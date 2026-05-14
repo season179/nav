@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,11 +10,22 @@ use std::{
     process::Stdio,
 };
 use tokio::{process::Command, time};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        http::header::{
+            AUTHORIZATION as WS_AUTHORIZATION, CONTENT_TYPE as WS_CONTENT_TYPE,
+            HeaderValue as WsHeaderValue,
+        },
+    },
+};
 
 // Reading guide:
 // 1. Start at main() to see the whole agent loop in one place.
 // 2. Read load_auth() to understand how ChatGPT/Codex subscription auth works.
-// 3. Read create_response() and decode_sse_response() to see the Responses API call.
+// 3. Read create_response() to see how WebSocket and SSE transports share one body.
 // 4. Read tool_definitions(), then run_tool() and the tool functions at the bottom.
 // 5. Come back to function_calls() to see how model tool requests become Rust calls.
 
@@ -30,6 +41,10 @@ struct Args {
     /// Authentication mode. ChatGPT reads ~/.codex/auth.json and calls the Codex Responses backend.
     #[arg(long, value_enum, default_value_t = AuthMode::Chatgpt)]
     auth: AuthMode,
+
+    /// Transport used to call the Responses API.
+    #[arg(long, value_enum, default_value_t = Transport::Websocket)]
+    transport: Transport,
 
     /// Codex home used for ChatGPT auth.
     #[arg(long)]
@@ -52,11 +67,18 @@ enum AuthMode {
     ApiKey,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Transport {
+    Websocket,
+    Sse,
+}
+
 // the rest of the code only needs two facts after auth is resolved:
-// which endpoint to call and which bearer token to attach.
+// which HTTP/WebSocket endpoint to call and which bearer token to attach.
 #[derive(Debug)]
 struct AuthConfig {
-    base_url: String,
+    http_base_url: String,
+    websocket_url: String,
     bearer: String,
 }
 
@@ -172,7 +194,8 @@ fn load_auth(args: &Args) -> Result<AuthConfig> {
             // API-key mode uses the public OpenAI API endpoint.
             let key = env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
             Ok(AuthConfig {
-                base_url: "https://api.openai.com/v1".to_string(),
+                http_base_url: "https://api.openai.com/v1".to_string(),
+                websocket_url: "wss://api.openai.com/v1/responses".to_string(),
                 bearer: key,
             })
         }
@@ -202,7 +225,8 @@ fn load_auth(args: &Args) -> Result<AuthConfig> {
                 .map(|tokens| tokens.access_token)
                 .context("Codex auth.json does not contain an access token")?;
             Ok(AuthConfig {
-                base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                http_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                websocket_url: "wss://chatgpt.com/backend-api/codex/responses".to_string(),
                 bearer,
             })
         }
@@ -228,24 +252,42 @@ async fn create_response(
     cwd: &Path,
     input: &[Value],
 ) -> Result<ResponseEnvelope> {
+    let mut body = response_body(args, cwd, input);
+    match args.transport {
+        Transport::Websocket => create_response_websocket(auth, body).await,
+        Transport::Sse => {
+            // SSE is the older path. It remains useful because it is plain HTTP
+            // and shows why the WebSocket transport is a latency optimization.
+            body["stream"] = json!(true);
+            create_response_sse(client, auth, body).await
+        }
+    }
+}
+
+fn response_body(args: &Args, cwd: &Path, input: &[Value]) -> Value {
     // tools are just JSON descriptions. The model decides whether to emit
     // a function_call item; Rust remains responsible for actually doing work.
-    let body = json!({
+    json!({
         "model": args.model,
         "instructions": format!(
             "You are a small coding agent running in {}. Use tools to inspect, edit, search, and verify code. Prefer small, explicit steps. Paths must be relative.",
             cwd.display()
         ),
         "input": input,
-        // ChatGPT/Codex subscription calls require store=false and stream=true.
-        // store=false also makes the transcript handling explicit for learning.
+        // store=false keeps the demo honest: nav manages the transcript itself,
+        // and no server-side stored conversation is needed for the agent loop.
         "store": false,
-        "stream": true,
         "tools": tool_definitions(),
-    });
+    })
+}
 
+async fn create_response_sse(
+    client: &reqwest::Client,
+    auth: &AuthConfig,
+    body: Value,
+) -> Result<ResponseEnvelope> {
     let response = client
-        .post(format!("{}/responses", auth.base_url))
+        .post(format!("{}/responses", auth.http_base_url))
         .json(&body)
         .send()
         .await
@@ -260,12 +302,125 @@ async fn create_response(
     decode_sse_response(response).await
 }
 
+async fn create_response_websocket(auth: &AuthConfig, mut body: Value) -> Result<ResponseEnvelope> {
+    // WebSocket mode sends the same Responses create body as HTTP, wrapped in
+    // an event envelope. One socket could carry multiple turns; this small CLI
+    // opens one per turn to keep lifetime/reconnect rules easy to understand.
+    body["type"] = json!("response.create");
+
+    let mut request = auth
+        .websocket_url
+        .as_str()
+        .into_client_request()
+        .context("failed to build WebSocket request")?;
+    request.headers_mut().insert(
+        WS_AUTHORIZATION,
+        WsHeaderValue::from_str(&format!("Bearer {}", auth.bearer))?,
+    );
+    request.headers_mut().insert(
+        WS_CONTENT_TYPE,
+        WsHeaderValue::from_static("application/json"),
+    );
+
+    let (mut socket, _) = connect_async(request)
+        .await
+        .context("failed to connect to Responses WebSocket")?;
+    socket
+        .send(Message::Text(body.to_string().into()))
+        .await
+        .context("failed to send response.create")?;
+
+    decode_websocket_response(&mut socket).await
+}
+
+async fn decode_websocket_response<S>(socket: &mut S) -> Result<ResponseEnvelope>
+where
+    S: futures_util::Stream<
+            Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
+        > + Unpin,
+{
+    let mut collector = ResponseCollector::default();
+
+    while let Some(message) = socket.next().await {
+        let message = message.context("failed to read Responses WebSocket event")?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+
+        let event: Value =
+            serde_json::from_str(&text).context("failed to decode WebSocket event")?;
+        if collector.push_event(event, "Responses WebSocket")? {
+            break;
+        }
+    }
+
+    collector.finish("Responses WebSocket")
+}
+
+#[derive(Default)]
+struct ResponseCollector {
+    completed: Option<ResponseEnvelope>,
+    output: Vec<ResponseItem>,
+    raw_output: Vec<Value>,
+}
+
+impl ResponseCollector {
+    fn push_event(&mut self, event: Value, source: &str) -> Result<bool> {
+        match event.get("type").and_then(Value::as_str) {
+            Some("error") => bail!("{source} returned error: {event}"),
+            Some("response.completed") => {
+                self.completed = Some(decode_completed_response(&event)?);
+                return Ok(true);
+            }
+            Some("response.output_item.done") => {
+                let item = event
+                    .get("item")
+                    .cloned()
+                    .context("response.output_item.done event had no item")?;
+                self.raw_output.push(item.clone());
+                self.output.push(
+                    serde_json::from_value::<ResponseItem>(item)
+                        .context("failed to decode output item")?,
+                );
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn finish(self, source: &str) -> Result<ResponseEnvelope> {
+        let mut completed = self
+            .completed
+            .with_context(|| format!("{source} ended without response.completed"))?;
+        if completed.output.as_ref().is_none_or(Vec::is_empty) {
+            completed.output = Some(self.output);
+        }
+        if completed.raw_output.is_empty() {
+            completed.raw_output = self.raw_output;
+        }
+        Ok(completed)
+    }
+}
+
+fn decode_completed_response(event: &Value) -> Result<ResponseEnvelope> {
+    let response = event
+        .get("response")
+        .cloned()
+        .context("response.completed event had no response")?;
+    let mut envelope = serde_json::from_value::<ResponseEnvelope>(response.clone())
+        .context("failed to decode completed response")?;
+    envelope.raw_output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(envelope)
+}
+
 async fn decode_sse_response(response: reqwest::Response) -> Result<ResponseEnvelope> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
-    let mut completed = None;
-    let mut output = Vec::new();
-    let mut raw_output = Vec::new();
+    let mut collector = ResponseCollector::default();
 
     // SSE arrives as arbitrary byte chunks, not neat JSON objects. We keep
     // a string buffer and split only when a full "\n\n"-terminated frame arrives.
@@ -288,50 +443,14 @@ async fn decode_sse_response(response: reqwest::Response) -> Result<ResponseEnve
 
                 let event: Value =
                     serde_json::from_str(data).context("failed to decode SSE event")?;
-                if event.get("type").and_then(Value::as_str) == Some("response.completed") {
-                    // completion tells us the stream is done and carries
-                    // usage/status metadata. In this backend shape, output may
-                    // still be empty, so output_item.done events matter too.
-                    let response = event
-                        .get("response")
-                        .cloned()
-                        .context("response.completed event had no response")?;
-                    let mut envelope = serde_json::from_value::<ResponseEnvelope>(response.clone())
-                        .context("failed to decode completed response")?;
-                    envelope.raw_output = response
-                        .get("output")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    completed = Some(envelope);
-                } else if event.get("type").and_then(Value::as_str)
-                    == Some("response.output_item.done")
-                {
-                    // completed output items are the durable transcript
-                    // units: messages for humans and function_call items for tools.
-                    let item = event
-                        .get("item")
-                        .cloned()
-                        .context("response.output_item.done event had no item")?;
-                    raw_output.push(item.clone());
-                    output.push(
-                        serde_json::from_value::<ResponseItem>(item)
-                            .context("failed to decode output item")?,
-                    );
+                if collector.push_event(event, "Responses API stream")? {
+                    return collector.finish("Responses API stream");
                 }
             }
         }
     }
 
-    let mut completed =
-        completed.context("Responses API stream ended without response.completed")?;
-    if completed.output.as_ref().is_none_or(Vec::is_empty) {
-        completed.output = Some(output);
-    }
-    if completed.raw_output.is_empty() {
-        completed.raw_output = raw_output;
-    }
-    Ok(completed)
+    collector.finish("Responses API stream")
 }
 
 fn tool_definitions() -> Vec<Value> {

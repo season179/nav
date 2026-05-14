@@ -5,7 +5,11 @@ A tiny Rust coding agent built on the Responses API.
 This keeps the spirit of Geoffrey Huntley's workshop: a coding agent is a loop
 that can read, edit, search, run commands, and report back. By default it uses
 the ChatGPT OAuth credentials stored by Codex in `~/.codex/auth.json` and calls
-the Codex Responses backend directly.
+the Codex Responses backend directly over WebSocket.
+
+WebSocket mode keeps the model/tool loop on one low-latency transport. The SSE
+transport is still available with `--transport sse` because plain HTTP is useful
+for learning the shape of streamed Responses events.
 
 ## Setup
 
@@ -24,6 +28,7 @@ codex login
 ```sh
 cargo run -- "List the files and explain what this project does"
 cargo run -- --model gpt-5.5 "Add tests for the CLI argument parser"
+cargo run -- --transport sse "Use the HTTP/SSE transport instead"
 cargo run -- --auth api-key "Use OPENAI_API_KEY instead"
 ```
 
@@ -33,6 +38,7 @@ After installing:
 cargo install --path .
 nav "List the files and explain what this project does"
 nav --model gpt-5.5 "Add tests for the CLI argument parser"
+nav --transport sse "Use the HTTP/SSE transport instead"
 nav --auth api-key "Use OPENAI_API_KEY instead"
 ```
 
