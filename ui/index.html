@@ -18,16 +18,23 @@
         <nav class="primary-nav" aria-label="Primary">
           <button class="nav-action" type="button">
             <span class="icon" aria-hidden="true">✎</span>
-            <span>New chat</span>
+            <span>New session</span>
           </button>
         </nav>
 
         <section class="sidebar-section projects" aria-labelledby="projects-title">
           <h2 id="projects-title">Projects</h2>
-          <button class="project-row active selected-workspace-button" type="button">
+          <button
+            class="project-toggle"
+            type="button"
+            aria-expanded="true"
+            aria-controls="project-sessions"
+          >
             <span class="folder" aria-hidden="true">▱</span>
-            <span class="workspace-name">Select working directory</span>
+            <span class="project-name">No project selected</span>
+            <span class="project-chevron" aria-hidden="true">⌄</span>
           </button>
+          <div id="project-sessions" class="session-list" aria-label="Sessions"></div>
         </section>
       </aside>
 

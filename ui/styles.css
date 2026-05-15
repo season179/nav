@@ -82,7 +82,7 @@ button {
 }
 
 .nav-action,
-.project-row,
+.project-toggle,
 .workspace-strip button,
 .send-button {
   border: 0;
@@ -91,7 +91,7 @@ button {
 }
 
 .nav-action,
-.project-row {
+.project-toggle {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
@@ -108,7 +108,7 @@ button {
 }
 
 .nav-action:hover,
-.project-row:hover {
+.project-toggle:hover {
   background: rgba(255, 255, 255, 0.08);
 }
 
@@ -131,12 +131,30 @@ button {
   font-weight: 500;
 }
 
-.project-row {
-  grid-template-columns: 22px minmax(0, 1fr);
+.project-toggle {
+  color: #c8cfcc;
 }
 
-.project-row.active {
-  color: #f3f8f6;
+.project-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-chevron {
+  color: #98a19e;
+  font-size: 13px;
+  transition: transform 140ms ease;
+}
+
+.project-toggle[aria-expanded="false"] .project-chevron {
+  transform: rotate(-90deg);
+}
+
+.session-list {
+  display: grid;
+  gap: 3px;
+  margin-top: 3px;
 }
 
 .main-panel {
@@ -305,13 +323,14 @@ body:not(.has-workspace) .workspace-strip button:last-child {
   }
 
   .nav-action span:last-child,
-  .project-row span:last-child,
+  .project-name,
+  .project-chevron,
   .sidebar-section h2 {
     display: none;
   }
 
   .nav-action,
-  .project-row {
+  .project-toggle {
     grid-template-columns: 1fr;
     justify-items: center;
   }

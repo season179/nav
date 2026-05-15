@@ -3,7 +3,9 @@ const prompt = document.querySelector("#prompt");
 const sendButton = document.querySelector(".send-button");
 const heading = document.querySelector("h1");
 const workspaceNames = document.querySelectorAll(".workspace-name");
-const selectedWorkspaceButton = document.querySelector(".selected-workspace-button");
+const projectName = document.querySelector(".project-name");
+const projectToggle = document.querySelector(".project-toggle");
+const sessionList = document.querySelector(".session-list");
 const workspaceStripButton = document.querySelector(".workspace-strip-button");
 
 let currentWorkspace = null;
@@ -19,17 +21,21 @@ const setWorkspace = (workspace) => {
     element.textContent = name;
   });
 
+  if (projectName) {
+    projectName.textContent = workspace?.name ?? "No project selected";
+  }
+
+  if (projectToggle) {
+    projectToggle.setAttribute(
+      "aria-label",
+      workspace?.name ?? "No project selected",
+    );
+  }
+
   if (heading) {
     heading.textContent = hasWorkspace
       ? `What should we build in ${name}?`
       : "What should we work on?";
-  }
-
-  if (selectedWorkspaceButton) {
-    selectedWorkspaceButton.setAttribute(
-      "aria-label",
-      hasWorkspace ? name : "Select working directory",
-    );
   }
 
   if (workspaceStripButton) {
@@ -82,7 +88,12 @@ composer?.addEventListener("submit", (event) => {
   prompt?.focus();
 });
 
-selectedWorkspaceButton?.addEventListener("click", chooseWorkspace);
+projectToggle?.addEventListener("click", () => {
+  const isExpanded = projectToggle.getAttribute("aria-expanded") !== "false";
+  projectToggle.setAttribute("aria-expanded", String(!isExpanded));
+  sessionList?.toggleAttribute("hidden", isExpanded);
+});
+
 workspaceStripButton?.addEventListener("click", chooseWorkspace);
 
 loadWorkspace();
