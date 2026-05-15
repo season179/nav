@@ -7,9 +7,13 @@ that can read, edit, search, run commands, and report back. By default it uses
 the ChatGPT OAuth credentials stored by Codex in `~/.codex/auth.json` and calls
 the Codex Responses backend directly over WebSocket.
 
-WebSocket mode keeps the model/tool loop on one low-latency transport. The SSE
+WebSocket mode keeps each turn on one low-latency transport. The SSE
 transport is still available with `--transport sse` because plain HTTP is useful
 for learning the shape of streamed Responses events.
+
+## Prerequisites
+
+- `rg` from ripgrep must be on `PATH` for the `code_search` tool.
 
 ## Setup
 
@@ -32,6 +36,10 @@ cargo run -- --transport sse "Use the HTTP/SSE transport instead"
 cargo run -- --auth api-key "Use OPENAI_API_KEY instead"
 ```
 
+`gpt-5.5` is the default model name used by this demo for the Codex backend; use
+`--model` to choose a model your backend/account exposes. For `--auth api-key`,
+set `OPENAI_API_KEY` first.
+
 After installing:
 
 ```sh
@@ -51,3 +59,4 @@ nav --auth api-key "Use OPENAI_API_KEY instead"
 - `code_search`: search with `rg`
 
 Tool paths are resolved inside the current working directory.
+Absolute paths, parent traversal (`..`), and symbolic-link escapes are rejected.
