@@ -110,3 +110,124 @@ fn string_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing string input field `{key}`"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use tempfile::tempdir;
+
+    // ── tool_definitions ──────────────────────────────────────────
+
+    #[test]
+    fn tool_definitions_returns_all_five_tools() {
+        let defs = tool_definitions();
+        assert_eq!(defs.len(), 5);
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|d| d.get("name").and_then(Value::as_str))
+            .collect();
+        for expected in ["read_file", "list_files", "bash", "edit_file", "code_search"] {
+            assert!(names.contains(&expected), "missing tool: {expected}");
+        }
+    }
+
+    #[test]
+    fn tool_definitions_have_valid_schemas() {
+        for def in tool_definitions() {
+            assert_eq!(def["type"], "function");
+            let params = &def["parameters"];
+            assert_eq!(params["type"], "object");
+            assert!(params["properties"].is_object());
+            assert!(params["required"].is_array());
+        }
+    }
+
+    // ── run_tool dispatch ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_tool_rejects_unknown_tool() {
+        let cwd = Path::new("/tmp");
+        let err = run_tool(cwd, 5, "fly_away", json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("unknown tool: fly_away"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_dispatches() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::write(cwd.join("hello.txt"), "world").unwrap();
+
+        let result = run_tool(&cwd, 5, "read_file", json!({"path": "hello.txt"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "world");
+    }
+
+    #[tokio::test]
+    async fn run_tool_list_files_dispatches() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::write(cwd.join("a.txt"), "").unwrap();
+        fs::create_dir(cwd.join("subdir")).unwrap();
+
+        let result = run_tool(&cwd, 5, "list_files", json!({"path": "."}))
+            .await
+            .unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&result).unwrap();
+        assert!(parsed.contains(&"a.txt".to_string()));
+        assert!(parsed.contains(&"subdir/".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_tool_bash_dispatches() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+
+        let result = run_tool(&cwd, 5, "bash", json!({"command": "echo ok"}))
+            .await
+            .unwrap();
+        assert!(result.contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_edit_file_dispatches() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::write(cwd.join("f.txt"), "hello world").unwrap();
+
+        let result = run_tool(
+            &cwd,
+            5,
+            "edit_file",
+            json!({"path": "f.txt", "old_str": "world", "new_str": "nav"}),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("edited"));
+        assert_eq!(fs::read_to_string(cwd.join("f.txt")).unwrap(), "hello nav");
+    }
+
+    // ── string_arg ────────────────────────────────────────────────
+
+    #[test]
+    fn string_arg_extracts_existing_field() {
+        let input = json!({"path": "foo.rs"});
+        assert_eq!(string_arg(&input, "path").unwrap(), "foo.rs");
+    }
+
+    #[test]
+    fn string_arg_rejects_missing_field() {
+        let input = json!({"path": "foo.rs"});
+        let err = string_arg(&input, "command").unwrap_err();
+        assert!(err.to_string().contains("missing string input field `command`"));
+    }
+
+    #[test]
+    fn string_arg_rejects_non_string_field() {
+        let input = json!({"path": 42});
+        let err = string_arg(&input, "path").unwrap_err();
+        assert!(err.to_string().contains("missing string input field `path`"));
+    }
+}
