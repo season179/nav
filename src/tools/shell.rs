@@ -76,6 +76,6 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
         let result = bash(&cwd, 5, "pwd").await.unwrap();
-        assert!(result.contains(cwd.to_str().unwrap()));
+        assert!(result.contains(&format!("stdout:\n{}", cwd.display())));
     }
 }

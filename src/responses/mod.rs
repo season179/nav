@@ -177,16 +177,11 @@ mod tests {
     use crate::cli::Args;
     use serde_json::json;
 
-    /// Minimal Args for unit-testing response_body and friends.
-    fn test_args() -> Args {
-        Args::test_default()
-    }
-
     // ── response_body ─────────────────────────────────────────────
 
     #[test]
     fn response_body_includes_model_and_store_false() {
-        let args = test_args();
+        let args = Args::test_default();
         let cwd = std::path::Path::new("/tmp");
         let input = vec![json!({"type": "message", "role": "user", "content": "hi"})];
         let body = response_body(&args, cwd, &input);
@@ -198,7 +193,7 @@ mod tests {
 
     #[test]
     fn response_body_instructions_contain_cwd() {
-        let args = test_args();
+        let args = Args::test_default();
         let cwd = std::path::Path::new("/my/project");
         let body = response_body(&args, cwd, &[]);
         let instructions = body["instructions"].as_str().unwrap();
@@ -207,7 +202,7 @@ mod tests {
 
     #[test]
     fn response_body_passes_input_through() {
-        let args = test_args();
+        let args = Args::test_default();
         let cwd = std::path::Path::new("/tmp");
         let input = vec![
             json!({"type": "message", "role": "user", "content": "hello"}),
@@ -312,6 +307,7 @@ mod tests {
     }
 
     #[test]
+    // print_messages writes to stdout ("done"); cargo test captures it.
     fn process_response_returns_empty_when_message_only() {
         let response = ResponseEnvelope {
             output: Some(vec![ResponseItem::Message {
@@ -404,6 +400,7 @@ mod tests {
         });
         let done = collector.push_event(&event, "src").unwrap();
         assert!(done);
+        assert!(collector.completed.is_some());
     }
 
     #[test]
@@ -438,18 +435,19 @@ mod tests {
     #[test]
     fn collector_finish_merges_streamed_output() {
         let mut collector = ResponseCollector::default();
-        // Simulate receiving a completed response with no output field
-        let completed_event = json!({
-            "type": "response.completed",
-            "response": {"id": "r1"}
-        });
-        collector.push_event(&completed_event, "src").unwrap();
-        // Simulate receiving an output item (arrived before completed but not in the response object)
+        // In real streaming, output_item.done arrives before response.completed.
+        // Push them in that order; the completed response has no output field,
+        // so finish() should merge the streamed items.
         let output_event = json!({
             "type": "response.output_item.done",
             "item": {"type": "message", "content": [{"type": "output_text", "text": "hi"}]}
         });
         collector.push_event(&output_event, "src").unwrap();
+        let completed_event = json!({
+            "type": "response.completed",
+            "response": {"id": "r1"}
+        });
+        collector.push_event(&completed_event, "src").unwrap();
 
         let result = collector.finish("src").unwrap();
         let output = result.output.as_ref().unwrap();

@@ -41,7 +41,9 @@ impl Args {
             model: "test-model".into(),
             auth: AuthMode::Chatgpt,
             transport: Transport::Websocket,
-            codex_home: None,
+            // Poisoned so load_auth(&Args::test_default()) fails fast instead of
+            // reading the developer's real ~/.codex/auth.json.
+            codex_home: Some(PathBuf::from("/nonexistent/test/codex/home")),
             max_turns: 4,
             bash_timeout_secs: 10,
             prompt: vec!["test".into()],

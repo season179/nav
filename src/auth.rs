@@ -174,11 +174,22 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_rejects_empty_tokens_object() {
+        let temp = tempdir().unwrap();
+        // tokens:{} fails serde parse because access_token is non-Optional String.
+        let auth_json = r#"{"auth_mode":"chatgpt","tokens":{}}"#;
+        fs::write(temp.path().join("auth.json"), auth_json).unwrap();
+
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("parse"));
+    }
+
+    #[test]
     fn chatgpt_rejects_missing_auth_file() {
         let temp = tempdir().unwrap();
         let args = chatgpt_args(temp.path().join("nonexistent").to_path_buf());
         let err = load_auth(&args).unwrap_err();
-        assert!(err.to_string().contains("auth.json"));
+        assert!(err.to_string().contains("failed to read"));
     }
 
     #[test]
@@ -217,6 +228,8 @@ mod tests {
             bearer: "super-secret".into(),
         };
         let debug = format!("{auth:?}");
+        assert!(debug.contains("https://x.com"));
+        assert!(debug.contains("wss://x.com"));
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("super-secret"));
     }
