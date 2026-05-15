@@ -33,6 +33,22 @@ pub(super) struct Args {
     pub(super) prompt: Vec<String>,
 }
 
+impl Args {
+    /// Shared constructor for unit tests across modules.
+    #[cfg(test)]
+    pub(super) fn test_default() -> Self {
+        Self {
+            model: "test-model".into(),
+            auth: AuthMode::Chatgpt,
+            transport: Transport::Websocket,
+            codex_home: None,
+            max_turns: 4,
+            bash_timeout_secs: 10,
+            prompt: vec!["test".into()],
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub(super) enum AuthMode {
     Chatgpt,

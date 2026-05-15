@@ -174,20 +174,12 @@ fn output_items(response: &ResponseEnvelope) -> Result<&[ResponseItem]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Args, AuthMode, Transport};
+    use crate::cli::Args;
     use serde_json::json;
 
     /// Minimal Args for unit-testing response_body and friends.
     fn test_args() -> Args {
-        Args {
-            model: "test-model".into(),
-            auth: AuthMode::Chatgpt,
-            transport: Transport::Websocket,
-            codex_home: None,
-            max_turns: 4,
-            bash_timeout_secs: 10,
-            prompt: vec!["test".into()],
-        }
+        Args::test_default()
     }
 
     // ── response_body ─────────────────────────────────────────────
@@ -299,6 +291,7 @@ mod tests {
         ];
         let calls = function_calls(&items).unwrap();
         assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
     }
 
     // ── process_response ──────────────────────────────────────────
@@ -369,8 +362,20 @@ mod tests {
             }
         });
         let envelope = decode_completed_response(&event).unwrap();
-        assert!(envelope.output.is_some());
+        let output = envelope.output.as_ref().unwrap();
+        assert_eq!(output.len(), 1);
         assert_eq!(envelope.raw_output.len(), 1);
+        // Verify the message deserialized correctly, not just that it exists
+        match &output[0] {
+            ResponseItem::Message { content } => {
+                let parts = content.as_ref().unwrap();
+                match &parts[0] {
+                    MessagePart::OutputText { text } => assert_eq!(text, "hi"),
+                    other => panic!("expected OutputText, got {other:?}"),
+                }
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
     }
 
     #[test]

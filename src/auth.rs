@@ -96,20 +96,15 @@ pub(super) fn default_headers(auth: &AuthConfig) -> Result<HeaderMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Args, AuthMode, Transport};
+    use crate::cli::{Args, AuthMode};
     use std::fs;
     use tempfile::tempdir;
 
     fn chatgpt_args(codex_home: std::path::PathBuf) -> Args {
-        Args {
-            model: "test".into(),
-            auth: AuthMode::Chatgpt,
-            transport: Transport::Websocket,
-            codex_home: Some(codex_home),
-            max_turns: 1,
-            bash_timeout_secs: 5,
-            prompt: vec![],
-        }
+        let mut args = Args::test_default();
+        args.auth = AuthMode::Chatgpt;
+        args.codex_home = Some(codex_home);
+        args
     }
 
     // ── default_headers ───────────────────────────────────────────

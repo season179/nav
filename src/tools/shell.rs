@@ -53,14 +53,15 @@ mod tests {
 
     #[tokio::test]
     async fn bash_reports_exit_status() {
+        // On Unix, ExitStatus Display is "exit status: N".
         let result = bash(Path::new("/tmp"), 5, "exit 42").await.unwrap();
-        assert!(result.contains("status: exit status: 42") || result.contains("status: 42"));
+        assert!(result.contains("status: exit status: 42"));
     }
 
     #[tokio::test]
     async fn bash_reports_zero_exit() {
         let result = bash(Path::new("/tmp"), 5, "true").await.unwrap();
-        assert!(result.contains("status: exit status: 0") || result.contains("status: 0"));
+        assert!(result.contains("status: exit status: 0"));
     }
 
     #[tokio::test]
@@ -72,8 +73,9 @@ mod tests {
 
     #[tokio::test]
     async fn bash_runs_in_cwd() {
-        let cwd = Path::new("/tmp");
-        let result = bash(cwd, 5, "pwd").await.unwrap();
-        assert!(result.contains("/tmp"));
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let result = bash(&cwd, 5, "pwd").await.unwrap();
+        assert!(result.contains(cwd.to_str().unwrap()));
     }
 }
