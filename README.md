@@ -1,11 +1,19 @@
 # nav
 
-A tiny Rust coding agent built on the Responses API.
+`nav` is a small Rust coding agent built on the Responses API.
 
 This keeps the spirit of Geoffrey Huntley's workshop: a coding agent is a loop
-that can read, edit, search, run commands, and report back. By default it uses
-the ChatGPT OAuth credentials stored by Codex in `~/.codex/auth.json` and calls
-the Codex Responses backend directly over WebSocket.
+that can read, edit, search, run commands, and report back. The project started
+as an educational implementation, but now also has a second goal: become a
+usable local coding agent with a real product surface. Keep the simple learning
+path intact, but prefer designs that can grow into reliable day-to-day use.
+
+See [CONTEXT.md](CONTEXT.md) for the current product direction and engineering
+priorities.
+
+By default it uses the ChatGPT OAuth credentials stored by Codex in
+`~/.codex/auth.json` and calls the Codex Responses backend directly over
+WebSocket.
 
 WebSocket mode keeps each turn on one low-latency transport. The SSE
 transport is still available with `--transport sse` because plain HTTP is useful
