@@ -61,8 +61,10 @@ nav --auth api-key "Use OPENAI_API_KEY instead"
 ## Desktop UI
 
 `nav` also has an early Electron desktop shell. This is intentionally small for
-now: a left sidebar and a main prompt area, ready for the Rust agent loop to be
-connected through a local backend/event stream.
+now: a left sidebar, a main prompt area, and a persisted working-directory
+picker. If no workspace is selected, submitting from the prompt asks for one
+first, so the future Rust agent loop has an explicit filesystem boundary before
+it runs.
 
 Install the UI dependencies once:
 

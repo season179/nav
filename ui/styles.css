@@ -72,8 +72,7 @@ button {
 }
 
 .primary-nav,
-.sidebar-section,
-.recent-threads {
+.sidebar-section {
   -webkit-app-region: no-drag;
 }
 
@@ -84,7 +83,6 @@ button {
 
 .nav-action,
 .project-row,
-.recent-row,
 .workspace-strip button,
 .send-button {
   border: 0;
@@ -93,8 +91,7 @@ button {
 }
 
 .nav-action,
-.project-row,
-.recent-row {
+.project-row {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
@@ -111,9 +108,7 @@ button {
 }
 
 .nav-action:hover,
-.project-row:hover,
-.recent-row:hover,
-.recent-row.selected {
+.project-row:hover {
   background: rgba(255, 255, 255, 0.08);
 }
 
@@ -142,28 +137,6 @@ button {
 
 .project-row.active {
   color: #f3f8f6;
-}
-
-.recent-threads {
-  margin-top: 8px;
-  padding-left: 24px;
-}
-
-.recent-row {
-  grid-template-columns: minmax(0, 1fr) auto;
-  padding-left: 8px;
-  color: #d3d9d7;
-}
-
-.recent-row time {
-  color: #9da5a2;
-  font-size: 13px;
-}
-
-.truncate {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .main-panel {
@@ -234,6 +207,10 @@ textarea::placeholder {
   color: #7c8280;
 }
 
+textarea:disabled {
+  color: var(--faint);
+}
+
 .composer-toolbar {
   display: flex;
   align-items: center;
@@ -260,12 +237,17 @@ textarea::placeholder {
   font-weight: 600;
 }
 
+.send-button:disabled {
+  background: #5c6260;
+  color: #2a2d2c;
+}
+
 .workspace-strip {
   display: flex;
   align-items: center;
-  gap: 15px;
+  gap: 12px;
   width: min(730px, 100%);
-  padding: 10px 12px 0;
+  padding: 10px 14px 0;
   color: #9da5a2;
   font-size: 13px;
 }
@@ -276,6 +258,25 @@ textarea::placeholder {
   gap: 6px;
   min-width: 0;
   color: inherit;
+}
+
+.workspace-strip-button {
+  max-width: min(420px, 100%);
+  color: #9da5a2;
+}
+
+.workspace-strip-button .workspace-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+body.has-workspace .workspace-strip-button {
+  color: #c8d1ce;
+}
+
+body:not(.has-workspace) .workspace-strip button:last-child {
+  display: none;
 }
 
 .sr-only {
@@ -305,7 +306,6 @@ textarea::placeholder {
 
   .nav-action span:last-child,
   .project-row span:last-child,
-  .recent-threads,
   .sidebar-section h2 {
     display: none;
   }

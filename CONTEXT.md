@@ -31,6 +31,10 @@ a fast path to an IDE-like surface with mature web UI primitives. Keep the
 agent logic in Rust and use Electron as the desktop shell, not as the place
 where privileged agent behavior lives.
 
+The desktop UI should require a working directory before it can run the agent.
+That selected directory becomes the visible workspace boundary for file reads,
+edits, command execution, diffs, and future approval flows.
+
 ## Engineering Principles
 
 - Keep the educational path clear. A new contributor should still be able to
@@ -53,7 +57,8 @@ where privileged agent behavior lives.
    command output, errors, and completion.
 3. Add a local API layer for a desktop UI to start sessions and subscribe to
    events.
-4. Design the first UI around the real coding workflow: transcript, tool log,
+4. Use the selected working directory as the first required session input.
+5. Design the first UI around the real coding workflow: transcript, tool log,
    command output, file/diff view, and workspace controls.
-5. Keep tests focused on safety boundaries, transcript correctness, and tool
+6. Keep tests focused on safety boundaries, transcript correctness, and tool
    execution behavior.
