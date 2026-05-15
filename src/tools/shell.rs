@@ -47,8 +47,8 @@ mod tests {
 
     #[tokio::test]
     async fn bash_captures_stderr() {
-        let result = bash(Path::new("/tmp"), 5, "echo err >&2").await.unwrap();
-        assert!(result.contains("err"));
+        let result = bash(Path::new("/tmp"), 5, "echo oops >&2").await.unwrap();
+        assert!(result.contains("stderr:\noops"));
     }
 
     #[tokio::test]
