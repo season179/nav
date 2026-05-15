@@ -1,8 +1,9 @@
 {
-  "name": "nav-ui",
+  "name": "nav-app",
+  "productName": "nav-app",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop UI shell for nav.",
+  "description": "Desktop UI shell for nav-app.",
   "main": "nav-app/main.js",
   "scripts": {
     "start": "electron ."

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "nav-ui",
+      "name": "nav-app",
       "devDependencies": {
         "electron": "^42.1.0",
       },

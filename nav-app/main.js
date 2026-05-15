@@ -2,6 +2,10 @@ const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 
+const APP_NAME = "nav-app";
+
+app.setName(APP_NAME);
+
 const workspaceStatePath = () =>
   path.join(app.getPath("userData"), "workspace.json");
 
@@ -57,7 +61,7 @@ const createWindow = () => {
     height: 760,
     minWidth: 900,
     minHeight: 620,
-    title: "nav",
+    title: APP_NAME,
     titleBarStyle: "hiddenInset",
     backgroundColor: "#202020",
     webPreferences: {

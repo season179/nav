@@ -18,8 +18,8 @@ local coding agent for real development work.
 - preserve enough session state to make longer tasks understandable;
 - expose a UI suitable for daily use on macOS and Windows.
 
-The UI direction should assume a local agent backend rather than putting all
-agent logic in the frontend. The likely shape is:
+The desktop UI is called `nav-app`. Its direction should assume a local agent
+backend rather than putting all agent logic in the frontend. The likely shape is:
 
 ```text
 Rust agent core -> local event/API layer -> desktop UI

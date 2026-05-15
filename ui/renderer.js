@@ -47,7 +47,7 @@ const setWorkspace = (workspace) => {
 
   if (prompt) {
     prompt.disabled = false;
-    prompt.placeholder = "Ask nav anything. @ to mention files";
+    prompt.placeholder = "Ask Nav anything. @ to mention files";
   }
 
   if (sendButton) {
