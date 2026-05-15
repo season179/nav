@@ -26,9 +26,10 @@ Rust agent core -> local event/API layer -> desktop UI
 ```
 
 For a desktop UI, prefer options that preserve the Rust core and support both
-macOS and Windows. As of the current research pass, Tauri v2 is the leading
-candidate, with Electron as the pragmatic fallback if IDE-like UI requirements
-outgrow system WebViews.
+macOS and Windows. The first UI slice uses Electron because it gives the project
+a fast path to an IDE-like surface with mature web UI primitives. Keep the
+agent logic in Rust and use Electron as the desktop shell, not as the place
+where privileged agent behavior lives.
 
 ## Engineering Principles
 

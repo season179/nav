@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:;"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>nav</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Navigation">
+        <div class="traffic-spacer"></div>
+
+        <nav class="primary-nav" aria-label="Primary">
+          <button class="nav-action" type="button">
+            <span class="icon" aria-hidden="true">✎</span>
+            <span>New chat</span>
+          </button>
+        </nav>
+
+        <section class="sidebar-section projects" aria-labelledby="projects-title">
+          <h2 id="projects-title">Projects</h2>
+          <button class="project-row active" type="button">
+            <span class="folder" aria-hidden="true">▱</span>
+            <span>Personal</span>
+          </button>
+          <button class="project-row" type="button">
+            <span class="folder" aria-hidden="true">▱</span>
+            <span>typeling</span>
+          </button>
+          <button class="project-row" type="button">
+            <span class="folder" aria-hidden="true">▱</span>
+            <span>pi-ecosystem</span>
+          </button>
+
+          <div class="recent-threads" aria-label="Recent pi-ecosystem chats">
+            <button class="recent-row selected" type="button">
+              <span class="truncate">Add layman rewrite step</span>
+              <time>1d</time>
+            </button>
+            <button class="recent-row" type="button">
+              <span class="truncate">Locate pi-readbeam</span>
+              <time>3d</time>
+            </button>
+            <button class="recent-row" type="button">
+              <span class="truncate">Check pi-readbeam release</span>
+              <time>3d</time>
+            </button>
+          </div>
+        </section>
+      </aside>
+
+      <main class="main-panel">
+        <header class="top-bar" aria-label="Workspace controls">
+          <div class="window-title">Personal</div>
+        </header>
+
+        <section class="hero-compose" aria-label="New coding session">
+          <h1>What should we build in Personal?</h1>
+
+          <form class="composer">
+            <label class="sr-only" for="prompt">Prompt</label>
+            <textarea
+              id="prompt"
+              rows="2"
+              placeholder="Ask nav anything. @ to mention files"
+            ></textarea>
+
+            <div class="composer-toolbar">
+              <div class="toolbar-right">
+                <button class="send-button" type="submit" aria-label="Send">
+                  ↑
+                </button>
+              </div>
+            </div>
+          </form>
+
+          <div class="workspace-strip" aria-label="Session context">
+            <button type="button">
+              <span aria-hidden="true">▱</span>
+              Personal
+              <span aria-hidden="true">⌄</span>
+            </button>
+            <button type="button">
+              <span aria-hidden="true">⑂</span>
+              main
+              <span aria-hidden="true">⌄</span>
+            </button>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>
