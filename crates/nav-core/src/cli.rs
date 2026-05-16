@@ -5,38 +5,38 @@ use std::path::PathBuf;
 // educational path clear: model choice, auth choice, loop limit, and prompt.
 #[derive(Parser, Debug)]
 #[command(about = "A tiny Rust coding agent using the Responses API")]
-pub(super) struct Args {
+pub struct Args {
     /// Model to use.
     #[arg(default_value = "gpt-5.5", long)]
-    pub(super) model: String,
+    pub model: String,
 
     /// Authentication mode. `ChatGPT` reads ~/.codex/auth.json and calls the `Codex` Responses backend.
     #[arg(long, value_enum, default_value_t = AuthMode::Chatgpt)]
-    pub(super) auth: AuthMode,
+    pub auth: AuthMode,
 
     /// Transport used to call the Responses API.
     #[arg(long, value_enum, default_value_t = Transport::Websocket)]
-    pub(super) transport: Transport,
+    pub transport: Transport,
 
     /// `Codex` home used for `ChatGPT` auth.
     #[arg(long)]
-    pub(super) codex_home: Option<PathBuf>,
+    pub codex_home: Option<PathBuf>,
 
     /// Maximum model/tool loop iterations.
     #[arg(default_value_t = 8, long)]
-    pub(super) max_turns: usize,
+    pub max_turns: usize,
 
     /// Timeout for shell commands run by the bash tool.
     #[arg(default_value_t = 20, long)]
-    pub(super) bash_timeout_secs: u64,
+    pub bash_timeout_secs: u64,
 
-    pub(super) prompt: Vec<String>,
+    pub prompt: Vec<String>,
 }
 
 impl Args {
     /// Shared constructor for unit tests across modules.
     #[cfg(test)]
-    pub(super) fn test_default() -> Self {
+    pub fn test_default() -> Self {
         Self {
             model: "test-model".into(),
             auth: AuthMode::Chatgpt,
@@ -52,13 +52,13 @@ impl Args {
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
-pub(super) enum AuthMode {
+pub enum AuthMode {
     Chatgpt,
     ApiKey,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
-pub(super) enum Transport {
+pub enum Transport {
     Websocket,
     Sse,
 }

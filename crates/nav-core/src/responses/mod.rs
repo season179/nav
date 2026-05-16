@@ -1,5 +1,5 @@
 mod sse;
-mod types;
+pub mod types;
 mod websocket;
 
 use crate::{
@@ -13,13 +13,13 @@ use std::path::Path;
 use types::{MessagePart, ResponseEnvelope, ResponseItem};
 
 #[derive(Debug)]
-pub(super) struct ToolCall {
-    pub(super) call_id: String,
-    pub(super) name: String,
-    pub(super) arguments: Value,
+pub struct ToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
 }
 
-pub(super) async fn create_response(
+pub async fn create_response(
     client: &reqwest::Client,
     auth: &AuthConfig,
     args: &Args,
@@ -110,7 +110,7 @@ fn decode_completed_response(event: &Value) -> Result<ResponseEnvelope> {
     Ok(envelope)
 }
 
-pub(super) fn process_response(response: &ResponseEnvelope) -> Result<Vec<ToolCall>> {
+pub fn process_response(response: &ResponseEnvelope) -> Result<Vec<ToolCall>> {
     let output = output_items(response)?;
     print_messages(output);
     function_calls(output)
@@ -160,7 +160,7 @@ fn function_calls(output: &[ResponseItem]) -> Result<Vec<ToolCall>> {
         .collect()
 }
 
-pub(super) fn into_raw_output(response: ResponseEnvelope) -> Vec<Value> {
+pub fn into_raw_output(response: ResponseEnvelope) -> Vec<Value> {
     response.raw_output
 }
 

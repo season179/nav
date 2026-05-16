@@ -8,7 +8,7 @@ use serde_json::Value;
 // raw_output stores streamed output items so the next turn can replay the
 // model's function_call items alongside our function_call_output items.
 #[derive(Debug, Deserialize)]
-pub(crate) struct ResponseEnvelope {
+pub struct ResponseEnvelope {
     pub(super) output: Option<Vec<ResponseItem>>,
     // Filled by decode_completed_response/ResponseCollector, never by serde.
     #[serde(default, skip)]

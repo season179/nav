@@ -1,10 +1,10 @@
 {
-  "name": "nav-app",
-  "productName": "nav-app",
+  "name": "nav-desktop",
+  "productName": "nav-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop UI shell for nav-app.",
-  "main": "nav-app/main.js",
+  "description": "Desktop UI shell for nav-desktop.",
+  "main": "nav-desktop/main.js",
   "scripts": {
     "start": "electron ."
   },

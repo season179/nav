@@ -1,11 +1,6 @@
-mod auth;
-mod cli;
-mod responses;
-mod tools;
-
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use cli::Args;
+use nav_core::{auth, cli::Args, responses, tools};
 use serde_json::json;
 use std::env;
 

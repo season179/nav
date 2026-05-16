@@ -51,7 +51,7 @@ set `OPENAI_API_KEY` first.
 After installing:
 
 ```sh
-cargo install --path .
+cargo install --path crates/nav-cli
 nav "List the files and explain what this project does"
 nav --model gpt-5.5 "Add tests for the CLI argument parser"
 nav --transport sse "Use the HTTP/SSE transport instead"
@@ -60,7 +60,7 @@ nav --auth api-key "Use OPENAI_API_KEY instead"
 
 ## Desktop UI
 
-`nav-app` is the early Electron desktop shell for `nav`. It is intentionally
+`nav-desktop` is the early Electron desktop shell for `nav`. It is intentionally
 small for now: a left sidebar, a main prompt area, and a persisted working-directory
 picker. If no workspace is selected, submitting from the prompt asks for one
 first, so the future Rust agent loop has an explicit filesystem boundary before
@@ -72,7 +72,7 @@ Install the UI dependencies once:
 bun install
 ```
 
-Start `nav-app`:
+Start `nav-desktop`:
 
 ```sh
 bun run start

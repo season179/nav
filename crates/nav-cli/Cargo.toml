@@ -1,0 +1,16 @@
+[package]
+name = "nav-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nav"
+path = "src/main.rs"
+
+[dependencies]
+nav-core = { path = "../nav-core" }
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

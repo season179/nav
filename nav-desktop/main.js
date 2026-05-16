@@ -3,7 +3,7 @@ const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 
-const APP_NAME = "nav-app";
+const APP_NAME = "nav-desktop";
 const APP_ROOT = path.resolve(__dirname, "..");
 const CARGO_COMMAND = process.platform === "win32" ? "cargo.exe" : "cargo";
 
@@ -86,7 +86,7 @@ const runAgent = async (event, input) => {
   const manifestPath = path.join(APP_ROOT, "Cargo.toml");
   const child = spawn(
     CARGO_COMMAND,
-    ["run", "--quiet", "--manifest-path", manifestPath, "--", prompt],
+    ["run", "--quiet", "--manifest-path", manifestPath, "--bin", "nav", "--", prompt],
     {
       cwd: workspace.path,
       env: process.env,

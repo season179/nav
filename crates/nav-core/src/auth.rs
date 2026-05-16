@@ -6,7 +6,7 @@ use std::{env, fmt, fs, path::PathBuf};
 
 // the rest of the code only needs two facts after auth is resolved:
 // which HTTP/WebSocket endpoint to call and which bearer token to attach.
-pub(super) struct AuthConfig {
+pub struct AuthConfig {
     pub(super) http_base_url: String,
     pub(super) websocket_url: String,
     pub(super) bearer: String,
@@ -36,7 +36,7 @@ struct CodexTokens {
     access_token: String,
 }
 
-pub(super) fn load_auth(args: &Args) -> Result<AuthConfig> {
+pub fn load_auth(args: &Args) -> Result<AuthConfig> {
     match args.auth {
         AuthMode::ApiKey => {
             // API-key mode uses the public OpenAI API endpoint.
@@ -81,7 +81,7 @@ pub(super) fn load_auth(args: &Args) -> Result<AuthConfig> {
     }
 }
 
-pub(super) fn default_headers(auth: &AuthConfig) -> Result<HeaderMap> {
+pub fn default_headers(auth: &AuthConfig) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,

@@ -74,7 +74,7 @@ pub(super) fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-pub(super) async fn run_tool(
+pub async fn run_tool(
     cwd: &Path,
     timeout_secs: u64,
     name: &str,
