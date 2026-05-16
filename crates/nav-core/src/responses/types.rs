@@ -10,9 +10,35 @@ use serde_json::Value;
 #[derive(Debug, Deserialize)]
 pub struct ResponseEnvelope {
     pub(super) output: Option<Vec<ResponseItem>>,
+    #[serde(default)]
+    pub(super) usage: Option<RawUsage>,
     // Filled by decode_completed_response/ResponseCollector, never by serde.
     #[serde(default, skip)]
     pub(super) raw_output: Vec<Value>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(super) struct RawUsage {
+    #[serde(default)]
+    pub(super) input_tokens: Option<u64>,
+    #[serde(default)]
+    pub(super) output_tokens: Option<u64>,
+    #[serde(default)]
+    pub(super) input_tokens_details: Option<InputTokensDetails>,
+    #[serde(default)]
+    pub(super) output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(super) struct InputTokensDetails {
+    #[serde(default)]
+    pub(super) cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(super) struct OutputTokensDetails {
+    #[serde(default)]
+    pub(super) reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,12 +93,10 @@ mod tests {
         let json = r#"{"type":"message","content":[{"type":"text","text":"hi"}]}"#;
         let item: ResponseItem = serde_json::from_str(json).unwrap();
         match &item {
-            ResponseItem::Message { content } => {
-                match &content.as_ref().unwrap()[0] {
-                    MessagePart::Text { text } => assert_eq!(text, "hi"),
-                    other => panic!("expected Text, got {other:?}"),
-                }
-            }
+            ResponseItem::Message { content } => match &content.as_ref().unwrap()[0] {
+                MessagePart::Text { text } => assert_eq!(text, "hi"),
+                other => panic!("expected Text, got {other:?}"),
+            },
             other => panic!("expected Message, got {other:?}"),
         }
     }
@@ -137,5 +161,26 @@ mod tests {
         let json = r#"{}"#;
         let env: ResponseEnvelope = serde_json::from_str(json).unwrap();
         assert!(env.output.is_none());
+    }
+
+    #[test]
+    fn deserialize_envelope_with_usage() {
+        let json = r#"{
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "input_tokens_details": {"cached_tokens": 20},
+                "output_tokens_details": {"reasoning_tokens": 10}
+            }
+        }"#;
+        let env: ResponseEnvelope = serde_json::from_str(json).unwrap();
+        let usage = env.usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(50));
+        assert_eq!(usage.input_tokens_details.unwrap().cached_tokens, Some(20));
+        assert_eq!(
+            usage.output_tokens_details.unwrap().reasoning_tokens,
+            Some(10)
+        );
     }
 }

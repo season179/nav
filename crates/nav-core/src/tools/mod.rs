@@ -74,12 +74,7 @@ pub(super) fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-pub async fn run_tool(
-    cwd: &Path,
-    timeout_secs: u64,
-    name: &str,
-    input: Value,
-) -> Result<String> {
+pub async fn run_tool(cwd: &Path, timeout_secs: u64, name: &str, input: Value) -> Result<String> {
     // central dispatch keeps the trust boundary obvious. The model asks;
     // this Rust match decides exactly which local capability is allowed.
     match name {
@@ -128,7 +123,13 @@ mod tests {
             .iter()
             .filter_map(|d| d.get("name").and_then(Value::as_str))
             .collect();
-        for expected in ["read_file", "list_files", "bash", "edit_file", "code_search"] {
+        for expected in [
+            "read_file",
+            "list_files",
+            "bash",
+            "edit_file",
+            "code_search",
+        ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
     }
@@ -221,13 +222,19 @@ mod tests {
     fn string_arg_rejects_missing_field() {
         let input = json!({"path": "foo.rs"});
         let err = string_arg(&input, "command").unwrap_err();
-        assert!(err.to_string().contains("missing string input field `command`"));
+        assert!(
+            err.to_string()
+                .contains("missing string input field `command`")
+        );
     }
 
     #[test]
     fn string_arg_rejects_non_string_field() {
         let input = json!({"path": 42});
         let err = string_arg(&input, "path").unwrap_err();
-        assert!(err.to_string().contains("missing string input field `path`"));
+        assert!(
+            err.to_string()
+                .contains("missing string input field `path`")
+        );
     }
 }

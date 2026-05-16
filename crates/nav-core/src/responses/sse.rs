@@ -1,19 +1,31 @@
-use super::{ResponseCollector, types::ResponseEnvelope};
 use crate::auth::AuthConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::str;
+use tokio::sync::mpsc::UnboundedSender;
 
-pub(super) async fn create_response_sse(
+pub(super) async fn stream_sse(
     client: &reqwest::Client,
     auth: &AuthConfig,
     mut body: Value,
-) -> Result<ResponseEnvelope> {
+    tx: UnboundedSender<Result<Value>>,
+) {
     // SSE is the older path. It remains useful because it is plain HTTP
     // and shows why the WebSocket transport is a latency optimization.
     body["stream"] = json!(true);
 
+    if let Err(err) = drive_sse(client, auth, body, &tx).await {
+        let _ = tx.send(Err(err));
+    }
+}
+
+async fn drive_sse(
+    client: &reqwest::Client,
+    auth: &AuthConfig,
+    body: Value,
+    tx: &UnboundedSender<Result<Value>>,
+) -> Result<()> {
     let response = client
         .post(format!("{}/responses", auth.http_base_url))
         .json(&body)
@@ -27,13 +39,8 @@ pub(super) async fn create_response_sse(
         bail!("Responses API returned {status}: {error_body}");
     }
 
-    decode_sse_response(response).await
-}
-
-async fn decode_sse_response(response: reqwest::Response) -> Result<ResponseEnvelope> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
-    let mut collector = ResponseCollector::default();
 
     // SSE arrives as arbitrary byte chunks, not neat JSON objects. We keep
     // a byte buffer so UTF-8 split across chunks is decoded only after a full frame arrives.
@@ -57,14 +64,20 @@ async fn decode_sse_response(response: reqwest::Response) -> Result<ResponseEnve
 
                 let event: Value =
                     serde_json::from_str(data).context("failed to decode SSE event")?;
-                if collector.push_event(&event, "Responses API stream")? {
-                    return collector.finish("Responses API stream");
+                let is_terminal = matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("response.completed") | Some("error")
+                );
+                if tx.send(Ok(event)).is_err() {
+                    return Ok(());
+                }
+                if is_terminal {
+                    return Ok(());
                 }
             }
         }
     }
-
-    collector.finish("Responses API stream")
+    Ok(())
 }
 
 fn frame_boundary(buffer: &[u8]) -> Option<usize> {

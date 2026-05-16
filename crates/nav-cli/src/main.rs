@@ -1,15 +1,15 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use nav_core::{auth, cli::Args, responses, tools};
-use serde_json::json;
+use nav_core::{AgentEvent, OpenAiTransport, auth, cli::Args, run_agent};
 use std::env;
+use tokio::sync::mpsc;
 
 // Reading guide:
-// 1. Start at main() to see the whole agent loop in one place.
-// 2. Read auth.rs to understand how ChatGPT/Codex subscription auth works.
-// 3. Read responses/mod.rs to see how WebSocket and SSE transports share one body.
-// 4. Read tools/mod.rs, then the tool functions in tools/fs.rs and tools/shell.rs.
-// 5. Come back to responses::process_response() to see how model tool requests become Rust calls.
+// 1. Start at main() to see the CLI wire the event stream to stdout/stderr.
+// 2. Read nav_core::agent::run_agent to see the agent loop itself.
+// 3. Read auth.rs to understand how ChatGPT/Codex subscription auth works.
+// 4. Read responses/mod.rs to see how WebSocket and SSE transports share one body.
+// 5. Read tools/mod.rs, then the tool functions in tools/fs.rs and tools/shell.rs.
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,48 +22,47 @@ async fn main() -> Result<()> {
         .context("failed to read current directory")?
         .canonicalize()
         .context("failed to canonicalize current directory")?;
-    let auth = auth::load_auth(&args)?;
+    let auth_config = auth::load_auth(&args)?;
     let client = reqwest::Client::builder()
-        .default_headers(auth::default_headers(&auth)?)
+        .default_headers(auth::default_headers(&auth_config)?)
         .build()
         .context("failed to build HTTP client")?;
 
-    // Responses input is a transcript. The first item is the user prompt;
-    // later turns append model tool-call items and local tool results.
-    let mut input = vec![json!({
-        "type": "message",
-        "role": "user",
-        "content": args.prompt.join(" ")
-    })];
+    let transport = OpenAiTransport::new(client, auth_config, args.transport);
+    let prompt = args.prompt.join(" ");
 
-    // this is the entire "agent" idea: ask the model, run any tools it
-    // requested, append the tool results, then ask again until it answers.
-    for _ in 0..args.max_turns {
-        let response = responses::create_response(&client, &auth, &args, &cwd, &input).await?;
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-        let calls = responses::process_response(&response)?;
-        if calls.is_empty() {
-            return Ok(());
-        }
+    // Render events as they arrive so streaming behavior survives the refactor.
+    // The agent task drives run_agent; the main task drains the event stream so
+    // the channel is read concurrently with model/tool execution.
+    let agent = tokio::spawn(async move { run_agent(&transport, &args, &cwd, &prompt, tx).await });
 
-        // with stateless store=false calls, the API does not remember the
-        // previous function_call. We include it again so the matching
-        // function_call_output has context and the call_id is valid.
-        input.extend(responses::into_raw_output(response));
-        for call in calls {
-            eprintln!("tool: {}({})", call.name, call.arguments);
-            let result =
-                tools::run_tool(&cwd, args.bash_timeout_secs, &call.name, call.arguments).await;
-            input.push(json!({
-                "type": "function_call_output",
-                "call_id": call.call_id,
-                "output": match result {
-                    Ok(value) => value,
-                    Err(err) => format!("tool error: {err:#}"),
-                }
-            }));
-        }
+    while let Some(event) = rx.recv().await {
+        render_event(&event);
     }
 
-    bail!("stopped after {} tool turns", args.max_turns)
+    agent.await.context("agent task panicked")??;
+
+    Ok(())
+}
+
+/// Mirrors the pre-refactor CLI output: tool-call notifications go to stderr,
+/// assistant text goes to stdout. Other events stay silent so an existing
+/// transcript is byte-for-byte unchanged.
+fn render_event(event: &AgentEvent) {
+    match event {
+        AgentEvent::ToolCallStarted {
+            name, arguments, ..
+        } => {
+            eprintln!("tool: {name}({arguments})");
+        }
+        AgentEvent::AssistantMessageDone { text } => {
+            println!("{text}");
+        }
+        AgentEvent::AssistantMessageDelta { .. }
+        | AgentEvent::ToolCallOutput { .. }
+        | AgentEvent::TurnComplete { .. }
+        | AgentEvent::Error { .. } => {}
+    }
 }

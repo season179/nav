@@ -2,15 +2,21 @@ mod sse;
 pub mod types;
 mod websocket;
 
+use crate::agent::{ResponsesTransport, TurnUsage};
 use crate::{
     auth::AuthConfig,
     cli::{Args, Transport},
     tools::tool_definitions,
 };
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{Stream, stream};
 use serde_json::{Value, json};
+use std::future::Future;
 use std::path::Path;
-use types::{MessagePart, ResponseEnvelope, ResponseItem};
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use types::{MessagePart, RawUsage, ResponseEnvelope, ResponseItem};
 
 #[derive(Debug)]
 pub struct ToolCall {
@@ -19,21 +25,11 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-pub async fn create_response(
-    client: &reqwest::Client,
-    auth: &AuthConfig,
-    args: &Args,
-    cwd: &Path,
-    input: &[Value],
-) -> Result<ResponseEnvelope> {
-    let body = response_body(args, cwd, input);
-    match args.transport {
-        Transport::Websocket => websocket::create_response_websocket(auth, body).await,
-        Transport::Sse => sse::create_response_sse(client, auth, body).await,
-    }
-}
-
-fn response_body(args: &Args, cwd: &Path, input: &[Value]) -> Value {
+/// Builds the JSON body for a `Responses` API create request.
+///
+/// Exposed at crate level so the agent loop and tests can share it with the
+/// transport implementations without duplicating the schema.
+pub(crate) fn response_body(args: &Args, cwd: &Path, input: &[Value]) -> Value {
     // tools are just JSON descriptions. The model decides whether to emit
     // a function_call item; Rust remains responsible for actually doing work.
     json!({
@@ -50,15 +46,70 @@ fn response_body(args: &Args, cwd: &Path, input: &[Value]) -> Value {
     })
 }
 
+/// Real `Responses` transport backed by the existing WebSocket and SSE code.
+///
+/// The agent loop holds this as a `dyn ResponsesTransport` so a stub transport
+/// can be swapped in for tests without touching the network.
+pub struct OpenAiTransport {
+    client: reqwest::Client,
+    auth: Arc<AuthConfig>,
+    transport: Transport,
+}
+
+impl OpenAiTransport {
+    pub fn new(client: reqwest::Client, auth: AuthConfig, transport: Transport) -> Self {
+        Self {
+            client,
+            auth: Arc::new(auth),
+            transport,
+        }
+    }
+}
+
+impl ResponsesTransport for OpenAiTransport {
+    fn create<'a>(
+        &'a self,
+        body: Value,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Pin<Box<dyn Stream<Item = Result<Value>> + Send>>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        let client = self.client.clone();
+        let auth = self.auth.clone();
+        let transport = self.transport;
+        Box::pin(async move {
+            let (tx, rx) = mpsc::unbounded_channel::<Result<Value>>();
+            tokio::spawn(async move {
+                match transport {
+                    Transport::Websocket => {
+                        websocket::stream_websocket(auth.as_ref(), body, tx).await;
+                    }
+                    Transport::Sse => {
+                        sse::stream_sse(&client, auth.as_ref(), body, tx).await;
+                    }
+                }
+            });
+            let stream = stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            let boxed: Pin<Box<dyn Stream<Item = Result<Value>> + Send>> = Box::pin(stream);
+            Ok(boxed)
+        })
+    }
+}
+
 #[derive(Default)]
-struct ResponseCollector {
+pub(crate) struct ResponseCollector {
     completed: Option<ResponseEnvelope>,
     output: Vec<ResponseItem>,
     raw_output: Vec<Value>,
 }
 
 impl ResponseCollector {
-    fn push_event(&mut self, event: &Value, source: &str) -> Result<bool> {
+    pub(crate) fn push_event(&mut self, event: &Value, source: &str) -> Result<bool> {
         match event.get("type").and_then(Value::as_str) {
             Some("error") => bail!("{source} returned error: {event}"),
             Some("response.completed") => {
@@ -81,7 +132,7 @@ impl ResponseCollector {
         Ok(false)
     }
 
-    fn finish(self, source: &str) -> Result<ResponseEnvelope> {
+    pub(crate) fn finish(self, source: &str) -> Result<ResponseEnvelope> {
         let mut completed = self
             .completed
             .with_context(|| format!("{source} ended without response.completed"))?;
@@ -160,8 +211,46 @@ fn function_calls(output: &[ResponseItem]) -> Result<Vec<ToolCall>> {
         .collect()
 }
 
+/// Convenience wrapper used by the agent loop. Skips the stdout side-effect of
+/// `process_response` so events stay the single source of truth for output.
+pub(crate) fn function_calls_from(response: &ResponseEnvelope) -> Result<Vec<ToolCall>> {
+    let output = output_items(response)?;
+    function_calls(output)
+}
+
 pub fn into_raw_output(response: ResponseEnvelope) -> Vec<Value> {
     response.raw_output
+}
+
+/// Normalizes the OpenAI Responses `usage` object into [`TurnUsage`].
+///
+/// Maps `input_tokens` → `tokens_input`,
+/// `output_tokens` → `tokens_output`,
+/// `input_tokens_details.cached_tokens` → `tokens_input_cached`,
+/// `output_tokens_details.reasoning_tokens` → `tokens_reasoning`.
+/// Any missing field defaults to 0.
+pub(crate) fn turn_usage_from(response: &ResponseEnvelope) -> TurnUsage {
+    let Some(usage) = response.usage.as_ref() else {
+        return TurnUsage::default();
+    };
+    usage_from_raw(usage)
+}
+
+fn usage_from_raw(usage: &RawUsage) -> TurnUsage {
+    TurnUsage {
+        tokens_input: usage.input_tokens.unwrap_or(0),
+        tokens_output: usage.output_tokens.unwrap_or(0),
+        tokens_input_cached: usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0),
+        tokens_reasoning: usage
+            .output_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens)
+            .unwrap_or(0),
+    }
 }
 
 fn output_items(response: &ResponseEnvelope) -> Result<&[ResponseItem]> {
@@ -299,6 +388,7 @@ mod tests {
                 name: "bash".into(),
                 arguments: r#"{"command":"ls"}"#.into(),
             }]),
+            usage: None,
             raw_output: vec![],
         };
         let calls = process_response(&response).unwrap();
@@ -315,6 +405,7 @@ mod tests {
                     text: "done".into(),
                 }]),
             }]),
+            usage: None,
             raw_output: vec![],
         };
         let calls = process_response(&response).unwrap();
@@ -325,6 +416,7 @@ mod tests {
     fn process_response_errors_on_no_output() {
         let response = ResponseEnvelope {
             output: None,
+            usage: None,
             raw_output: vec![],
         };
         let err = process_response(&response).unwrap_err();
@@ -337,6 +429,7 @@ mod tests {
     fn into_raw_output_returns_raw_items() {
         let response = ResponseEnvelope {
             output: Some(vec![]),
+            usage: None,
             raw_output: vec![json!({"type": "function_call", "call_id": "c1"})],
         };
         let raw = into_raw_output(response);
@@ -379,6 +472,56 @@ mod tests {
         let event = json!({"type": "response.completed"});
         let err = decode_completed_response(&event).unwrap_err();
         assert!(err.to_string().contains("no response"));
+    }
+
+    // ── turn_usage_from ───────────────────────────────────────────
+
+    #[test]
+    fn turn_usage_from_returns_default_when_missing() {
+        let response = ResponseEnvelope {
+            output: None,
+            usage: None,
+            raw_output: vec![],
+        };
+        let usage = turn_usage_from(&response);
+        assert_eq!(usage, TurnUsage::default());
+    }
+
+    #[test]
+    fn turn_usage_from_maps_all_fields() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "input_tokens_details": {"cached_tokens": 20},
+                    "output_tokens_details": {"reasoning_tokens": 10}
+                }
+            }
+        });
+        let envelope = decode_completed_response(&event).unwrap();
+        let usage = turn_usage_from(&envelope);
+        assert_eq!(usage.tokens_input, 100);
+        assert_eq!(usage.tokens_output, 50);
+        assert_eq!(usage.tokens_input_cached, 20);
+        assert_eq!(usage.tokens_reasoning, 10);
+    }
+
+    #[test]
+    fn turn_usage_from_missing_subfields_default_to_zero() {
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {"input_tokens": 7}
+            }
+        });
+        let envelope = decode_completed_response(&event).unwrap();
+        let usage = turn_usage_from(&envelope);
+        assert_eq!(usage.tokens_input, 7);
+        assert_eq!(usage.tokens_output, 0);
+        assert_eq!(usage.tokens_input_cached, 0);
+        assert_eq!(usage.tokens_reasoning, 0);
     }
 
     // ── ResponseCollector ─────────────────────────────────────────
@@ -429,7 +572,10 @@ mod tests {
     fn collector_finish_errors_without_completed() {
         let collector = ResponseCollector::default();
         let err = collector.finish("test").unwrap_err();
-        assert!(err.to_string().contains("test ended without response.completed"));
+        assert!(
+            err.to_string()
+                .contains("test ended without response.completed")
+        );
     }
 
     #[test]

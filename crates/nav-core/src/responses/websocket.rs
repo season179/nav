@@ -1,8 +1,8 @@
-use super::{ResponseCollector, types::ResponseEnvelope};
 use crate::auth::AuthConfig;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -15,15 +15,26 @@ use tokio_tungstenite::{
     },
 };
 
-pub(super) async fn create_response_websocket(
+pub(super) async fn stream_websocket(
     auth: &AuthConfig,
     mut body: Value,
-) -> Result<ResponseEnvelope> {
+    tx: UnboundedSender<Result<Value>>,
+) {
     // WebSocket mode sends the same Responses create body as HTTP, wrapped in
     // an event envelope. One socket could carry multiple turns; this small CLI
     // opens one per turn to keep lifetime/reconnect rules easy to understand.
     body["type"] = json!("response.create");
 
+    if let Err(err) = drive_websocket(auth, body, &tx).await {
+        let _ = tx.send(Err(err));
+    }
+}
+
+async fn drive_websocket(
+    auth: &AuthConfig,
+    body: Value,
+    tx: &UnboundedSender<Result<Value>>,
+) -> Result<()> {
     let mut request = auth
         .websocket_url
         .as_str()
@@ -46,17 +57,6 @@ pub(super) async fn create_response_websocket(
         .await
         .context("failed to send response.create")?;
 
-    decode_websocket_response(&mut socket).await
-}
-
-async fn decode_websocket_response<S>(socket: &mut S) -> Result<ResponseEnvelope>
-where
-    S: futures_util::Stream<
-            Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
-        > + Unpin,
-{
-    let mut collector = ResponseCollector::default();
-
     while let Some(message) = socket.next().await {
         let message = message.context("failed to read Responses WebSocket event")?;
         let Message::Text(text) = message else {
@@ -65,10 +65,16 @@ where
 
         let event: Value =
             serde_json::from_str(&text).context("failed to decode WebSocket event")?;
-        if collector.push_event(&event, "Responses WebSocket")? {
+        let is_terminal = matches!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.completed") | Some("error")
+        );
+        if tx.send(Ok(event)).is_err() {
+            return Ok(());
+        }
+        if is_terminal {
             break;
         }
     }
-
-    collector.finish("Responses WebSocket")
+    Ok(())
 }
