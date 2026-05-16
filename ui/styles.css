@@ -187,6 +187,19 @@ button {
   padding: 0 34px 92px;
 }
 
+body.session-active .hero-compose {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  padding-top: 24px;
+  padding-bottom: 26px;
+}
+
+body.session-active h1 {
+  display: none;
+}
+
 h1 {
   margin: 0 0 42px;
   color: #eef4f2;
@@ -197,7 +210,66 @@ h1 {
   text-align: center;
 }
 
+.session-output {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 14px;
+  width: min(730px, 100%);
+  min-height: 0;
+  padding: 0 0 18px;
+  overflow: auto;
+}
+
+.session-output[hidden] {
+  display: none;
+}
+
+.session-message {
+  max-width: 100%;
+  color: #e9efed;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.session-message.user {
+  align-self: flex-end;
+  max-width: min(560px, 88%);
+  padding: 10px 13px;
+  border-radius: 16px;
+  background: #303231;
+}
+
+.session-message.agent {
+  align-self: stretch;
+}
+
+.session-message.log,
+.session-message.error,
+.session-message.status {
+  align-self: stretch;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-family:
+    "SFMono-Regular", Consolas, "Liberation Mono", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.session-message.error {
+  border-color: rgba(255, 119, 119, 0.24);
+  color: #ffb7b7;
+}
+
+.session-message.status {
+  color: #b8e5dd;
+}
+
 .composer {
+  flex: 0 0 auto;
   width: min(730px, 100%);
   min-height: 96px;
   border: 1px solid rgba(255, 255, 255, 0.04);

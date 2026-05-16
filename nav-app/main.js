@@ -1,10 +1,15 @@
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 
 const APP_NAME = "nav-app";
+const APP_ROOT = path.resolve(__dirname, "..");
+const CARGO_COMMAND = process.platform === "win32" ? "cargo.exe" : "cargo";
 
 app.setName(APP_NAME);
+
+const activeAgents = new Map();
 
 const workspaceStatePath = () =>
   path.join(app.getPath("userData"), "workspace.json");
@@ -55,6 +60,91 @@ const saveWorkspace = async (directoryPath) => {
   );
 };
 
+const sendAgentEvent = (webContents, payload) => {
+  if (!webContents.isDestroyed()) {
+    webContents.send("agent:event", payload);
+  }
+};
+
+const runAgent = async (event, input) => {
+  const prompt = typeof input?.prompt === "string" ? input.prompt.trim() : "";
+  if (!prompt) {
+    throw new Error("Prompt is required.");
+  }
+
+  const webContents = event.sender;
+  const webContentsId = webContents.id;
+  if (activeAgents.has(webContentsId)) {
+    throw new Error("Nav is already running in this window.");
+  }
+
+  const workspace = await readWorkspace();
+  if (!workspace) {
+    throw new Error("Select a working directory first.");
+  }
+
+  const manifestPath = path.join(APP_ROOT, "Cargo.toml");
+  const child = spawn(
+    CARGO_COMMAND,
+    ["run", "--quiet", "--manifest-path", manifestPath, "--", prompt],
+    {
+      cwd: workspace.path,
+      env: process.env,
+      windowsHide: true,
+    },
+  );
+
+  activeAgents.set(webContentsId, child);
+  sendAgentEvent(webContents, { type: "started", workspace });
+
+  return await new Promise((resolve) => {
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+
+    const settle = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      activeAgents.delete(webContentsId);
+      resolve(result);
+    };
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      sendAgentEvent(webContents, { type: "stdout", text: chunk });
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+      sendAgentEvent(webContents, { type: "stderr", text: chunk });
+    });
+
+    child.on("error", (error) => {
+      sendAgentEvent(webContents, {
+        type: "error",
+        message: error.message,
+      });
+      settle({ ok: false, error: error.message, stdout, stderr });
+    });
+
+    child.on("close", (exitCode, signal) => {
+      const ok = exitCode === 0;
+      sendAgentEvent(webContents, {
+        type: "done",
+        ok,
+        exitCode,
+        signal,
+      });
+      settle({ ok, exitCode, signal, stdout, stderr });
+    });
+  });
+};
+
 const createWindow = () => {
   const mainWindow = new BrowserWindow({
     width: 1120,
@@ -77,6 +167,7 @@ const createWindow = () => {
 
 app.whenReady().then(() => {
   ipcMain.handle("workspace:get", readWorkspace);
+  ipcMain.handle("agent:run", runAgent);
 
   ipcMain.handle("workspace:select", async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender);
@@ -108,6 +199,13 @@ app.whenReady().then(() => {
       createWindow();
     }
   });
+});
+
+app.on("before-quit", () => {
+  for (const child of activeAgents.values()) {
+    child.kill();
+  }
+  activeAgents.clear();
 });
 
 app.on("window-all-closed", () => {
