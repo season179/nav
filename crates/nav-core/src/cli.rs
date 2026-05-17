@@ -30,6 +30,24 @@ pub struct Args {
     #[arg(default_value_t = 20, long)]
     pub bash_timeout_secs: u64,
 
+    /// Resume a previously stored session by ULID. The transcript is rebuilt
+    /// from the on-disk event log and the prompt becomes the next user turn.
+    #[arg(long)]
+    pub resume: Option<String>,
+
+    /// List stored sessions and exit. Pair with `--cwd` to scope the listing.
+    #[arg(long)]
+    pub list_sessions: bool,
+
+    /// Filter `--list-sessions` to one working directory.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
+
+    /// Override the on-disk session database path. Defaults to the OS-specific
+    /// state/data directory joined with `nav/nav.db`.
+    #[arg(long)]
+    pub db_path: Option<PathBuf>,
+
     pub prompt: Vec<String>,
 }
 
@@ -46,6 +64,10 @@ impl Args {
             codex_home: Some(PathBuf::from("/nonexistent/test/codex/home")),
             max_turns: 4,
             bash_timeout_secs: 10,
+            resume: None,
+            list_sessions: false,
+            cwd: None,
+            db_path: None,
             prompt: vec!["test".into()],
         }
     }
