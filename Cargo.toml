@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nav-core", "crates/nav-cli"]
+members = ["crates/nav-core", "crates/nav-cli", "crates/nav-tui"]
 default-members = ["crates/nav-cli"]
 resolver = "2"
 
@@ -10,8 +10,11 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1.0.98"
 clap = { version = "4.5.38", features = ["derive"] }
+crossterm = "0.29"
 dirs = "5.0.1"
 futures-util = "0.3.32"
+insta = "1.47"
+ratatui = "0.30"
 reqwest = { version = "0.12.15", features = ["json", "stream", "rustls-tls"], default-features = false }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }

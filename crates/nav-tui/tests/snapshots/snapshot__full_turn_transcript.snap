@@ -1,0 +1,16 @@
+---
+source: crates/nav-tui/tests/snapshot.rs
+expression: rendered
+---
+user
+  list files in the repo
+
+tool call
+  tool · shell {"command":["ls"]}
+
+tool output
+  Cargo.toml
+  src
+
+assistant
+  Two entries: Cargo.toml and src.
