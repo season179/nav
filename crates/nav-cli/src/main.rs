@@ -4,72 +4,60 @@ use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, SessionBinding, SessionStore,
     SessionSummary, auth, cli::Args, rebuild_responses_input, run_agent,
 };
-use std::env;
+use std::{env, io::IsTerminal};
 use tokio::sync::mpsc;
-
-// Reading guide:
-// 1. Start at main() to see the CLI wire the event stream to stdout/stderr.
-// 2. Read nav_core::agent::run_agent to see the agent loop itself.
-// 3. Read auth.rs to understand how ChatGPT/Codex subscription auth works.
-// 4. Read responses/mod.rs to see how WebSocket and SSE transports share one body.
-// 5. Read tools/mod.rs, then the tool functions in tools/fs.rs and tools/shell.rs.
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
     if args.list_sessions {
         return list_sessions_command(&args);
     }
-
-    if args.prompt.is_empty() {
-        bail!("provide a prompt, for example: cargo run -- \"list the files\"");
+    if args.prompt.is_empty() && !should_use_tui(&args) {
+        bail!("provide a prompt");
     }
 
-    let cwd = env::current_dir()
-        .context("failed to read current directory")?
+    let cwd = env::current_dir()?
         .canonicalize()
         .context("failed to canonicalize current directory")?;
-
-    // Open the session store and (when --resume is given) rebuild the
-    // Responses transcript *before* touching auth, so a missing session
-    // is reported up front instead of after a network round-trip.
     let store = SessionStore::open(args.db_path.clone())?;
+
+    if should_use_tui(&args) {
+        let auth_config = auth::load_auth(&args)?;
+        let client = reqwest::Client::builder()
+            .default_headers(auth::default_headers(&auth_config)?)
+            .build()?;
+        let transport = OpenAiTransport::new(client, auth_config, args.transport);
+        return nav_tui::run(&transport, &args, &cwd, &store).await;
+    }
+
     let (session_id, initial_input) = match args.resume.as_deref() {
-        Some(id) => {
-            let events = store.load_session(id)?;
-            eprintln!(
-                "nav-core: resumed session {id} with {} prior events",
-                events.len()
-            );
-            let input = rebuild_responses_input(&events);
-            (id.to_string(), Some(input))
-        }
-        None => {
-            let id = store.create_session(&cwd, PROVIDER_OPENAI_RESPONSES, &args.model, None)?;
-            (id, None)
-        }
+        Some(id) => (
+            id.to_string(),
+            Some(rebuild_responses_input(&store.load_session(id)?)),
+        ),
+        None => (
+            store.create_session(
+                &cwd,
+                PROVIDER_OPENAI_RESPONSES,
+                &args.model,
+                Some("default"),
+            )?,
+            None,
+        ),
     };
 
     let auth_config = auth::load_auth(&args)?;
     let client = reqwest::Client::builder()
         .default_headers(auth::default_headers(&auth_config)?)
-        .build()
-        .context("failed to build HTTP client")?;
-
+        .build()?;
     let transport = OpenAiTransport::new(client, auth_config, args.transport);
     let prompt = args.prompt.join(" ");
-
     let binding = SessionBinding {
         store: &store,
         session_id,
     };
-
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-
-    // Drive run_agent and drain the event channel concurrently. tx is moved
-    // into run_agent; when run_agent returns, tx drops and the drainer's
-    // rx.recv() returns None, closing the loop.
     let agent = run_agent(
         &transport,
         &args,
@@ -81,35 +69,29 @@ async fn main() -> Result<()> {
     );
     let drainer = async {
         while let Some(event) = rx.recv().await {
-            render_event(&event);
+            render_event(&event, args.json_events);
         }
     };
     let (result, _) = tokio::join!(agent, drainer);
     result?;
-
     Ok(())
 }
 
-/// Mirrors the pre-refactor CLI output: tool-call notifications go to stderr,
-/// assistant text goes to stdout. Other events stay silent so an existing
-/// transcript is byte-for-byte unchanged.
-fn render_event(event: &AgentEvent) {
-    match event {
-        AgentEvent::ToolCallStarted {
-            name, arguments, ..
-        } => {
-            eprintln!("tool: {name}({arguments})");
-        }
-        AgentEvent::AssistantMessageDone { text } => {
-            println!("{text}");
-        }
-        AgentEvent::AssistantMessageDelta { .. }
-        | AgentEvent::ToolCallOutput { .. }
-        | AgentEvent::TurnComplete { .. }
-        | AgentEvent::Error { .. } => {}
+fn should_use_tui(args: &Args) -> bool {
+    std::io::stdout().is_terminal() && !args.json_events
+}
+fn render_event(event: &AgentEvent, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(event).unwrap_or_else(|_| "{}".into())
+        );
+        return;
+    }
+    if let AgentEvent::AssistantMessageDone { text } = event {
+        println!("{text}");
     }
 }
-
 fn list_sessions_command(args: &Args) -> Result<()> {
     let store = SessionStore::open(args.db_path.clone())?;
     let summaries = store.list_sessions(args.cwd.as_deref())?;
@@ -125,21 +107,18 @@ fn list_sessions_command(args: &Args) -> Result<()> {
             truncate(&summary.cwd, 40),
             truncate(&summary.model, 20),
             summary.tokens_input + summary.tokens_output,
-            format_cost(&summary),
+            format_cost(&summary)
         );
     }
     Ok(())
 }
-
 fn format_cost(summary: &SessionSummary) -> String {
     if summary.turns_with_reported_cost == 0 {
         "—".to_string()
     } else {
-        let dollars = summary.cost_micros_reported as f64 / 1_000_000.0;
-        format!("${dollars:.4}")
+        format!("${:.4}", summary.cost_micros_reported as f64 / 1_000_000.0)
     }
 }
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
