@@ -4,700 +4,1157 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>nav · A reader's tour</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..900,0..100;1,9..144,300..900,0..100&family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&family=JetBrains+Mono:wght@300..700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0f1115;
-    --panel: #161a21;
-    --panel-2: #1c212b;
-    --ink: #e6e8ec;
-    --muted: #99a1ad;
-    --line: #2a313d;
-    --accent: #7cc4ff;
-    --accent-2: #b6e3a7;
-    --warn: #f5c97b;
-    --danger: #f08a8a;
-    --gutter-user: #7cc4ff;
-    --gutter-asst: #b6e3a7;
-    --gutter-tool: #f5c97b;
-    --gutter-err:  #f08a8a;
-    --code-bg: #11141a;
+    --ink-deep: #0d0b08;
+    --ink: #14110d;
+    --paper: #1b1712;
+    --paper-2: #231d16;
+    --line: #2e2820;
+    --line-soft: #251f18;
+
+    --text: #ede4d3;
+    --text-dim: #c7bca6;
+    --text-mute: #8a8071;
+    --text-faint: #5a5247;
+
+    --gold: #d4a574;
+    --gold-bright: #ecc18a;
+    --rust: #c97b4d;
+    --sage: #94b08a;
+    --sage-bright: #b3cba9;
+    --warn: #e0a050;
+    --danger: #d97070;
+
+    --g-user: var(--gold-bright);
+    --g-asst: var(--sage-bright);
+    --g-tool: var(--warn);
+    --g-err:  var(--danger);
+
+    --display: "Fraunces", ui-serif, Georgia, serif;
+    --body: "Newsreader", ui-serif, Georgia, serif;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    --sidebar: 220px;
+    --margin-col: 280px;
+    --gutter: 56px;
+    --max: 1480px;
   }
   * { box-sizing: border-box; }
-  html, body {
-    margin: 0; padding: 0;
-    background: var(--bg); color: var(--ink);
-    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, Helvetica, Arial, sans-serif;
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--text);
+    font: 400 19.5px/1.65 var(--body);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    background-image:
+      radial-gradient(at 78% -8%, rgba(212,165,116,0.07), transparent 55%),
+      radial-gradient(at -8% 92%, rgba(148,176,138,0.05), transparent 55%);
+    background-attachment: fixed;
   }
-  main {
-    max-width: 920px;
+  ::selection { background: rgba(212,165,116,0.28); color: var(--text); }
+
+  /* ─── top bar ───────────────────────────────────────────── */
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    background: rgba(20,17,13,0.72);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .topbar-inner {
+    max-width: var(--max);
     margin: 0 auto;
-    padding: 48px 28px 96px;
+    padding: 14px 40px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 24px;
   }
-  header.hero {
-    border-left: 3px solid var(--accent);
-    padding: 6px 0 6px 18px;
-    margin-bottom: 28px;
+  .brand {
+    font-family: var(--display);
+    font-weight: 500;
+    font-size: 19px;
+    letter-spacing: -0.015em;
+    font-variation-settings: "SOFT" 70, "opsz" 24;
   }
-  header.hero .eyebrow {
-    color: var(--muted);
-    font-size: 12px;
-    letter-spacing: 0.12em;
+  .brand .dot { color: var(--gold); font-style: italic; }
+  .topbar-meta {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-mute);
+    letter-spacing: 0.08em;
     text-transform: uppercase;
   }
-  header.hero h1 {
-    margin: 6px 0 6px;
-    font-size: 30px;
-    font-weight: 700;
-    letter-spacing: -0.01em;
+  .topbar-meta .pulse {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--sage);
+    margin-right: 8px;
+    vertical-align: middle;
+    box-shadow: 0 0 0 0 rgba(148,176,138,0.5);
+    animation: pulse 2.4s infinite;
   }
-  header.hero p {
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(148,176,138,0.45); }
+    70%  { box-shadow: 0 0 0 8px rgba(148,176,138,0); }
+    100% { box-shadow: 0 0 0 0 rgba(148,176,138,0); }
+  }
+
+  /* ─── hero ──────────────────────────────────────────────── */
+  .hero {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 96px 40px 72px;
+    display: grid;
+    grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+    gap: 72px;
+    align-items: end;
+    position: relative;
+  }
+  .hero::after {
+    content: "";
+    position: absolute;
+    left: 40px; right: 40px; bottom: 24px;
+    height: 1px;
+    background: linear-gradient(90deg, var(--line) 0%, var(--line-soft) 40%, transparent 100%);
+  }
+  .hero .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin-bottom: 28px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .hero .eyebrow .rule {
+    height: 1px; width: 56px; background: var(--gold);
+  }
+  .hero h1 {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: clamp(48px, 7.2vw, 96px);
+    line-height: 0.95;
+    letter-spacing: -0.028em;
     margin: 0;
-    color: var(--muted);
-    max-width: 64ch;
+    font-variation-settings: "SOFT" 90, "opsz" 144;
   }
-  h2 {
-    margin: 56px 0 14px;
+  .hero h1 em {
+    font-style: italic;
+    font-weight: 300;
+    color: var(--gold);
+    font-variation-settings: "SOFT" 100, "opsz" 144;
+  }
+  .hero .lede {
+    font-family: var(--body);
     font-size: 22px;
-    font-weight: 700;
-    letter-spacing: -0.01em;
+    line-height: 1.55;
+    color: var(--text-dim);
+    margin: 0;
+    max-width: 50ch;
   }
-  h2 .num {
-    color: var(--muted);
-    font-weight: 500;
-    margin-right: 10px;
-    font-variant-numeric: tabular-nums;
+  .hero .lede code {
+    font-family: var(--mono);
+    font-size: 0.85em;
+    color: var(--gold-bright);
+    background: var(--paper);
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--line-soft);
   }
+  .hero .meta {
+    display: flex;
+    gap: 32px;
+    margin-top: 24px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.08em;
+    color: var(--text-mute);
+    text-transform: uppercase;
+  }
+  .hero .meta b { color: var(--text); font-weight: 500; }
+
+  /* ─── shell layout ──────────────────────────────────────── */
+  .shell {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 64px 40px 96px;
+    display: grid;
+    grid-template-columns: var(--sidebar) minmax(0, 1fr) var(--margin-col);
+    gap: var(--gutter);
+    align-items: start;
+  }
+
+  /* ─── TOC ───────────────────────────────────────────────── */
+  .toc {
+    position: sticky;
+    top: 80px;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.5;
+    max-height: calc(100vh - 100px);
+    overflow-y: auto;
+  }
+  .toc::-webkit-scrollbar { width: 4px; }
+  .toc::-webkit-scrollbar-thumb { background: var(--line); border-radius: 2px; }
+  .toc .title {
+    font-size: 10.5px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+    margin-bottom: 18px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .toc ol { list-style: none; padding: 0; margin: 0; counter-reset: toc; }
+  .toc li { counter-increment: toc; }
+  .toc a {
+    display: grid;
+    grid-template-columns: 28px 1fr;
+    gap: 6px;
+    padding: 7px 10px 7px 0;
+    color: var(--text-mute);
+    text-decoration: none;
+    border: none;
+    transition: color 0.15s, transform 0.2s;
+    position: relative;
+  }
+  .toc a::before {
+    content: counter(toc, decimal-leading-zero);
+    color: var(--text-faint);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+  }
+  .toc a:hover { color: var(--text); }
+  .toc a.active { color: var(--gold-bright); }
+  .toc a.active::before { color: var(--gold); }
+  .toc a.active::after {
+    content: "";
+    position: absolute;
+    left: -18px; top: 50%;
+    width: 6px; height: 6px;
+    background: var(--gold);
+    border-radius: 50%;
+    transform: translateY(-50%);
+    box-shadow: 0 0 12px rgba(212,165,116,0.6);
+  }
+
+  /* ─── body (content + margin subgrid) ───────────────────── */
+  .body {
+    grid-column: 2 / span 2;
+    display: grid;
+    grid-template-columns: subgrid;
+    column-gap: var(--gutter);
+    row-gap: 0;
+  }
+  .body > section {
+    grid-column: 1 / -1;
+    display: grid;
+    grid-template-columns: subgrid;
+    column-gap: var(--gutter);
+    row-gap: 0;
+    margin-bottom: 104px;
+    scroll-margin-top: 80px;
+  }
+  .body > section > * {
+    grid-column: 1;
+    min-width: 0;
+  }
+  .body > section > .mnote {
+    grid-column: 2;
+  }
+  .body > section > .full {
+    grid-column: 1 / -1;
+  }
+
+  /* ─── section headers ───────────────────────────────────── */
+  .section-head { margin-bottom: 36px; }
+  .section-head .num {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--gold);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .section-head .num .ord {
+    font-family: var(--display);
+    font-style: italic;
+    font-weight: 300;
+    font-size: 38px;
+    line-height: 1;
+    color: var(--gold);
+    letter-spacing: -0.02em;
+    font-variation-settings: "SOFT" 100, "opsz" 60;
+    text-transform: none;
+  }
+  .section-head .num .label {
+    border-top: 1px solid var(--gold);
+    padding-top: 6px;
+    padding-left: 2px;
+    flex: 1;
+  }
+  .section-head h2 {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: clamp(30px, 3.4vw, 44px);
+    line-height: 1.04;
+    letter-spacing: -0.022em;
+    margin: 0;
+    font-variation-settings: "SOFT" 80, "opsz" 60;
+    color: var(--text);
+  }
+  .section-head h2 em {
+    font-style: italic;
+    font-weight: 300;
+    color: var(--gold);
+  }
+
   h3 {
-    margin: 28px 0 10px;
-    font-size: 16px;
-    font-weight: 600;
-    color: var(--ink);
+    font-family: var(--display);
+    font-weight: 500;
+    font-size: 26px;
+    letter-spacing: -0.01em;
+    margin: 56px 0 14px;
+    color: var(--text);
+    font-variation-settings: "SOFT" 70, "opsz" 36;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
   }
-  p { margin: 0 0 12px; }
-  p + p { margin-top: 0; }
-  ul, ol { padding-left: 22px; margin: 8px 0 14px; }
-  li { margin: 4px 0; }
-  a { color: var(--accent); text-decoration: none; border-bottom: 1px dotted #4a6f93; }
-  a:hover { border-bottom-color: var(--accent); }
+  h3::before {
+    content: "";
+    width: 18px;
+    height: 1px;
+    background: var(--gold);
+    flex-shrink: 0;
+    transform: translateY(-6px);
+  }
+
+  p { margin: 0 0 20px; color: var(--text); }
+  p.lead { font-size: 21px; line-height: 1.6; color: var(--text); }
+  p.drop::first-letter {
+    font-family: var(--display);
+    font-weight: 400;
+    font-variation-settings: "SOFT" 100, "opsz" 144;
+    font-size: 4.6em;
+    line-height: 0.82;
+    float: left;
+    margin: 10px 14px -4px 0;
+    color: var(--gold);
+  }
+
+  ul, ol { margin: 0 0 18px; padding-left: 24px; }
+  li { margin: 6px 0; }
+  ul li::marker { color: var(--gold); }
+  ol li::marker { color: var(--gold); font-family: var(--mono); font-size: 0.86em; }
+
+  a {
+    color: var(--gold-bright);
+    text-decoration: none;
+    border-bottom: 1px solid rgba(212,165,116,0.3);
+    transition: border-color 0.15s, color 0.15s;
+  }
+  a:hover { border-bottom-color: var(--gold); color: var(--gold); }
+
   code, kbd {
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12.5px;
+    font-family: var(--mono);
+    font-size: 0.84em;
   }
   code {
-    background: var(--code-bg);
+    background: var(--paper);
     padding: 1px 6px;
-    border-radius: 4px;
-    color: #d6e3ee;
+    border-radius: 3px;
+    color: var(--gold-bright);
+    border: 1px solid var(--line-soft);
   }
   kbd {
-    background: #232934;
+    background: var(--paper-2);
     border: 1px solid var(--line);
     border-bottom-width: 2px;
-    padding: 1px 6px;
+    padding: 1px 7px;
     border-radius: 4px;
-    color: #d6e3ee;
+    color: var(--text);
+    font-size: 0.82em;
   }
+
+  blockquote {
+    border-left: 2px solid var(--gold);
+    margin: 28px 0;
+    padding: 4px 0 4px 26px;
+    font-family: var(--display);
+    font-style: italic;
+    font-size: 23px;
+    line-height: 1.45;
+    color: var(--text-dim);
+    font-weight: 300;
+    font-variation-settings: "SOFT" 90, "opsz" 36;
+  }
+  blockquote strong {
+    color: var(--text);
+    font-style: normal;
+    font-weight: 500;
+  }
+
+  /* ─── code blocks ───────────────────────────────────────── */
   pre {
-    background: var(--code-bg);
-    border: 1px solid var(--line);
+    background: var(--ink-deep);
+    border: 1px solid var(--line-soft);
     border-radius: 8px;
-    padding: 14px 16px;
+    padding: 22px 24px 20px;
     overflow-x: auto;
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12.5px;
+    font-family: var(--mono);
+    font-size: 14.5px;
+    line-height: 1.65;
+    color: #d4cab2;
+    margin: 28px 0;
+    position: relative;
+    font-weight: 400;
+  }
+  pre[data-lang]::before {
+    content: attr(data-lang);
+    position: absolute;
+    top: 10px; right: 16px;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+  }
+  pre .cmt { color: var(--text-mute); font-style: italic; }
+  pre .kw { color: var(--rust); }
+  pre .fn { color: var(--gold-bright); }
+  pre .str { color: var(--sage-bright); }
+  pre .num { color: var(--warn); }
+
+  /* ─── margin notes ──────────────────────────────────────── */
+  .mnote {
+    position: relative;
+    padding: 18px 20px;
+    font-size: 16px;
     line-height: 1.55;
-    color: #d6e3ee;
+    color: var(--text-dim);
+    margin-bottom: 24px;
+    border-left: 2px solid var(--gold);
+    background: linear-gradient(90deg, rgba(212,165,116,0.07), rgba(212,165,116,0.0) 85%);
+    border-radius: 0 6px 6px 0;
   }
-  pre.diagram {
-    color: #b9c4d1;
-    background: var(--panel);
-  }
-
-  /* Callouts */
-  .callout {
-    border-left: 3px solid var(--accent);
-    background: var(--panel);
-    padding: 12px 16px;
-    border-radius: 0 8px 8px 0;
-    margin: 14px 0;
-  }
-  .callout.why { border-color: var(--accent-2); }
-  .callout.why::before {
-    content: "Why this matters";
+  .mnote .label {
     display: block;
-    font-size: 11px;
-    letter-spacing: 0.12em;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.18em;
     text-transform: uppercase;
-    color: var(--accent-2);
-    margin-bottom: 4px;
+    color: var(--gold);
+    margin-bottom: 9px;
   }
-  .callout.read::before {
-    content: "Read this if you want to understand…";
-    display: block;
-    font-size: 11px;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--accent);
-    margin-bottom: 4px;
-  }
-  .callout.aside { border-color: var(--warn); }
-  .callout.aside::before {
-    content: "Aside";
-    display: block;
-    font-size: 11px;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--warn);
-    margin-bottom: 4px;
-  }
+  .mnote.why { border-color: var(--sage); background: linear-gradient(90deg, rgba(148,176,138,0.08), transparent 85%); }
+  .mnote.why .label { color: var(--sage-bright); }
+  .mnote.aside { border-color: var(--warn); background: linear-gradient(90deg, rgba(224,160,80,0.08), transparent 85%); }
+  .mnote.aside .label { color: var(--warn); }
+  .mnote code { font-size: 0.86em; background: rgba(212,165,116,0.08); }
 
-  /* TOC */
-  nav.toc {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 18px 22px;
-    margin: 20px 0 30px;
-  }
-  nav.toc .title {
-    font-size: 11px;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--muted);
-    margin-bottom: 8px;
-  }
-  nav.toc ol {
-    margin: 0;
-    padding-left: 24px;
-  }
-  nav.toc li { margin: 3px 0; }
-  nav.toc a { border-bottom: none; }
-
-  /* File tree */
+  /* ─── file tree ─────────────────────────────────────────── */
   .tree {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 14px 18px;
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 13px;
-    line-height: 1.7;
-    color: #c2cbd6;
-  }
-  .tree .dir { color: var(--accent); }
-  .tree .focus { color: #ffffff; font-weight: 600; }
-  .tree .dim { color: var(--muted); }
-  .tree .note { color: var(--muted); font-style: italic; }
-
-  /* Event-flow diagram */
-  .flow {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 10px;
-    margin: 14px 0;
-  }
-  .flow .row {
-    display: grid;
-    grid-template-columns: 160px 1fr;
-    gap: 14px;
-    align-items: start;
-    border: 1px solid var(--line);
-    background: var(--panel);
-    border-radius: 8px;
-    padding: 12px 14px;
-  }
-  .flow .who {
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12px;
-    color: var(--accent);
-    padding-top: 2px;
-  }
-  .flow .what { color: var(--ink); }
-  .flow .what em { color: var(--muted); font-style: normal; }
-
-  /* TUI mockup */
-  .tui {
-    background: #0b0d12;
-    border: 1px solid var(--line);
+    background: var(--paper);
+    border: 1px solid var(--line-soft);
     border-radius: 10px;
-    padding: 14px 16px;
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12.5px;
-    line-height: 1.6;
-    color: #d4dbe4;
-    margin: 14px 0;
+    padding: 32px 36px;
+    font-family: var(--mono);
+    font-size: 14.5px;
+    line-height: 1.95;
+    color: var(--text-dim);
+    overflow-x: auto;
+    position: relative;
+    margin: 32px 0;
   }
-  .tui .row { white-space: pre; }
-  .tui .glyph-user { color: var(--gutter-user); font-weight: 700; }
-  .tui .glyph-asst { color: var(--gutter-asst); font-weight: 700; }
-  .tui .glyph-tool { color: var(--gutter-tool); font-weight: 700; }
-  .tui .glyph-err  { color: var(--gutter-err);  font-weight: 700; }
-  .tui .muted { color: var(--muted); }
-  .tui .composer {
-    margin-top: 10px;
-    background: #131722;
-    border-radius: 6px;
-    padding: 8px 10px;
-    color: var(--muted);
+  .tree::before {
+    content: "FILE TREE";
+    position: absolute;
+    top: 14px; right: 20px;
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    color: var(--text-faint);
   }
-  .tui .composer .caret { color: #fff; }
-  .tui .status {
-    margin-top: 10px;
-    color: var(--muted);
-    font-size: 12px;
+  .tree .root { color: var(--gold-bright); font-weight: 600; }
+  .tree .dir { color: var(--gold); }
+  .tree .focus { color: var(--text); font-weight: 600; }
+  .tree .note { color: var(--text-mute); font-style: italic; padding-left: 14px; }
+  .tree .branch { color: var(--text-faint); }
+  .tree .group {
+    display: block;
+    margin: 14px 0 2px;
+    color: var(--text-faint);
+    font-size: 10.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
   }
-  .tui .status .ready { color: var(--accent-2); font-weight: 700; }
 
-  /* Two-column "fact + why" */
+  /* ─── pair cards ────────────────────────────────────────── */
   .pair {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 12px;
-    margin: 12px 0;
+    gap: 20px;
+    margin: 28px 0;
   }
-  @media (max-width: 760px) { .pair { grid-template-columns: 1fr; } }
-  .pair .card {
-    border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 12px 14px;
-    background: var(--panel);
-  }
-  .pair .card h4 {
-    margin: 0 0 6px;
-    font-size: 13px;
-    color: var(--muted);
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-  }
-  .pair .card p { margin: 0; }
+  .pair.three { grid-template-columns: repeat(3, 1fr); }
+  .pair.six { grid-template-columns: repeat(3, 1fr); }
 
-  footer {
-    margin-top: 64px;
-    padding-top: 18px;
-    border-top: 1px solid var(--line);
-    color: var(--muted);
+  .card {
+    background: var(--paper);
+    border: 1px solid var(--line-soft);
+    border-radius: 8px;
+    padding: 22px 24px 22px;
+    transition: border-color 0.2s, transform 0.2s, background 0.2s;
+    position: relative;
+  }
+  .card:hover {
+    border-color: var(--gold);
+    transform: translateY(-2px);
+    background: linear-gradient(180deg, var(--paper-2), var(--paper));
+  }
+  .card .ord {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--text-faint);
+    letter-spacing: 0.12em;
+    display: block;
+    margin-bottom: 6px;
+  }
+  .card h4 {
+    font-family: var(--mono);
+    font-weight: 500;
     font-size: 13px;
+    letter-spacing: 0.02em;
+    color: var(--gold);
+    margin: 0 0 8px;
+  }
+  .card.alt h4 { color: var(--sage-bright); }
+  .card.muted h4 { color: var(--text-mute); }
+  .card p {
+    margin: 0;
+    font-size: 17px;
+    line-height: 1.55;
+    color: var(--text-dim);
+  }
+  .card .name {
+    font-family: var(--display);
+    font-style: italic;
+    font-weight: 400;
+    font-size: 25px;
+    color: var(--text);
+    margin: 4px 0 10px;
+    letter-spacing: -0.01em;
+    font-variation-settings: "SOFT" 90, "opsz" 36;
+  }
+
+  /* ─── event-flow rows ───────────────────────────────────── */
+  .flow {
+    margin: 32px 0;
+    border-top: 1px solid var(--line-soft);
+  }
+  .flow .row {
+    display: grid;
+    grid-template-columns: 240px 1fr;
+    gap: 32px;
+    align-items: baseline;
+    border-bottom: 1px solid var(--line-soft);
+    padding: 18px 0 16px;
+    transition: background 0.15s;
+  }
+  .flow .row:hover { background: rgba(212,165,116,0.025); }
+  .flow .who {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--gold);
+    letter-spacing: 0.01em;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .flow .who::before {
+    content: "→";
+    color: var(--text-faint);
+    font-size: 14px;
+  }
+  .flow .what {
+    color: var(--text-dim);
+    font-size: 17.5px;
+    line-height: 1.55;
+  }
+  .flow .what em {
+    color: var(--text-mute);
+    font-style: italic;
+  }
+
+  /* ─── TUI mockup ────────────────────────────────────────── */
+  .tui {
+    background: #0a0907;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    margin: 32px 0;
+    overflow: hidden;
+    box-shadow:
+      0 30px 80px rgba(0,0,0,0.5),
+      0 0 0 1px rgba(212,165,116,0.05),
+      inset 0 1px 0 rgba(255,255,255,0.03);
+  }
+  .tui-bar {
+    background: var(--paper-2);
+    border-bottom: 1px solid var(--line);
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .tui-bar .light {
+    width: 11px; height: 11px;
+    border-radius: 50%;
+    background: #3a342c;
+  }
+  .tui-bar .light.r { background: #d97070; }
+  .tui-bar .light.y { background: #e0a050; }
+  .tui-bar .light.g { background: #94b08a; }
+  .tui-bar .title {
+    margin-left: 16px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-mute);
+    letter-spacing: 0.06em;
+  }
+  .tui-body {
+    font-family: var(--mono);
+    font-size: 14.5px;
+    line-height: 1.75;
+    color: #d4cab2;
+    padding: 22px 26px 18px;
+  }
+  .tui-body .row { white-space: pre; }
+  .tui-body .glyph-user { color: var(--g-user); font-weight: 700; }
+  .tui-body .glyph-asst { color: var(--g-asst); font-weight: 700; }
+  .tui-body .glyph-tool { color: var(--g-tool); font-weight: 700; }
+  .tui-body .glyph-err  { color: var(--g-err);  font-weight: 700; }
+  .tui-body .muted { color: var(--text-mute); }
+  .tui-body .dim   { color: var(--text-faint); }
+  .tui-body .composer {
+    margin-top: 16px;
+    background: #131009;
+    border: 1px solid var(--line-soft);
+    border-radius: 5px;
+    padding: 11px 14px;
+    color: var(--text-mute);
+  }
+  .tui-body .composer .caret { color: var(--gold); }
+  .tui-body .status {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line-soft);
+    color: var(--text-mute);
+    font-size: 13px;
+  }
+  .tui-body .status .ready { color: var(--sage-bright); font-weight: 700; }
+
+  /* ─── try cta block ─────────────────────────────────────── */
+  .try-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin: 32px 0;
+  }
+  .try-card {
+    background: var(--paper);
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    padding: 22px 24px 24px;
+  }
+  .try-card h4 {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin: 0 0 14px;
+  }
+  .try-card pre {
+    margin: 0 0 14px;
+    background: var(--ink-deep);
+    font-size: 14px;
+    padding: 14px 16px;
+  }
+  .try-card p {
+    margin: 0;
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--text-dim);
+  }
+
+  /* ─── footer ────────────────────────────────────────────── */
+  footer {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 56px 40px 96px;
+    border-top: 1px solid var(--line-soft);
+    color: var(--text-mute);
+    font-size: 16px;
+    display: grid;
+    grid-template-columns: var(--sidebar) minmax(0, 1fr) var(--margin-col);
+    gap: var(--gutter);
+  }
+  footer .col .label {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin-bottom: 12px;
+    display: block;
+  }
+  footer .col p { margin: 0 0 8px; color: var(--text-mute); }
+  footer .col.sig {
+    font-family: var(--display);
+    font-style: italic;
+    font-size: 19px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    font-variation-settings: "SOFT" 90, "opsz" 36;
+  }
+
+  /* ─── responsive ────────────────────────────────────────── */
+  @media (max-width: 1280px) {
+    :root { --margin-col: 0px; --gutter: 48px; }
+    .shell { grid-template-columns: var(--sidebar) minmax(0, 1fr); }
+    .body { grid-template-columns: minmax(0, 1fr); }
+    .body > section { grid-template-columns: minmax(0, 1fr); }
+    .body > section > .mnote { grid-column: 1; margin: 8px 0 24px; }
+    .body > section > .full { grid-column: 1; }
+    footer { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 900px) {
+    :root { --sidebar: 0; }
+    .shell { grid-template-columns: 1fr; padding: 32px 24px 64px; }
+    .toc { display: none; }
+    .topbar-inner { padding: 12px 24px; }
+    .hero { padding: 56px 24px 48px; grid-template-columns: 1fr; gap: 32px; }
+    .hero::after { left: 24px; right: 24px; }
+    footer { grid-template-columns: 1fr; padding: 40px 24px 64px; gap: 28px; }
+    .pair, .pair.three, .try-grid { grid-template-columns: 1fr; }
+    .flow .row { grid-template-columns: 1fr; gap: 4px; }
   }
 </style>
 </head>
 <body>
-<main>
 
-<header class="hero">
-  <div class="eyebrow">A reader's tour · nav</div>
-  <h1>How nav works, in plain English</h1>
-  <p>
-    <code>nav</code> is a small Rust coding agent. It reads files, edits them,
-    runs commands, and talks back to you in a terminal chat. This page walks
-    through the code one piece at a time, in the order that makes it easiest
-    to learn. No prior agent experience needed.
-  </p>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">nav<span class="dot">.</span></div>
+    <div class="topbar-meta"><span class="pulse"></span>A reader's tour · v2026.05</div>
+  </div>
 </header>
 
-<nav class="toc">
-  <div class="title">Table of contents</div>
-  <ol>
-    <li><a href="#big-picture">The big picture in 60 seconds</a></li>
-    <li><a href="#repo-map">Where the code lives</a></li>
-    <li><a href="#reading-order">A suggested reading order</a></li>
-    <li><a href="#loop">The agent loop, step by step</a></li>
-    <li><a href="#events">The <code>AgentEvent</code> bus</a></li>
-    <li><a href="#tools">The five tools the model can call</a></li>
-    <li><a href="#transport">Talking to the model (WebSocket &amp; SSE)</a></li>
-    <li><a href="#sessions">Sessions and resume</a></li>
-    <li><a href="#tui">The TUI: how the chat appears on screen</a></li>
-    <li><a href="#streaming">Streaming text without flicker</a></li>
-    <li><a href="#composer">The composer and slash popup</a></li>
-    <li><a href="#try">Try it yourself</a></li>
-  </ol>
-</nav>
-
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="big-picture"><span class="num">1</span>The big picture in 60 seconds</h2>
-
-<p>
-  A coding agent is a loop. The loop is simple enough to describe in one
-  paragraph: the user types a prompt; nav sends it to a model; the model
-  either replies with text or asks nav to run a tool; nav runs the tool,
-  hands the output back to the model, and asks again; repeat until the
-  model is done. That's it. The rest of the code exists to make that
-  loop pleasant to watch, easier to audit, and possible to resume tomorrow.
-</p>
-
-<div class="callout why">
-  Everything in <code>nav-core</code> is in service of that loop. Everything
-  in <code>nav-tui</code> is about painting it on screen. If a piece of
-  code doesn't fit one of those two roles, treat that as a smell.
-</div>
-
-<p>nav splits into two pieces you'll spend your time in:</p>
-
-<div class="pair">
-  <div class="card">
-    <h4>nav-core (the library)</h4>
-    <p>
-      The loop, the tools, the model transport, the session database.
-      No screen, no keyboard. Just produces a stream of
-      <code>AgentEvent</code>s that anyone can consume.
-    </p>
+<section class="hero">
+  <div>
+    <div class="eyebrow"><span class="rule"></span>Architecture · plain English edition</div>
+    <h1>How <em>nav</em> works,<br>one piece at a time.</h1>
   </div>
-  <div class="card">
-    <h4>nav-tui (the terminal UI)</h4>
-    <p>
-      Takes the event stream and renders the chat: messages above,
-      composer below, status bar at the bottom. Built on
-      <code>ratatui</code> + <code>crossterm</code>.
-    </p>
+  <div>
+    <p class="lede"><code>nav</code> is a small Rust coding agent. It reads files, edits them, runs commands, and talks back to you in a terminal chat. This page walks through the code in the order that makes it easiest to learn — no prior agent experience required.</p>
+    <div class="meta">
+      <span><b>12</b> &nbsp;chapters</span>
+      <span><b>~25 min</b> &nbsp;read</span>
+      <span><b>Rust</b> &nbsp;· ratatui</span>
+    </div>
   </div>
-</div>
+</section>
 
-<p>
-  A tiny binary <code>nav-cli</code> wires those two together. When stdout
-  is a terminal and <code>--json-events</code> is not set, it launches
-  the TUI. Otherwise — for example when you pass
-  <code>--json-events</code> or pipe stdout to a file — it emits raw
-  events as JSON, one per line.
-</p>
+<div class="shell">
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="repo-map"><span class="num">2</span>Where the code lives</h2>
+  <!-- ─── TOC ─────────────────────────────────────────── -->
+  <aside class="toc">
+    <div class="title">Contents</div>
+    <ol>
+      <li><a href="#big-picture">The big picture in 60 seconds</a></li>
+      <li><a href="#repo-map">Where the code lives</a></li>
+      <li><a href="#reading-order">A suggested reading order</a></li>
+      <li><a href="#loop">The agent loop, step by step</a></li>
+      <li><a href="#events">The AgentEvent bus</a></li>
+      <li><a href="#tools">The five tools the model can call</a></li>
+      <li><a href="#transport">Talking to the model</a></li>
+      <li><a href="#sessions">Sessions and resume</a></li>
+      <li><a href="#tui">The TUI: how chat appears on screen</a></li>
+      <li><a href="#streaming">Streaming text without flicker</a></li>
+      <li><a href="#composer">The composer and slash popup</a></li>
+      <li><a href="#try">Try it yourself</a></li>
+    </ol>
+  </aside>
 
-<div class="tree">
-<span class="dir">nav/</span>
-├── <span class="focus">crates/nav-core/</span>           <span class="note">— the loop, tools, transport, sessions</span>
-│   ├── src/<span class="focus">agent.rs</span>           <span class="note">— AgentEvent + run_agent model/tool loop</span>
-│   ├── src/<span class="focus">cli.rs</span>             <span class="note">— Args (clap), shared by every frontend</span>
-│   ├── src/<span class="focus">auth.rs</span>            <span class="note">— ChatGPT OAuth via ~/.codex/auth.json, or OPENAI_API_KEY</span>
-│   ├── src/responses/    <span class="note">— OpenAI Responses API client (WebSocket + SSE)</span>
-│   ├── src/tools/        <span class="note">— read_file, list_files, bash, edit_file, code_search</span>
-│   └── src/session/      <span class="note">— SQLite event log; powers --list-sessions / --resume</span>
+  <!-- ─── BODY (content + margin) ───────────────────── -->
+  <div class="body">
+
+    <!-- 01 ─────────────────────────────────────────── -->
+    <section id="big-picture">
+      <header class="section-head">
+        <div class="num"><span class="ord">01</span><span class="label">Overview</span></div>
+        <h2>The big picture in <em>sixty seconds</em>.</h2>
+      </header>
+
+      <p class="drop lead">A coding agent is a loop. Simple enough to describe in one paragraph: the user types a prompt; nav sends it to a model; the model either replies with text or asks nav to run a tool; nav runs the tool, hands the output back to the model, and asks again; repeat until the model is done. That's it. The rest of the code exists to make that loop pleasant to watch, easier to audit, and possible to resume tomorrow.</p>
+
+      <aside class="mnote why">
+        <span class="label">Why this matters</span>
+        Everything in <code>nav-core</code> is in service of that loop. Everything in <code>nav-tui</code> is about painting it on screen. If a piece of code doesn't fit one of those two roles, treat that as a smell.
+      </aside>
+
+      <p>nav splits into two pieces you'll spend your time in:</p>
+
+      <div class="full pair">
+        <div class="card">
+          <span class="ord">CORE</span>
+          <div class="name">nav-core</div>
+          <p>The loop, the tools, the model transport, the session database. No screen, no keyboard. Just produces a stream of <code>AgentEvent</code>s that anyone can consume.</p>
+        </div>
+        <div class="card alt">
+          <span class="ord">FRONTEND</span>
+          <div class="name">nav-tui</div>
+          <p>Takes the event stream and renders the chat: messages above, composer below, status bar at the bottom. Built on <code>ratatui</code> + <code>crossterm</code>.</p>
+        </div>
+      </div>
+
+      <p>A tiny binary <code>nav-cli</code> wires those two together. When stdout is a terminal and <code>--json-events</code> is not set, it launches the TUI. Otherwise — for example when you pass <code>--json-events</code> or pipe stdout to a file — it emits raw events as JSON, one per line.</p>
+    </section>
+
+    <!-- 02 ─────────────────────────────────────────── -->
+    <section id="repo-map">
+      <header class="section-head">
+        <div class="num"><span class="ord">02</span><span class="label">Repository map</span></div>
+        <h2>Where the code <em>lives</em>.</h2>
+      </header>
+
+      <p class="drop">The repo splits into three crates plus a couple of top-level docs. Read the focused files first; the rest are scaffolding.</p>
+
+      <aside class="mnote aside">
+        <span class="label">Aside · desktop</span>
+        <code>nav-desktop/</code> exists at the root but this tour skips it. It's an early Electron shell that spawns <code>cargo run --bin nav -- &lt;prompt&gt;</code> and streams stdout/stderr into the page. Because stdout is a pipe, nav emits NDJSON events — but the desktop renderer doesn't parse them into rich cells yet.
+      </aside>
+
+      <div class="full tree">
+<span class="root">nav/</span>
+<span class="group">— Library</span>
+├── <span class="focus">crates/nav-core/</span>           <span class="note">the loop, tools, transport, sessions</span>
+│   ├── src/<span class="focus">agent.rs</span>            <span class="note">AgentEvent + run_agent model/tool loop</span>
+│   ├── src/<span class="focus">cli.rs</span>              <span class="note">Args (clap), shared by every frontend</span>
+│   ├── src/<span class="focus">auth.rs</span>             <span class="note">ChatGPT OAuth via ~/.codex/auth.json, or OPENAI_API_KEY</span>
+│   ├── src/responses/     <span class="note">OpenAI Responses API client (WebSocket + SSE)</span>
+│   ├── src/tools/         <span class="note">read_file, list_files, bash, edit_file, code_search</span>
+│   └── src/session/       <span class="note">SQLite event log; powers --list-sessions / --resume</span>
 │
-├── <span class="focus">crates/nav-tui/</span>            <span class="note">— terminal chat UI</span>
-│   ├── src/lib.rs        <span class="note">— event loop: draw, read keys, spawn agent</span>
-│   ├── src/widget.rs     <span class="note">— ChatWidget: stack of history cells</span>
-│   ├── src/cells.rs      <span class="note">— chat cell types for user, assistant, tools, errors, welcome</span>
-│   ├── src/streaming.rs  <span class="note">— "stable vs tail" helper for live deltas</span>
-│   ├── src/status_bar.rs <span class="note">— model · cwd · branch · Ready/Working Ns</span>
-│   └── src/bottom_pane/  <span class="note">— Composer + SlashCommandPopup overlay</span>
+<span class="group">— Frontend</span>
+├── <span class="focus">crates/nav-tui/</span>             <span class="note">terminal chat UI</span>
+│   ├── src/lib.rs         <span class="note">event loop: draw, read keys, spawn agent</span>
+│   ├── src/widget.rs      <span class="note">ChatWidget: stack of history cells</span>
+│   ├── src/cells.rs       <span class="note">chat cell types for user, assistant, tools, errors, welcome</span>
+│   ├── src/streaming.rs   <span class="note">"stable vs tail" helper for live deltas</span>
+│   ├── src/status_bar.rs  <span class="note">model · cwd · branch · Ready/Working Ns</span>
+│   └── src/bottom_pane/   <span class="note">Composer + SlashCommandPopup overlay</span>
 │
-├── <span class="focus">crates/nav-cli/</span>            <span class="note">— the binary; ~120 lines, wires core+tui</span>
-│
-├── CONTEXT.md            <span class="note">— product direction (read this second)</span>
-├── README.md             <span class="note">— how to install &amp; use</span>
-└── ARCHITECTURE.html     <span class="note">— this page</span>
-</div>
+<span class="group">— Binary &amp; docs</span>
+├── <span class="focus">crates/nav-cli/</span>             <span class="note">the binary; ~120 lines, wires core+tui</span>
+├── CONTEXT.md             <span class="note">product direction (read this second)</span>
+├── README.md              <span class="note">how to install &amp; use</span>
+└── ARCHITECTURE.html      <span class="note">this page</span></div>
+    </section>
 
-<div class="callout aside">
-  <code>nav-desktop/</code> exists at the repo root but this tour mostly
-  skips it. It's an early Electron shell: today it spawns
-  <code>cargo run --quiet --manifest-path Cargo.toml --bin nav -- &lt;prompt&gt;</code>
-  and streams stdout/stderr into the page. Because stdout is a pipe,
-  <code>nav</code> emits NDJSON <code>AgentEvent</code>s, but the desktop
-  renderer does not parse them into rich chat cells yet.
-</div>
+    <!-- 03 ─────────────────────────────────────────── -->
+    <section id="reading-order">
+      <header class="section-head">
+        <div class="num"><span class="ord">03</span><span class="label">Reading order</span></div>
+        <h2>A suggested <em>reading order</em>.</h2>
+      </header>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="reading-order"><span class="num">3</span>A suggested reading order</h2>
+      <p class="drop">Open the files in this order. Each one will make more sense than if you'd opened them alphabetically.</p>
 
-<p>
-  Open the files in this order. Each one will make more sense than if
-  you'd opened them alphabetically.
-</p>
+      <aside class="mnote">
+        <span class="label">Tip</span>
+        If you only have ten minutes, read items 1, 2, and 3. That's the entire control flow of a turn.
+      </aside>
 
-<ol>
-  <li><code>crates/nav-core/src/cli.rs</code> — the CLI options. Tiny. Shows what knobs exist.</li>
-  <li><code>crates/nav-core/src/agent.rs</code> — start at <code>run_agent</code>. The whole loop is one function.</li>
-  <li><code>crates/nav-core/src/tools/mod.rs</code> — the dispatcher; five tools, one match arm each.</li>
-  <li><code>crates/nav-core/src/tools/fs.rs</code> — the workspace sandbox. Notice <code>resolve_inside</code>.</li>
-  <li><code>crates/nav-core/src/responses/mod.rs</code> — turns the loop's request into a Responses API body.</li>
-  <li><code>crates/nav-core/src/session/mod.rs</code> — SQLite event log behind <code>--resume</code>.</li>
-  <li><code>crates/nav-tui/src/lib.rs</code> — the TUI's <code>run()</code>: <code>tokio::select!</code> over keys + agent events.</li>
-  <li><code>crates/nav-tui/src/widget.rs</code> + <code>cells.rs</code> — how each event becomes a row on screen.</li>
-  <li><code>crates/nav-tui/src/streaming.rs</code> — the helper meant to make live streamed text not flicker.</li>
-  <li><code>crates/nav-tui/src/bottom_pane/</code> — composer and slash-command overlay.</li>
-</ol>
+      <ol>
+        <li><code>crates/nav-core/src/cli.rs</code> — the CLI options. Tiny. Shows what knobs exist.</li>
+        <li><code>crates/nav-core/src/agent.rs</code> — start at <code>run_agent</code>. The whole loop is one function.</li>
+        <li><code>crates/nav-core/src/tools/mod.rs</code> — the dispatcher; five tools, one match arm each.</li>
+        <li><code>crates/nav-core/src/tools/fs.rs</code> — the workspace sandbox. Notice <code>resolve_inside</code>.</li>
+        <li><code>crates/nav-core/src/responses/mod.rs</code> — turns the loop's request into a Responses API body.</li>
+        <li><code>crates/nav-core/src/session/mod.rs</code> — SQLite event log behind <code>--resume</code>.</li>
+        <li><code>crates/nav-tui/src/lib.rs</code> — the TUI's <code>run()</code>: <code>tokio::select!</code> over keys + agent events.</li>
+        <li><code>crates/nav-tui/src/widget.rs</code> + <code>cells.rs</code> — how each event becomes a row on screen.</li>
+        <li><code>crates/nav-tui/src/streaming.rs</code> — the helper meant to make live streamed text not flicker.</li>
+        <li><code>crates/nav-tui/src/bottom_pane/</code> — composer and slash-command overlay.</li>
+      </ol>
+    </section>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="loop"><span class="num">4</span>The agent loop, step by step</h2>
+    <!-- 04 ─────────────────────────────────────────── -->
+    <section id="loop">
+      <header class="section-head">
+        <div class="num"><span class="ord">04</span><span class="label">The agent loop</span></div>
+        <h2>The agent loop, <em>step by step</em>.</h2>
+      </header>
 
-<div class="callout read">
-  <code>crates/nav-core/src/agent.rs</code> — function <code>run_agent</code>.
-</div>
+      <aside class="mnote">
+        <span class="label">Read this for</span>
+        <code>crates/nav-core/src/agent.rs</code> — function <code>run_agent</code>.
+      </aside>
 
-<p>
-  Open <code>agent.rs</code> and find <code>run_agent</code>. Strip out
-  the bookkeeping and you're left with this skeleton:
-</p>
+      <p class="drop">Open <code>agent.rs</code> and find <code>run_agent</code>. Strip out the bookkeeping and you're left with this skeleton:</p>
 
-<pre>for _ in 0..args.max_turns {
-    // 1. ask the model
-    let body = responses::response_body(args, cwd, &amp;input);
-    let mut stream = transport.create(body).await?;
+      <pre data-lang="rust">for _ in 0..args.max_turns {
+    <span class="cmt">// 1. ask the model</span>
+    <span class="kw">let</span> body = responses::response_body(args, cwd, &input);
+    <span class="kw">let mut</span> stream = transport.create(body).<span class="kw">await</span>?;
 
-    // 2. read its streamed reply; emit deltas as we see them
-    while let Some(event) = stream.next().await {
-        emit_stream_events(&amp;event, &amp;events, session);
-        if collector.push_event(&amp;event, "Responses API")? { break; }
+    <span class="cmt">// 2. read its streamed reply; emit deltas as we see them</span>
+    <span class="kw">while let</span> Some(event) = stream.next().<span class="kw">await</span> {
+        emit_stream_events(&event, &events, session);
+        <span class="kw">if</span> collector.push_event(&event, <span class="str">"Responses API"</span>)? { <span class="kw">break</span>; }
     }
-    let envelope = collector.finish("Responses API")?;
+    <span class="kw">let</span> envelope = collector.finish(<span class="str">"Responses API"</span>)?;
 
-    // 3. did the model ask to run any tools?
-    let calls = responses::function_calls_from(&amp;envelope)?;
-    if calls.is_empty() {
-        finalize_turn(...);   // model is done — we're out
-        return Ok(());
+    <span class="cmt">// 3. did the model ask to run any tools?</span>
+    <span class="kw">let</span> calls = responses::function_calls_from(&envelope)?;
+    <span class="kw">if</span> calls.is_empty() {
+        finalize_turn(...);   <span class="cmt">// model is done — we're out</span>
+        <span class="kw">return</span> <span class="fn">Ok</span>(());
     }
 
-    // 4. run each tool, append the model's call + our output to `input`
-    for call in calls {
-        emit(ToolCallStarted { call_id, name, arguments });
-        let (text, is_error) = tools::run_tool(...).await;
+    <span class="cmt">// 4. run each tool, append the model's call + our output to `input`</span>
+    <span class="kw">for</span> call <span class="kw">in</span> calls {
+        emit(<span class="fn">ToolCallStarted</span> { call_id, name, arguments });
+        <span class="kw">let</span> (text, is_error) = tools::run_tool(...).<span class="kw">await</span>;
         input.push(function_call_output);
-        emit(ToolCallOutput { call_id, output: text, is_error });
+        emit(<span class="fn">ToolCallOutput</span> { call_id, output: text, is_error });
     }
 
-    finalize_turn(...);  // loop and ask again
-}
-</pre>
+    finalize_turn(...);  <span class="cmt">// loop and ask again</span>
+}</pre>
 
-<p>
-  One "turn" = one model call + zero-or-more tool calls. The function
-  exits as soon as the model returns a turn without any tool calls.
-  <code>max_turns</code> exists as a guardrail so a runaway model can't
-  burn forever.
-</p>
+      <p>One "turn" = one model call + zero-or-more tool calls. The function exits as soon as the model returns a turn without any tool calls. <code>max_turns</code> exists as a guardrail so a runaway model can't burn forever.</p>
 
-<div class="callout why">
-  The model does not call local code directly. It asks for a tool in
-  JSON; <code>tools::run_tool</code> dispatches by name; and Rust decides
-  what actually runs. The file/search/edit tools enforce workspace path
-  checks. <code>bash</code> is deliberately broader: it runs
-  <code>sh -c</code> in the workspace with a timeout and captured output,
-  but it is not a filesystem sandbox.
-</div>
+      <aside class="mnote why">
+        <span class="label">Why this matters</span>
+        The model does not call local code directly. It asks for a tool in JSON; <code>tools::run_tool</code> dispatches by name; and Rust decides what actually runs. The file/search/edit tools enforce workspace path checks. <code>bash</code> is deliberately broader — it runs <code>sh -c</code> in the workspace with a timeout and captured output, but it is <em>not</em> a filesystem sandbox.
+      </aside>
+    </section>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="events"><span class="num">5</span>The <code>AgentEvent</code> bus</h2>
+    <!-- 05 ─────────────────────────────────────────── -->
+    <section id="events">
+      <header class="section-head">
+        <div class="num"><span class="ord">05</span><span class="label">Event bus</span></div>
+        <h2>The <em>AgentEvent</em> bus.</h2>
+      </header>
 
-<div class="callout read">
-  <code>crates/nav-core/src/agent.rs</code> — <code>enum AgentEvent</code>.
-</div>
+      <aside class="mnote">
+        <span class="label">Read this for</span>
+        <code>crates/nav-core/src/agent.rs</code> — <code>enum AgentEvent</code>.
+      </aside>
 
-<p>
-  Instead of <code>println!</code>-ing as it goes, the loop emits one
-  <code>AgentEvent</code> per observable step. Every frontend — TUI,
-  NDJSON pipe, future Slack bot — reads the same six variants:
-</p>
+      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every frontend — TUI, NDJSON pipe, future Slack bot — reads the same six variants:</p>
 
-<div class="flow">
-  <div class="row">
-    <div class="who">AssistantMessageDelta</div>
-    <div class="what">A chunk of streaming text the model is still typing. <em>Transient — paint it, but don't save it.</em></div>
-  </div>
-  <div class="row">
-    <div class="who">AssistantMessageDone</div>
-    <div class="what">The full final text for one assistant message. <em>The durable record.</em></div>
-  </div>
-  <div class="row">
-    <div class="who">ToolCallStarted</div>
-    <div class="what">"I'm about to run <code>bash</code> with these arguments." Fires before the tool actually runs.</div>
-  </div>
-  <div class="row">
-    <div class="who">ToolCallOutput</div>
-    <div class="what">The tool's result text. For <code>bash</code>, that includes status, stdout, and stderr. <code>is_error</code> lets the UI colour failures red.</div>
-  </div>
-  <div class="row">
-    <div class="who">TurnComplete</div>
-    <div class="what">End of one model turn, with token usage. The TUI clears the spinner here.</div>
-  </div>
-  <div class="row">
-    <div class="who">Error</div>
-    <div class="what">Something failed, or the UI needs to show a problem. Errors produced by the agent loop end that run.</div>
-  </div>
-</div>
+      <div class="full flow">
+        <div class="row">
+          <div class="who">AssistantMessageDelta</div>
+          <div class="what">A chunk of streaming text the model is still typing. <em>Transient — paint it, but don't save it.</em></div>
+        </div>
+        <div class="row">
+          <div class="who">AssistantMessageDone</div>
+          <div class="what">The full final text for one assistant message. <em>The durable record.</em></div>
+        </div>
+        <div class="row">
+          <div class="who">ToolCallStarted</div>
+          <div class="what">"I'm about to run <code>bash</code> with these arguments." Fires before the tool actually runs.</div>
+        </div>
+        <div class="row">
+          <div class="who">ToolCallOutput</div>
+          <div class="what">The tool's result text. For <code>bash</code>, that includes status, stdout, and stderr. <code>is_error</code> lets the UI colour failures red.</div>
+        </div>
+        <div class="row">
+          <div class="who">TurnComplete</div>
+          <div class="what">End of one model turn, with token usage. The TUI clears the spinner here.</div>
+        </div>
+        <div class="row">
+          <div class="who">Error</div>
+          <div class="what">Something failed, or the UI needs to show a problem. Errors produced by the agent loop end that run.</div>
+        </div>
+      </div>
 
-<p>
-  Two flavours: <em>durable</em> events (everything except
-  <code>AssistantMessageDelta</code>) are written to the SQLite log;
-  the delta is paint-only and never persisted. That distinction is
-  encoded in one method, <code>AgentEvent::is_durable</code>.
-</p>
+      <p>Two flavours: <em>durable</em> events (everything except <code>AssistantMessageDelta</code>) are written to the SQLite log; the delta is paint-only and never persisted. That distinction is encoded in one method, <code>AgentEvent::is_durable</code>.</p>
 
-<div class="callout why">
-  Splitting "live render chunk" from "official record" means
-  <code>--resume</code> can replay the conversation from durable
-  events alone, even though you saw it stream in real time the first
-  time around. No special-case code, no second log.
-</div>
+      <aside class="mnote why">
+        <span class="label">Why this matters</span>
+        Splitting "live render chunk" from "official record" means <code>--resume</code> can replay the conversation from durable events alone, even though you saw it stream in real time the first time around. No special-case code, no second log.
+      </aside>
+    </section>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="tools"><span class="num">6</span>The five tools the model can call</h2>
+    <!-- 06 ─────────────────────────────────────────── -->
+    <section id="tools">
+      <header class="section-head">
+        <div class="num"><span class="ord">06</span><span class="label">Tools</span></div>
+        <h2>The five tools the <em>model</em> can call.</h2>
+      </header>
 
-<div class="callout read">
-  <code>crates/nav-core/src/tools/</code> — <code>mod.rs</code>, <code>fs.rs</code>, <code>shell.rs</code>.
-</div>
+      <aside class="mnote">
+        <span class="label">Read this for</span>
+        <code>crates/nav-core/src/tools/</code> — <code>mod.rs</code>, <code>fs.rs</code>, <code>shell.rs</code>.
+      </aside>
 
-<p>
-  The model is told, in JSON-Schema form, that it has exactly five
-  functions to call. They are deliberately primitive — together they
-  cover "inspect, find, change, verify."
-</p>
+      <p class="drop">The model is told, in JSON-Schema form, that it has exactly five functions to call. They are deliberately primitive — together they cover <em>inspect, find, change, verify</em>.</p>
 
-<div class="pair">
-  <div class="card">
-    <h4>read_file</h4>
-    <p>Read one file. Relative paths only. Directories rejected.</p>
-  </div>
-  <div class="card">
-    <h4>list_files</h4>
-    <p>List a directory. Returns names sorted alphabetically; directories get a trailing <code>/</code>.</p>
-  </div>
-  <div class="card">
-    <h4>bash</h4>
-    <p>Run a shell command via <code>sh -c</code>, with a timeout, capturing stdout+stderr+exit.</p>
-  </div>
-  <div class="card">
-    <h4>edit_file</h4>
-    <p>If <code>old_str</code> is empty, <em>create</em> the file. Otherwise, replace exactly one occurrence of <code>old_str</code> with <code>new_str</code>. Two matches = error.</p>
-  </div>
-  <div class="card">
-    <h4>code_search</h4>
-    <p>Shell out to <code>rg</code> (ripgrep). Exit code 1 (no matches) is treated as success — that's not an error.</p>
-  </div>
-  <div class="card">
-    <h4>(That's all.)</h4>
-    <p>Notice what's <em>not</em> here: no <code>delete_file</code>, no <code>git_commit</code>, no <code>http_get</code>. Less surface = easier to reason about.</p>
-  </div>
-</div>
+      <div class="full pair three">
+        <div class="card">
+          <span class="ord">01 · INSPECT</span>
+          <h4>read_file</h4>
+          <p>Read one file. Relative paths only. Directories rejected.</p>
+        </div>
+        <div class="card">
+          <span class="ord">02 · INSPECT</span>
+          <h4>list_files</h4>
+          <p>List a directory. Returns names sorted alphabetically; directories get a trailing <code>/</code>.</p>
+        </div>
+        <div class="card">
+          <span class="ord">03 · VERIFY</span>
+          <h4>bash</h4>
+          <p>Run a shell command via <code>sh -c</code>, with a timeout, capturing stdout + stderr + exit.</p>
+        </div>
+        <div class="card">
+          <span class="ord">04 · CHANGE</span>
+          <h4>edit_file</h4>
+          <p>If <code>old_str</code> is empty, <em>create</em> the file. Otherwise replace exactly one occurrence of <code>old_str</code> with <code>new_str</code>. Two matches = error.</p>
+        </div>
+        <div class="card">
+          <span class="ord">05 · FIND</span>
+          <h4>code_search</h4>
+          <p>Shell out to <code>rg</code> (ripgrep). Exit code 1 (no matches) is treated as success — that's not an error.</p>
+        </div>
+        <div class="card muted">
+          <span class="ord">— · OMITTED</span>
+          <h4>(that's all)</h4>
+          <p>Notice what's <em>not</em> here: no <code>delete_file</code>, no <code>git_commit</code>, no <code>http_get</code>. Less surface = easier to reason about.</p>
+        </div>
+      </div>
 
-<h3>The workspace sandbox</h3>
+      <h3>The workspace sandbox</h3>
 
-<p>
-  Every path used by <code>read_file</code>, <code>list_files</code>,
-  <code>edit_file</code>, and <code>code_search</code> goes through
-  <code>resolve_inside</code> (or <code>resolve_create_path</code>, for
-  new files). These reject:
-</p>
-<ul>
-  <li>absolute paths (<code>/etc/passwd</code>)</li>
-  <li>parent traversal (<code>../escape.txt</code>)</li>
-  <li>symlinks that escape the workspace</li>
-  <li>(on create) any symlink anywhere in the new path</li>
-</ul>
+      <p>Every path used by <code>read_file</code>, <code>list_files</code>, <code>edit_file</code>, and <code>code_search</code> goes through <code>resolve_inside</code> (or <code>resolve_create_path</code>, for new files). These reject:</p>
 
-<div class="callout why">
-  The model is good at writing plausible-looking code, but it's also good
-  at writing plausible-looking <code>../../etc/passwd</code>. Path
-  resolution doesn't trust the model's claim that a path is "relative";
-  it <code>canonicalize()</code>s the resolved path and checks it still
-  starts with the workspace root. Treat <code>bash</code> separately:
-  it is a powerful escape hatch, not part of this path sandbox.
-</div>
+      <ul>
+        <li>absolute paths (<code>/etc/passwd</code>)</li>
+        <li>parent traversal (<code>../escape.txt</code>)</li>
+        <li>symlinks that escape the workspace</li>
+        <li>(on create) any symlink anywhere in the new path</li>
+      </ul>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="transport"><span class="num">7</span>Talking to the model</h2>
+      <aside class="mnote why">
+        <span class="label">Why this matters</span>
+        The model is good at writing plausible-looking code, but it's also good at writing plausible-looking <code>../../etc/passwd</code>. Path resolution doesn't trust the model's claim that a path is "relative"; it <code>canonicalize()</code>s the resolved path and checks it still starts with the workspace root. Treat <code>bash</code> separately: it is a powerful escape hatch, not part of this path sandbox.
+      </aside>
+    </section>
 
-<div class="callout read">
-  <code>crates/nav-core/src/responses/</code> — <code>mod.rs</code>,
-  <code>websocket.rs</code>, <code>sse.rs</code>, <code>types.rs</code>.
-</div>
+    <!-- 07 ─────────────────────────────────────────── -->
+    <section id="transport">
+      <header class="section-head">
+        <div class="num"><span class="ord">07</span><span class="label">Transport</span></div>
+        <h2>Talking to the <em>model</em>.</h2>
+      </header>
 
-<p>
-  The model lives behind OpenAI's <em>Responses</em> API. nav speaks to
-  it two ways:
-</p>
+      <aside class="mnote">
+        <span class="label">Read this for</span>
+        <code>crates/nav-core/src/responses/</code> — <code>mod.rs</code>, <code>websocket.rs</code>, <code>sse.rs</code>, <code>types.rs</code>.
+      </aside>
 
-<ul>
-  <li><strong>WebSocket</strong> (default) — one socket per turn, lower latency, cleaner framing.</li>
-  <li><strong>SSE</strong> (<code>--transport sse</code>) — plain HTTP with <code>text/event-stream</code>. Slower, but easier to debug because you can <code>curl</code> it.</li>
-</ul>
+      <p class="drop">The model lives behind OpenAI's <em>Responses</em> API. nav speaks to it two ways:</p>
 
-<p>
-  Both implementations boil down to the same shape: "send the request
-  body, then push every event you receive into an unbounded channel."
-  The agent loop reads from that channel as a <code>Stream</code> and
-  doesn't care which transport is producing it.
-</p>
+      <ul>
+        <li><strong>WebSocket</strong> (default) — one socket per turn, lower latency, cleaner framing.</li>
+        <li><strong>SSE</strong> (<code>--transport sse</code>) — plain HTTP with <code>text/event-stream</code>. Slower, but easier to debug because you can <code>curl</code> it.</li>
+      </ul>
 
-<p>
-  The interesting glue is the <code>ResponseCollector</code> in
-  <code>responses/mod.rs</code>. As stream events come in, it accumulates
-  output items and waits for the terminal <code>response.completed</code>
-  event. Then <code>finish</code> merges streamed items with whatever the
-  final envelope claimed, so the loop sees one consistent
-  <code>ResponseEnvelope</code> regardless of how the bytes arrived.
-</p>
+      <p>Both implementations boil down to the same shape: "send the request body, then push every event you receive into an unbounded channel." The agent loop reads from that channel as a <code>Stream</code> and doesn't care which transport is producing it.</p>
 
-<div class="callout why">
-  Why two transports? Because nav is partly an educational project.
-  WebSocket is what you want in production; SSE is what you want when
-  you're learning what a Responses event stream actually looks like
-  on the wire.
-</div>
+      <p>The interesting glue is the <code>ResponseCollector</code> in <code>responses/mod.rs</code>. As stream events come in, it accumulates output items and waits for the terminal <code>response.completed</code> event. Then <code>finish</code> merges streamed items with whatever the final envelope claimed, so the loop sees one consistent <code>ResponseEnvelope</code> regardless of how the bytes arrived.</p>
 
-<h3>Authentication, briefly</h3>
-<p>
-  <code>auth.rs</code> resolves to one of two backends:
-</p>
-<ul>
-  <li><strong>ChatGPT</strong> (default) — reads <code>~/.codex/auth.json</code>
-    (written by <code>codex login</code>) and uses the OAuth access
-    token against <code>chatgpt.com/backend-api/codex</code>.</li>
-  <li><strong>API key</strong> (<code>--auth api-key</code>) — uses
-    <code>OPENAI_API_KEY</code> against the public OpenAI endpoint.</li>
-</ul>
-<p>
-  After resolution, the transport code only sees the resolved endpoints
-  and a bearer token.
-</p>
+      <aside class="mnote why">
+        <span class="label">Why this matters</span>
+        Why two transports? Because nav is partly an educational project. WebSocket is what you want in production; SSE is what you want when you're learning what a Responses event stream actually looks like on the wire.
+      </aside>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="sessions"><span class="num">8</span>Sessions and resume</h2>
+      <h3>Authentication, briefly</h3>
 
-<div class="callout read">
-  <code>crates/nav-core/src/session/mod.rs</code>.
-</div>
+      <p><code>auth.rs</code> resolves to one of two backends:</p>
 
-<p>
-  Every run is persisted to a SQLite file (default
-  <code>~/Library/Application Support/nav/nav.db</code> on macOS).
-  Three main tables, plus a small <code>schema_version</code> table for
-  migrations:
-</p>
-<ul>
-  <li><code>session</code> — one row per run, with rollups (cwd, model, token totals).</li>
-  <li><code>event</code> — one row per durable <code>AgentEvent</code>, JSON-encoded, with a per-session sequence number.</li>
-  <li><code>turn</code> — one row per model turn, with usage + (optional) cost.</li>
-</ul>
+      <ul>
+        <li><strong>ChatGPT</strong> (default) — reads <code>~/.codex/auth.json</code> (written by <code>codex login</code>) and uses the OAuth access token against <code>chatgpt.com/backend-api/codex</code>.</li>
+        <li><strong>API key</strong> (<code>--auth api-key</code>) — uses <code>OPENAI_API_KEY</code> against the public OpenAI endpoint.</li>
+      </ul>
 
-<p>
-  <code>--list-sessions</code> reads <code>session</code> with a rollup
-  query. <code>--resume &lt;id&gt;</code> loads every event for that
-  session in order and hands them to <code>rebuild_responses_input</code>,
-  which translates each one back into the wire format the Responses API
-  expects for "here is the conversation so far."
-</p>
+      <p>After resolution, the transport code only sees the resolved endpoints and a bearer token.</p>
+    </section>
 
-<div class="callout why">
-  Notice <code>nav</code> never computes <em>cost</em> from
-  <code>tokens × pricing</code>. The response object this code parses
-  gives token usage, not a per-response dollar amount, so
-  <code>complete_turn</code> is called with <code>None</code>, each turn
-  records <code>cost_source = 'unreported'</code>, and the listing shows
-  <code>—</code>. The schema is ready for a provider or separate lookup
-  that reports real cost later, but nav refuses to fake the number.
-</div>
+    <!-- 08 ─────────────────────────────────────────── -->
+    <section id="sessions">
+      <header class="section-head">
+        <div class="num"><span class="ord">08</span><span class="label">Sessions</span></div>
+        <h2>Sessions and <em>resume</em>.</h2>
+      </header>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="tui"><span class="num">9</span>The TUI: how the chat appears on screen</h2>
+      <aside class="mnote">
+        <span class="label">Read this for</span>
+        <code>crates/nav-core/src/session/mod.rs</code>.
+      </aside>
 
-<div class="callout read">
-  <code>crates/nav-tui/src/lib.rs</code> — function <code>run</code>.
-</div>
+      <p class="drop">Every run is persisted to a SQLite file (default <code>~/Library/Application Support/nav/nav.db</code> on macOS). Three main tables, plus a small <code>schema_version</code> table for migrations:</p>
 
-<p>The TUI lays out three regions, top to bottom:</p>
+      <ul>
+        <li><code>session</code> — one row per run, with rollups (cwd, model, token totals).</li>
+        <li><code>event</code> — one row per durable <code>AgentEvent</code>, JSON-encoded, with a per-session sequence number.</li>
+        <li><code>turn</code> — one row per model turn, with usage + (optional) cost.</li>
+      </ul>
 
-<div class="tui">
+      <p><code>--list-sessions</code> reads <code>session</code> with a rollup query. <code>--resume &lt;id&gt;</code> loads every event for that session in order and hands them to <code>rebuild_responses_input</code>, which translates each one back into the wire format the Responses API expects for "here is the conversation so far."</p>
+
+      <aside class="mnote why">
+        <span class="label">Why this matters</span>
+        nav never computes <em>cost</em> from <code>tokens × pricing</code>. The response object this code parses gives token usage, not a per-response dollar amount, so <code>complete_turn</code> is called with <code>None</code>, each turn records <code>cost_source = 'unreported'</code>, and the listing shows <code>—</code>. The schema is ready for a provider or separate lookup that reports real cost later, but nav refuses to fake the number.
+      </aside>
+    </section>
+
+    <!-- 09 ─────────────────────────────────────────── -->
+    <section id="tui">
+      <header class="section-head">
+        <div class="num"><span class="ord">09</span><span class="label">Terminal UI</span></div>
+        <h2>The TUI: how chat <em>appears on screen</em>.</h2>
+      </header>
+
+      <aside class="mnote">
+        <span class="label">Read this for</span>
+        <code>crates/nav-tui/src/lib.rs</code> — function <code>run</code>.
+      </aside>
+
+      <p class="drop">The TUI lays out three regions, top to bottom: a scrolling history of cells at the top, a composer in the middle, and a one-line status bar at the bottom.</p>
+
+      <div class="full tui">
+        <div class="tui-bar">
+          <span class="light r"></span><span class="light y"></span><span class="light g"></span>
+          <span class="title">nav · ~/code/nav · session 01JFK7…</span>
+        </div>
+        <div class="tui-body">
 <div class="row"><span class="muted">  nav  ·  gpt-5.5  ·  ~/code/nav  ·  session 01JFK7…</span></div>
 <div class="row"><span class="muted">  Type a prompt to begin. Slash commands:</span></div>
 <div class="row"><span class="muted">    /quit      exit</span></div>
@@ -708,219 +1165,199 @@
 <div class="row"> </div>
 <div class="row"><span class="glyph-asst">•</span> Let me look around.</div>
 <div class="row"> </div>
-<div class="row"><span class="glyph-tool">•</span> list_files {"path":"."}</div>
+<div class="row"><span class="glyph-tool">•</span> list_files <span class="dim">{"path":"."}</span></div>
 <div class="row"><span class="muted">└ Cargo.toml, README.md, crates/, …</span></div>
 <div class="row"> </div>
 <div class="row"><span class="glyph-asst">•</span> It's a small Rust coding agent…</div>
 <div class="composer"><span class="caret">›</span> <span class="muted">Ask nav to do anything</span></div>
 <div class="status">  gpt-5.5  ·  ~/code/nav  ·  main  ·  <span class="ready">Ready</span></div>
-</div>
+        </div>
+      </div>
 
-<p>The three regions, in code terms:</p>
+      <p>The three regions, in code terms:</p>
 
-<ul>
-  <li><strong>Scrollback</strong> — <code>ChatWidget</code> in <code>widget.rs</code>. A
-    <code>Vec&lt;Box&lt;dyn HistoryCell&gt;&gt;</code> painted top to
-    bottom.</li>
-  <li><strong>Composer</strong> — <code>BottomPane</code> in
-    <code>bottom_pane/mod.rs</code>. Owns a <code>Composer</code> and an
-    optional overlay (currently just <code>SlashCommandPopup</code>).</li>
-  <li><strong>Status bar</strong> — <code>StatusBar</code> in
-    <code>status_bar.rs</code>. One row: model · cwd · branch ·
-    <em>Ready</em> or <em>Working 4s</em>.</li>
-</ul>
+      <ul>
+        <li><strong>Scrollback</strong> — <code>ChatWidget</code> in <code>widget.rs</code>. A <code>Vec&lt;Box&lt;dyn HistoryCell&gt;&gt;</code> painted top to bottom.</li>
+        <li><strong>Composer</strong> — <code>BottomPane</code> in <code>bottom_pane/mod.rs</code>. Owns a <code>Composer</code> and an optional overlay (currently just <code>SlashCommandPopup</code>).</li>
+        <li><strong>Status bar</strong> — <code>StatusBar</code> in <code>status_bar.rs</code>. One row: model · cwd · branch · <em>Ready</em> or <em>Working 4s</em>.</li>
+      </ul>
 
-<h3>The TUI's main loop</h3>
+      <h3>The TUI's main loop</h3>
 
-<p>
-  <code>run</code> in <code>nav-tui/src/lib.rs</code> is a single
-  <code>tokio::select!</code> over three sources:
-</p>
+      <p><code>run</code> in <code>nav-tui/src/lib.rs</code> is a single <code>tokio::select!</code> over three sources:</p>
 
-<pre>tokio::select! {
-    Some(ev) = agent_rx.recv() =&gt; chat.ingest(ev);   // model said something
-    Some(app) = app_rx.recv()  =&gt; …;                 // /quit, /clear, Submit
-    _ = sleep(80ms) =&gt; {                             // periodic redraw + key poll
+      <pre data-lang="rust">tokio::select! {
+    Some(ev) = agent_rx.recv() => chat.ingest(ev);   <span class="cmt">// model said something</span>
+    Some(app) = app_rx.recv()  => …;                 <span class="cmt">// /quit, /clear, Submit</span>
+    _ = sleep(80ms) => {                             <span class="cmt">// periodic redraw + key poll</span>
         spinner_tick += 1;
-        while event::poll(0)? { handle key … }
+        <span class="kw">while</span> event::poll(0)? { handle key … }
     }
-}
-</pre>
+}</pre>
 
-<p>
-  Every iteration draws the frame, then waits for the next thing to
-  happen. The 80ms tick advances the spinner and polls the keyboard;
-  the two channels deliver the things that should change what's on
-  screen. When the user hits Enter, we spawn the agent loop on a
-  background task and let its events flow back through
-  <code>agent_rx</code>.
-</p>
+      <p>Every iteration draws the frame, then waits for the next thing to happen. The 80 ms tick advances the spinner and polls the keyboard; the two channels deliver the things that should change what's on screen. When the user hits Enter, we spawn the agent loop on a background task and let its events flow back through <code>agent_rx</code>.</p>
 
-<div class="callout why">
-  Why the background task? Because <code>run_agent</code> is async and
-  spends most of its time waiting for the model. If the TUI awaited it
-  directly, the spinner would freeze and keystrokes would back up.
-  Spawning it means the draw loop stays responsive — the agent's
-  progress arrives as events on a channel, same as any other input.
-</div>
+      <aside class="mnote why">
+        <span class="label">Why this matters</span>
+        Why the background task? Because <code>run_agent</code> is async and spends most of its time waiting for the model. If the TUI awaited it directly, the spinner would freeze and keystrokes would back up. Spawning it means the draw loop stays responsive — the agent's progress arrives as events on a channel, same as any other input.
+      </aside>
 
-<h3>Translating events into cells</h3>
+      <h3>Translating events into cells</h3>
 
-<p>
-  <code>ChatWidget::ingest</code> in <code>widget.rs</code> is a small
-  <code>match</code> that maps each <code>AgentEvent</code> variant to a
-  concrete cell type in <code>cells.rs</code>:
-</p>
+      <p><code>ChatWidget::ingest</code> in <code>widget.rs</code> is a small <code>match</code> that maps each <code>AgentEvent</code> variant to a concrete cell type in <code>cells.rs</code>:</p>
 
-<div class="flow">
-  <div class="row"><div class="who">AssistantMessageDone</div><div class="what">→ <code>AssistantMessageCell</code>, gutter glyph <span class="glyph-asst">•</span>, green.</div></div>
-  <div class="row"><div class="who">ToolCallStarted</div><div class="what">→ <code>ToolCallCell</code>, gutter glyph <span class="glyph-tool">•</span>, yellow. Shows <code>name {json args}</code>.</div></div>
-  <div class="row"><div class="who">ToolCallOutput</div><div class="what">→ <code>ToolOutputCell</code>, gutter glyph <code>└</code>, dim grey (red if <code>is_error</code>).</div></div>
-  <div class="row"><div class="who">Error</div><div class="what">→ <code>ErrorCell</code>, red.</div></div>
-  <div class="row"><div class="who">User input (not an event)</div><div class="what">→ <code>UserMessageCell</code>, gutter glyph <span class="glyph-user">›</span>, bold cyan.</div></div>
-  <div class="row"><div class="who">AssistantMessageDelta / TurnComplete</div><div class="what">Ignored by the widget today. The final assistant text appears on <code>AssistantMessageDone</code>; <code>TurnComplete</code> flips the status bar.</div></div>
-</div>
+      <div class="full flow">
+        <div class="row"><div class="who">AssistantMessageDone</div><div class="what"><code>AssistantMessageCell</code>, gutter glyph <span style="color:var(--g-asst);font-weight:700">•</span>, green.</div></div>
+        <div class="row"><div class="who">ToolCallStarted</div><div class="what"><code>ToolCallCell</code>, gutter glyph <span style="color:var(--g-tool);font-weight:700">•</span>, yellow. Shows <code>name {json args}</code>.</div></div>
+        <div class="row"><div class="who">ToolCallOutput</div><div class="what"><code>ToolOutputCell</code>, gutter glyph <code>└</code>, dim grey (red if <code>is_error</code>).</div></div>
+        <div class="row"><div class="who">Error</div><div class="what"><code>ErrorCell</code>, red.</div></div>
+        <div class="row"><div class="who">User input (not an event)</div><div class="what"><code>UserMessageCell</code>, gutter glyph <span style="color:var(--g-user);font-weight:700">›</span>, bold cyan.</div></div>
+        <div class="row"><div class="who">AssistantMessageDelta / TurnComplete</div><div class="what">Ignored by the widget today. The final assistant text appears on <code>AssistantMessageDone</code>; <code>TurnComplete</code> flips the status bar.</div></div>
+      </div>
+    </section>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="streaming"><span class="num">10</span>Streaming text without flicker</h2>
+    <!-- 10 ─────────────────────────────────────────── -->
+    <section id="streaming">
+      <header class="section-head">
+        <div class="num"><span class="ord">10</span><span class="label">Streaming</span></div>
+        <h2>Streaming text <em>without flicker</em>.</h2>
+      </header>
 
-<div class="callout read">
-  <code>crates/nav-tui/src/streaming.rs</code>.
-</div>
+      <aside class="mnote">
+        <span class="label">Read this for</span>
+        <code>crates/nav-tui/src/streaming.rs</code>.
+      </aside>
 
-<p>
-  Models stream text. Important current-state note: <code>ChatWidget</code>
-  currently ignores <code>AssistantMessageDelta</code>, so the TUI shows
-  the final assistant message when <code>AssistantMessageDone</code>
-  arrives. <code>StreamController</code> is the helper that keeps live
-  text stable once those deltas are wired into a live assistant cell.
-</p>
+      <p class="drop">Models stream text. Important current-state note: <code>ChatWidget</code> currently ignores <code>AssistantMessageDelta</code>, so the TUI shows the final assistant message when <code>AssistantMessageDone</code> arrives. <code>StreamController</code> is the helper that keeps live text stable once those deltas are wired into a live assistant cell.</p>
 
-<p>
-  If a frontend feeds deltas into <code>AssistantMessageCell::streaming()</code>,
-  simply appending every delta and re-rendering the whole thing each frame
-  would be readable but jumpy: a half-written table row reflows as cells
-  widen, code fences appear before their closing backticks, and so on.
-</p>
+      <p>If a frontend feeds deltas into <code>AssistantMessageCell::streaming()</code>, simply appending every delta and re-rendering the whole thing each frame would be readable but jumpy: a half-written table row reflows as cells widen, code fences appear before their closing backticks, and so on.</p>
 
-<p>
-  <code>StreamController</code> solves that with one rule:
-</p>
+      <p><code>StreamController</code> solves that with one rule:</p>
 
-<blockquote>
-  Lines end up in one of two buckets. A line that ends with a real
-  newline <strong>and</strong> isn't inside an open markdown construct
-  (fenced code block, table) moves to <em>stable</em>. Everything else
-  stays in <em>tail</em>. Stable lines are rendered as-is and never
-  reflow. The tail re-renders every frame and absorbs the wobble.
-</blockquote>
+      <blockquote>
+        Lines end up in one of two buckets. A line that ends with a real newline <strong>and</strong> isn't inside an open markdown construct (fenced code block, table) moves to <em>stable</em>. Everything else stays in <em>tail</em>. Stable lines are rendered as-is and never reflow. The tail re-renders every frame and absorbs the wobble.
+      </blockquote>
 
-<p>
-  The partition is computed by scanning lines once and tracking a tiny
-  state machine: <code>Outside</code> → <code>Fence(`` ``` ``)</code> /
-  <code>Fence(~~~)</code> / <code>Table</code> → back to
-  <code>Outside</code>. When the model finishes, <code>finalize()</code>
-  flips a flag and the whole buffer becomes stable in one step.
-</p>
+      <p>The partition is computed by scanning lines once and tracking a tiny state machine: <code>Outside</code> → <code>Fence(```)</code> / <code>Fence(~~~)</code> / <code>Table</code> → back to <code>Outside</code>. When the model finishes, <code>finalize()</code> flips a flag and the whole buffer becomes stable in one step.</p>
 
-<div class="callout why">
-  This isn't a markdown <em>renderer</em>. It's just enough markdown
-  awareness to know "the line I'm looking at isn't safe to commit yet
-  because we're mid-table." The actual rendering is plain monospace —
-  the partition just keeps live text from jumping around.
-</div>
+      <aside class="mnote why">
+        <span class="label">Why this matters</span>
+        This isn't a markdown <em>renderer</em>. It's just enough markdown awareness to know "the line I'm looking at isn't safe to commit yet because we're mid-table." The actual rendering is plain monospace — the partition just keeps live text from jumping around.
+      </aside>
+    </section>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="composer"><span class="num">11</span>The composer and slash popup</h2>
+    <!-- 11 ─────────────────────────────────────────── -->
+    <section id="composer">
+      <header class="section-head">
+        <div class="num"><span class="ord">11</span><span class="label">Composer</span></div>
+        <h2>The composer and <em>slash popup</em>.</h2>
+      </header>
 
-<div class="callout read">
-  <code>crates/nav-tui/src/bottom_pane/composer.rs</code> and <code>slash_popup.rs</code>.
-</div>
+      <aside class="mnote">
+        <span class="label">Read this for</span>
+        <code>crates/nav-tui/src/bottom_pane/composer.rs</code> and <code>slash_popup.rs</code>.
+      </aside>
 
-<p>
-  The <code>Composer</code> is a small multi-line text editor with
-  bash-style key bindings:
-</p>
+      <p class="drop">The <code>Composer</code> is a small multi-line text editor with bash-style key bindings:</p>
 
-<ul>
-  <li><kbd>Enter</kbd> submits; <kbd>Shift+Enter</kbd> inserts a newline.</li>
-  <li><kbd>Ctrl+U</kbd> clears to the start of line. <kbd>Ctrl+W</kbd> deletes the previous word.</li>
-  <li><kbd>↑</kbd> / <kbd>↓</kbd> at the top/bottom row recall earlier prompts from this session.</li>
-  <li><kbd>Esc</kbd> dismisses overlays (and the slash popup when it's open).</li>
-</ul>
+      <ul>
+        <li><kbd>Enter</kbd> submits; <kbd>Shift+Enter</kbd> inserts a newline.</li>
+        <li><kbd>Ctrl+U</kbd> clears to the start of line. <kbd>Ctrl+W</kbd> deletes the previous word.</li>
+        <li><kbd>↑</kbd> / <kbd>↓</kbd> at the top/bottom row recall earlier prompts from this session.</li>
+        <li><kbd>Esc</kbd> dismisses overlays (and the slash popup when it's open).</li>
+      </ul>
 
-<h3>Overlays: who sees the key first</h3>
+      <h3>Overlays: who sees the key first</h3>
 
-<p>
-  The <code>BottomPane</code> can host an overlay on top of the
-  composer. Today there's exactly one (<code>SlashCommandPopup</code>),
-  but the routing is general:
-</p>
+      <p>The <code>BottomPane</code> can host an overlay on top of the composer. Today there's exactly one (<code>SlashCommandPopup</code>), but the routing is general:</p>
 
-<pre>fn handle_key(&amp;mut self, key) {
-    if let Some(view) = self.view.as_mut() {
-        match view.handle_key(key, &amp;mut self.composer) {
-            Handled   =&gt; { /* stop here */ }
-            Unhandled =&gt; { /* fall through */ }
+      <pre data-lang="rust"><span class="kw">fn</span> <span class="fn">handle_key</span>(&<span class="kw">mut self</span>, key) {
+    <span class="kw">if let</span> Some(view) = <span class="kw">self</span>.view.as_mut() {
+        <span class="kw">match</span> view.handle_key(key, &<span class="kw">mut self</span>.composer) {
+            <span class="fn">Handled</span>   => { <span class="cmt">/* stop here */</span> }
+            <span class="fn">Unhandled</span> => { <span class="cmt">/* fall through */</span> }
         }
     }
-    self.composer.handle_key(key)
-}
-</pre>
+    <span class="kw">self</span>.composer.handle_key(key)
+}</pre>
 
-<p>
-  The popup auto-opens when the buffer starts with <code>/</code> and
-  has one line, and auto-closes when that's no longer true. Today
-  <code>/quit</code> and <code>/clear</code> are the commands wired up
-  in <code>run()</code>. The popup also lists <code>/help</code>,
-  <code>/resume</code>, and <code>/sessions</code> as placeholders;
-  selecting them puts the text in the composer, but pressing Enter sends
-  them as a normal prompt until <code>run()</code> handles them.
-  <code>slash_popup_suppressed</code> remembers "the user just hit Esc
-  to dismiss me; don't pop back open on the next keystroke."
-</p>
+      <p>The popup auto-opens when the buffer starts with <code>/</code> and has one line, and auto-closes when that's no longer true. Today <code>/quit</code> and <code>/clear</code> are the commands wired up in <code>run()</code>. The popup also lists <code>/help</code>, <code>/resume</code>, and <code>/sessions</code> as placeholders; selecting them puts the text in the composer, but pressing Enter sends them as a normal prompt until <code>run()</code> handles them. <code>slash_popup_suppressed</code> remembers "the user just hit Esc to dismiss me; don't pop back open on the next keystroke."</p>
+    </section>
 
-<!-- ─────────────────────────────────────────────────────────────── -->
-<h2 id="try"><span class="num">12</span>Try it yourself</h2>
+    <!-- 12 ─────────────────────────────────────────── -->
+    <section id="try">
+      <header class="section-head">
+        <div class="num"><span class="ord">12</span><span class="label">Try it</span></div>
+        <h2>Try it <em>yourself</em>.</h2>
+      </header>
 
-<p>
-  The fastest way to confirm any of the above is to run it and watch.
-  Two prompts that exercise the main flow and the raw event stream:
-</p>
+      <p class="drop">The fastest way to confirm any of the above is to run it and watch. Two prompts that exercise the main flow and the raw event stream:</p>
 
-<pre>cd ~/code/your-project
-nav "list the files and read README.md"
-</pre>
+      <aside class="mnote">
+        <span class="label">End of tour</span>
+        If something on this page disagrees with the code, trust the code — and please send a patch.
+      </aside>
 
-<p>
-  A typical run shows <code>list_files</code> arrive as a
-  <code>ToolCallStarted</code> cell (yellow), its output as a
-  <code>ToolOutputCell</code> (grey, attached with <code>└</code>),
-  then <code>read_file</code>, then a final assistant message (green)
-  summarising what it found. Compare that against the six events in
-  section 5, but remember that not every run emits every variant, and
-  the current TUI does not display <code>AssistantMessageDelta</code>
-  chunks.
-</p>
+      <div class="full try-grid">
+        <div class="try-card">
+          <h4>① Watch it in the TUI</h4>
+          <pre data-lang="shell">cd ~/code/your-project
+nav "list the files and read README.md"</pre>
+          <p>A typical run shows <code>list_files</code> arrive as a <code>ToolCallStarted</code> cell (yellow), its output as a <code>ToolOutputCell</code> (grey, attached with <code>└</code>), then <code>read_file</code>, then a final assistant message (green) summarising what it found. Compare that against the six events in section 5.</p>
+        </div>
+        <div class="try-card">
+          <h4>② Read the raw event stream</h4>
+          <pre data-lang="shell">nav --json-events "explain this repo" \
+  &gt; events.ndjson</pre>
+          <p>Same kind of agent run, but the TUI is off. Each line of <code>events.ndjson</code> is one <code>AgentEvent</code> as JSON. This is the wire format the CLI exposes for non-Rust frontends — and a fantastic debugger when something looks wrong in the TUI.</p>
+        </div>
+      </div>
+    </section>
 
-<pre>nav --json-events "explain this repo" &gt; events.ndjson
-</pre>
-
-<p>
-  Same kind of agent run, but the TUI is off. Each line of
-  <code>events.ndjson</code> is one <code>AgentEvent</code> as JSON. This
-  is the wire format the CLI exposes for non-Rust frontends — and it's
-  also a fantastic debugger when something looks wrong in the TUI: was
-  the event missing, or just rendered wrong?
-</p>
+  </div>
+</div>
 
 <footer>
-  Last updated 2026-05. If something on this page disagrees with the
-  code, trust the code — and please send a patch. See
-  <a href="CONTEXT.md">CONTEXT.md</a> for product direction and near-term
-  priorities, and <a href="README.md">README.md</a> for install &amp; usage.
+  <div class="col">
+    <span class="label">nav</span>
+    <p>A Rust coding agent</p>
+    <p>and a teaching project.</p>
+  </div>
+  <div class="col">
+    <span class="label">Companion reading</span>
+    <p><a href="CONTEXT.md">CONTEXT.md</a> — product direction &amp; near-term priorities.</p>
+    <p><a href="README.md">README.md</a> — install &amp; usage.</p>
+  </div>
+  <div class="col sig">
+    Last updated 2026-05.<br>
+    Trust the code over the prose.
+  </div>
 </footer>
 
-</main>
+<script>
+  // Active TOC tracking via IntersectionObserver.
+  const links = Array.from(document.querySelectorAll('.toc a'));
+  const sections = links
+    .map(a => document.querySelector(a.getAttribute('href')))
+    .filter(Boolean);
+  const linkBySection = new Map(sections.map((s, i) => [s, links[i]]));
+  const visible = new Set();
+
+  const io = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (e.isIntersecting) visible.add(e.target);
+      else visible.delete(e.target);
+    }
+    if (visible.size === 0) return;
+    // pick the first visible section in document order
+    const first = sections.find(s => visible.has(s));
+    if (!first) return;
+    links.forEach(l => l.classList.remove('active'));
+    linkBySection.get(first).classList.add('active');
+  }, { rootMargin: '-80px 0px -60% 0px', threshold: 0 });
+
+  sections.forEach(s => io.observe(s));
+</script>
+
 </body>
 </html>
