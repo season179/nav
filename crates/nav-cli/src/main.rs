@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use nav_core::{AgentEvent, OpenAiTransport, auth, cli::Args, run_agent};
+use nav_core::{
+    AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, SessionBinding, SessionStore,
+    SessionSummary, auth, cli::Args, rebuild_responses_input, run_agent,
+};
 use std::env;
 use tokio::sync::mpsc;
 
@@ -14,6 +17,11 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.list_sessions {
+        return list_sessions_command(&args);
+    }
+
     if args.prompt.is_empty() {
         bail!("provide a prompt, for example: cargo run -- \"list the files\"");
     }
@@ -22,6 +30,27 @@ async fn main() -> Result<()> {
         .context("failed to read current directory")?
         .canonicalize()
         .context("failed to canonicalize current directory")?;
+
+    // Open the session store and (when --resume is given) rebuild the
+    // Responses transcript *before* touching auth, so a missing session
+    // is reported up front instead of after a network round-trip.
+    let store = SessionStore::open(args.db_path.clone())?;
+    let (session_id, initial_input) = match args.resume.as_deref() {
+        Some(id) => {
+            let events = store.load_session(id)?;
+            eprintln!(
+                "nav-core: resumed session {id} with {} prior events",
+                events.len()
+            );
+            let input = rebuild_responses_input(&events);
+            (id.to_string(), Some(input))
+        }
+        None => {
+            let id = store.create_session(&cwd, PROVIDER_OPENAI_RESPONSES, &args.model, None)?;
+            (id, None)
+        }
+    };
+
     let auth_config = auth::load_auth(&args)?;
     let client = reqwest::Client::builder()
         .default_headers(auth::default_headers(&auth_config)?)
@@ -31,18 +60,32 @@ async fn main() -> Result<()> {
     let transport = OpenAiTransport::new(client, auth_config, args.transport);
     let prompt = args.prompt.join(" ");
 
+    let binding = SessionBinding {
+        store: &store,
+        session_id,
+    };
+
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    // Render events as they arrive so streaming behavior survives the refactor.
-    // The agent task drives run_agent; the main task drains the event stream so
-    // the channel is read concurrently with model/tool execution.
-    let agent = tokio::spawn(async move { run_agent(&transport, &args, &cwd, &prompt, tx).await });
-
-    while let Some(event) = rx.recv().await {
-        render_event(&event);
-    }
-
-    agent.await.context("agent task panicked")??;
+    // Drive run_agent and drain the event channel concurrently. tx is moved
+    // into run_agent; when run_agent returns, tx drops and the drainer's
+    // rx.recv() returns None, closing the loop.
+    let agent = run_agent(
+        &transport,
+        &args,
+        &cwd,
+        &prompt,
+        tx,
+        Some(&binding),
+        initial_input,
+    );
+    let drainer = async {
+        while let Some(event) = rx.recv().await {
+            render_event(&event);
+        }
+    };
+    let (result, _) = tokio::join!(agent, drainer);
+    result?;
 
     Ok(())
 }
@@ -64,5 +107,45 @@ fn render_event(event: &AgentEvent) {
         | AgentEvent::ToolCallOutput { .. }
         | AgentEvent::TurnComplete { .. }
         | AgentEvent::Error { .. } => {}
+    }
+}
+
+fn list_sessions_command(args: &Args) -> Result<()> {
+    let store = SessionStore::open(args.db_path.clone())?;
+    let summaries = store.list_sessions(args.cwd.as_deref())?;
+    println!(
+        "{:<26}  {:<12}  {:<40}  {:<20}  {:>12}  {:>12}",
+        "id", "updated_at", "cwd", "model", "tokens_total", "cost"
+    );
+    for summary in summaries {
+        println!(
+            "{:<26}  {:<12}  {:<40}  {:<20}  {:>12}  {:>12}",
+            summary.id,
+            summary.updated_at,
+            truncate(&summary.cwd, 40),
+            truncate(&summary.model, 20),
+            summary.tokens_input + summary.tokens_output,
+            format_cost(&summary),
+        );
+    }
+    Ok(())
+}
+
+fn format_cost(summary: &SessionSummary) -> String {
+    if summary.turns_with_reported_cost == 0 {
+        "—".to_string()
+    } else {
+        let dollars = summary.cost_micros_reported as f64 / 1_000_000.0;
+        format!("${dollars:.4}")
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }

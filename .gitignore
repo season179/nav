@@ -28,3 +28,8 @@ node_modules/
 dist/
 out/
 .DS_Store
+
+# SQLite session store
+*.db
+*.db-wal
+*.db-shm

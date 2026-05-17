@@ -1,0 +1,672 @@
+//! SQLite-backed session storage.
+//!
+//! A `SessionStore` owns one connection (guarded by a `Mutex`) into a single
+//! database file. The first call to `open` applies `init.sql` and records the
+//! migration in `schema_version`; subsequent calls are idempotent because every
+//! `CREATE` statement uses `IF NOT EXISTS`.
+//!
+//! Cost is never derived from token counts. Every turn is recorded with
+//! `cost_source = 'unreported'` and `cost_micros = NULL` unless the caller
+//! passes a [`ReportedCost`] obtained from a provider that actually reports it.
+
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+use ulid::Ulid;
+
+use crate::agent::{AgentEvent, TurnUsage};
+
+/// The schema embedded into the binary; applied once on first open.
+pub const INIT_SQL: &str = include_str!("init.sql");
+
+/// Current migration version. Bump (and add a new migration) whenever the
+/// schema changes incompatibly.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// `provider` value stored on every session created from `run_agent`. There is
+/// no `ModelProvider` trait yet; that arrives in a later slice.
+pub const PROVIDER_OPENAI_RESPONSES: &str = "openai-responses";
+
+/// Currency used for both `session.cost_currency` and `turn.cost_currency`
+/// when the provider does not report one. Matches the `DEFAULT 'USD'` in
+/// `init.sql`.
+pub const DEFAULT_CURRENCY: &str = "USD";
+
+/// `turn.cost_source` value indicating the provider returned a cost figure.
+pub const COST_SOURCE_REPORTED: &str = "reported";
+
+/// `turn.cost_source` value indicating cost was not reported. nav-core never
+/// derives cost from `tokens × pricing`, so unreported stays unreported.
+pub const COST_SOURCE_UNREPORTED: &str = "unreported";
+
+/// Newtype-style alias for the ULID strings used as session primary keys.
+pub type SessionId = String;
+
+/// A cost figure reported by a provider. nav-core never synthesises this from
+/// token counts; absence here is recorded as `cost_source = 'unreported'`.
+#[derive(Debug, Clone)]
+pub struct ReportedCost {
+    pub micros: i64,
+    pub currency: String,
+}
+
+/// One row returned by [`SessionStore::list_sessions`], with the rollup fields
+/// the CLI's `--list-sessions` command formats.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub updated_at: i64,
+    pub cwd: String,
+    pub provider: String,
+    pub model: String,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_input_cached: u64,
+    pub tokens_reasoning: u64,
+    pub cost_micros_reported: i64,
+    pub turns_with_reported_cost: u64,
+    pub turns_total: u64,
+    pub cost_currency: String,
+}
+
+/// Owns the single SQLite connection used to persist a nav session. All
+/// methods are `&self` so callers can share the store across the agent loop
+/// and the CLI without an extra `Arc<Mutex<…>>`.
+pub struct SessionStore {
+    conn: Mutex<Connection>,
+}
+
+impl SessionStore {
+    /// Opens (and migrates) the session database. When `path` is `None` the
+    /// OS-specific default — `~/.local/state/nav/nav.db` on Linux,
+    /// `~/Library/Application Support/nav/nav.db` on macOS, the equivalent
+    /// `data_local_dir()` location on Windows — is used. Echoes the resolved
+    /// pragma values to stderr so misconfiguration is visible at startup.
+    pub fn open(path: Option<PathBuf>) -> Result<Self> {
+        let path = match path {
+            Some(path) => path,
+            None => default_db_path()?,
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let conn = Connection::open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+
+        // `journal_mode = WAL` returns the new mode as a row; the other two
+        // are set with execute_batch and then read back so the echoed
+        // values reflect what SQLite actually accepted.
+        let journal_mode: String =
+            conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL")?;
+        let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        eprintln!(
+            "nav-core: opened {} (journal_mode={journal_mode}, synchronous={synchronous}, foreign_keys={foreign_keys})",
+            path.display()
+        );
+
+        apply_schema(&conn)?;
+        Ok(SessionStore {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// Inserts a new `session` row and returns the generated ULID.
+    pub fn create_session(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: &str,
+        profile: Option<&str>,
+    ) -> Result<SessionId> {
+        let id = Ulid::new().to_string();
+        let now = now_secs();
+        let cwd_str = cwd.to_string_lossy().into_owned();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO session (id, cwd, provider, model, profile, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![id, cwd_str, provider, model, profile, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Persists a durable event to the session log and bumps `updated_at`.
+    /// `AssistantMessageDelta` is intentionally dropped — it is a stream-only
+    /// concern. When the event is a `TurnComplete`, the session's
+    /// `tokens_*` rollups are incremented by the turn's usage.
+    pub fn append_event(&self, session_id: &str, event: &AgentEvent) -> Result<()> {
+        if !event.is_durable() {
+            return Ok(());
+        }
+        let now = now_secs();
+        let kind = event.kind();
+        let data = serde_json::to_string(event).context("failed to serialize event")?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // Folding `MAX(seq)+1` into the INSERT removes a per-event SELECT
+        // round-trip. The subquery returns NULL for the first event in a
+        // session, so COALESCE seeds seq at 0.
+        tx.execute(
+            "INSERT INTO event (session_id, seq, created_at, kind, data)
+             VALUES (
+                 ?1,
+                 COALESCE((SELECT MAX(seq) FROM event WHERE session_id = ?1), -1) + 1,
+                 ?2, ?3, ?4
+             )",
+            params![session_id, now, kind, data],
+        )?;
+        if let AgentEvent::TurnComplete { usage } = event {
+            tx.execute(
+                "UPDATE session
+                 SET tokens_input = tokens_input + ?1,
+                     tokens_output = tokens_output + ?2,
+                     tokens_input_cached = tokens_input_cached + ?3,
+                     tokens_reasoning = tokens_reasoning + ?4,
+                     updated_at = ?5
+                 WHERE id = ?6",
+                params![
+                    usage.tokens_input as i64,
+                    usage.tokens_output as i64,
+                    usage.tokens_input_cached as i64,
+                    usage.tokens_reasoning as i64,
+                    now,
+                    session_id,
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE session SET updated_at = ?1 WHERE id = ?2",
+                params![now, session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records one turn in the `turn` table and rolls its outcome up into
+    /// `session`. The cost columns reflect the constraint that nav never
+    /// computes cost from `tokens × pricing`: tokens are stored regardless,
+    /// but `cost_source` is `'reported'` only when `cost` is `Some`.
+    pub fn complete_turn(
+        &self,
+        session_id: &str,
+        model: &str,
+        usage: &TurnUsage,
+        cost: Option<ReportedCost>,
+    ) -> Result<()> {
+        let now = now_secs();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let (cost_micros, cost_currency, cost_source): (Option<i64>, &str, &str) = match &cost {
+            Some(c) => (Some(c.micros), c.currency.as_str(), COST_SOURCE_REPORTED),
+            None => (None, DEFAULT_CURRENCY, COST_SOURCE_UNREPORTED),
+        };
+        tx.execute(
+            "INSERT INTO turn (
+                session_id, turn_index, started_at, ended_at, model,
+                tokens_input, tokens_output, tokens_input_cached, tokens_reasoning,
+                cost_micros, cost_currency, cost_source
+             ) VALUES (
+                ?1,
+                COALESCE((SELECT MAX(turn_index) FROM turn WHERE session_id = ?1), -1) + 1,
+                ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+             )",
+            params![
+                session_id,
+                now,
+                now,
+                model,
+                usage.tokens_input as i64,
+                usage.tokens_output as i64,
+                usage.tokens_input_cached as i64,
+                usage.tokens_reasoning as i64,
+                cost_micros,
+                cost_currency,
+                cost_source,
+            ],
+        )?;
+        // Cost-source rollups branch separately so unreported turns never
+        // touch `cost_micros_reported` or `turns_with_reported_cost`.
+        if let Some(c) = &cost {
+            tx.execute(
+                "UPDATE session
+                 SET cost_micros_reported = cost_micros_reported + ?1,
+                     turns_with_reported_cost = turns_with_reported_cost + 1,
+                     turns_total = turns_total + 1,
+                     updated_at = ?2
+                 WHERE id = ?3",
+                params![c.micros, now, session_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE session
+                 SET turns_total = turns_total + 1,
+                     updated_at = ?1
+                 WHERE id = ?2",
+                params![now, session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Returns every durable event for a session in seq order. Each row's
+    /// `data` column is parsed back into the `AgentEvent` it was serialised
+    /// from, so callers can reconstruct the conversation transcript directly.
+    pub fn load_session(&self, session_id: &str) -> Result<Vec<AgentEvent>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT data FROM event WHERE session_id = ?1 ORDER BY seq ASC")?;
+        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let data = row?;
+            let event: AgentEvent =
+                serde_json::from_str(&data).context("failed to deserialize stored event")?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    /// Lists all sessions, sorted by `updated_at DESC`. Pass `cwd` to scope
+    /// the listing to a single working directory.
+    pub fn list_sessions(&self, cwd: Option<&Path>) -> Result<Vec<SessionSummary>> {
+        let conn = self.lock();
+        // `?1 IS NULL OR cwd = ?1` folds both the unfiltered and cwd-filtered
+        // queries into one prepared statement; SQLite short-circuits the
+        // disjunction so the index on `(cwd, updated_at DESC)` is still used
+        // when a path is supplied.
+        let cwd_str: Option<String> = cwd.map(|p| p.to_string_lossy().into_owned());
+        let mut stmt = conn.prepare(
+            "SELECT id, updated_at, cwd, provider, model,
+                    tokens_input, tokens_output, tokens_input_cached, tokens_reasoning,
+                    cost_micros_reported, turns_with_reported_cost, turns_total, cost_currency
+             FROM session
+             WHERE ?1 IS NULL OR cwd = ?1
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map(params![cwd_str], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                updated_at: row.get(1)?,
+                cwd: row.get(2)?,
+                provider: row.get(3)?,
+                model: row.get(4)?,
+                tokens_input: row.get::<_, i64>(5)? as u64,
+                tokens_output: row.get::<_, i64>(6)? as u64,
+                tokens_input_cached: row.get::<_, i64>(7)? as u64,
+                tokens_reasoning: row.get::<_, i64>(8)? as u64,
+                cost_micros_reported: row.get(9)?,
+                turns_with_reported_cost: row.get::<_, i64>(10)? as u64,
+                turns_total: row.get::<_, i64>(11)? as u64,
+                cost_currency: row.get(12)?,
+            })
+        })?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
+    /// Acquires the connection mutex. A panic here means another method
+    /// previously panicked while holding the lock — the database is in an
+    /// undefined state and the only safe recovery is to crash the process.
+    fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().expect("session store mutex poisoned")
+    }
+}
+
+/// Resolves the on-disk location of the session database when the caller does
+/// not pass an explicit path. Per spec: `state_dir()` on Linux,
+/// `data_local_dir()` everywhere else, joined with `nav/nav.db`.
+fn default_db_path() -> Result<PathBuf> {
+    let base = if cfg!(target_os = "linux") {
+        dirs::state_dir()
+    } else {
+        dirs::data_local_dir()
+    };
+    let base = base.context("could not resolve OS state/data directory for nav.db")?;
+    Ok(base.join("nav").join("nav.db"))
+}
+
+fn apply_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(INIT_SQL)
+        .context("failed to apply nav-core schema")?;
+    let already_applied: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM schema_version WHERE version = ?1",
+            params![SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_applied.is_none() {
+        conn.execute(
+            "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+            params![SCHEMA_VERSION, now_secs()],
+        )?;
+    }
+    Ok(())
+}
+
+fn now_secs() -> i64 {
+    // Unix epoch is non-negative for the next several billion years; the
+    // cast cannot wrap for any realistic clock. If the clock is set before
+    // 1970 (e.g. embedded board with no RTC) we record 0 instead of panicking.
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn open_temp_store() -> (tempfile::TempDir, SessionStore) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nav.db");
+        let store = SessionStore::open(Some(path)).expect("open store");
+        (dir, store)
+    }
+
+    #[test]
+    fn schema_applies_on_fresh_temp_db() {
+        let (_dir, store) = open_temp_store();
+        let conn = store.conn.lock().unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "session"),
+            "expected session table, got {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "event"));
+        assert!(names.iter().any(|n| n == "turn"));
+        assert!(names.iter().any(|n| n == "schema_version"));
+
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM schema_version WHERE version = ?1",
+                params![SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn pragmas_are_set_on_open() {
+        let (_dir, store) = open_temp_store();
+        let conn = store.conn.lock().unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_lowercase(), "wal");
+
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "NORMAL = 1");
+
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn round_trip_create_append_load() {
+        let (_dir, store) = open_temp_store();
+        let cwd = Path::new("/some/project");
+        let id = store
+            .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", Some("default"))
+            .unwrap();
+
+        let events = vec![
+            AgentEvent::AssistantMessageDone {
+                text: "hello".into(),
+            },
+            AgentEvent::ToolCallStarted {
+                call_id: "c1".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "echo hi"}),
+            },
+            AgentEvent::ToolCallOutput {
+                call_id: "c1".into(),
+                output: "hi\n".into(),
+                is_error: false,
+            },
+            AgentEvent::TurnComplete {
+                usage: TurnUsage {
+                    tokens_input: 11,
+                    tokens_output: 22,
+                    tokens_input_cached: 3,
+                    tokens_reasoning: 4,
+                },
+            },
+        ];
+        for event in &events {
+            store.append_event(&id, event).unwrap();
+        }
+        let loaded = store.load_session(&id).unwrap();
+        assert_eq!(loaded, events);
+    }
+
+    #[test]
+    fn append_event_skips_assistant_message_delta_persists_done() {
+        let (_dir, store) = open_temp_store();
+        let cwd = Path::new("/tmp/proj");
+        let id = store
+            .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+            .unwrap();
+
+        store
+            .append_event(
+                &id,
+                &AgentEvent::AssistantMessageDelta {
+                    text: "ignored".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &id,
+                &AgentEvent::AssistantMessageDone {
+                    text: "kept".into(),
+                },
+            )
+            .unwrap();
+
+        let loaded = store.load_session(&id).unwrap();
+        assert_eq!(
+            loaded,
+            vec![AgentEvent::AssistantMessageDone {
+                text: "kept".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn append_event_turn_complete_rolls_up_session_tokens() {
+        let (_dir, store) = open_temp_store();
+        let id = store
+            .create_session(
+                Path::new("/proj"),
+                PROVIDER_OPENAI_RESPONSES,
+                "gpt-test",
+                None,
+            )
+            .unwrap();
+        store
+            .append_event(
+                &id,
+                &AgentEvent::TurnComplete {
+                    usage: TurnUsage {
+                        tokens_input: 100,
+                        tokens_output: 50,
+                        tokens_input_cached: 20,
+                        tokens_reasoning: 10,
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &id,
+                &AgentEvent::TurnComplete {
+                    usage: TurnUsage {
+                        tokens_input: 5,
+                        tokens_output: 3,
+                        tokens_input_cached: 0,
+                        tokens_reasoning: 1,
+                    },
+                },
+            )
+            .unwrap();
+        let summary = &store.list_sessions(None).unwrap()[0];
+        assert_eq!(summary.tokens_input, 105);
+        assert_eq!(summary.tokens_output, 53);
+        assert_eq!(summary.tokens_input_cached, 20);
+        assert_eq!(summary.tokens_reasoning, 11);
+    }
+
+    #[test]
+    fn complete_turn_reported_rolls_up_cost_and_counts() {
+        let (_dir, store) = open_temp_store();
+        let id = store
+            .create_session(
+                Path::new("/proj"),
+                PROVIDER_OPENAI_RESPONSES,
+                "gpt-test",
+                None,
+            )
+            .unwrap();
+        let usage = TurnUsage {
+            tokens_input: 50,
+            tokens_output: 25,
+            tokens_input_cached: 0,
+            tokens_reasoning: 0,
+        };
+        store
+            .complete_turn(
+                &id,
+                "gpt-test",
+                &usage,
+                Some(ReportedCost {
+                    micros: 1_500,
+                    currency: "USD".into(),
+                }),
+            )
+            .unwrap();
+        store
+            .complete_turn(
+                &id,
+                "gpt-test",
+                &usage,
+                Some(ReportedCost {
+                    micros: 500,
+                    currency: "USD".into(),
+                }),
+            )
+            .unwrap();
+        let summary = &store.list_sessions(None).unwrap()[0];
+        assert_eq!(summary.cost_micros_reported, 2_000);
+        assert_eq!(summary.turns_with_reported_cost, 2);
+        assert_eq!(summary.turns_total, 2);
+
+        // Each turn row records 'reported' regardless of session-level rollup.
+        let conn = store.conn.lock().unwrap();
+        let sources: Vec<String> = conn
+            .prepare("SELECT cost_source FROM turn WHERE session_id = ?1 ORDER BY turn_index")
+            .unwrap()
+            .query_map(params![id], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            sources,
+            vec!["reported".to_string(), "reported".to_string()]
+        );
+    }
+
+    #[test]
+    fn complete_turn_unreported_rolls_up_only_turns_total() {
+        let (_dir, store) = open_temp_store();
+        let id = store
+            .create_session(
+                Path::new("/proj"),
+                PROVIDER_OPENAI_RESPONSES,
+                "gpt-test",
+                None,
+            )
+            .unwrap();
+        let usage = TurnUsage {
+            tokens_input: 50,
+            tokens_output: 25,
+            tokens_input_cached: 0,
+            tokens_reasoning: 0,
+        };
+        store.complete_turn(&id, "gpt-test", &usage, None).unwrap();
+        store.complete_turn(&id, "gpt-test", &usage, None).unwrap();
+        let summary = &store.list_sessions(None).unwrap()[0];
+        assert_eq!(summary.cost_micros_reported, 0);
+        assert_eq!(summary.turns_with_reported_cost, 0);
+        assert_eq!(summary.turns_total, 2);
+
+        // The constraint says every turn must record cost_source='unreported',
+        // cost_micros=NULL when no cost is reported.
+        let conn = store.conn.lock().unwrap();
+        let (source, micros): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT cost_source, cost_micros FROM turn WHERE session_id = ?1 ORDER BY turn_index LIMIT 1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source, "unreported");
+        assert!(micros.is_none());
+    }
+
+    #[test]
+    fn list_sessions_filters_by_cwd_and_orders_by_updated_at_desc() {
+        let (_dir, store) = open_temp_store();
+        let a = Path::new("/proj/a");
+        let b = Path::new("/proj/b");
+        let id_a_old = store
+            .create_session(a, PROVIDER_OPENAI_RESPONSES, "gpt", None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let id_b = store
+            .create_session(b, PROVIDER_OPENAI_RESPONSES, "gpt", None)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let id_a_new = store
+            .create_session(a, PROVIDER_OPENAI_RESPONSES, "gpt", None)
+            .unwrap();
+
+        let all = store.list_sessions(None).unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![id_a_new.clone(), id_b.clone(), id_a_old.clone()]
+        );
+        let only_a = store.list_sessions(Some(a)).unwrap();
+        assert_eq!(
+            only_a.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            vec![id_a_new, id_a_old]
+        );
+    }
+}
