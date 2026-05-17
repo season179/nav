@@ -58,6 +58,60 @@ nav --transport sse "Use the HTTP/SSE transport instead"
 nav --auth api-key "Use OPENAI_API_KEY instead"
 ```
 
+## TUI mode
+
+`cd` to your project and run `nav` with no arguments — when stdout is a tty
+and `--json-events` is not set, it launches the interactive TUI: chat
+transcript above, multi-line composer below.
+
+```sh
+cd ~/code/my-project
+nav
+```
+
+Pass a prompt to seed the first turn and skip having to type it in the
+composer:
+
+```sh
+nav "kick off the session"
+```
+
+Inside the TUI:
+
+- `Enter` submits, `Shift+Enter` inserts a newline.
+- `Ctrl+U` clears to start of line, `Ctrl+W` deletes the previous word.
+- `Up` / `Down` recall earlier prompts from this session.
+- A leading `/` opens a slash-command popup (`/help`, `/clear`, `/quit`,
+  `/resume`, `/sessions`). Type to filter, Tab/Enter completes.
+- `/quit` and `Ctrl+C` twice exit cleanly; `/clear` empties the transcript.
+
+To bypass the TUI and stream raw events:
+
+```sh
+nav --json-events "list the files" > events.ndjson
+```
+
+Each line is one `AgentEvent` as JSON (`assistant_message_delta`,
+`tool_call_started`, `turn_complete`, …). Non-tty stdout defaults to this
+mode automatically.
+
+## Sessions
+
+Every run is persisted to a local SQLite database (default
+`~/Library/Application Support/nav/nav.db` on macOS, `$XDG_STATE_HOME/nav/nav.db`
+on Linux). Override with `--db-path`.
+
+```sh
+nav --list-sessions                 # all sessions, newest first
+nav --list-sessions --cwd "$PWD"    # only sessions started in this directory
+nav --resume <session-id> "follow-up prompt"
+```
+
+`--resume` rebuilds the Responses transcript from the on-disk event log and
+appends the new prompt as the next turn. Token rollups appear in
+`--list-sessions`; cost is shown only for providers that report it (none do
+today, so the column reads `—`).
+
 ## Desktop UI
 
 `nav-desktop` is the early Electron desktop shell for `nav`. It is intentionally

@@ -6,6 +6,7 @@ use nav_core::{
 };
 use std::env;
 use std::io::IsTerminal;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -14,14 +15,11 @@ async fn main() -> Result<()> {
     if args.list_sessions {
         return list_sessions_command(&args);
     }
-    if args.prompt.is_empty() {
-        bail!("provide a prompt, for example: cargo run -- \"list the files\"");
-    }
 
     let cwd = env::current_dir()?
         .canonicalize()
         .context("failed to canonicalize current directory")?;
-    let store = SessionStore::open(args.db_path.clone())?;
+    let store = Arc::new(SessionStore::open(args.db_path.clone())?);
     let (session_id, initial_input, resume_events) = match args.resume.as_deref() {
         Some(id) => {
             let events = store.load_session(id)?;
@@ -41,31 +39,34 @@ async fn main() -> Result<()> {
     let client = reqwest::Client::builder()
         .default_headers(auth::default_headers(&auth_config)?)
         .build()?;
-    let transport = OpenAiTransport::new(client, auth_config, args.transport);
+    let transport = Arc::new(OpenAiTransport::new(client, auth_config, args.transport));
 
     let is_tty = std::io::stdout().is_terminal();
     if is_tty && !args.json_events {
+        let initial_prompt = (!args.prompt.is_empty()).then(|| args.prompt.join(" "));
         return nav_tui::run(
-            &transport,
-            &args,
-            &cwd,
-            SessionBinding {
-                store: &store,
-                session_id,
-            },
+            transport,
+            args,
+            cwd,
+            store,
+            session_id,
             resume_events,
+            initial_prompt,
         )
         .await;
     }
 
+    if args.prompt.is_empty() {
+        bail!("provide a prompt for non-interactive mode, e.g. nav \"list the files\"");
+    }
     let prompt = args.prompt.join(" ");
     let binding = SessionBinding {
-        store: &store,
+        store: store.as_ref(),
         session_id,
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
     let agent = run_agent(
-        &transport,
+        transport.as_ref(),
         &args,
         &cwd,
         &prompt,

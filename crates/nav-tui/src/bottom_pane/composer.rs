@@ -1,7 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 /// Events produced by [`Composer::handle_key`].
@@ -167,9 +168,26 @@ impl Composer {
         self.lines.len().max(1) as u16
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.lines.len() == 1 && self.lines[0].is_empty()
+    }
+
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let rendered: Vec<Line<'_>> = self.lines.iter().map(|l| Line::from(l.as_str())).collect();
-        Paragraph::new(rendered).render(area, buf);
+        let bg = Style::default().bg(crate::theme::COMPOSER_BG);
+        if self.is_empty() {
+            let hint = Span::styled(
+                "Ask nav to do anything",
+                bg.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            );
+            Paragraph::new(Line::from(hint)).style(bg).render(area, buf);
+            return;
+        }
+        let rendered: Vec<Line<'_>> = self
+            .lines
+            .iter()
+            .map(|l| Line::from(Span::styled(l.clone(), bg.fg(Color::White))))
+            .collect();
+        Paragraph::new(rendered).style(bg).render(area, buf);
     }
 
     fn insert_char(&mut self, c: char) {

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 // clap turns this struct into the CLI. Keeping options small makes the
 // educational path clear: model choice, auth choice, loop limit, and prompt.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(about = "A tiny Rust coding agent using the Responses API")]
 pub struct Args {
     /// Model to use.

@@ -2,15 +2,11 @@
 source: crates/nav-tui/tests/snapshot.rs
 expression: rendered
 ---
-user
-  list files in the repo
+› list files in the repo
 
-tool call
-  tool · shell {"command":["ls"]}
+• shell {"command":["ls"]}
 
-tool output
-  Cargo.toml
+└ Cargo.toml
   src
 
-assistant
-  Two entries: Cargo.toml and src.
+• Two entries: Cargo.toml and src.

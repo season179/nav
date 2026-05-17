@@ -4,7 +4,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::cells::{
-    AssistantMessageCell, ErrorCell, ToolCallCell, ToolOutputCell, UserMessageCell,
+    AssistantMessageCell, ErrorCell, ToolCallCell, ToolOutputCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -25,6 +25,18 @@ impl ChatWidget {
     /// `AgentEvent`, so it has its own entry point.
     pub fn push_user(&mut self, text: impl Into<String>) {
         self.cells.push(Box::new(UserMessageCell::new(text)));
+    }
+
+    /// Prepend a welcome cell that orients the user (model, cwd, session id).
+    /// Called at TUI launch on a fresh session.
+    pub fn push_welcome(
+        &mut self,
+        model: impl Into<String>,
+        cwd: impl Into<String>,
+        session_id: impl Into<String>,
+    ) {
+        self.cells
+            .push(Box::new(WelcomeCell::new(model, cwd, session_id)));
     }
 
     /// Translate an agent event into a history cell and append it.

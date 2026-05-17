@@ -1,9 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::composer::Composer;
 use super::view::InputResult;
@@ -49,20 +49,25 @@ impl SlashCommandPopup {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let bg = Style::default().bg(crate::theme::POPUP_BG);
+        Block::default().style(bg).render(area, buf);
         let lines: Vec<Line<'static>> = self
             .matches
             .iter()
             .enumerate()
             .map(|(i, cmd)| {
-                let style = if i == self.selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                let row_style = if i == self.selected {
+                    bg.fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
+                    bg.fg(Color::Gray)
                 };
-                Line::from(Span::styled(*cmd, style))
+                Line::from(vec![
+                    Span::styled("  ", row_style),
+                    Span::styled(*cmd, row_style),
+                ])
             })
             .collect();
-        Paragraph::new(lines).render(area, buf);
+        Paragraph::new(lines).style(bg).render(area, buf);
     }
 
     pub fn on_composer_text_changed(&mut self, first_line: &str) {

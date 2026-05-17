@@ -41,44 +41,119 @@ pub(crate) fn render_body(text: &str, width: u16) -> Vec<Line<'static>> {
     out
 }
 
-struct LabeledBlock {
-    label: &'static str,
-    color: Color,
-    body: String,
+/// Replace the leading two-space pad on `lines[0]` with a styled gutter glyph
+/// (e.g. `›` / `•` / `└`). Continuation lines keep the two-space pad so body
+/// text aligns under the glyph at column 2.
+fn apply_gutter_glyph(lines: &mut [Line<'static>], glyph: &str, style: Style) {
+    let Some(first) = lines.first_mut() else {
+        return;
+    };
+    let Some(span) = first.spans.first_mut() else {
+        return;
+    };
+    let rest = span.content.strip_prefix("  ").unwrap_or(&span.content);
+    let rest_owned = rest.to_string();
+    let trailing = std::mem::take(&mut first.spans).into_iter().skip(1);
+    let mut spans = Vec::with_capacity(2);
+    spans.push(Span::styled(format!("{glyph} "), style));
+    spans.push(Span::raw(rest_owned));
+    spans.extend(trailing);
+    first.spans = spans;
 }
 
-impl LabeledBlock {
-    fn new(label: &'static str, color: Color, body: impl Into<String>) -> Self {
+fn body_cell(glyph: &str, style: Style, body: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = render_body(body, width);
+    if lines.is_empty() {
+        lines.push(Line::from("  ".to_string()));
+    }
+    apply_gutter_glyph(&mut lines, glyph, style);
+    lines.push(Line::from(String::new()));
+    lines
+}
+
+/// Welcome card injected as the first transcript entry. Shows the model,
+/// working directory, and session id, plus a short hint about slash commands
+/// so the empty alt-screen doesn't read as a frozen blank.
+pub struct WelcomeCell {
+    model: String,
+    cwd: String,
+    session_id: String,
+}
+
+impl WelcomeCell {
+    pub fn new(
+        model: impl Into<String>,
+        cwd: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> Self {
         Self {
-            label,
-            color,
-            body: body.into(),
+            model: model.into(),
+            cwd: cwd.into(),
+            session_id: session_id.into(),
         }
     }
+}
 
-    fn lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut out = Vec::with_capacity(2);
-        out.push(Line::from(Span::styled(
-            self.label.to_string(),
-            Style::default().fg(self.color).add_modifier(Modifier::BOLD),
-        )));
-        out.extend(render_body(&self.body, width));
-        out.push(Line::from(String::new()));
-        out
+impl HistoryCell for WelcomeCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let dim = Style::default().fg(Color::DarkGray);
+        let value = Style::default().fg(Color::White);
+        let accent = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let session_short: String = self.session_id.chars().take(10).collect();
+        vec![
+            Line::from(vec![
+                Span::styled("  nav", accent),
+                Span::styled("  ·  ", dim),
+                Span::styled(self.model.clone(), value),
+                Span::styled("  ·  ", dim),
+                Span::styled(self.cwd.clone(), value),
+                Span::styled("  ·  session ", dim),
+                Span::styled(session_short, value),
+            ]),
+            Line::from(String::new()),
+            Line::from(Span::styled(
+                "  Type a prompt to begin. Slash commands:".to_string(),
+                dim,
+            )),
+            Line::from(vec![
+                Span::styled("    /quit", dim),
+                Span::styled("      exit".to_string(), dim),
+            ]),
+            Line::from(vec![
+                Span::styled("    /clear", dim),
+                Span::styled("     start a new transcript".to_string(), dim),
+            ]),
+            Line::from(vec![
+                Span::styled("    /sessions", dim),
+                Span::styled("  list saved sessions".to_string(), dim),
+            ]),
+            Line::from(String::new()),
+        ]
     }
 }
 
-pub struct UserMessageCell(LabeledBlock);
+pub struct UserMessageCell {
+    text: String,
+}
 
 impl UserMessageCell {
     pub fn new(text: impl Into<String>) -> Self {
-        Self(LabeledBlock::new("user", Color::Cyan, text))
+        Self { text: text.into() }
     }
 }
 
 impl HistoryCell for UserMessageCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.0.lines(width)
+        body_cell(
+            "›",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            &self.text,
+            width,
+        )
     }
 }
 
@@ -112,66 +187,98 @@ impl AssistantMessageCell {
 impl HistoryCell for AssistantMessageCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let (stable, tail) = self.controller.partitioned_lines(width);
-        let mut out = Vec::with_capacity(2 + stable.len() + tail.len());
-        out.push(Line::from(Span::styled(
-            "assistant".to_string(),
+        let mut out: Vec<Line<'static>> = Vec::with_capacity(stable.len() + tail.len() + 1);
+        out.extend(stable);
+        out.extend(tail);
+        if out.is_empty() {
+            out.push(Line::from("  ".to_string()));
+        }
+        apply_gutter_glyph(
+            &mut out,
+            "•",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
-        )));
-        out.extend(stable);
-        out.extend(tail);
+        );
         out.push(Line::from(String::new()));
         out
     }
 }
 
-pub struct ToolCallCell(LabeledBlock);
+pub struct ToolCallCell {
+    summary: String,
+}
 
 impl ToolCallCell {
     pub fn new(name: impl Into<String>, arguments: Value) -> Self {
         let args =
             serde_json::to_string(&arguments).unwrap_or_else(|_| "<unserializable>".to_string());
-        let summary = format!("tool · {} {}", name.into(), args);
-        Self(LabeledBlock::new("tool call", Color::Yellow, summary))
+        Self {
+            summary: format!("{} {}", name.into(), args),
+        }
     }
 }
 
 impl HistoryCell for ToolCallCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.0.lines(width)
+        body_cell(
+            "•",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            &self.summary,
+            width,
+        )
     }
 }
 
-pub struct ToolOutputCell(LabeledBlock);
+pub struct ToolOutputCell {
+    output: String,
+    is_error: bool,
+}
 
 impl ToolOutputCell {
     pub fn new(output: impl Into<String>, is_error: bool) -> Self {
-        let (label, color) = if is_error {
-            ("tool error", Color::Red)
-        } else {
-            ("tool output", Color::DarkGray)
-        };
-        Self(LabeledBlock::new(label, color, output))
+        Self {
+            output: output.into(),
+            is_error,
+        }
     }
 }
 
 impl HistoryCell for ToolOutputCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.0.lines(width)
+        let (glyph, style) = if self.is_error {
+            (
+                "└",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("└", Style::default().fg(Color::DarkGray))
+        };
+        body_cell(glyph, style, &self.output, width)
     }
 }
 
-pub struct ErrorCell(LabeledBlock);
+pub struct ErrorCell {
+    message: String,
+}
 
 impl ErrorCell {
     pub fn new(message: impl Into<String>) -> Self {
-        Self(LabeledBlock::new("error", Color::Red, message))
+        Self {
+            message: message.into(),
+        }
     }
 }
 
 impl HistoryCell for ErrorCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        self.0.lines(width)
+        body_cell(
+            "•",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            &self.message,
+            width,
+        )
     }
 }
