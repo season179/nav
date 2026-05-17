@@ -1214,6 +1214,7 @@ dependencies = [
  "anyhow",
  "clap",
  "nav-core",
+ "nav-tui",
  "reqwest",
  "serde_json",
  "tokio",
@@ -1241,6 +1242,7 @@ dependencies = [
 name = "nav-tui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crossterm",
  "insta",
  "nav-core",
