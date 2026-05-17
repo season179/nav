@@ -5,6 +5,7 @@ use nav_core::{
     SessionSummary, auth, cli::Args, rebuild_responses_input, run_agent,
 };
 use std::env;
+use std::io::IsTerminal;
 use tokio::sync::mpsc;
 
 // Reading guide:
@@ -25,6 +26,8 @@ async fn main() -> Result<()> {
     if args.prompt.is_empty() {
         bail!("provide a prompt, for example: cargo run -- \"list the files\"");
     }
+
+    let json_mode = args.json_events || !std::io::stdout().is_terminal();
 
     let cwd = env::current_dir()
         .context("failed to read current directory")?
@@ -60,6 +63,19 @@ async fn main() -> Result<()> {
     let transport = OpenAiTransport::new(client, auth_config, args.transport);
     let prompt = args.prompt.join(" ");
 
+    if !json_mode {
+        return nav_tui::run(
+            prompt,
+            transport,
+            &args,
+            cwd,
+            store,
+            session_id,
+            initial_input,
+        )
+        .await;
+    }
+
     let binding = SessionBinding {
         store: &store,
         session_id,
@@ -81,33 +97,16 @@ async fn main() -> Result<()> {
     );
     let drainer = async {
         while let Some(event) = rx.recv().await {
-            render_event(&event);
+            println!(
+                "{}",
+                serde_json::to_string(&event).expect("serialize AgentEvent")
+            );
         }
     };
     let (result, _) = tokio::join!(agent, drainer);
     result?;
 
     Ok(())
-}
-
-/// Mirrors the pre-refactor CLI output: tool-call notifications go to stderr,
-/// assistant text goes to stdout. Other events stay silent so an existing
-/// transcript is byte-for-byte unchanged.
-fn render_event(event: &AgentEvent) {
-    match event {
-        AgentEvent::ToolCallStarted {
-            name, arguments, ..
-        } => {
-            eprintln!("tool: {name}({arguments})");
-        }
-        AgentEvent::AssistantMessageDone { text } => {
-            println!("{text}");
-        }
-        AgentEvent::AssistantMessageDelta { .. }
-        | AgentEvent::ToolCallOutput { .. }
-        | AgentEvent::TurnComplete { .. }
-        | AgentEvent::Error { .. } => {}
-    }
 }
 
 fn list_sessions_command(args: &Args) -> Result<()> {
