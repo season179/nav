@@ -46,6 +46,14 @@ enum AppEvent {
     Clear,
 }
 
+/// Restores the terminal to a sane state when `run` returns.
+///
+/// Raw mode, the alt screen, bracketed paste, and a hidden cursor would
+/// otherwise persist after the process exits — the user's shell prompt
+/// would render with no echo and on the wrong screen buffer. `Drop` runs
+/// on normal `Ok`/`Err` returns and on unwinding panics. The companion
+/// panic hook below repeats the same teardown before the panic message is
+/// printed, so the error is shown back on the normal terminal screen.
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -98,8 +106,10 @@ pub async fn run(
     if resume_events.is_empty() {
         chat.push_welcome(&args.model, cwd.display().to_string(), &session_id);
     }
-    // First turn after `--resume` must rehydrate the Responses transcript so
-    // the model sees prior context; subsequent turns are appended server-side.
+    // The first prompt after `--resume` gets the rebuilt transcript. Later
+    // prompts currently start from their own text; the local session log still
+    // records them, but nav does not maintain server-side conversation state
+    // because `response_body` sends `store: false`.
     let mut initial_input: Option<Vec<Value>> = if resume_events.is_empty() {
         None
     } else {
@@ -171,6 +181,10 @@ pub async fn run(
                         chat.push_welcome(&args.model, cwd.display().to_string(), &session_id);
                     }
                     AppEvent::Submit(prompt) => {
+                        // Refuse a second prompt while a turn is still in flight.
+                        // The Responses API gives no clean way to interleave two
+                        // running turns on the same session, and we don't want to
+                        // race the spinner / token rollups with two in-flight runs.
                         if turn_started_at.is_some() {
                             chat.ingest(AgentEvent::Error {
                                 message: "agent is busy; wait for the current turn to finish".into(),
@@ -185,6 +199,9 @@ pub async fn run(
                         let store = Arc::clone(&store);
                         let session_id = session_id.clone();
                         let tx = agent_tx.clone();
+                        // `take()` consumes the rebuilt transcript exactly once;
+                        // otherwise every later prompt would resend the same
+                        // pre-resume history.
                         let first_input = initial_input.take();
                         tokio::spawn(async move {
                             let binding = SessionBinding {
@@ -211,6 +228,10 @@ pub async fn run(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(80)) => {
+                // 80 ms = ~12 Hz: fast enough that the braille spinner reads as
+                // motion, slow enough that an idle TUI doesn't peg a CPU core.
+                // The poll(0) below pulls *all* buffered keys per tick so a fast
+                // typist never lags a redraw behind their keystrokes.
                 spinner_tick = spinner_tick.wrapping_add(1);
                 while event::poll(Duration::from_millis(0))? {
                     let CtEvent::Key(key) = event::read()? else { continue };

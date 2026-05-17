@@ -293,6 +293,9 @@ impl Composer {
         let idx = match self.history_idx {
             Some(i) if i > 0 => i - 1,
             Some(i) => i,
+            // First Up press: stash whatever the user was mid-composing so
+            // Down can restore it once they walk back past the newest entry.
+            // Without this the half-typed draft would be silently discarded.
             None => {
                 self.pending_draft = Some(self.text());
                 self.history.len() - 1
@@ -312,6 +315,9 @@ impl Composer {
             let text = self.history[i + 1].clone();
             self.set_text(&text);
         } else {
+            // Walked past the newest entry — restore the stashed draft so the
+            // composer ends back at exactly what the user had typed before
+            // they started browsing history.
             self.history_idx = None;
             let draft = self.pending_draft.take().unwrap_or_default();
             self.set_text(&draft);

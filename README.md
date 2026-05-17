@@ -9,7 +9,9 @@ usable local coding agent with a real product surface. Keep the simple learning
 path intact, but prefer designs that can grow into reliable day-to-day use.
 
 See [CONTEXT.md](CONTEXT.md) for the current product direction and engineering
-priorities.
+priorities. If you want to read the code, start with the guided tour in
+[ARCHITECTURE.html](ARCHITECTURE.html) — it walks through `nav-core` and
+`nav-tui` in plain English and tells you which files to open in which order.
 
 By default it uses the ChatGPT OAuth credentials stored by Codex in
 `~/.codex/auth.json` and calls the Codex Responses backend directly over

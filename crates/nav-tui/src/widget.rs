@@ -41,8 +41,9 @@ impl ChatWidget {
 
     /// Translate an agent event into a history cell and append it.
     ///
-    /// `AssistantMessageDelta` and `TurnComplete` are intentionally ignored:
-    /// streaming-partition and a status surface arrive in later slices.
+    /// `AssistantMessageDelta` is currently ignored: the TUI shows assistant
+    /// text when `AssistantMessageDone` arrives. `TurnComplete` is handled by
+    /// the status bar in `run()`, not by the scrollback widget.
     pub fn ingest(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::AssistantMessageDelta { .. } | AgentEvent::TurnComplete { .. } => {}

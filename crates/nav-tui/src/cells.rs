@@ -127,7 +127,7 @@ impl HistoryCell for WelcomeCell {
             ]),
             Line::from(vec![
                 Span::styled("    /sessions", dim),
-                Span::styled("  list saved sessions".to_string(), dim),
+                Span::styled("  not wired yet".to_string(), dim),
             ]),
             Line::from(String::new()),
         ]
