@@ -4,6 +4,7 @@
 //! [`nav_core::AgentEvent`], and the [`ChatWidget`] that stacks cells
 //! top-to-bottom in a ratatui buffer.
 
+pub mod bottom_pane;
 mod cells;
 mod history;
 mod streaming;
