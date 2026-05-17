@@ -1,0 +1,8 @@
+---
+source: crates/nav-tui/src/streaming.rs
+expression: "snapshot_body(&c, 40)"
+---
+=== stable ===
+  Hello there.
+=== tail ===
+  How are you doi
