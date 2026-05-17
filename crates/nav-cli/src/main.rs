@@ -5,6 +5,7 @@ use nav_core::{
     SessionSummary, auth, cli::Args, rebuild_responses_input, run_agent,
 };
 use std::env;
+use std::io::IsTerminal;
 use tokio::sync::mpsc;
 
 // Reading guide:
@@ -65,6 +66,21 @@ async fn main() -> Result<()> {
         session_id,
     };
 
+    let is_tty = std::io::stdout().is_terminal();
+    let ndjson_mode = args.json_events || !is_tty;
+
+    if !ndjson_mode {
+        return nav_tui::run(
+            &transport,
+            &args,
+            &cwd,
+            &prompt,
+            Some(&binding),
+            initial_input,
+        )
+        .await;
+    }
+
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     // Drive run_agent and drain the event channel concurrently. tx is moved
@@ -81,33 +97,14 @@ async fn main() -> Result<()> {
     );
     let drainer = async {
         while let Some(event) = rx.recv().await {
-            render_event(&event);
+            println!("{}", serde_json::to_string(&event)?);
         }
+        Ok::<(), anyhow::Error>(())
     };
     let (result, _) = tokio::join!(agent, drainer);
     result?;
 
     Ok(())
-}
-
-/// Mirrors the pre-refactor CLI output: tool-call notifications go to stderr,
-/// assistant text goes to stdout. Other events stay silent so an existing
-/// transcript is byte-for-byte unchanged.
-fn render_event(event: &AgentEvent) {
-    match event {
-        AgentEvent::ToolCallStarted {
-            name, arguments, ..
-        } => {
-            eprintln!("tool: {name}({arguments})");
-        }
-        AgentEvent::AssistantMessageDone { text } => {
-            println!("{text}");
-        }
-        AgentEvent::AssistantMessageDelta { .. }
-        | AgentEvent::ToolCallOutput { .. }
-        | AgentEvent::TurnComplete { .. }
-        | AgentEvent::Error { .. } => {}
-    }
 }
 
 fn list_sessions_command(args: &Args) -> Result<()> {

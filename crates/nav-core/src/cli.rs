@@ -48,6 +48,10 @@ pub struct Args {
     #[arg(long)]
     pub db_path: Option<PathBuf>,
 
+    /// Stream AgentEvent objects as NDJSON on stdout.
+    #[arg(long)]
+    pub json_events: bool,
+
     pub prompt: Vec<String>,
 }
 
@@ -68,6 +72,7 @@ impl Args {
             list_sessions: false,
             cwd: None,
             db_path: None,
+            json_events: false,
             prompt: vec!["test".into()],
         }
     }

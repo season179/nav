@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 nav-core = { path = "../nav-core" }
+nav-tui = { path = "../nav-tui" }
 anyhow.workspace = true
 clap.workspace = true
 reqwest.workspace = true
