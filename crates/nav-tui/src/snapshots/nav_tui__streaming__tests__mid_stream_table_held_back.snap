@@ -1,0 +1,10 @@
+---
+source: crates/nav-tui/src/streaming.rs
+expression: "snapshot_body(&c, 40)"
+---
+=== stable ===
+  Quick summary:
+=== tail ===
+  | col a | col b |
+  |-------|-------|
+  | 1     | 2     |

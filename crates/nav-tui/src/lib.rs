@@ -6,8 +6,10 @@
 
 mod cells;
 mod history;
+mod streaming;
 mod widget;
 
 pub use cells::{AssistantMessageCell, ErrorCell, ToolCallCell, ToolOutputCell, UserMessageCell};
 pub use history::HistoryCell;
+pub use streaming::StreamController;
 pub use widget::ChatWidget;
