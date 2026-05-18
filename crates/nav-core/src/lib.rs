@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cli;
 pub mod responses;
 pub mod session;
+pub mod skills;
 pub mod tools;
 
 pub use agent::{
@@ -13,3 +14,4 @@ pub use responses::OpenAiTransport;
 pub use session::{
     PROVIDER_OPENAI_RESPONSES, ReportedCost, SessionId, SessionStore, SessionSummary,
 };
+pub use skills::{Catalog, Skill, SkillScope, discover_skills, discover_skills_with_roots};

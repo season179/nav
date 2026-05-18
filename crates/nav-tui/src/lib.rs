@@ -18,7 +18,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use nav_core::{
-    AgentEvent, OpenAiTransport, SessionBinding, SessionId, SessionStore, cli::Args,
+    AgentEvent, Catalog, OpenAiTransport, SessionBinding, SessionId, SessionStore, cli::Args,
     rebuild_responses_input, run_agent,
 };
 use ratatui::Terminal;
@@ -44,6 +44,15 @@ enum AppEvent {
     Submit(String),
     Quit,
     Clear,
+    /// Standalone `/<skill>` submission — the wrapped SKILL.md body is held
+    /// in TUI state and flushed onto the next real prompt. We carry both
+    /// the user-facing label (just the skill name) and the body to inject
+    /// so the chat shows a clear "queued" notice without leaking the full
+    /// wrapped block into history.
+    QueueSkill {
+        skill_name: String,
+        wrapped_body: String,
+    },
 }
 
 /// Restores the terminal to a sane state when `run` returns.
@@ -78,6 +87,7 @@ pub async fn run(
     session_id: SessionId,
     resume_events: Vec<AgentEvent>,
     initial_prompt: Option<String>,
+    skills: Arc<Catalog>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -102,6 +112,8 @@ pub async fn run(
         prev(info);
     }));
 
+    let slash_entries = bottom_pane::build_slash_entries(skills.as_ref());
+
     let mut chat = ChatWidget::new();
     if resume_events.is_empty() {
         chat.push_welcome(&args.model, cwd.display().to_string(), &session_id);
@@ -118,8 +130,14 @@ pub async fn run(
     for ev in resume_events {
         chat.ingest(ev);
     }
-    let mut pane = bottom_pane::BottomPane::new();
+    let mut pane = bottom_pane::BottomPane::with_slash_entries(slash_entries);
     let mut ctrl_c_count = 0u8;
+    // Holds the wrapped `<skill …>…</skill>` body from a standalone
+    // `/<skill>` submission. Flushed onto the next non-slash prompt so the
+    // model actually sees the skill body in the same turn as the user
+    // request that needs it (per-turn `run_agent` calls don't replay prior
+    // user prompts).
+    let mut pending_skill: Option<String> = None;
     let mut turn_started_at: Option<Instant> = None;
     let mut spinner_tick: u64 = 0;
     let cwd_short = status_bar::shorten_home(&cwd);
@@ -179,8 +197,20 @@ pub async fn run(
                     AppEvent::Clear => {
                         chat = ChatWidget::new();
                         chat.push_welcome(&args.model, cwd.display().to_string(), &session_id);
+                        pending_skill = None;
                     }
-                    AppEvent::Submit(prompt) => {
+                    AppEvent::QueueSkill { skill_name, wrapped_body } => {
+                        // Replace any previously queued skill; selecting a new
+                        // one before sending a prompt should override.
+                        pending_skill = Some(wrapped_body);
+                        chat.push_user(format!("/{skill_name}"));
+                        chat.ingest(AgentEvent::AssistantMessageDone {
+                            text: format!(
+                                "Skill `{skill_name}` queued. Send your request to apply it."
+                            ),
+                        });
+                    }
+                    AppEvent::Submit(raw_prompt) => {
                         // Refuse a second prompt while a turn is still in flight.
                         // The Responses API gives no clean way to interleave two
                         // running turns on the same session, and we don't want to
@@ -191,7 +221,12 @@ pub async fn run(
                             });
                             continue;
                         }
-                        chat.push_user(prompt.clone());
+                        // Flush any queued skill activation into this prompt.
+                        // The chat shows the user's typed text untouched; the
+                        // wrapped SKILL.md goes only into the model-facing
+                        // payload so the scrollback stays readable.
+                        let prompt = prepend_pending_skill(pending_skill.take(), &raw_prompt);
+                        chat.push_user(raw_prompt);
                         turn_started_at = Some(Instant::now());
                         let transport = Arc::clone(&transport);
                         let args = args.clone();
@@ -199,6 +234,7 @@ pub async fn run(
                         let store = Arc::clone(&store);
                         let session_id = session_id.clone();
                         let tx = agent_tx.clone();
+                        let skills = Arc::clone(&skills);
                         // `take()` consumes the rebuilt transcript exactly once;
                         // otherwise every later prompt would resend the same
                         // pre-resume history.
@@ -216,6 +252,7 @@ pub async fn run(
                                 tx.clone(),
                                 Some(&binding),
                                 first_input,
+                                skills.as_ref(),
                             )
                             .await
                             {
@@ -245,7 +282,22 @@ pub async fn run(
                         bottom_pane::ComposerEvent::Submit(text) => {
                             if text == "/quit" { app_tx.send(AppEvent::Quit).ok(); }
                             else if text == "/clear" { app_tx.send(AppEvent::Clear).ok(); }
-                            else { app_tx.send(AppEvent::Submit(text)).ok(); }
+                            else {
+                                match classify_slash(&text, skills.as_ref()) {
+                                    SlashAction::NotASkill => {
+                                        app_tx.send(AppEvent::Submit(text)).ok();
+                                    }
+                                    SlashAction::Inline { prompt } => {
+                                        app_tx.send(AppEvent::Submit(prompt)).ok();
+                                    }
+                                    SlashAction::Queue { skill_name, wrapped_body } => {
+                                        app_tx.send(AppEvent::QueueSkill {
+                                            skill_name,
+                                            wrapped_body,
+                                        }).ok();
+                                    }
+                                }
+                            }
                         }
                         bottom_pane::ComposerEvent::Nothing | bottom_pane::ComposerEvent::Cancelled => {}
                     }
@@ -259,4 +311,169 @@ pub async fn run(
 fn spinner_frame(tick: u64) -> char {
     const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     FRAMES[(tick as usize) % FRAMES.len()]
+}
+
+/// Classifies a submitted composer line that may be a skill activation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SlashAction {
+    /// The text does not begin with a known `/<skill-name>` prefix.
+    NotASkill,
+    /// The user typed only `/<skill-name>` (no trailing request). The
+    /// wrapped body is queued and should be prepended to the *next* real
+    /// prompt rather than fired as its own turn. Storing the body in TUI
+    /// state is what makes activation actually persist — sending the body
+    /// as a standalone turn would not, since nav rebuilds each new
+    /// `run_agent` call without prior history.
+    Queue {
+        skill_name: String,
+        wrapped_body: String,
+    },
+    /// The user typed `/<skill-name> <request>`. The wrapped body and the
+    /// trailing request travel together as the immediate prompt for the
+    /// next turn.
+    Inline { prompt: String },
+}
+
+/// Classify `text`. If the leading token is `/<skill-name>` for a known
+/// skill, return how the activation should be handled. Returns
+/// [`SlashAction::NotASkill`] otherwise so the caller can pass the text
+/// through unchanged.
+///
+/// Wrapping uses a `<skill name="..." dir="...">` block so the model can
+/// both load the instructions and resolve relative resources against the
+/// skill's directory. Scripts, references, and assets referenced inside
+/// the SKILL.md are intentionally not read here — the model loads them on
+/// demand through its existing file-read tools.
+pub fn classify_slash(text: &str, skills: &Catalog) -> SlashAction {
+    let trimmed = text.trim_start();
+    let Some(first_token) = trimmed.split_whitespace().next() else {
+        return SlashAction::NotASkill;
+    };
+    let Some(skill_name) = first_token.strip_prefix('/') else {
+        return SlashAction::NotASkill;
+    };
+    let Some(skill) = skills.get(skill_name) else {
+        return SlashAction::NotASkill;
+    };
+
+    let body = std::fs::read_to_string(&skill.skill_md_path).unwrap_or_else(|err| {
+        format!(
+            "[nav: failed to read SKILL.md for `{}` at {}: {err}]",
+            skill.name,
+            skill.skill_md_path.display()
+        )
+    });
+    let wrapped_body = format!(
+        "<skill name=\"{name}\" dir=\"{dir}\">\n{body}\n</skill>",
+        name = skill.name,
+        dir = skill.skill_dir.display(),
+        body = body.trim_end()
+    );
+
+    let rest = trimmed[first_token.len()..].trim_start();
+    if rest.is_empty() {
+        SlashAction::Queue {
+            skill_name: skill.name.clone(),
+            wrapped_body,
+        }
+    } else {
+        SlashAction::Inline {
+            prompt: format!("{wrapped_body}\n\n{rest}\n"),
+        }
+    }
+}
+
+/// Merges a previously queued skill body with the user's next prompt. If
+/// `pending` is `Some`, it is prepended; otherwise `prompt` is returned
+/// as-is. Used by the TUI loop to flush the pending activation exactly
+/// once on the next real prompt.
+pub fn prepend_pending_skill(pending: Option<String>, prompt: &str) -> String {
+    match pending {
+        Some(body) => format!("{body}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nav_core::{Catalog, Skill, SkillScope};
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn catalog_with_skill(dir: &std::path::Path) -> Catalog {
+        let skill_dir = dir.join("foo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "---\nname: foo\ndescription: do foo\n---\nHere are instructions.\n",
+        )
+        .unwrap();
+        Catalog::new(vec![Skill {
+            name: "foo".into(),
+            description: "do foo".into(),
+            skill_md_path: skill_md,
+            skill_dir,
+            scope: SkillScope::Project,
+        }])
+    }
+
+    #[test]
+    fn classify_slash_queues_standalone_invocation() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        match classify_slash("/foo", &catalog) {
+            SlashAction::Queue {
+                skill_name,
+                wrapped_body,
+            } => {
+                assert_eq!(skill_name, "foo");
+                assert!(wrapped_body.contains("<skill name=\"foo\""));
+                assert!(wrapped_body.contains("Here are instructions."));
+                assert!(wrapped_body.trim_end().ends_with("</skill>"));
+            }
+            other => panic!("expected Queue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_slash_inlines_when_request_follows() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        match classify_slash("/foo please help with X", &catalog) {
+            SlashAction::Inline { prompt } => {
+                assert!(prompt.contains("</skill>"));
+                assert!(prompt.contains("please help with X"));
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_slash_passes_through_unknown_or_plain_text() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        assert!(matches!(
+            classify_slash("/bar", &catalog),
+            SlashAction::NotASkill
+        ));
+        assert!(matches!(
+            classify_slash("plain text", &catalog),
+            SlashAction::NotASkill
+        ));
+    }
+
+    #[test]
+    fn prepend_pending_skill_merges_body_with_prompt() {
+        let merged = prepend_pending_skill(Some("<skill>body</skill>".into()), "do X");
+        assert!(merged.starts_with("<skill>"));
+        assert!(merged.contains("do X"));
+    }
+
+    #[test]
+    fn prepend_pending_skill_returns_prompt_when_empty() {
+        let merged = prepend_pending_skill(None, "do X");
+        assert_eq!(merged, "do X");
+    }
 }

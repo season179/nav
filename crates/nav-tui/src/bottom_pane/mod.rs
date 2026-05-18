@@ -20,7 +20,7 @@ mod slash_popup;
 mod view;
 
 pub use composer::{Composer, ComposerEvent};
-pub use slash_popup::{SLASH_COMMANDS, SlashCommandPopup};
+pub use slash_popup::{BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries};
 pub use view::{BottomPaneView, InputResult};
 
 pub struct BottomPane {
@@ -31,14 +31,28 @@ pub struct BottomPane {
     /// submit the slash command as a plain prompt. Cleared once the
     /// composer no longer starts with `/`.
     slash_popup_suppressed: bool,
+    /// Slash entries surfaced by the popup. Combines built-in commands
+    /// with the discovered skills catalog and is rebuilt only when nav
+    /// starts, since the catalog is fixed for the process lifetime.
+    slash_entries: Vec<SlashEntry>,
 }
 
 impl BottomPane {
     pub fn new() -> Self {
+        Self::with_slash_entries(
+            BUILTIN_SLASH_COMMANDS
+                .iter()
+                .map(|cmd| SlashEntry::builtin(cmd))
+                .collect(),
+        )
+    }
+
+    pub fn with_slash_entries(slash_entries: Vec<SlashEntry>) -> Self {
         Self {
             composer: Composer::new(),
             view: None,
             slash_popup_suppressed: false,
+            slash_entries,
         }
     }
 
@@ -103,7 +117,7 @@ impl BottomPane {
 
         match (&mut self.view, slash_active) {
             (None, true) if !self.slash_popup_suppressed => {
-                let mut popup = SlashCommandPopup::new();
+                let mut popup = SlashCommandPopup::new(self.slash_entries.clone());
                 popup.on_composer_text_changed(first);
                 if !popup.is_complete() {
                     self.view = Some(BottomPaneView::SlashCommand(popup));

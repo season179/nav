@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, SessionBinding, SessionStore,
-    SessionSummary, auth, cli::Args, rebuild_responses_input, run_agent,
+    SessionSummary, auth, cli::Args, discover_skills, rebuild_responses_input, run_agent,
 };
 use std::env;
 use std::io::IsTerminal;
@@ -19,6 +19,10 @@ async fn main() -> Result<()> {
     let cwd = env::current_dir()?
         .canonicalize()
         .context("failed to canonicalize current directory")?;
+    // Skill discovery is locked to the process launch cwd. Anything that
+    // happens later (the TUI changing directories, tools resolving paths) sees
+    // the same catalog so the system prompt and slash popup never disagree.
+    let skills = Arc::new(discover_skills(&cwd));
     let store = Arc::new(SessionStore::open(args.db_path.clone())?);
     let (session_id, initial_input, resume_events) = match args.resume.as_deref() {
         Some(id) => {
@@ -52,6 +56,7 @@ async fn main() -> Result<()> {
             session_id,
             resume_events,
             initial_prompt,
+            skills,
         )
         .await;
     }
@@ -73,6 +78,7 @@ async fn main() -> Result<()> {
         tx,
         Some(&binding),
         initial_input,
+        skills.as_ref(),
     );
     let drainer = async {
         while let Some(event) = rx.recv().await {
