@@ -273,7 +273,7 @@ pub async fn run(
                     ctrl_c_count = 0;
                     match pane.handle_key(key) {
                         bottom_pane::ComposerEvent::Submit(text) => {
-                            if text == "/quit" { app_tx.send(AppEvent::Quit).ok(); }
+                            if text == "/quit" || text == "/exit" { app_tx.send(AppEvent::Quit).ok(); }
                             else if text == "/clear" { app_tx.send(AppEvent::Clear).ok(); }
                             else {
                                 match classify_slash(&text, skills.as_ref()) {

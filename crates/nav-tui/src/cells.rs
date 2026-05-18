@@ -118,7 +118,7 @@ impl HistoryCell for WelcomeCell {
                 dim,
             )),
             Line::from(vec![
-                Span::styled("    /quit", dim),
+                Span::styled("    /quit, /exit", dim),
                 Span::styled("      exit".to_string(), dim),
             ]),
             Line::from(vec![
