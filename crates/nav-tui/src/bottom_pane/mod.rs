@@ -6,6 +6,8 @@
 //! overlay sees the key first, and the composer only sees keys the overlay
 //! explicitly returns [`InputResult::Unhandled`] for.
 
+use std::sync::Arc;
+
 use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -31,23 +33,19 @@ pub struct BottomPane {
     /// submit the slash command as a plain prompt. Cleared once the
     /// composer no longer starts with `/`.
     slash_popup_suppressed: bool,
-    /// Slash entries surfaced by the popup. Combines built-in commands
-    /// with the discovered skills catalog and is rebuilt only when nav
-    /// starts, since the catalog is fixed for the process lifetime.
-    slash_entries: Vec<SlashEntry>,
+    slash_entries: Arc<[SlashEntry]>,
 }
 
 impl BottomPane {
     pub fn new() -> Self {
-        Self::with_slash_entries(
-            BUILTIN_SLASH_COMMANDS
-                .iter()
-                .map(|cmd| SlashEntry::builtin(cmd))
-                .collect(),
-        )
+        let entries: Vec<SlashEntry> = BUILTIN_SLASH_COMMANDS
+            .iter()
+            .map(|cmd| SlashEntry::builtin(cmd))
+            .collect();
+        Self::with_slash_entries(entries.into())
     }
 
-    pub fn with_slash_entries(slash_entries: Vec<SlashEntry>) -> Self {
+    pub fn with_slash_entries(slash_entries: Arc<[SlashEntry]>) -> Self {
         Self {
             composer: Composer::new(),
             view: None,
@@ -117,7 +115,7 @@ impl BottomPane {
 
         match (&mut self.view, slash_active) {
             (None, true) if !self.slash_popup_suppressed => {
-                let mut popup = SlashCommandPopup::new(self.slash_entries.clone());
+                let mut popup = SlashCommandPopup::new(Arc::clone(&self.slash_entries));
                 popup.on_composer_text_changed(first);
                 if !popup.is_complete() {
                     self.view = Some(BottomPaneView::SlashCommand(popup));

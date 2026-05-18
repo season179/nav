@@ -53,8 +53,8 @@ fn build_instructions(cwd: &Path, skills: &Catalog) -> String {
     if !skills.is_empty() {
         out.push_str("\n\nAvailable skills:\n");
         for skill in skills.iter() {
-            // The model resolves skills via the existing file-read tool. Use
-            // absolute paths here so it does not have to guess about cwd.
+            // Absolute paths: the model loads these via the read_file tool,
+            // which now accepts paths under any catalog skill_dir.
             let _ = writeln!(
                 out,
                 "- {name} [{scope}]: {description} (SKILL.md: {path}, skill_dir: {dir})",

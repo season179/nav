@@ -19,9 +19,8 @@ async fn main() -> Result<()> {
     let cwd = env::current_dir()?
         .canonicalize()
         .context("failed to canonicalize current directory")?;
-    // Skill discovery is locked to the process launch cwd. Anything that
-    // happens later (the TUI changing directories, tools resolving paths) sees
-    // the same catalog so the system prompt and slash popup never disagree.
+    // Locked to launch cwd so the system prompt and slash popup never
+    // disagree if the TUI later moves around.
     let skills = Arc::new(discover_skills(&cwd));
     let store = Arc::new(SessionStore::open(args.db_path.clone())?);
     let (session_id, initial_input, resume_events) = match args.resume.as_deref() {

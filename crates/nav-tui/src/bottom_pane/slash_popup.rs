@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -28,19 +30,21 @@ impl SlashEntry {
 }
 
 /// Overlay that filters [`SlashEntry`] entries by composer-buffer prefix and
-/// lets the user pick one with Tab / Enter. The entry list combines built-in
-/// commands with the discovered skills catalog (one entry per skill).
+/// lets the user pick one with Tab / Enter. Entries are shared via `Arc` so
+/// opening the popup is a refcount bump, and matches are tracked as indices
+/// into that shared slice — keystroke filtering and the ~12 Hz render path
+/// never clone an entry.
 pub struct SlashCommandPopup {
-    entries: Vec<SlashEntry>,
+    entries: Arc<[SlashEntry]>,
     filter: String,
-    matches: Vec<SlashEntry>,
+    matches: Vec<usize>,
     selected: usize,
     completed: bool,
 }
 
 impl SlashCommandPopup {
-    pub fn new(entries: Vec<SlashEntry>) -> Self {
-        let matches = entries.clone();
+    pub fn new(entries: Arc<[SlashEntry]>) -> Self {
+        let matches = (0..entries.len()).collect();
         Self {
             entries,
             filter: String::from("/"),
@@ -50,8 +54,8 @@ impl SlashCommandPopup {
         }
     }
 
-    pub fn matches(&self) -> &[SlashEntry] {
-        &self.matches
+    pub fn matches(&self) -> Vec<&SlashEntry> {
+        self.matches.iter().map(|&i| &self.entries[i]).collect()
     }
 
     pub fn filter(&self) -> &str {
@@ -72,23 +76,24 @@ impl SlashCommandPopup {
         }
         let bg = Style::default().bg(crate::theme::POPUP_BG);
         Block::default().style(bg).render(area, buf);
-        let lines: Vec<Line<'static>> = self
+        let lines: Vec<Line<'_>> = self
             .matches
             .iter()
             .enumerate()
-            .map(|(i, entry)| {
-                let row_style = if i == self.selected {
+            .map(|(row, &entry_idx)| {
+                let entry = &self.entries[entry_idx];
+                let row_style = if row == self.selected {
                     bg.fg(Color::Cyan).add_modifier(Modifier::BOLD)
                 } else {
                     bg.fg(Color::Gray)
                 };
                 let mut spans = vec![
                     Span::styled("  ", row_style),
-                    Span::styled(entry.command.clone(), row_style),
+                    Span::styled(entry.command.as_str(), row_style),
                 ];
-                if let Some(desc) = entry.description.as_ref() {
+                if let Some(desc) = entry.description.as_deref() {
                     spans.push(Span::styled("  ", row_style));
-                    spans.push(Span::styled(desc.clone(), bg.fg(Color::DarkGray)));
+                    spans.push(Span::styled(desc, bg.fg(Color::DarkGray)));
                 }
                 Line::from(spans)
             })
@@ -135,33 +140,31 @@ impl SlashCommandPopup {
     }
 
     fn try_complete(&mut self, composer: &mut Composer) -> InputResult {
-        let Some(entry) = self.matches.get(self.selected) else {
+        let Some(&entry_idx) = self.matches.get(self.selected) else {
             return InputResult::Unhandled;
         };
-        composer.set_text(&entry.command);
+        composer.set_text(&self.entries[entry_idx].command);
         self.completed = true;
         InputResult::Handled
     }
 
     fn refilter(&mut self) {
-        self.matches = self
-            .entries
-            .iter()
-            .filter(|entry| entry.command.starts_with(&self.filter))
-            .cloned()
-            .collect();
+        self.matches.clear();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.command.starts_with(&self.filter) {
+                self.matches.push(idx);
+            }
+        }
         if self.selected >= self.matches.len() {
             self.selected = 0;
         }
     }
 }
 
-/// Build the combined entry list used by the slash popup.
-///
-/// Built-in commands come first, followed by one entry per skill keyed as
-/// `/<skill-name>` with the skill's description shown to the right of the
-/// command name.
-pub fn build_slash_entries(skills: &nav_core::Catalog) -> Vec<SlashEntry> {
+/// Build the combined slash entry list shared by every popup instance.
+/// Built-ins come first, then one entry per skill keyed as `/<skill-name>`
+/// with the skill's description shown alongside.
+pub fn build_slash_entries(skills: &nav_core::Catalog) -> Arc<[SlashEntry]> {
     let mut entries: Vec<SlashEntry> = BUILTIN_SLASH_COMMANDS
         .iter()
         .map(|cmd| SlashEntry::builtin(cmd))
@@ -172,7 +175,7 @@ pub fn build_slash_entries(skills: &nav_core::Catalog) -> Vec<SlashEntry> {
             description: Some(skill.description.clone()),
         });
     }
-    entries
+    entries.into()
 }
 
 #[cfg(test)]

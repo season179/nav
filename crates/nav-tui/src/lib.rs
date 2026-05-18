@@ -44,11 +44,8 @@ enum AppEvent {
     Submit(String),
     Quit,
     Clear,
-    /// Standalone `/<skill>` submission — the wrapped SKILL.md body is held
-    /// in TUI state and flushed onto the next real prompt. We carry both
-    /// the user-facing label (just the skill name) and the body to inject
-    /// so the chat shows a clear "queued" notice without leaking the full
-    /// wrapped block into history.
+    /// Standalone `/<skill>` — the wrapped body is held until the next
+    /// non-slash prompt rather than fired as its own turn.
     QueueSkill {
         skill_name: String,
         wrapped_body: String,
@@ -132,11 +129,9 @@ pub async fn run(
     }
     let mut pane = bottom_pane::BottomPane::with_slash_entries(slash_entries);
     let mut ctrl_c_count = 0u8;
-    // Holds the wrapped `<skill …>…</skill>` body from a standalone
-    // `/<skill>` submission. Flushed onto the next non-slash prompt so the
-    // model actually sees the skill body in the same turn as the user
-    // request that needs it (per-turn `run_agent` calls don't replay prior
-    // user prompts).
+    // Each `run_agent` call is independent of prior turns, so a standalone
+    // `/<skill>` cannot persist on its own — we hold its wrapped body here
+    // and prepend it onto the next non-slash prompt.
     let mut pending_skill: Option<String> = None;
     let mut turn_started_at: Option<Instant> = None;
     let mut spinner_tick: u64 = 0;
@@ -221,10 +216,8 @@ pub async fn run(
                             });
                             continue;
                         }
-                        // Flush any queued skill activation into this prompt.
-                        // The chat shows the user's typed text untouched; the
-                        // wrapped SKILL.md goes only into the model-facing
-                        // payload so the scrollback stays readable.
+                        // Scrollback shows the typed text; the wrapped SKILL.md
+                        // goes only to the model-facing payload.
                         let prompt = prepend_pending_skill(pending_skill.take(), &raw_prompt);
                         chat.push_user(raw_prompt);
                         turn_started_at = Some(Instant::now());
@@ -313,37 +306,27 @@ fn spinner_frame(tick: u64) -> char {
     FRAMES[(tick as usize) % FRAMES.len()]
 }
 
-/// Classifies a submitted composer line that may be a skill activation.
+/// Classification of a submitted composer line that may be a skill activation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SlashAction {
-    /// The text does not begin with a known `/<skill-name>` prefix.
     NotASkill,
-    /// The user typed only `/<skill-name>` (no trailing request). The
-    /// wrapped body is queued and should be prepended to the *next* real
-    /// prompt rather than fired as its own turn. Storing the body in TUI
-    /// state is what makes activation actually persist — sending the body
-    /// as a standalone turn would not, since nav rebuilds each new
-    /// `run_agent` call without prior history.
+    /// Standalone `/<skill-name>`. The wrapped body should be queued and
+    /// prepended to the next real prompt — sending it as its own turn would
+    /// be lost, since each `run_agent` call replays no prior history.
     Queue {
         skill_name: String,
         wrapped_body: String,
     },
-    /// The user typed `/<skill-name> <request>`. The wrapped body and the
-    /// trailing request travel together as the immediate prompt for the
-    /// next turn.
-    Inline { prompt: String },
+    /// `/<skill-name> <request>` — wrap and request travel together.
+    Inline {
+        prompt: String,
+    },
 }
 
-/// Classify `text`. If the leading token is `/<skill-name>` for a known
-/// skill, return how the activation should be handled. Returns
-/// [`SlashAction::NotASkill`] otherwise so the caller can pass the text
-/// through unchanged.
-///
-/// Wrapping uses a `<skill name="..." dir="...">` block so the model can
-/// both load the instructions and resolve relative resources against the
-/// skill's directory. Scripts, references, and assets referenced inside
-/// the SKILL.md are intentionally not read here — the model loads them on
-/// demand through its existing file-read tools.
+/// Wraps the leading `/<skill-name>` (if any) in a `<skill name=… dir=…>`
+/// block so the model can load instructions and resolve relative resources
+/// against the skill's directory. Scripts/references inside the SKILL.md
+/// are not read here — the model loads them on demand.
 pub fn classify_slash(text: &str, skills: &Catalog) -> SlashAction {
     let trimmed = text.trim_start();
     let Some(first_token) = trimmed.split_whitespace().next() else {
@@ -383,10 +366,6 @@ pub fn classify_slash(text: &str, skills: &Catalog) -> SlashAction {
     }
 }
 
-/// Merges a previously queued skill body with the user's next prompt. If
-/// `pending` is `Some`, it is prepended; otherwise `prompt` is returned
-/// as-is. Used by the TUI loop to flush the pending activation exactly
-/// once on the next real prompt.
 pub fn prepend_pending_skill(pending: Option<String>, prompt: &str) -> String {
     match pending {
         Some(body) => format!("{body}\n\n{prompt}"),

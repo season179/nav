@@ -14,4 +14,4 @@ pub use responses::OpenAiTransport;
 pub use session::{
     PROVIDER_OPENAI_RESPONSES, ReportedCost, SessionId, SessionStore, SessionSummary,
 };
-pub use skills::{Catalog, Skill, SkillScope, discover_skills, discover_skills_with_roots};
+pub use skills::{Catalog, Skill, SkillScope, discover_skills};

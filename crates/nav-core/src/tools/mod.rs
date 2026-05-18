@@ -3,7 +3,7 @@ mod shell;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::skills::Catalog;
 
@@ -85,16 +85,12 @@ pub async fn run_tool(
 ) -> Result<String> {
     // central dispatch keeps the trust boundary obvious. The model asks;
     // this Rust match decides exactly which local capability is allowed.
-    //
-    // Skill directories are accepted as additional read roots so the model
-    // can load `SKILL.md` files (and any references the skill author lists)
-    // by the absolute paths it sees in the system-prompt catalog. Writes
-    // (`edit_file`) are intentionally still workspace-only — skills are
-    // input to the agent, not its output surface.
-    let skill_dirs: Vec<PathBuf> = skills.iter().map(|skill| skill.skill_dir.clone()).collect();
+    // Skill directories are accepted as extra read roots; writes
+    // (`edit_file`) stay workspace-only.
+    let skill_dirs = skills.skill_dirs();
     match name {
-        "read_file" => fs::read_file(cwd, &skill_dirs, string_arg(&input, "path")?),
-        "list_files" => fs::list_files(cwd, &skill_dirs, string_arg(&input, "path")?),
+        "read_file" => fs::read_file(cwd, skill_dirs, string_arg(&input, "path")?),
+        "list_files" => fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?),
         "bash" => shell::bash(cwd, timeout_secs, string_arg(&input, "command")?).await,
         "edit_file" => fs::edit_file(
             cwd,
@@ -105,7 +101,7 @@ pub async fn run_tool(
         "code_search" => {
             fs::code_search(
                 cwd,
-                &skill_dirs,
+                skill_dirs,
                 string_arg(&input, "pattern")?,
                 string_arg(&input, "path")?,
             )

@@ -46,11 +46,14 @@ impl SkillScope {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
     skills: Vec<Skill>,
+    // Cached so `run_tool` does not rebuild the allow-list on every dispatch.
+    skill_dirs: Vec<PathBuf>,
 }
 
 impl Catalog {
     pub fn new(skills: Vec<Skill>) -> Self {
-        Self { skills }
+        let skill_dirs = skills.iter().map(|s| s.skill_dir.clone()).collect();
+        Self { skills, skill_dirs }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -69,8 +72,11 @@ impl Catalog {
         self.skills.iter().find(|s| s.name == name)
     }
 
-    pub fn as_slice(&self) -> &[Skill] {
-        &self.skills
+    /// Canonical `skill_dir` paths in catalog order. Used as the read
+    /// allow-list for fs tools so absolute paths advertised in the system
+    /// prompt are actually resolvable.
+    pub fn skill_dirs(&self) -> &[PathBuf] {
+        &self.skill_dirs
     }
 }
 
@@ -101,13 +107,7 @@ fn find_project_skills_root(start: &Path, user_root: Option<&Path>) -> Option<Pa
 }
 
 fn candidate_matches_user_root(candidate: &Path, user_root_canonical: Option<&Path>) -> bool {
-    let Some(user_root) = user_root_canonical else {
-        return false;
-    };
-    match candidate.canonicalize() {
-        Ok(canon) => canon == user_root,
-        Err(_) => candidate == user_root,
-    }
+    user_root_canonical.is_some_and(|root| canonicalize_or_self(candidate) == root)
 }
 
 /// Returns the user-scope skills root, `~/.agents/skills/`, if a home
@@ -235,21 +235,19 @@ fn load_skill(skill_dir: &Path, skill_md_path: &Path, scope: SkillScope) -> Resu
         );
     }
 
-    // Canonicalize so downstream guards that compare against `skill_dir`
-    // (e.g. fs tools accepting absolute paths under known skill roots) match
-    // even when `$HOME` or another ancestor is a symlink.
-    let skill_dir_canonical = skill_dir.canonicalize().unwrap_or(skill_dir.to_path_buf());
-    let skill_md_canonical = skill_md_path
-        .canonicalize()
-        .unwrap_or(skill_md_path.to_path_buf());
-
+    // Canonicalize so downstream fs guards still accept these paths when
+    // `$HOME` or another ancestor is a symlink.
     Ok(Skill {
         name,
         description,
-        skill_md_path: skill_md_canonical,
-        skill_dir: skill_dir_canonical,
+        skill_md_path: canonicalize_or_self(skill_md_path),
+        skill_dir: canonicalize_or_self(skill_dir),
         scope,
     })
+}
+
+fn canonicalize_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Extracts the YAML body between leading `---` fences. Returns `None` if the

@@ -10,36 +10,24 @@ fn resolve_inside(root: &Path, requested: &str) -> Result<PathBuf> {
 }
 
 /// Resolve a requested path against `root` (for relative paths) or against
-/// `root` plus any of `extra_roots` (for absolute paths). `extra_roots` is
-/// used by skill-aware reads so the model can load files listed in the
-/// system-prompt catalog via their absolute `skill_dir` paths without
-/// loosening workspace isolation for relative paths.
+/// any of `extra_roots` (for absolute paths). Skill-aware reads pass
+/// `Catalog::skill_dirs` here so the model can load files advertised in the
+/// system-prompt catalog without loosening the relative-path guard.
 fn resolve_under(root: &Path, extra_roots: &[PathBuf], requested: &str) -> Result<PathBuf> {
     debug_assert_is_canonical(root);
-    if requested.is_empty() {
-        bail!("path is required");
-    }
-    let path = Path::new(requested);
-    if path.is_absolute() {
-        let resolved = path
+    if Path::new(requested).is_absolute() {
+        let resolved = Path::new(requested)
             .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", path.display()))?;
-        for allowed in extra_roots {
-            if resolved.starts_with(allowed) {
-                return Ok(resolved);
-            }
+            .with_context(|| format!("failed to canonicalize {requested}"))?;
+        if extra_roots.iter().any(|root| resolved.starts_with(root)) {
+            return Ok(resolved);
         }
         bail!(
             "absolute paths are only allowed under a known skill directory: {}",
             resolved.display()
         );
     }
-    if path
-        .components()
-        .any(|part| matches!(part, Component::ParentDir))
-    {
-        bail!("parent directory traversal is not allowed");
-    }
+    let path = relative_path(requested)?;
     let joined = root.join(path);
     let resolved = joined
         .canonicalize()
