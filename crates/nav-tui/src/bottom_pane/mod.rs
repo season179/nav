@@ -128,11 +128,17 @@ impl BottomPane {
         }
 
         // 2) Pasted text that resolves to an existing image file (e.g. drag
-        //    from Finder pastes a `file://...` URL). Strip the prefix and
-        //    insert verbatim so the agent sees the canonical path.
+        //    from Finder pastes a `file://...` URL). The agent's `read_file`
+        //    only accepts workspace-relative paths, so we relativize when the
+        //    source is already under cwd and otherwise copy it into
+        //    `.nav/clipboard/` like a clipboard blob — inserting an absolute
+        //    `/Users/.../foo.png` would render and submit fine but the agent
+        //    couldn't read it.
         let trimmed = text.trim();
-        if let Some(cleaned) = recognized_image_path(trimmed) {
-            self.composer.insert_paste(&cleaned);
+        if let Some(cleaned) = recognized_image_path(trimmed)
+            && let Some(rel) = workspace_relative_image(&self.cwd, &cleaned)
+        {
+            self.composer.insert_paste(&rel);
             self.reconcile_popups();
             return;
         }
@@ -310,6 +316,30 @@ fn try_save_clipboard_image(cwd: &Path) -> Option<String> {
     Some(rel.to_string_lossy().into_owned())
 }
 
+/// Turn a pasted-image absolute or relative path into a workspace-relative
+/// path the agent can actually `read_file`. Already-relative inputs pass
+/// through; absolute paths inside `cwd` get relativized; absolute paths
+/// outside the workspace are copied into `<cwd>/.nav/clipboard/` so the read
+/// sandbox can reach them. Returns `None` if all three fail (rare — usually
+/// permission errors on the copy).
+fn workspace_relative_image(cwd: &Path, cleaned: &str) -> Option<String> {
+    let path = Path::new(cleaned);
+    if path.is_relative() {
+        return Some(cleaned.to_string());
+    }
+    if let Ok(rel) = path.strip_prefix(cwd) {
+        return Some(rel.to_string_lossy().into_owned());
+    }
+    let dir = cwd.join(".nav").join("clipboard");
+    std::fs::create_dir_all(&dir).ok()?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    let filename = format!("{}.{ext}", uuid::Uuid::new_v4().simple());
+    let dest = dir.join(&filename);
+    std::fs::copy(path, &dest).ok()?;
+    let rel = PathBuf::from(".nav").join("clipboard").join(filename);
+    Some(rel.to_string_lossy().into_owned())
+}
+
 /// If `s` looks like a path to a readable image file, return the cleaned
 /// path (with any `file://` prefix removed). The check is intentionally
 /// cheap — extension match against `image::ImageFormat` + a single
@@ -415,5 +445,44 @@ mod tests {
         assert_eq!(recognized_image_path(&path_str), Some(path_str.clone()));
         let file_url = format!("file://{}", path_str);
         assert_eq!(recognized_image_path(&file_url), Some(path_str));
+    }
+
+    fn write_png(path: &Path) {
+        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+        image::DynamicImage::ImageRgba8(img)
+            .save_with_format(path, image::ImageFormat::Png)
+            .unwrap();
+    }
+
+    #[test]
+    fn workspace_relative_passes_relative_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = workspace_relative_image(dir.path(), "screenshots/foo.png").unwrap();
+        assert_eq!(out, "screenshots/foo.png");
+    }
+
+    #[test]
+    fn workspace_relative_strips_cwd_prefix_for_in_workspace_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a").join("b.png");
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        write_png(&png);
+        let out = workspace_relative_image(dir.path(), &png.to_string_lossy()).unwrap();
+        assert_eq!(out, "a/b.png");
+    }
+
+    #[test]
+    fn workspace_relative_copies_external_path_into_clipboard_dir() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = src_dir.path().join("outside.png");
+        write_png(&src);
+
+        let cwd = tempfile::tempdir().unwrap();
+        let out = workspace_relative_image(cwd.path(), &src.to_string_lossy()).unwrap();
+        assert!(
+            out.starts_with(".nav/clipboard/") && out.ends_with(".png"),
+            "expected workspace-relative copy, got {out:?}"
+        );
+        assert!(cwd.path().join(&out).exists());
     }
 }

@@ -48,9 +48,29 @@ async fn main() -> Result<()> {
         .build()?;
     let transport = Arc::new(OpenAiTransport::new(client, auth_config, args.transport));
 
+    // Drain piped stdin up-front so it works regardless of which mode we end
+    // up in — interactive TUI (`cat prompt.txt | nav` seeds the composer with
+    // the file contents) or one-shot NDJSON (`echo … | nav --json-events`).
+    // Without this, the TTY-based branch below returns first and silently
+    // drops the pipe. Mirrors codex `exec`'s OptionalAppend/RequiredIfPiped.
+    let stdin_prompt = if std::io::stdin().is_terminal() {
+        None
+    } else {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read prompt from stdin")?;
+        let trimmed = buf.trim_end_matches(['\n', '\r']).to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    };
+
     let is_tty = std::io::stdout().is_terminal();
     if is_tty && !args.json_events {
-        let initial_prompt = (!args.prompt.is_empty()).then(|| args.prompt.join(" "));
+        let initial_prompt = if !args.prompt.is_empty() {
+            Some(args.prompt.join(" "))
+        } else {
+            stdin_prompt
+        };
         return nav_tui::run(
             transport,
             args,
@@ -64,25 +84,12 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    let prompt = if args.prompt.is_empty() {
-        // Non-interactive mode with no positional prompt: if stdin is piped
-        // (not a TTY), consume it as the prompt. Matches codex `exec` and pi's
-        // `readPipedStdin` behavior. If stdin is also a TTY there is no input
-        // source, so keep the existing hard-fail.
-        if std::io::stdin().is_terminal() {
-            bail!("provide a prompt for non-interactive mode, e.g. nav \"list the files\"");
-        }
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .context("failed to read prompt from stdin")?;
-        let trimmed = buf.trim_end_matches(['\n', '\r']).to_string();
-        if trimmed.is_empty() {
-            bail!("empty prompt from stdin; pass a prompt argument or pipe non-empty input");
-        }
-        trimmed
-    } else {
+    let prompt = if !args.prompt.is_empty() {
         args.prompt.join(" ")
+    } else if let Some(piped) = stdin_prompt {
+        piped
+    } else {
+        bail!("provide a prompt for non-interactive mode, e.g. nav \"list the files\"");
     };
     let binding = SessionBinding {
         store: store.as_ref(),
