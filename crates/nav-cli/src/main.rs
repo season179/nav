@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
         &cwd,
         &prompt,
         None,
+        Vec::new(),
         tx,
         Some(&binding),
         initial_input,

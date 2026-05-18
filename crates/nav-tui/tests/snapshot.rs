@@ -52,6 +52,7 @@ fn wrapped_skill_prompt_renders_as_skill_then_user_request() {
     widget.ingest(AgentEvent::UserMessage {
         text: "<skill name=\"zoom-out\" dir=\"/Users/season/.agents/skills/zoom-out\">\nSkill body\n</skill>\n\nInspect the TUI modules.".to_string(),
         display_text: None,
+        attachments: Vec::new(),
     });
 
     let rendered = render_widget(&widget, 90, 10);
@@ -72,6 +73,7 @@ fn wrapped_skill_prompt_uses_outer_closing_tag() {
     widget.ingest(AgentEvent::UserMessage {
         text: "<skill name=\"zoom-out\" dir=\"/Users/season/.agents/skills/zoom-out\">\nDo not render this literal </skill> mention.\n</skill>\n\nInspect the TUI modules.".to_string(),
         display_text: None,
+        attachments: Vec::new(),
     });
 
     let rendered = render_widget(&widget, 90, 10);
@@ -91,6 +93,7 @@ fn literal_skill_xml_without_nav_dir_attribute_stays_user_text() {
     widget.ingest(AgentEvent::UserMessage {
         text: "<skill name=\"literal\">\nbody\n</skill>\n\nExplain this tag.".to_string(),
         display_text: None,
+        attachments: Vec::new(),
     });
 
     let rendered = render_widget(&widget, 90, 10);

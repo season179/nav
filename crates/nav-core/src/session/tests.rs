@@ -98,6 +98,7 @@ fn round_trip_create_append_load() {
         AgentEvent::UserMessage {
             text: "hi".into(),
             display_text: None,
+            attachments: Vec::new(),
         },
         AgentEvent::AssistantMessageDone {
             text: "hello".into(),

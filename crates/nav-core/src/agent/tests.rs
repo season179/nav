@@ -127,6 +127,7 @@ fn rebuild_responses_input_replays_user_text_not_display_text() {
         AgentEvent::UserMessage {
             text: "model-facing prompt".into(),
             display_text: Some("visible prompt".into()),
+            attachments: Vec::new(),
         },
         AgentEvent::AssistantMessageDone {
             text: "assistant reply".into(),
@@ -143,6 +144,7 @@ fn rebuild_responses_input_skips_tool_events() {
         AgentEvent::UserMessage {
             text: "inspect".into(),
             display_text: None,
+            attachments: Vec::new(),
         },
         AgentEvent::ToolCallStarted {
             call_id: "call_1".into(),
@@ -228,6 +230,7 @@ async fn run_agent_emits_single_error_when_transport_create_fails() {
         &cwd,
         "hello",
         None,
+        Vec::new(),
         tx,
         None,
         None,
@@ -305,6 +308,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         &cwd,
         "do the thing",
         None,
+        Vec::new(),
         tx,
         None,
         None,
@@ -324,7 +328,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
     assert!(
         matches!(
             events.first(),
-            Some(AgentEvent::UserMessage { text, display_text })
+            Some(AgentEvent::UserMessage { text, display_text, .. })
                 if text == "do the thing" && display_text.is_none()
         ),
         "unexpected first event: {:?}",
@@ -495,6 +499,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         &cwd,
         "first",
         None,
+        Vec::new(),
         tx1,
         Some(&binding_one),
         None,
@@ -543,6 +548,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         &cwd,
         "second",
         None,
+        Vec::new(),
         tx2,
         Some(&binding_two),
         Some(rebuilt),
@@ -591,4 +597,79 @@ async fn resume_replays_transcript_and_appends_new_events() {
         .filter(|e| matches!(e, AgentEvent::TurnComplete { .. }))
         .count();
     assert_eq!(turn_completes, 2);
+}
+
+#[tokio::test]
+async fn user_message_with_image_attachment_is_sent_as_input_image_content() {
+    use base64::Engine;
+    use std::path::PathBuf;
+
+    // Minimal turn: assistant replies with a plain message so the agent loop
+    // terminates after one round-trip without invoking tools.
+    let turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}],
+            },
+        }),
+        json!({"type": "response.completed", "response": {"usage": {}}}),
+    ];
+    let transport = StubTransport::new(vec![turn]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 1;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\nFAKEBYTES";
+    let rel = PathBuf::from("paste.png");
+    std::fs::write(cwd.join(&rel), png_bytes).unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "describe this",
+        None,
+        vec![UserAttachment::Image { path: rel }],
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+    )
+    .await
+    .expect("run_agent");
+    drop(rx.recv().await);
+    while rx.recv().await.is_some() {}
+
+    // The first request body's `input[0]` should be a user message whose
+    // content is an array containing both `input_text` and `input_image`.
+    let body = transport.bodies().remove(0);
+    let input = body.get("input").and_then(Value::as_array).expect("input");
+    let first = input.first().expect("first input item");
+    let content = first
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("content should be an array when attachments are present");
+    let parts: Vec<&str> = content
+        .iter()
+        .filter_map(|p| p.get("type").and_then(Value::as_str))
+        .collect();
+    assert!(parts.contains(&"input_text"), "missing input_text: {parts:?}");
+    assert!(parts.contains(&"input_image"), "missing input_image: {parts:?}");
+    let image_part = content
+        .iter()
+        .find(|p| p.get("type").and_then(Value::as_str) == Some("input_image"))
+        .expect("image part");
+    let url = image_part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .expect("image_url");
+    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    assert!(
+        url.starts_with("data:image/png;base64,") && url.contains(&expected_b64),
+        "unexpected image_url: {url}"
+    );
 }

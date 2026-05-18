@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use nav_core::{
-    AgentEvent, Catalog, OpenAiTransport, SessionBinding, SessionId, SessionStore, cli::Args,
-    rebuild_responses_input, run_agent,
+    AgentEvent, Catalog, OpenAiTransport, SessionBinding, SessionId, SessionStore, UserAttachment,
+    cli::Args, rebuild_responses_input, run_agent,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ pub(crate) struct TurnSpawn<'a> {
     pub session_id: SessionId,
     pub raw_prompt: String,
     pub pending_skill: Option<&'a str>,
+    pub attachments: Vec<UserAttachment>,
     pub agent_tx: mpsc::UnboundedSender<AgentEvent>,
     pub skills: Arc<Catalog>,
 }
@@ -40,6 +41,7 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
         cwd,
         store,
         session_id,
+        attachments,
         agent_tx,
         skills,
         ..
@@ -56,6 +58,7 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
             &cwd,
             &prompt,
             Some(&display_prompt),
+            attachments,
             agent_tx.clone(),
             Some(&binding),
             history_input,

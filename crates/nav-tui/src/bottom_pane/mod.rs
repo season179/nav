@@ -122,6 +122,7 @@ impl BottomPane {
         if text.trim().is_empty()
             && let Some(rel) = try_save_clipboard_image(&self.cwd)
         {
+            self.composer.push_pending_image(PathBuf::from(&rel));
             self.composer.insert_paste(&rel);
             self.reconcile_popups();
             return;
@@ -138,6 +139,7 @@ impl BottomPane {
         if let Some(cleaned) = recognized_image_path(trimmed)
             && let Some(rel) = workspace_relative_image(&self.cwd, &cleaned)
         {
+            self.composer.push_pending_image(PathBuf::from(&rel));
             self.composer.insert_paste(&rel);
             self.reconcile_popups();
             return;

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -10,8 +12,13 @@ use ratatui::widgets::{Paragraph, Widget};
 pub enum ComposerEvent {
     Nothing,
     /// Enter pressed on a non-empty buffer. The buffer has already been
-    /// cleared and the prompt pushed onto history.
-    Submit(String),
+    /// cleared and the prompt pushed onto history. `images` carries any
+    /// workspace-relative image paths queued by paste events during the
+    /// composing session — drained at submit so the next prompt starts fresh.
+    Submit {
+        text: String,
+        images: Vec<PathBuf>,
+    },
     Cancelled,
 }
 
@@ -35,6 +42,9 @@ pub struct Composer {
     /// lives in the composer buffer until [`Composer::submit`] swaps each one
     /// back to its original content. Cleared on every successful submit.
     pending_pastes: Vec<(String, String)>,
+    /// Workspace-relative paths of image attachments accumulated by paste
+    /// events. Drained on submit and surfaced via [`ComposerEvent::Submit`].
+    pending_images: Vec<PathBuf>,
 }
 
 impl Composer {
@@ -47,7 +57,16 @@ impl Composer {
             history_idx: None,
             pending_draft: None,
             pending_pastes: Vec::new(),
+            pending_images: Vec::new(),
         }
+    }
+
+    /// Queue a workspace-relative image path as an attachment to the next
+    /// submit. Called by `BottomPane::on_paste` when an image was saved into
+    /// the workspace; the path is also inserted into the visible buffer so
+    /// the user can edit around it.
+    pub fn push_pending_image(&mut self, path: PathBuf) {
+        self.pending_images.push(path);
     }
 
     pub fn text(&self) -> String {
@@ -208,7 +227,7 @@ impl Composer {
                 ComposerEvent::Nothing
             }
             (KeyCode::Enter, _) => match self.submit() {
-                Some(text) => ComposerEvent::Submit(text),
+                Some((text, images)) => ComposerEvent::Submit { text, images },
                 None => ComposerEvent::Nothing,
             },
             (KeyCode::Esc, _) => ComposerEvent::Cancelled,
@@ -458,7 +477,7 @@ impl Composer {
         }
     }
 
-    fn submit(&mut self) -> Option<String> {
+    fn submit(&mut self) -> Option<(String, Vec<PathBuf>)> {
         if self.lines.iter().all(String::is_empty) {
             return None;
         }
@@ -473,7 +492,8 @@ impl Composer {
         self.history_idx = None;
         self.pending_draft = None;
         self.pending_pastes.clear();
-        Some(expanded)
+        let images = std::mem::take(&mut self.pending_images);
+        Some((expanded, images))
     }
 
     fn expand_pending_pastes(&self, buf: &str) -> String {
@@ -589,7 +609,7 @@ mod tests {
         );
         assert_eq!(c.pending_pastes.len(), 1);
 
-        let ComposerEvent::Submit(expanded) = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text: expanded, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         assert_eq!(expanded, big);
@@ -609,7 +629,7 @@ mod tests {
         assert!(buf.contains(&base), "buffer missing base placeholder: {buf:?}");
         assert!(buf.contains(&dup), "buffer missing #2 placeholder: {buf:?}");
 
-        let ComposerEvent::Submit(expanded) = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text: expanded, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         // Both placeholders should have been replaced with the original paste.
@@ -639,7 +659,7 @@ mod tests {
         assert!(c.pending_pastes.is_empty());
         // Submit should now just return the literal slash command, with no
         // dangling placeholder expansion.
-        let ComposerEvent::Submit(text) = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         assert_eq!(text, "/help");

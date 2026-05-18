@@ -1690,6 +1690,7 @@ name = "nav-core"
 version = "26.5.2"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "dirs",
  "futures-util",

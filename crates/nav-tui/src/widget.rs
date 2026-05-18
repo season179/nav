@@ -59,7 +59,11 @@ impl ChatWidget {
     /// the status bar in `run()`, not by the scrollback widget.
     pub fn ingest(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::UserMessage { text, display_text } => {
+            AgentEvent::UserMessage {
+                text,
+                display_text,
+                attachments: _,
+            } => {
                 self.push_user_event(text, display_text);
             }
             AgentEvent::AssistantMessageDelta { .. } | AgentEvent::TurnComplete { .. } => {}
