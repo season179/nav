@@ -174,7 +174,9 @@ impl RetryPolicy {
         let r = jitter_fn().clamp(0.0, 1.0);
         let mult = 1.0 - self.jitter + 2.0 * self.jitter * r;
         let ms = (raw.as_millis() as f64 * mult) as u64;
-        Duration::from_millis(ms)
+        // Re-clamp after jitter: positive jitter on a delay that already hit
+        // `max_delay` would otherwise blow past the documented bound.
+        Duration::from_millis(ms).min(self.max_delay)
     }
 }
 
@@ -294,6 +296,26 @@ mod tests {
         // Without cap, attempt 10 would be 100ms * 2^9 = 51.2s.
         let d = policy.delay_for(10, None, || 0.5);
         assert!(d <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn delay_for_clamps_jitter_to_max_delay() {
+        // Once the exponential term hits `max_delay`, positive jitter would
+        // push the result past the documented bound. Verify it doesn't.
+        let policy = RetryPolicy {
+            max_attempts: 10,
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(8),
+            jitter: 0.1,
+        };
+        for attempt in 5..=10 {
+            let d = policy.delay_for(attempt, None, || 1.0);
+            assert!(
+                d <= policy.max_delay,
+                "attempt {attempt} returned {d:?}, expected <= {:?}",
+                policy.max_delay
+            );
+        }
     }
 
     #[test]

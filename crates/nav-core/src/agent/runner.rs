@@ -84,8 +84,18 @@ pub async fn run_agent(
     // One-shot recovery per `run_agent` call. The first overflow drops the
     // oldest tool pair and retries the turn; a second overflow gives up.
     let mut overflow_recovery_attempted = false;
+    // Tracked manually so an overflow trim+retry doesn't consume the user's
+    // turn budget — the server rejected our request before any work happened.
+    let mut turns_used = 0usize;
 
-    'turns: for _ in 0..args.max_turns {
+    'turns: loop {
+        if turns_used >= args.max_turns {
+            return fail(
+                &events,
+                session,
+                anyhow!("stopped after {} tool turns", args.max_turns),
+            );
+        }
         let body = responses::response_body(args, cwd, &input, skills);
         let mut stream = match transport.create(body, events.clone()).await {
             Ok(stream) => stream,
@@ -196,13 +206,8 @@ pub async fn run_agent(
         if let Err(err) = finalize_turn(&events, session, &args.model, &usage) {
             return fail(&events, session, err);
         }
+        turns_used += 1;
     }
-
-    fail(
-        &events,
-        session,
-        anyhow!("stopped after {} tool turns", args.max_turns),
-    )
 }
 
 /// Drop the oldest `function_call` + matching `function_call_output` pair from

@@ -756,6 +756,82 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
 }
 
 #[tokio::test]
+async fn overflow_recovery_does_not_consume_turn_budget() {
+    // With max_turns=2, the agent must still be able to (1) run a tool-call
+    // turn, (2) hit overflow, trim, (3) retry, and (4) finish — even though
+    // the trim+retry conceptually happens on what would have been the "last"
+    // turn. Recovery is bookkeeping, not a real model turn.
+    let turn_one = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let turn_two_overflow = vec![StubItem::Err(
+        crate::responses::ResponsesError::ContextWindowExceeded {
+            message: "too long".into(),
+        },
+    )];
+    let turn_three_after_trim = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "done"}]
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let transport = StubTransport::with_items(vec![
+        turn_one,
+        turn_two_overflow,
+        turn_three_after_trim,
+    ]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 2;
+    let cwd = tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "go",
+        None,
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+    )
+    .await
+    .expect("recovery on the last allowed turn should still succeed");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextTrimmed { dropped_pairs: 1 }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AssistantMessageDone { text } if text == "done"))
+    );
+    assert_eq!(transport.bodies().len(), 3, "3 transport calls expected");
+}
+
+#[tokio::test]
 async fn overflow_second_failure_surfaces_clean_error() {
     // Turn 1: tool call to seed a droppable pair.
     let turn_one = vec![
