@@ -246,6 +246,83 @@ fn rebuild_responses_input_keeps_text_when_image_file_missing() {
     );
 }
 
+#[test]
+fn image_attachment_with_dotdot_escape_is_dropped() {
+    // A relative attachment path containing `..` resolves outside cwd; even
+    // if the file exists and is readable, encode_image_data_uri must refuse
+    // to ship its bytes — that's the workspace-boundary contract.
+    let outer = tempdir().unwrap();
+    let outside = outer.path().join("secret.png");
+    std::fs::write(&outside, b"not really a png but doesn't matter").unwrap();
+    let cwd = outer.path().join("workspace");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "exfiltrate this".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image {
+                path: PathBuf::from("../secret.png"),
+            }],
+        }],
+        &cwd,
+    );
+
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("attachments produce typed parts");
+    assert!(
+        content
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image")),
+        "../ escape must not emit input_image: {content:?}"
+    );
+}
+
+#[test]
+fn image_attachment_via_symlink_escape_is_dropped() {
+    // A symlink inside the workspace that points outside must not be read
+    // and forwarded to the model. canonicalize() resolves the symlink before
+    // the containment check.
+    let outer = tempdir().unwrap();
+    let outside = outer.path().join("secret.png");
+    std::fs::write(&outside, b"x").unwrap();
+    let cwd = outer.path().join("workspace");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let link = cwd.join("evil.png");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(not(unix))]
+    {
+        // No portable symlink on non-unix; skip the assertion when it cannot
+        // be set up. The Linux/macOS CI path is the one we care about.
+        let _ = &link;
+        return;
+    }
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "look".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image {
+                path: PathBuf::from("evil.png"),
+            }],
+        }],
+        &cwd,
+    );
+
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("attachments produce typed parts");
+    assert!(
+        content
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image"))
+    );
+}
+
 // ── emit_stream_events ────────────────────────────────────────
 
 #[test]

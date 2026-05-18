@@ -80,13 +80,25 @@ pub(super) fn build_user_content(
 }
 
 fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
+    // Defense-in-depth: nav's workspace contract says reads/writes for
+    // user-provided paths stay inside the workspace root. The TUI normally
+    // relativizes / copies pastes into <cwd>/.nav/clipboard/ before queuing
+    // them, but a path with `..` segments or a symlink that resolves outside
+    // would otherwise let us silently base64 arbitrary files (e.g.
+    // ~/.ssh/id_rsa) into the Responses request. Canonicalize both sides and
+    // require containment before reading.
     let abs = if rel.is_absolute() {
         rel.to_path_buf()
     } else {
         cwd.join(rel)
     };
-    let bytes = std::fs::read(&abs).ok()?;
-    let ext = abs
+    let canonical = abs.canonicalize().ok()?;
+    let cwd_canonical = cwd.canonicalize().ok()?;
+    if !canonical.starts_with(&cwd_canonical) {
+        return None;
+    }
+    let bytes = std::fs::read(&canonical).ok()?;
+    let ext = canonical
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
