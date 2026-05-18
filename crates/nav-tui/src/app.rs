@@ -70,6 +70,9 @@ fn install_panic_teardown_hook() {
     }));
 }
 
+// The TUI entrypoint mirrors the CLI bootstrap dependencies explicitly so the
+// construction boundary stays in main.rs instead of a catch-all config bag.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     transport: Arc<OpenAiTransport>,
     args: Args,
@@ -102,7 +105,7 @@ pub async fn run(
     let mut ctrl_c_count = 0u8;
     // A standalone `/<skill>` is a local TUI gesture, not a model turn. Hold
     // its wrapped body here and prepend it onto the next non-slash prompt.
-    let mut pending_skill: Option<String> = None;
+    let mut pending_skill: Option<(String, String)> = None;
     let mut turn_started_at: Option<Instant> = None;
     let mut spinner_tick: u64 = 0;
     let cwd_short = shorten_home(&cwd);
@@ -175,14 +178,10 @@ pub async fn run(
                     AppEvent::QueueSkill { skill_name, wrapped_body } => {
                         // Replace any previously queued skill; selecting a new
                         // one before sending a prompt should override.
-                        pending_skill = Some(wrapped_body);
+                        pending_skill = Some((skill_name.clone(), wrapped_body));
                         chat.scroll_to_bottom();
                         chat.push_user(format!("/{skill_name}"));
-                        chat.ingest(AgentEvent::AssistantMessageDone {
-                            text: format!(
-                                "Skill `{skill_name}` queued. Send your request to apply it."
-                            ),
-                        });
+                        chat.push_skill(skill_name, "queued for the next prompt");
                     }
                     AppEvent::Submit(raw_prompt) => {
                         // Refuse a second prompt while a turn is still in flight.
@@ -197,6 +196,10 @@ pub async fn run(
                             continue;
                         }
 
+                        let pending_skill_name =
+                            pending_skill.as_ref().map(|(name, _)| name.clone());
+                        let pending_skill_body =
+                            pending_skill.as_ref().map(|(_, body)| body.as_str());
                         let spawned = spawn_turn(TurnSpawn {
                             transport: Arc::clone(&transport),
                             args: args.clone(),
@@ -204,7 +207,7 @@ pub async fn run(
                             store: Arc::clone(&store),
                             session_id: session_id.clone(),
                             raw_prompt: raw_prompt.clone(),
-                            pending_skill: pending_skill.as_deref(),
+                            pending_skill: pending_skill_body,
                             agent_tx: agent_tx.clone(),
                             skills: Arc::clone(&skills),
                         });
@@ -218,6 +221,9 @@ pub async fn run(
 
                         pending_skill = None;
                         chat.scroll_to_bottom();
+                        if let Some(skill_name) = pending_skill_name {
+                            chat.push_skill(skill_name, "applied to this turn");
+                        }
                         chat.push_user(raw_prompt);
                         turn_started_at = Some(Instant::now());
                     }

@@ -50,6 +50,9 @@ fn user_message_event(prompt: &str, display_prompt: Option<&str>) -> AgentEvent 
 /// `initial_input` lets callers rehydrate the Responses API transcript from a
 /// stored session before appending the new user prompt. `display_prompt` is
 /// stored only for renderers; replay always uses `prompt`.
+// This is the core dependency-injection boundary for transports, persistence,
+// and skills; keeping those dependencies explicit makes tests easier to audit.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
     transport: &dyn ResponsesTransport,
     args: &Args,

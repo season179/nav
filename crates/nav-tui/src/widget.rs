@@ -2,9 +2,11 @@ use nav_core::AgentEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Paragraph, Widget};
+use std::collections::HashMap;
 
 use crate::cells::{
-    AssistantMessageCell, ErrorCell, ToolCallCell, ToolOutputCell, UserMessageCell, WelcomeCell,
+    AssistantMessageCell, ErrorCell, SkillInvocationCell, ToolCallCell, ToolCallContext,
+    ToolOutputCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -12,6 +14,7 @@ use crate::history::HistoryCell;
 /// renders a viewport over their flattened lines.
 pub struct ChatWidget {
     cells: Vec<Box<dyn HistoryCell>>,
+    tool_calls: HashMap<String, ToolCallContext>,
     /// `None` follows the newest transcript row. `Some(row)` pins the top of
     /// the viewport while the user is reading older output.
     scroll_top: Option<usize>,
@@ -21,6 +24,7 @@ impl ChatWidget {
     pub fn new() -> Self {
         Self {
             cells: Vec::new(),
+            tool_calls: HashMap::new(),
             scroll_top: None,
         }
     }
@@ -28,7 +32,12 @@ impl ChatWidget {
     /// Append a user-authored message before the agent loop echoes the durable
     /// event back. Resume uses `AgentEvent::UserMessage` directly.
     pub fn push_user(&mut self, text: impl Into<String>) {
-        self.cells.push(Box::new(UserMessageCell::new(text)));
+        self.push_user_event(text.into(), None);
+    }
+
+    pub fn push_skill(&mut self, name: impl Into<String>, detail: impl Into<String>) {
+        self.cells
+            .push(Box::new(SkillInvocationCell::new(name, detail)));
     }
 
     /// Prepend a welcome cell that orients the user (model, cwd, session id).
@@ -51,28 +60,30 @@ impl ChatWidget {
     pub fn ingest(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::UserMessage { text, display_text } => {
-                self.cells
-                    .push(Box::new(UserMessageCell::new(display_text.unwrap_or(text))));
+                self.push_user_event(text, display_text);
             }
             AgentEvent::AssistantMessageDelta { .. } | AgentEvent::TurnComplete { .. } => {}
             AgentEvent::AssistantMessageDone { text } => {
                 self.cells.push(Box::new(AssistantMessageCell::new(text)));
             }
             AgentEvent::ToolCallStarted {
-                call_id: _,
+                call_id,
                 name,
                 arguments,
             } => {
-                self.cells
-                    .push(Box::new(ToolCallCell::new(name, arguments)));
+                let cell = ToolCallCell::new(name, arguments);
+                self.tool_calls.insert(call_id, cell.context());
+                self.cells.push(Box::new(cell));
             }
             AgentEvent::ToolCallOutput {
-                call_id: _,
+                call_id,
                 output,
                 is_error,
             } => {
-                self.cells
-                    .push(Box::new(ToolOutputCell::new(output, is_error)));
+                let context = self.tool_calls.remove(&call_id);
+                self.cells.push(Box::new(ToolOutputCell::with_context(
+                    output, is_error, context,
+                )));
             }
             AgentEvent::Error { message } => {
                 self.cells.push(Box::new(ErrorCell::new(message)));
@@ -137,6 +148,22 @@ impl ChatWidget {
         }
         lines
     }
+
+    fn push_user_event(&mut self, text: String, display_text: Option<String>) {
+        if let Some(skill) = parse_skill_prompt(&text) {
+            self.push_skill(skill.name, "applied to this turn");
+            let visible_text = display_text.unwrap_or(skill.request);
+            if !visible_text.trim().is_empty() {
+                self.push_user_cell(visible_text);
+            }
+            return;
+        }
+        self.push_user_cell(display_text.unwrap_or(text));
+    }
+
+    fn push_user_cell(&mut self, text: impl Into<String>) {
+        self.cells.push(Box::new(UserMessageCell::new(text)));
+    }
 }
 
 impl Default for ChatWidget {
@@ -162,4 +189,21 @@ impl Widget for &ChatWidget {
             .collect();
         Paragraph::new(visible).render(area, buf);
     }
+}
+
+struct SkillPrompt {
+    name: String,
+    request: String,
+}
+
+fn parse_skill_prompt(text: &str) -> Option<SkillPrompt> {
+    let trimmed = text.trim_start();
+    let name_start = trimmed.strip_prefix("<skill name=\"")?;
+    let name_end = name_start.find('"')?;
+    let name = name_start[..name_end].to_string();
+    name_start[name_end..].strip_prefix("\" dir=\"")?;
+    let closing = "</skill>";
+    let close_idx = trimmed.rfind(closing)?;
+    let request = trimmed[close_idx + closing.len()..].trim().to_string();
+    Some(SkillPrompt { name, request })
 }

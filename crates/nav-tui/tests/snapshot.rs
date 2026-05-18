@@ -46,6 +46,108 @@ fn widget_with_numbered_output(line_count: usize) -> ChatWidget {
 }
 
 #[test]
+fn wrapped_skill_prompt_renders_as_skill_then_user_request() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::UserMessage {
+        text: "<skill name=\"zoom-out\" dir=\"/Users/season/.agents/skills/zoom-out\">\nSkill body\n</skill>\n\nInspect the TUI modules.".to_string(),
+        display_text: None,
+    });
+
+    let rendered = render_widget(&widget, 90, 10);
+
+    assert!(rendered.contains("◆ skill  zoom-out"), "{rendered}");
+    assert!(
+        rendered.contains("› user  Inspect the TUI modules."),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("<skill"), "{rendered}");
+    assert!(!rendered.contains("Skill body"), "{rendered}");
+}
+
+#[test]
+fn wrapped_skill_prompt_uses_outer_closing_tag() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::UserMessage {
+        text: "<skill name=\"zoom-out\" dir=\"/Users/season/.agents/skills/zoom-out\">\nDo not render this literal </skill> mention.\n</skill>\n\nInspect the TUI modules.".to_string(),
+        display_text: None,
+    });
+
+    let rendered = render_widget(&widget, 90, 10);
+
+    assert!(rendered.contains("◆ skill  zoom-out"), "{rendered}");
+    assert!(
+        rendered.contains("› user  Inspect the TUI modules."),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Do not render"), "{rendered}");
+}
+
+#[test]
+fn literal_skill_xml_without_nav_dir_attribute_stays_user_text() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::UserMessage {
+        text: "<skill name=\"literal\">\nbody\n</skill>\n\nExplain this tag.".to_string(),
+        display_text: None,
+    });
+
+    let rendered = render_widget(&widget, 90, 10);
+
+    assert!(!rendered.contains("◆ skill"), "{rendered}");
+    assert!(
+        rendered.contains("› user  <skill name=\"literal\">"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({
+            "path": "/Users/season/.agents/skills/zoom-out/SKILL.md"
+        }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "call_1".to_string(),
+        output: (0..20)
+            .map(|i| format!("line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        is_error: false,
+    });
+
+    let rendered = render_widget(&widget, 90, 20);
+
+    assert!(
+        rendered.contains("• tool  read_file SKILL.md (zoom-out skill)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("└ output  20 lines"), "{rendered}");
+    assert!(rendered.contains("line 03"), "{rendered}");
+    assert!(rendered.contains("… 16 more lines hidden"), "{rendered}");
+    assert!(!rendered.contains("line 19"), "{rendered}");
+}
+
+#[test]
+fn labeled_rows_wrap_without_clipping_first_line() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: format!("{}LOSTMARK{}", "a".repeat(27), "b".repeat(20)),
+    });
+
+    let rendered = render_widget(&widget, 40, 8);
+
+    assert!(rendered.contains("LOSTMARK"), "{rendered}");
+}
+
+#[test]
 fn renders_full_turn_transcript() {
     let mut widget = ChatWidget::new();
 

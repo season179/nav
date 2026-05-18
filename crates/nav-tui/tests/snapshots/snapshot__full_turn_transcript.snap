@@ -2,11 +2,12 @@
 source: crates/nav-tui/tests/snapshot.rs
 expression: rendered
 ---
-› list files in the repo
+› user  list files in the repo
 
-• shell {"command":["ls"]}
+• tool  shell {"command":["ls"]}
 
-└ Cargo.toml
+└ output  2 lines, 14 chars
+  Cargo.toml
   src
 
-• Two entries: Cargo.toml and src.
+• assistant  Two entries: Cargo.toml and src.
