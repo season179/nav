@@ -35,23 +35,22 @@ impl MentionEntry {
 /// matches codex `chat_composer.rs::insert_selected_path` semantics.
 pub struct FileMentionPopup {
     entries: Arc<[MentionEntry]>,
-    /// Most recent query (the text after `@`, not including the `@` itself).
-    query: String,
     /// Indices into `entries`, ranked by nucleo match score (best first).
+    /// Truncated to [`MAX_VISIBLE`] so navigation never exceeds what's drawn.
     matches: Vec<usize>,
     selected: usize,
     completed: bool,
 }
 
 /// Cap rendered rows so the popup never eats the whole screen on a generic
-/// `@` query. Match codex's typical popup height.
+/// `@` query. `matches` is truncated to this cap so the selection index can
+/// always reach every entry the user can actually see.
 const MAX_VISIBLE: usize = 8;
 
 impl FileMentionPopup {
     pub fn new(entries: Arc<[MentionEntry]>, initial_query: &str) -> Self {
         let mut popup = Self {
             entries,
-            query: String::new(),
             matches: Vec::new(),
             selected: 0,
             completed: false,
@@ -72,13 +71,10 @@ impl FileMentionPopup {
         self.matches.len().clamp(1, MAX_VISIBLE) as u16
     }
 
-    /// Re-rank `entries` against `query` using `nucleo-matcher`. Empty query
-    /// surfaces a prefix of the index so the popup is never blank — picking
-    /// the first few files is still a reasonable affordance.
+    /// Re-rank `entries` against `query` using `nucleo-matcher` and keep the
+    /// top [`MAX_VISIBLE`] scores. Empty query surfaces a prefix so the popup
+    /// is never blank.
     pub fn set_query(&mut self, query: &str) {
-        self.query.clear();
-        self.query.push_str(query);
-
         self.matches.clear();
         if self.entries.is_empty() {
             self.selected = 0;
@@ -86,7 +82,7 @@ impl FileMentionPopup {
         }
 
         if query.is_empty() {
-            for i in 0..self.entries.len().min(MAX_VISIBLE * 4) {
+            for i in 0..self.entries.len().min(MAX_VISIBLE) {
                 self.matches.push(i);
             }
             self.selected = 0;
@@ -114,7 +110,7 @@ impl FileMentionPopup {
                     .cmp(&self.entries[b.1].display.len())
             })
         });
-        for (_, idx) in scored {
+        for (_, idx) in scored.into_iter().take(MAX_VISIBLE) {
             self.matches.push(idx);
         }
         self.selected = 0;
@@ -132,8 +128,7 @@ impl FileMentionPopup {
                 InputResult::Handled
             }
             (KeyCode::Down, _) => {
-                let visible = self.matches.len().min(MAX_VISIBLE);
-                if visible > 0 && self.selected + 1 < visible {
+                if self.selected + 1 < self.matches.len() {
                     self.selected += 1;
                 }
                 InputResult::Handled
@@ -177,8 +172,8 @@ impl FileMentionPopup {
             return;
         }
 
-        let visible = self.matches.len().min(MAX_VISIBLE);
-        let lines: Vec<Line<'_>> = self.matches[..visible]
+        let lines: Vec<Line<'_>> = self
+            .matches
             .iter()
             .enumerate()
             .map(|(row, &entry_idx)| {

@@ -109,7 +109,8 @@ pub async fn run(
     for ev in resume_events {
         chat.ingest(ev);
     }
-    let mut pane = bottom_pane::BottomPane::with_entries(slash_entries, mention_entries);
+    let mut pane =
+        bottom_pane::BottomPane::with_entries(slash_entries, mention_entries, cwd.clone());
     let mut ctrl_c_count = 0u8;
     // A standalone `/<skill>` is a local TUI gesture, not a model turn. Hold
     // its wrapped body here and prepend it onto the next non-slash prompt.
@@ -268,11 +269,8 @@ pub async fn run(
                         CtEvent::Paste(text) => {
                             // Bracketed paste was enabled at TUI entry
                             // (see write_tui_enter_sequences); without this
-                            // arm the payload would be silently dropped. `cwd`
-                            // is passed through so clipboard images can be
-                            // persisted under `.nav/clipboard/` inside the
-                            // read sandbox.
-                            pane.on_paste(&cwd, &text);
+                            // arm the payload would be silently dropped.
+                            pane.on_paste(&text);
                         }
                         _ => {}
                     }

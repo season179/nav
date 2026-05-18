@@ -46,6 +46,10 @@ pub struct BottomPane {
     mention_popup_suppressed: bool,
     slash_entries: Arc<[SlashEntry]>,
     mention_entries: Arc<[MentionEntry]>,
+    /// Workspace root. Held so clipboard images can persist under
+    /// `<cwd>/.nav/clipboard/` without the event loop re-passing the path on
+    /// every paste.
+    cwd: PathBuf,
 }
 
 impl BottomPane {
@@ -54,16 +58,25 @@ impl BottomPane {
             .iter()
             .map(|cmd| SlashEntry::builtin(cmd))
             .collect();
-        Self::with_entries(entries.into(), Arc::from(Vec::<MentionEntry>::new()))
+        Self::with_entries(
+            entries.into(),
+            Arc::from(Vec::<MentionEntry>::new()),
+            PathBuf::from("."),
+        )
     }
 
     pub fn with_slash_entries(slash_entries: Arc<[SlashEntry]>) -> Self {
-        Self::with_entries(slash_entries, Arc::from(Vec::<MentionEntry>::new()))
+        Self::with_entries(
+            slash_entries,
+            Arc::from(Vec::<MentionEntry>::new()),
+            PathBuf::from("."),
+        )
     }
 
     pub fn with_entries(
         slash_entries: Arc<[SlashEntry]>,
         mention_entries: Arc<[MentionEntry]>,
+        cwd: PathBuf,
     ) -> Self {
         Self {
             composer: Composer::new(),
@@ -72,6 +85,7 @@ impl BottomPane {
             mention_popup_suppressed: false,
             slash_entries,
             mention_entries,
+            cwd,
         }
     }
 
@@ -95,11 +109,10 @@ impl BottomPane {
     /// Bypasses overlay routing: a popup can be open but a paste should always
     /// land in the buffer; the popup will reconcile on the next keystroke.
     ///
-    /// `cwd` is the workspace root — clipboard images are saved relative to
-    /// it so the inserted path lives inside the read sandbox (paths under
-    /// `/tmp` would be rejected by `nav-core`'s fs sandbox, defeating the
-    /// point of the affordance).
-    pub fn on_paste(&mut self, cwd: &Path, text: &str) {
+    /// Clipboard images are saved under `<cwd>/.nav/clipboard/` so the
+    /// inserted path lives inside the read sandbox (paths under `/tmp` would
+    /// be rejected by `nav-core`'s fs sandbox, defeating the affordance).
+    pub fn on_paste(&mut self, text: &str) {
         // 1) Clipboard image blob. If the OS clipboard holds an image and the
         //    bracketed-paste payload is empty (or junk), persist the image
         //    under `.nav/clipboard/` and insert the workspace-relative path
@@ -107,7 +120,7 @@ impl BottomPane {
         //    `handleClipboardImagePaste` plus codex's "where to put it"
         //    constraint of sandbox-readable paths.
         if text.trim().is_empty()
-            && let Some(rel) = try_save_clipboard_image(cwd)
+            && let Some(rel) = try_save_clipboard_image(&self.cwd)
         {
             self.composer.insert_paste(&rel);
             self.reconcile_popups();
@@ -213,8 +226,8 @@ impl BottomPane {
     /// as the user moves out of that context.
     fn reconcile_popups(&mut self) {
         let single_line = self.composer.line_count() == 1;
-        let first = self.composer.first_line();
-        let slash_active = single_line && first.starts_with('/');
+        let first_owned = self.composer.first_line().to_string();
+        let slash_active = single_line && first_owned.starts_with('/');
         let mention_token = if slash_active {
             None
         } else {
@@ -229,63 +242,40 @@ impl BottomPane {
             self.mention_popup_suppressed = false;
         }
 
-        enum Target {
-            None,
-            Slash,
-            Mention,
-        }
-        let target = if slash_active && !self.slash_popup_suppressed {
-            Target::Slash
-        } else if mention_active && !self.mention_popup_suppressed {
-            Target::Mention
-        } else {
-            Target::None
-        };
+        let want_slash = slash_active && !self.slash_popup_suppressed;
+        let want_mention = !want_slash && mention_active && !self.mention_popup_suppressed;
 
-        match (&mut self.view, target) {
-            (None, Target::None) => {}
-            (None, Target::Slash) => {
-                let mut popup = SlashCommandPopup::new(Arc::clone(&self.slash_entries));
-                popup.on_composer_text_changed(first);
-                if !popup.is_complete() {
-                    self.view = Some(BottomPaneView::SlashCommand(popup));
-                }
-            }
-            (None, Target::Mention) => {
-                let token = mention_token.as_deref().unwrap_or("");
-                let popup = FileMentionPopup::new(Arc::clone(&self.mention_entries), token);
-                self.view = Some(BottomPaneView::FileMention(popup));
-            }
-            (Some(BottomPaneView::SlashCommand(p)), Target::Slash) => {
-                p.on_composer_text_changed(first);
+        // Fast path: the active popup already matches the desired target —
+        // just refresh its filter and bail. Avoids reconstructing the popup
+        // (and re-cloning the entries `Arc`) on every keystroke.
+        match (&mut self.view, want_slash, want_mention) {
+            (Some(BottomPaneView::SlashCommand(p)), true, _) => {
+                p.on_composer_text_changed(&first_owned);
                 if p.is_complete() {
                     self.view = None;
                 }
+                return;
             }
-            (Some(BottomPaneView::FileMention(p)), Target::Mention) => {
-                let token = mention_token.as_deref().unwrap_or("");
-                p.set_query(token);
+            (Some(BottomPaneView::FileMention(p)), _, true) => {
+                p.set_query(mention_token.as_deref().unwrap_or(""));
+                return;
             }
-            (Some(_), Target::None) => {
-                self.view = None;
-            }
-            // Switch popups: e.g. user backspaces past a `/` so the slash
-            // popup should go away, and an unrelated `@…` token is now under
-            // the cursor.
-            (Some(_), Target::Slash) => {
-                let mut popup = SlashCommandPopup::new(Arc::clone(&self.slash_entries));
-                popup.on_composer_text_changed(first);
-                self.view = if popup.is_complete() {
-                    None
-                } else {
-                    Some(BottomPaneView::SlashCommand(popup))
-                };
-            }
-            (Some(_), Target::Mention) => {
-                let token = mention_token.as_deref().unwrap_or("");
-                let popup = FileMentionPopup::new(Arc::clone(&self.mention_entries), token);
-                self.view = Some(BottomPaneView::FileMention(popup));
-            }
+            _ => {}
+        }
+
+        // Slow path: open the right popup, or close whatever is open.
+        if want_slash {
+            let mut popup = SlashCommandPopup::new(Arc::clone(&self.slash_entries));
+            popup.on_composer_text_changed(&first_owned);
+            self.view = (!popup.is_complete()).then_some(BottomPaneView::SlashCommand(popup));
+        } else if want_mention {
+            let popup = FileMentionPopup::new(
+                Arc::clone(&self.mention_entries),
+                mention_token.as_deref().unwrap_or(""),
+            );
+            self.view = Some(BottomPaneView::FileMention(popup));
+        } else {
+            self.view = None;
         }
     }
 }
@@ -320,23 +310,20 @@ fn try_save_clipboard_image(cwd: &Path) -> Option<String> {
     Some(rel.to_string_lossy().into_owned())
 }
 
-/// If `s` looks like a path to a readable image file (PNG/JPEG/GIF/WebP),
-/// return the cleaned path (with any `file://` prefix removed). The check
-/// is intentionally cheap — extension match + a single `image_dimensions`
-/// probe — so a non-image paste falls through with negligible cost.
+/// If `s` looks like a path to a readable image file, return the cleaned
+/// path (with any `file://` prefix removed). The check is intentionally
+/// cheap — extension match against `image::ImageFormat` + a single
+/// `image_dimensions` probe — so a non-image paste falls through with
+/// negligible cost. The probe earns its keep by rejecting wrong-extension
+/// or corrupted files before they end up in the prompt.
 fn recognized_image_path(s: &str) -> Option<String> {
     if s.is_empty() {
         return None;
     }
     let cleaned = s.strip_prefix("file://").unwrap_or(s);
     let path = Path::new(cleaned);
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())?;
-    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
-        return None;
-    }
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    image::ImageFormat::from_extension(ext)?;
     image::image_dimensions(path).ok()?;
     Some(cleaned.to_string())
 }
