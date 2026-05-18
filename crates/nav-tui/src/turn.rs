@@ -27,7 +27,14 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
         .store
         .load_session(&request.session_id)
         .context("failed to load session history")?;
-    let history_input = Some(rebuild_responses_input(&history_events, &request.cwd));
+    // Replay resolves stored image attachment paths against the session's
+    // original cwd, not the resumed process's, so a resume from a different
+    // directory still reattaches images saved during the original session.
+    let session_cwd = request
+        .store
+        .session_cwd(&request.session_id)
+        .unwrap_or_else(|_| request.cwd.clone());
+    let history_input = Some(rebuild_responses_input(&history_events, &session_cwd));
     // Scrollback shows the typed text; the wrapped SKILL.md goes only to the
     // model-facing payload.
     let display_prompt = request.raw_prompt.clone();

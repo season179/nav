@@ -30,9 +30,13 @@ async fn main() -> Result<()> {
     let (session_id, initial_input, resume_events) = match args.resume.as_deref() {
         Some(id) => {
             let events = store.load_session(id)?;
+            // Use the cwd recorded at session creation when rebuilding the
+            // input array — relative attachment paths in stored events were
+            // workspace-relative to *that* cwd, not the resumed process's.
+            let session_cwd = store.session_cwd(id)?;
             (
                 id.to_string(),
-                Some(rebuild_responses_input(&events, &cwd)),
+                Some(rebuild_responses_input(&events, &session_cwd)),
                 events,
             )
         }

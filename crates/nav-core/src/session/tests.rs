@@ -332,3 +332,22 @@ fn list_sessions_filters_by_cwd_and_orders_by_updated_at_desc() {
         vec![id_a_new, id_a_old]
     );
 }
+
+#[test]
+fn session_cwd_returns_creation_cwd_regardless_of_caller() {
+    // session_cwd is the contract that lets --resume re-resolve stored
+    // attachment paths against the session's original workspace root even
+    // when the resumed nav process is launched from a different directory.
+    let (_dir, store) = open_temp_store();
+    let origin = Path::new("/repo/origin");
+    let id = store
+        .create_session(origin, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+    assert_eq!(store.session_cwd(&id).unwrap(), origin);
+}
+
+#[test]
+fn session_cwd_errors_on_missing_session() {
+    let (_dir, store) = open_temp_store();
+    assert!(store.session_cwd("does-not-exist").is_err());
+}

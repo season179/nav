@@ -34,5 +34,8 @@ out/
 *.db-wal
 *.db-shm
 
-# Clipboard images persisted by the TUI paste handler
-.nav/clipboard/
+# Clipboard images persisted by the TUI paste handler. The `**/`
+# prefix is required so the pattern also matches when nav is launched
+# from a sub-directory and writes `<launch_cwd>/.nav/clipboard/` —
+# without it git anchors the rule to repo root only.
+**/.nav/clipboard/
