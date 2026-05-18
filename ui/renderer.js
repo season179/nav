@@ -20,6 +20,108 @@ const scrollSessionToBottom = () => {
   }
 };
 
+const previewText = (text, maxChars = 4000) => {
+  if (!text || text.length <= maxChars) {
+    return text ?? "";
+  }
+  return `${text.slice(0, maxChars)}\n... truncated ...`;
+};
+
+const patchPathSummary = (patch) => {
+  const entries = [];
+  let lastUpdateIndex = null;
+  for (const line of patch.split(/\r?\n/)) {
+    if (line.startsWith("*** Update File: ")) {
+      lastUpdateIndex = entries.length;
+      entries.push(`M ${line.slice("*** Update File: ".length)}`);
+    } else if (line.startsWith("*** Move to: ")) {
+      if (lastUpdateIndex !== null) {
+        entries[lastUpdateIndex] += ` -> ${line.slice("*** Move to: ".length)}`;
+      }
+    } else if (line.startsWith("*** Add File: ")) {
+      lastUpdateIndex = null;
+      entries.push(`A ${line.slice("*** Add File: ".length)}`);
+    } else if (line.startsWith("*** Delete File: ")) {
+      lastUpdateIndex = null;
+      entries.push(`D ${line.slice("*** Delete File: ".length)}`);
+    }
+  }
+
+  if (entries.length === 0) {
+    return "apply_patch";
+  }
+
+  const shown = entries.slice(0, 6);
+  const hidden = entries.length - shown.length;
+  return `apply_patch ${shown.join(", ")}${hidden > 0 ? `, ... ${hidden} more` : ""}`;
+};
+
+const toolSummary = (event) => {
+  if (event.name === "apply_patch") {
+    return patchPathSummary(event.arguments?.patch ?? "");
+  }
+  if (typeof event.arguments?.path === "string") {
+    return `${event.name} ${event.arguments.path}`;
+  }
+  if (typeof event.arguments?.command === "string") {
+    return `bash ${event.arguments.command}`;
+  }
+  return event.name;
+};
+
+const changePath = (change) => {
+  if (change.kind === "update" && change.move_path) {
+    return change.line_start
+      ? `${change.path} -> ${change.move_path}:${change.line_start}`
+      : `${change.path} -> ${change.move_path}`;
+  }
+  return change.line_start ? `${change.path}:${change.line_start}` : change.path;
+};
+
+const changeLetter = (change) => {
+  if (change.kind === "add") {
+    return "A";
+  }
+  if (change.kind === "delete") {
+    return "D";
+  }
+  return "M";
+};
+
+const renderFileChange = (event) => {
+  const lines = [event.summary ?? `${event.changes?.length ?? 0} files changed`];
+  for (const change of event.changes ?? []) {
+    lines.push(
+      `${changeLetter(change)} ${changePath(change)} (+${change.additions ?? 0} -${change.deletions ?? 0})`,
+    );
+    if (change.diff) {
+      lines.push(previewText(change.diff));
+    }
+  }
+  if (event.error) {
+    lines.push(event.error);
+  }
+  return lines.join("\n");
+};
+
+const renderTurnDiff = (diff) => {
+  const files = diff.files ?? [];
+  const fileWord = files.length === 1 ? "file" : "files";
+  const lines = [`${files.length} ${fileWord} changed`];
+  for (const file of files) {
+    lines.push(
+      `${file.status} ${file.path} (+${file.additions ?? 0} -${file.deletions ?? 0})`,
+    );
+  }
+  if (diff.unified_diff) {
+    lines.push(previewText(diff.unified_diff));
+  }
+  if (diff.truncated) {
+    lines.push("full diff truncated");
+  }
+  return lines.join("\n");
+};
+
 const setRunning = (running) => {
   isRunning = running;
 
@@ -162,6 +264,7 @@ const runPrompt = async (text) => {
 
   currentRun = {
     assistant: appendStreamMessage("agent"),
+    assistantText: "",
     log: appendStreamMessage("log"),
   };
 
@@ -184,6 +287,59 @@ const runPrompt = async (text) => {
 
 window.navApp?.onAgentEvent?.((event) => {
   if (!event || !currentRun) {
+    return;
+  }
+
+  if (event.type === "agent_event") {
+    const agentEvent = event.event;
+    if (!agentEvent) {
+      return;
+    }
+
+    if (agentEvent.kind === "assistant_message_delta") {
+      currentRun.assistantText += agentEvent.text ?? "";
+      currentRun.assistant.append(agentEvent.text);
+      return;
+    }
+
+    if (agentEvent.kind === "assistant_message_done") {
+      if (!currentRun.assistantText) {
+        currentRun.assistantText = agentEvent.text ?? "";
+        currentRun.assistant.append(agentEvent.text);
+      }
+      return;
+    }
+
+    if (agentEvent.kind === "tool_call_started") {
+      appendMessage("tool", toolSummary(agentEvent));
+      return;
+    }
+
+    if (agentEvent.kind === "tool_call_output") {
+      if (agentEvent.is_error) {
+        appendMessage("error", agentEvent.output);
+      } else if (agentEvent.output) {
+        appendMessage("log", agentEvent.output);
+      }
+      return;
+    }
+
+    if (agentEvent.kind === "file_change") {
+      appendMessage(
+        agentEvent.status === "failed" ? "error" : "change",
+        renderFileChange(agentEvent),
+      );
+      return;
+    }
+
+    if (agentEvent.kind === "turn_diff") {
+      appendMessage("diff", renderTurnDiff(agentEvent));
+      return;
+    }
+
+    if (agentEvent.kind === "error") {
+      appendMessage("error", agentEvent.message);
+    }
     return;
   }
 

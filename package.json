@@ -6,7 +6,8 @@
   "description": "Desktop UI shell for nav-desktop.",
   "main": "nav-desktop/main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "test": "bun test"
   },
   "devDependencies": {
     "electron": "^42.1.0"

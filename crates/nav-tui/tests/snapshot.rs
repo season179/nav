@@ -1,4 +1,6 @@
-use nav_core::{AgentEvent, TurnUsage};
+use nav_core::{
+    AgentEvent, FileChangeKind, FileChangeSummary, FileDiffSummary, PatchApplyStatus, TurnUsage,
+};
 use nav_tui::ChatWidget;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -132,6 +134,97 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
     assert!(rendered.contains("line 03"), "{rendered}");
     assert!(rendered.contains("… 16 more lines hidden"), "{rendered}");
     assert!(!rendered.contains("line 19"), "{rendered}");
+}
+
+#[test]
+fn apply_patch_tool_row_summarizes_patch_paths() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_1".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** Add File: src/new.rs\n+hello\n*** End Patch\n"
+        }),
+    });
+
+    let rendered = render_widget(&widget, 100, 8);
+
+    assert!(
+        rendered.contains("• tool  apply_patch M src/lib.rs, A src/new.rs"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("*** Begin Patch"), "{rendered}");
+}
+
+#[test]
+fn apply_patch_tool_row_summarizes_moves() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_1".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "*** Begin Patch\n*** Update File: old.rs\n*** Move to: new.rs\n@@\n-old\n+new\n*** End Patch\n"
+        }),
+    });
+
+    let rendered = render_widget(&widget, 100, 8);
+
+    assert!(
+        rendered.contains("• tool  apply_patch M old.rs -> new.rs"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn file_change_event_renders_reviewable_diff_preview() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::FileChange {
+        call_id: "call_1".to_string(),
+        status: PatchApplyStatus::Completed,
+        summary: "updated 1 file: M note.txt:1 (+1 -1)".to_string(),
+        error: None,
+        changes: vec![FileChangeSummary {
+            path: "note.txt".to_string(),
+            kind: FileChangeKind::Update { move_path: None },
+            additions: 1,
+            deletions: 1,
+            line_start: Some(1),
+            diff: "--- a/note.txt\n+++ b/note.txt\n@@\n-old\n+new\n".to_string(),
+        }],
+    });
+
+    let rendered = render_widget(&widget, 100, 12);
+
+    assert!(rendered.contains("◆ changed  updated 1 file"), "{rendered}");
+    assert!(rendered.contains("M note.txt:1 (+1 -1)"), "{rendered}");
+    assert!(rendered.contains("-old"), "{rendered}");
+    assert!(rendered.contains("+new"), "{rendered}");
+}
+
+#[test]
+fn turn_diff_event_renders_modified_file_summary() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::TurnDiff {
+        truncated: false,
+        files: vec![FileDiffSummary {
+            path: "note.txt".to_string(),
+            status: "modified".to_string(),
+            additions: 1,
+            deletions: 1,
+        }],
+        unified_diff: "--- a/note.txt\n+++ b/note.txt\n@@\n-old\n+new\n".to_string(),
+    });
+
+    let rendered = render_widget(&widget, 100, 12);
+
+    assert!(rendered.contains("◆ diff  1 file changed"), "{rendered}");
+    assert!(rendered.contains("modified note.txt (+1 -1)"), "{rendered}");
+    assert!(rendered.contains("-old"), "{rendered}");
+    assert!(rendered.contains("+new"), "{rendered}");
 }
 
 #[test]

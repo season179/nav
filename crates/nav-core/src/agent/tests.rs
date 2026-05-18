@@ -4,8 +4,10 @@ use crate::skills::Catalog;
 use anyhow::Result;
 use futures_util::stream;
 use serde_json::{Value, json};
+use std::fs;
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Command as StdCommand;
 use std::sync::Mutex;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
@@ -66,6 +68,15 @@ fn is_input_assistant_message(item: &Value, text: &str) -> bool {
             .and_then(|part| part.get("text"))
             .and_then(Value::as_str)
             == Some(text)
+}
+
+fn git(cwd: &std::path::Path, args: &[&str]) {
+    let status = StdCommand::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .expect("run git");
+    assert!(status.success(), "git {args:?} failed with {status}");
 }
 
 impl ResponsesTransport for StubTransport {
@@ -421,6 +432,171 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         events.last().unwrap(),
         AgentEvent::TurnComplete { .. }
     ));
+}
+
+#[tokio::test]
+async fn run_agent_emits_file_change_and_turn_diff_for_patch_tool() {
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "arguments": "{\"patch\":\"*** Begin Patch\\n*** Update File: note.txt\\n@@\\n-old\\n+new\\n*** End Patch\\n\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let turn_two = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Patched."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one, turn_two]);
+    let mut args = Args::test_default();
+    args.max_turns = 4;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    fs::write(cwd.join("note.txt"), "old\n").unwrap();
+    git(&cwd, &["init"]);
+    git(&cwd, &["add", "note.txt"]);
+    git(
+        &cwd,
+        &[
+            "-c",
+            "user.name=Nav Test",
+            "-c",
+            "user.email=nav@example.test",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "patch note",
+        None,
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+    )
+    .await
+    .expect("run_agent");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let pos_tool_output = event_position(&events, "ToolCallOutput", |event| {
+        matches!(
+            event,
+            AgentEvent::ToolCallOutput { output, .. }
+                if output.contains("updated 1 file") && !output.contains("@@")
+        )
+    });
+    let pos_file_change = event_position(&events, "FileChange", |event| {
+        matches!(
+            event,
+            AgentEvent::FileChange { call_id, changes, status, .. }
+                if call_id == "call_patch"
+                    && *status == crate::mutation::PatchApplyStatus::Completed
+                    && changes.len() == 1
+                    && changes[0].path == "note.txt"
+                    && changes[0].diff.contains("-old")
+                    && changes[0].diff.contains("+new")
+        )
+    });
+    let pos_turn_diff = event_position(&events, "TurnDiff", |event| {
+        matches!(
+            event,
+            AgentEvent::TurnDiff { files, unified_diff, .. }
+                if files.iter().any(|file| file.path == "note.txt")
+                    && unified_diff.contains("-old")
+                    && unified_diff.contains("+new")
+        )
+    });
+    let first_turn_complete = event_position(&events, "TurnComplete", |event| {
+        matches!(event, AgentEvent::TurnComplete { .. })
+    });
+
+    assert!(pos_tool_output < pos_file_change);
+    assert!(pos_file_change < pos_turn_diff);
+    assert!(pos_turn_diff < first_turn_complete);
+}
+
+#[tokio::test]
+async fn run_agent_emits_failed_file_change_for_rejected_patch_tool() {
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "arguments": "{\"patch\":\"*** Begin Patch\\n*** Update File: note.txt\\n@@\\n-missing\\n+new\\n*** End Patch\\n\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let turn_two = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Could not patch."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one, turn_two]);
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    fs::write(cwd.join("note.txt"), "old\n").unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &Args::test_default(),
+        &cwd,
+        "patch note",
+        None,
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+    )
+    .await
+    .expect("run_agent continues after tool error");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    event_position(&events, "failed FileChange", |event| {
+        matches!(
+            event,
+            AgentEvent::FileChange { call_id, changes, status, summary, error }
+                if call_id == "call_patch"
+                    && changes.is_empty()
+                    && *status == crate::mutation::PatchApplyStatus::Failed
+                    && summary.contains("note.txt")
+                    && error.as_deref().is_some_and(|message| message.contains("tool error"))
+        )
+    });
+    assert_eq!(fs::read_to_string(cwd.join("note.txt")).unwrap(), "old\n");
 }
 
 // ── --resume integration ──────────────────────────────────────

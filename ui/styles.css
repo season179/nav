@@ -245,6 +245,9 @@ h1 {
 }
 
 .session-message.log,
+.session-message.tool,
+.session-message.change,
+.session-message.diff,
 .session-message.error,
 .session-message.status {
   align-self: stretch;
@@ -262,6 +265,20 @@ h1 {
 .session-message.error {
   border-color: rgba(255, 119, 119, 0.24);
   color: #ffb7b7;
+}
+
+.session-message.tool {
+  color: #ded8aa;
+}
+
+.session-message.change,
+.session-message.diff {
+  border-color: rgba(184, 229, 221, 0.2);
+  color: #ccece7;
+}
+
+.session-message.diff {
+  color: #b8c9e5;
 }
 
 .session-message.status {
