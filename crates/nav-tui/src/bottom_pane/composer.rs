@@ -164,12 +164,41 @@ impl Composer {
         }
     }
 
-    pub fn desired_height(&self, _width: u16) -> u16 {
-        self.lines.len().max(1) as u16
+    pub fn desired_height(&self, width: u16) -> u16 {
+        let w = width.max(1) as usize;
+        let mut total: u16 = 0;
+        for line in &self.lines {
+            total = total.saturating_add(wrapped_row_count(line, w) as u16);
+        }
+        total.max(1)
     }
 
     pub fn is_empty(&self) -> bool {
         self.lines.len() == 1 && self.lines[0].is_empty()
+    }
+
+    /// Cursor position relative to the rendered content area, accounting for
+    /// character-wrapping at `width`. Returns `(column, row)`.
+    pub fn visual_position(&self, width: u16) -> (u16, u16) {
+        let w = width.max(1) as usize;
+        let mut row_offset: u16 = 0;
+        for (i, line) in self.lines.iter().enumerate() {
+            if i == self.row {
+                let col_chars = line[..self.col].chars().count();
+                // Cursor exactly at end of a line whose length is a multiple of
+                // the wrap width: park it at the right edge of the last visible
+                // wrapped row instead of column 0 of a phantom next row.
+                if self.col == line.len() && col_chars > 0 && col_chars % w == 0 {
+                    let last_row = (col_chars / w - 1) as u16;
+                    return (w as u16, row_offset + last_row);
+                }
+                let seg_row = (col_chars / w) as u16;
+                let seg_col = (col_chars % w) as u16;
+                return (seg_col, row_offset + seg_row);
+            }
+            row_offset = row_offset.saturating_add(wrapped_row_count(line, w) as u16);
+        }
+        (0, row_offset)
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -182,11 +211,13 @@ impl Composer {
             Paragraph::new(Line::from(hint)).style(bg).render(area, buf);
             return;
         }
-        let rendered: Vec<Line<'_>> = self
-            .lines
-            .iter()
-            .map(|l| Line::from(Span::styled(l.clone(), bg.fg(Color::White))))
-            .collect();
+        let width = area.width.max(1) as usize;
+        let mut rendered: Vec<Line<'_>> = Vec::new();
+        for line in &self.lines {
+            for segment in wrap_slices(line, width) {
+                rendered.push(Line::from(Span::styled(segment, bg.fg(Color::White))));
+            }
+        }
         Paragraph::new(rendered).style(bg).render(area, buf);
     }
 
@@ -342,6 +373,55 @@ impl Composer {
 impl Default for Composer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn wrapped_row_count(line: &str, width: usize) -> usize {
+    let chars = line.chars().count();
+    if chars == 0 {
+        1
+    } else {
+        (chars - 1) / width + 1
+    }
+}
+
+/// Yield successive `&str` slices of `line`, each at most `width` chars long.
+/// An empty input yields a single empty slice so the row still renders.
+fn wrap_slices(line: &str, width: usize) -> WrapSlices<'_> {
+    WrapSlices {
+        rest: line,
+        width: width.max(1),
+        emitted: false,
+    }
+}
+
+struct WrapSlices<'a> {
+    rest: &'a str,
+    width: usize,
+    emitted: bool,
+}
+
+impl<'a> Iterator for WrapSlices<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<&'a str> {
+        if self.rest.is_empty() {
+            if self.emitted {
+                return None;
+            }
+            self.emitted = true;
+            return Some("");
+        }
+        self.emitted = true;
+        let mut end = self.rest.len();
+        for (i, (byte_idx, _)) in self.rest.char_indices().enumerate() {
+            if i == self.width {
+                end = byte_idx;
+                break;
+            }
+        }
+        let (seg, rest) = self.rest.split_at(end);
+        self.rest = rest;
+        Some(seg)
     }
 }
 

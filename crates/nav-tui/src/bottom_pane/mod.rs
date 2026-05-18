@@ -25,6 +25,11 @@ pub use composer::{Composer, ComposerEvent};
 pub use slash_popup::{BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries};
 pub use view::{BottomPaneView, InputResult};
 
+/// Width of the gutter column that renders the `›` prompt next to the
+/// composer. Used in three lockstep places: pane-height math, cursor
+/// positioning, and the render-time horizontal split.
+const GUTTER_WIDTH: u16 = 2;
+
 pub struct BottomPane {
     composer: Composer,
     view: Option<BottomPaneView>,
@@ -95,13 +100,41 @@ impl BottomPane {
         // Composer always reserves at least 3 rows so the filled background
         // reads as a distinct input block (one row of `›` + text plus a row
         // of padding above and below — matches the codex visual weight).
-        let composer_h = self.composer.desired_height(width).max(3);
+        let content_w = width.saturating_sub(GUTTER_WIDTH);
+        let composer_visual = self.composer.desired_height(content_w);
+        let composer_h = composer_visual.saturating_add(2).max(3);
         let overlay_h = self
             .view
             .as_ref()
             .map(|v| v.desired_height(width))
             .unwrap_or(0);
         composer_h.saturating_add(overlay_h)
+    }
+
+    /// Absolute screen position of the composer caret, given the rect the
+    /// pane is being rendered into. Mirrors the layout in [`Widget::render`].
+    pub fn cursor_position(&self, pane_area: Rect) -> Option<(u16, u16)> {
+        if pane_area.width == 0 || pane_area.height == 0 {
+            return None;
+        }
+        let overlay_h = self
+            .view
+            .as_ref()
+            .map(|v| v.desired_height(pane_area.width))
+            .unwrap_or(0);
+        let composer_y = pane_area.y.saturating_add(overlay_h);
+        let composer_h = pane_area.height.saturating_sub(overlay_h);
+        if composer_h <= 1 {
+            return None;
+        }
+        let text_top = composer_y.saturating_add(1);
+        let content_x = pane_area.x.saturating_add(GUTTER_WIDTH);
+        let content_width = pane_area.width.saturating_sub(GUTTER_WIDTH);
+        if content_width == 0 {
+            return None;
+        }
+        let (vcol, vrow) = self.composer.visual_position(content_width);
+        Some((content_x.saturating_add(vcol), text_top.saturating_add(vrow)))
     }
 
     fn reconcile_slash_popup(&mut self) {
@@ -166,18 +199,20 @@ impl Widget for &BottomPane {
             let bg = Style::default().bg(COMPOSER_BG);
             Block::default().style(bg).render(composer_outer, buf);
 
-            // One row of top padding so the prompt + text sit visually centred
-            // inside the block when only one line is composed.
+            // One row of padding above and below the text so the block reads
+            // as a distinct input region instead of butting up against the
+            // status bar / overlay.
             let text_top = composer_outer.y.saturating_add(1);
             let text_rect = Rect {
                 x: composer_outer.x,
                 y: text_top,
                 width: composer_outer.width,
-                height: composer_outer.height.saturating_sub(1),
+                height: composer_outer.height.saturating_sub(2),
             };
 
             let [gutter, content] =
-                Layout::horizontal([Constraint::Length(2), Constraint::Min(0)]).areas(text_rect);
+                Layout::horizontal([Constraint::Length(GUTTER_WIDTH), Constraint::Min(0)])
+                    .areas(text_rect);
 
             let prompt_style = if self.composer.is_empty() {
                 bg.fg(Color::DarkGray)

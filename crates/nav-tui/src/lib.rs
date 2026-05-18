@@ -168,6 +168,9 @@ pub async fn run(
             .split(area);
             f.render_widget(&chat, chunks[0]);
             f.render_widget(&pane, chunks[1]);
+            if let Some((cx, cy)) = pane.cursor_position(chunks[1]) {
+                f.set_cursor_position((cx, cy));
+            }
             f.render_widget(
                 StatusBar {
                     model: &args.model,
