@@ -10,6 +10,34 @@ fn open_temp_store() -> (tempfile::TempDir, SessionStore) {
 }
 
 #[test]
+fn default_db_path_uses_xdg_data_dir() {
+    let expected = xdg_data_home().unwrap().join("nav").join("nav.db");
+    assert_eq!(default_db_path().unwrap(), expected);
+}
+
+#[test]
+fn relative_db_path_resolves_under_nav_data_dir() {
+    assert_eq!(
+        resolve_db_path(Some(PathBuf::from("custom.db"))).unwrap(),
+        default_db_dir().unwrap().join("custom.db")
+    );
+}
+
+#[test]
+fn absolute_db_path_is_honored() {
+    let path = std::env::temp_dir().join("custom-nav.db");
+    assert_eq!(resolve_db_path(Some(path.clone())).unwrap(), path);
+}
+
+#[test]
+fn memory_db_path_is_honored() {
+    assert_eq!(
+        resolve_db_path(Some(PathBuf::from(":memory:"))).unwrap(),
+        PathBuf::from(":memory:")
+    );
+}
+
+#[test]
 fn schema_applies_on_fresh_temp_db() {
     let (_dir, store) = open_temp_store();
     let conn = store.conn.lock().unwrap();

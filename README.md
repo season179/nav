@@ -100,8 +100,9 @@ mode automatically.
 ## Sessions
 
 Every run is persisted to a local SQLite database (default
-`~/Library/Application Support/nav/nav.db` on macOS, `$XDG_STATE_HOME/nav/nav.db`
-on Linux). Override with `--db-path`.
+`$XDG_DATA_HOME/nav/nav.db`, falling back to `~/.local/share/nav/nav.db`).
+Absolute `--db-path` values are honored; relative values are resolved inside the
+nav data directory.
 
 ```sh
 nav --list-sessions                 # all sessions, newest first

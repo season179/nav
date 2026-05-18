@@ -11,10 +11,10 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 use ulid::Ulid;
 
 use crate::agent::{AgentEvent, TurnUsage};
@@ -81,15 +81,12 @@ pub struct SessionStore {
 
 impl SessionStore {
     /// Opens (and migrates) the session database. When `path` is `None` the
-    /// OS-specific default — `~/.local/state/nav/nav.db` on Linux,
-    /// `~/Library/Application Support/nav/nav.db` on macOS, the equivalent
-    /// `data_local_dir()` location on Windows — is used. Echoes the resolved
-    /// pragma values to stderr so misconfiguration is visible at startup.
+    /// XDG data directory — `$XDG_DATA_HOME/nav/nav.db`, falling back to
+    /// `~/.local/share/nav/nav.db` — is used. Relative overrides are resolved
+    /// inside that same nav data directory. Echoes the resolved pragma values
+    /// to stderr so misconfiguration is visible at startup.
     pub fn open(path: Option<PathBuf>) -> Result<Self> {
-        let path = match path {
-            Some(path) => path,
-            None => default_db_path()?,
-        };
+        let path = resolve_db_path(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -324,17 +321,35 @@ impl SessionStore {
     }
 }
 
-/// Resolves the on-disk location of the session database when the caller does
-/// not pass an explicit path. Per spec: `state_dir()` on Linux,
-/// `data_local_dir()` everywhere else, joined with `nav/nav.db`.
+/// Resolves the on-disk location of the session database. Absolute overrides
+/// are honored as-is; relative overrides mirror opencode's behavior by staying
+/// under nav's per-user data directory instead of the launch cwd.
+fn resolve_db_path(path: Option<PathBuf>) -> Result<PathBuf> {
+    match path {
+        Some(path) if path == Path::new(":memory:") || path.is_absolute() => Ok(path),
+        Some(path) => Ok(default_db_dir()?.join(path)),
+        None => default_db_path(),
+    }
+}
+
+/// Resolves the per-user XDG data directory used for nav-owned durable storage.
+fn default_db_dir() -> Result<PathBuf> {
+    let base = xdg_data_home().context("could not resolve XDG data directory for nav.db")?;
+    Ok(base.join("nav"))
+}
+
+/// Resolves the default on-disk location of the session database when the
+/// caller does not pass an explicit path. Per spec: XDG data home joined with
+/// `nav/nav.db`.
 fn default_db_path() -> Result<PathBuf> {
-    let base = if cfg!(target_os = "linux") {
-        dirs::state_dir()
-    } else {
-        dirs::data_local_dir()
-    };
-    let base = base.context("could not resolve OS state/data directory for nav.db")?;
-    Ok(base.join("nav").join("nav.db"))
+    Ok(default_db_dir()?.join("nav.db"))
+}
+
+fn xdg_data_home() -> Option<PathBuf> {
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))
 }
 
 fn apply_schema(conn: &Connection) -> Result<()> {

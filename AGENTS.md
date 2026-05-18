@@ -36,8 +36,9 @@ them from a `nav` task.
 - **TUI vs. NDJSON is auto-selected.** TTY stdout + no `--json-events` →
   interactive TUI. Anything else → one `AgentEvent` per line of NDJSON on
   stdout — the wire format every non-Rust frontend consumes.
-- **Sessions persist to SQLite** at `~/Library/Application Support/nav/nav.db`
-  (macOS) or `$XDG_STATE_HOME/nav/nav.db` (Linux). `--db-path` overrides it.
+- **Sessions persist to SQLite** at `$XDG_DATA_HOME/nav/nav.db`, falling back
+  to `~/.local/share/nav/nav.db`. Absolute `--db-path` overrides it; relative
+  values resolve inside the nav data directory.
 - **`nav update` / `nav upgrade`** reinstalls from the compile-time
   `CARGO_MANIFEST_DIR`, not from `$PWD`. If that checkout moved, the upgrade
   fails loudly instead of silently using a stale path.

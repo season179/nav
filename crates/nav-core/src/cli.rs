@@ -44,7 +44,8 @@ pub struct Args {
     pub cwd: Option<PathBuf>,
 
     /// Override the on-disk session database path. Defaults to the OS-specific
-    /// state/data directory joined with `nav/nav.db`.
+    /// XDG data directory joined with `nav/nav.db`; relative overrides resolve
+    /// inside that nav data directory.
     #[arg(long)]
     pub db_path: Option<PathBuf>,
 

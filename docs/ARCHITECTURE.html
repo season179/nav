@@ -1132,7 +1132,7 @@
         <code>crates/nav-core/src/session/mod.rs</code>.
       </aside>
 
-      <p class="drop">Every run is persisted to a SQLite file (default <code>~/Library/Application Support/nav/nav.db</code> on macOS). Three main tables, plus a small <code>schema_version</code> table for migrations:</p>
+      <p class="drop">Every run is persisted to a SQLite file (default <code>$XDG_DATA_HOME/nav/nav.db</code>, falling back to <code>~/.local/share/nav/nav.db</code>). Three main tables, plus a small <code>schema_version</code> table for migrations:</p>
 
       <ul>
         <li><code>session</code> — one row per run, with rollups (cwd, model, token totals).</li>
