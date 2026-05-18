@@ -8,6 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::{AgentEvent, TurnUsage};
 use crate::cli::Args;
+use crate::project::ProjectContext;
 use crate::responses::{self, ResponseCollector};
 use crate::session::{SessionId, SessionStore};
 use crate::skills::Catalog;
@@ -63,6 +64,7 @@ pub async fn run_agent(
     session: Option<&SessionBinding<'_>>,
     initial_input: Option<Vec<Value>>,
     skills: &Catalog,
+    context: Option<&ProjectContext>,
 ) -> Result<()> {
     let mut input = initial_input.unwrap_or_default();
     emit(&events, session, user_message_event(prompt, display_prompt));
@@ -73,7 +75,7 @@ pub async fn run_agent(
     }));
 
     for _ in 0..args.max_turns {
-        let body = responses::response_body(args, cwd, &input, skills);
+        let body = responses::response_body(args, cwd, &input, skills, context);
         let mut stream = match transport.create(body).await {
             Ok(stream) => stream,
             Err(err) => return fail(&events, session, err),

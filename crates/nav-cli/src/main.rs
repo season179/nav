@@ -1,18 +1,19 @@
 use anyhow::{Context, Result, bail};
-use clap::Parser;
 use nav_core::{
-    AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, SessionBinding, SessionStore,
-    SessionSummary, auth, cli::Args, discover_skills, rebuild_responses_input, run_agent,
+    AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, SessionBinding,
+    SessionStore, SessionSummary, auth, cli::Args, discover_skills, load_project_context,
+    rebuild_responses_input, run_agent, shorten_home,
 };
 use std::env;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let (mut args, provided) = Args::parse_with_sources();
     if args.list_sessions {
         return list_sessions_command(&args);
     }
@@ -23,6 +24,22 @@ async fn main() -> Result<()> {
     let cwd = env::current_dir()?
         .canonicalize()
         .context("failed to canonicalize current directory")?;
+
+    // Project context (settings, AGENTS.md/CLAUDE.md bodies, git workspace
+    // summary). Loaded once; explicit CLI flags win over any value pulled
+    // from settings, but a settings file can fill defaults.
+    let project = Arc::new(load_project_context(&cwd));
+    args.apply_settings(&project.settings, &provided);
+
+    // Headless mode emits its startup banner here, before auth setup, so a
+    // missing API key still shows the workspace summary first — useful when
+    // diagnosing "wait, which branch was I on?".
+    let is_tty = std::io::stdout().is_terminal();
+    let is_ndjson_mode = !is_tty || args.json_events;
+    if is_ndjson_mode {
+        print_ndjson_banner(&args, &cwd, project.as_ref());
+    }
+
     // Locked to launch cwd so the system prompt and slash popup never
     // disagree if the TUI later moves around.
     let skills = Arc::new(discover_skills(&cwd));
@@ -48,8 +65,7 @@ async fn main() -> Result<()> {
         .build()?;
     let transport = Arc::new(OpenAiTransport::new(client, auth_config, args.transport));
 
-    let is_tty = std::io::stdout().is_terminal();
-    if is_tty && !args.json_events {
+    if !is_ndjson_mode {
         let initial_prompt = (!args.prompt.is_empty()).then(|| args.prompt.join(" "));
         return nav_tui::run(
             transport,
@@ -60,6 +76,7 @@ async fn main() -> Result<()> {
             resume_events,
             initial_prompt,
             skills,
+            project,
         )
         .await;
     }
@@ -83,6 +100,7 @@ async fn main() -> Result<()> {
         Some(&binding),
         initial_input,
         skills.as_ref(),
+        Some(project.as_ref()),
     );
     let drainer = async {
         while let Some(event) = rx.recv().await {
@@ -142,6 +160,25 @@ fn run_upgrade() -> Result<()> {
     }
     println!("nav reinstalled.");
     Ok(())
+}
+
+/// One-shot startup banner emitted to stderr in NDJSON mode. Mirrors the lines
+/// the TUI welcome cell shows so headless frontends can still see which model,
+/// branch, and context files are in play. Stdout is reserved for `AgentEvent`
+/// NDJSON — adding a new event variant would force every external frontend to
+/// update, which is a steep cost for an observability nicety.
+fn print_ndjson_banner(args: &Args, cwd: &Path, project: &ProjectContext) {
+    let mut header = format!("nav · model {} · cwd {}", args.model, shorten_home(cwd));
+    if let Some(branch) = project.branch_summary() {
+        header.push_str(&format!(" · branch {branch}"));
+    }
+    eprintln!("{header}");
+    if let Some(summary) = project.context_summary() {
+        eprintln!("context: {summary}");
+    }
+    if let Some(summary) = project.settings_summary(cwd) {
+        eprintln!("settings: {summary}");
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

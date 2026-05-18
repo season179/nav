@@ -232,6 +232,7 @@ async fn run_agent_emits_single_error_when_transport_create_fails() {
         None,
         None,
         &Catalog::default(),
+        None,
     )
     .await
     .expect_err("transport failure should return an error");
@@ -309,6 +310,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         None,
         None,
         &Catalog::default(),
+        None,
     )
     .await;
     result.expect("run_agent should succeed");
@@ -499,6 +501,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         Some(&binding_one),
         None,
         &Catalog::default(),
+        None,
     )
     .await
     .expect("first run_agent");
@@ -547,6 +550,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         Some(&binding_two),
         Some(rebuilt),
         &Catalog::default(),
+        None,
     )
     .await
     .expect("resumed run_agent");
