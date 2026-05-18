@@ -4,6 +4,23 @@ Non-obvious context for editing `nav`. Product direction lives in
 [docs/CONTEXT.md](docs/CONTEXT.md); a guided code tour lives in
 [docs/ARCHITECTURE.html](docs/ARCHITECTURE.html).
 
+## Reference implementations
+
+Sibling coding-agent repos live next to this checkout — consult them before
+inventing a pattern from scratch. They are read-only references; do not edit
+them from a `nav` task.
+
+- `../codex` — upstream Codex CLI; the canonical source for transport, auth,
+  and `AgentEvent` shapes that `nav` mirrors.
+- `../opencode` — alternative TUI/runtime architecture; useful for session
+  persistence and frontend wire-format ideas.
+- `../hermes-agent` — agent loop, tool-call plumbing, and skill execution
+  patterns.
+- `../nanoclaw` — minimal Claude-compatible harness; good for comparing the
+  bare-minimum surface area.
+- `../pi` — adjacent agent project; check for shared conventions before
+  diverging.
+
 ## Prerequisites
 
 - `rg` (ripgrep) on `PATH` — the `code_search` tool shells out to it and
