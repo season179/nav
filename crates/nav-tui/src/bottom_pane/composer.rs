@@ -490,13 +490,20 @@ impl Composer {
         // History stores the post-expansion text so Up-arrow recall surfaces
         // the real prompt the agent received, not a stale placeholder.
         self.history.push(expanded.clone());
+        // Reconcile queued images against what the user actually submits: an
+        // image was inserted as a literal path string into the buffer; if the
+        // user has since edited or deleted that marker, the image should not
+        // ride along on the prompt. Substring-match on the original path is
+        // the cheapest reliable test — codex review iter 5 flagged the prior
+        // unconditional drain as a quiet privacy leak.
+        let mut images = std::mem::take(&mut self.pending_images);
+        images.retain(|path| expanded.contains(path.to_string_lossy().as_ref()));
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
         self.history_idx = None;
         self.pending_draft = None;
         self.pending_pastes.clear();
-        let images = std::mem::take(&mut self.pending_images);
         Some((expanded, images))
     }
 
@@ -667,6 +674,43 @@ mod tests {
             panic!("expected Submit");
         };
         assert_eq!(text, "/help");
+    }
+
+    #[test]
+    fn submit_drops_pending_image_when_path_edited_out_of_buffer() {
+        // User pastes an image, then deletes / replaces the inserted path
+        // before submitting. The image must not silently ride along on the
+        // outgoing prompt; only paths still present in the buffer ship.
+        let mut c = Composer::new();
+        c.push_pending_image(PathBuf::from(".nav/clipboard/abc.png"));
+        c.insert_paste(".nav/clipboard/abc.png");
+        // Simulate the user replacing the visible path with a typed prompt.
+        c.set_text("look at the doc");
+        // set_text already clears pending_images; re-queue to simulate the
+        // narrower bug where pending_images survives despite the path being
+        // edited out by direct typing rather than a full buffer swap.
+        c.push_pending_image(PathBuf::from(".nav/clipboard/abc.png"));
+        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(text, "look at the doc");
+        assert!(images.is_empty(), "stale image leaked: {images:?}");
+    }
+
+    #[test]
+    fn submit_keeps_image_whose_path_is_still_in_buffer() {
+        let mut c = Composer::new();
+        c.push_pending_image(PathBuf::from(".nav/clipboard/abc.png"));
+        c.insert_paste(".nav/clipboard/abc.png ");
+        // User types extra context after the path.
+        for ch in "review this".chars() {
+            c.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+        }
+        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert!(text.contains(".nav/clipboard/abc.png"));
+        assert_eq!(images, vec![PathBuf::from(".nav/clipboard/abc.png")]);
     }
 
     #[test]

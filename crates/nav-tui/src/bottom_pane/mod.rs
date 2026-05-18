@@ -343,21 +343,33 @@ fn workspace_relative_image(cwd: &Path, cleaned: &str) -> Option<String> {
 }
 
 /// If `s` looks like a path to a readable image file, return the cleaned
-/// path (with any `file://` prefix removed). The check is intentionally
-/// cheap — extension match against `image::ImageFormat` + a single
-/// `image_dimensions` probe — so a non-image paste falls through with
-/// negligible cost. The probe earns its keep by rejecting wrong-extension
-/// or corrupted files before they end up in the prompt.
+/// path. The check is intentionally cheap — extension match against
+/// `image::ImageFormat` + a single `image_dimensions` probe — so a non-image
+/// paste falls through with negligible cost. The probe earns its keep by
+/// rejecting wrong-extension or corrupted files before they end up in the
+/// prompt.
+///
+/// File URLs (`file:///tmp/My%20Image.png`) are parsed with `url::Url` so
+/// percent-encoded spaces and non-ASCII characters round-trip back into the
+/// real filesystem path before the probe. A bare path strip wouldn't decode
+/// `%20`, leaving an image with a space in its name as plain text instead of
+/// an attachment.
 fn recognized_image_path(s: &str) -> Option<String> {
-    if s.is_empty() {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let cleaned = s.strip_prefix("file://").unwrap_or(s);
-    let path = Path::new(cleaned);
+    let path: PathBuf = if let Ok(url) = url::Url::parse(trimmed)
+        && url.scheme() == "file"
+    {
+        url.to_file_path().ok()?
+    } else {
+        PathBuf::from(trimmed)
+    };
     let ext = path.extension().and_then(|e| e.to_str())?;
     image::ImageFormat::from_extension(ext)?;
-    image::image_dimensions(path).ok()?;
-    Some(cleaned.to_string())
+    image::image_dimensions(&path).ok()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 impl Widget for &BottomPane {
@@ -447,6 +459,29 @@ mod tests {
         assert_eq!(recognized_image_path(&path_str), Some(path_str.clone()));
         let file_url = format!("file://{}", path_str);
         assert_eq!(recognized_image_path(&file_url), Some(path_str));
+    }
+
+    #[test]
+    fn recognized_image_path_decodes_percent_encoded_file_url() {
+        // Filename with a space (very common on macOS / GNOME screenshots).
+        // A bare `strip_prefix("file://")` leaves `%20` in the path and the
+        // dimensions probe fails — the image silently falls through as text.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("My Image.png");
+        write_png(&path);
+
+        // Build a file:// URL with proper percent-encoding via the `url` crate
+        // so the test asserts the real decoding path, not just a hand-rolled
+        // string.
+        let url = url::Url::from_file_path(&path).expect("valid file path");
+        let encoded = url.as_str();
+        assert!(
+            encoded.contains("%20"),
+            "expected encoded space in test fixture: {encoded}"
+        );
+
+        let decoded = recognized_image_path(encoded).expect("encoded file URL must resolve");
+        assert_eq!(decoded, path.to_string_lossy());
     }
 
     fn write_png(path: &Path) {
