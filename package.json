@@ -1,7 +1,7 @@
 {
   "name": "nav-desktop",
   "productName": "nav-desktop",
-  "version": "0.1.0",
+  "version": "26.5.0",
   "private": true,
   "description": "Desktop UI shell for nav-desktop.",
   "main": "nav-desktop/main.js",
