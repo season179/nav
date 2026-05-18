@@ -6,6 +6,7 @@ use nav_core::{
 };
 use std::env;
 use std::io::IsTerminal;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -14,6 +15,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     if args.list_sessions {
         return list_sessions_command(&args);
+    }
+    if is_upgrade_command(&args.prompt) {
+        return run_upgrade();
     }
 
     let cwd = env::current_dir()?
@@ -118,6 +122,27 @@ fn format_cost(summary: &SessionSummary) -> String {
         format!("${:.4}", summary.cost_micros_reported as f64 / 1_000_000.0)
     }
 }
+fn is_upgrade_command(prompt: &[String]) -> bool {
+    prompt.len() == 1 && matches!(prompt[0].as_str(), "update" | "upgrade")
+}
+
+// The manifest dir is captured at compile time, so a globally installed `nav`
+// still knows which checkout it was built from. If the user moved or deleted
+// that checkout, `cargo install` fails with a clear message.
+fn run_upgrade() -> Result<()> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    println!("Reinstalling nav from {manifest_dir}");
+    let status = Command::new("cargo")
+        .args(["install", "--path", manifest_dir, "--force"])
+        .status()
+        .context("failed to invoke `cargo` (is it on PATH?)")?;
+    if !status.success() {
+        bail!("`cargo install` exited with {status}");
+    }
+    println!("nav reinstalled.");
+    Ok(())
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
