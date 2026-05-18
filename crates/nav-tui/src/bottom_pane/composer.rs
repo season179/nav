@@ -112,7 +112,9 @@ impl Composer {
     /// `email@example.com` and reopens the popup only after a space is typed.
     pub fn current_at_token(&self) -> Option<(usize, &str)> {
         let line = &self.lines[self.row];
-        if self.col > line.len() {
+        // Defensive: any path that left `self.col` inside a multibyte char or
+        // past the end of the line must not panic — this runs on every key.
+        if self.col > line.len() || !line.is_char_boundary(self.col) {
             return None;
         }
         let before = &line[..self.col];
@@ -430,7 +432,7 @@ impl Composer {
             return false;
         }
         self.row -= 1;
-        self.col = self.col.min(self.lines[self.row].len());
+        self.col = clamp_to_char_boundary(&self.lines[self.row], self.col);
         true
     }
 
@@ -439,7 +441,7 @@ impl Composer {
             return false;
         }
         self.row += 1;
-        self.col = self.col.min(self.lines[self.row].len());
+        self.col = clamp_to_char_boundary(&self.lines[self.row], self.col);
         true
     }
 
@@ -590,6 +592,21 @@ fn next_char_boundary(s: &str, byte: usize) -> usize {
         .nth(1)
         .map(|(i, _)| byte + i)
         .unwrap_or(s.len())
+}
+
+/// Snap a tentative byte offset into `s` to the nearest valid char boundary
+/// at or before it, capped at `s.len()`. Vertical cursor movement can land
+/// inside a multibyte character — e.g. column 1 on a line starting with `é`
+/// (two bytes) — and `&s[..col]` would then panic. This is the cheap fix
+/// used by move_up_intra / move_down_intra. We walk backwards manually
+/// rather than calling `prev_char_boundary` because that helper itself
+/// slices `s[..byte]`, which would panic on the very offset we need to fix.
+fn clamp_to_char_boundary(s: &str, byte: usize) -> usize {
+    let mut b = byte.min(s.len());
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
 }
 
 #[cfg(test)]
@@ -746,6 +763,25 @@ mod tests {
             c.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
         }
         c
+    }
+
+    #[test]
+    fn move_up_across_multibyte_does_not_panic_on_at_token_probe() {
+        // Regression: type `é` (2 bytes), Shift+Enter to drop to a new line,
+        // type `a`, press Up. Without char-boundary clamping, col=1 on the
+        // first line falls inside `é` and `current_at_token` slices a
+        // non-boundary, crashing the TUI on every key while the @ popup logic
+        // probes after each keystroke.
+        let mut c = Composer::new();
+        c.handle_key(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::empty()));
+        c.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        c.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        c.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        // The probe must not panic; either Some or None is acceptable, the
+        // point is that this call returns at all.
+        let _ = c.current_at_token();
+        // Cursor must land on a real char boundary on the first line.
+        assert!(c.lines[c.row].is_char_boundary(c.col));
     }
 
     #[test]
