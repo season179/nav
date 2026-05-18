@@ -3,6 +3,7 @@ pub mod types;
 mod websocket;
 
 use crate::agent::{ResponsesTransport, TurnUsage};
+use crate::skills::Catalog;
 use crate::{
     auth::AuthConfig,
     cli::{Args, Transport},
@@ -11,6 +12,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{Stream, stream};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -29,21 +31,48 @@ pub struct ToolCall {
 ///
 /// Exposed at crate level so the agent loop and tests can share it with the
 /// transport implementations without duplicating the schema.
-pub(crate) fn response_body(args: &Args, cwd: &Path, input: &[Value]) -> Value {
+pub(crate) fn response_body(args: &Args, cwd: &Path, input: &[Value], skills: &Catalog) -> Value {
     // tools are just JSON descriptions. The model decides whether to emit
     // a function_call item; Rust remains responsible for actually doing work.
     json!({
         "model": args.model,
-        "instructions": format!(
-            "You are a small coding agent running in {}. Use tools to inspect, edit, search, and verify code. Prefer small, explicit steps. Paths must be relative.",
-            cwd.display()
-        ),
+        "instructions": build_instructions(cwd, skills),
         "input": input,
         // store=false keeps the demo honest: nav manages the transcript itself,
         // and no server-side stored conversation is needed for the agent loop.
         "store": false,
         "tools": tool_definitions(),
     })
+}
+
+fn build_instructions(cwd: &Path, skills: &Catalog) -> String {
+    let mut out = format!(
+        "You are a small coding agent running in {}. Use tools to inspect, edit, search, and verify code. Prefer small, explicit steps. Paths must be relative.",
+        cwd.display()
+    );
+    if !skills.is_empty() {
+        out.push_str("\n\nAvailable skills:\n");
+        for skill in skills.iter() {
+            // Absolute paths: the model loads these via the read_file tool,
+            // which now accepts paths under any catalog skill_dir.
+            let _ = writeln!(
+                out,
+                "- {name} [{scope}]: {description} (SKILL.md: {path}, skill_dir: {dir})",
+                name = skill.name,
+                scope = skill.scope.as_str(),
+                description = skill.description,
+                path = skill.skill_md_path.display(),
+                dir = skill.skill_dir.display(),
+            );
+        }
+        out.push_str(
+            "When a user request matches a skill, read the listed SKILL.md \
+             first to load its instructions before acting. Resolve any \
+             relative resources mentioned in a SKILL.md against that skill's \
+             skill_dir.",
+        );
+    }
+    out
 }
 
 /// Real `Responses` transport backed by the existing WebSocket and SSE code.
@@ -273,7 +302,7 @@ mod tests {
         let args = Args::test_default();
         let cwd = std::path::Path::new("/tmp");
         let input = vec![json!({"type": "message", "role": "user", "content": "hi"})];
-        let body = response_body(&args, cwd, &input);
+        let body = response_body(&args, cwd, &input, &Catalog::default());
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["store"], false);
         assert!(body["input"].is_array());
@@ -284,9 +313,11 @@ mod tests {
     fn response_body_instructions_contain_cwd() {
         let args = Args::test_default();
         let cwd = std::path::Path::new("/my/project");
-        let body = response_body(&args, cwd, &[]);
+        let body = response_body(&args, cwd, &[], &Catalog::default());
         let instructions = body["instructions"].as_str().unwrap();
         assert!(instructions.contains("/my/project"));
+        // No skills => no available-skills section.
+        assert!(!instructions.contains("Available skills"));
     }
 
     #[test]
@@ -297,10 +328,32 @@ mod tests {
             json!({"type": "message", "role": "user", "content": "hello"}),
             json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
         ];
-        let body = response_body(&args, cwd, &input);
+        let body = response_body(&args, cwd, &input, &Catalog::default());
         let body_input = body["input"].as_array().unwrap();
         assert_eq!(body_input.len(), 2);
         assert_eq!(body_input[1]["call_id"], "c1");
+    }
+
+    #[test]
+    fn response_body_lists_skills_when_present() {
+        use crate::skills::{Skill, SkillScope};
+        let args = Args::test_default();
+        let cwd = std::path::Path::new("/tmp");
+        let catalog = Catalog::new(vec![Skill {
+            name: "demo".into(),
+            description: "demo skill".into(),
+            skill_md_path: "/abs/skills/demo/SKILL.md".into(),
+            skill_dir: "/abs/skills/demo".into(),
+            scope: SkillScope::Project,
+        }]);
+        let body = response_body(&args, cwd, &[], &catalog);
+        let instructions = body["instructions"].as_str().unwrap();
+        assert!(instructions.contains("Available skills"));
+        assert!(instructions.contains("demo"));
+        assert!(instructions.contains("demo skill"));
+        assert!(instructions.contains("/abs/skills/demo/SKILL.md"));
+        assert!(instructions.contains("/abs/skills/demo"));
+        assert!(instructions.contains("read the listed SKILL.md"));
     }
 
     // ── function_calls ────────────────────────────────────────────

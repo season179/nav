@@ -53,9 +53,14 @@ fn slash_shows_popup_and_he_filters_to_help() {
     assert!(pane.has_overlay(), "popup must appear on the leading slash");
     let popup = pane.slash_popup().expect("slash popup");
     assert_eq!(popup.filter(), "/");
+    let commands: Vec<&str> = popup
+        .matches()
+        .iter()
+        .map(|entry| entry.command.as_str())
+        .collect();
     assert_eq!(
-        popup.matches(),
-        &["/help", "/clear", "/quit", "/resume", "/sessions"]
+        commands,
+        vec!["/help", "/clear", "/quit", "/resume", "/sessions"]
     );
 
     type_text(&mut pane, "he");
@@ -63,7 +68,38 @@ fn slash_shows_popup_and_he_filters_to_help() {
 
     let popup = pane.slash_popup().expect("slash popup remains");
     assert_eq!(popup.filter(), "/he");
-    assert_eq!(popup.matches(), &["/help"]);
+    let commands: Vec<&str> = popup
+        .matches()
+        .iter()
+        .map(|entry| entry.command.as_str())
+        .collect();
+    assert_eq!(commands, vec!["/help"]);
+}
+
+#[test]
+fn slash_popup_lists_catalog_skills() {
+    use nav_core::{Catalog, Skill, SkillScope};
+    use nav_tui::bottom_pane::build_slash_entries;
+    let catalog = Catalog::new(vec![Skill {
+        name: "foo".into(),
+        description: "do foo".into(),
+        skill_md_path: "/tmp/foo/SKILL.md".into(),
+        skill_dir: "/tmp/foo".into(),
+        scope: SkillScope::Project,
+    }]);
+    let mut pane = BottomPane::with_slash_entries(build_slash_entries(&catalog));
+    press(&mut pane, KeyCode::Char('/'), KeyModifiers::NONE);
+    let popup = pane.slash_popup().expect("slash popup");
+    let commands: Vec<&str> = popup
+        .matches()
+        .iter()
+        .map(|entry| entry.command.as_str())
+        .collect();
+    assert!(
+        commands.contains(&"/foo"),
+        "catalog skill missing: {commands:?}"
+    );
+    assert!(commands.contains(&"/help"));
 }
 
 #[test]

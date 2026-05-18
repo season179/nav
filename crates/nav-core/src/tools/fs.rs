@@ -6,14 +6,32 @@ use std::{
 use tokio::process::Command;
 
 fn resolve_inside(root: &Path, requested: &str) -> Result<PathBuf> {
-    // coding agents should not freely read or edit the whole machine. This
-    // demo restricts path tools to relative paths under the current workspace.
+    resolve_under(root, &[], requested)
+}
+
+/// Resolve a requested path against `root` (for relative paths) or against
+/// any of `extra_roots` (for absolute paths). Skill-aware reads pass
+/// `Catalog::skill_dirs` here so the model can load files advertised in the
+/// system-prompt catalog without loosening the relative-path guard.
+fn resolve_under(root: &Path, extra_roots: &[PathBuf], requested: &str) -> Result<PathBuf> {
     debug_assert_is_canonical(root);
+    if Path::new(requested).is_absolute() {
+        let resolved = Path::new(requested)
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {requested}"))?;
+        if extra_roots.iter().any(|root| resolved.starts_with(root)) {
+            return Ok(resolved);
+        }
+        bail!(
+            "absolute paths are only allowed under a known skill directory: {}",
+            resolved.display()
+        );
+    }
     let path = relative_path(requested)?;
-    let resolved = root.join(path);
-    let resolved = resolved
+    let joined = root.join(path);
+    let resolved = joined
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", resolved.display()))?;
+        .with_context(|| format!("failed to canonicalize {}", joined.display()))?;
     if !resolved.starts_with(root) {
         bail!("path escapes workspace: {}", resolved.display());
     }
@@ -101,16 +119,16 @@ fn debug_assert_is_canonical(root: &Path) {
     );
 }
 
-pub(super) fn read_file(cwd: &Path, path: &str) -> Result<String> {
-    let path = resolve_inside(cwd, path)?;
+pub(super) fn read_file(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Result<String> {
+    let path = resolve_under(cwd, skill_dirs, path)?;
     if path.is_dir() {
         bail!("{} is a directory", path.display());
     }
     fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
 }
 
-pub(super) fn list_files(cwd: &Path, path: &str) -> Result<String> {
-    let path = resolve_inside(cwd, path)?;
+pub(super) fn list_files(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Result<String> {
+    let path = resolve_under(cwd, skill_dirs, path)?;
     let mut entries = fs::read_dir(&path)
         .with_context(|| format!("failed to list {}", path.display()))?
         .map(|entry| {
@@ -153,8 +171,13 @@ pub(super) fn edit_file(cwd: &Path, path: &str, old_str: &str, new_str: &str) ->
     Ok(format!("edited {}", path.display()))
 }
 
-pub(super) async fn code_search(cwd: &Path, pattern: &str, path: &str) -> Result<String> {
-    let path = resolve_inside(cwd, path)?;
+pub(super) async fn code_search(
+    cwd: &Path,
+    skill_dirs: &[PathBuf],
+    pattern: &str,
+    path: &str,
+) -> Result<String> {
+    let path = resolve_under(cwd, skill_dirs, path)?;
     let output = Command::new("rg")
         .arg("--line-number")
         .arg("--no-heading")
@@ -232,7 +255,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
         let workspace = workspace.canonicalize().unwrap();
 
-        let error = read_file(&workspace, "link").unwrap_err();
+        let error = read_file(&workspace, &[], "link").unwrap_err();
 
         assert!(error.to_string().contains("path escapes workspace"));
     }
@@ -267,9 +290,45 @@ mod tests {
         let temp = tempdir().unwrap();
         let workspace = temp.path().canonicalize().unwrap();
 
-        let error = read_file(&workspace, "").unwrap_err();
+        let error = read_file(&workspace, &[], "").unwrap_err();
 
         assert!(error.to_string().contains("path is required"));
+    }
+
+    #[test]
+    fn read_file_allows_absolute_path_under_skill_dir() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+
+        let skill_dir = temp.path().join("skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_dir = skill_dir.canonicalize().unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(&skill_md, "skill body").unwrap();
+
+        let body = read_file(
+            &workspace,
+            std::slice::from_ref(&skill_dir),
+            skill_md.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body, "skill body");
+    }
+
+    #[test]
+    fn read_file_rejects_absolute_path_without_skill_root() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let outside = temp.path().join("outside.txt");
+        fs::write(&outside, "secret").unwrap();
+
+        let err = read_file(&workspace, &[], outside.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("absolute paths are only allowed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

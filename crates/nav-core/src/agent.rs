@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::cli::Args;
 use crate::responses::{self, ResponseCollector};
 use crate::session::{SessionId, SessionStore};
+use crate::skills::Catalog;
 use crate::tools;
 
 /// Normalized usage counters emitted at the end of each model turn.
@@ -115,6 +116,7 @@ pub async fn run_agent(
     events: UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
     initial_input: Option<Vec<Value>>,
+    skills: &Catalog,
 ) -> Result<()> {
     let mut input = initial_input.unwrap_or_default();
     input.push(json!({
@@ -124,7 +126,7 @@ pub async fn run_agent(
     }));
 
     for _ in 0..args.max_turns {
-        let body = responses::response_body(args, cwd, &input);
+        let body = responses::response_body(args, cwd, &input, skills);
         let mut stream = transport.create(body).await?;
 
         let mut collector = ResponseCollector::default();
@@ -184,8 +186,14 @@ pub async fn run_agent(
                 },
             );
 
-            let result =
-                tools::run_tool(cwd, args.bash_timeout_secs, &call.name, call.arguments).await;
+            let result = tools::run_tool(
+                cwd,
+                skills,
+                args.bash_timeout_secs,
+                &call.name,
+                call.arguments,
+            )
+            .await;
             let (output_text, is_error) = match result {
                 Ok(text) => (text, false),
                 Err(err) => (format!("tool error: {err:#}"), true),
@@ -527,7 +535,17 @@ mod tests {
         let cwd = cwd_dir.path().canonicalize().unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-        let result = run_agent(&transport, &args, &cwd, "do the thing", tx, None, None).await;
+        let result = run_agent(
+            &transport,
+            &args,
+            &cwd,
+            "do the thing",
+            tx,
+            None,
+            None,
+            &Catalog::default(),
+        )
+        .await;
         result.expect("run_agent should succeed");
 
         let mut events = Vec::new();
@@ -724,6 +742,7 @@ mod tests {
             tx1,
             Some(&binding_one),
             None,
+            &Catalog::default(),
         )
         .await
         .expect("first run_agent");
@@ -762,6 +781,7 @@ mod tests {
             tx2,
             Some(&binding_two),
             Some(rebuilt),
+            &Catalog::default(),
         )
         .await
         .expect("resumed run_agent");

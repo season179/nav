@@ -65,6 +65,42 @@ so `nav-core` itself stays generic.
 There is no long-lived `nav-server` daemon. If long-lived multi-session state
 later becomes necessary, it can be added without rewriting any of the above.
 
+## Skills
+
+`nav` implements the [agentskills.io](https://agentskills.io) client protocol:
+agent skills are directories containing a `SKILL.md` file with YAML
+frontmatter (`name`, `description`). Discovery happens once when `nav`
+starts, scoped to the process launch cwd:
+
+1. Walk upward from launch cwd to the nearest ancestor with `.agents/skills/`
+   — these are project skills.
+2. Read `~/.agents/skills/` — these are user skills.
+3. Project entries shadow user entries with the same parsed `name` and the
+   shadowing is logged with both paths.
+
+The discovered [`Catalog`] is shared by three seams:
+
+- `response_body` injects a compact "Available skills" list into the system
+  prompt — `name`, `description`, absolute `SKILL.md` path, and `skill_dir`.
+  The model loads instructions on demand using its existing file-read tool
+  rather than via any dedicated `activate_skill` tool.
+- `run_tool` accepts paths under any catalog `skill_dir` as additional read
+  roots for `read_file`, `list_files`, and `code_search`, so the absolute
+  paths the system prompt advertises are actually resolvable. Writes
+  (`edit_file`) remain workspace-only.
+- The TUI slash popup is sourced from the same catalog: built-in commands
+  (`/help`, `/clear`, `/quit`, `/resume`, `/sessions`) plus one entry per
+  skill. Submitting `/<skill-name> <request>` wraps the SKILL.md body in a
+  `<skill name=… dir=…>` block and inlines `<request>` for the next turn.
+  Submitting `/<skill-name>` alone queues the wrapped body in TUI state and
+  prepends it to the next non-slash prompt; each `run_agent` call is
+  independent of prior turns, so without this queue the activation would
+  not reach the model alongside the actual request.
+
+Skills that are malformed (missing description, unparseable frontmatter) are
+skipped with a diagnostic. Cosmetic issues like a `name`/directory mismatch
+warn but still load.
+
 ## Engineering Principles
 
 - Keep the educational path clear. A new contributor should still be able to

@@ -5,6 +5,8 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::path::Path;
 
+use crate::skills::Catalog;
+
 pub(super) fn tool_definitions() -> Vec<Value> {
     // these five primitives mirror the workshop article. Together they let
     // the model inspect code, find code, change code, and verify with commands.
@@ -74,12 +76,21 @@ pub(super) fn tool_definitions() -> Vec<Value> {
     ]
 }
 
-pub async fn run_tool(cwd: &Path, timeout_secs: u64, name: &str, input: Value) -> Result<String> {
+pub async fn run_tool(
+    cwd: &Path,
+    skills: &Catalog,
+    timeout_secs: u64,
+    name: &str,
+    input: Value,
+) -> Result<String> {
     // central dispatch keeps the trust boundary obvious. The model asks;
     // this Rust match decides exactly which local capability is allowed.
+    // Skill directories are accepted as extra read roots; writes
+    // (`edit_file`) stay workspace-only.
+    let skill_dirs = skills.skill_dirs();
     match name {
-        "read_file" => fs::read_file(cwd, string_arg(&input, "path")?),
-        "list_files" => fs::list_files(cwd, string_arg(&input, "path")?),
+        "read_file" => fs::read_file(cwd, skill_dirs, string_arg(&input, "path")?),
+        "list_files" => fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?),
         "bash" => shell::bash(cwd, timeout_secs, string_arg(&input, "command")?).await,
         "edit_file" => fs::edit_file(
             cwd,
@@ -90,6 +101,7 @@ pub async fn run_tool(cwd: &Path, timeout_secs: u64, name: &str, input: Value) -
         "code_search" => {
             fs::code_search(
                 cwd,
+                skill_dirs,
                 string_arg(&input, "pattern")?,
                 string_arg(&input, "path")?,
             )
@@ -150,7 +162,9 @@ mod tests {
     #[tokio::test]
     async fn run_tool_rejects_unknown_tool() {
         let cwd = Path::new("/tmp");
-        let err = run_tool(cwd, 5, "fly_away", json!({})).await.unwrap_err();
+        let err = run_tool(cwd, &Catalog::default(), 5, "fly_away", json!({}))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("unknown tool: fly_away"));
     }
 
@@ -160,9 +174,15 @@ mod tests {
         let cwd = temp.path().canonicalize().unwrap();
         fs::write(cwd.join("hello.txt"), "world").unwrap();
 
-        let result = run_tool(&cwd, 5, "read_file", json!({"path": "hello.txt"}))
-            .await
-            .unwrap();
+        let result = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            "read_file",
+            json!({"path": "hello.txt"}),
+        )
+        .await
+        .unwrap();
         assert_eq!(result, "world");
     }
 
@@ -173,9 +193,15 @@ mod tests {
         fs::write(cwd.join("a.txt"), "").unwrap();
         fs::create_dir(cwd.join("subdir")).unwrap();
 
-        let result = run_tool(&cwd, 5, "list_files", json!({"path": "."}))
-            .await
-            .unwrap();
+        let result = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            "list_files",
+            json!({"path": "."}),
+        )
+        .await
+        .unwrap();
         let parsed: Vec<String> = serde_json::from_str(&result).unwrap();
         assert!(parsed.contains(&"a.txt".to_string()));
         assert!(parsed.contains(&"subdir/".to_string()));
@@ -186,9 +212,15 @@ mod tests {
         let temp = tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
 
-        let result = run_tool(&cwd, 5, "bash", json!({"command": "echo ok"}))
-            .await
-            .unwrap();
+        let result = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            "bash",
+            json!({"command": "echo ok"}),
+        )
+        .await
+        .unwrap();
         assert!(result.contains("ok"));
     }
 
@@ -200,6 +232,7 @@ mod tests {
 
         let result = run_tool(
             &cwd,
+            &Catalog::default(),
             5,
             "edit_file",
             json!({"path": "f.txt", "old_str": "world", "new_str": "nav"}),
@@ -208,6 +241,59 @@ mod tests {
         .unwrap();
         assert!(result.contains("edited"));
         assert_eq!(fs::read_to_string(cwd.join("f.txt")).unwrap(), "hello nav");
+    }
+
+    #[tokio::test]
+    async fn run_tool_reads_skill_md_under_skill_dir() {
+        use crate::skills::{Skill, SkillScope};
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let skill_home = tempdir().unwrap();
+        let skill_dir = skill_home.path().canonicalize().unwrap().join("demo");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "---\nname: demo\ndescription: d\n---\nSkill body\n",
+        )
+        .unwrap();
+        let catalog = Catalog::new(vec![Skill {
+            name: "demo".into(),
+            description: "d".into(),
+            skill_md_path: skill_md.clone(),
+            skill_dir: skill_dir.clone(),
+            scope: SkillScope::User,
+        }]);
+
+        let result = run_tool(
+            &cwd,
+            &catalog,
+            5,
+            "read_file",
+            json!({"path": skill_md.to_string_lossy()}),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("Skill body"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_rejects_absolute_path_outside_skill_dirs() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let err = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            "read_file",
+            json!({"path": "/etc/hosts"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("absolute paths are only allowed"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── string_arg ────────────────────────────────────────────────
