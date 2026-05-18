@@ -319,25 +319,46 @@ fn try_save_clipboard_image(cwd: &Path) -> Option<String> {
 }
 
 /// Turn a pasted-image absolute or relative path into a workspace-relative
-/// path the agent can actually `read_file`. Already-relative inputs pass
-/// through; absolute paths inside `cwd` get relativized; absolute paths
-/// outside the workspace are copied into `<cwd>/.nav/clipboard/` so the read
-/// sandbox can reach them. Returns `None` if all three fail (rare — usually
-/// permission errors on the copy).
+/// path the agent can actually `read_file`. Paths whose canonical form lives
+/// inside `cwd` get relativized; everything else is copied into
+/// `<cwd>/.nav/clipboard/` so the read sandbox in nav-core can actually read
+/// the bytes. Without resolving relative paths against `cwd` first, a paste
+/// like `../screenshot.png` from a sub-directory of the workspace passes
+/// through unchanged, then `encode_image_data_uri` silently drops it because
+/// it escapes the canonicalized cwd. Returns `None` only when both the
+/// containment check fails and the fallback copy fails.
 fn workspace_relative_image(cwd: &Path, cleaned: &str) -> Option<String> {
     let path = Path::new(cleaned);
-    if path.is_relative() {
-        return Some(cleaned.to_string());
-    }
-    if let Ok(rel) = path.strip_prefix(cwd) {
+    let abs_for_check = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let canonical = abs_for_check
+        .canonicalize()
+        .ok()
+        .or_else(|| Some(abs_for_check.clone()))?;
+    let cwd_canonical = cwd.canonicalize().ok().unwrap_or_else(|| cwd.to_path_buf());
+
+    // Already inside the workspace? Hand back the cwd-relative form so the
+    // composer shows a short, recognizable path and so the runner's
+    // containment check downstream agrees.
+    if let Ok(rel) = canonical.strip_prefix(&cwd_canonical) {
         return Some(rel.to_string_lossy().into_owned());
     }
+
+    // Outside the workspace — copy in. Use the canonical path as the source
+    // so we follow any symlink the user pointed at, but the destination is
+    // always under `.nav/clipboard/`.
     let dir = cwd.join(".nav").join("clipboard");
     std::fs::create_dir_all(&dir).ok()?;
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png");
     let filename = format!("{}.{ext}", uuid::Uuid::new_v4().simple());
     let dest = dir.join(&filename);
-    std::fs::copy(path, &dest).ok()?;
+    std::fs::copy(&canonical, &dest).ok()?;
     let rel = PathBuf::from(".nav").join("clipboard").join(filename);
     Some(rel.to_string_lossy().into_owned())
 }
@@ -493,7 +514,14 @@ mod tests {
 
     #[test]
     fn workspace_relative_passes_relative_through() {
+        // A relative path that resolves *inside* cwd round-trips back to the
+        // canonical workspace-relative form. The file has to exist so the
+        // canonicalization step can resolve symlinks on macOS where `/tmp`
+        // is a symlink to `/private/tmp`.
         let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("screenshots").join("foo.png");
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        write_png(&png);
         let out = workspace_relative_image(dir.path(), "screenshots/foo.png").unwrap();
         assert_eq!(out, "screenshots/foo.png");
     }
@@ -521,5 +549,25 @@ mod tests {
             "expected workspace-relative copy, got {out:?}"
         );
         assert!(cwd.path().join(&out).exists());
+    }
+
+    #[test]
+    fn workspace_relative_copies_relative_path_that_escapes_cwd() {
+        // Running `nav` from `repo/subdir` and pasting `../outside.png` —
+        // resolves outside the launch cwd. Returning the literal `../` path
+        // would later be silently dropped by the runner's containment check,
+        // so the image must be copied into `<cwd>/.nav/clipboard/` instead.
+        let outer = tempfile::tempdir().unwrap();
+        let outside = outer.path().join("escapes.png");
+        write_png(&outside);
+        let cwd = outer.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let out = workspace_relative_image(&cwd, "../escapes.png").unwrap();
+        assert!(
+            out.starts_with(".nav/clipboard/") && out.ends_with(".png"),
+            "relative escape must be copied in, got {out:?}"
+        );
+        assert!(cwd.join(&out).exists());
     }
 }
