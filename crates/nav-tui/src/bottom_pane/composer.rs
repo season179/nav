@@ -83,8 +83,11 @@ impl Composer {
     }
 
     /// Replace the entire buffer and place the cursor at the end. Any pending
-    /// large-paste placeholders are dropped — `set_text` is a wholesale buffer
-    /// swap, so the old placeholders no longer point at anything meaningful.
+    /// large-paste placeholders and queued image attachments are dropped —
+    /// `set_text` is a wholesale buffer swap (history recall, slash completion,
+    /// programmatic clear), so the old state no longer corresponds to what the
+    /// user can see. Without clearing `pending_images`, a stale clipboard image
+    /// would silently ride along on the next submit.
     pub fn set_text(&mut self, text: &str) {
         self.lines = if text.is_empty() {
             vec![String::new()]
@@ -94,6 +97,7 @@ impl Composer {
         self.row = self.lines.len() - 1;
         self.col = self.lines[self.row].len();
         self.pending_pastes.clear();
+        self.pending_images.clear();
     }
 
     pub fn history(&self) -> &[String] {
@@ -663,6 +667,25 @@ mod tests {
             panic!("expected Submit");
         };
         assert_eq!(text, "/help");
+    }
+
+    #[test]
+    fn set_text_clears_pending_images() {
+        // Wholesale buffer swap (history recall, slash completion) must drop
+        // queued image attachments — otherwise the next submit silently sends
+        // an image the user can no longer see in the composer.
+        let mut c = Composer::new();
+        c.push_pending_image(PathBuf::from(".nav/clipboard/abcd.png"));
+        c.insert_paste(".nav/clipboard/abcd.png");
+        assert_eq!(c.pending_images.len(), 1);
+        c.set_text("hello world");
+        assert!(c.pending_images.is_empty());
+
+        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(text, "hello world");
+        assert!(images.is_empty());
     }
 
     #[test]

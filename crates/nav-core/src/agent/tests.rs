@@ -5,6 +5,7 @@ use anyhow::Result;
 use futures_util::stream;
 use serde_json::{Value, json};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
 use tempfile::tempdir;
@@ -123,16 +124,19 @@ fn extract_message_text_returns_none_for_empty_content() {
 
 #[test]
 fn rebuild_responses_input_replays_user_text_not_display_text() {
-    let input = rebuild_responses_input(&[
-        AgentEvent::UserMessage {
-            text: "model-facing prompt".into(),
-            display_text: Some("visible prompt".into()),
-            attachments: Vec::new(),
-        },
-        AgentEvent::AssistantMessageDone {
-            text: "assistant reply".into(),
-        },
-    ]);
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "model-facing prompt".into(),
+                display_text: Some("visible prompt".into()),
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "assistant reply".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
 
     assert!(is_input_user_message(&input[0], "model-facing prompt"));
     assert!(is_input_assistant_message(&input[1], "assistant reply"));
@@ -140,26 +144,29 @@ fn rebuild_responses_input_replays_user_text_not_display_text() {
 
 #[test]
 fn rebuild_responses_input_skips_tool_events() {
-    let input = rebuild_responses_input(&[
-        AgentEvent::UserMessage {
-            text: "inspect".into(),
-            display_text: None,
-            attachments: Vec::new(),
-        },
-        AgentEvent::ToolCallStarted {
-            call_id: "call_1".into(),
-            name: "read_file".into(),
-            arguments: json!({"path": "Cargo.toml"}),
-        },
-        AgentEvent::ToolCallOutput {
-            call_id: "call_1".into(),
-            output: "contents".into(),
-            is_error: false,
-        },
-        AgentEvent::AssistantMessageDone {
-            text: "Cargo.toml is a Rust manifest.".into(),
-        },
-    ]);
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "inspect".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::ToolCallStarted {
+                call_id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "Cargo.toml"}),
+            },
+            AgentEvent::ToolCallOutput {
+                call_id: "call_1".into(),
+                output: "contents".into(),
+                is_error: false,
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "Cargo.toml is a Rust manifest.".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
 
     assert_eq!(input.len(), 2);
     assert!(is_input_user_message(&input[0], "inspect"));
@@ -167,6 +174,76 @@ fn rebuild_responses_input_skips_tool_events() {
         &input[1],
         "Cargo.toml is a Rust manifest."
     ));
+}
+
+#[test]
+fn rebuild_responses_input_carries_image_attachments_back_into_input() {
+    // PNG header bytes — encode_image_data_uri only reads from disk and
+    // base64s, no decoding, so the exact content doesn't need to be valid.
+    let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let dir = tempdir().unwrap();
+    let rel = PathBuf::from(".nav/clipboard/restored.png");
+    let abs = dir.path().join(&rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, bytes).unwrap();
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "look at this".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image { path: rel }],
+        }],
+        dir.path(),
+    );
+
+    assert_eq!(input.len(), 1);
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("attachments produce typed content array");
+    assert!(content.iter().any(|part| {
+        part.get("type").and_then(Value::as_str) == Some("input_text")
+            && part.get("text").and_then(Value::as_str) == Some("look at this")
+    }));
+    assert!(content.iter().any(|part| {
+        part.get("type").and_then(Value::as_str) == Some("input_image")
+            && part
+                .get("image_url")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.starts_with("data:image/png;base64,"))
+    }));
+}
+
+#[test]
+fn rebuild_responses_input_keeps_text_when_image_file_missing() {
+    let dir = tempdir().unwrap();
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "image gone".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image {
+                path: PathBuf::from(".nav/clipboard/missing.png"),
+            }],
+        }],
+        dir.path(),
+    );
+
+    // Missing image bytes degrade to the text-only typed parts array (no
+    // input_image part) rather than failing the resume.
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("attachments still trigger typed-parts shape");
+    assert!(
+        content
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image"))
+    );
+    assert!(
+        content
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+    );
 }
 
 // ── emit_stream_events ────────────────────────────────────────
@@ -523,7 +600,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
     ));
 
     // ── Resume: load events, rebuild input, run prompt "second".
-    let rebuilt = rebuild_responses_input(&stored_after_run1);
+    let rebuilt = rebuild_responses_input(&stored_after_run1, Path::new("/tmp"));
     // Sanity: the rebuilt input contains the prior user prompt and the
     // assistant reply in order.
     assert!(matches!(

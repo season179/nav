@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
             let events = store.load_session(id)?;
             (
                 id.to_string(),
-                Some(rebuild_responses_input(&events)),
+                Some(rebuild_responses_input(&events, &cwd)),
                 events,
             )
         }

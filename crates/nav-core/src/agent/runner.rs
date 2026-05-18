@@ -54,7 +54,11 @@ fn user_message_event(
 /// present, return an array of typed content parts so the Responses API can
 /// see `input_text` alongside `input_image`. Images that fail to load are
 /// silently dropped — a bad path shouldn't block the turn.
-fn build_user_content(prompt: &str, attachments: &[UserAttachment], cwd: &Path) -> Value {
+pub(super) fn build_user_content(
+    prompt: &str,
+    attachments: &[UserAttachment],
+    cwd: &Path,
+) -> Value {
     if attachments.is_empty() {
         return Value::String(prompt.to_string());
     }

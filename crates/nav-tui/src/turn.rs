@@ -27,7 +27,7 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
         .store
         .load_session(&request.session_id)
         .context("failed to load session history")?;
-    let history_input = Some(rebuild_responses_input(&history_events));
+    let history_input = Some(rebuild_responses_input(&history_events, &request.cwd));
     // Scrollback shows the typed text; the wrapped SKILL.md goes only to the
     // model-facing payload.
     let display_prompt = request.raw_prompt.clone();
