@@ -1157,7 +1157,7 @@
         <div class="tui-body">
 <div class="row"><span class="muted">  nav  ·  gpt-5.5  ·  ~/code/nav  ·  session 01JFK7…</span></div>
 <div class="row"><span class="muted">  Type a prompt to begin. Slash commands:</span></div>
-<div class="row"><span class="muted">    /quit      exit</span></div>
+<div class="row"><span class="muted">    /quit, /exit      exit</span></div>
 <div class="row"><span class="muted">    /clear     start a new transcript</span></div>
 <div class="row"><span class="muted">    /sessions  shown in popup, not wired yet</span></div>
 <div class="row"> </div>
@@ -1281,7 +1281,7 @@
     <span class="kw">self</span>.composer.handle_key(key)
 }</pre>
 
-      <p>The popup auto-opens when the buffer starts with <code>/</code> and has one line, and auto-closes when that's no longer true. Today <code>/quit</code> and <code>/clear</code> are the commands wired up in <code>run()</code>. The popup also lists <code>/help</code>, <code>/resume</code>, and <code>/sessions</code> as placeholders; selecting them puts the text in the composer, but pressing Enter sends them as a normal prompt until <code>run()</code> handles them. <code>slash_popup_suppressed</code> remembers "the user just hit Esc to dismiss me; don't pop back open on the next keystroke."</p>
+      <p>The popup auto-opens when the buffer starts with <code>/</code> and has one line, and auto-closes when that's no longer true. Today <code>/quit</code> (and its alias <code>/exit</code>) and <code>/clear</code> are the commands wired up in <code>run()</code>. The popup also lists <code>/help</code>, <code>/resume</code>, and <code>/sessions</code> as placeholders; selecting them puts the text in the composer, but pressing Enter sends them as a normal prompt until <code>run()</code> handles them. <code>slash_popup_suppressed</code> remembers "the user just hit Esc to dismiss me; don't pop back open on the next keystroke."</p>
     </section>
 
     <!-- 12 ─────────────────────────────────────────── -->
