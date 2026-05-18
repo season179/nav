@@ -134,7 +134,10 @@ impl BottomPane {
             return None;
         }
         let (vcol, vrow) = self.composer.visual_position(content_width);
-        Some((content_x.saturating_add(vcol), text_top.saturating_add(vrow)))
+        Some((
+            content_x.saturating_add(vcol),
+            text_top.saturating_add(vrow),
+        ))
     }
 
     fn reconcile_slash_popup(&mut self) {

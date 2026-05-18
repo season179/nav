@@ -9,16 +9,20 @@ use crate::cells::{
 use crate::history::HistoryCell;
 
 /// Flat scrollback widget. Holds the full history as a vector of cells and
-/// stacks them top-to-bottom inside its render area. Anything that does not
-/// fit is silently clipped at the bottom — scrolling and viewport tracking
-/// belong to a later slice.
+/// renders a viewport over their flattened lines.
 pub struct ChatWidget {
     cells: Vec<Box<dyn HistoryCell>>,
+    /// `None` follows the newest transcript row. `Some(row)` pins the top of
+    /// the viewport while the user is reading older output.
+    scroll_top: Option<usize>,
 }
 
 impl ChatWidget {
     pub fn new() -> Self {
-        Self { cells: Vec::new() }
+        Self {
+            cells: Vec::new(),
+            scroll_top: None,
+        }
     }
 
     /// Append a user-authored message. User input is not delivered through
@@ -71,6 +75,64 @@ impl ChatWidget {
             }
         }
     }
+
+    pub fn scroll_up(&mut self, rows: u16, width: u16, viewport_height: u16) {
+        let max_top = self.max_top(width, viewport_height);
+        if max_top == 0 {
+            self.scroll_top = None;
+            return;
+        }
+        let current = self.current_top(width, viewport_height);
+        self.scroll_top = Some(current.saturating_sub(rows as usize));
+    }
+
+    pub fn scroll_down(&mut self, rows: u16, width: u16, viewport_height: u16) {
+        let max_top = self.max_top(width, viewport_height);
+        let current = self.current_top(width, viewport_height);
+        let next = current.saturating_add(rows as usize);
+        if next >= max_top {
+            self.scroll_top = None;
+        } else {
+            self.scroll_top = Some(next);
+        }
+    }
+
+    pub fn scroll_to_top(&mut self, width: u16, viewport_height: u16) {
+        if self.max_top(width, viewport_height) == 0 {
+            self.scroll_top = None;
+        } else {
+            self.scroll_top = Some(0);
+        }
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_top = None;
+    }
+
+    fn max_top(&self, width: u16, viewport_height: u16) -> usize {
+        self.rendered_height(width)
+            .saturating_sub(viewport_height as usize)
+    }
+
+    fn current_top(&self, width: u16, viewport_height: u16) -> usize {
+        let max_top = self.max_top(width, viewport_height);
+        self.scroll_top.unwrap_or(max_top).min(max_top)
+    }
+
+    fn rendered_height(&self, width: u16) -> usize {
+        self.cells
+            .iter()
+            .map(|cell| cell.display_lines(width).len())
+            .sum()
+    }
+
+    fn render_lines(&self, width: u16) -> Vec<ratatui::text::Line<'static>> {
+        let mut lines = Vec::new();
+        for cell in &self.cells {
+            lines.extend(cell.display_lines(width));
+        }
+        lines
+    }
 }
 
 impl Default for ChatWidget {
@@ -81,25 +143,19 @@ impl Default for ChatWidget {
 
 impl Widget for &ChatWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let mut y = area.y;
-        for cell in &self.cells {
-            if y >= area.bottom() {
-                break;
-            }
-            let lines = cell.display_lines(area.width);
-            if lines.is_empty() {
-                continue;
-            }
-            let remaining = area.bottom() - y;
-            let h = (lines.len() as u16).min(remaining);
-            let rect = Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: h,
-            };
-            Paragraph::new(lines).render(rect, buf);
-            y = y.saturating_add(h);
+        if area.width == 0 || area.height == 0 {
+            return;
         }
+        let lines = self.render_lines(area.width);
+        let total = lines.len();
+        let viewport_height = area.height as usize;
+        let max_scroll = total.saturating_sub(viewport_height);
+        let start = self.scroll_top.unwrap_or(max_scroll).min(max_scroll);
+        let visible: Vec<_> = lines
+            .into_iter()
+            .skip(start)
+            .take(viewport_height)
+            .collect();
+        Paragraph::new(visible).render(area, buf);
     }
 }

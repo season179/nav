@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "nav-cli"
-version = "26.5.1"
+version = "26.5.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "nav-core"
-version = "26.5.1"
+version = "26.5.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "nav-tui"
-version = "26.5.1"
+version = "26.5.2"
 dependencies = [
  "anyhow",
  "crossterm",

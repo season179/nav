@@ -13,7 +13,10 @@ mod theme;
 mod widget;
 
 use anyhow::Result;
-use crossterm::event::{self, Event as CtEvent, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent, KeyCode, KeyEvent,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -54,12 +57,10 @@ enum AppEvent {
 
 /// Restores the terminal to a sane state when `run` returns.
 ///
-/// Raw mode, the alt screen, bracketed paste, and a hidden cursor would
-/// otherwise persist after the process exits — the user's shell prompt
-/// would render with no echo and on the wrong screen buffer. `Drop` runs
-/// on normal `Ok`/`Err` returns and on unwinding panics. The companion
-/// panic hook below repeats the same teardown before the panic message is
-/// printed, so the error is shown back on the normal terminal screen.
+/// Raw mode, the alt screen, mouse capture, bracketed paste, and a hidden
+/// cursor would otherwise persist after the process exits. `Drop` runs on
+/// normal `Ok`/`Err` returns and on unwinding panics. The companion panic hook
+/// below repeats the same teardown before the panic message is printed.
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -69,11 +70,32 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = crossterm::execute!(
             self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            crossterm::event::DisableBracketedPaste
+            DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+            LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
     }
+}
+
+fn enter_tui(out: &mut impl io::Write) -> Result<()> {
+    enable_raw_mode()?;
+    if let Err(err) = crossterm::execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
+    ) {
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(
+            out,
+            DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+        return Err(err.into());
+    }
+    Ok(())
 }
 
 pub async fn run(
@@ -86,16 +108,10 @@ pub async fn run(
     initial_prompt: Option<String>,
     skills: Arc<Catalog>,
 ) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(
-        stdout,
-        EnterAlternateScreen,
-        crossterm::event::EnableBracketedPaste
-    )?;
-    let backend = CrosstermBackend::new(stdout);
+    let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend)?;
     let mut term = TerminalGuard { terminal };
+    enter_tui(term.terminal.backend_mut())?;
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -103,8 +119,9 @@ pub async fn run(
         let mut out = io::stdout();
         let _ = crossterm::execute!(
             out,
-            LeaveAlternateScreen,
-            crossterm::event::DisableBracketedPaste
+            DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+            LeaveAlternateScreen
         );
         prev(info);
     }));
@@ -153,6 +170,7 @@ pub async fn run(
             },
             None => AgentState::Ready,
         };
+        let mut history_viewport = (1, 1);
         term.terminal.draw(|f| {
             use ratatui::layout::{Constraint, Layout};
             let area = f.area();
@@ -166,6 +184,7 @@ pub async fn run(
                 Constraint::Length(1),
             ])
             .split(area);
+            history_viewport = (chunks[0].width, chunks[0].height);
             f.render_widget(&chat, chunks[0]);
             f.render_widget(&pane, chunks[1]);
             if let Some((cx, cy)) = pane.cursor_position(chunks[1]) {
@@ -201,6 +220,7 @@ pub async fn run(
                         // Replace any previously queued skill; selecting a new
                         // one before sending a prompt should override.
                         pending_skill = Some(wrapped_body);
+                        chat.scroll_to_bottom();
                         chat.push_user(format!("/{skill_name}"));
                         chat.ingest(AgentEvent::AssistantMessageDone {
                             text: format!(
@@ -214,6 +234,7 @@ pub async fn run(
                         // running turns on the same session, and we don't want to
                         // race the spinner / token rollups with two in-flight runs.
                         if turn_started_at.is_some() {
+                            chat.scroll_to_bottom();
                             chat.ingest(AgentEvent::Error {
                                 message: "agent is busy; wait for the current turn to finish".into(),
                             });
@@ -222,6 +243,7 @@ pub async fn run(
                         // Scrollback shows the typed text; the wrapped SKILL.md
                         // goes only to the model-facing payload.
                         let prompt = prepend_pending_skill(pending_skill.take(), &raw_prompt);
+                        chat.scroll_to_bottom();
                         chat.push_user(raw_prompt);
                         turn_started_at = Some(Instant::now());
                         let transport = Arc::clone(&transport);
@@ -267,41 +289,99 @@ pub async fn run(
                 // typist never lags a redraw behind their keystrokes.
                 spinner_tick = spinner_tick.wrapping_add(1);
                 while event::poll(Duration::from_millis(0))? {
-                    let CtEvent::Key(key) = event::read()? else { continue };
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        ctrl_c_count += 1;
-                        if ctrl_c_count >= 2 { app_tx.send(AppEvent::Quit).ok(); }
-                        continue;
-                    }
-                    ctrl_c_count = 0;
-                    match pane.handle_key(key) {
-                        bottom_pane::ComposerEvent::Submit(text) => {
-                            if text == "/quit" || text == "/exit" { app_tx.send(AppEvent::Quit).ok(); }
-                            else if text == "/clear" { app_tx.send(AppEvent::Clear).ok(); }
-                            else {
-                                match classify_slash(&text, skills.as_ref()) {
-                                    SlashAction::NotASkill => {
-                                        app_tx.send(AppEvent::Submit(text)).ok();
-                                    }
-                                    SlashAction::Inline { prompt } => {
-                                        app_tx.send(AppEvent::Submit(prompt)).ok();
-                                    }
-                                    SlashAction::Queue { skill_name, wrapped_body } => {
-                                        app_tx.send(AppEvent::QueueSkill {
-                                            skill_name,
-                                            wrapped_body,
-                                        }).ok();
-                                    }
+                    match event::read()? {
+                        CtEvent::Key(key) => {
+                            if is_ctrl_c(&key) {
+                                ctrl_c_count += 1;
+                                if ctrl_c_count >= 2 {
+                                    app_tx.send(AppEvent::Quit).ok();
                                 }
+                                continue;
+                            }
+                            ctrl_c_count = 0;
+                            if handle_scrollback_key(&mut chat, &key, history_viewport) {
+                                continue;
+                            }
+                            match pane.handle_key(key) {
+                                bottom_pane::ComposerEvent::Submit(text) => {
+                                    dispatch_submit(text, skills.as_ref(), &app_tx);
+                                }
+                                bottom_pane::ComposerEvent::Nothing
+                                | bottom_pane::ComposerEvent::Cancelled => {}
                             }
                         }
-                        bottom_pane::ComposerEvent::Nothing | bottom_pane::ComposerEvent::Cancelled => {}
+                        CtEvent::Mouse(mouse) => {
+                            handle_mouse_scroll(&mut chat, mouse.kind, history_viewport);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn handle_scrollback_key(
+    chat: &mut ChatWidget,
+    key: &KeyEvent,
+    (history_w, history_h): (u16, u16),
+) -> bool {
+    let page_rows = history_h.saturating_sub(1).max(1);
+    match key.code {
+        KeyCode::PageUp => chat.scroll_up(page_rows, history_w, history_h),
+        KeyCode::PageDown => chat.scroll_down(page_rows, history_w, history_h),
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            chat.scroll_to_top(history_w, history_h)
+        }
+        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => chat.scroll_to_bottom(),
+        _ => return false,
+    }
+    true
+}
+
+fn handle_mouse_scroll(
+    chat: &mut ChatWidget,
+    kind: MouseEventKind,
+    (history_w, history_h): (u16, u16),
+) {
+    match kind {
+        MouseEventKind::ScrollUp => chat.scroll_up(3, history_w, history_h),
+        MouseEventKind::ScrollDown => chat.scroll_down(3, history_w, history_h),
+        _ => {}
+    }
+}
+
+fn dispatch_submit(text: String, skills: &Catalog, app_tx: &mpsc::UnboundedSender<AppEvent>) {
+    if text == "/quit" || text == "/exit" {
+        app_tx.send(AppEvent::Quit).ok();
+    } else if text == "/clear" {
+        app_tx.send(AppEvent::Clear).ok();
+    } else {
+        match classify_slash(&text, skills) {
+            SlashAction::NotASkill => {
+                app_tx.send(AppEvent::Submit(text)).ok();
+            }
+            SlashAction::Inline { prompt } => {
+                app_tx.send(AppEvent::Submit(prompt)).ok();
+            }
+            SlashAction::Queue {
+                skill_name,
+                wrapped_body,
+            } => {
+                app_tx
+                    .send(AppEvent::QueueSkill {
+                        skill_name,
+                        wrapped_body,
+                    })
+                    .ok();
+            }
+        }
+    }
 }
 
 fn spinner_frame(tick: u64) -> char {
