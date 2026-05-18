@@ -48,6 +48,22 @@ pub enum AgentEvent {
     TurnComplete {
         usage: TurnUsage,
     },
+    /// Emitted before sleeping during a retry of the streaming provider call.
+    /// Surfaces transient failures so the TUI / session log can show that a
+    /// hiccup was recovered from, not papered over.
+    ProviderRetry {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+        reason: String,
+    },
+    /// Emitted after the agent drops the oldest tool-call pair from the
+    /// transcript in response to a `context_length_exceeded` error.
+    /// `dropped_pairs` is the number of `function_call` + `function_call_output`
+    /// pairs removed (currently always `1` — recovery is one-shot per session).
+    ContextTrimmed {
+        dropped_pairs: usize,
+    },
     Error {
         message: String,
     },
@@ -64,6 +80,8 @@ impl AgentEvent {
             AgentEvent::ToolCallStarted { .. } => "tool_call_started",
             AgentEvent::ToolCallOutput { .. } => "tool_call_output",
             AgentEvent::TurnComplete { .. } => "turn_complete",
+            AgentEvent::ProviderRetry { .. } => "provider_retry",
+            AgentEvent::ContextTrimmed { .. } => "context_trimmed",
             AgentEvent::Error { .. } => "error",
         }
     }

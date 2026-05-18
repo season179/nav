@@ -30,6 +30,12 @@ pub struct Args {
     #[arg(default_value_t = 20, long)]
     pub bash_timeout_secs: u64,
 
+    /// Maximum time without an SSE/WebSocket event before the provider stream
+    /// is considered stalled. The connect retry then decides whether to
+    /// re-try or surface the failure.
+    #[arg(default_value_t = 60, long)]
+    pub idle_timeout_secs: u64,
+
     /// Resume a previously stored session by ULID. The transcript is rebuilt
     /// from the on-disk event log and the prompt becomes the next user turn.
     #[arg(long)]
@@ -69,6 +75,7 @@ impl Args {
             codex_home: Some(PathBuf::from("/nonexistent/test/codex/home")),
             max_turns: 4,
             bash_timeout_secs: 10,
+            idle_timeout_secs: 30,
             resume: None,
             list_sessions: false,
             cwd: None,

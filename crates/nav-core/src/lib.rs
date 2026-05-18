@@ -10,7 +10,7 @@ pub use agent::{
     AgentEvent, EventStream, ResponsesTransport, SessionBinding, TurnUsage,
     rebuild_responses_input, run_agent,
 };
-pub use responses::OpenAiTransport;
+pub use responses::{OpenAiTransport, RetryPolicy};
 pub use session::{
     PROVIDER_OPENAI_RESPONSES, ReportedCost, SessionId, SessionStore, SessionSummary,
 };

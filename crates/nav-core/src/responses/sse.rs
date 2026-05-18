@@ -1,50 +1,87 @@
+use super::retry::{TransportError, parse_retry_after_seconds};
+use super::{ResponsesError, detect_context_overflow};
 use crate::auth::AuthConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::str;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::timeout;
 
-pub(super) async fn stream_sse(
-    client: &reqwest::Client,
-    auth: &AuthConfig,
-    mut body: Value,
-    tx: UnboundedSender<Result<Value>>,
-) {
-    // SSE is the older path. It remains useful because it is plain HTTP
-    // and shows why the WebSocket transport is a latency optimization.
-    body["stream"] = json!(true);
-
-    if let Err(err) = drive_sse(client, auth, body, &tx).await {
-        let _ = tx.send(Err(err));
-    }
-}
-
-async fn drive_sse(
+/// Issue the streaming `POST /responses` request and verify a 2xx response.
+///
+/// Returns a [`TransportError`] so the retry wrapper can decide whether to
+/// re-try (429 / 5xx / network / timeout) or surface the failure.
+pub(super) async fn connect_sse(
     client: &reqwest::Client,
     auth: &AuthConfig,
     body: Value,
-    tx: &UnboundedSender<Result<Value>>,
-) -> Result<()> {
+) -> Result<reqwest::Response, TransportError> {
+    let mut body = body;
+    body["stream"] = json!(true);
+
     let response = client
         .post(format!("{}/responses", auth.http_base_url))
         .json(&body)
         .send()
-        .await
-        .context("Responses API request failed")?;
+        .await?;
 
     let status = response.status();
-    if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_default();
-        bail!("Responses API returned {status}: {error_body}");
+    if status.is_success() {
+        return Ok(response);
     }
 
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after_seconds);
+    let body_text = response.text().await.unwrap_or_default();
+    Err(TransportError::Http {
+        status,
+        retry_after,
+        body: body_text,
+    })
+}
+
+/// Read the SSE stream and forward decoded events onto `tx`. Aborts with
+/// `ResponsesError::ContextWindowExceeded` when the server signals
+/// `context_length_exceeded`; any other failure surfaces as `Other`.
+///
+/// `idle_timeout` bounds the wait between byte chunks — a stuck stream is
+/// caught instead of hanging the agent indefinitely.
+pub(super) async fn drive_sse(
+    response: reqwest::Response,
+    idle_timeout: Duration,
+    tx: UnboundedSender<Result<Value, ResponsesError>>,
+) {
+    if let Err(err) = drive_sse_inner(response, idle_timeout, &tx).await {
+        let _ = tx.send(Err(ResponsesError::Other(err)));
+    }
+}
+
+async fn drive_sse_inner(
+    response: reqwest::Response,
+    idle_timeout: Duration,
+    tx: &UnboundedSender<Result<Value, ResponsesError>>,
+) -> Result<()> {
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
 
-    // SSE arrives as arbitrary byte chunks, not neat JSON objects. We keep
-    // a byte buffer so UTF-8 split across chunks is decoded only after a full frame arrives.
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = match timeout(idle_timeout, stream.next()).await {
+            Ok(item) => item,
+            Err(_) => {
+                bail!(
+                    "idle timeout: no SSE event for {}s",
+                    idle_timeout.as_secs()
+                );
+            }
+        };
+        let Some(chunk) = next else {
+            return Ok(());
+        };
         let chunk = chunk.context("failed to read Responses API stream")?;
         buffer.extend_from_slice(&chunk);
 
@@ -64,6 +101,12 @@ async fn drive_sse(
 
                 let event: Value =
                     serde_json::from_str(data).context("failed to decode SSE event")?;
+
+                if let Some(message) = detect_context_overflow(&event) {
+                    let _ = tx.send(Err(ResponsesError::ContextWindowExceeded { message }));
+                    return Ok(());
+                }
+
                 let is_terminal = matches!(
                     event.get("type").and_then(Value::as_str),
                     Some("response.completed") | Some("error")
@@ -77,7 +120,6 @@ async fn drive_sse(
             }
         }
     }
-    Ok(())
 }
 
 fn frame_boundary(buffer: &[u8]) -> Option<usize> {

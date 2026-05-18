@@ -1,13 +1,15 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nav_core::{
-    AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, SessionBinding, SessionStore,
-    SessionSummary, auth, cli::Args, discover_skills, rebuild_responses_input, run_agent,
+    AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, RetryPolicy, SessionBinding,
+    SessionStore, SessionSummary, auth, cli::Args, discover_skills, rebuild_responses_input,
+    run_agent,
 };
 use std::env;
 use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -43,10 +45,21 @@ async fn main() -> Result<()> {
     };
 
     let auth_config = auth::load_auth(&args)?;
+    // No global `.timeout()` — a streaming turn legitimately runs for minutes.
+    // The SSE/WS idle timeout below is what catches stuck streams.
     let client = reqwest::Client::builder()
         .default_headers(auth::default_headers(&auth_config)?)
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
         .build()?;
-    let transport = Arc::new(OpenAiTransport::new(client, auth_config, args.transport));
+    let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
+    let transport = Arc::new(OpenAiTransport::with_config(
+        client,
+        auth_config,
+        args.transport,
+        idle_timeout,
+        RetryPolicy::default(),
+    ));
 
     let is_tty = std::io::stdout().is_terminal();
     if is_tty && !args.json_events {

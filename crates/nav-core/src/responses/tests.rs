@@ -7,6 +7,60 @@ use crate::cli::Args;
 use crate::skills::Catalog;
 use serde_json::json;
 
+// ── detect_context_overflow ───────────────────────────────────
+
+#[test]
+fn detect_context_overflow_matches_top_level_error() {
+    let event = json!({
+        "type": "error",
+        "code": "context_length_exceeded",
+        "message": "Your input exceeds the model's context"
+    });
+    let msg = detect_context_overflow(&event).expect("should detect overflow");
+    assert!(msg.contains("exceeds the model's context"));
+}
+
+#[test]
+fn detect_context_overflow_matches_response_failed_shape() {
+    let event = json!({
+        "type": "response.failed",
+        "response": {
+            "error": {
+                "code": "context_window_exceeded",
+                "message": "Too long"
+            }
+        }
+    });
+    let msg = detect_context_overflow(&event).expect("should detect overflow");
+    assert_eq!(msg, "Too long");
+}
+
+#[test]
+fn detect_context_overflow_ignores_other_error_codes() {
+    let event = json!({
+        "type": "error",
+        "code": "rate_limit_exceeded",
+        "message": "Slow down"
+    });
+    assert!(detect_context_overflow(&event).is_none());
+}
+
+#[test]
+fn detect_context_overflow_ignores_non_error_events() {
+    let event = json!({"type": "response.completed", "response": {}});
+    assert!(detect_context_overflow(&event).is_none());
+}
+
+#[test]
+fn responses_error_round_trips_to_anyhow() {
+    let err = ResponsesError::ContextWindowExceeded {
+        message: "boom".into(),
+    };
+    let anyhow_err: anyhow::Error = err.into();
+    assert!(anyhow_err.to_string().contains("context window exceeded"));
+    assert!(anyhow_err.to_string().contains("boom"));
+}
+
 // ── response_body ─────────────────────────────────────────────
 
 #[test]

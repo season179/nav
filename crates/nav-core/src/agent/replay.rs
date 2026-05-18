@@ -36,6 +36,8 @@ pub fn rebuild_responses_input(events: &[AgentEvent]) -> Vec<Value> {
             | AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ToolCallOutput { .. }
             | AgentEvent::TurnComplete { .. }
+            | AgentEvent::ProviderRetry { .. }
+            | AgentEvent::ContextTrimmed { .. }
             | AgentEvent::Error { .. } => {}
         }
     }
