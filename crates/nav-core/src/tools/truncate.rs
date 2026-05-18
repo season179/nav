@@ -57,6 +57,31 @@ fn marker(dropped_bytes: usize, dropped_lines: usize) -> String {
     format!("\n[truncated {dropped_bytes} bytes / {dropped_lines} lines]\n")
 }
 
+/// Largest UTF-8-safe prefix of `s` not exceeding `max` bytes. Walks back to
+/// the nearest char boundary so the returned slice is always valid UTF-8.
+fn byte_prefix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Largest UTF-8-safe suffix of `s` not exceeding `max` bytes.
+fn byte_suffix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 fn render_head(
     lines: &[&str],
     max_lines: usize,
@@ -68,7 +93,17 @@ fn render_head(
     let mut kept_lines = 0usize;
     let mut kept_bytes = 0usize;
     for line in lines {
-        if kept_lines >= max_lines || kept_bytes + line.len() > max_bytes {
+        if kept_lines >= max_lines {
+            break;
+        }
+        let remaining = max_bytes - kept_bytes;
+        if line.len() > remaining {
+            // Long single line (minified JSON/JS, ripgrep hit on a generated
+            // file). Don't drop the whole line — keep a byte-bounded prefix
+            // at the nearest UTF-8 boundary so the model sees real content.
+            let prefix = byte_prefix(line, remaining);
+            kept_text.push_str(prefix);
+            kept_bytes += prefix.len();
             break;
         }
         kept_text.push_str(line);
@@ -108,9 +143,14 @@ fn render_head_tail(
     let mut head_lines_kept = 0usize;
     let mut head_bytes_kept = 0usize;
     for line in lines {
-        if head_lines_kept >= head_lines_budget
-            || head_bytes_kept + line.len() > head_byte_budget
-        {
+        if head_lines_kept >= head_lines_budget {
+            break;
+        }
+        let remaining = head_byte_budget - head_bytes_kept;
+        if line.len() > remaining {
+            let prefix = byte_prefix(line, remaining);
+            head_text.push_str(prefix);
+            head_bytes_kept += prefix.len();
             break;
         }
         head_text.push_str(line);
@@ -120,14 +160,21 @@ fn render_head_tail(
 
     // The tail starts after the lines the head already consumed, so a
     // small input never gets the same line in both segments.
-    let remaining = &lines[head_lines_kept..];
+    let remaining_lines = &lines[head_lines_kept..];
     let mut tail_chunks: Vec<&str> = Vec::new();
     let mut tail_lines_kept = 0usize;
     let mut tail_bytes_kept = 0usize;
-    for line in remaining.iter().rev() {
-        if tail_lines_kept >= tail_lines_budget
-            || tail_bytes_kept + line.len() > tail_byte_budget
-        {
+    for line in remaining_lines.iter().rev() {
+        if tail_lines_kept >= tail_lines_budget {
+            break;
+        }
+        let remaining = tail_byte_budget - tail_bytes_kept;
+        if line.len() > remaining {
+            // Single line overflows the tail budget — keep its byte-bounded
+            // suffix (closer to whole tail lines we already collected).
+            let suffix = byte_suffix(line, remaining);
+            tail_chunks.push(suffix);
+            tail_bytes_kept += suffix.len();
             break;
         }
         tail_chunks.push(line);
@@ -260,6 +307,86 @@ mod tests {
         // Head-only: marker is the suffix after the kept prefix.
         assert!(result.starts_with("a\nb\n"));
         assert!(result.contains("[truncated"));
+    }
+
+    #[test]
+    fn head_keeps_byte_prefix_of_overlong_single_line() {
+        // Minified JSON-style single line bigger than the byte cap. The
+        // previous implementation returned only the marker; now we keep a
+        // byte-bounded prefix.
+        let input = "x".repeat(2000);
+        let result = bound_with_limits(input, TruncateMode::Head, 1000, 200);
+        let marker_start = result.find("\n[truncated").expect("marker present");
+        let body = &result[..marker_start];
+        assert_eq!(body.len(), 200);
+        assert!(body.chars().all(|c| c == 'x'));
+        assert!(result.contains("1800 bytes"));
+    }
+
+    #[test]
+    fn head_tail_keeps_byte_prefix_of_overlong_head_line() {
+        // Long first line + a tail. Head budget keeps a prefix of the long
+        // line; tail keeps the trailing lines untouched.
+        let mut input = String::new();
+        input.push_str(&"a".repeat(5000));
+        input.push('\n');
+        for i in 0..5 {
+            input.push_str(&format!("tail{i}\n"));
+        }
+        let result = bound_with_limits(
+            input,
+            TruncateMode::HeadTail { head_lines: 2 },
+            10,
+            1000,
+        );
+        let marker_start = result.find("\n[truncated").expect("marker present");
+        let head = &result[..marker_start];
+        assert!(head.len() >= 100, "head was {} bytes: {:?}", head.len(), head);
+        assert!(head.chars().all(|c| c == 'a'));
+        // Tail still has the short trailing lines.
+        let tail = &result[marker_start..];
+        assert!(tail.contains("tail4\n"));
+    }
+
+    #[test]
+    fn head_tail_keeps_byte_suffix_of_overlong_tail_line() {
+        // Short head + a single huge final line that exceeds the tail
+        // budget. Keep the trailing bytes (often where the error/result is).
+        let mut input = String::new();
+        for i in 0..3 {
+            input.push_str(&format!("head{i}\n"));
+        }
+        input.push_str(&"z".repeat(3000));
+        let result = bound_with_limits(
+            input,
+            TruncateMode::HeadTail { head_lines: 3 },
+            10,
+            500,
+        );
+        let marker_start = result.find("\n[truncated").expect("marker present");
+        let head = &result[..marker_start];
+        let tail = &result[marker_start..];
+        assert!(head.contains("head0\n"));
+        let z_count = tail.chars().filter(|c| *c == 'z').count();
+        assert!(z_count > 50, "tail kept only {z_count} 'z' chars: {tail:?}");
+    }
+
+    #[test]
+    fn byte_prefix_respects_utf8_boundaries() {
+        // "é" is two bytes (0xC3 0xA9). Asking for a 1-byte prefix must
+        // back up to a char boundary, not slice mid-codepoint.
+        assert_eq!(byte_prefix("éé", 1), "");
+        assert_eq!(byte_prefix("éé", 2), "é");
+        assert_eq!(byte_prefix("éé", 3), "é");
+        assert_eq!(byte_prefix("éé", 4), "éé");
+    }
+
+    #[test]
+    fn byte_suffix_respects_utf8_boundaries() {
+        assert_eq!(byte_suffix("éé", 1), "");
+        assert_eq!(byte_suffix("éé", 2), "é");
+        assert_eq!(byte_suffix("éé", 3), "é");
+        assert_eq!(byte_suffix("éé", 4), "éé");
     }
 
     #[test]

@@ -87,8 +87,13 @@ impl AgentEvent {
     }
 
     /// `AssistantMessageDelta` is a stream chunk meant only for live rendering;
-    /// every other variant is the canonical record of the conversation.
+    /// `ProviderRetry` is a transient transport hint that adds no value on
+    /// `--resume`. Every other variant is the canonical record of the
+    /// conversation and must round-trip through the session log.
     pub fn is_durable(&self) -> bool {
-        !matches!(self, AgentEvent::AssistantMessageDelta { .. })
+        !matches!(
+            self,
+            AgentEvent::AssistantMessageDelta { .. } | AgentEvent::ProviderRetry { .. }
+        )
     }
 }
