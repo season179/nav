@@ -25,8 +25,8 @@ impl ChatWidget {
         }
     }
 
-    /// Append a user-authored message. User input is not delivered through
-    /// `AgentEvent`, so it has its own entry point.
+    /// Append a user-authored message before the agent loop echoes the durable
+    /// event back. Resume uses `AgentEvent::UserMessage` directly.
     pub fn push_user(&mut self, text: impl Into<String>) {
         self.cells.push(Box::new(UserMessageCell::new(text)));
     }
@@ -50,6 +50,10 @@ impl ChatWidget {
     /// the status bar in `run()`, not by the scrollback widget.
     pub fn ingest(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::UserMessage { text, display_text } => {
+                self.cells
+                    .push(Box::new(UserMessageCell::new(display_text.unwrap_or(text))));
+            }
             AgentEvent::AssistantMessageDelta { .. } | AgentEvent::TurnComplete { .. } => {}
             AgentEvent::AssistantMessageDone { text } => {
                 self.cells.push(Box::new(AssistantMessageCell::new(text)));

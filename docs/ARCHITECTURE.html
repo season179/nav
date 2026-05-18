@@ -851,16 +851,20 @@
 <span class="root">nav/</span>
 <span class="group">— Library</span>
 ├── <span class="focus">crates/nav-core/</span>           <span class="note">the loop, tools, transport, sessions</span>
-│   ├── src/<span class="focus">agent.rs</span>            <span class="note">AgentEvent + run_agent model/tool loop</span>
+│   ├── src/<span class="focus">agent.rs</span>            <span class="note">small facade for agent modules</span>
+│   ├── src/agent/        <span class="note">events, replay, and run_agent runner</span>
 │   ├── src/<span class="focus">cli.rs</span>              <span class="note">Args (clap), shared by every frontend</span>
 │   ├── src/<span class="focus">auth.rs</span>             <span class="note">ChatGPT OAuth via ~/.codex/auth.json, or OPENAI_API_KEY</span>
-│   ├── src/responses/     <span class="note">OpenAI Responses API client (WebSocket + SSE)</span>
+│   ├── src/responses/     <span class="note">request building, collection/parsing, WebSocket + SSE</span>
 │   ├── src/tools/         <span class="note">read_file, list_files, bash, edit_file, code_search</span>
 │   └── src/session/       <span class="note">SQLite event log; powers --list-sessions / --resume</span>
 │
 <span class="group">— Frontend</span>
 ├── <span class="focus">crates/nav-tui/</span>             <span class="note">terminal chat UI</span>
-│   ├── src/lib.rs         <span class="note">event loop: draw, read keys, spawn agent</span>
+│   ├── src/lib.rs         <span class="note">small facade for TUI modules</span>
+│   ├── src/app.rs         <span class="note">event loop: draw, read keys, route events</span>
+│   ├── src/input.rs       <span class="note">keyboard, scroll, slash command handling</span>
+│   ├── src/turn.rs        <span class="note">load history and spawn run_agent turns</span>
 │   ├── src/widget.rs      <span class="note">ChatWidget: stack of history cells</span>
 │   ├── src/cells.rs       <span class="note">chat cell types for user, assistant, tools, errors, welcome</span>
 │   ├── src/streaming.rs   <span class="note">"stable vs tail" helper for live deltas</span>
@@ -870,6 +874,7 @@
 <span class="group">— Binary &amp; docs</span>
 ├── <span class="focus">crates/nav-cli/</span>             <span class="note">the binary; ~120 lines, wires core+tui</span>
 ├── CONTEXT.md             <span class="note">product direction (read this second)</span>
+├── TODO.md                <span class="note">future provider-adapter work</span>
 ├── README.md              <span class="note">how to install &amp; use</span>
 └── ARCHITECTURE.html      <span class="note">this page</span></div>
     </section>
@@ -885,17 +890,19 @@
 
       <aside class="mnote">
         <span class="label">Tip</span>
-        If you only have ten minutes, read items 1, 2, and 3. That's the entire control flow of a turn.
+        If you only have ten minutes, read items 1, 2, 6, and 8. That's the CLI knobs, the agent loop, the Responses boundary, and the TUI loop.
       </aside>
 
       <ol>
         <li><code>crates/nav-core/src/cli.rs</code> — the CLI options. Tiny. Shows what knobs exist.</li>
-        <li><code>crates/nav-core/src/agent.rs</code> — start at <code>run_agent</code>. The whole loop is one function.</li>
+        <li><code>crates/nav-core/src/agent/runner.rs</code> — start at <code>run_agent</code>. This is the model/tool loop.</li>
+        <li><code>crates/nav-core/src/agent/events.rs</code> and <code>replay.rs</code> — the event contract and resume transcript builder.</li>
         <li><code>crates/nav-core/src/tools/mod.rs</code> — the dispatcher; five tools, one match arm each.</li>
         <li><code>crates/nav-core/src/tools/fs.rs</code> — the workspace sandbox. Notice <code>resolve_inside</code>.</li>
-        <li><code>crates/nav-core/src/responses/mod.rs</code> — turns the loop's request into a Responses API body.</li>
+        <li><code>crates/nav-core/src/responses/request.rs</code>, <code>collector.rs</code>, and <code>parser.rs</code> — request body, stream folding, output parsing.</li>
         <li><code>crates/nav-core/src/session/mod.rs</code> — SQLite event log behind <code>--resume</code>.</li>
-        <li><code>crates/nav-tui/src/lib.rs</code> — the TUI's <code>run()</code>: <code>tokio::select!</code> over keys + agent events.</li>
+        <li><code>crates/nav-tui/src/app.rs</code> — the TUI's <code>run()</code>: <code>tokio::select!</code> over keys + agent events.</li>
+        <li><code>crates/nav-tui/src/input.rs</code> and <code>turn.rs</code> — command classification and background turn spawning.</li>
         <li><code>crates/nav-tui/src/widget.rs</code> + <code>cells.rs</code> — how each event becomes a row on screen.</li>
         <li><code>crates/nav-tui/src/streaming.rs</code> — the helper meant to make live streamed text not flicker.</li>
         <li><code>crates/nav-tui/src/bottom_pane/</code> — composer and slash-command overlay.</li>
@@ -911,14 +918,14 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-core/src/agent.rs</code> — function <code>run_agent</code>.
+        <code>crates/nav-core/src/agent/runner.rs</code> — function <code>run_agent</code>.
       </aside>
 
-      <p class="drop">Open <code>agent.rs</code> and find <code>run_agent</code>. Strip out the bookkeeping and you're left with this skeleton:</p>
+      <p class="drop">Open <code>agent/runner.rs</code> and find <code>run_agent</code>. Strip out the bookkeeping and you're left with this skeleton:</p>
 
       <pre data-lang="rust">for _ in 0..args.max_turns {
     <span class="cmt">// 1. ask the model</span>
-    <span class="kw">let</span> body = responses::response_body(args, cwd, &input);
+    <span class="kw">let</span> body = responses::response_body(args, cwd, &input, skills);
     <span class="kw">let mut</span> stream = transport.create(body).<span class="kw">await</span>?;
 
     <span class="cmt">// 2. read its streamed reply; emit deltas as we see them</span>
@@ -963,12 +970,16 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-core/src/agent.rs</code> — <code>enum AgentEvent</code>.
+        <code>crates/nav-core/src/agent/events.rs</code> — <code>enum AgentEvent</code>.
       </aside>
 
-      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every frontend — TUI, NDJSON pipe, future Slack bot — reads the same six variants:</p>
+      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every frontend — TUI, NDJSON pipe, future Slack bot — reads the same seven variants:</p>
 
       <div class="full flow">
+        <div class="row">
+          <div class="who">UserMessage</div>
+          <div class="what">The exact model-facing user prompt, plus optional display text. <em>Durable — this is what resume replays.</em></div>
+        </div>
         <div class="row">
           <div class="who">AssistantMessageDelta</div>
           <div class="what">A chunk of streaming text the model is still typing. <em>Transient — paint it, but don't save it.</em></div>
@@ -999,7 +1010,7 @@
 
       <aside class="mnote why">
         <span class="label">Why this matters</span>
-        Splitting "live render chunk" from "official record" means <code>--resume</code> can replay the conversation from durable events alone, even though you saw it stream in real time the first time around. No special-case code, no second log.
+        Splitting "live render chunk" from "official record" means <code>--resume</code> can replay the conversation from durable events alone, even though you saw it stream in real time the first time around. <code>UserMessage</code> closes the loop: persisted sessions now contain both sides of the conversation, not only assistant/tool output.
       </aside>
     </section>
 
@@ -1076,7 +1087,7 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-core/src/responses/</code> — <code>mod.rs</code>, <code>websocket.rs</code>, <code>sse.rs</code>, <code>types.rs</code>.
+        <code>crates/nav-core/src/responses/</code> — <code>request.rs</code>, <code>collector.rs</code>, <code>parser.rs</code>, <code>websocket.rs</code>, <code>sse.rs</code>, <code>types.rs</code>.
       </aside>
 
       <p class="drop">The model lives behind OpenAI's <em>Responses</em> API. nav speaks to it two ways:</p>
@@ -1088,7 +1099,9 @@
 
       <p>Both implementations boil down to the same shape: "send the request body, then push every event you receive into an unbounded channel." The agent loop reads from that channel as a <code>Stream</code> and doesn't care which transport is producing it.</p>
 
-      <p>The interesting glue is the <code>ResponseCollector</code> in <code>responses/mod.rs</code>. As stream events come in, it accumulates output items and waits for the terminal <code>response.completed</code> event. Then <code>finish</code> merges streamed items with whatever the final envelope claimed, so the loop sees one consistent <code>ResponseEnvelope</code> regardless of how the bytes arrived.</p>
+      <p>The Responses module is now split by job: <code>request.rs</code> builds the create body and instructions, <code>collector.rs</code> folds streamed events into one envelope, and <code>parser.rs</code> extracts tool calls, raw output, and token usage. Because nav uses <code>store: false</code>, <code>request.rs</code> also asks for <code>reasoning.encrypted_content</code> so reasoning items can be replayed during stateless tool-call turns without pointing at server-stored <code>rs_...</code> ids.</p>
+
+      <p>The interesting glue is the <code>ResponseCollector</code> in <code>collector.rs</code>. As stream events come in, it accumulates output items and waits for the terminal <code>response.completed</code> event. Then <code>finish</code> merges streamed items with whatever the final envelope claimed, so the loop sees one consistent <code>ResponseEnvelope</code> regardless of how the bytes arrived.</p>
 
       <aside class="mnote why">
         <span class="label">Why this matters</span>
@@ -1127,7 +1140,7 @@
         <li><code>turn</code> — one row per model turn, with usage + (optional) cost.</li>
       </ul>
 
-      <p><code>--list-sessions</code> reads <code>session</code> with a rollup query. <code>--resume &lt;id&gt;</code> loads every event for that session in order and hands them to <code>rebuild_responses_input</code>, which translates each one back into the wire format the Responses API expects for "here is the conversation so far."</p>
+      <p><code>--list-sessions</code> reads <code>session</code> with a rollup query. <code>--resume &lt;id&gt;</code> loads every event for that session in order and hands them to <code>rebuild_responses_input</code> in <code>agent/replay.rs</code>, which translates durable user/assistant messages back into the wire format the Responses API expects for "here is the conversation so far." Tool events remain visible in scrollback, but replay skips them because old session rows do not include the encrypted reasoning items required to safely replay stateless tool-call items.</p>
 
       <aside class="mnote why">
         <span class="label">Why this matters</span>
@@ -1144,7 +1157,7 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-tui/src/lib.rs</code> — function <code>run</code>.
+        <code>crates/nav-tui/src/app.rs</code> — function <code>run</code>.
       </aside>
 
       <p class="drop">The TUI lays out three regions, top to bottom: a scrolling history of cells at the top, a composer in the middle, and a one-line status bar at the bottom.</p>
@@ -1184,18 +1197,18 @@
 
       <h3>The TUI's main loop</h3>
 
-      <p><code>run</code> in <code>nav-tui/src/lib.rs</code> is a single <code>tokio::select!</code> over three sources:</p>
+      <p><code>run</code> in <code>nav-tui/src/app.rs</code> is a single <code>tokio::select!</code> over three sources. <code>input.rs</code> owns key/scroll/slash handling, and <code>turn.rs</code> owns loading session history and spawning <code>run_agent</code>.</p>
 
       <pre data-lang="rust">tokio::select! {
-    Some(ev) = agent_rx.recv() => chat.ingest(ev);   <span class="cmt">// model said something</span>
-    Some(app) = app_rx.recv()  => …;                 <span class="cmt">// /quit, /clear, Submit</span>
+    Some(ev) = agent_rx.recv() => handle agent event; <span class="cmt">// model said something</span>
+    Some(app) = app_rx.recv()  => handle app command; <span class="cmt">// /quit, /clear, Submit</span>
     _ = sleep(80ms) => {                             <span class="cmt">// periodic redraw + key poll</span>
         spinner_tick += 1;
         <span class="kw">while</span> event::poll(0)? { handle key … }
     }
 }</pre>
 
-      <p>Every iteration draws the frame, then waits for the next thing to happen. The 80 ms tick advances the spinner and polls the keyboard; the two channels deliver the things that should change what's on screen. When the user hits Enter, we spawn the agent loop on a background task and let its events flow back through <code>agent_rx</code>.</p>
+      <p>Every iteration draws the frame, then waits for the next thing to happen. The 80 ms tick advances the spinner and polls the keyboard; the two channels deliver the things that should change what's on screen. When the user hits Enter, <code>turn.rs</code> reloads the persisted session events, rebuilds the Responses input, spawns the agent loop on a background task, and lets its events flow back through <code>agent_rx</code>.</p>
 
       <aside class="mnote why">
         <span class="label">Why this matters</span>
@@ -1207,11 +1220,11 @@
       <p><code>ChatWidget::ingest</code> in <code>widget.rs</code> is a small <code>match</code> that maps each <code>AgentEvent</code> variant to a concrete cell type in <code>cells.rs</code>:</p>
 
       <div class="full flow">
+        <div class="row"><div class="who">UserMessage</div><div class="what"><code>UserMessageCell</code>, gutter glyph <span style="color:var(--g-user);font-weight:700">›</span>, bold cyan. The live TUI draws the typed prompt immediately and skips the echoed live event; resumed sessions ingest it normally.</div></div>
         <div class="row"><div class="who">AssistantMessageDone</div><div class="what"><code>AssistantMessageCell</code>, gutter glyph <span style="color:var(--g-asst);font-weight:700">•</span>, green.</div></div>
         <div class="row"><div class="who">ToolCallStarted</div><div class="what"><code>ToolCallCell</code>, gutter glyph <span style="color:var(--g-tool);font-weight:700">•</span>, yellow. Shows <code>name {json args}</code>.</div></div>
         <div class="row"><div class="who">ToolCallOutput</div><div class="what"><code>ToolOutputCell</code>, gutter glyph <code>└</code>, dim grey (red if <code>is_error</code>).</div></div>
         <div class="row"><div class="who">Error</div><div class="what"><code>ErrorCell</code>, red.</div></div>
-        <div class="row"><div class="who">User input (not an event)</div><div class="what"><code>UserMessageCell</code>, gutter glyph <span style="color:var(--g-user);font-weight:700">›</span>, bold cyan.</div></div>
         <div class="row"><div class="who">AssistantMessageDelta / TurnComplete</div><div class="what">Ignored by the widget today. The final assistant text appears on <code>AssistantMessageDone</code>; <code>TurnComplete</code> flips the status bar.</div></div>
       </div>
     </section>
@@ -1281,7 +1294,7 @@
     <span class="kw">self</span>.composer.handle_key(key)
 }</pre>
 
-      <p>The popup auto-opens when the buffer starts with <code>/</code> and has one line, and auto-closes when that's no longer true. Today <code>/quit</code> (and its alias <code>/exit</code>) and <code>/clear</code> are the commands wired up in <code>run()</code>. The popup also lists <code>/help</code>, <code>/resume</code>, and <code>/sessions</code> as placeholders; selecting them puts the text in the composer, but pressing Enter sends them as a normal prompt until <code>run()</code> handles them. <code>slash_popup_suppressed</code> remembers "the user just hit Esc to dismiss me; don't pop back open on the next keystroke."</p>
+      <p>The popup auto-opens when the buffer starts with <code>/</code> and has one line, and auto-closes when that's no longer true. Today <code>/quit</code> (and its alias <code>/exit</code>) and <code>/clear</code> are the commands wired up in <code>run()</code>. The popup also lists <code>/help</code>, <code>/resume</code>, and <code>/sessions</code> as placeholders; <kbd>Tab</kbd> only completes the selected command, while <kbd>Enter</kbd> completes the selected command and submits it in the same keypress. <code>slash_popup_suppressed</code> remembers "the user just hit Esc to dismiss me; don't pop back open on the next keystroke."</p>
     </section>
 
     <!-- 12 ─────────────────────────────────────────── -->

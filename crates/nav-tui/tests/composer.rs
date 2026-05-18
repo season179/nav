@@ -77,6 +77,30 @@ fn slash_shows_popup_and_he_filters_to_help() {
 }
 
 #[test]
+fn exact_slash_command_enter_submits_without_second_enter() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "/exit");
+    let event = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(event, ComposerEvent::Submit("/exit".to_string()));
+    assert_eq!(pane.composer().text(), "");
+    assert_eq!(pane.composer().history(), &["/exit".to_string()]);
+}
+
+#[test]
+fn partial_slash_command_enter_completes_and_submits() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "/ex");
+    let event = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+
+    assert_eq!(event, ComposerEvent::Submit("/exit".to_string()));
+    assert_eq!(pane.composer().text(), "");
+    assert_eq!(pane.composer().history(), &["/exit".to_string()]);
+}
+
+#[test]
 fn slash_popup_lists_catalog_skills() {
     use nav_core::{Catalog, Skill, SkillScope};
     use nav_tui::bottom_pane::build_slash_entries;

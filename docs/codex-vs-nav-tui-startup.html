@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nav · Codex vs nav TUI startup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,300..900,0..100;1,9..144,300..900,0..100&family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&family=JetBrains+Mono:wght@300..700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #14110d;
+    --paper: #1b1712;
+    --paper-2: #231d16;
+    --line: #2e2820;
+    --line-soft: #251f18;
+    --text: #ede4d3;
+    --text-dim: #c7bca6;
+    --text-mute: #8a8071;
+    --gold: #d4a574;
+    --gold-bright: #ecc18a;
+    --rust: #c97b4d;
+    --sage: #94b08a;
+    --sage-bright: #b3cba9;
+    --display: "Fraunces", ui-serif, Georgia, serif;
+    --body: "Newsreader", ui-serif, Georgia, serif;
+    --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+    --max: 1060px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--text);
+    font: 400 19.5px/1.65 var(--body);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    background-image:
+      radial-gradient(at 78% -8%, rgba(212,165,116,0.07), transparent 55%),
+      radial-gradient(at -8% 92%, rgba(148,176,138,0.05), transparent 55%);
+    background-attachment: fixed;
+  }
+  a { color: var(--gold-bright); text-decoration: none; border-bottom: 1px solid rgba(212,165,116,0.35); }
+  code {
+    font-family: var(--mono);
+    font-size: 0.78em;
+    color: var(--gold-bright);
+    background: rgba(27,23,18,0.82);
+    border: 1px solid var(--line-soft);
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    backdrop-filter: blur(14px);
+    background: rgba(20,17,13,0.72);
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .topbar-inner {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 14px 32px;
+    display: flex;
+    justify-content: space-between;
+    gap: 24px;
+    align-items: baseline;
+  }
+  .brand {
+    font-family: var(--display);
+    font-size: 19px;
+    font-weight: 500;
+    letter-spacing: -0.015em;
+    font-variation-settings: "SOFT" 70, "opsz" 24;
+  }
+  .brand .dot { color: var(--gold); font-style: italic; }
+  .topbar-meta {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+  }
+  main {
+    max-width: var(--max);
+    margin: 0 auto;
+    padding: 82px 32px 96px;
+  }
+  .hero {
+    padding-bottom: 54px;
+    border-bottom: 1px solid var(--line);
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--gold);
+    margin-bottom: 22px;
+  }
+  h1 {
+    font-family: var(--display);
+    font-weight: 400;
+    font-size: clamp(46px, 8vw, 86px);
+    line-height: 0.98;
+    letter-spacing: -0.028em;
+    margin: 0 0 24px;
+    font-variation-settings: "SOFT" 90, "opsz" 144;
+  }
+  h1 em {
+    color: var(--gold);
+    font-style: italic;
+    font-weight: 300;
+  }
+  .lede {
+    max-width: 62ch;
+    margin: 0;
+    color: var(--text-dim);
+    font-size: 23px;
+    line-height: 1.5;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 22px;
+    margin: 42px 0;
+  }
+  section {
+    padding: 38px 0;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  h2 {
+    font-family: var(--display);
+    font-size: 34px;
+    font-weight: 450;
+    line-height: 1.08;
+    letter-spacing: -0.015em;
+    margin: 0 0 18px;
+    font-variation-settings: "SOFT" 80, "opsz" 48;
+  }
+  h3 {
+    margin: 0 0 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--sage-bright);
+  }
+  p { margin: 0 0 16px; }
+  ul, ol { margin: 14px 0 0; padding-left: 22px; }
+  li { margin: 9px 0; }
+  .panel {
+    background: linear-gradient(180deg, rgba(35,29,22,0.86), rgba(27,23,18,0.78));
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 22px;
+  }
+  .panel strong { color: var(--text); }
+  .note {
+    color: var(--text-dim);
+    border-left: 2px solid var(--gold);
+    padding-left: 18px;
+  }
+  .refs {
+    margin-top: 20px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text-mute);
+  }
+  .ranked li::marker { color: var(--gold); font-family: var(--mono); }
+  @media (max-width: 820px) {
+    main { padding: 58px 22px 72px; }
+    .topbar-inner { padding: 13px 22px; }
+    .topbar-meta { display: none; }
+    .grid { grid-template-columns: 1fr; }
+    .lede { font-size: 21px; }
+  }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">nav<span class="dot">.</span>docs</div>
+      <div class="topbar-meta">TUI startup comparison</div>
+    </div>
+  </div>
+
+  <main>
+    <header class="hero">
+      <div class="eyebrow">Sibling read: ../codex</div>
+      <h1>Codex starts a product; <em>nav starts a loop.</em></h1>
+      <p class="lede">
+        Codex's TUI startup is an operational boot path: resolve config,
+        choose or create a thread, recover state, and enter a rich event loop.
+        nav already has the important bones, but its TUI should grow only where
+        that makes daily use feel continuous and recoverable.
+      </p>
+    </header>
+
+    <section>
+      <h2>What Codex Does</h2>
+      <p>
+        Codex starts by normalizing CLI flags into runtime configuration, then
+        resolving Codex home, config, environment, model provider, auth
+        requirements, telemetry/logging, and the local state database before the
+        main app loop is entered. It also has explicit recovery handling around
+        local state database startup failures in the CLI wrapper.
+      </p>
+      <div class="grid">
+        <div class="panel">
+          <h3>Boot</h3>
+          <p>
+            `codex_tui::run_main` parses config overrides, finds Codex home,
+            probes the app-server target, derives environment paths, loads
+            config, resolves provider defaults, initializes telemetry/logging,
+            and opens the state database before handing off to the ratatui app.
+          </p>
+        </div>
+        <div class="panel">
+          <h3>Session</h3>
+          <p>
+            Startup then chooses a fresh, resumed, or forked thread. Resume can
+            target an explicit id, `--last`, or a picker, and Codex can prompt
+            when the saved session cwd differs from the current cwd.
+          </p>
+        </div>
+      </div>
+      <p>
+        Once inside `App::run`, Codex bootstraps the app server, obtains model
+        and account status, starts/resumes/forks the server-side thread, builds
+        the `ChatWidget`, enqueues the initial thread state and turns, refreshes
+        startup skills, and prefetches rate limits without blocking the first
+        useful frame.
+      </p>
+      <div class="refs">
+        Evidence: `../codex/codex-rs/tui/src/lib.rs:781-940`,
+        `../codex/codex-rs/tui/src/lib.rs:1357-1629`,
+        `../codex/codex-rs/tui/src/app.rs:642-990`,
+        `../codex/codex-rs/cli/src/main.rs:1986-2018`.
+      </div>
+    </section>
+
+    <section>
+      <h2>What nav Does</h2>
+      <p>
+        nav's startup is smaller and easier to follow. The CLI canonicalizes
+        the launch cwd, discovers skills from that cwd, opens the SQLite session
+        store, either creates a new session or loads events for `--resume`,
+        loads auth, builds the OpenAI transport, and enters the TUI only when
+        stdout is a terminal and `--json-events` is not set.
+      </p>
+      <div class="grid">
+        <div class="panel">
+          <h3>Boot</h3>
+          <p>
+            The TUI enters alternate screen/raw mode, installs a panic hook to
+            restore the terminal, builds slash-command entries, creates the
+            chat widget, shows a welcome cell for fresh sessions, and replays
+            durable resume events into the scrollback.
+          </p>
+        </div>
+        <div class="panel">
+          <h3>Turn Loop</h3>
+          <p>
+            The event loop draws history, composer, and status bar; handles
+            submit/clear/quit/skill-queue actions; spawns `run_agent` for each
+            prompt; and rejects a second prompt while a turn is running.
+          </p>
+        </div>
+      </div>
+      <p>
+        nav does have persistence: durable `AgentEvent`s are written to the
+        session store, and `--resume` rebuilds the Responses input from stored
+        events. But in the current TUI that rebuilt transcript is consumed only
+        for the first prompt after resume; later prompts start from their own
+        text. The scrollback also ignores streaming deltas and paints assistant
+        text only when the final message arrives.
+      </p>
+      <div class="refs">
+        Evidence: `crates/nav-cli/src/main.rs:23-64`,
+        `crates/nav-tui/src/lib.rs:101-162`,
+        `crates/nav-tui/src/lib.rs:204-275`,
+        `crates/nav-tui/src/widget.rs:46-55`,
+        `crates/nav-core/src/agent.rs:111-180`.
+      </div>
+    </section>
+
+    <section>
+      <h2>What nav Is Missing</h2>
+      <ul>
+        <li>
+          <strong>Conversation continuity beyond startup resume.</strong>
+          nav can replay a saved transcript into the first resumed turn, but
+          the TUI comments say later prompts do not maintain server-side
+          conversation state.
+        </li>
+        <li>
+          <strong>Session UX.</strong>
+          nav has `--resume &lt;id&gt;` and `--list-sessions`, but not a TUI
+          picker, `--last`, fork flow, cwd prompt, or visible resume guidance
+          comparable to Codex.
+        </li>
+        <li>
+          <strong>Operational startup handling.</strong>
+          auth, DB, config, and startup failures mostly bubble as errors. Codex
+          has more explicit local-state recovery and auth/onboarding paths;
+          nav should add clear, local fixes where failures are common.
+        </li>
+        <li>
+          <strong>Daily TUI affordances.</strong>
+          nav has a spinner, status bar, slash popup, scrollback, and double
+          Ctrl-C quit. It still lacks polished interruption, input history,
+          streaming rendering, richer status, and recovery from common mistakes.
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Recommendation</h2>
+      <p class="note">
+        Improve nav's TUI, but only where the work turns it from a demo loop
+        into something Season can actually live in every day. Do not copy
+        Codex's whole boot pipeline for symmetry.
+      </p>
+      <ol class="ranked">
+        <li>
+          Make conversation continuity real: keep every TUI prompt grounded in
+          the current session transcript, not just the first prompt after
+          `--resume`.
+        </li>
+        <li>
+          Add session UX: a simple resume picker, `--last`, clearer session
+          identity, and cwd mismatch handling.
+        </li>
+        <li>
+          Improve operational startup errors: auth, DB open/migration, and
+          state-lock failures should explain the fix before the user sees a raw
+          Rust error.
+        </li>
+        <li>
+          Then polish daily TUI usability: interrupt a running turn, input
+          history, visible streaming, and status that says what the agent is
+          doing instead of only whether it is ready or working.
+        </li>
+      </ol>
+    </section>
+  </main>
+</body>
+</html>

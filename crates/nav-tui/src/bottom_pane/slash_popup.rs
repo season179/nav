@@ -121,7 +121,9 @@ impl SlashCommandPopup {
         }
         match (key.code, key.modifiers) {
             (KeyCode::Tab, _) => self.try_complete(composer),
-            (KeyCode::Enter, m) if !m.contains(KeyModifiers::SHIFT) => self.try_complete(composer),
+            (KeyCode::Enter, m) if !m.contains(KeyModifiers::SHIFT) => {
+                self.try_submit_or_complete(composer)
+            }
             (KeyCode::Up, _) => {
                 self.selected = self.selected.saturating_sub(1);
                 InputResult::Handled
@@ -147,6 +149,24 @@ impl SlashCommandPopup {
         composer.set_text(&self.entries[entry_idx].command);
         self.completed = true;
         InputResult::Handled
+    }
+
+    fn try_submit_or_complete(&mut self, composer: &mut Composer) -> InputResult {
+        if self.has_exact_match() {
+            return InputResult::Unhandled;
+        }
+        let Some(&entry_idx) = self.matches.get(self.selected) else {
+            return InputResult::Unhandled;
+        };
+        composer.set_text(&self.entries[entry_idx].command);
+        self.completed = true;
+        InputResult::Unhandled
+    }
+
+    fn has_exact_match(&self) -> bool {
+        self.matches
+            .iter()
+            .any(|&entry_idx| self.entries[entry_idx].command == self.filter)
     }
 
     fn refilter(&mut self) {

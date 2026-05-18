@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
         &args,
         &cwd,
         &prompt,
+        None,
         tx,
         Some(&binding),
         initial_input,
