@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event as CtEvent};
+use crossterm::event::{self, Event as CtEvent};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -14,18 +14,16 @@ use tokio::sync::mpsc;
 
 use crate::ChatWidget;
 use crate::bottom_pane;
-use crate::input::{
-    AppEvent, dispatch_submit, handle_mouse_scroll, handle_scrollback_key, is_ctrl_c,
-};
+use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
 use crate::status_bar::{AgentState, StatusBar, git_branch, shorten_home};
 use crate::turn::{TurnSpawn, spawn_turn};
 
 /// Restores the terminal to a sane state when `run` returns.
 ///
-/// Raw mode, the alt screen, mouse capture, bracketed paste, and a hidden
-/// cursor would otherwise persist after the process exits. `Drop` runs on
-/// normal `Ok`/`Err` returns and on unwinding panics. The companion panic hook
-/// below repeats the same teardown before the panic message is printed.
+/// Raw mode, the alt screen, bracketed paste, and a hidden cursor would
+/// otherwise persist after the process exits. `Drop` runs on normal `Ok`/`Err`
+/// returns and on unwinding panics. The companion panic hook below repeats the
+/// same teardown before the panic message is printed.
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -39,26 +37,32 @@ impl Drop for TerminalGuard {
 
 fn leave_tui(out: &mut impl io::Write) {
     let _ = disable_raw_mode();
-    let _ = crossterm::execute!(
-        out,
-        DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
+    let _ = write_tui_leave_sequences(out);
 }
 
 fn enter_tui(out: &mut impl io::Write) -> Result<()> {
     enable_raw_mode()?;
-    if let Err(err) = crossterm::execute!(
-        out,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste
-    ) {
+    if let Err(err) = write_tui_enter_sequences(out) {
         leave_tui(out);
         return Err(err.into());
     }
     Ok(())
+}
+
+fn write_tui_enter_sequences(out: &mut impl io::Write) -> io::Result<()> {
+    crossterm::execute!(
+        out,
+        EnterAlternateScreen,
+        crossterm::event::EnableBracketedPaste
+    )
+}
+
+fn write_tui_leave_sequences(out: &mut impl io::Write) -> io::Result<()> {
+    crossterm::execute!(
+        out,
+        crossterm::event::DisableBracketedPaste,
+        LeaveAlternateScreen
+    )
 }
 
 fn install_panic_teardown_hook() {
@@ -230,31 +234,25 @@ pub async fn run(
                 // typist never lags a redraw behind their keystrokes.
                 spinner_tick = spinner_tick.wrapping_add(1);
                 while event::poll(Duration::from_millis(0))? {
-                    match event::read()? {
-                        CtEvent::Key(key) => {
-                            if is_ctrl_c(&key) {
-                                ctrl_c_count += 1;
-                                if ctrl_c_count >= 2 {
-                                    app_tx.send(AppEvent::Quit).ok();
-                                }
-                                continue;
+                    if let CtEvent::Key(key) = event::read()? {
+                        if is_ctrl_c(&key) {
+                            ctrl_c_count += 1;
+                            if ctrl_c_count >= 2 {
+                                app_tx.send(AppEvent::Quit).ok();
                             }
-                            ctrl_c_count = 0;
-                            if handle_scrollback_key(&mut chat, &key, history_viewport) {
-                                continue;
-                            }
-                            match pane.handle_key(key) {
-                                bottom_pane::ComposerEvent::Submit(text) => {
-                                    dispatch_submit(text, skills.as_ref(), &app_tx);
-                                }
-                                bottom_pane::ComposerEvent::Nothing
-                                | bottom_pane::ComposerEvent::Cancelled => {}
-                            }
+                            continue;
                         }
-                        CtEvent::Mouse(mouse) => {
-                            handle_mouse_scroll(&mut chat, mouse.kind, history_viewport);
+                        ctrl_c_count = 0;
+                        if handle_scrollback_key(&mut chat, &key, history_viewport) {
+                            continue;
                         }
-                        _ => {}
+                        match pane.handle_key(key) {
+                            bottom_pane::ComposerEvent::Submit(text) => {
+                                dispatch_submit(text, skills.as_ref(), &app_tx);
+                            }
+                            bottom_pane::ComposerEvent::Nothing
+                            | bottom_pane::ComposerEvent::Cancelled => {}
+                        }
                     }
                 }
             }
@@ -266,4 +264,31 @@ pub async fn run(
 fn spinner_frame(tick: u64) -> char {
     const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     FRAMES[(tick as usize) % FRAMES.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_enter_sequences_do_not_enable_mouse_capture() {
+        let mut out = Vec::new();
+        write_tui_enter_sequences(&mut out).unwrap();
+        let bytes = String::from_utf8_lossy(&out);
+
+        assert!(bytes.contains("\u{1b}[?1049h"));
+        assert!(bytes.contains("\u{1b}[?2004h"));
+        for seq in [
+            "\u{1b}[?1000h",
+            "\u{1b}[?1002h",
+            "\u{1b}[?1003h",
+            "\u{1b}[?1015h",
+            "\u{1b}[?1006h",
+        ] {
+            assert!(
+                !bytes.contains(seq),
+                "mouse capture prevents native terminal text selection: {seq:?}"
+            );
+        }
+    }
 }

@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nav_core::Catalog;
 use tokio::sync::mpsc;
 
@@ -37,18 +37,6 @@ pub(crate) fn handle_scrollback_key(
         _ => return false,
     }
     true
-}
-
-pub(crate) fn handle_mouse_scroll(
-    chat: &mut ChatWidget,
-    kind: MouseEventKind,
-    (history_w, history_h): (u16, u16),
-) {
-    match kind {
-        MouseEventKind::ScrollUp => chat.scroll_up(3, history_w, history_h),
-        MouseEventKind::ScrollDown => chat.scroll_down(3, history_w, history_h),
-        _ => {}
-    }
 }
 
 pub(crate) fn dispatch_submit(
