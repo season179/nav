@@ -72,8 +72,8 @@ agent skills are directories containing a `SKILL.md` file with YAML
 frontmatter (`name`, `description`). Discovery happens once when `nav`
 starts, scoped to the process launch cwd:
 
-1. Walk upward from launch cwd to the nearest ancestor with `.agents/skills/`
-   — these are project skills.
+1. Read `<launch_cwd>/.agents/skills/` — these are project skills. We do not
+   walk upward to ancestor directories.
 2. Read `~/.agents/skills/` — these are user skills.
 3. Project entries shadow user entries with the same parsed `name` and the
    shadowing is logged with both paths.

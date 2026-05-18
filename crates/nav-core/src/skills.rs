@@ -7,10 +7,10 @@
 //! inject the body eagerly into the system prompt.
 //!
 //! Discovery is runtime-scoped. The launch cwd is captured once when nav
-//! starts; project skills are resolved by walking upward from that cwd to the
-//! nearest ancestor that contains `.agents/skills/`. User skills live at
-//! `~/.agents/skills/`. Project skills shadow user skills with the same
-//! parsed `name`.
+//! starts; project skills are resolved at `<launch_cwd>/.agents/skills/`
+//! only — we deliberately do not walk upward to ancestor directories. User
+//! skills live at `~/.agents/skills/`. Project skills shadow user skills with
+//! the same parsed `name`.
 
 use serde::Deserialize;
 use std::fs;
@@ -80,26 +80,41 @@ impl Catalog {
     }
 }
 
+/// Returns `<dir>/.agents/skills` if it exists and isn't the user-skills
+/// root. The user-root check prevents launching nav directly from `$HOME`
+/// (or, for the walk-up variant, any subdirectory of `$HOME` with no project
+/// skills of its own) from mis-scoping `~/.agents/skills/` as project — that
+/// would re-scan during the user pass and log every entry as shadowed.
+fn skills_candidate(dir: &Path, user_root_canonical: Option<&Path>) -> Option<PathBuf> {
+    let candidate = dir.join(".agents").join("skills");
+    (candidate.is_dir() && !candidate_matches_user_root(&candidate, user_root_canonical))
+        .then_some(candidate)
+}
+
+/// Resolves project skills at `<start>/.agents/skills/` only — no upward walk.
+fn find_project_skills_root_in_cwd(start: &Path, user_root: Option<&Path>) -> Option<PathBuf> {
+    let user_root_canonical = user_root.and_then(|r| r.canonicalize().ok());
+    skills_candidate(start, user_root_canonical.as_deref())
+}
+
 /// Walk upward from `start` to the nearest ancestor that contains
 /// `.agents/skills/`. Returns that `.agents/skills` directory.
 ///
-/// The walk stops at the filesystem root. A candidate whose canonical path
-/// matches `user_root` is skipped: otherwise launching nav from any
-/// subdirectory of `$HOME` without its own project skills would mis-scope
-/// `~/.agents/skills/` as project, then re-scan it during the user pass and
-/// log every entry as shadowed.
+/// KEEP — preserved for future use. Today nav only reads `.agents/skills/`
+/// directly under the launch cwd (see `find_project_skills_root_in_cwd`),
+/// but we plan to re-enable ancestor discovery so that running nav inside a
+/// subdirectory of a project still picks up the project's skills. Do not
+/// delete; restore the call in `discover_skills_with_roots` when that lands.
 ///
 /// Symlinks are not followed explicitly; we trust the standard library
 /// `is_dir` check.
+#[allow(dead_code)]
 fn find_project_skills_root(start: &Path, user_root: Option<&Path>) -> Option<PathBuf> {
     let user_root_canonical = user_root.and_then(|r| r.canonicalize().ok());
     let mut current = Some(start);
     while let Some(dir) = current {
-        let candidate = dir.join(".agents").join("skills");
-        if candidate.is_dir()
-            && !candidate_matches_user_root(&candidate, user_root_canonical.as_deref())
-        {
-            return Some(candidate);
+        if let Some(found) = skills_candidate(dir, user_root_canonical.as_deref()) {
+            return Some(found);
         }
         current = dir.parent();
     }
@@ -119,8 +134,9 @@ fn user_skills_root() -> Option<PathBuf> {
 /// Discovers skills in the conventional locations.
 ///
 /// `launch_cwd` is the process working directory at startup. It is used to
-/// resolve the project skill root; nested subdirectories work because we walk
-/// upward looking for `.agents/skills/`.
+/// resolve the project skill root at `<launch_cwd>/.agents/skills/`. We do
+/// not walk upward — launching nav from a nested subdirectory will not pick
+/// up an ancestor's project skills.
 ///
 /// Project skills are discovered first, then user skills. When two skills
 /// share a parsed `name`, the project entry wins and a warning is logged via
@@ -140,7 +156,7 @@ pub fn discover_skills_with_roots(launch_cwd: &Path, user_root: Option<&Path>) -
     let mut skills: Vec<Skill> = Vec::new();
     let mut seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
 
-    if let Some(project_root) = find_project_skills_root(launch_cwd, user_root) {
+    if let Some(project_root) = find_project_skills_root_in_cwd(launch_cwd, user_root) {
         for skill in scan_directory(&project_root, SkillScope::Project) {
             seen.insert(skill.name.clone(), skill.skill_md_path.clone());
             skills.push(skill);
@@ -311,17 +327,19 @@ mod tests {
     }
 
     #[test]
-    fn discover_skills_walks_up_from_nested_dir() {
+    fn discover_skills_does_not_walk_up_from_nested_dir() {
         let temp = tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         fs::create_dir_all(root.join(".agents/skills")).unwrap();
-        write_skill(&root.join(".agents/skills"), "nested", "n", "body");
+        write_skill(&root.join(".agents/skills"), "ancestor", "a", "body");
 
         let nested = root.join("a/b/c");
         fs::create_dir_all(&nested).unwrap();
         let catalog = discover_skills_with_roots(&nested, None);
-        assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog.get("nested").unwrap().name, "nested");
+        assert!(
+            catalog.is_empty(),
+            "project skills in an ancestor dir must not be picked up"
+        );
     }
 
     #[test]
@@ -380,21 +398,18 @@ mod tests {
     }
 
     #[test]
-    fn project_walk_skips_user_root_when_launched_under_home() {
-        // Simulates launching nav from a subdirectory of $HOME that has no
-        // project `.agents/skills/`. The upward walk would otherwise discover
-        // `$HOME/.agents/skills/` and mis-scope every user skill as project,
-        // then log each one as shadowed during the user-pass.
+    fn project_lookup_skips_user_root_when_launched_from_home() {
+        // Launching nav directly from $HOME would otherwise resolve
+        // `$HOME/.agents/skills/` as the project root, then re-scan it during
+        // the user pass and log every entry as shadowed. The user-root guard
+        // in `find_project_skills_root_in_cwd` prevents that.
         let home = tempdir().unwrap();
         let home_path = home.path().canonicalize().unwrap();
         let user_root = home_path.join(".agents/skills");
         fs::create_dir_all(&user_root).unwrap();
         write_skill(&user_root, "global", "user skill", "body-u");
 
-        let nested = home_path.join("projects/sub");
-        fs::create_dir_all(&nested).unwrap();
-
-        let catalog = discover_skills_with_roots(&nested, Some(&user_root));
+        let catalog = discover_skills_with_roots(&home_path, Some(&user_root));
         let global = catalog.get("global").expect("global skill");
         assert_eq!(
             global.scope,
