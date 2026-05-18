@@ -64,13 +64,10 @@ async fn main() -> Result<()> {
         (!trimmed.is_empty()).then_some(trimmed)
     };
 
+    let combined_prompt = combine_prompt(args.prompt.as_slice(), stdin_prompt.as_deref());
+
     let is_tty = std::io::stdout().is_terminal();
     if is_tty && !args.json_events {
-        let initial_prompt = if !args.prompt.is_empty() {
-            Some(args.prompt.join(" "))
-        } else {
-            stdin_prompt
-        };
         return nav_tui::run(
             transport,
             args,
@@ -78,17 +75,13 @@ async fn main() -> Result<()> {
             store,
             session_id,
             resume_events,
-            initial_prompt,
+            combined_prompt,
             skills,
         )
         .await;
     }
 
-    let prompt = if !args.prompt.is_empty() {
-        args.prompt.join(" ")
-    } else if let Some(piped) = stdin_prompt {
-        piped
-    } else {
+    let Some(prompt) = combined_prompt else {
         bail!("provide a prompt for non-interactive mode, e.g. nav \"list the files\"");
     };
     let binding = SessionBinding {
@@ -150,6 +143,20 @@ fn is_upgrade_command(prompt: &[String]) -> bool {
     prompt.len() == 1 && matches!(prompt[0].as_str(), "update" | "upgrade")
 }
 
+/// Merge positional prompt args with anything read from piped stdin. When
+/// both are present, the stdin payload is appended as context (`<prompt>\n\n<stdin>`)
+/// — that's the `git diff | nav "review this diff"` flow. Returns `None`
+/// only when both sources are empty.
+fn combine_prompt(args_prompt: &[String], stdin_prompt: Option<&str>) -> Option<String> {
+    let arg_text = (!args_prompt.is_empty()).then(|| args_prompt.join(" "));
+    match (arg_text, stdin_prompt) {
+        (Some(arg), Some(piped)) => Some(format!("{arg}\n\n{piped}")),
+        (Some(arg), None) => Some(arg),
+        (None, Some(piped)) => Some(piped.to_string()),
+        (None, None) => None,
+    }
+}
+
 // The manifest dir is captured at compile time, so a globally installed `nav`
 // still knows which checkout it was built from. If the user moved or deleted
 // that checkout, `cargo install` fails with a clear message.
@@ -174,5 +181,38 @@ fn truncate(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn combine_arg_only() {
+        let out = combine_prompt(&args(&["review", "this"]), None);
+        assert_eq!(out.as_deref(), Some("review this"));
+    }
+
+    #[test]
+    fn combine_stdin_only() {
+        let out = combine_prompt(&[], Some("piped text"));
+        assert_eq!(out.as_deref(), Some("piped text"));
+    }
+
+    #[test]
+    fn combine_arg_and_stdin_appends_stdin_as_context() {
+        let out = combine_prompt(&args(&["summarize"]), Some("file contents"));
+        assert_eq!(out.as_deref(), Some("summarize\n\nfile contents"));
+    }
+
+    #[test]
+    fn combine_neither_returns_none() {
+        let out = combine_prompt(&[], None);
+        assert!(out.is_none());
     }
 }
