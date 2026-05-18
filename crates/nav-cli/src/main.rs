@@ -5,7 +5,7 @@ use nav_core::{
     SessionSummary, auth, cli::Args, discover_skills, rebuild_responses_input, run_agent,
 };
 use std::env;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -64,10 +64,26 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    if args.prompt.is_empty() {
-        bail!("provide a prompt for non-interactive mode, e.g. nav \"list the files\"");
-    }
-    let prompt = args.prompt.join(" ");
+    let prompt = if args.prompt.is_empty() {
+        // Non-interactive mode with no positional prompt: if stdin is piped
+        // (not a TTY), consume it as the prompt. Matches codex `exec` and pi's
+        // `readPipedStdin` behavior. If stdin is also a TTY there is no input
+        // source, so keep the existing hard-fail.
+        if std::io::stdin().is_terminal() {
+            bail!("provide a prompt for non-interactive mode, e.g. nav \"list the files\"");
+        }
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("failed to read prompt from stdin")?;
+        let trimmed = buf.trim_end_matches(['\n', '\r']).to_string();
+        if trimmed.is_empty() {
+            bail!("empty prompt from stdin; pass a prompt argument or pipe non-empty input");
+        }
+        trimmed
+    } else {
+        args.prompt.join(" ")
+    };
     let binding = SessionBinding {
         store: store.as_ref(),
         session_id,

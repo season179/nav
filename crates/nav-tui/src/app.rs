@@ -94,6 +94,10 @@ pub async fn run(
     install_panic_teardown_hook();
 
     let slash_entries = bottom_pane::build_slash_entries(skills.as_ref());
+    // Walk the workspace once at startup so the `@file` popup has something to
+    // fuzzy-match against. A re-scan affordance can come later; an idle TUI
+    // doesn't need a filesystem watcher to earn its keep.
+    let mention_entries = bottom_pane::build_mention_entries(&cwd);
 
     let mut chat = ChatWidget::new();
     if resume_events.is_empty() {
@@ -105,7 +109,7 @@ pub async fn run(
     for ev in resume_events {
         chat.ingest(ev);
     }
-    let mut pane = bottom_pane::BottomPane::with_slash_entries(slash_entries);
+    let mut pane = bottom_pane::BottomPane::with_entries(slash_entries, mention_entries);
     let mut ctrl_c_count = 0u8;
     // A standalone `/<skill>` is a local TUI gesture, not a model turn. Hold
     // its wrapped body here and prepend it onto the next non-slash prompt.
@@ -240,25 +244,37 @@ pub async fn run(
                 // typist never lags a redraw behind their keystrokes.
                 spinner_tick = spinner_tick.wrapping_add(1);
                 while event::poll(Duration::from_millis(0))? {
-                    if let CtEvent::Key(key) = event::read()? {
-                        if is_ctrl_c(&key) {
-                            ctrl_c_count += 1;
-                            if ctrl_c_count >= 2 {
-                                app_tx.send(AppEvent::Quit).ok();
+                    match event::read()? {
+                        CtEvent::Key(key) => {
+                            if is_ctrl_c(&key) {
+                                ctrl_c_count += 1;
+                                if ctrl_c_count >= 2 {
+                                    app_tx.send(AppEvent::Quit).ok();
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        ctrl_c_count = 0;
-                        if handle_scrollback_key(&mut chat, &key, history_viewport) {
-                            continue;
-                        }
-                        match pane.handle_key(key) {
-                            bottom_pane::ComposerEvent::Submit(text) => {
-                                dispatch_submit(text, skills.as_ref(), &app_tx);
+                            ctrl_c_count = 0;
+                            if handle_scrollback_key(&mut chat, &key, history_viewport) {
+                                continue;
                             }
-                            bottom_pane::ComposerEvent::Nothing
-                            | bottom_pane::ComposerEvent::Cancelled => {}
+                            match pane.handle_key(key) {
+                                bottom_pane::ComposerEvent::Submit(text) => {
+                                    dispatch_submit(text, skills.as_ref(), &app_tx);
+                                }
+                                bottom_pane::ComposerEvent::Nothing
+                                | bottom_pane::ComposerEvent::Cancelled => {}
+                            }
                         }
+                        CtEvent::Paste(text) => {
+                            // Bracketed paste was enabled at TUI entry
+                            // (see write_tui_enter_sequences); without this
+                            // arm the payload would be silently dropped. `cwd`
+                            // is passed through so clipboard images can be
+                            // persisted under `.nav/clipboard/` inside the
+                            // read sandbox.
+                            pane.on_paste(&cwd, &text);
+                        }
+                        _ => {}
                     }
                 }
             }

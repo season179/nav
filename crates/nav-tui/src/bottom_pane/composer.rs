@@ -15,6 +15,12 @@ pub enum ComposerEvent {
     Cancelled,
 }
 
+/// Pastes larger than this many `char`s are inserted as an atomic placeholder
+/// (`[Pasted Content N chars]`) and expanded back to full text at submit. The
+/// threshold matches codex so multi-KB pastes don't render line-by-line and
+/// blow up the composer height.
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
+
 /// Multi-line text editor with bash-style key bindings and a submitted-prompt
 /// history. Overlays mutate the buffer through [`Composer::set_text`] /
 /// [`Composer::insert_paste`].
@@ -25,6 +31,10 @@ pub struct Composer {
     history: Vec<String>,
     history_idx: Option<usize>,
     pending_draft: Option<String>,
+    /// `(placeholder, full_text)` pairs from large pastes. The placeholder
+    /// lives in the composer buffer until [`Composer::submit`] swaps each one
+    /// back to its original content. Cleared on every successful submit.
+    pending_pastes: Vec<(String, String)>,
 }
 
 impl Composer {
@@ -36,6 +46,7 @@ impl Composer {
             history: Vec::new(),
             history_idx: None,
             pending_draft: None,
+            pending_pastes: Vec::new(),
         }
     }
 
@@ -52,7 +63,9 @@ impl Composer {
         self.lines.len()
     }
 
-    /// Replace the entire buffer and place the cursor at the end.
+    /// Replace the entire buffer and place the cursor at the end. Any pending
+    /// large-paste placeholders are dropped — `set_text` is a wholesale buffer
+    /// swap, so the old placeholders no longer point at anything meaningful.
     pub fn set_text(&mut self, text: &str) {
         self.lines = if text.is_empty() {
             vec![String::new()]
@@ -61,10 +74,100 @@ impl Composer {
         };
         self.row = self.lines.len() - 1;
         self.col = self.lines[self.row].len();
+        self.pending_pastes.clear();
     }
 
     pub fn history(&self) -> &[String] {
         &self.history
+    }
+
+    /// Workspace path mention currently under the cursor, if any. Returns
+    /// `(at_position, token)` where `at_position` is the byte offset of the
+    /// `@` on the current line and `token` is the text typed after it (may be
+    /// empty). The `@` must sit at line start or after whitespace, and no
+    /// whitespace may appear between the `@` and the cursor — that disqualifies
+    /// `email@example.com` and reopens the popup only after a space is typed.
+    pub fn current_at_token(&self) -> Option<(usize, &str)> {
+        let line = &self.lines[self.row];
+        if self.col > line.len() {
+            return None;
+        }
+        let before = &line[..self.col];
+        let at_pos = before.rfind('@')?;
+        let between = &line[at_pos + 1..self.col];
+        if between.chars().any(char::is_whitespace) {
+            return None;
+        }
+        if at_pos > 0 {
+            let prev = line[..at_pos].chars().next_back();
+            if let Some(c) = prev
+                && !c.is_whitespace()
+            {
+                return None;
+            }
+        }
+        Some((at_pos, between))
+    }
+
+    /// Replace the `@token` under the cursor with `replacement` plus a
+    /// trailing space, moving the cursor to the end of the inserted text.
+    /// Returns `false` if no `@token` is under the cursor.
+    pub fn replace_active_at_token(&mut self, replacement: &str) -> bool {
+        let Some((at_pos, _)) = self.current_at_token() else {
+            return false;
+        };
+        let inserted = format!("{replacement} ");
+        let end = self.col;
+        self.lines[self.row].replace_range(at_pos..end, &inserted);
+        self.col = at_pos + inserted.len();
+        self.history_idx = None;
+        true
+    }
+
+    /// Entry point from the TUI's `CtEvent::Paste` arm. Small pastes go
+    /// straight into the buffer; pastes larger than
+    /// [`LARGE_PASTE_CHAR_THRESHOLD`] insert an atomic placeholder so the
+    /// composer height stays sane, with the full text held in
+    /// [`Composer::pending_pastes`] until submit. Matches codex's
+    /// `chat_composer.rs::handle_paste`.
+    pub fn handle_paste(&mut self, paste: &str) {
+        if paste.is_empty() {
+            return;
+        }
+        let char_count = paste.chars().count();
+        if char_count <= LARGE_PASTE_CHAR_THRESHOLD {
+            self.insert_paste(paste);
+            return;
+        }
+        let placeholder = self.fresh_paste_placeholder(char_count);
+        self.insert_paste(&placeholder);
+        self.pending_pastes.push((placeholder, paste.to_string()));
+    }
+
+    fn fresh_paste_placeholder(&self, char_count: usize) -> String {
+        let base = format!("[Pasted Content {char_count} chars]");
+        if !self.placeholder_in_use(&base) {
+            return base;
+        }
+        let mut n: usize = 2;
+        loop {
+            let candidate = format!("[Pasted Content {char_count} chars] #{n}");
+            if !self.placeholder_in_use(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    fn placeholder_in_use(&self, candidate: &str) -> bool {
+        if self
+            .pending_pastes
+            .iter()
+            .any(|(p, _)| p.as_str() == candidate)
+        {
+            return true;
+        }
+        self.lines.iter().any(|line| line.contains(candidate))
     }
 
     /// Insert pasted text as a single edit, splitting on `\n` so a multi-line
@@ -359,14 +462,31 @@ impl Composer {
         if self.lines.iter().all(String::is_empty) {
             return None;
         }
-        let text = self.text();
-        self.history.push(text.clone());
+        let raw = self.text();
+        let expanded = self.expand_pending_pastes(&raw);
+        // History stores the post-expansion text so Up-arrow recall surfaces
+        // the real prompt the agent received, not a stale placeholder.
+        self.history.push(expanded.clone());
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
         self.history_idx = None;
         self.pending_draft = None;
-        Some(text)
+        self.pending_pastes.clear();
+        Some(expanded)
+    }
+
+    fn expand_pending_pastes(&self, buf: &str) -> String {
+        if self.pending_pastes.is_empty() {
+            return buf.to_string();
+        }
+        let mut out = buf.to_string();
+        for (placeholder, content) in &self.pending_pastes {
+            if let Some(pos) = out.find(placeholder.as_str()) {
+                out.replace_range(pos..pos + placeholder.len(), content);
+            }
+        }
+        out
     }
 }
 
@@ -439,4 +559,149 @@ fn next_char_boundary(s: &str, byte: usize) -> usize {
         .nth(1)
         .map(|(i, _)| byte + i)
         .unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn small_paste_lands_verbatim() {
+        let mut c = Composer::new();
+        c.handle_paste("cargo test");
+        assert_eq!(c.text(), "cargo test");
+        assert!(c.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn large_paste_becomes_placeholder_and_expands_on_submit() {
+        let mut c = Composer::new();
+        let big: String = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        c.handle_paste(&big);
+        let buffer = c.text();
+        assert_eq!(
+            buffer,
+            format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 1)
+        );
+        assert_eq!(c.pending_pastes.len(), 1);
+
+        let ComposerEvent::Submit(expanded) = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(expanded, big);
+        assert!(c.pending_pastes.is_empty());
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn duplicate_large_pastes_get_suffixes() {
+        let mut c = Composer::new();
+        let big: String = "y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5);
+        c.handle_paste(&big);
+        c.handle_paste(&big);
+        let buf = c.text();
+        let base = format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 5);
+        let dup = format!("{base} #2");
+        assert!(buf.contains(&base), "buffer missing base placeholder: {buf:?}");
+        assert!(buf.contains(&dup), "buffer missing #2 placeholder: {buf:?}");
+
+        let ComposerEvent::Submit(expanded) = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        // Both placeholders should have been replaced with the original paste.
+        let occurrences = expanded.matches(big.as_str()).count();
+        assert_eq!(occurrences, 2);
+        assert!(!expanded.contains('['));
+    }
+
+    #[test]
+    fn submit_history_stores_expanded_text() {
+        let mut c = Composer::new();
+        let big: String = "z".repeat(LARGE_PASTE_CHAR_THRESHOLD + 10);
+        c.handle_paste(&big);
+        let _ = c.handle_key(enter());
+        let history = c.history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0], big);
+    }
+
+    #[test]
+    fn set_text_clears_pending_pastes() {
+        let mut c = Composer::new();
+        let big: String = "q".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        c.handle_paste(&big);
+        assert_eq!(c.pending_pastes.len(), 1);
+        c.set_text("/help");
+        assert!(c.pending_pastes.is_empty());
+        // Submit should now just return the literal slash command, with no
+        // dangling placeholder expansion.
+        let ComposerEvent::Submit(text) = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(text, "/help");
+    }
+
+    #[test]
+    fn empty_paste_is_noop() {
+        let mut c = Composer::new();
+        c.handle_paste("");
+        assert!(c.is_empty());
+        assert!(c.pending_pastes.is_empty());
+    }
+
+    fn typed(text: &str) -> Composer {
+        let mut c = Composer::new();
+        for ch in text.chars() {
+            c.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+        }
+        c
+    }
+
+    #[test]
+    fn at_token_detected_at_line_start() {
+        let c = typed("@sr");
+        let (pos, tok) = c.current_at_token().expect("should detect");
+        assert_eq!(pos, 0);
+        assert_eq!(tok, "sr");
+    }
+
+    #[test]
+    fn at_token_detected_after_whitespace() {
+        let c = typed("look at @co");
+        let (pos, tok) = c.current_at_token().expect("should detect");
+        assert_eq!(pos, "look at ".len());
+        assert_eq!(tok, "co");
+    }
+
+    #[test]
+    fn at_token_rejected_when_preceded_by_non_whitespace() {
+        // Treat `email@example` as an address, not a file mention.
+        let c = typed("email@example");
+        assert!(c.current_at_token().is_none());
+    }
+
+    #[test]
+    fn at_token_closes_when_whitespace_after() {
+        let c = typed("@src foo");
+        // Cursor sits after `foo` — whitespace between `@` and cursor disqualifies.
+        assert!(c.current_at_token().is_none());
+    }
+
+    #[test]
+    fn replace_at_token_inserts_path_and_trailing_space() {
+        let mut c = typed("review @co");
+        assert!(c.replace_active_at_token("src/composer.rs"));
+        assert_eq!(c.text(), "review src/composer.rs ");
+    }
+
+    #[test]
+    fn replace_at_token_at_line_start() {
+        let mut c = typed("@");
+        assert!(c.replace_active_at_token("Cargo.toml"));
+        assert_eq!(c.text(), "Cargo.toml ");
+    }
 }

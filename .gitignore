@@ -33,3 +33,6 @@ out/
 *.db
 *.db-wal
 *.db-shm
+
+# Clipboard images persisted by the TUI paste handler
+.nav/clipboard/
