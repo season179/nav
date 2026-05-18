@@ -1,5 +1,5 @@
 use super::retry::TransportError;
-use super::{ResponsesError, detect_context_overflow};
+use super::{ResponsesError, detect_context_overflow, detect_http_overflow};
 use crate::auth::AuthConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -44,12 +44,31 @@ pub(super) async fn connect_ws(
         .headers_mut()
         .insert(WS_CONTENT_TYPE, WsHeaderValue::from_static("application/json"));
 
-    let (mut socket, _) = connect_async(request).await?;
+    let (mut socket, _) = match connect_async(request).await {
+        Ok(pair) => pair,
+        Err(err) => return Err(reclassify_handshake_error(err)),
+    };
     socket
         .send(Message::Text(body.to_string().into()))
         .await
         .map_err(TransportError::from)?;
     Ok(socket)
+}
+
+/// Map a tungstenite handshake error into a `TransportError`, peeking at the
+/// HTTP body when present so a 400 with `context_length_exceeded` recovers
+/// like a stream-time overflow instead of aborting the turn.
+fn reclassify_handshake_error(err: tokio_tungstenite::tungstenite::Error) -> TransportError {
+    use tokio_tungstenite::tungstenite::Error as WsErr;
+    if let WsErr::Http(response) = &err
+        && let Some(bytes) = response.body()
+    {
+        let body = String::from_utf8_lossy(bytes);
+        if let Some(message) = detect_http_overflow(&body) {
+            return TransportError::ContextWindowExceeded { message };
+        }
+    }
+    TransportError::from(err)
 }
 
 /// Read the WebSocket stream, decode text frames as JSON events, forward

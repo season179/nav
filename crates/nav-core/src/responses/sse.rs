@@ -1,5 +1,5 @@
 use super::retry::{TransportError, parse_retry_after_seconds};
-use super::{ResponsesError, detect_context_overflow};
+use super::{ResponsesError, detect_context_overflow, detect_http_overflow};
 use crate::auth::AuthConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -38,6 +38,9 @@ pub(super) async fn connect_sse(
         .and_then(|v| v.to_str().ok())
         .and_then(parse_retry_after_seconds);
     let body_text = response.text().await.unwrap_or_default();
+    if let Some(message) = detect_http_overflow(&body_text) {
+        return Err(TransportError::ContextWindowExceeded { message });
+    }
     Err(TransportError::Http {
         status,
         retry_after,

@@ -51,6 +51,10 @@ pub enum TransportError {
     Timeout,
     /// TCP / TLS / DNS / socket-level failure surfaced by reqwest or tungstenite.
     Network(String),
+    /// Server rejected the request with a context-window error. Surfaced from
+    /// the HTTP error body or WebSocket handshake response so the runner can
+    /// route it through the same one-shot recovery as stream-time overflows.
+    ContextWindowExceeded { message: String },
     /// Anything else — kept around so callers can convert to `anyhow::Error`.
     Other(anyhow::Error),
 }
@@ -76,6 +80,9 @@ impl std::fmt::Display for TransportError {
             }
             TransportError::Timeout => write!(f, "transport timed out"),
             TransportError::Network(msg) => write!(f, "network error: {msg}"),
+            TransportError::ContextWindowExceeded { message } => {
+                write!(f, "context window exceeded: {message}")
+            }
             TransportError::Other(err) => write!(f, "{err:#}"),
         }
     }
@@ -138,7 +145,7 @@ pub fn should_retry(err: &TransportError) -> bool {
             status.as_u16() == 429 || status.is_server_error()
         }
         TransportError::Timeout | TransportError::Network(_) => true,
-        TransportError::Other(_) => false,
+        TransportError::ContextWindowExceeded { .. } | TransportError::Other(_) => false,
     }
 }
 
@@ -252,6 +259,9 @@ mod tests {
         assert!(!should_retry(&http(401, None)));
         assert!(!should_retry(&http(403, None)));
         assert!(!should_retry(&http(404, None)));
+        assert!(!should_retry(&TransportError::ContextWindowExceeded {
+            message: "too long".into()
+        }));
         assert!(!should_retry(&TransportError::Other(anyhow!("nope"))));
     }
 

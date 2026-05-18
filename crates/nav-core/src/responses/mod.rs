@@ -84,14 +84,39 @@ pub(crate) fn detect_context_overflow(event: &Value) -> Option<String> {
         }
         _ => return None,
     };
-    if matches!(
-        code,
-        Some("context_length_exceeded") | Some("context_window_exceeded")
-    ) {
+    if is_overflow_code(code) {
         Some(message.unwrap_or_default().to_string())
     } else {
         None
     }
+}
+
+/// Returns the error message if an HTTP error response body indicates a
+/// context-window overflow. Used by the SSE and WebSocket connect paths so a
+/// 400 / handshake rejection routes through the same recovery as stream-time
+/// overflows. Expected body shape:
+/// `{"error": {"code": "context_length_exceeded", "message": "..."}}`.
+pub(crate) fn detect_http_overflow(body: &str) -> Option<String> {
+    let json: Value = serde_json::from_str(body).ok()?;
+    let err = json.get("error")?;
+    let code = err.get("code").and_then(Value::as_str);
+    if is_overflow_code(code) {
+        Some(
+            err.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn is_overflow_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("context_length_exceeded") | Some("context_window_exceeded")
+    )
 }
 
 /// Real `Responses` transport backed by the existing WebSocket and SSE code.
@@ -174,24 +199,41 @@ impl ResponsesTransport for OpenAiTransport {
 
             match transport {
                 Transport::Websocket => {
-                    let socket = retry::retry(&policy, on_retry, || async {
+                    let result = retry::retry(&policy, on_retry, || async {
                         websocket::connect_ws(auth.as_ref(), body.clone()).await
                     })
-                    .await
-                    .map_err(anyhow::Error::from)?;
-                    tokio::spawn(async move {
-                        websocket::drive_ws(socket, idle_timeout, tx).await;
-                    });
+                    .await;
+                    match result {
+                        Ok(socket) => {
+                            tokio::spawn(async move {
+                                websocket::drive_ws(socket, idle_timeout, tx).await;
+                            });
+                        }
+                        Err(retry::TransportError::ContextWindowExceeded { message }) => {
+                            // Surface as a stream-level error so run_agent's
+                            // one-shot recovery handles connect-time and
+                            // stream-time overflows the same way.
+                            let _ = tx.send(Err(ResponsesError::ContextWindowExceeded { message }));
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
                 }
                 Transport::Sse => {
-                    let response = retry::retry(&policy, on_retry, || async {
+                    let result = retry::retry(&policy, on_retry, || async {
                         sse::connect_sse(&client, auth.as_ref(), body.clone()).await
                     })
-                    .await
-                    .map_err(anyhow::Error::from)?;
-                    tokio::spawn(async move {
-                        sse::drive_sse(response, idle_timeout, tx).await;
-                    });
+                    .await;
+                    match result {
+                        Ok(response) => {
+                            tokio::spawn(async move {
+                                sse::drive_sse(response, idle_timeout, tx).await;
+                            });
+                        }
+                        Err(retry::TransportError::ContextWindowExceeded { message }) => {
+                            let _ = tx.send(Err(ResponsesError::ContextWindowExceeded { message }));
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
                 }
             }
 
