@@ -175,14 +175,25 @@ impl DoctorBuilder {
 
 /// Run every check and return the aggregated report. `cwd` is the launch
 /// directory; `project` is the already-loaded project context (so checks
-/// stay in lock-step with what the agent loop actually saw).
-pub fn run(args: &Args, cwd: &Path, project: &ProjectContext) -> DoctorReport {
+/// stay in lock-step with what the agent loop actually saw);
+/// `install_manifest_dir` is the cargo manifest directory the *binary
+/// crate* was compiled from — `nav-cli` passes its own `CARGO_MANIFEST_DIR`
+/// here so doctor reports the same path `nav update` will pass to `cargo
+/// install --path`. Reading the env macro inside this `nav-core` module
+/// would instead report `crates/nav-core`, which is not what gets
+/// installed.
+pub fn run(
+    args: &Args,
+    cwd: &Path,
+    project: &ProjectContext,
+    install_manifest_dir: &str,
+) -> DoctorReport {
     let mut b = DoctorBuilder::new();
     check_runtime(&mut b, args);
     check_auth(&mut b, args);
     check_storage(&mut b, args);
     check_project(&mut b, cwd, project);
-    check_install(&mut b);
+    check_install(&mut b, install_manifest_dir);
     b.finish()
 }
 
@@ -344,7 +355,7 @@ fn check_project(b: &mut DoctorBuilder, cwd: &Path, project: &ProjectContext) {
 
 // ── install ─────────────────────────────────────────────────────────
 
-fn check_install(b: &mut DoctorBuilder) {
+fn check_install(b: &mut DoctorBuilder, manifest_dir: &str) {
     b.ok(
         DoctorGroup::Install,
         "version",
@@ -358,7 +369,6 @@ fn check_install(b: &mut DoctorBuilder) {
         "nav not on PATH — running from cargo target dir is fine, otherwise add cargo's bin dir to PATH",
     );
 
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     if Path::new(manifest_dir).exists() {
         b.ok(DoctorGroup::Install, "manifest dir", manifest_dir);
     } else {
@@ -510,7 +520,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let args = args_with_poisoned_codex_home();
         let project = ProjectContext::default();
-        let report = run(&args, tmp.path(), &project);
+        let report = run(&args, tmp.path(), &project, env!("CARGO_MANIFEST_DIR"));
         assert!(report.has_failures());
         let auth_fail = report
             .checks
@@ -563,21 +573,28 @@ mod tests {
 
     #[test]
     fn check_install_flags_missing_manifest_dir() {
-        // If CARGO_MANIFEST_DIR were stale we'd want a fail row. We can't
-        // re-set the compile-time env var, but we can at least verify the
-        // current manifest dir is reported as present.
         let mut b = DoctorBuilder::new();
-        check_install(&mut b);
-        let manifest_row = b
+        check_install(&mut b, "/definitely/not/a/real/manifest/dir");
+        let row = b
             .checks
             .iter()
             .find(|c| c.label == "manifest dir")
             .expect("manifest dir row");
-        assert_eq!(
-            manifest_row.group as u8,
-            DoctorGroup::Install as u8,
-            "should be in install group"
-        );
+        assert!(matches!(row.status, DoctorStatus::Fail));
+        assert!(row.detail.contains("no longer exists"));
+    }
+
+    #[test]
+    fn check_install_passes_for_existing_manifest_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut b = DoctorBuilder::new();
+        check_install(&mut b, tmp.path().to_str().unwrap());
+        let row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "manifest dir")
+            .expect("manifest dir row");
+        assert!(matches!(row.status, DoctorStatus::Ok));
     }
 
     #[test]

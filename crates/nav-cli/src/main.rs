@@ -208,9 +208,12 @@ fn run_cli_command(
 /// Run every doctor check and exit non-zero on any `[fail]` row. The
 /// settings-merged `args` and pre-loaded `project` come from the caller so
 /// doctor reports the same configuration the agent loop would see — not the
-/// bare clap defaults.
+/// bare clap defaults. `CARGO_MANIFEST_DIR` is read here so doctor reports
+/// `nav-cli`'s manifest (the one `run_upgrade` installs from), not
+/// `nav-core`'s — those would be the same nav-core function called from a
+/// different crate.
 fn doctor_command(args: &Args, cwd: &Path, project: &ProjectContext, json: bool) -> Result<()> {
-    let report = doctor::run(args, cwd, project);
+    let report = doctor::run(args, cwd, project, env!("CARGO_MANIFEST_DIR"));
     if json {
         println!(
             "{}",
@@ -406,8 +409,18 @@ fn run_upgrade() -> Result<()> {
         }
     }
 
-    let post_version = resolved
+    // Always read the cargo-installed binary directly for the post-install
+    // version. Falling back to whatever `PATH` resolves would report the
+    // shadow binary's version — the same case the warning above is for —
+    // and yield a bogus "already at X" summary when cargo's `bin/nav`
+    // genuinely changed underneath the shadow.
+    let post_install_bin = cargo_bin_dir
+        .as_ref()
+        .map(|dir| dir.join("nav"))
+        .filter(|p| p.exists());
+    let post_version = post_install_bin
         .as_deref()
+        .or(resolved.as_deref())
         .and_then(doctor::binary_version)
         .unwrap_or_else(|| "unknown".to_string());
 
