@@ -3,6 +3,7 @@ use std::path::{Component, Path};
 use std::time::Duration;
 
 use crate::sandbox::SandboxRequest;
+use crate::tools::output_accumulator::OutputAccumulator;
 use crate::tools::preflight::PermissionContext;
 use crate::tools::read_filter::{self, ReadOptions};
 use crate::{permissions::bash_parse::parse_command_pipeline, tools::fs};
@@ -43,10 +44,17 @@ pub(super) async fn bash(
         policy: permissions.sandbox_policy.clone(),
     };
     let output = permissions.sandbox.run(req).await?;
-    Ok(format!(
+    let combined = format!(
         "status: {}\nstdout:\n{}\nstderr:\n{}",
         output.status_display, output.stdout, output.stderr
-    ))
+    );
+    // Feed through the accumulator so oversized output spills to a log
+    // file under the nav data dir and only the bounded head+tail window
+    // (plus a `[Full output: <path>]` trailer) reaches the model.
+    let mut acc = OutputAccumulator::new("bash")?;
+    acc.push(combined.as_bytes())?;
+    let result = acc.finish()?;
+    Ok(result.content)
 }
 
 fn read_rewrite(command: &str) -> Option<ReadRewrite> {
@@ -482,6 +490,34 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn bash_spills_large_output_and_appends_trailer() {
+        let result = bash(
+            &unchecked_permission_context(),
+            Path::new("/tmp"),
+            30,
+            "seq 1 200000",
+        )
+        .await
+        .unwrap();
+        // Trailer with the absolute path is appended at the end.
+        let trailer_marker = "[Full output: ";
+        let trailer_at = result
+            .rfind(trailer_marker)
+            .expect("trailer present in bash output");
+        let trailer_tail = &result[trailer_at + trailer_marker.len()..];
+        let path_end = trailer_tail.find(']').expect("closing bracket on trailer");
+        let path_str = &trailer_tail[..path_end];
+        let path = Path::new(path_str);
+        assert!(path.is_absolute(), "trailer path was relative: {path_str}");
+        let on_disk = std::fs::read_to_string(path).expect("spill file readable");
+        assert!(
+            on_disk.contains("\n200000\n") || on_disk.ends_with("200000\n"),
+            "spill file is missing line 200000 (last 80 chars: {:?})",
+            &on_disk[on_disk.len().saturating_sub(80)..]
+        );
     }
 
     #[tokio::test]

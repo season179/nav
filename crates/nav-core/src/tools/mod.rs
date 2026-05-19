@@ -1,4 +1,5 @@
 mod fs;
+pub mod output_accumulator;
 mod patch;
 pub mod preflight;
 mod read_filter;
@@ -343,14 +344,7 @@ pub async fn run_tool(
             string_arg(&input, "command")?,
         )
         .await
-        .map(|out| {
-            ToolResult::text(bound(
-                out,
-                TruncateMode::HeadTail {
-                    head_lines: BASH_HEAD_LINES,
-                },
-            ))
-        }),
+        .map(ToolResult::text),
         "edit_file" => fs::edit_file_with_metadata(
             cwd,
             string_arg(&input, "path")?,

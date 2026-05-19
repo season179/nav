@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
     // disagree if the TUI later moves around.
     let skills = Arc::new(discover_skills(&cwd));
     let store = Arc::new(SessionStore::open(args.db_path.clone())?);
+    nav_core::tools::output_accumulator::sweep_old();
     let (session_id, initial_input, resume_events) = match args.resume.as_deref() {
         Some(id) => {
             let events = store.load_session(id)?;
