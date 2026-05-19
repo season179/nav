@@ -299,6 +299,43 @@ fn pending_queue_and_abort_events_render_as_control_rows() {
 }
 
 #[test]
+fn subagent_lifecycle_events_render_as_rows() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::SubagentStarted {
+        id: "call_worker".to_string(),
+        label: Some("explorer".to_string()),
+        task: "inspect session code".to_string(),
+    });
+    widget.ingest(AgentEvent::SubagentCompleted {
+        id: "call_worker".to_string(),
+        summary: "checked session/mod.rs".to_string(),
+    });
+    widget.ingest(AgentEvent::SubagentFailed {
+        id: "call_other".to_string(),
+        message: "model returned no summary".to_string(),
+    });
+
+    let rendered = render_widget(&widget, 100, 14);
+
+    assert!(
+        rendered.contains("* subagent  explorer (call_worker) started"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("inspect session code"), "{rendered}");
+    assert!(
+        rendered.contains("* subagent  explorer (call_worker) completed"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("checked session/mod.rs"), "{rendered}");
+    assert!(
+        rendered.contains("* subagent  call_other failed"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("model returned no summary"), "{rendered}");
+}
+
+#[test]
 fn assistant_deltas_paint_incrementally_then_finalize() {
     let mut widget = ChatWidget::new();
 

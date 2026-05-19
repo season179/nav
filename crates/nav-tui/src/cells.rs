@@ -611,6 +611,72 @@ impl HistoryCell for ToolOutputCell {
     }
 }
 
+enum SubagentPhase {
+    Started,
+    Completed,
+    Failed,
+}
+
+pub struct SubagentCell {
+    phase: SubagentPhase,
+    id: String,
+    label: Option<String>,
+    body: String,
+}
+
+impl SubagentCell {
+    pub fn started(id: impl Into<String>, label: Option<String>, task: impl Into<String>) -> Self {
+        Self {
+            phase: SubagentPhase::Started,
+            id: id.into(),
+            label,
+            body: task.into(),
+        }
+    }
+
+    pub fn completed(
+        id: impl Into<String>,
+        label: Option<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self {
+            phase: SubagentPhase::Completed,
+            id: id.into(),
+            label,
+            body: summary.into(),
+        }
+    }
+
+    pub fn failed(
+        id: impl Into<String>,
+        label: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            phase: SubagentPhase::Failed,
+            id: id.into(),
+            label,
+            body: message.into(),
+        }
+    }
+}
+
+impl HistoryCell for SubagentCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let name = self
+            .label
+            .as_deref()
+            .map(|label| format!("{label} ({})", self.id))
+            .unwrap_or_else(|| self.id.clone());
+        let (color, body) = match self.phase {
+            SubagentPhase::Started => (Color::Blue, format!("{name} started\n{}", self.body)),
+            SubagentPhase::Completed => (Color::Green, format!("{name} completed\n{}", self.body)),
+            SubagentPhase::Failed => (Color::Red, format!("{name} failed\n{}", self.body)),
+        };
+        body_cell("*", "subagent", color, &body, width)
+    }
+}
+
 pub struct FileChangeCell {
     changes: Vec<FileChangeSummary>,
     status: PatchApplyStatus,

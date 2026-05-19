@@ -16,7 +16,7 @@ use crate::cli::Args;
 use crate::project::ProjectContext;
 use crate::responses::{InstructionSectionKind, instruction_sections};
 use crate::skills::Catalog;
-use crate::tools::tool_definitions;
+use crate::tools::{ToolAccess, tool_definitions};
 
 const IMAGE_TOKEN_ESTIMATE: u64 = 1_000;
 
@@ -246,7 +246,7 @@ fn instruction_categories(
 }
 
 fn tool_category() -> ContextCategory {
-    let tools = tool_definitions();
+    let tools = tool_definitions(ToolAccess::Full, true);
     let mut category = ContextCategory::new("Tools", Some(format!("{} definitions", tools.len())));
     for tool in tools {
         let label = tool

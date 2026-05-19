@@ -93,6 +93,20 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
     },
+    SubagentStarted {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        task: String,
+    },
+    SubagentCompleted {
+        id: String,
+        summary: String,
+    },
+    SubagentFailed {
+        id: String,
+        message: String,
+    },
     FileChange {
         call_id: String,
         changes: Vec<FileChangeSummary>,
@@ -246,6 +260,9 @@ impl AgentEvent {
             AgentEvent::AssistantMessageDone { .. } => "assistant_message_done",
             AgentEvent::ToolCallStarted { .. } => "tool_call_started",
             AgentEvent::ToolCallOutput { .. } => "tool_call_output",
+            AgentEvent::SubagentStarted { .. } => "subagent_started",
+            AgentEvent::SubagentCompleted { .. } => "subagent_completed",
+            AgentEvent::SubagentFailed { .. } => "subagent_failed",
             AgentEvent::FileChange { .. } => "file_change",
             AgentEvent::TurnDiff { .. } => "turn_diff",
             AgentEvent::GitCheckpoint { .. } => "git_checkpoint",
@@ -405,6 +422,41 @@ mod tests {
                 "ids": ["pending-1", "pending-2"]
             })
         );
+    }
+
+    #[test]
+    fn subagent_events_have_stable_wire_format() {
+        let started = AgentEvent::SubagentStarted {
+            id: "call_1".into(),
+            label: Some("reviewer".into()),
+            task: "check the diff".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            json!({
+                "kind": "subagent_started",
+                "id": "call_1",
+                "label": "reviewer",
+                "task": "check the diff"
+            })
+        );
+        assert_eq!(started.kind(), "subagent_started");
+        assert!(started.is_durable());
+
+        let completed = AgentEvent::SubagentCompleted {
+            id: "call_1".into(),
+            summary: "clean".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&completed).unwrap(),
+            json!({
+                "kind": "subagent_completed",
+                "id": "call_1",
+                "summary": "clean"
+            })
+        );
+        assert_eq!(completed.kind(), "subagent_completed");
+        assert!(completed.is_durable());
     }
 
     #[test]

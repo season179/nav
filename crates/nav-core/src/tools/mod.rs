@@ -24,12 +24,38 @@ const BASH_HEAD_LINES: usize = 200;
 
 pub use preflight::{PermissionContext, PreflightOutcome};
 
-pub(crate) fn tool_definitions() -> Vec<Value> {
+pub const SPAWN_SUBAGENT_TOOL: &str = "spawn_subagent";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolAccess {
+    Full,
+    ReadOnly,
+}
+
+impl ToolAccess {
+    pub fn allows(self, name: &str) -> bool {
+        match self {
+            ToolAccess::Full => matches!(
+                name,
+                "read_file"
+                    | "list_files"
+                    | "bash"
+                    | "edit_file"
+                    | "apply_patch"
+                    | "code_search"
+                    | SPAWN_SUBAGENT_TOOL
+            ),
+            ToolAccess::ReadOnly => matches!(name, "read_file" | "list_files" | "code_search"),
+        }
+    }
+}
+
+pub(super) fn tool_definitions(access: ToolAccess, include_subagents: bool) -> Vec<Value> {
     // These primitives mirror the workshop article, with `apply_patch` as the
     // reviewable multi-file editing path learned from sibling agent projects.
     // Together they let the model inspect code, find code, change code, and
     // verify with commands.
-    vec![
+    let mut definitions = vec![
         json!({
             "type": "function",
             "name": "read_file",
@@ -105,7 +131,39 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
-    ]
+    ];
+
+    definitions.retain(|definition| {
+        definition
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| access.allows(name))
+    });
+
+    if include_subagents && access.allows(SPAWN_SUBAGENT_TOOL) {
+        definitions.push(json!({
+            "type": "function",
+            "name": SPAWN_SUBAGENT_TOOL,
+            "description": "Run a focused helper agent with its own short context for bounded codebase exploration or review. The helper cannot edit files, run shell commands, or spawn more agents; it returns a concise summary for you to integrate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "The focused task for the helper agent."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional short human-readable label for the helper."
+                    }
+                },
+                "required": ["task"],
+                "additionalProperties": false
+            }
+        }));
+    }
+
+    definitions
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,9 +426,9 @@ mod tests {
     // ── tool_definitions ──────────────────────────────────────────
 
     #[test]
-    fn tool_definitions_returns_all_six_tools() {
-        let defs = tool_definitions();
-        assert_eq!(defs.len(), 6);
+    fn tool_definitions_returns_full_toolset() {
+        let defs = tool_definitions(ToolAccess::Full, true);
+        assert_eq!(defs.len(), 7);
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.get("name").and_then(Value::as_str))
@@ -382,14 +440,33 @@ mod tests {
             "edit_file",
             "apply_patch",
             "code_search",
+            SPAWN_SUBAGENT_TOOL,
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
     }
 
     #[test]
+    fn tool_definitions_can_hide_subagents_and_mutations() {
+        let root_defs = tool_definitions(ToolAccess::Full, false);
+        let root_names: Vec<&str> = root_defs
+            .iter()
+            .filter_map(|d| d.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(!root_names.contains(&SPAWN_SUBAGENT_TOOL));
+        assert!(root_names.contains(&"apply_patch"));
+
+        let worker_defs = tool_definitions(ToolAccess::ReadOnly, false);
+        let worker_names: Vec<&str> = worker_defs
+            .iter()
+            .filter_map(|d| d.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(worker_names, vec!["read_file", "list_files", "code_search"]);
+    }
+
+    #[test]
     fn tool_definitions_have_valid_schemas() {
-        for def in tool_definitions() {
+        for def in tool_definitions(ToolAccess::Full, true) {
             assert_eq!(def["type"], "function");
             let params = &def["parameters"];
             assert_eq!(params["type"], "object");

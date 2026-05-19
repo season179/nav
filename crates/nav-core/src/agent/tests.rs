@@ -1043,6 +1043,229 @@ async fn run_agent_git_checkpoints_dirty_worktree_before_user_message() {
 }
 
 #[tokio::test]
+async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
+    let parent_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_worker",
+                "name": crate::tools::SPAWN_SUBAGENT_TOOL,
+                "arguments": "{\"task\":\"inspect session code\",\"label\":\"explorer\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let worker_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Checked session/mod.rs; no issue found."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let parent_final = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Integrated the worker result."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![parent_turn, worker_turn, parent_final]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 4;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "use a helper",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let pos_tool = event_position(&events, "ToolCallStarted", |event| {
+        matches!(
+            event,
+            AgentEvent::ToolCallStarted { call_id, name, .. }
+                if call_id == "call_worker" && name == crate::tools::SPAWN_SUBAGENT_TOOL
+        )
+    });
+    let pos_started = event_position(&events, "SubagentStarted", |event| {
+        matches!(
+            event,
+            AgentEvent::SubagentStarted { id, label, task }
+                if id == "call_worker"
+                    && label.as_deref() == Some("explorer")
+                    && task == "inspect session code"
+        )
+    });
+    let pos_completed = event_position(&events, "SubagentCompleted", |event| {
+        matches!(
+            event,
+            AgentEvent::SubagentCompleted { id, summary }
+                if id == "call_worker" && summary.contains("Checked session/mod.rs")
+        )
+    });
+    let pos_output = event_position(&events, "ToolCallOutput", |event| {
+        matches!(
+            event,
+            AgentEvent::ToolCallOutput { call_id, output, is_error }
+                if call_id == "call_worker"
+                    && !*is_error
+                    && output.contains("Checked session/mod.rs")
+        )
+    });
+    assert!(pos_tool < pos_started);
+    assert!(pos_started < pos_completed);
+    assert!(pos_completed < pos_output);
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AgentEvent::AssistantMessageDone { text } if text == "Integrated the worker result.")
+        )
+    );
+
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 3);
+    let worker_body = &bodies[1];
+    let worker_tools: Vec<&str> = worker_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(worker_tools, vec!["read_file", "list_files", "code_search"]);
+    let worker_input = worker_body.get("input").and_then(Value::as_array).unwrap();
+    assert!(
+        worker_input
+            .first()
+            .and_then(|item| item.get("content"))
+            .and_then(Value::as_str)
+            .is_some_and(|text| {
+                text.contains("focused nav subagent") && text.contains("inspect session code")
+            }),
+        "worker prompt missing task: {worker_input:#?}"
+    );
+}
+
+#[tokio::test]
+async fn subagent_scope_blocks_hallucinated_mutating_tool() {
+    let parent_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_worker",
+                "name": crate::tools::SPAWN_SUBAGENT_TOOL,
+                "arguments": "{\"task\":\"try to edit note.txt\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let worker_mutation_attempt = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "worker_patch",
+                "name": "apply_patch",
+                "arguments": "{\"patch\":\"*** Begin Patch\\n*** Update File: note.txt\\n@@\\n-old\\n+new\\n*** End Patch\\n\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let worker_final = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Mutation was blocked by subagent scope."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let parent_final = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Worker could not edit."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![
+        parent_turn,
+        worker_mutation_attempt,
+        worker_final,
+        parent_final,
+    ]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 5;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    fs::write(cwd.join("note.txt"), "old\n").unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "use a helper",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent");
+    while rx.recv().await.is_some() {}
+
+    assert_eq!(fs::read_to_string(cwd.join("note.txt")).unwrap(), "old\n");
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 4);
+    let second_worker_input = bodies[2].get("input").and_then(Value::as_array).unwrap();
+    assert!(
+        second_worker_input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .is_some_and(|output| output.contains("tool apply_patch blocked"))
+        }),
+        "worker retry did not receive blocked tool output: {second_worker_input:#?}"
+    );
+}
+
+#[tokio::test]
 async fn run_agent_injects_steering_before_dispatching_stale_tool_calls() {
     let turn_one = vec![
         json!({

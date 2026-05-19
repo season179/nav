@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use crate::cells::{
     AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell, FileChangeCell,
     GitCheckpointCell, PendingInputCell, SessionListCell, SessionNoticeCell, SessionTreeCell,
-    SkillInvocationCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
-    TurnAbortedCell, TurnDiffCell, UserMessageCell, WelcomeCell,
+    SkillInvocationCell, SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell,
+    TranscriptHitsCell, TurnAbortedCell, TurnDiffCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -17,6 +17,7 @@ use crate::history::HistoryCell;
 pub struct ChatWidget {
     cells: Vec<Box<dyn HistoryCell>>,
     tool_calls: HashMap<String, ToolCallContext>,
+    subagent_labels: HashMap<String, String>,
     /// In-flight streaming assistant cell, anchored to its eventual index
     /// in `cells`. Held outside `cells` so deltas can mutate it in place;
     /// control-plane rows that fire mid-stream (pending-input queue ops)
@@ -34,6 +35,7 @@ impl ChatWidget {
         Self {
             cells: Vec::new(),
             tool_calls: HashMap::new(),
+            subagent_labels: HashMap::new(),
             streaming_assistant: None,
             scroll_top: None,
         }
@@ -169,6 +171,22 @@ impl ChatWidget {
             } => {
                 let context = self.tool_calls.remove(&call_id);
                 self.push_cell(ToolOutputCell::with_context(output, is_error, context));
+            }
+            AgentEvent::SubagentStarted { id, label, task } => {
+                if let Some(label) = label.clone() {
+                    self.subagent_labels.insert(id.clone(), label);
+                } else {
+                    self.subagent_labels.remove(&id);
+                }
+                self.push_cell(SubagentCell::started(id, label, task));
+            }
+            AgentEvent::SubagentCompleted { id, summary } => {
+                let label = self.subagent_labels.remove(&id);
+                self.push_cell(SubagentCell::completed(id, label, summary));
+            }
+            AgentEvent::SubagentFailed { id, message } => {
+                let label = self.subagent_labels.remove(&id);
+                self.push_cell(SubagentCell::failed(id, label, message));
             }
             AgentEvent::FileChange {
                 changes,
