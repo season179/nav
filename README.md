@@ -83,9 +83,11 @@ Inside the TUI:
 - `Enter` submits, `Shift+Enter` inserts a newline.
 - `Ctrl+U` clears to start of line, `Ctrl+W` deletes the previous word.
 - `Up` / `Down` recall earlier prompts from this session.
-- A leading `/` opens a slash-command popup (`/help`, `/clear`, `/quit`,
-  `/resume`, `/sessions`). Type to filter, Tab/Enter completes.
+- A leading `/` opens a slash-command popup (`/help`, `/clear`, `/context`,
+  `/quit`, `/resume`, `/sessions`). Type to filter, Tab/Enter completes.
 - `/quit` and `Ctrl+C` twice exit cleanly; `/clear` empties the transcript.
+- `/context [all]` estimates the current context distribution without sending
+  a model turn.
 
 To bypass the TUI and stream raw events:
 

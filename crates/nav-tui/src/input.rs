@@ -41,6 +41,9 @@ pub(crate) enum AppEvent {
     Export {
         path: Option<PathBuf>,
     },
+    ShowContext {
+        include_all: bool,
+    },
     ForkSession {
         at: Option<u64>,
     },
@@ -53,6 +56,15 @@ pub(crate) enum AppEvent {
     },
     FindTranscript {
         query: String,
+    },
+    GitCheckpoint {
+        label: Option<String>,
+    },
+    GitStash {
+        label: Option<String>,
+    },
+    GitRestore {
+        target: Option<String>,
     },
     SlashError {
         message: String,
@@ -180,6 +192,15 @@ fn parse_builtin_command(text: &str) -> Option<AppEvent> {
             path: (!rest.is_empty()).then(|| PathBuf::from(rest)),
         });
     }
+    if let Some(rest) = slash_rest(trimmed, "/context") {
+        return match rest {
+            "" => Some(AppEvent::ShowContext { include_all: false }),
+            "all" => Some(AppEvent::ShowContext { include_all: true }),
+            _ => Some(AppEvent::SlashError {
+                message: "usage: /context [all]".to_string(),
+            }),
+        };
+    }
     if let Some(rest) = slash_rest(trimmed, "/fork") {
         let at = if rest.is_empty() {
             None
@@ -226,6 +247,21 @@ fn parse_builtin_command(text: &str) -> Option<AppEvent> {
         }
         return Some(AppEvent::FindTranscript {
             query: rest.to_string(),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/checkpoint") {
+        return Some(AppEvent::GitCheckpoint {
+            label: (!rest.is_empty()).then(|| rest.to_string()),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/stash") {
+        return Some(AppEvent::GitStash {
+            label: (!rest.is_empty()).then(|| rest.to_string()),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/restore") {
+        return Some(AppEvent::GitRestore {
+            target: (!rest.is_empty()).then(|| rest.to_string()),
         });
     }
     None
@@ -496,6 +532,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_git_builtin_commands() {
+        assert!(matches!(
+            parse_builtin_command("/checkpoint before risky edit"),
+            Some(AppEvent::GitCheckpoint { label: Some(label) }) if label == "before risky edit"
+        ));
+        assert!(matches!(
+            parse_builtin_command("/stash"),
+            Some(AppEvent::GitStash { label: None })
+        ));
+        assert!(matches!(
+            parse_builtin_command("/restore stash@{2}"),
+            Some(AppEvent::GitRestore { target: Some(target) }) if target == "stash@{2}"
+        ));
+    }
+
+    #[test]
     fn prepend_pending_skill_merges_body_with_prompt() {
         let merged = prepend_pending_skill(Some("<skill>body</skill>".into()), "do X");
         assert!(merged.starts_with("<skill>"));
@@ -690,5 +742,17 @@ mod tests {
 
         dispatch_submit("/abort".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::AbortTurn));
+
+        dispatch_submit("/context".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::ShowContext { include_all: false }
+        ));
+
+        dispatch_submit("/context all".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::ShowContext { include_all: true }
+        ));
     }
 }
