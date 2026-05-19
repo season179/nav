@@ -230,6 +230,10 @@ impl BottomPane {
         self.view.is_some()
     }
 
+    pub fn can_scroll_transcript_with_arrows(&self) -> bool {
+        self.view.is_none() && self.composer.text().is_empty()
+    }
+
     /// Returns the slash-command popup if it is the active overlay.
     pub fn slash_popup(&self) -> Option<&SlashCommandPopup> {
         match &self.view {
@@ -737,6 +741,32 @@ mod tests {
             pane.take_session_selection(),
             Some("01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string())
         );
+    }
+
+    #[test]
+    fn transcript_arrows_scroll_only_when_pane_is_idle() {
+        let mut pane = BottomPane::new();
+        assert!(pane.can_scroll_transcript_with_arrows());
+
+        pane.handle_key(key(KeyCode::Char('h')));
+        assert!(!pane.can_scroll_transcript_with_arrows());
+
+        let mut pane = BottomPane::new();
+        pane.handle_key(key(KeyCode::Char(' ')));
+        assert!(!pane.can_scroll_transcript_with_arrows());
+
+        let mut pane = BottomPane::new();
+        assert!(pane.can_scroll_transcript_with_arrows());
+
+        pane.open_session_picker(vec![SessionPickerEntry {
+            id: "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+            name: Some("release work".to_string()),
+            created_at: 100,
+            last_active: 250,
+            turn_count: 2,
+            title: Some("Implement picker".to_string()),
+        }]);
+        assert!(!pane.can_scroll_transcript_with_arrows());
     }
 
     #[test]

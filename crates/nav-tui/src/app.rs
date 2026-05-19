@@ -1,4 +1,5 @@
 use anyhow::Result;
+use crossterm::Command;
 use crossterm::event::{self, Event as CtEvent};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -16,6 +17,7 @@ use nav_core::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::collections::VecDeque;
+use std::fmt;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -63,6 +65,7 @@ fn write_tui_enter_sequences(out: &mut impl io::Write) -> io::Result<()> {
     crossterm::execute!(
         out,
         EnterAlternateScreen,
+        EnableAlternateScroll,
         crossterm::event::EnableBracketedPaste
     )
 }
@@ -71,8 +74,51 @@ fn write_tui_leave_sequences(out: &mut impl io::Write) -> io::Result<()> {
     crossterm::execute!(
         out,
         crossterm::event::DisableBracketedPaste,
+        DisableAlternateScroll,
         LeaveAlternateScreen
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableAlternateScroll;
+
+impl Command for EnableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1007h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "tried to execute EnableAlternateScroll using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableAlternateScroll;
+
+impl Command for DisableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1007l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "tried to execute DisableAlternateScroll using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
 }
 
 fn install_panic_teardown_hook() {
@@ -628,7 +674,12 @@ pub async fn run(
                                 continue;
                             }
                             ctrl_c_count = 0;
-                            if handle_scrollback_key(&mut chat, &key, history_viewport) {
+                            if handle_scrollback_key(
+                                &mut chat,
+                                &key,
+                                history_viewport,
+                                pane.can_scroll_transcript_with_arrows(),
+                            ) {
                                 continue;
                             }
                             match pane.handle_key(key) {
@@ -1112,12 +1163,13 @@ mod tests {
     }
 
     #[test]
-    fn tui_enter_sequences_do_not_enable_mouse_capture() {
+    fn tui_enter_sequences_enable_alternate_scroll_without_mouse_capture() {
         let mut out = Vec::new();
         write_tui_enter_sequences(&mut out).unwrap();
         let bytes = String::from_utf8_lossy(&out);
 
         assert!(bytes.contains("\u{1b}[?1049h"));
+        assert!(bytes.contains("\u{1b}[?1007h"));
         assert!(bytes.contains("\u{1b}[?2004h"));
         for seq in [
             "\u{1b}[?1000h",
@@ -1131,6 +1183,16 @@ mod tests {
                 "mouse capture prevents native terminal text selection: {seq:?}"
             );
         }
+    }
+
+    #[test]
+    fn tui_leave_sequences_disable_alternate_scroll() {
+        let mut out = Vec::new();
+        write_tui_leave_sequences(&mut out).unwrap();
+        let bytes = String::from_utf8_lossy(&out);
+
+        assert!(bytes.contains("\u{1b}[?1007l"));
+        assert!(bytes.contains("\u{1b}[?1049l"));
     }
 
     #[test]

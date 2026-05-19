@@ -67,9 +67,16 @@ pub(crate) fn handle_scrollback_key(
     chat: &mut ChatWidget,
     key: &KeyEvent,
     (history_w, history_h): (u16, u16),
+    allow_line_scroll: bool,
 ) -> bool {
+    const LINE_SCROLL_ROWS: u16 = 3;
+
     let page_rows = history_h.saturating_sub(1).max(1);
     match key.code {
+        KeyCode::Up if allow_line_scroll => chat.scroll_up(LINE_SCROLL_ROWS, history_w, history_h),
+        KeyCode::Down if allow_line_scroll => {
+            chat.scroll_down(LINE_SCROLL_ROWS, history_w, history_h)
+        }
         KeyCode::PageUp => chat.scroll_up(page_rows, history_w, history_h),
         KeyCode::PageDown => chat.scroll_down(page_rows, history_w, history_h),
         KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -373,9 +380,52 @@ pub fn prepend_pending_skill(pending: Option<String>, prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nav_core::{Catalog, Skill, SkillScope};
+    use nav_core::{AgentEvent, Catalog, Skill, SkillScope};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use std::fs;
     use tempfile::tempdir;
+
+    fn buffer_to_text(buf: &Buffer) -> String {
+        let area = buf.area();
+        let mut out = String::with_capacity((area.width as usize + 1) * area.height as usize);
+        for y in 0..area.height {
+            let row_start = out.len();
+            for x in 0..area.width {
+                out.push_str(buf[(area.x + x, area.y + y)].symbol());
+            }
+            let trimmed = out[row_start..].trim_end_matches(' ').len();
+            out.truncate(row_start + trimmed);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_widget(widget: &ChatWidget, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                frame.render_widget(widget, area);
+            })
+            .expect("draw");
+        buffer_to_text(terminal.backend().buffer())
+    }
+
+    fn widget_with_numbered_output(line_count: usize) -> ChatWidget {
+        let mut widget = ChatWidget::new();
+        widget.ingest(AgentEvent::ToolCallOutput {
+            call_id: "call_1".to_string(),
+            output: (0..line_count)
+                .map(|i| format!("line {i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            is_error: false,
+        });
+        widget
+    }
 
     fn catalog_with_skill(dir: &std::path::Path) -> Catalog {
         let skill_dir = dir.join("foo");
@@ -456,6 +506,67 @@ mod tests {
     fn prepend_pending_skill_returns_prompt_when_empty() {
         let merged = prepend_pending_skill(None, "do X");
         assert_eq!(merged, "do X");
+    }
+
+    #[test]
+    fn page_keys_scroll_scrollback() {
+        let mut widget = widget_with_numbered_output(20);
+
+        assert!(handle_scrollback_key(
+            &mut widget,
+            &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            (40, 6),
+            false,
+        ));
+        let older = render_widget(&widget, 40, 6);
+        assert!(!older.contains("line 19"), "{older}");
+
+        assert!(handle_scrollback_key(
+            &mut widget,
+            &KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            (40, 6),
+            false,
+        ));
+        let newest = render_widget(&widget, 40, 6);
+        assert!(newest.contains("line 19"), "{newest}");
+    }
+
+    #[test]
+    fn non_scrollback_keys_do_not_steal_composer_input() {
+        let mut widget = widget_with_numbered_output(20);
+
+        assert!(!handle_scrollback_key(
+            &mut widget,
+            &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            (40, 6),
+            true,
+        ));
+        let rendered = render_widget(&widget, 40, 6);
+
+        assert!(rendered.contains("line 19"), "{rendered}");
+    }
+
+    #[test]
+    fn line_scroll_keys_only_scroll_when_enabled() {
+        let mut widget = widget_with_numbered_output(20);
+
+        assert!(!handle_scrollback_key(
+            &mut widget,
+            &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            (40, 6),
+            false,
+        ));
+        let newest = render_widget(&widget, 40, 6);
+        assert!(newest.contains("line 19"), "{newest}");
+
+        assert!(handle_scrollback_key(
+            &mut widget,
+            &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            (40, 6),
+            true,
+        ));
+        let older = render_widget(&widget, 40, 6);
+        assert!(!older.contains("line 19"), "{older}");
     }
 
     #[test]
