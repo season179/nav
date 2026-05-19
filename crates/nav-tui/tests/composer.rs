@@ -3,9 +3,11 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nav_core::{AgentEvent, PendingInputMode};
-use nav_tui::bottom_pane::{BottomPane, ComposerEvent};
+use nav_tui::bottom_pane::{BottomPane, ComposerEvent, MentionEntry, SlashEntry};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 fn press(pane: &mut BottomPane, code: KeyCode, mods: KeyModifiers) -> ComposerEvent {
     pane.handle_key(KeyEvent::new(code, mods))
@@ -114,6 +116,59 @@ fn slash_shows_popup_and_he_filters_to_help() {
         .map(|entry| entry.command.as_str())
         .collect();
     assert_eq!(commands, vec!["/help"]);
+}
+
+#[test]
+fn at_file_shows_mention_popup_and_filters_paths() {
+    let mention_entries: Arc<[MentionEntry]> = vec![
+        MentionEntry {
+            display: "README.md".to_string(),
+        },
+        MentionEntry {
+            display: "crates/nav-tui/src/bottom_pane/composer.rs".to_string(),
+        },
+    ]
+    .into();
+    let mut pane = BottomPane::with_entries(
+        Arc::from(Vec::<SlashEntry>::new()),
+        mention_entries,
+        PathBuf::from("."),
+    );
+    let mut terminal = fresh_terminal();
+
+    type_text(&mut pane, "@read");
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+
+    assert!(pane.has_overlay(), "mention popup did not open: {rendered}");
+    assert!(rendered.contains("README.md"), "{rendered}");
+}
+
+#[test]
+fn altgr_at_file_shows_mention_popup() {
+    let mention_entries: Arc<[MentionEntry]> = vec![MentionEntry {
+        display: "README.md".to_string(),
+    }]
+    .into();
+    let mut pane = BottomPane::with_entries(
+        Arc::from(Vec::<SlashEntry>::new()),
+        mention_entries,
+        PathBuf::from("."),
+    );
+    let mut terminal = fresh_terminal();
+
+    press(
+        &mut pane,
+        KeyCode::Char('@'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    );
+    type_text(&mut pane, "read");
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+
+    assert_eq!(pane.composer().text(), "@read");
+    assert!(pane.has_overlay(), "mention popup did not open: {rendered}");
+    assert!(rendered.contains("README.md"), "{rendered}");
 }
 
 #[test]

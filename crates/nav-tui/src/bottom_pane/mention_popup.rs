@@ -414,4 +414,17 @@ mod tests {
         popup.set_query("ga");
         assert_eq!(popup.selected, 0);
     }
+
+    #[test]
+    fn build_mention_entries_indexes_hidden_launch_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join(".hidden-worktree");
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+
+        let entries = build_mention_entries(&cwd);
+        let names: Vec<&str> = entries.iter().map(|entry| entry.display.as_str()).collect();
+
+        assert!(names.contains(&"src/main.rs"), "{names:?}");
+    }
 }

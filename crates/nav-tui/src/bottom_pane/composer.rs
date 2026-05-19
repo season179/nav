@@ -263,7 +263,7 @@ impl Composer {
                 ComposerEvent::Nothing
             }
             (KeyCode::Char(c), m) => {
-                if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::ALT) {
+                if should_ignore_modified_char(c, m) {
                     return ComposerEvent::Nothing;
                 }
                 self.insert_char(c);
@@ -275,6 +275,22 @@ impl Composer {
             }
             (KeyCode::Delete, _) => {
                 self.delete_forward();
+                ComposerEvent::Nothing
+            }
+            (KeyCode::Left, m) if is_command_modifier(m) => {
+                self.col = 0;
+                ComposerEvent::Nothing
+            }
+            (KeyCode::Right, m) if is_command_modifier(m) => {
+                self.col = self.lines[self.row].len();
+                ComposerEvent::Nothing
+            }
+            (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => {
+                self.move_word_left();
+                ComposerEvent::Nothing
+            }
+            (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => {
+                self.move_word_right();
                 ComposerEvent::Nothing
             }
             (KeyCode::Left, _) => {
@@ -442,6 +458,31 @@ impl Composer {
             self.row += 1;
             self.col = 0;
         }
+    }
+
+    fn move_word_left(&mut self) {
+        if self.col == 0 {
+            if self.row > 0 {
+                self.row -= 1;
+                self.col = self.lines[self.row].len();
+                self.move_word_left();
+            }
+            return;
+        }
+        self.col = previous_word_boundary(&self.lines[self.row], self.col);
+    }
+
+    fn move_word_right(&mut self) {
+        let line_len = self.lines[self.row].len();
+        if self.col == line_len {
+            if self.row + 1 < self.lines.len() {
+                self.row += 1;
+                self.col = 0;
+                self.move_word_right();
+            }
+            return;
+        }
+        self.col = next_word_boundary(&self.lines[self.row], self.col);
     }
 
     fn move_up_intra(&mut self) -> bool {
@@ -624,6 +665,46 @@ fn clamp_to_char_boundary(s: &str, byte: usize) -> usize {
         b -= 1;
     }
     b
+}
+
+fn should_ignore_modified_char(c: char, modifiers: KeyModifiers) -> bool {
+    if modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) {
+        return true;
+    }
+    modifiers.contains(KeyModifiers::ALT) && c.is_ascii_alphanumeric()
+}
+
+fn is_command_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SUPER) || modifiers.contains(KeyModifiers::META)
+}
+
+fn previous_word_boundary(s: &str, byte: usize) -> usize {
+    let before = &s[..byte];
+    let without_trailing_space = before.trim_end_matches(char::is_whitespace);
+    if without_trailing_space.is_empty() {
+        return 0;
+    }
+    without_trailing_space
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0)
+}
+
+fn next_word_boundary(s: &str, byte: usize) -> usize {
+    let after = &s[byte..];
+    let first_non_space = after
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(i, _)| i)
+        .unwrap_or(after.len());
+    let word_start = byte + first_non_space;
+    s[word_start..]
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace())
+        .map(|(i, _)| word_start + i)
+        .unwrap_or(s.len())
 }
 
 #[cfg(test)]
@@ -854,5 +935,55 @@ mod tests {
         let mut c = typed("@");
         assert!(c.replace_active_at_token("Cargo.toml"));
         assert_eq!(c.text(), "Cargo.toml ");
+    }
+
+    #[test]
+    fn altgr_punctuation_inserts_printable_characters() {
+        let mut c = Composer::new();
+        c.handle_key(KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+
+        assert_eq!(c.text(), "@");
+        let (pos, tok) = c.current_at_token().expect("should detect");
+        assert_eq!(pos, 0);
+        assert_eq!(tok, "");
+    }
+
+    #[test]
+    fn alt_letter_shortcuts_still_do_not_insert_text() {
+        let mut c = Composer::new();
+        c.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn option_arrows_move_by_word() {
+        let mut c = typed("hello world");
+
+        c.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(c.col, "hello ".len());
+
+        c.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(c.col, 0);
+
+        c.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(c.col, "hello".len());
+
+        c.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(c.col, "hello world".len());
+    }
+
+    #[test]
+    fn command_arrows_move_to_line_edges() {
+        let mut c = typed("hello world");
+
+        c.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER));
+        assert_eq!(c.col, 0);
+
+        c.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER));
+        assert_eq!(c.col, "hello world".len());
     }
 }

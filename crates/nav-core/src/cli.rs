@@ -37,7 +37,7 @@ pub struct Args {
     pub codex_home: Option<PathBuf>,
 
     /// Maximum model/tool loop iterations.
-    #[arg(default_value_t = 8, long)]
+    #[arg(default_value_t = 10000, long)]
     pub max_turns: usize,
 
     /// Timeout for shell commands run by the bash tool.
