@@ -313,6 +313,9 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             | AgentEvent::PendingInputRemoved { .. }
             | AgentEvent::PendingInputCleared { .. }
             | AgentEvent::PendingInputDequeued { .. }
+            | AgentEvent::SubagentStarted { .. }
+            | AgentEvent::SubagentCompleted { .. }
+            | AgentEvent::SubagentFailed { .. }
             | AgentEvent::FileChange { .. }
             | AgentEvent::TurnDiff { .. }
             | AgentEvent::GitCheckpoint { .. }

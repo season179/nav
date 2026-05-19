@@ -88,6 +88,9 @@ fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
         AgentEvent::AssistantMessageDelta { .. }
         | AgentEvent::ToolCallStarted { .. }
         | AgentEvent::ToolCallOutput { .. }
+        | AgentEvent::SubagentStarted { .. }
+        | AgentEvent::SubagentCompleted { .. }
+        | AgentEvent::SubagentFailed { .. }
         | AgentEvent::FileChange { .. }
         | AgentEvent::TurnDiff { .. }
         | AgentEvent::GitCheckpoint { .. }

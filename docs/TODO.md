@@ -240,9 +240,29 @@ small slice earlier.
    - `--json-events` remains the raw backward-compatible debugging stream.
      `nav-desktop` now launches `--json-rpc` and its parser still accepts raw
      `AgentEvent` lines for legacy output.
-6. [ ] Revisit subagents only after the single-agent workflow is strong; Pi is
+6. [x] Revisit subagents only after the single-agent workflow is strong; Pi is
    daily-usable without them.
-   - Not started.
+   - Done in this work: root agents now get a `spawn_subagent` tool for
+     bounded helper-agent exploration/review. The helper runs the existing
+     `run_agent` loop with its own short context and returns a concise summary
+     as the parent tool result, so the parent remains responsible for
+     integration.
+   - Guardrails: worker agents get only `read_file`, `list_files`, and
+     `code_search`; `bash`, `edit_file`, `apply_patch`, and recursive
+     `spawn_subagent` are hidden from the worker tool schema and still blocked
+     if hallucinated. Worker transcripts are not persisted as standalone
+     sessions yet; parent transcripts persist `SubagentStarted`,
+     `SubagentCompleted`, and `SubagentFailed` lifecycle events.
+   - TUI renders subagent lifecycle rows, and NDJSON consumers get the same
+     stable event variants.
+   - Deferred outside this checklist item: parallel workers, subprocess /
+     worktree isolation, durable task-board orchestration, and editable worker
+     scopes.
+   - Verified with `cargo fmt --all -- --check`,
+     `cargo test -p nav-core -p nav-cli -p nav-tui` (7 nav-cli tests, 525
+     nav-core tests, 84 nav-tui unit tests, 11 composer tests, 26 snapshot
+     tests, plus doc-tests), and `cargo clippy -p nav-core -p nav-cli -p
+     nav-tui --all-targets -- -D warnings`.
 
 ## Provider API Adapters
 

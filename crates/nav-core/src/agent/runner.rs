@@ -21,7 +21,9 @@ use crate::git_diff;
 use crate::mutation::PatchApplyStatus;
 use crate::permissions::approval::ApprovalRequest;
 use crate::permissions::protected::is_protected_read;
-use crate::permissions::{ApprovalReason, ReviewDecision};
+use crate::permissions::{
+    ApprovalReason, AskForApproval, ReviewDecision, SandboxPolicy, SessionAllowlist,
+};
 use crate::project::ProjectContext;
 use crate::responses::{self, ResponseCollector, ResponsesError};
 use crate::session::{SessionId, SessionStore};
@@ -356,7 +358,43 @@ pub async fn run_agent_with_control(
     skills: &Catalog,
     context: Option<&ProjectContext>,
     permissions: PermissionContext,
+    controls: TurnControls,
+) -> Result<()> {
+    run_agent_inner(
+        transport,
+        args,
+        cwd,
+        prompt,
+        display_prompt,
+        attachments,
+        events,
+        session,
+        initial_input,
+        skills,
+        context,
+        permissions,
+        controls,
+        responses::ResponseBodyOptions::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_inner(
+    transport: &dyn ResponsesTransport,
+    args: &Args,
+    cwd: &Path,
+    prompt: &str,
+    display_prompt: Option<&str>,
+    attachments: Vec<UserAttachment>,
+    events: UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    initial_input: Option<Vec<Value>>,
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+    permissions: PermissionContext,
     mut controls: TurnControls,
+    options: responses::ResponseBodyOptions,
 ) -> Result<()> {
     let mut input = initial_input.unwrap_or_default();
 
@@ -466,7 +504,8 @@ pub async fn run_agent_with_control(
                 anyhow!("stopped after {} tool turns", args.max_turns),
             );
         }
-        let body = responses::response_body(args, cwd, &input, skills, context);
+        let body =
+            responses::response_body_with_options(args, cwd, &input, skills, context, options);
         let mut stream = match transport.create(body, events.clone()).await {
             Ok(stream) => stream,
             Err(err) => return fail(&events, session, err),
@@ -572,17 +611,39 @@ pub async fn run_agent_with_control(
 
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
-            let result = tools::run_tool(
-                cwd,
-                skills,
-                args.bash_timeout_secs,
-                &permissions,
-                &call_id,
-                &tool_name,
-                tool_arguments.clone(),
-                Some(&events),
-            )
-            .await;
+            let result = if tool_name == tools::SPAWN_SUBAGENT_TOOL && options.include_subagents {
+                Ok(run_subagent_tool(
+                    transport,
+                    args,
+                    cwd,
+                    skills,
+                    context,
+                    permissions.clone(),
+                    &events,
+                    session,
+                    &call_id,
+                    &tool_arguments,
+                )
+                .await)
+            } else if !options.allows_tool(&tool_name) {
+                Ok(blocked_tool_outcome(
+                    &tool_name,
+                    "tool is not available in this agent scope",
+                    "agent_tool_scope",
+                ))
+            } else {
+                tools::run_tool(
+                    cwd,
+                    skills,
+                    args.bash_timeout_secs,
+                    &permissions,
+                    &call_id,
+                    &tool_name,
+                    tool_arguments.clone(),
+                    Some(&events),
+                )
+                .await
+            };
             let (output_text, is_error, aborted, mutation, failed_mutation_summary) = match result {
                 Ok(outcome) => {
                     if let Some(blocked) = outcome.blocked {
@@ -754,6 +815,200 @@ fn drain_steering(
         );
     }
     drained
+}
+
+const SUBAGENT_MAX_TURNS: usize = 8;
+
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_tool(
+    transport: &dyn ResponsesTransport,
+    args: &Args,
+    cwd: &Path,
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+    permissions: PermissionContext,
+    parent_events: &UnboundedSender<AgentEvent>,
+    parent_session: Option<&SessionBinding<'_>>,
+    call_id: &str,
+    input: &Value,
+) -> tools::ToolOutcome {
+    let Some(task) = input.get("task").and_then(Value::as_str).map(str::trim) else {
+        return error_tool_outcome("tool error: missing string input field `task`");
+    };
+    if task.is_empty() {
+        return error_tool_outcome("tool error: `task` must not be empty");
+    }
+
+    let label = input
+        .get("label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    emit(
+        parent_events,
+        parent_session,
+        AgentEvent::SubagentStarted {
+            id: call_id.to_string(),
+            label: label.clone(),
+            task: task.to_string(),
+        },
+    );
+
+    let mut subagent_args = args.clone();
+    subagent_args.max_turns = subagent_args.max_turns.clamp(1, SUBAGENT_MAX_TURNS);
+    subagent_args.auto_compact_token_limit = 0;
+
+    let worker_prompt = subagent_prompt(label.as_deref(), task);
+    let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let worker_result = Box::pin(run_agent_inner(
+        transport,
+        &subagent_args,
+        cwd,
+        &worker_prompt,
+        None,
+        Vec::new(),
+        worker_tx,
+        None,
+        None,
+        skills,
+        context,
+        subagent_permissions(permissions),
+        TurnControls::default(),
+        responses::ResponseBodyOptions::read_only(),
+    ))
+    .await;
+
+    let mut worker_events = Vec::new();
+    while let Some(event) = worker_rx.recv().await {
+        worker_events.push(event);
+    }
+
+    match worker_result {
+        Ok(()) => {
+            if let Some(summary) = final_subagent_summary(&worker_events) {
+                let bounded = bound(summary, TruncateMode::Head);
+                emit(
+                    parent_events,
+                    parent_session,
+                    AgentEvent::SubagentCompleted {
+                        id: call_id.to_string(),
+                        summary: bounded.clone(),
+                    },
+                );
+                text_tool_outcome(format!(
+                    "subagent {} completed:\n{}",
+                    subagent_display_name(call_id, label.as_deref()),
+                    bounded
+                ))
+            } else {
+                let message = "subagent finished without a final assistant message".to_string();
+                emit_subagent_failed(parent_events, parent_session, call_id, &message);
+                error_tool_outcome(format!("tool error: {message}"))
+            }
+        }
+        Err(err) => {
+            let message =
+                final_subagent_error(&worker_events).unwrap_or_else(|| format!("{err:#}"));
+            emit_subagent_failed(parent_events, parent_session, call_id, &message);
+            error_tool_outcome(format!("tool error: subagent failed: {message}"))
+        }
+    }
+}
+
+fn text_tool_outcome(output: impl Into<String>) -> tools::ToolOutcome {
+    tools::ToolOutcome {
+        output: output.into(),
+        is_error: false,
+        blocked: None,
+        aborted: false,
+        mutation: None,
+    }
+}
+
+fn error_tool_outcome(output: impl Into<String>) -> tools::ToolOutcome {
+    tools::ToolOutcome {
+        output: output.into(),
+        is_error: true,
+        blocked: None,
+        aborted: false,
+        mutation: None,
+    }
+}
+
+fn blocked_tool_outcome(name: &str, reason: &str, rule: &str) -> tools::ToolOutcome {
+    tools::ToolOutcome {
+        output: format!("tool {name} blocked: {reason}"),
+        is_error: true,
+        blocked: Some(tools::BlockedTool {
+            rule: rule.to_string(),
+            reason: reason.to_string(),
+        }),
+        aborted: false,
+        mutation: None,
+    }
+}
+
+fn subagent_prompt(label: Option<&str>, task: &str) -> String {
+    let label_line = label
+        .map(|value| format!("Label: {value}\n"))
+        .unwrap_or_default();
+    format!(
+        "You are a focused nav subagent.\n\
+         {label_line}\
+         Work independently on the task below. You may inspect files with \
+         read_file, list_files, and code_search. You cannot edit files, run \
+         shell commands, request approvals, or spawn more agents. Return a \
+         concise final summary with findings, files checked, and remaining \
+         uncertainty.\n\n\
+         Task:\n{task}"
+    )
+}
+
+fn subagent_permissions(mut permissions: PermissionContext) -> PermissionContext {
+    permissions.policy = AskForApproval::Never;
+    permissions.sandbox_policy = SandboxPolicy::ReadOnly;
+    permissions.session_allowlist = SessionAllowlist::default();
+    permissions
+}
+
+fn final_subagent_summary(events: &[AgentEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::AssistantMessageDone { text } if !text.trim().is_empty() => {
+            Some(text.trim().to_string())
+        }
+        _ => None,
+    })
+}
+
+fn final_subagent_error(events: &[AgentEvent]) -> Option<String> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::Error { message } => Some(message.clone()),
+        _ => None,
+    })
+}
+
+fn emit_subagent_failed(
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    id: &str,
+    message: &str,
+) {
+    emit(
+        events,
+        session,
+        AgentEvent::SubagentFailed {
+            id: id.to_string(),
+            message: message.to_string(),
+        },
+    );
+}
+
+fn subagent_display_name(id: &str, label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!("{label} ({id})"),
+        None => id.to_string(),
+    }
 }
 
 fn emit_turn_aborted(
@@ -1007,7 +1262,14 @@ async fn run_compaction_turn(
         "content": SUMMARIZATION_PROMPT,
     }));
 
-    let body = responses::response_body(args, cwd, &compaction_input, skills, context);
+    let body = responses::response_body_with_options(
+        args,
+        cwd,
+        &compaction_input,
+        skills,
+        context,
+        responses::ResponseBodyOptions::read_only(),
+    );
     let stream_result = transport.create(body, events.clone()).await;
     let mut stream = match stream_result {
         Ok(stream) => stream,
@@ -1054,7 +1316,14 @@ async fn run_compaction_turn(
                         dropped_pairs: dropped,
                     },
                 );
-                let body = responses::response_body(args, cwd, &compaction_input, skills, context);
+                let body = responses::response_body_with_options(
+                    args,
+                    cwd,
+                    &compaction_input,
+                    skills,
+                    context,
+                    responses::ResponseBodyOptions::read_only(),
+                );
                 stream = match transport.create(body, events.clone()).await {
                     Ok(stream) => stream,
                     Err(err) => {

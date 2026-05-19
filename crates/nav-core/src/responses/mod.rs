@@ -20,7 +20,11 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 pub(crate) use collector::ResponseCollector;
 pub use parser::{ToolCall, into_raw_output, process_response};
 pub(crate) use parser::{assistant_text, function_calls_from, turn_usage_from};
-pub(crate) use request::{InstructionSectionKind, instruction_sections, response_body};
+#[cfg(test)]
+pub(crate) use request::response_body;
+pub(crate) use request::{
+    InstructionSectionKind, ResponseBodyOptions, instruction_sections, response_body_with_options,
+};
 pub use retry::RetryPolicy;
 
 /// Errors yielded by a `ResponsesTransport` stream.
