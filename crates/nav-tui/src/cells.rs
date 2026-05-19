@@ -1,6 +1,6 @@
 use nav_core::{
     CompactionTrigger, FileChangeSummary, FileDiffSummary, PatchApplyStatus, PendingInputMode,
-    SessionSummary, SessionTreeNode, TranscriptHit, TurnDiff,
+    SessionSummary, SessionTreeNode, TranscriptHit, TurnDiff, layout_session_tree,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -265,7 +265,7 @@ impl HistoryCell for SessionListCell {
 
 fn session_list_body(sessions: &[SessionSummary]) -> String {
     let any_parent = sessions.iter().any(|s| s.parent_id.is_some());
-    let layout = if any_parent {
+    let layout: Vec<(usize, &SessionSummary)> = if any_parent {
         layout_session_tree(sessions)
     } else {
         sessions.iter().map(|s| (0usize, s)).collect()
@@ -296,39 +296,6 @@ fn session_list_body(sessions: &[SessionSummary]) -> String {
         parts.push(format!("{indent}  {title}"));
     }
     parts.join("\n")
-}
-
-fn layout_session_tree(sessions: &[SessionSummary]) -> Vec<(usize, &SessionSummary)> {
-    use std::collections::{HashMap, HashSet};
-    let ids: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-    let mut children_by_parent: HashMap<&str, Vec<&SessionSummary>> = HashMap::new();
-    let mut roots: Vec<&SessionSummary> = Vec::new();
-    for summary in sessions {
-        match summary.parent_id.as_deref() {
-            Some(parent) if ids.contains(parent) => {
-                children_by_parent.entry(parent).or_default().push(summary);
-            }
-            _ => roots.push(summary),
-        }
-    }
-    let mut out = Vec::new();
-    fn walk<'a>(
-        node: &'a SessionSummary,
-        depth: usize,
-        out: &mut Vec<(usize, &'a SessionSummary)>,
-        children_by_parent: &HashMap<&'a str, Vec<&'a SessionSummary>>,
-    ) {
-        out.push((depth, node));
-        if let Some(children) = children_by_parent.get(node.id.as_str()) {
-            for child in children {
-                walk(child, depth + 1, out, children_by_parent);
-            }
-        }
-    }
-    for root in roots {
-        walk(root, 0, &mut out, &children_by_parent);
-    }
-    out
 }
 
 pub struct SessionNoticeCell {

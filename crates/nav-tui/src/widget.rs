@@ -57,6 +57,15 @@ impl ChatWidget {
         self.push_cell(SessionNoticeCell::new(label, message));
     }
 
+    /// Convenience for the (very common) "store call failed, surface it as an
+    /// error cell" pattern in `app.rs`. Uses the `{err:#}` anyhow chain
+    /// formatter so context isn't dropped on its way to the scrollback.
+    pub fn push_err(&mut self, err: anyhow::Error) {
+        self.ingest(AgentEvent::Error {
+            message: format!("{err:#}"),
+        });
+    }
+
     pub fn push_session_tree(&mut self, nodes: Vec<SessionTreeNode>) {
         self.cells.push(Box::new(SessionTreeCell::new(nodes)));
     }

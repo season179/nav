@@ -9,7 +9,8 @@ use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
     SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, agent, auth,
     cli::{Args, CliCommand, CliExportFormat, SessionsAction, sandbox_policy_from_args},
-    discover_skills, doctor, load_project_context, models, rebuild_responses_input, shorten_home,
+    discover_skills, doctor, layout_session_tree, load_project_context, models,
+    rebuild_responses_input, shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -400,7 +401,7 @@ fn list_sessions_command(args: &Args) -> Result<()> {
         "{:<28}  {:<12}  {:<40}  {:<20}  {:>12}  {:>12}  labels",
         "id", "updated_at", "cwd", "model", "tokens_total", "cost"
     );
-    let rows = layout_session_rows(summaries);
+    let rows = layout_session_tree(&summaries);
     for (indent, summary) in rows {
         let id_field = format!("{}{}", "  ".repeat(indent), summary.id);
         let labels = if summary.labels.is_empty() {
@@ -415,58 +416,11 @@ fn list_sessions_command(args: &Args) -> Result<()> {
             truncate(&summary.cwd, 40),
             truncate(&summary.model, 20),
             summary.tokens_input + summary.tokens_output,
-            format_cost(&summary),
+            format_cost(summary),
             labels,
         );
     }
     Ok(())
-}
-
-/// Group sessions so children sit immediately after their parent when the
-/// parent is also in the result set; otherwise fall back to the original
-/// `updated_at DESC` order. Returns `(indent_depth, summary)` pairs.
-fn layout_session_rows(summaries: Vec<SessionSummary>) -> Vec<(usize, SessionSummary)> {
-    use std::collections::HashMap;
-    let ids: std::collections::HashSet<String> = summaries.iter().map(|s| s.id.clone()).collect();
-    let mut children_by_parent: HashMap<String, Vec<SessionSummary>> = HashMap::new();
-    let mut roots: Vec<SessionSummary> = Vec::new();
-    for summary in summaries {
-        match summary.parent_id.as_deref() {
-            Some(parent) if ids.contains(parent) => {
-                children_by_parent
-                    .entry(parent.to_string())
-                    .or_default()
-                    .push(summary);
-            }
-            _ => roots.push(summary),
-        }
-    }
-    let mut out = Vec::new();
-    fn walk(
-        node: SessionSummary,
-        depth: usize,
-        out: &mut Vec<(usize, SessionSummary)>,
-        children_by_parent: &mut std::collections::HashMap<String, Vec<SessionSummary>>,
-    ) {
-        let id = node.id.clone();
-        out.push((depth, node));
-        if let Some(children) = children_by_parent.remove(&id) {
-            for child in children {
-                walk(child, depth + 1, out, children_by_parent);
-            }
-        }
-    }
-    for root in roots {
-        walk(root, 0, &mut out, &mut children_by_parent);
-    }
-    // Any orphans left over (parent not in result set after filtering) get
-    // appended at depth 0 so nothing is silently dropped.
-    let mut leftover: Vec<SessionSummary> = children_by_parent.into_values().flatten().collect();
-    leftover.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
-    for summary in leftover {
-        out.push((0, summary));
-    }
-    out
 }
 
 fn short_id(id: &str) -> String {

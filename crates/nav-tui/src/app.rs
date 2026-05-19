@@ -418,9 +418,7 @@ pub async fn run(
                                 chat.scroll_to_bottom();
                                 chat.push_session_list(summaries);
                             }
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         }
                     }
                     AppEvent::Resume { query: Some(query) } => {
@@ -450,9 +448,7 @@ pub async fn run(
                                     format!("Resumed session {session_id}"),
                                 );
                             }
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         }
                     }
                     AppEvent::Resume { query: None } => {
@@ -470,9 +466,7 @@ pub async fn run(
                                 "name",
                                 format!("Session name set to \"{}\"", name.trim()),
                             ),
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         }
                     }
                     AppEvent::Export { path } => {
@@ -481,9 +475,7 @@ pub async fn run(
                                 "export",
                                 format!("Wrote transcript to {}", path.display()),
                             ),
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         }
                     }
                     AppEvent::ForkSession { at } => {
@@ -504,9 +496,7 @@ pub async fn run(
                                         .unwrap_or_else(|| "now".to_string()),
                                 ),
                             ),
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         }
                     }
                     AppEvent::ShowTree => match resolve_tree_root(&store, &session_id) {
@@ -515,13 +505,9 @@ pub async fn run(
                                 chat.scroll_to_bottom();
                                 chat.push_session_tree(nodes);
                             }
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         },
-                        Err(err) => chat.ingest(AgentEvent::Error {
-                            message: format!("{err:#}"),
-                        }),
+                        Err(err) => chat.push_err(err),
                     },
                     AppEvent::AddLabel { label } => {
                         match store.add_label(&session_id, &label) {
@@ -529,9 +515,7 @@ pub async fn run(
                                 "label",
                                 format!("Added label \"{}\"", label.trim()),
                             ),
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         }
                     }
                     AppEvent::RemoveLabel { label } => {
@@ -540,9 +524,7 @@ pub async fn run(
                                 "unlabel",
                                 format!("Removed label \"{}\"", label.trim()),
                             ),
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         }
                     }
                     AppEvent::FindTranscript { query } => {
@@ -551,9 +533,7 @@ pub async fn run(
                                 chat.scroll_to_bottom();
                                 chat.push_transcript_hits(query, hits);
                             }
-                            Err(err) => chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            }),
+                            Err(err) => chat.push_err(err),
                         }
                     }
                     AppEvent::SlashError { message } => {
@@ -622,9 +602,7 @@ pub async fn run(
                             &permissions,
                             &mut chat,
                         ) {
-                            chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
-                            });
+                            chat.push_err(err);
                         }
                     }
                 }
@@ -801,9 +779,7 @@ fn start_next_follow_up(
         permissions,
         chat,
     ) {
-        chat.ingest(AgentEvent::Error {
-            message: format!("{err:#}"),
-        });
+        chat.push_err(err);
     }
 }
 
@@ -1008,15 +984,14 @@ fn open_session_picker(
                 .collect();
             pane.open_session_picker(entries);
         }
-        Err(err) => chat.ingest(AgentEvent::Error {
-            message: format!("{err:#}"),
-        }),
+        Err(err) => chat.push_err(err),
     }
 }
 
 /// Walk `parent_id` upward from `session_id` until we land on a row whose
 /// parent is `None` (or the chain leaves the local db). Used by `/tree` so a
-/// fork can still see its siblings and ancestors.
+/// fork can still see its siblings and ancestors. Uses `session_parent_id`
+/// rather than `session_summary` so each hop is one SELECT instead of two.
 fn resolve_tree_root(store: &SessionStore, session_id: &str) -> Result<String> {
     let mut current = session_id.to_string();
     let mut guard = 0u32;
@@ -1025,10 +1000,7 @@ fn resolve_tree_root(store: &SessionStore, session_id: &str) -> Result<String> {
         if guard > 1024 {
             anyhow::bail!("session tree exceeds 1024 ancestors at {current}");
         }
-        let Some(summary) = store.session_summary(&current)? else {
-            anyhow::bail!("session not found: {current}");
-        };
-        match summary.parent_id {
+        match store.session_parent_id(&current)? {
             Some(parent) => current = parent,
             None => return Ok(current),
         }

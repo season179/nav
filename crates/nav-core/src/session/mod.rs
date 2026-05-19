@@ -114,6 +114,54 @@ pub struct SessionTreeNode {
     pub depth: u32,
 }
 
+/// Group `summaries` so each child sits immediately after its parent when the
+/// parent is also in the input slice; otherwise treat the row as a root.
+/// Returns `(depth, summary)` pairs with `depth = 0` for roots and orphans —
+/// orphans appear at the end so nothing is silently dropped.
+///
+/// Shared between the CLI's `--list-sessions` formatter and the TUI's
+/// `/sessions` cell so the two surfaces never drift on indentation rules.
+pub fn layout_session_tree(summaries: &[SessionSummary]) -> Vec<(usize, &SessionSummary)> {
+    use std::collections::{HashMap, HashSet};
+    let ids: HashSet<&str> = summaries.iter().map(|s| s.id.as_str()).collect();
+    let mut children_by_parent: HashMap<&str, Vec<&SessionSummary>> = HashMap::new();
+    let mut roots: Vec<&SessionSummary> = Vec::new();
+    for summary in summaries {
+        match summary.parent_id.as_deref() {
+            Some(parent) if ids.contains(parent) => {
+                children_by_parent.entry(parent).or_default().push(summary);
+            }
+            _ => roots.push(summary),
+        }
+    }
+    fn walk<'a>(
+        node: &'a SessionSummary,
+        depth: usize,
+        out: &mut Vec<(usize, &'a SessionSummary)>,
+        children_by_parent: &mut HashMap<&'a str, Vec<&'a SessionSummary>>,
+    ) {
+        out.push((depth, node));
+        if let Some(children) = children_by_parent.remove(node.id.as_str()) {
+            for child in children {
+                walk(child, depth + 1, out, children_by_parent);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(summaries.len());
+    for root in roots {
+        walk(root, 0, &mut out, &mut children_by_parent);
+    }
+    // Anything still in `children_by_parent` is an orphan whose parent isn't
+    // visible (e.g. cwd-filtered out). Append at depth 0, newest first, so
+    // the row count matches the input length.
+    let mut leftover: Vec<&SessionSummary> = children_by_parent.into_values().flatten().collect();
+    leftover.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
+    for summary in leftover {
+        out.push((0, summary));
+    }
+    out
+}
+
 /// Transcript export formats supported by both the TUI `/export` command and
 /// the headless `nav export` command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -706,7 +754,9 @@ impl SessionStore {
         // disjunction so the index on `(cwd, updated_at DESC)` is still used
         // when a path is supplied.
         let cwd_str: Option<String> = cwd.map(|p| p.to_string_lossy().into_owned());
-        let mut stmt = conn.prepare(SESSION_SUMMARY_QUERY_WHERE_CWD)?;
+        let mut stmt = conn.prepare(&summary_query(
+            "WHERE ?1 IS NULL OR cwd = ?1 ORDER BY updated_at DESC",
+        ))?;
         let rows = stmt.query_map(params![cwd_str], summary_from_row)?;
         let mut summaries = Vec::new();
         for row in rows {
@@ -717,11 +767,26 @@ impl SessionStore {
         Ok(summaries)
     }
 
+    /// Return the `parent_id` of `session_id` if it exists. `Ok(None)` covers
+    /// both "session has no parent" and "session does not exist" — callers
+    /// walking ancestors don't usually need to distinguish those.
+    pub fn session_parent_id(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let parent: Option<Option<String>> = conn
+            .query_row(
+                "SELECT parent_id FROM session WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(parent.flatten())
+    }
+
     /// Fetch a single [`SessionSummary`] by canonical ULID. Returns `None`
     /// when the session does not exist.
     pub fn session_summary(&self, session_id: &str) -> Result<Option<SessionSummary>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(SESSION_SUMMARY_QUERY_BY_ID)?;
+        let mut stmt = conn.prepare(&summary_query("WHERE id = ?1 LIMIT 1"))?;
         let mut rows = stmt.query_map(params![session_id], summary_from_row)?;
         let summary = match rows.next() {
             Some(row) => Some(row?),
@@ -836,7 +901,9 @@ impl SessionStore {
     /// Direct children of `parent_id`, ordered by creation time ascending.
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<SessionSummary>> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(SESSION_SUMMARY_QUERY_BY_PARENT)?;
+        let mut stmt = conn.prepare(&summary_query(
+            "WHERE parent_id = ?1 ORDER BY created_at ASC",
+        ))?;
         let rows = stmt.query_map(params![parent_id], summary_from_row)?;
         let mut summaries: Vec<SessionSummary> = rows.collect::<rusqlite::Result<_>>()?;
         drop(stmt);
@@ -846,31 +913,47 @@ impl SessionStore {
 
     /// Flat depth-ordered list of every descendant of `root_id`, including
     /// the root itself at depth 0. Used by `/tree` and `nav sessions tree`.
+    ///
+    /// One recursive CTE collects `(id, depth)` for the whole subtree, then a
+    /// single join against the summary projection rehydrates each row; one
+    /// batched `attach_labels` populates labels in one more query. That keeps
+    /// the cost flat at three prepared statements regardless of tree size.
     pub fn walk_tree(&self, root_id: &str) -> Result<Vec<SessionTreeNode>> {
-        let root_summary = self
-            .session_summary(root_id)?
-            .ok_or_else(|| anyhow::anyhow!("session not found: {root_id}"))?;
-        let mut out = vec![SessionTreeNode {
-            summary: root_summary,
-            depth: 0,
-        }];
-        let mut frontier: Vec<(String, u32)> = vec![(root_id.to_string(), 0)];
-        while let Some((parent, depth)) = frontier.pop() {
-            let children = self.list_children(&parent)?;
-            for child in children {
-                let child_id = child.id.clone();
-                out.push(SessionTreeNode {
-                    summary: child,
-                    depth: depth + 1,
-                });
-                frontier.push((child_id, depth + 1));
-            }
+        let conn = self.lock();
+        let sql = format!(
+            "WITH RECURSIVE tree(id, depth) AS (
+                 SELECT id, 0 FROM session WHERE id = ?1
+                 UNION ALL
+                 SELECT s.id, tree.depth + 1
+                 FROM session AS s
+                 JOIN tree ON s.parent_id = tree.id
+             )
+             SELECT {SESSION_SUMMARY_COLUMNS}, tree.depth AS tree_depth
+             FROM session
+             JOIN tree ON tree.id = session.id
+             ORDER BY tree.depth ASC, session.created_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        // The CTE appends `tree_depth` after the 18 summary columns.
+        let rows = stmt.query_map(params![root_id], |row| {
+            let summary = summary_from_row(row)?;
+            let depth: i64 = row.get(18)?;
+            Ok(SessionTreeNode {
+                summary,
+                depth: depth.max(0) as u32,
+            })
+        })?;
+        let mut out: Vec<SessionTreeNode> = rows.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        if out.is_empty() {
+            anyhow::bail!("session not found: {root_id}");
         }
-        out.sort_by(|a, b| {
-            a.depth
-                .cmp(&b.depth)
-                .then_with(|| a.summary.created_at.cmp(&b.summary.created_at))
-        });
+        let mut summaries: Vec<SessionSummary> =
+            out.iter().map(|node| node.summary.clone()).collect();
+        attach_labels(&conn, &mut summaries)?;
+        for (node, summary) in out.iter_mut().zip(summaries) {
+            node.summary = summary;
+        }
         Ok(out)
     }
 
@@ -917,7 +1000,11 @@ impl SessionStore {
     pub fn list_by_label(&self, label: &str, cwd: Option<&Path>) -> Result<Vec<SessionSummary>> {
         let conn = self.lock();
         let cwd_str: Option<String> = cwd.map(|p| p.to_string_lossy().into_owned());
-        let mut stmt = conn.prepare(SESSION_SUMMARY_QUERY_BY_LABEL)?;
+        let mut stmt = conn.prepare(&summary_query(
+            "WHERE id IN (SELECT session_id FROM label WHERE label = ?1)
+               AND (?2 IS NULL OR cwd = ?2)
+             ORDER BY updated_at DESC",
+        ))?;
         let rows = stmt.query_map(params![label, cwd_str], summary_from_row)?;
         let mut summaries: Vec<SessionSummary> = rows.collect::<rusqlite::Result<_>>()?;
         drop(stmt);
@@ -939,51 +1026,35 @@ impl SessionStore {
         anyhow::ensure!(!trimmed.is_empty(), "search query cannot be empty");
         let conn = self.lock();
         let cap = (limit as i64).max(1);
+        let label_opt: Option<&str> = label;
+        // `?2 IS NULL OR session_id IN (...)` folds the unfiltered and
+        // label-filtered queries into one prepared statement; SQLite
+        // short-circuits the disjunction so the label index is still used
+        // when a label is supplied.
+        let mut stmt = conn.prepare(
+            "SELECT session_id, seq, kind,
+                    snippet(event_fts, 3, '[', ']', '…', 16) AS snippet
+             FROM event_fts
+             WHERE event_fts MATCH ?1
+               AND (?2 IS NULL
+                    OR session_id IN (SELECT session_id FROM label WHERE label = ?2))
+             ORDER BY rank, session_id, seq
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![trimmed, label_opt, cap], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
         let mut hits = Vec::new();
-        if let Some(label) = label {
-            let mut stmt = conn.prepare(
-                "SELECT f.session_id, f.seq, f.kind,
-                        snippet(event_fts, 3, '[', ']', '…', 16) AS snippet
-                 FROM event_fts AS f
-                 JOIN label AS l ON l.session_id = f.session_id
-                 WHERE event_fts MATCH ?1 AND l.label = ?2
-                 ORDER BY rank, f.session_id, f.seq
-                 LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(params![trimmed, label, cap], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            for row in rows {
-                let (session_id, seq, kind, snippet) = row?;
-                hits.push((session_id, seq, kind, snippet));
-            }
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT session_id, seq, kind,
-                        snippet(event_fts, 3, '[', ']', '…', 16) AS snippet
-                 FROM event_fts
-                 WHERE event_fts MATCH ?1
-                 ORDER BY rank, session_id, seq
-                 LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(params![trimmed, cap], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?;
-            for row in rows {
-                let (session_id, seq, kind, snippet) = row?;
-                hits.push((session_id, seq, kind, snippet));
-            }
+        for row in rows {
+            let (session_id, seq, kind, snippet) = row?;
+            hits.push((session_id, seq, kind, snippet));
         }
+        drop(stmt);
         drop(conn);
         let mut summary_cache: HashMap<String, SessionSummary> = HashMap::new();
         let mut out = Vec::with_capacity(hits.len());
@@ -1192,73 +1263,38 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
     Ok(false)
 }
 
-/// SQL fragment selecting every column [`summary_from_row`] reads, in order.
-/// Inlined into each query so the resulting strings remain `&'static str`
-/// without pulling in a const-concat helper.
-const SESSION_SUMMARY_QUERY_WHERE_CWD: &str =
-    "SELECT id, name, created_at, updated_at, cwd, provider, model,
-     tokens_input, tokens_output, tokens_input_cached, tokens_reasoning,
-     cost_micros_reported, turns_with_reported_cost, turns_total, cost_currency,
+/// Shared column list used by every `SessionSummary` query. The column order
+/// must stay in sync with [`summary_from_row`] (which reads by index).
+/// Every column is qualified with `session.` so the list is safe to embed
+/// inside a JOIN that introduces another table with overlapping column names
+/// (e.g. the `tree(id, depth)` CTE in [`walk_tree`]).
+const SESSION_SUMMARY_COLUMNS: &str =
+    "session.id, session.name, session.created_at, session.updated_at, session.cwd,
+     session.provider, session.model,
+     session.tokens_input, session.tokens_output, session.tokens_input_cached,
+     session.tokens_reasoning,
+     session.cost_micros_reported, session.turns_with_reported_cost, session.turns_total,
+     session.cost_currency,
      (
          SELECT data FROM event
          WHERE event.session_id = session.id AND kind = 'user_message'
          ORDER BY seq ASC
          LIMIT 1
      ) AS first_user_event,
-     parent_id,
-     (SELECT COUNT(*) FROM session AS child WHERE child.parent_id = session.id) AS child_count
-     FROM session
-     WHERE ?1 IS NULL OR cwd = ?1
-     ORDER BY updated_at DESC";
+     session.parent_id,
+     (SELECT COUNT(*) FROM session AS child WHERE child.parent_id = session.id) AS child_count";
 
-const SESSION_SUMMARY_QUERY_BY_ID: &str =
-    "SELECT id, name, created_at, updated_at, cwd, provider, model,
-     tokens_input, tokens_output, tokens_input_cached, tokens_reasoning,
-     cost_micros_reported, turns_with_reported_cost, turns_total, cost_currency,
-     (
-         SELECT data FROM event
-         WHERE event.session_id = session.id AND kind = 'user_message'
-         ORDER BY seq ASC
-         LIMIT 1
-     ) AS first_user_event,
-     parent_id,
-     (SELECT COUNT(*) FROM session AS child WHERE child.parent_id = session.id) AS child_count
-     FROM session
-     WHERE id = ?1
-     LIMIT 1";
-
-const SESSION_SUMMARY_QUERY_BY_PARENT: &str =
-    "SELECT id, name, created_at, updated_at, cwd, provider, model,
-     tokens_input, tokens_output, tokens_input_cached, tokens_reasoning,
-     cost_micros_reported, turns_with_reported_cost, turns_total, cost_currency,
-     (
-         SELECT data FROM event
-         WHERE event.session_id = session.id AND kind = 'user_message'
-         ORDER BY seq ASC
-         LIMIT 1
-     ) AS first_user_event,
-     parent_id,
-     (SELECT COUNT(*) FROM session AS child WHERE child.parent_id = session.id) AS child_count
-     FROM session
-     WHERE parent_id = ?1
-     ORDER BY created_at ASC";
-
-const SESSION_SUMMARY_QUERY_BY_LABEL: &str =
-    "SELECT id, name, created_at, updated_at, cwd, provider, model,
-     tokens_input, tokens_output, tokens_input_cached, tokens_reasoning,
-     cost_micros_reported, turns_with_reported_cost, turns_total, cost_currency,
-     (
-         SELECT data FROM event
-         WHERE event.session_id = session.id AND kind = 'user_message'
-         ORDER BY seq ASC
-         LIMIT 1
-     ) AS first_user_event,
-     parent_id,
-     (SELECT COUNT(*) FROM session AS child WHERE child.parent_id = session.id) AS child_count
-     FROM session
-     WHERE id IN (SELECT session_id FROM label WHERE label = ?1)
-       AND (?2 IS NULL OR cwd = ?2)
-     ORDER BY updated_at DESC";
+/// `SELECT <SESSION_SUMMARY_COLUMNS> FROM session ` (trailing space included
+/// so callers can append `WHERE …` directly).
+fn summary_query(suffix: &str) -> String {
+    let prefix_len = "SELECT  FROM session ".len() + SESSION_SUMMARY_COLUMNS.len();
+    let mut sql = String::with_capacity(prefix_len + suffix.len());
+    sql.push_str("SELECT ");
+    sql.push_str(SESSION_SUMMARY_COLUMNS);
+    sql.push_str(" FROM session ");
+    sql.push_str(suffix);
+    sql
+}
 
 fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
     let turns_total = row.get::<_, i64>(13)? as u64;

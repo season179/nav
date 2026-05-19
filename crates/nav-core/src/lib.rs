@@ -34,6 +34,6 @@ pub use responses::{OpenAiTransport, RetryPolicy};
 pub use session::{
     ExportFormat, PROVIDER_OPENAI_RESPONSES, ReportedCost, ResolveSessionError, SessionId,
     SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, export_events,
-    infer_export_format, resolved_db_path,
+    infer_export_format, layout_session_tree, resolved_db_path,
 };
 pub use skills::{Catalog, Skill, SkillScope, discover_skills};

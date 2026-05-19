@@ -1152,6 +1152,35 @@ fn walk_tree_returns_depth_ordered_descendants() {
 }
 
 #[test]
+fn fts_trigger_indexed_kinds_match_agent_event_kind_strings() {
+    // The v3 FTS triggers (event_fts_ai / event_fts_ad) hardcode three event
+    // kind strings. They must stay in lockstep with AgentEvent::kind() —
+    // otherwise renaming a variant silently breaks transcript search.
+    let user = AgentEvent::UserMessage {
+        text: "x".into(),
+        display_text: None,
+        attachments: Vec::new(),
+    };
+    let assistant_done = AgentEvent::AssistantMessageDone { text: "y".into() };
+    let assistant_delta = AgentEvent::AssistantMessageDelta { text: "z".into() };
+    assert_eq!(user.kind(), "user_message");
+    assert_eq!(assistant_done.kind(), "assistant_message_done");
+    assert_eq!(assistant_delta.kind(), "assistant_message_delta");
+
+    let triggers = include_str!("init.sql");
+    for kind in [
+        "'user_message'",
+        "'assistant_message_done'",
+        "'assistant_message_delta'",
+    ] {
+        assert!(
+            triggers.contains(kind),
+            "init.sql FTS triggers must list {kind} — keep them in sync with AgentEvent::kind()"
+        );
+    }
+}
+
+#[test]
 fn search_transcript_finds_phrase_across_sessions() {
     let (_dir, store) = open_temp_store();
     let cwd = Path::new("/proj");
