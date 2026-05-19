@@ -115,8 +115,9 @@ pub struct Args {
     pub auto_compact_token_limit: u64,
 
     /// Fraction of [`Args::auto_compact_token_limit`] at which automatic
-    /// compaction fires. Defaults to `0.85` (Codex behavior); must be in
-    /// `0.0..=1.0`.
+    /// compaction fires. Defaults to `1.0`, so the firing point lines up
+    /// exactly with the token limit (200K). Lower values pull the firing
+    /// point in earlier; must be in `0.0..=1.0`.
     #[arg(
         default_value_t = crate::agent::DEFAULT_AUTO_COMPACT_FRACTION,
         long,

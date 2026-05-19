@@ -46,16 +46,18 @@ Here is the summary produced by the other language model, use the information in
 /// Slash command users type into the composer to request compaction.
 pub const COMPACT_SLASH: &str = "/compact";
 
-/// Default automatic compaction threshold expressed as a fraction of the
-/// model's context window. When estimated tokens-in for the next turn cross
-/// `0.85 × context_window`, nav runs an automatic compaction before
-/// submitting. Configurable per-model via settings / CLI.
-pub const DEFAULT_AUTO_COMPACT_FRACTION: f32 = 0.85;
+/// Default automatic compaction threshold expressed as a fraction of
+/// [`DEFAULT_AUTO_COMPACT_TOKEN_LIMIT`]. The default fraction is `1.0`, so the
+/// threshold lines up exactly with the configured token limit (200K). Lower
+/// values pull the firing point in early; configurable per-run via settings /
+/// CLI.
+pub const DEFAULT_AUTO_COMPACT_FRACTION: f32 = 1.0;
 
-/// Conservative per-model context budget used when we have no reported
-/// `tokens_input` to lean on. Picked low enough to keep tests deterministic;
-/// real production runs read the value from `Args::auto_compact_token_limit`.
-pub const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT: u64 = 160_000;
+/// Default token budget that triggers automatic compaction. Combined with
+/// [`DEFAULT_AUTO_COMPACT_FRACTION`] this fires `should_auto_compact` at
+/// exactly 200_000 rolling input tokens. Configurable per-run via
+/// `Args::auto_compact_token_limit`.
+pub const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT: u64 = 200_000;
 
 /// How many trailing real user messages to keep model-visible alongside the
 /// summary. Mirrors Codex's behavior: the summary is followed by the recent
@@ -258,6 +260,31 @@ mod tests {
         let decision = should_auto_compact(90_000, 100_000, 0.85);
         assert!(decision.should_compact);
         assert_eq!(decision.threshold, 85_000);
+    }
+
+    #[test]
+    fn auto_compact_defaults_fire_at_200k() {
+        let below = should_auto_compact(
+            199_999,
+            DEFAULT_AUTO_COMPACT_TOKEN_LIMIT,
+            DEFAULT_AUTO_COMPACT_FRACTION,
+        );
+        assert!(
+            !below.should_compact,
+            "should not compact at 199_999 tokens with the configured defaults"
+        );
+        assert_eq!(below.threshold, 200_000);
+
+        let at = should_auto_compact(
+            200_000,
+            DEFAULT_AUTO_COMPACT_TOKEN_LIMIT,
+            DEFAULT_AUTO_COMPACT_FRACTION,
+        );
+        assert!(
+            at.should_compact,
+            "should compact at 200_000 tokens with the configured defaults"
+        );
+        assert_eq!(at.threshold, 200_000);
     }
 
     #[test]

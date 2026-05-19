@@ -491,6 +491,7 @@ mod tests {
     fn report_splits_startup_context_from_conversation() {
         let mut args = Args::test_default();
         args.auto_compact_token_limit = 10_000;
+        args.auto_compact_fraction = 0.85;
         let cwd = Path::new("/tmp/nav");
         let project = ProjectContext {
             context_files: vec![ContextFile {
