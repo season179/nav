@@ -10,7 +10,9 @@ use crate::permissions::ReviewDecision;
 /// A non-text input attached to a [`AgentEvent::UserMessage`]. Stored by path
 /// (workspace-relative) — the bytes are loaded by the transport at request
 /// time, so the session log doesn't bloat with base64. Resume rebuilds the
-/// same input shape from the stored paths.
+/// same input shape from the stored paths. The `kind` tag is part of the
+/// wire format, so adding a variant is backwards-compatible: an old session
+/// log full of `Image` rows still deserializes into the new enum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UserAttachment {
@@ -18,6 +20,11 @@ pub enum UserAttachment {
     /// always workspace-relative — the TUI relativizes / copies external
     /// paths into `<cwd>/.nav/clipboard/` before raising the event.
     Image { path: PathBuf },
+    /// Generic file attachment (text, source code, markdown, etc.) selected
+    /// via `@file` mention. Workspace-relative; bytes are loaded by the
+    /// transport at request time and emitted as an `input_text` part — only
+    /// UTF-8 decodable content is included.
+    File { path: PathBuf },
 }
 
 /// Provenance flag carried on every compaction lifecycle event so frontends can
@@ -373,6 +380,31 @@ mod tests {
                 "kind": "pending_input_cleared",
                 "ids": ["pending-1", "pending-2"]
             })
+        );
+    }
+
+    #[test]
+    fn user_attachment_file_variant_round_trips() {
+        let attach = UserAttachment::File {
+            path: "src/main.rs".into(),
+        };
+        let json = serde_json::to_value(&attach).unwrap();
+        assert_eq!(json, json!({"kind": "file", "path": "src/main.rs"}));
+        let parsed: UserAttachment = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, attach);
+    }
+
+    #[test]
+    fn user_attachment_image_rows_still_deserialize() {
+        // Backwards compatibility: an old session log row with `kind: "image"`
+        // must still parse after the File variant was added.
+        let parsed: UserAttachment =
+            serde_json::from_value(json!({"kind": "image", "path": "a.png"})).unwrap();
+        assert_eq!(
+            parsed,
+            UserAttachment::Image {
+                path: "a.png".into()
+            }
         );
     }
 

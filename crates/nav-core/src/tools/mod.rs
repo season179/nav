@@ -2,7 +2,7 @@ mod fs;
 mod patch;
 pub mod preflight;
 mod shell;
-mod truncate;
+pub mod truncate;
 
 use crate::mutation::MutationResult;
 use anyhow::{Result, anyhow};

@@ -3,7 +3,7 @@ use base64::Engine;
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -17,11 +17,21 @@ use crate::cli::Args;
 use crate::control::{PendingInput, PendingInputMode, TurnControls};
 use crate::git_diff;
 use crate::mutation::PatchApplyStatus;
+use crate::permissions::approval::ApprovalRequest;
+use crate::permissions::protected::is_protected_read;
+use crate::permissions::{ApprovalReason, ReviewDecision};
 use crate::project::ProjectContext;
 use crate::responses::{self, ResponseCollector, ResponsesError};
 use crate::session::{SessionId, SessionStore};
 use crate::skills::Catalog;
+use crate::tools::truncate::{TruncateMode, bound};
 use crate::tools::{self, PermissionContext};
+
+/// Tool name used in the [`AgentEvent::ToolCallApprovalRequest`] event when
+/// an `@file` attachment resolves to a protected path. Surfaces in the
+/// approval modal so the operator can tell a file-attachment read from a
+/// `read_file` tool call.
+const ATTACHMENT_READ_TOOL: &str = "attachment_read";
 
 /// Stream of raw `Responses` API events yielded by a transport.
 ///
@@ -98,8 +108,11 @@ fn user_message_event(
 /// Build the `content` part of a Responses API user message. Plain text turns
 /// stay as a single string (the historical shape); when attachments are
 /// present, return an array of typed content parts so the Responses API can
-/// see `input_text` alongside `input_image`. Images that fail to load are
-/// silently dropped — a bad path shouldn't block the turn.
+/// see `input_text` alongside `input_image`. Attachments that fail to load
+/// (path escapes workspace, unreadable file, non-UTF-8 file body) are
+/// dropped — a bad path shouldn't block the turn. Non-UTF-8 file
+/// attachments and skipped binary content surface as inline text notes
+/// rather than silent omissions so the model knows the path was requested.
 pub(super) fn build_user_content(
     prompt: &str,
     attachments: &[UserAttachment],
@@ -120,19 +133,26 @@ pub(super) fn build_user_content(
                     }));
                 }
             }
+            UserAttachment::File { path } => {
+                if let Some(text) = load_file_attachment(cwd, path) {
+                    parts.push(json!({
+                        "type": "input_text",
+                        "text": text,
+                    }));
+                }
+            }
         }
     }
     Value::Array(parts)
 }
 
-fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
-    // Defense-in-depth: nav's workspace contract says reads/writes for
-    // user-provided paths stay inside the workspace root. The TUI normally
-    // relativizes / copies pastes into <cwd>/.nav/clipboard/ before queuing
-    // them, but a path with `..` segments or a symlink that resolves outside
-    // would otherwise let us silently base64 arbitrary files (e.g.
-    // ~/.ssh/id_rsa) into the Responses request. Canonicalize both sides and
-    // require containment before reading.
+/// Canonicalize `rel` against `cwd` and require workspace containment.
+/// Shared by image and file attachments: nav's workspace contract says
+/// user-provided paths must resolve under the workspace root. A `..`-laden
+/// path or a symlink that escapes would otherwise let us silently include
+/// arbitrary files (e.g. `~/.ssh/id_rsa`) in the request. Returns `None`
+/// if the path can't be canonicalized or escapes the workspace.
+fn resolve_workspace_path(cwd: &Path, rel: &Path) -> Option<PathBuf> {
     let abs = if rel.is_absolute() {
         rel.to_path_buf()
     } else {
@@ -143,6 +163,11 @@ fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
     if !canonical.starts_with(&cwd_canonical) {
         return None;
     }
+    Some(canonical)
+}
+
+fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
+    let canonical = resolve_workspace_path(cwd, rel)?;
     let bytes = std::fs::read(&canonical).ok()?;
     let ext = canonical
         .extension()
@@ -157,6 +182,135 @@ fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
     };
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     Some(format!("data:{mime};base64,{encoded}"))
+}
+
+/// Render a `File` attachment as a fenced block the model can read. UTF-8
+/// only — binary bodies fall back to a note so the model doesn't see mojibake
+/// or random base64 garbage. Truncation uses the same dual cap as tool
+/// outputs (50 KB / 2000 lines, head-only) so a 10 MB file doesn't blow up
+/// the request. Symlink reaches into protected reads (where the raw
+/// workspace-relative path looked fine, but the canonical path lands on a
+/// secret) are refused here even after gate approval, matching the
+/// read_file tool's symlink-bypass check.
+fn load_file_attachment(cwd: &Path, rel: &Path) -> Option<String> {
+    let rel_display = rel.display().to_string();
+    let canonical = resolve_workspace_path(cwd, rel)?;
+    if is_protected_read(&canonical) && !is_protected_read(rel) {
+        return Some(format!(
+            "<attached file: {rel_display}>\n[refused: path resolves via symlink to a protected secret]\n</attached>",
+        ));
+    }
+    let bytes = std::fs::read(&canonical).ok()?;
+    let body = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            return Some(format!(
+                "<attached file: {rel_display}>\n[skipped: file is not valid UTF-8 ({} bytes)]\n</attached>",
+                bytes.len()
+            ));
+        }
+    };
+    let bounded = bound(body, TruncateMode::Head);
+    Some(format!(
+        "<attached file: {rel_display}>\n{bounded}\n</attached>",
+    ))
+}
+
+/// For every `File` attachment that matches a [`is_protected_read`] glob,
+/// fire an approval request through the same gate `read_file` uses. The
+/// returned vector keeps only attachments that survived (approved + non-
+/// protected pass through). If any approval comes back as `Abort`, the
+/// second tuple element carries the abort reason — `run_agent` translates
+/// that into a `TurnAborted` event and returns without sending the turn,
+/// which mirrors how the tool dispatch handles a user-abort decision.
+async fn gate_protected_attachments(
+    attachments: Vec<UserAttachment>,
+    permissions: &PermissionContext,
+    cwd: &Path,
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+) -> (Vec<UserAttachment>, Option<&'static str>) {
+    if !attachments.iter().any(|a| match a {
+        UserAttachment::File { path } => is_protected_read(path),
+        UserAttachment::Image { .. } => false,
+    }) {
+        return (attachments, None);
+    }
+    if matches!(
+        permissions.policy,
+        crate::permissions::AskForApproval::Never
+    ) {
+        // Never-policy: refuse silently and emit a blocked-style note. We
+        // can't ask the operator, and including a secret in the prompt would
+        // defeat the whole point of `protected_read`.
+        let kept: Vec<UserAttachment> = attachments
+            .into_iter()
+            .filter(|a| match a {
+                UserAttachment::File { path } => {
+                    if is_protected_read(path) {
+                        emit(
+                            events,
+                            session,
+                            AgentEvent::ToolCallBlocked {
+                                call_id: String::new(),
+                                tool: ATTACHMENT_READ_TOOL.to_string(),
+                                reason: format!(
+                                    "attachment {} is protected and approval policy is `never`; dropped",
+                                    path.display()
+                                ),
+                                rule: ApprovalReason::ProtectedRead.as_str().to_string(),
+                            },
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                UserAttachment::Image { .. } => true,
+            })
+            .collect();
+        return (kept, None);
+    }
+
+    let mut kept = Vec::with_capacity(attachments.len());
+    for attach in attachments {
+        match &attach {
+            UserAttachment::File { path } if is_protected_read(path) => {
+                let request = ApprovalRequest {
+                    call_id: String::new(),
+                    tool: ATTACHMENT_READ_TOOL.to_string(),
+                    command: None,
+                    path: Some(path.display().to_string()),
+                    cwd: cwd.display().to_string(),
+                    reason: ApprovalReason::ProtectedRead.as_str().to_string(),
+                };
+                match permissions.gate.request(request).await {
+                    ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
+                        kept.push(attach);
+                    }
+                    ReviewDecision::Denied => {
+                        // Surface as a `ToolCallBlocked` so the chat log
+                        // shows the operator chose to refuse the read.
+                        emit(
+                            events,
+                            session,
+                            AgentEvent::ToolCallBlocked {
+                                call_id: String::new(),
+                                tool: ATTACHMENT_READ_TOOL.to_string(),
+                                reason: format!("attachment {} denied by user", path.display()),
+                                rule: ApprovalReason::ProtectedRead.as_str().to_string(),
+                            },
+                        );
+                    }
+                    ReviewDecision::Abort => {
+                        return (Vec::new(), Some("attachment approval abort"));
+                    }
+                }
+            }
+            _ => kept.push(attach),
+        }
+    }
+    (kept, None)
 }
 
 /// Drives the model/tool loop, emitting one [`AgentEvent`] per observable
@@ -288,6 +442,18 @@ pub async fn run_agent_with_control(
         }
     }
 
+    // A `File` attachment under `@.env` (or *.pem, *.key, SSH keys) counts as
+    // a read of that path. We gate it through the same `protected.rs` rules
+    // as the `read_file` tool so a secret is never silently base64'd into
+    // the Responses request because the user typed `@`. Aborting here exits
+    // the turn before the user-message event is emitted.
+    let (attachments, abort_reason) =
+        gate_protected_attachments(attachments, &permissions, cwd, &events, session).await;
+    if let Some(reason) = abort_reason {
+        emit_turn_aborted(&events, session, controls.turn_id.as_deref(), reason);
+        return Ok(());
+    }
+
     let content = build_user_content(prompt, &attachments, cwd);
     emit(
         &events,
@@ -374,10 +540,25 @@ pub async fn run_agent_with_control(
         let steering = drain_steering(&mut controls, &events, session);
         if !steering.is_empty() {
             for item in steering {
+                // Steering messages can carry attachments too; route them
+                // through the same protected-read gate as the initial turn
+                // so `/steer` with `@.env` cannot bypass approval.
+                let (attachments, abort_reason) = gate_protected_attachments(
+                    item.attachments,
+                    &permissions,
+                    cwd,
+                    &events,
+                    session,
+                )
+                .await;
+                if let Some(reason) = abort_reason {
+                    emit_turn_aborted(&events, session, controls.turn_id.as_deref(), reason);
+                    return Ok(());
+                }
                 input.push(json!({
                     "type": "message",
                     "role": "user",
-                    "content": build_user_content(&item.text, &item.attachments, cwd),
+                    "content": build_user_content(&item.text, &attachments, cwd),
                 }));
             }
             continue 'turns;

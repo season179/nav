@@ -14,10 +14,13 @@ pub enum ComposerEvent {
     /// Enter pressed on a non-empty buffer. The buffer has already been
     /// cleared and the prompt pushed onto history. `images` carries any
     /// workspace-relative image paths queued by paste events during the
-    /// composing session — drained at submit so the next prompt starts fresh.
+    /// composing session; `files` carries non-image file attachments queued
+    /// by `@file` mentions. Both are drained at submit so the next prompt
+    /// starts fresh.
     Submit {
         text: String,
         images: Vec<PathBuf>,
+        files: Vec<PathBuf>,
     },
     Cancelled,
 }
@@ -45,6 +48,10 @@ pub struct Composer {
     /// Workspace-relative paths of image attachments accumulated by paste
     /// events. Drained on submit and surfaced via [`ComposerEvent::Submit`].
     pending_images: Vec<PathBuf>,
+    /// Workspace-relative paths of non-image file attachments queued by
+    /// `@file` mention completions. Drained on submit alongside
+    /// `pending_images`.
+    pending_files: Vec<PathBuf>,
 }
 
 impl Composer {
@@ -58,6 +65,7 @@ impl Composer {
             pending_draft: None,
             pending_pastes: Vec::new(),
             pending_images: Vec::new(),
+            pending_files: Vec::new(),
         }
     }
 
@@ -67,6 +75,15 @@ impl Composer {
     /// the user can edit around it.
     pub fn push_pending_image(&mut self, path: PathBuf) {
         self.pending_images.push(path);
+    }
+
+    /// Queue a workspace-relative non-image file path as an attachment to
+    /// the next submit. Called from the `@file` mention popup when the
+    /// selected entry isn't an image; the path is inserted into the buffer
+    /// the same way an image attachment is, and reconciled at submit so an
+    /// edited-away marker drops the attachment.
+    pub fn push_pending_file(&mut self, path: PathBuf) {
+        self.pending_files.push(path);
     }
 
     pub fn text(&self) -> String {
@@ -83,11 +100,11 @@ impl Composer {
     }
 
     /// Replace the entire buffer and place the cursor at the end. Any pending
-    /// large-paste placeholders and queued image attachments are dropped —
+    /// large-paste placeholders and queued attachments are dropped —
     /// `set_text` is a wholesale buffer swap (history recall, slash completion,
     /// programmatic clear), so the old state no longer corresponds to what the
-    /// user can see. Without clearing `pending_images`, a stale clipboard image
-    /// would silently ride along on the next submit.
+    /// user can see. Without clearing the pending lists, a stale clipboard
+    /// image or file attachment would silently ride along on the next submit.
     pub fn set_text(&mut self, text: &str) {
         self.lines = if text.is_empty() {
             vec![String::new()]
@@ -98,6 +115,7 @@ impl Composer {
         self.col = self.lines[self.row].len();
         self.pending_pastes.clear();
         self.pending_images.clear();
+        self.pending_files.clear();
     }
 
     pub fn history(&self) -> &[String] {
@@ -233,7 +251,11 @@ impl Composer {
                 ComposerEvent::Nothing
             }
             (KeyCode::Enter, _) => match self.submit() {
-                Some((text, images)) => ComposerEvent::Submit { text, images },
+                Some((text, images, files)) => ComposerEvent::Submit {
+                    text,
+                    images,
+                    files,
+                },
                 None => ComposerEvent::Nothing,
             },
             (KeyCode::Esc, _) => ComposerEvent::Cancelled,
@@ -483,7 +505,7 @@ impl Composer {
         }
     }
 
-    fn submit(&mut self) -> Option<(String, Vec<PathBuf>)> {
+    fn submit(&mut self) -> Option<(String, Vec<PathBuf>, Vec<PathBuf>)> {
         if self.lines.iter().all(String::is_empty) {
             return None;
         }
@@ -492,21 +514,24 @@ impl Composer {
         // History stores the post-expansion text so Up-arrow recall surfaces
         // the real prompt the agent received, not a stale placeholder.
         self.history.push(expanded.clone());
-        // Reconcile queued images against what the user actually submits: an
-        // image was inserted as a literal path string into the buffer; if the
-        // user has since edited or deleted that marker, the image should not
-        // ride along on the prompt. Substring-match on the original path is
-        // the cheapest reliable test — codex review iter 5 flagged the prior
-        // unconditional drain as a quiet privacy leak.
+        // Reconcile queued attachments against what the user actually
+        // submits: an attachment was inserted as a literal path string into
+        // the buffer; if the user has since edited or deleted that marker,
+        // the attachment should not ride along on the prompt. Substring
+        // match on the original path is the cheapest reliable test — codex
+        // review iter 5 flagged the prior unconditional drain as a quiet
+        // privacy leak. Same rule applies to non-image file attachments.
         let mut images = std::mem::take(&mut self.pending_images);
         images.retain(|path| expanded.contains(path.to_string_lossy().as_ref()));
+        let mut files = std::mem::take(&mut self.pending_files);
+        files.retain(|path| expanded.contains(path.to_string_lossy().as_ref()));
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
         self.history_idx = None;
         self.pending_draft = None;
         self.pending_pastes.clear();
-        Some((expanded, images))
+        Some((expanded, images, files))
     }
 
     fn expand_pending_pastes(&self, buf: &str) -> String {
@@ -710,7 +735,7 @@ mod tests {
         // narrower bug where pending_images survives despite the path being
         // edited out by direct typing rather than a full buffer swap.
         c.push_pending_image(PathBuf::from(".nav/clipboard/abc.png"));
-        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text, images, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         assert_eq!(text, "look at the doc");
@@ -726,7 +751,7 @@ mod tests {
         for ch in "review this".chars() {
             c.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
         }
-        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text, images, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         assert!(text.contains(".nav/clipboard/abc.png"));
@@ -745,7 +770,7 @@ mod tests {
         c.set_text("hello world");
         assert!(c.pending_images.is_empty());
 
-        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text, images, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         assert_eq!(text, "hello world");
