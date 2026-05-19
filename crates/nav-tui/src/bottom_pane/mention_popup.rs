@@ -157,13 +157,19 @@ impl FileMentionPopup {
         let Some(&entry_idx) = self.matches.get(self.selected) else {
             return InputResult::Unhandled;
         };
-        let path = quote_path_if_needed(&self.entries[entry_idx].display);
+        let raw = self.entries[entry_idx].display.clone();
+        let quoted = quote_path_if_needed(&raw);
         self.completed = true;
-        if composer.replace_active_at_token(&path) {
-            InputResult::Handled
-        } else {
-            InputResult::Unhandled
+        if !composer.replace_active_at_token(&quoted) {
+            return InputResult::Unhandled;
         }
+        let path = PathBuf::from(&raw);
+        if is_image_extension(&raw) {
+            composer.push_pending_image(path);
+        } else {
+            composer.push_pending_file(path);
+        }
+        InputResult::Handled
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -228,6 +234,26 @@ pub fn build_mention_entries(cwd: &Path) -> Arc<[MentionEntry]> {
 /// the user can usefully filter through. Same order of magnitude as codex's
 /// `file-search` defaults.
 const MENTION_INDEX_CAP: usize = 20_000;
+
+/// Extension-only check for whether a workspace-relative path should be
+/// attached as an image vs. a generic file. Cheap (no I/O) — the agent's
+/// `build_user_content` does its own load and silently drops anything that
+/// fails to read, so a wrong-extension paste degrades to a no-op image
+/// rather than corrupting the prompt. Matches the same extension set that
+/// nav-core's `encode_image_data_uri` recognizes.
+fn is_image_extension(path: &str) -> bool {
+    let Some(ext) = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    )
+}
 
 /// Quote a path the way a shell would: if it contains whitespace or shell
 /// metacharacters, wrap it in single quotes and escape any embedded single
@@ -314,6 +340,65 @@ mod tests {
         // Reconcile: same query → must be a no-op for selection.
         popup.set_query("");
         assert_eq!(popup.selected, 1);
+    }
+
+    #[test]
+    fn completing_non_image_path_queues_file_attachment() {
+        let mut popup = FileMentionPopup::new(entries(&["src/main.rs", "README.md"]), "");
+        let mut composer = Composer::new();
+        composer.insert_paste("@");
+        popup.set_query("src/main");
+        popup.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut composer,
+        );
+        assert!(composer.text().contains("src/main.rs"));
+        let (_, attachments) = drain_submit(&mut composer);
+        assert_eq!(
+            attachments,
+            vec![nav_core::UserAttachment::File {
+                path: PathBuf::from("src/main.rs")
+            }]
+        );
+    }
+
+    #[test]
+    fn completing_image_path_queues_image_attachment() {
+        let mut popup = FileMentionPopup::new(entries(&["assets/cat.png"]), "");
+        let mut composer = Composer::new();
+        composer.insert_paste("@");
+        popup.set_query("cat");
+        popup.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            &mut composer,
+        );
+        let (_, attachments) = drain_submit(&mut composer);
+        assert_eq!(
+            attachments,
+            vec![nav_core::UserAttachment::Image {
+                path: PathBuf::from("assets/cat.png")
+            }]
+        );
+    }
+
+    fn drain_submit(c: &mut Composer) -> (String, Vec<nav_core::UserAttachment>) {
+        let event = c.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        match event {
+            super::super::composer::ComposerEvent::Submit { text, attachments } => {
+                (text, attachments)
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_image_extension_matches_known_image_suffixes() {
+        assert!(is_image_extension("a.png"));
+        assert!(is_image_extension("path/to/IMG.JPG"));
+        assert!(is_image_extension("clip.webp"));
+        assert!(!is_image_extension("src/main.rs"));
+        assert!(!is_image_extension("README.md"));
+        assert!(!is_image_extension("noext"));
     }
 
     #[test]

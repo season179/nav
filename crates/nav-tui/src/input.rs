@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nav_core::{Catalog, PendingInputMode, PendingSkill};
+use nav_core::{Catalog, PendingInputMode, PendingSkill, UserAttachment};
 use tokio::sync::mpsc;
 
 use crate::ChatWidget;
@@ -11,7 +11,7 @@ pub(crate) enum AppEvent {
     Submit {
         text: String,
         display_text: Option<String>,
-        images: Vec<PathBuf>,
+        attachments: Vec<UserAttachment>,
         mode: PendingInputMode,
         skill: Option<PendingSkill>,
     },
@@ -70,18 +70,22 @@ pub(crate) fn handle_scrollback_key(
 
 pub(crate) fn dispatch_submit(
     text: String,
-    images: Vec<PathBuf>,
+    attachments: Vec<UserAttachment>,
     skills: &Catalog,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     let event = match parse_builtin_command(&text) {
         Some(event) => event,
-        None => submit_event_for_text(text, images, skills),
+        None => submit_event_for_text(text, attachments, skills),
     };
     app_tx.send(event).ok();
 }
 
-fn submit_event_for_text(text: String, images: Vec<PathBuf>, skills: &Catalog) -> AppEvent {
+fn submit_event_for_text(
+    text: String,
+    attachments: Vec<UserAttachment>,
+    skills: &Catalog,
+) -> AppEvent {
     match text.as_str() {
         "/quit" | "/exit" => AppEvent::Quit,
         "/clear" => AppEvent::Clear,
@@ -90,16 +94,20 @@ fn submit_event_for_text(text: String, images: Vec<PathBuf>, skills: &Catalog) -
         // `/compact` is handled inside nav-core's `run_agent` — submit the
         // literal text so the agent loop's `is_compact_command` check
         // dispatches the non-steerable compaction turn.
-        "/compact" => submit_event(text, None, images, PendingInputMode::FollowUp, None),
-        _ => skill_or_submit_event(text, images, skills),
+        "/compact" => submit_event(text, None, attachments, PendingInputMode::FollowUp, None),
+        _ => skill_or_submit_event(text, attachments, skills),
     }
 }
 
-fn skill_or_submit_event(text: String, images: Vec<PathBuf>, skills: &Catalog) -> AppEvent {
+fn skill_or_submit_event(
+    text: String,
+    attachments: Vec<UserAttachment>,
+    skills: &Catalog,
+) -> AppEvent {
     match classify_slash(&text, skills) {
-        SlashAction::Control(control) => control.into_event(images),
+        SlashAction::Control(control) => control.into_event(attachments),
         SlashAction::NotASkill => {
-            submit_event(text, None, images, PendingInputMode::FollowUp, None)
+            submit_event(text, None, attachments, PendingInputMode::FollowUp, None)
         }
         SlashAction::Inline {
             skill_name,
@@ -108,7 +116,7 @@ fn skill_or_submit_event(text: String, images: Vec<PathBuf>, skills: &Catalog) -
         } => submit_event(
             request.clone(),
             Some(request),
-            images,
+            attachments,
             PendingInputMode::FollowUp,
             Some(PendingSkill {
                 name: skill_name,
@@ -167,14 +175,14 @@ fn slash_rest<'a>(text: &'a str, command: &str) -> Option<&'a str> {
 fn submit_event(
     text: String,
     display_text: Option<String>,
-    images: Vec<PathBuf>,
+    attachments: Vec<UserAttachment>,
     mode: PendingInputMode,
     skill: Option<PendingSkill>,
 ) -> AppEvent {
     AppEvent::Submit {
         text,
         display_text,
-        images,
+        attachments,
         mode,
         skill,
     }
@@ -210,10 +218,10 @@ pub enum ControlCommand {
 }
 
 impl ControlCommand {
-    fn into_event(self, images: Vec<PathBuf>) -> AppEvent {
+    fn into_event(self, attachments: Vec<UserAttachment>) -> AppEvent {
         match self {
             ControlCommand::Steer { text } => {
-                submit_event(text, None, images, PendingInputMode::Steering, None)
+                submit_event(text, None, attachments, PendingInputMode::Steering, None)
             }
             ControlCommand::EditPending { id, text } => AppEvent::EditPending { id, text },
             ControlCommand::RemovePending { id } => AppEvent::RemovePending { id },
@@ -400,9 +408,11 @@ mod tests {
         dispatch_submit("/compact".to_string(), Vec::new(), &catalog, &tx);
         let event = rx.try_recv().expect("event sent");
         match event {
-            AppEvent::Submit { text, images, .. } => {
+            AppEvent::Submit {
+                text, attachments, ..
+            } => {
                 assert_eq!(text, "/compact");
-                assert!(images.is_empty());
+                assert!(attachments.is_empty());
             }
             other => panic!("expected Submit, got {other:?}"),
         }

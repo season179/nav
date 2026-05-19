@@ -174,6 +174,9 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
                         crate::agent::UserAttachment::Image { path } => {
                             out.push_str(&format!("- attachment: image `{}`\n", path.display()));
                         }
+                        crate::agent::UserAttachment::File { path } => {
+                            out.push_str(&format!("- attachment: file `{}`\n", path.display()));
+                        }
                     }
                 }
                 if !attachments.is_empty() {

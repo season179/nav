@@ -166,6 +166,56 @@ fn aborting_permission_context() -> PermissionContext {
     }
 }
 
+/// Recording approval gate. Captures the [`ApprovalRequest`]s that fly
+/// through it and returns a pre-programmed [`ReviewDecision`] per request,
+/// cycling through `decisions`. Used by the attachment-gate tests so we can
+/// assert *which* attachment paths triggered approval and that the
+/// `protected_read` reason was set.
+#[derive(Default)]
+struct RecordingGate {
+    decisions: Mutex<Vec<ReviewDecision>>,
+    requests: Mutex<Vec<ApprovalRequest>>,
+}
+
+impl RecordingGate {
+    fn with_decisions(decisions: Vec<ReviewDecision>) -> Self {
+        Self {
+            decisions: Mutex::new(decisions),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<ApprovalRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl ApprovalGate for RecordingGate {
+    fn request<'a>(
+        &'a self,
+        req: ApprovalRequest,
+    ) -> Pin<Box<dyn Future<Output = ReviewDecision> + Send + 'a>> {
+        self.requests.lock().unwrap().push(req);
+        let decision = self
+            .decisions
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or(ReviewDecision::Approved);
+        Box::pin(async move { decision })
+    }
+}
+
+fn recording_permission_context(gate: Arc<RecordingGate>) -> PermissionContext {
+    PermissionContext {
+        gate,
+        policy: AskForApproval::OnRequest,
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        sandbox: Arc::new(PassthroughRunner),
+        session_allowlist: SessionAllowlist::default(),
+    }
+}
+
 // ── drop_oldest_tool_pair ────────────────────────────────────
 
 #[test]
@@ -397,6 +447,156 @@ fn rebuild_responses_input_carries_image_attachments_back_into_input() {
                 .and_then(Value::as_str)
                 .is_some_and(|s| s.starts_with("data:image/png;base64,"))
     }));
+}
+
+#[test]
+fn file_attachment_body_is_truncated_via_tool_output_policy() {
+    // A pathologically large file attachment must not blow up the request.
+    // We reuse the same `bound` / `TruncateMode::Head` policy as the
+    // read_file tool output: a head-only block plus a "truncated" marker
+    // counting the dropped bytes / lines.
+    let dir = tempdir().unwrap();
+    let rel = PathBuf::from("huge.txt");
+    let abs = dir.path().join(&rel);
+    // 60 KB > 50 KB MAX_BYTES — head-only truncation kicks in.
+    let body = "x".repeat(60 * 1024);
+    std::fs::write(&abs, &body).unwrap();
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "read".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::File { path: rel }],
+        }],
+        dir.path(),
+    );
+
+    let content = input[0].get("content").and_then(Value::as_array).unwrap();
+    let attached = content
+        .iter()
+        .find_map(|p| {
+            let t = p.get("text").and_then(Value::as_str)?;
+            t.contains("<attached file: huge.txt>")
+                .then_some(t.to_string())
+        })
+        .expect("file attachment part missing");
+    assert!(
+        attached.contains("[truncated"),
+        "expected truncation marker: {}",
+        &attached[..attached.len().min(200)]
+    );
+    // Bounded body is well under the unbounded 60 KB original.
+    assert!(attached.len() < 60 * 1024);
+}
+
+#[test]
+fn rebuild_responses_input_carries_file_attachments_back_into_input() {
+    // The wire format for a File attachment is an `input_text` part holding
+    // a fenced block with the workspace-relative path and the file body.
+    // Resume just calls build_user_content again, so this is the same path
+    // as the live agent uses for the initial turn.
+    let dir = tempdir().unwrap();
+    let rel = PathBuf::from("docs/notes.md");
+    let abs = dir.path().join(&rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, "hello\nworld\n").unwrap();
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "summarise this".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::File { path: rel.clone() }],
+        }],
+        dir.path(),
+    );
+
+    assert_eq!(input.len(), 1);
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("file attachment produces typed parts");
+    let attached_text_part = content
+        .iter()
+        .find_map(|part| {
+            let kind = part.get("type").and_then(Value::as_str)?;
+            let text = part.get("text").and_then(Value::as_str)?;
+            (kind == "input_text" && text.contains("<attached file:")).then_some(text.to_string())
+        })
+        .expect("expected fenced file attachment part");
+    assert!(
+        attached_text_part.contains("docs/notes.md"),
+        "missing path: {attached_text_part}"
+    );
+    assert!(
+        attached_text_part.contains("hello\nworld"),
+        "missing body: {attached_text_part}"
+    );
+}
+
+#[test]
+fn rebuild_responses_input_marks_non_utf8_file_attachments() {
+    let dir = tempdir().unwrap();
+    let rel = PathBuf::from("blob.bin");
+    let abs = dir.path().join(&rel);
+    std::fs::write(&abs, [0xff, 0xfe, 0xfa]).unwrap();
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "skip me".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::File { path: rel }],
+        }],
+        dir.path(),
+    );
+
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("typed parts");
+    let note = content
+        .iter()
+        .find_map(|part| {
+            let text = part.get("text").and_then(Value::as_str)?;
+            text.contains("[skipped: file is not valid UTF-8")
+                .then_some(text.to_string())
+        })
+        .expect("non-UTF-8 file body must surface as a note rather than silent omission");
+    assert!(note.contains("blob.bin"));
+}
+
+#[test]
+fn rebuild_responses_input_drops_file_attachment_that_escapes_workspace() {
+    // Exfiltration guard: a stored attachment whose path resolves outside
+    // cwd must not have its bytes pulled in on resume. The user's text
+    // still goes through; the attachment part is simply absent.
+    let outer = tempdir().unwrap();
+    let outside = outer.path().join("secret.txt");
+    std::fs::write(&outside, "shhh").unwrap();
+    let cwd = outer.path().join("workspace");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "see notes".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::File {
+                path: PathBuf::from("../secret.txt"),
+            }],
+        }],
+        &cwd,
+    );
+
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("typed parts");
+    assert!(
+        !content.iter().any(|part| part
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains("shhh"))),
+        "../ escape leaked file body: {content:?}"
+    );
 }
 
 #[test]
@@ -1079,6 +1279,205 @@ async fn run_agent_emits_failed_file_change_for_rejected_patch_tool() {
         )
     });
     assert_eq!(fs::read_to_string(cwd.join("note.txt")).unwrap(), "old\n");
+}
+
+// ── protected-read attachment gating ─────────────────────────
+
+#[tokio::test]
+async fn run_agent_gates_protected_file_attachment_through_approval() {
+    // A user typing `@.env` must not silently leak the file: the agent loop
+    // routes the attachment through the same approval gate as the
+    // `read_file` tool. Approved → bytes ride along; Denied → the
+    // attachment is dropped and a `ToolCallBlocked` event surfaces in the
+    // transcript so the operator sees what happened.
+    let turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    fs::write(cwd.join(".env"), "DB_PASS=hunter2").unwrap();
+
+    let gate = Arc::new(RecordingGate::with_decisions(vec![ReviewDecision::Denied]));
+    let permissions = recording_permission_context(gate.clone());
+
+    let transport = StubTransport::new(vec![turn]);
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &Args::test_default(),
+        &cwd,
+        "look".into(),
+        None,
+        vec![UserAttachment::File {
+            path: PathBuf::from(".env"),
+        }],
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        permissions,
+    )
+    .await
+    .expect("run_agent");
+
+    // The gate saw a request for `.env` with the protected_read reason.
+    let requests = gate.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path.as_deref(), Some(".env"));
+    assert_eq!(requests[0].reason, "protected_read");
+
+    // The denied attachment must not have its body in the outbound body.
+    let bodies = transport.bodies.lock().unwrap();
+    let serialized = bodies[0].to_string();
+    assert!(
+        !serialized.contains("hunter2"),
+        "denied secret leaked into request: {serialized}"
+    );
+
+    // The transcript records a Blocked event so the user understands the
+    // attachment was refused.
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let saw_blocked = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ToolCallBlocked { tool, rule, .. }
+                if tool == "attachment_read" && rule == "protected_read"
+        )
+    });
+    assert!(saw_blocked, "expected ToolCallBlocked event: {events:#?}");
+}
+
+#[tokio::test]
+async fn run_agent_includes_protected_file_attachment_when_approved() {
+    let turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    fs::write(cwd.join(".env"), "DB_PASS=hunter2").unwrap();
+
+    let gate = Arc::new(RecordingGate::with_decisions(vec![
+        ReviewDecision::Approved,
+    ]));
+    let permissions = recording_permission_context(gate.clone());
+
+    let transport = StubTransport::new(vec![turn]);
+    let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &Args::test_default(),
+        &cwd,
+        "look".into(),
+        None,
+        vec![UserAttachment::File {
+            path: PathBuf::from(".env"),
+        }],
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        permissions,
+    )
+    .await
+    .expect("run_agent");
+
+    assert_eq!(gate.requests().len(), 1);
+    let bodies = transport.bodies.lock().unwrap();
+    let serialized = bodies[0].to_string();
+    assert!(
+        serialized.contains("DB_PASS=hunter2"),
+        "approved attachment body missing: {serialized}"
+    );
+    assert!(
+        serialized.contains("<attached file: .env>"),
+        "expected fenced wrapper: {serialized}"
+    );
+}
+
+#[tokio::test]
+async fn run_agent_aborts_turn_when_attachment_approval_aborts() {
+    let turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "should not appear"}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    fs::write(cwd.join("id_rsa"), "ssh secret").unwrap();
+
+    let permissions = aborting_permission_context();
+    let transport = StubTransport::new(vec![turn]);
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &Args::test_default(),
+        &cwd,
+        "look".into(),
+        None,
+        vec![UserAttachment::File {
+            path: PathBuf::from("id_rsa"),
+        }],
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        permissions,
+    )
+    .await
+    .expect("run_agent");
+
+    // No body should have been sent — the abort fires before the prompt is
+    // emitted as a user message and before the transport is invoked.
+    let bodies = transport.bodies.lock().unwrap();
+    assert!(
+        bodies.is_empty(),
+        "aborted turn must not call the transport: {bodies:#?}"
+    );
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnAborted { .. })),
+        "expected TurnAborted: {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::UserMessage { .. })),
+        "user message must not be emitted on abort: {events:#?}"
+    );
 }
 
 // ── --resume integration ──────────────────────────────────────

@@ -150,15 +150,34 @@ are the unchecked items at the top; shipped foundation stays here as evidence.
 These should come after the must-haves unless a frontend or integration needs a
 small slice earlier.
 
-1. [ ] Finish file ergonomics polish after real dogfooding: `@file` mentions,
+1. [x] Finish file ergonomics polish after real dogfooding: `@file` mentions,
    path completion, piped stdin, paste handling, and generic attachments.
-   - Mostly done: `@file` mentions + nucleo path completion
-     (`nav-tui/src/bottom_pane/mention_popup.rs`), piped stdin
-     (`nav-cli/src/main.rs`), and paste / clipboard-image handling
-     (recent commits 50def85, 729ea70, d93b1a5, 262d0d4).
-   - Outstanding: recent work is bug-fix polish (multibyte cursor panic,
-     popup Down-arrow, escaped paths, resumed-session attachment paths) and
-     generic non-image file attachments are not implemented.
+   - Done in commit cae8524: `UserAttachment::File` variant carrying a
+     workspace-relative path (`nav-core/src/agent/events.rs`); shared
+     `resolve_workspace_path` + UTF-8-only `load_file_attachment` in
+     `nav-core/src/agent/runner.rs` emit a fenced `input_text` part, bounded
+     by the same 50 KB / 2000-line head-only truncation as `read_file`
+     output (`nav-core/src/tools/truncate.rs`); protected-read attachments
+     (`.env*`, `*.pem`, `*.key`, SSH keys) route through the existing
+     approval gate via a new `attachment_read` tool name with the
+     `protected_read` reason, including the steering path; mention popup
+     queues images vs. files by extension and surfaces both via
+     `push_pending_image` / `push_pending_file` on `Composer`, threaded
+     through `ComposerEvent::Submit`, `AppEvent::Submit`, and `pending_draft`
+     so the chip + reconciliation logic shipped for images applies to files
+     unchanged; session resume rebuilds `File` rows through the same
+     `build_user_content` path (`#[serde(tag = "kind")]` keeps old
+     image-only logs deserializing).
+   - Verified with `cargo fmt --check`, `cargo test -p nav-core -p nav-tui`
+     (467 nav-core tests, 90 nav-tui tests across 4 suites, 0 failures),
+     and `cargo clippy --all-targets` (1 pre-existing warning unrelated to
+     this change).
+   - Deferred outside this checklist item: PDF/Word/binary extraction
+     (UTF-8 only for v1), drag-and-drop from outside the workspace, a
+     dedicated `/attach` slash command. Earlier bug-fix polish (multibyte
+     cursor panic, popup Down-arrow, escaped paths, resumed-session
+     attachment paths) shipped in commits 50def85, 729ea70, d93b1a5,
+     262d0d4 before this work.
 2. [ ] Add advanced session workflows: fork/clone, tree navigation, branch
    summaries, labels, and richer transcript search.
    - Not started.

@@ -170,7 +170,7 @@ pub async fn run(
             .send(AppEvent::Submit {
                 text: prompt,
                 display_text: None,
-                images: Vec::new(),
+                attachments: Vec::new(),
                 mode: PendingInputMode::FollowUp,
                 skill: None,
             })
@@ -492,12 +492,18 @@ pub async fn run(
                     AppEvent::Submit {
                         text,
                         display_text,
-                        images,
+                        attachments,
                         mode,
                         skill,
                     } => {
-                        let draft =
-                            pending_draft(text, display_text, images, mode, skill, &mut pending_skill);
+                        let draft = pending_draft(
+                            text,
+                            display_text,
+                            attachments,
+                            mode,
+                            skill,
+                            &mut pending_skill,
+                        );
                         if control.active().is_some() {
                             let item = match mode {
                                 PendingInputMode::FollowUp => control.enqueue_follow_up(draft),
@@ -579,8 +585,8 @@ pub async fn run(
                                 continue;
                             }
                             match pane.handle_key(key) {
-                                bottom_pane::ComposerEvent::Submit { text, images } => {
-                                    dispatch_submit(text, images, skills.as_ref(), &app_tx);
+                                bottom_pane::ComposerEvent::Submit { text, attachments } => {
+                                    dispatch_submit(text, attachments, skills.as_ref(), &app_tx);
                                 }
                                 bottom_pane::ComposerEvent::Nothing
                                 | bottom_pane::ComposerEvent::Cancelled => {}
@@ -774,7 +780,7 @@ fn clear_active_steering(queue: &Option<PendingSteeringQueue>) {
 fn pending_draft(
     text: String,
     display_text: Option<String>,
-    images: Vec<PathBuf>,
+    attachments: Vec<UserAttachment>,
     mode: PendingInputMode,
     skill: Option<PendingSkill>,
     pending_skill: &mut Option<PendingSkill>,
@@ -787,10 +793,7 @@ fn pending_draft(
     PendingInputDraft {
         text,
         display_text,
-        attachments: images
-            .into_iter()
-            .map(|path| UserAttachment::Image { path })
-            .collect(),
+        attachments,
         skill,
     }
 }

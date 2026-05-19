@@ -3,7 +3,8 @@ use base64::Engine;
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::future::Future;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -17,11 +18,19 @@ use crate::cli::Args;
 use crate::control::{PendingInput, PendingInputMode, TurnControls};
 use crate::git_diff;
 use crate::mutation::PatchApplyStatus;
+use crate::permissions::approval::ApprovalRequest;
+use crate::permissions::protected::is_protected_read;
+use crate::permissions::{ApprovalReason, ReviewDecision};
 use crate::project::ProjectContext;
 use crate::responses::{self, ResponseCollector, ResponsesError};
 use crate::session::{SessionId, SessionStore};
 use crate::skills::Catalog;
-use crate::tools::{self, PermissionContext};
+use crate::tools::truncate::{self, TruncateMode, bound};
+use crate::tools::{self, PermissionContext, preflight};
+
+/// `tool` field surfaced on approval/block events for protected `@file`
+/// attachments. Lets the modal distinguish them from `read_file` calls.
+const ATTACHMENT_READ_TOOL: &str = "attachment_read";
 
 /// Stream of raw `Responses` API events yielded by a transport.
 ///
@@ -97,9 +106,10 @@ fn user_message_event(
 
 /// Build the `content` part of a Responses API user message. Plain text turns
 /// stay as a single string (the historical shape); when attachments are
-/// present, return an array of typed content parts so the Responses API can
-/// see `input_text` alongside `input_image`. Images that fail to load are
-/// silently dropped — a bad path shouldn't block the turn.
+/// present, return an array of typed content parts so the Responses API
+/// sees `input_text` alongside `input_image`. Attachments that fail to load
+/// are dropped silently; non-UTF-8 or symlink-to-secret cases surface as
+/// inline text notes so the model knows the path was requested.
 pub(super) fn build_user_content(
     prompt: &str,
     attachments: &[UserAttachment],
@@ -108,15 +118,29 @@ pub(super) fn build_user_content(
     if attachments.is_empty() {
         return Value::String(prompt.to_string());
     }
+    // Canonicalize cwd once; resolve_workspace_path used to do this per
+    // attachment, which on a turn with N files meant N stat-walks of the
+    // workspace root.
+    let cwd_canonical = cwd.canonicalize().ok();
     let mut parts: Vec<Value> = Vec::with_capacity(1 + attachments.len());
     parts.push(json!({ "type": "input_text", "text": prompt }));
     for attach in attachments {
         match attach {
             UserAttachment::Image { path } => {
-                if let Some(data_uri) = encode_image_data_uri(cwd, path) {
+                if let Some(canonical) = resolve_workspace_path(cwd_canonical.as_deref(), cwd, path)
+                    && let Some(data_uri) = encode_image_data_uri(&canonical)
+                {
                     parts.push(json!({
                         "type": "input_image",
                         "image_url": data_uri,
+                    }));
+                }
+            }
+            UserAttachment::File { path } => {
+                if let Some(text) = load_file_attachment(cwd_canonical.as_deref(), cwd, path) {
+                    parts.push(json!({
+                        "type": "input_text",
+                        "text": text,
                     }));
                 }
             }
@@ -125,25 +149,28 @@ pub(super) fn build_user_content(
     Value::Array(parts)
 }
 
-fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
-    // Defense-in-depth: nav's workspace contract says reads/writes for
-    // user-provided paths stay inside the workspace root. The TUI normally
-    // relativizes / copies pastes into <cwd>/.nav/clipboard/ before queuing
-    // them, but a path with `..` segments or a symlink that resolves outside
-    // would otherwise let us silently base64 arbitrary files (e.g.
-    // ~/.ssh/id_rsa) into the Responses request. Canonicalize both sides and
-    // require containment before reading.
+/// Canonicalize `rel` against `cwd` and require workspace containment. A
+/// `..`-laden path or a symlink that escapes would otherwise let us
+/// silently include arbitrary files (e.g. `~/.ssh/id_rsa`) in the request.
+/// `cwd_canonical` is the pre-canonicalized cwd from the caller — passing
+/// `None` falls back to canonicalizing per call, used by code paths that
+/// don't have the canonical form handy.
+fn resolve_workspace_path(cwd_canonical: Option<&Path>, cwd: &Path, rel: &Path) -> Option<PathBuf> {
     let abs = if rel.is_absolute() {
         rel.to_path_buf()
     } else {
         cwd.join(rel)
     };
     let canonical = abs.canonicalize().ok()?;
-    let cwd_canonical = cwd.canonicalize().ok()?;
-    if !canonical.starts_with(&cwd_canonical) {
-        return None;
-    }
-    let bytes = std::fs::read(&canonical).ok()?;
+    let cwd_canonical = match cwd_canonical {
+        Some(p) => p.to_path_buf(),
+        None => cwd.canonicalize().ok()?,
+    };
+    canonical.starts_with(&cwd_canonical).then_some(canonical)
+}
+
+fn encode_image_data_uri(canonical: &Path) -> Option<String> {
+    let bytes = std::fs::read(canonical).ok()?;
     let ext = canonical
         .extension()
         .and_then(|e| e.to_str())
@@ -157,6 +184,116 @@ fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
     };
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     Some(format!("data:{mime};base64,{encoded}"))
+}
+
+/// Cap on how many bytes a single file attachment may pull off disk before
+/// truncation. `MAX_BYTES + 1` so a file at exactly the cap still has the
+/// next byte sampled — the marker would otherwise lie about whether
+/// anything was dropped.
+const FILE_ATTACHMENT_READ_CAP: u64 = (truncate::MAX_BYTES as u64) + 1;
+
+/// Render a `File` attachment as a fenced block. UTF-8 only; binary bodies
+/// fall back to a note. We read at most `FILE_ATTACHMENT_READ_CAP` bytes so
+/// a 1 GB attachment doesn't pull 1 GB into memory just to discard the
+/// tail. Symlink reaches into protected paths are refused inline even
+/// after gate approval — matches `read_file`'s symlink-bypass check.
+fn load_file_attachment(cwd_canonical: Option<&Path>, cwd: &Path, rel: &Path) -> Option<String> {
+    let rel_display = rel.display().to_string();
+    let canonical = resolve_workspace_path(cwd_canonical, cwd, rel)?;
+    if is_protected_read(&canonical) && !is_protected_read(rel) {
+        return Some(format!(
+            "<attached file: {rel_display}>\n[refused: path resolves via symlink to a protected secret]\n</attached>",
+        ));
+    }
+    let file = std::fs::File::open(&canonical).ok()?;
+    let mut bytes = Vec::new();
+    file.take(FILE_ATTACHMENT_READ_CAP)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let body = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => {
+            return Some(format!(
+                "<attached file: {rel_display}>\n[skipped: file is not valid UTF-8 ({} bytes read)]\n</attached>",
+                err.into_bytes().len()
+            ));
+        }
+    };
+    let bounded = bound(body, TruncateMode::Head);
+    Some(format!(
+        "<attached file: {rel_display}>\n{bounded}\n</attached>",
+    ))
+}
+
+/// Gate each `File` attachment whose path matches [`is_protected_read`]
+/// through the same approval flow the `read_file` tool uses. Under
+/// `AskForApproval::Never` the gate is short-circuited to `Denied` so a
+/// secret can't ride along when the operator isn't around to refuse. An
+/// `Abort` decision propagates as the abort reason in the returned tuple;
+/// `run_agent` turns it into a `TurnAborted` event.
+async fn gate_protected_attachments(
+    attachments: Vec<UserAttachment>,
+    permissions: &PermissionContext,
+    cwd: &Path,
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+) -> (Vec<UserAttachment>, Option<&'static str>) {
+    if !attachments
+        .iter()
+        .any(|a| matches!(a, UserAttachment::File { path } if is_protected_read(path)))
+    {
+        return (attachments, None);
+    }
+
+    let auto_denied = preflight::auto_denies_approvals(permissions.policy);
+    let mut kept = Vec::with_capacity(attachments.len());
+    for attach in attachments {
+        let UserAttachment::File { path } = &attach else {
+            kept.push(attach);
+            continue;
+        };
+        if !is_protected_read(path) {
+            kept.push(attach);
+            continue;
+        }
+        let decision = if auto_denied {
+            ReviewDecision::Denied
+        } else {
+            permissions
+                .gate
+                .request(ApprovalRequest {
+                    call_id: String::new(),
+                    tool: ATTACHMENT_READ_TOOL.to_string(),
+                    command: None,
+                    path: Some(path.display().to_string()),
+                    cwd: cwd.display().to_string(),
+                    reason: ApprovalReason::ProtectedRead.as_str().to_string(),
+                })
+                .await
+        };
+        match decision {
+            ReviewDecision::Approved | ReviewDecision::ApprovedForSession => kept.push(attach),
+            ReviewDecision::Denied => emit(
+                events,
+                session,
+                AgentEvent::ToolCallBlocked {
+                    call_id: String::new(),
+                    tool: ATTACHMENT_READ_TOOL.to_string(),
+                    reason: if auto_denied {
+                        format!(
+                            "attachment {} is protected and approval policy is `never`; dropped",
+                            path.display()
+                        )
+                    } else {
+                        format!("attachment {} denied by user", path.display())
+                    },
+                    rule: ApprovalReason::ProtectedRead.as_str().to_string(),
+                },
+            ),
+            ReviewDecision::Abort => return (Vec::new(), Some("attachment approval abort")),
+        }
+    }
+    (kept, None)
 }
 
 /// Drives the model/tool loop, emitting one [`AgentEvent`] per observable
@@ -288,6 +425,15 @@ pub async fn run_agent_with_control(
         }
     }
 
+    // Abort before emitting the user-message event so a denied `.env`
+    // doesn't show up in the transcript as a turn that almost happened.
+    let (attachments, abort_reason) =
+        gate_protected_attachments(attachments, &permissions, cwd, &events, session).await;
+    if let Some(reason) = abort_reason {
+        emit_turn_aborted(&events, session, controls.turn_id.as_deref(), reason);
+        return Ok(());
+    }
+
     let content = build_user_content(prompt, &attachments, cwd);
     emit(
         &events,
@@ -374,10 +520,22 @@ pub async fn run_agent_with_control(
         let steering = drain_steering(&mut controls, &events, session);
         if !steering.is_empty() {
             for item in steering {
+                let (attachments, abort_reason) = gate_protected_attachments(
+                    item.attachments,
+                    &permissions,
+                    cwd,
+                    &events,
+                    session,
+                )
+                .await;
+                if let Some(reason) = abort_reason {
+                    emit_turn_aborted(&events, session, controls.turn_id.as_deref(), reason);
+                    return Ok(());
+                }
                 input.push(json!({
                     "type": "message",
                     "role": "user",
-                    "content": build_user_content(&item.text, &item.attachments, cwd),
+                    "content": build_user_content(&item.text, &attachments, cwd),
                 }));
             }
             continue 'turns;

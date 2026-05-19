@@ -21,9 +21,10 @@ use super::runner::build_user_content;
 /// the checkpoint, so a resumed compacted session never silently expands back
 /// to the full pre-compaction transcript.
 ///
-/// `cwd` is the workspace root used to resolve image attachment paths back to
-/// bytes. Images whose files are no longer readable are silently dropped, same
-/// as the live agent loop — a missing attachment can't block resume.
+/// `cwd` is the workspace root used to resolve image and file attachment
+/// paths back to bytes. Attachments whose files are no longer readable are
+/// silently dropped, same as the live agent loop — a missing attachment
+/// can't block resume.
 ///
 /// Tool-call events stay in the persisted log for scrollback, but replay skips
 /// them. Stateless Responses tool turns require the matching reasoning items,
