@@ -19,6 +19,7 @@ ignore = "0.4.25"
 arboard = "3.6.1"
 image = "0.25.10"
 uuid = { version = "1.23.1", features = ["v4"] }
+url = "2.5"
 
 [dev-dependencies]
 insta.workspace = true

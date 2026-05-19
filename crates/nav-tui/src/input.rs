@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nav_core::Catalog;
 use tokio::sync::mpsc;
@@ -6,7 +8,10 @@ use crate::ChatWidget;
 
 #[derive(Debug)]
 pub(crate) enum AppEvent {
-    Submit(String),
+    Submit {
+        text: String,
+        images: Vec<PathBuf>,
+    },
     Quit,
     Clear,
     /// Standalone `/<skill>` - the wrapped body is held until the next
@@ -41,6 +46,7 @@ pub(crate) fn handle_scrollback_key(
 
 pub(crate) fn dispatch_submit(
     text: String,
+    images: Vec<PathBuf>,
     skills: &Catalog,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
@@ -48,8 +54,11 @@ pub(crate) fn dispatch_submit(
         "/quit" | "/exit" => AppEvent::Quit,
         "/clear" => AppEvent::Clear,
         _ => match classify_slash(&text, skills) {
-            SlashAction::NotASkill => AppEvent::Submit(text),
-            SlashAction::Inline { prompt } => AppEvent::Submit(prompt),
+            SlashAction::NotASkill => AppEvent::Submit { text, images },
+            SlashAction::Inline { prompt } => AppEvent::Submit {
+                text: prompt,
+                images,
+            },
             SlashAction::Queue {
                 skill_name,
                 wrapped_body,

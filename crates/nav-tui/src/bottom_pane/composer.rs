@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -10,8 +12,13 @@ use ratatui::widgets::{Paragraph, Widget};
 pub enum ComposerEvent {
     Nothing,
     /// Enter pressed on a non-empty buffer. The buffer has already been
-    /// cleared and the prompt pushed onto history.
-    Submit(String),
+    /// cleared and the prompt pushed onto history. `images` carries any
+    /// workspace-relative image paths queued by paste events during the
+    /// composing session — drained at submit so the next prompt starts fresh.
+    Submit {
+        text: String,
+        images: Vec<PathBuf>,
+    },
     Cancelled,
 }
 
@@ -35,6 +42,9 @@ pub struct Composer {
     /// lives in the composer buffer until [`Composer::submit`] swaps each one
     /// back to its original content. Cleared on every successful submit.
     pending_pastes: Vec<(String, String)>,
+    /// Workspace-relative paths of image attachments accumulated by paste
+    /// events. Drained on submit and surfaced via [`ComposerEvent::Submit`].
+    pending_images: Vec<PathBuf>,
 }
 
 impl Composer {
@@ -47,7 +57,16 @@ impl Composer {
             history_idx: None,
             pending_draft: None,
             pending_pastes: Vec::new(),
+            pending_images: Vec::new(),
         }
+    }
+
+    /// Queue a workspace-relative image path as an attachment to the next
+    /// submit. Called by `BottomPane::on_paste` when an image was saved into
+    /// the workspace; the path is also inserted into the visible buffer so
+    /// the user can edit around it.
+    pub fn push_pending_image(&mut self, path: PathBuf) {
+        self.pending_images.push(path);
     }
 
     pub fn text(&self) -> String {
@@ -64,8 +83,11 @@ impl Composer {
     }
 
     /// Replace the entire buffer and place the cursor at the end. Any pending
-    /// large-paste placeholders are dropped — `set_text` is a wholesale buffer
-    /// swap, so the old placeholders no longer point at anything meaningful.
+    /// large-paste placeholders and queued image attachments are dropped —
+    /// `set_text` is a wholesale buffer swap (history recall, slash completion,
+    /// programmatic clear), so the old state no longer corresponds to what the
+    /// user can see. Without clearing `pending_images`, a stale clipboard image
+    /// would silently ride along on the next submit.
     pub fn set_text(&mut self, text: &str) {
         self.lines = if text.is_empty() {
             vec![String::new()]
@@ -75,6 +97,7 @@ impl Composer {
         self.row = self.lines.len() - 1;
         self.col = self.lines[self.row].len();
         self.pending_pastes.clear();
+        self.pending_images.clear();
     }
 
     pub fn history(&self) -> &[String] {
@@ -89,7 +112,9 @@ impl Composer {
     /// `email@example.com` and reopens the popup only after a space is typed.
     pub fn current_at_token(&self) -> Option<(usize, &str)> {
         let line = &self.lines[self.row];
-        if self.col > line.len() {
+        // Defensive: any path that left `self.col` inside a multibyte char or
+        // past the end of the line must not panic — this runs on every key.
+        if self.col > line.len() || !line.is_char_boundary(self.col) {
             return None;
         }
         let before = &line[..self.col];
@@ -208,7 +233,7 @@ impl Composer {
                 ComposerEvent::Nothing
             }
             (KeyCode::Enter, _) => match self.submit() {
-                Some(text) => ComposerEvent::Submit(text),
+                Some((text, images)) => ComposerEvent::Submit { text, images },
                 None => ComposerEvent::Nothing,
             },
             (KeyCode::Esc, _) => ComposerEvent::Cancelled,
@@ -407,7 +432,7 @@ impl Composer {
             return false;
         }
         self.row -= 1;
-        self.col = self.col.min(self.lines[self.row].len());
+        self.col = clamp_to_char_boundary(&self.lines[self.row], self.col);
         true
     }
 
@@ -416,7 +441,7 @@ impl Composer {
             return false;
         }
         self.row += 1;
-        self.col = self.col.min(self.lines[self.row].len());
+        self.col = clamp_to_char_boundary(&self.lines[self.row], self.col);
         true
     }
 
@@ -458,7 +483,7 @@ impl Composer {
         }
     }
 
-    fn submit(&mut self) -> Option<String> {
+    fn submit(&mut self) -> Option<(String, Vec<PathBuf>)> {
         if self.lines.iter().all(String::is_empty) {
             return None;
         }
@@ -467,13 +492,21 @@ impl Composer {
         // History stores the post-expansion text so Up-arrow recall surfaces
         // the real prompt the agent received, not a stale placeholder.
         self.history.push(expanded.clone());
+        // Reconcile queued images against what the user actually submits: an
+        // image was inserted as a literal path string into the buffer; if the
+        // user has since edited or deleted that marker, the image should not
+        // ride along on the prompt. Substring-match on the original path is
+        // the cheapest reliable test — codex review iter 5 flagged the prior
+        // unconditional drain as a quiet privacy leak.
+        let mut images = std::mem::take(&mut self.pending_images);
+        images.retain(|path| expanded.contains(path.to_string_lossy().as_ref()));
         self.lines = vec![String::new()];
         self.row = 0;
         self.col = 0;
         self.history_idx = None;
         self.pending_draft = None;
         self.pending_pastes.clear();
-        Some(expanded)
+        Some((expanded, images))
     }
 
     fn expand_pending_pastes(&self, buf: &str) -> String {
@@ -561,6 +594,21 @@ fn next_char_boundary(s: &str, byte: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+/// Snap a tentative byte offset into `s` to the nearest valid char boundary
+/// at or before it, capped at `s.len()`. Vertical cursor movement can land
+/// inside a multibyte character — e.g. column 1 on a line starting with `é`
+/// (two bytes) — and `&s[..col]` would then panic. This is the cheap fix
+/// used by move_up_intra / move_down_intra. We walk backwards manually
+/// rather than calling `prev_char_boundary` because that helper itself
+/// slices `s[..byte]`, which would panic on the very offset we need to fix.
+fn clamp_to_char_boundary(s: &str, byte: usize) -> usize {
+    let mut b = byte.min(s.len());
+    while b > 0 && !s.is_char_boundary(b) {
+        b -= 1;
+    }
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,7 +637,7 @@ mod tests {
         );
         assert_eq!(c.pending_pastes.len(), 1);
 
-        let ComposerEvent::Submit(expanded) = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text: expanded, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         assert_eq!(expanded, big);
@@ -606,10 +654,13 @@ mod tests {
         let buf = c.text();
         let base = format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 5);
         let dup = format!("{base} #2");
-        assert!(buf.contains(&base), "buffer missing base placeholder: {buf:?}");
+        assert!(
+            buf.contains(&base),
+            "buffer missing base placeholder: {buf:?}"
+        );
         assert!(buf.contains(&dup), "buffer missing #2 placeholder: {buf:?}");
 
-        let ComposerEvent::Submit(expanded) = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text: expanded, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         // Both placeholders should have been replaced with the original paste.
@@ -639,10 +690,66 @@ mod tests {
         assert!(c.pending_pastes.is_empty());
         // Submit should now just return the literal slash command, with no
         // dangling placeholder expansion.
-        let ComposerEvent::Submit(text) = c.handle_key(enter()) else {
+        let ComposerEvent::Submit { text, .. } = c.handle_key(enter()) else {
             panic!("expected Submit");
         };
         assert_eq!(text, "/help");
+    }
+
+    #[test]
+    fn submit_drops_pending_image_when_path_edited_out_of_buffer() {
+        // User pastes an image, then deletes / replaces the inserted path
+        // before submitting. The image must not silently ride along on the
+        // outgoing prompt; only paths still present in the buffer ship.
+        let mut c = Composer::new();
+        c.push_pending_image(PathBuf::from(".nav/clipboard/abc.png"));
+        c.insert_paste(".nav/clipboard/abc.png");
+        // Simulate the user replacing the visible path with a typed prompt.
+        c.set_text("look at the doc");
+        // set_text already clears pending_images; re-queue to simulate the
+        // narrower bug where pending_images survives despite the path being
+        // edited out by direct typing rather than a full buffer swap.
+        c.push_pending_image(PathBuf::from(".nav/clipboard/abc.png"));
+        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(text, "look at the doc");
+        assert!(images.is_empty(), "stale image leaked: {images:?}");
+    }
+
+    #[test]
+    fn submit_keeps_image_whose_path_is_still_in_buffer() {
+        let mut c = Composer::new();
+        c.push_pending_image(PathBuf::from(".nav/clipboard/abc.png"));
+        c.insert_paste(".nav/clipboard/abc.png ");
+        // User types extra context after the path.
+        for ch in "review this".chars() {
+            c.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
+        }
+        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert!(text.contains(".nav/clipboard/abc.png"));
+        assert_eq!(images, vec![PathBuf::from(".nav/clipboard/abc.png")]);
+    }
+
+    #[test]
+    fn set_text_clears_pending_images() {
+        // Wholesale buffer swap (history recall, slash completion) must drop
+        // queued image attachments — otherwise the next submit silently sends
+        // an image the user can no longer see in the composer.
+        let mut c = Composer::new();
+        c.push_pending_image(PathBuf::from(".nav/clipboard/abcd.png"));
+        c.insert_paste(".nav/clipboard/abcd.png");
+        assert_eq!(c.pending_images.len(), 1);
+        c.set_text("hello world");
+        assert!(c.pending_images.is_empty());
+
+        let ComposerEvent::Submit { text, images } = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(text, "hello world");
+        assert!(images.is_empty());
     }
 
     #[test]
@@ -659,6 +766,25 @@ mod tests {
             c.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
         }
         c
+    }
+
+    #[test]
+    fn move_up_across_multibyte_does_not_panic_on_at_token_probe() {
+        // Regression: type `é` (2 bytes), Shift+Enter to drop to a new line,
+        // type `a`, press Up. Without char-boundary clamping, col=1 on the
+        // first line falls inside `é` and `current_at_token` slices a
+        // non-boundary, crashing the TUI on every key while the @ popup logic
+        // probes after each keystroke.
+        let mut c = Composer::new();
+        c.handle_key(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::empty()));
+        c.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        c.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        c.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        // The probe must not panic; either Some or None is acceptable, the
+        // point is that this call returns at all.
+        let _ = c.current_at_token();
+        // Cursor must land on a real char boundary on the first line.
+        assert!(c.lines[c.row].is_char_boundary(c.col));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod fs;
 mod patch;
 mod shell;
+mod truncate;
 
 use crate::mutation::MutationResult;
 use anyhow::{Result, anyhow};
@@ -8,12 +9,18 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::skills::Catalog;
+use truncate::{TruncateMode, bound};
+
+// `bash` errors tend to appear at the tail (assert failures, panics, traceback
+// footers), so it gets head+tail. `read_file` / `code_search` are head-only
+// because the earliest matches/lines are the most useful.
+const BASH_HEAD_LINES: usize = 200;
 
 pub(super) fn tool_definitions() -> Vec<Value> {
     // These primitives mirror the workshop article, with `apply_patch` as the
     // reviewable multi-file editing path learned from sibling agent projects.
-    // Together they let
-    // the model inspect code, find code, change code, and verify with commands.
+    // Together they let the model inspect code, find code, change code, and
+    // verify with commands.
     vec![
         json!({
             "type": "function",
@@ -128,15 +135,22 @@ pub async fn run_tool(
     // workspace-only.
     let skill_dirs = skills.skill_dirs();
     match name {
-        "read_file" => {
-            fs::read_file(cwd, skill_dirs, string_arg(&input, "path")?).map(ToolResult::text)
-        }
-        "list_files" => {
-            fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?).map(ToolResult::text)
-        }
+        "read_file" => fs::read_file(cwd, skill_dirs, string_arg(&input, "path")?)
+            .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
+        "list_files" => fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?)
+            .map(ToolResult::text),
         "bash" => shell::bash(cwd, timeout_secs, string_arg(&input, "command")?)
             .await
-            .map(ToolResult::text),
+            .map(|out| {
+                ToolResult::text(
+                    bound(
+                        out,
+                        TruncateMode::HeadTail {
+                            head_lines: BASH_HEAD_LINES,
+                        },
+                    ),
+                )
+            }),
         "edit_file" => fs::edit_file_with_metadata(
             cwd,
             string_arg(&input, "path")?,
@@ -151,7 +165,7 @@ pub async fn run_tool(
             string_arg(&input, "path")?,
         )
         .await
-        .map(ToolResult::text),
+        .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -270,6 +284,33 @@ mod tests {
         let parsed: Vec<String> = serde_json::from_str(&result.output).unwrap();
         assert!(parsed.contains(&"a.txt".to_string()));
         assert!(parsed.contains(&"subdir/".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_tool_bash_output_is_bounded() {
+        // A bash command that emits more than MAX_BYTES should come back
+        // truncated with the marker, so it lands the same way in the prompt
+        // and in the session log.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+
+        let result = run_tool(
+            &cwd,
+            &Catalog::default(),
+            10,
+            "bash",
+            json!({"command": "yes hellohello | head -n 20000"}),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.output.contains("[truncated"));
+        assert!(
+            result.output.len() < 80 * 1024,
+            "result was {} bytes",
+            result.output.len()
+        );
+        assert!(result.mutation.is_none());
     }
 
     #[tokio::test]

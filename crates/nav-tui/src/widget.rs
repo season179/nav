@@ -47,9 +47,18 @@ impl ChatWidget {
         model: impl Into<String>,
         cwd: impl Into<String>,
         session_id: impl Into<String>,
+        branch_summary: Option<String>,
+        context_summary: Option<String>,
+        settings_summary: Option<String>,
     ) {
-        self.cells
-            .push(Box::new(WelcomeCell::new(model, cwd, session_id)));
+        self.cells.push(Box::new(WelcomeCell::new(
+            model,
+            cwd,
+            session_id,
+            branch_summary,
+            context_summary,
+            settings_summary,
+        )));
     }
 
     /// Translate an agent event into a history cell and append it.
@@ -59,10 +68,30 @@ impl ChatWidget {
     /// the status bar in `run()`, not by the scrollback widget.
     pub fn ingest(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::UserMessage { text, display_text } => {
+            AgentEvent::UserMessage {
+                text,
+                display_text,
+                attachments: _,
+            } => {
                 self.push_user_event(text, display_text);
             }
             AgentEvent::AssistantMessageDelta { .. } | AgentEvent::TurnComplete { .. } => {}
+            AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason,
+            } => {
+                let secs = delay_ms as f64 / 1000.0;
+                self.cells.push(Box::new(ErrorCell::new(format!(
+                    "provider retry {attempt}/{max_attempts} after {secs:.1}s — {reason}"
+                ))));
+            }
+            AgentEvent::ContextTrimmed { dropped_pairs } => {
+                self.cells.push(Box::new(ErrorCell::new(format!(
+                    "context window exceeded — trimmed {dropped_pairs} oldest tool pair(s) and retried"
+                ))));
+            }
             AgentEvent::AssistantMessageDone { text } => {
                 self.cells.push(Box::new(AssistantMessageCell::new(text)));
             }

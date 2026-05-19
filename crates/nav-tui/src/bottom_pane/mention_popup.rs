@@ -40,6 +40,11 @@ pub struct FileMentionPopup {
     matches: Vec<usize>,
     selected: usize,
     completed: bool,
+    /// The token (without the leading `@`) that produced the current
+    /// `matches` ranking. `set_query` is called on every keystroke via
+    /// `reconcile_popups`; remembering the prior query lets us short-circuit
+    /// a no-op refresh so navigation keys don't reset `selected` to 0.
+    current_query: String,
 }
 
 /// Cap rendered rows so the popup never eats the whole screen on a generic
@@ -54,6 +59,7 @@ impl FileMentionPopup {
             matches: Vec::new(),
             selected: 0,
             completed: false,
+            current_query: String::new(),
         };
         popup.set_query(initial_query);
         popup
@@ -73,8 +79,14 @@ impl FileMentionPopup {
 
     /// Re-rank `entries` against `query` using `nucleo-matcher` and keep the
     /// top [`MAX_VISIBLE`] scores. Empty query surfaces a prefix so the popup
-    /// is never blank.
+    /// is never blank. A no-op call (same query as last time) is a fast
+    /// return — otherwise `reconcile_popups` would reset `selected` to 0 on
+    /// every keystroke, including Up/Down, hiding navigation entirely.
     pub fn set_query(&mut self, query: &str) {
+        if query == self.current_query && !self.matches.is_empty() {
+            return;
+        }
+        self.current_query = query.to_string();
         self.matches.clear();
         if self.entries.is_empty() {
             self.selected = 0;
@@ -166,9 +178,7 @@ impl FileMentionPopup {
                 "  no files match",
                 bg.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             );
-            Paragraph::new(Line::from(hint))
-                .style(bg)
-                .render(area, buf);
+            Paragraph::new(Line::from(hint)).style(bg).render(area, buf);
             return;
         }
 
@@ -286,5 +296,37 @@ mod tests {
     #[test]
     fn quote_path_escapes_embedded_single_quote() {
         assert_eq!(quote_path_if_needed("don't.txt"), "'don'\\''t.txt'");
+    }
+
+    #[test]
+    fn down_navigation_persists_through_reconcile_with_same_query() {
+        // Down arrow advances `selected`; `BottomPane::reconcile_popups` then
+        // calls `set_query` with the same token on every keystroke. Prior to
+        // the no-op guard, this reset `selected` to 0 and the user could
+        // never move past the first row.
+        let mut popup = FileMentionPopup::new(entries(&["a.rs", "b.rs", "c.rs"]), "");
+        assert_eq!(popup.selected, 0);
+        popup.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut Composer::new(),
+        );
+        assert_eq!(popup.selected, 1);
+        // Reconcile: same query → must be a no-op for selection.
+        popup.set_query("");
+        assert_eq!(popup.selected, 1);
+    }
+
+    #[test]
+    fn changing_query_resets_selection() {
+        // Real query changes still reset to 0 so the user lands on the top
+        // ranked result for the new pattern.
+        let mut popup = FileMentionPopup::new(entries(&["alpha", "beta", "gamma"]), "");
+        popup.handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            &mut Composer::new(),
+        );
+        assert_eq!(popup.selected, 1);
+        popup.set_query("ga");
+        assert_eq!(popup.selected, 0);
     }
 }

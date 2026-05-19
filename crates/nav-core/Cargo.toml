@@ -8,6 +8,7 @@ name = "nav_core"
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22.1"
 clap.workspace = true
 dirs.workspace = true
 futures-util.workspace = true

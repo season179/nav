@@ -4,8 +4,89 @@ use super::types::{MessagePart, ResponseEnvelope, ResponseItem};
 use super::*;
 use crate::agent::TurnUsage;
 use crate::cli::Args;
+use crate::project::{ContextFile, ContextScope, ProjectContext};
 use crate::skills::Catalog;
 use serde_json::json;
+use std::path::PathBuf;
+
+// ── detect_context_overflow ───────────────────────────────────
+
+#[test]
+fn detect_context_overflow_matches_top_level_error() {
+    let event = json!({
+        "type": "error",
+        "code": "context_length_exceeded",
+        "message": "Your input exceeds the model's context"
+    });
+    let msg = detect_context_overflow(&event).expect("should detect overflow");
+    assert!(msg.contains("exceeds the model's context"));
+}
+
+#[test]
+fn detect_context_overflow_matches_response_failed_shape() {
+    let event = json!({
+        "type": "response.failed",
+        "response": {
+            "error": {
+                "code": "context_window_exceeded",
+                "message": "Too long"
+            }
+        }
+    });
+    let msg = detect_context_overflow(&event).expect("should detect overflow");
+    assert_eq!(msg, "Too long");
+}
+
+#[test]
+fn detect_context_overflow_ignores_other_error_codes() {
+    let event = json!({
+        "type": "error",
+        "code": "rate_limit_exceeded",
+        "message": "Slow down"
+    });
+    assert!(detect_context_overflow(&event).is_none());
+}
+
+#[test]
+fn detect_context_overflow_ignores_non_error_events() {
+    let event = json!({"type": "response.completed", "response": {}});
+    assert!(detect_context_overflow(&event).is_none());
+}
+
+#[test]
+fn detect_http_overflow_matches_responses_api_error_body() {
+    let body = r#"{"error":{"code":"context_length_exceeded","message":"Your input is 220k tokens; the model supports 200k."}}"#;
+    let msg = detect_http_overflow(body).expect("should match");
+    assert!(msg.contains("220k tokens"));
+}
+
+#[test]
+fn detect_http_overflow_matches_window_alias() {
+    let body = r#"{"error":{"code":"context_window_exceeded","message":"too long"}}"#;
+    assert_eq!(detect_http_overflow(body).as_deref(), Some("too long"));
+}
+
+#[test]
+fn detect_http_overflow_ignores_other_errors() {
+    let body = r#"{"error":{"code":"invalid_request_error","message":"bad model"}}"#;
+    assert!(detect_http_overflow(body).is_none());
+}
+
+#[test]
+fn detect_http_overflow_ignores_non_json_body() {
+    assert!(detect_http_overflow("not json at all").is_none());
+    assert!(detect_http_overflow("").is_none());
+}
+
+#[test]
+fn responses_error_round_trips_to_anyhow() {
+    let err = ResponsesError::ContextWindowExceeded {
+        message: "boom".into(),
+    };
+    let anyhow_err: anyhow::Error = err.into();
+    assert!(anyhow_err.to_string().contains("context window exceeded"));
+    assert!(anyhow_err.to_string().contains("boom"));
+}
 
 // ── response_body ─────────────────────────────────────────────
 
@@ -14,7 +95,7 @@ fn response_body_includes_model_and_store_false() {
     let args = Args::test_default();
     let cwd = std::path::Path::new("/tmp");
     let input = vec![json!({"type": "message", "role": "user", "content": "hi"})];
-    let body = response_body(&args, cwd, &input, &Catalog::default());
+    let body = response_body(&args, cwd, &input, &Catalog::default(), None);
     assert_eq!(body["model"], "test-model");
     assert_eq!(body["store"], false);
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
@@ -26,7 +107,7 @@ fn response_body_includes_model_and_store_false() {
 fn response_body_instructions_contain_cwd() {
     let args = Args::test_default();
     let cwd = std::path::Path::new("/my/project");
-    let body = response_body(&args, cwd, &[], &Catalog::default());
+    let body = response_body(&args, cwd, &[], &Catalog::default(), None);
     let instructions = body["instructions"].as_str().unwrap();
     assert!(instructions.contains("/my/project"));
     // No skills => no available-skills section.
@@ -41,7 +122,7 @@ fn response_body_passes_input_through() {
         json!({"type": "message", "role": "user", "content": "hello"}),
         json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
     ];
-    let body = response_body(&args, cwd, &input, &Catalog::default());
+    let body = response_body(&args, cwd, &input, &Catalog::default(), None);
     let body_input = body["input"].as_array().unwrap();
     assert_eq!(body_input.len(), 2);
     assert_eq!(body_input[1]["call_id"], "c1");
@@ -59,7 +140,7 @@ fn response_body_lists_skills_when_present() {
         skill_dir: "/abs/skills/demo".into(),
         scope: SkillScope::Project,
     }]);
-    let body = response_body(&args, cwd, &[], &catalog);
+    let body = response_body(&args, cwd, &[], &catalog, None);
     let instructions = body["instructions"].as_str().unwrap();
     assert!(instructions.contains("Available skills"));
     assert!(instructions.contains("demo"));
@@ -67,6 +148,51 @@ fn response_body_lists_skills_when_present() {
     assert!(instructions.contains("/abs/skills/demo/SKILL.md"));
     assert!(instructions.contains("/abs/skills/demo"));
     assert!(instructions.contains("read the listed SKILL.md"));
+}
+
+#[test]
+fn response_body_appends_context_files_in_user_then_project_order() {
+    let args = Args::test_default();
+    let cwd = std::path::Path::new("/tmp");
+    let context = ProjectContext {
+        context_files: vec![
+            ContextFile {
+                path: PathBuf::from("/home/me/.agents/AGENTS.md"),
+                display_name: "AGENTS.md".into(),
+                scope: ContextScope::User,
+                bytes: "USER body".into(),
+            },
+            ContextFile {
+                path: PathBuf::from("/tmp/AGENTS.md"),
+                display_name: "AGENTS.md".into(),
+                scope: ContextScope::Project,
+                bytes: "PROJECT body".into(),
+            },
+        ],
+        ..ProjectContext::default()
+    };
+    let body = response_body(&args, cwd, &[], &Catalog::default(), Some(&context));
+    let instructions = body["instructions"].as_str().unwrap();
+    assert!(instructions.contains("Project context follows"));
+    assert!(instructions.contains("USER body"));
+    assert!(instructions.contains("PROJECT body"));
+    // Project body must appear after the user body so it gets the strongest
+    // recency anchor in the instructions.
+    let user_idx = instructions.find("USER body").unwrap();
+    let project_idx = instructions.find("PROJECT body").unwrap();
+    assert!(user_idx < project_idx);
+    assert!(instructions.contains("--- BEGIN AGENTS.md (user) ---"));
+    assert!(instructions.contains("--- END AGENTS.md (project) ---"));
+}
+
+#[test]
+fn response_body_omits_context_section_when_no_files() {
+    let args = Args::test_default();
+    let cwd = std::path::Path::new("/tmp");
+    let context = ProjectContext::default();
+    let body = response_body(&args, cwd, &[], &Catalog::default(), Some(&context));
+    let instructions = body["instructions"].as_str().unwrap();
+    assert!(!instructions.contains("Project context follows"));
 }
 
 // ── function_calls ────────────────────────────────────────────

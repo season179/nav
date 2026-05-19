@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use base64::Engine;
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::future::Future;
@@ -6,24 +7,34 @@ use std::path::Path;
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{AgentEvent, TurnUsage};
+use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::cli::Args;
 use crate::git_diff;
 use crate::mutation::PatchApplyStatus;
-use crate::responses::{self, ResponseCollector};
+use crate::project::ProjectContext;
+use crate::responses::{self, ResponseCollector, ResponsesError};
 use crate::session::{SessionId, SessionStore};
 use crate::skills::Catalog;
 use crate::tools;
 
 /// Stream of raw `Responses` API events yielded by a transport.
-pub type EventStream = Pin<Box<dyn Stream<Item = Result<Value>> + Send>>;
+///
+/// `ResponsesError::ContextWindowExceeded` is the only error variant the agent
+/// loop recovers from; everything else is wrapped in `Other` and surfaces as
+/// an `AgentEvent::Error`.
+pub type EventStream = Pin<Box<dyn Stream<Item = Result<Value, ResponsesError>> + Send>>;
 
 /// Abstraction over the `Responses` API transport so the agent loop can be
 /// driven by either the real WebSocket/SSE client or a test stub.
+///
+/// `events` lets the transport surface durable events (e.g. `ProviderRetry`)
+/// onto the same channel the rest of the agent loop uses, without forcing the
+/// transport to know about session persistence.
 pub trait ResponsesTransport: Send + Sync {
     fn create<'a>(
         &'a self,
         body: Value,
+        events: UnboundedSender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = Result<EventStream>> + Send + 'a>>;
 }
 
@@ -35,14 +46,83 @@ pub struct SessionBinding<'a> {
     pub session_id: SessionId,
 }
 
-fn user_message_event(prompt: &str, display_prompt: Option<&str>) -> AgentEvent {
+fn user_message_event(
+    prompt: &str,
+    display_prompt: Option<&str>,
+    attachments: Vec<UserAttachment>,
+) -> AgentEvent {
     let display_text = display_prompt
         .filter(|display| *display != prompt)
         .map(str::to_string);
     AgentEvent::UserMessage {
         text: prompt.to_string(),
         display_text,
+        attachments,
     }
+}
+
+/// Build the `content` part of a Responses API user message. Plain text turns
+/// stay as a single string (the historical shape); when attachments are
+/// present, return an array of typed content parts so the Responses API can
+/// see `input_text` alongside `input_image`. Images that fail to load are
+/// silently dropped — a bad path shouldn't block the turn.
+pub(super) fn build_user_content(
+    prompt: &str,
+    attachments: &[UserAttachment],
+    cwd: &Path,
+) -> Value {
+    if attachments.is_empty() {
+        return Value::String(prompt.to_string());
+    }
+    let mut parts: Vec<Value> = Vec::with_capacity(1 + attachments.len());
+    parts.push(json!({ "type": "input_text", "text": prompt }));
+    for attach in attachments {
+        match attach {
+            UserAttachment::Image { path } => {
+                if let Some(data_uri) = encode_image_data_uri(cwd, path) {
+                    parts.push(json!({
+                        "type": "input_image",
+                        "image_url": data_uri,
+                    }));
+                }
+            }
+        }
+    }
+    Value::Array(parts)
+}
+
+fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
+    // Defense-in-depth: nav's workspace contract says reads/writes for
+    // user-provided paths stay inside the workspace root. The TUI normally
+    // relativizes / copies pastes into <cwd>/.nav/clipboard/ before queuing
+    // them, but a path with `..` segments or a symlink that resolves outside
+    // would otherwise let us silently base64 arbitrary files (e.g.
+    // ~/.ssh/id_rsa) into the Responses request. Canonicalize both sides and
+    // require containment before reading.
+    let abs = if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        cwd.join(rel)
+    };
+    let canonical = abs.canonicalize().ok()?;
+    let cwd_canonical = cwd.canonicalize().ok()?;
+    if !canonical.starts_with(&cwd_canonical) {
+        return None;
+    }
+    let bytes = std::fs::read(&canonical).ok()?;
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| "png".to_string());
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(format!("data:{mime};base64,{encoded}"))
 }
 
 /// Drives the model/tool loop, emitting one [`AgentEvent`] per observable
@@ -61,22 +141,43 @@ pub async fn run_agent(
     cwd: &Path,
     prompt: &str,
     display_prompt: Option<&str>,
+    attachments: Vec<UserAttachment>,
     events: UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
     initial_input: Option<Vec<Value>>,
     skills: &Catalog,
+    context: Option<&ProjectContext>,
 ) -> Result<()> {
     let mut input = initial_input.unwrap_or_default();
-    emit(&events, session, user_message_event(prompt, display_prompt));
+    let content = build_user_content(prompt, &attachments, cwd);
+    emit(
+        &events,
+        session,
+        user_message_event(prompt, display_prompt, attachments),
+    );
     input.push(json!({
         "type": "message",
         "role": "user",
-        "content": prompt,
+        "content": content,
     }));
 
-    for _ in 0..args.max_turns {
-        let body = responses::response_body(args, cwd, &input, skills);
-        let mut stream = match transport.create(body).await {
+    // One-shot recovery per `run_agent` call. The first overflow drops the
+    // oldest tool pair and retries the turn; a second overflow gives up.
+    let mut overflow_recovery_attempted = false;
+    // Tracked manually so an overflow trim+retry doesn't consume the user's
+    // turn budget — the server rejected our request before any work happened.
+    let mut turns_used = 0usize;
+
+    'turns: loop {
+        if turns_used >= args.max_turns {
+            return fail(
+                &events,
+                session,
+                anyhow!("stopped after {} tool turns", args.max_turns),
+            );
+        }
+        let body = responses::response_body(args, cwd, &input, skills, context);
+        let mut stream = match transport.create(body, events.clone()).await {
             Ok(stream) => stream,
             Err(err) => return fail(&events, session, err),
         };
@@ -85,9 +186,30 @@ pub async fn run_agent(
         loop {
             let event = match stream.next().await {
                 Some(Ok(event)) => event,
-                Some(Err(err)) => {
-                    return fail(&events, session, err);
+                Some(Err(ResponsesError::ContextWindowExceeded { message }))
+                    if !overflow_recovery_attempted =>
+                {
+                    overflow_recovery_attempted = true;
+                    let dropped = drop_oldest_tool_pair(&mut input);
+                    if dropped == 0 {
+                        return fail(
+                            &events,
+                            session,
+                            anyhow!(
+                                "context window exceeded with no prior tool pair to drop: {message}"
+                            ),
+                        );
+                    }
+                    emit(
+                        &events,
+                        session,
+                        AgentEvent::ContextTrimmed {
+                            dropped_pairs: dropped,
+                        },
+                    );
+                    continue 'turns;
                 }
+                Some(Err(err)) => return fail(&events, session, err.into()),
                 None => break,
             };
             emit_stream_events(&event, &events, session);
@@ -212,13 +334,47 @@ pub async fn run_agent(
         ) {
             return fail(&events, session, err);
         }
+        turns_used += 1;
     }
+}
 
-    fail(
-        &events,
-        session,
-        anyhow!("stopped after {} tool turns", args.max_turns),
-    )
+/// Drop the oldest `function_call` + matching `function_call_output` pair from
+/// the conversation `input`. Returns the number of pairs removed (`0` or `1`).
+/// Used for one-shot context-overflow recovery: we shed the oldest tool
+/// exchange and re-issue the turn with a shorter transcript.
+pub(super) fn drop_oldest_tool_pair(input: &mut Vec<Value>) -> usize {
+    let call_pos = input
+        .iter()
+        .position(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+    let Some(call_pos) = call_pos else {
+        return 0;
+    };
+    let call_id = input[call_pos]
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(call_id) = call_id else {
+        // Malformed item — drop just this entry rather than nothing.
+        input.remove(call_pos);
+        return 1;
+    };
+    // Find the matching output anywhere after the call (it usually appears
+    // immediately, but the API sometimes interleaves additional items).
+    let output_pos = input
+        .iter()
+        .enumerate()
+        .skip(call_pos + 1)
+        .find(|(_, item)| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id.as_str())
+        })
+        .map(|(idx, _)| idx);
+    if let Some(out_pos) = output_pos {
+        // Remove output first so the call index stays valid.
+        input.remove(out_pos);
+    }
+    input.remove(call_pos);
+    1
 }
 
 fn fail<T>(
