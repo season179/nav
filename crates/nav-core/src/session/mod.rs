@@ -272,6 +272,23 @@ impl SessionStore {
         Ok(events)
     }
 
+    /// Returns the launch cwd recorded for `session_id` at creation time.
+    /// Replay uses this — not the resumed process's cwd — when resolving
+    /// workspace-relative attachment paths back into bytes, otherwise an
+    /// image saved during a session created in repo A would silently fail
+    /// to attach when the user resumes from repo B.
+    pub fn session_cwd(&self, session_id: &str) -> Result<PathBuf> {
+        let conn = self.lock();
+        let cwd: String = conn
+            .query_row(
+                "SELECT cwd FROM session WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("session not found: {session_id}"))?;
+        Ok(PathBuf::from(cwd))
+    }
+
     /// Lists all sessions, sorted by `updated_at DESC`. Pass `cwd` to scope
     /// the listing to a single working directory.
     pub fn list_sessions(&self, cwd: Option<&Path>) -> Result<Vec<SessionSummary>> {
