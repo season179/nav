@@ -1,6 +1,7 @@
 mod fs;
 mod patch;
 pub mod preflight;
+mod read_filter;
 mod shell;
 pub mod truncate;
 
