@@ -25,7 +25,7 @@ pub fn is_known_model_prefix(model: &str) -> bool {
         .any(|prefix| normalized.starts_with(prefix))
 }
 
-/// Pick up to `limit` names from [`SUGGESTION_POOL`] whose Damerau-Levenshtein
+/// Pick up to `limit` names from [`SUGGESTION_POOL`] whose Levenshtein
 /// distance to `model` is small enough to be worth showing. Returns an empty
 /// vec when nothing is close — better silent than misleading.
 pub fn suggest_models(model: &str, limit: usize) -> Vec<&'static str> {
@@ -52,17 +52,17 @@ pub fn suggest_models(model: &str, limit: usize) -> Vec<&'static str> {
         .collect()
 }
 
-/// Format a suggestion list as `"did you mean `a`, `b`, or `c`?"`. Returns
-/// the empty string when there are no suggestions so callers can append
-/// unconditionally.
-pub fn did_you_mean(model: &str) -> String {
+/// Format a "did you mean…?" suggestion list. Returns `None` when nothing
+/// is close enough to be worth showing — callers decide how to splice it
+/// into the surrounding sentence.
+pub fn did_you_mean(model: &str) -> Option<String> {
     let suggestions = suggest_models(model, 3);
     match suggestions.as_slice() {
-        [] => String::new(),
-        [one] => format!(" Did you mean `{one}`?"),
-        [a, b] => format!(" Did you mean `{a}` or `{b}`?"),
-        [a, b, c] => format!(" Did you mean `{a}`, `{b}`, or `{c}`?"),
-        _ => String::new(),
+        [] => None,
+        [one] => Some(format!("Did you mean `{one}`?")),
+        [a, b] => Some(format!("Did you mean `{a}` or `{b}`?")),
+        [a, b, c] => Some(format!("Did you mean `{a}`, `{b}`, or `{c}`?")),
+        _ => None,
     }
 }
 
@@ -142,10 +142,10 @@ mod tests {
 
     #[test]
     fn did_you_mean_formats_for_zero_and_many() {
-        assert_eq!(did_you_mean("totally-unrelated-name"), "");
-        assert!(did_you_mean("gpt-55").starts_with(" Did you mean"));
-        // Multiple close matches — the format string should be valid English.
-        let multi = did_you_mean("gpt-4");
+        assert_eq!(did_you_mean("totally-unrelated-name"), None);
+        let one = did_you_mean("gpt-55").expect("expected suggestion");
+        assert!(one.starts_with("Did you mean"));
+        let multi = did_you_mean("gpt-4").expect("expected suggestions");
         assert!(multi.contains("Did you mean"));
         // No trailing whitespace.
         assert_eq!(multi.trim_end(), multi);

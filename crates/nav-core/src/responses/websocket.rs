@@ -68,8 +68,7 @@ fn reclassify_handshake_error(err: tokio_tungstenite::tungstenite::Error) -> Tra
         // Same "did you mean…?" enrichment as the SSE 4xx path so the
         // websocket transport surfaces an actionable hint rather than the
         // bare provider blob.
-        let hint = model_hint_from_body(&body);
-        if !hint.is_empty() {
+        if let Some(hint) = model_hint_from_body(&body) {
             let status = response.status();
             let retry_after = response
                 .headers()
@@ -79,7 +78,7 @@ fn reclassify_handshake_error(err: tokio_tungstenite::tungstenite::Error) -> Tra
             return TransportError::Http {
                 status,
                 retry_after,
-                body: format!("{body}{hint}"),
+                body: format!("{body} {hint}"),
             };
         }
     }

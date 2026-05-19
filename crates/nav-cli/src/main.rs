@@ -42,11 +42,12 @@ async fn main() -> Result<()> {
     let project = Arc::new(load_project_context(&cwd));
     args.apply_settings(&project.settings, &provided);
 
-    // Typo guard: a model name that doesn't match any known family prefix is
-    // *probably* a typo. Warn (don't fail) so the user still gets the
-    // provider's authoritative answer if they meant a brand-new model.
     if !models::is_known_model_prefix(&args.model) {
-        let hint = models::did_you_mean(&args.model);
+        // Warn (not error) — a brand-new model the provider supports but
+        // nav's prefix list hasn't learned about yet should still work.
+        let hint = models::did_you_mean(&args.model)
+            .map(|h| format!(" {h}"))
+            .unwrap_or_default();
         eprintln!(
             "nav: --model `{}` doesn't match any known family prefix.{hint}",
             args.model
@@ -212,7 +213,7 @@ fn doctor_command(args: &Args, json: bool) -> Result<()> {
     } else {
         print!("{}", report.render_text());
     }
-    if report.has_failures {
+    if report.has_failures() {
         std::process::exit(1);
     }
     Ok(())
@@ -377,27 +378,26 @@ fn run_upgrade() -> Result<()> {
         bail!("`cargo install` exited with {status}");
     }
 
-    // Verify the reinstall actually took effect by running the new binary
-    // and parsing its --version. Without this step, a silent PATH-shim
-    // mismatch (where an older `nav` shadows cargo's install dir) would
-    // happily print "nav reinstalled." while leaving the user on the
-    // previous version.
+    // A silent PATH-shim mismatch — an older `nav` shadowing cargo's install
+    // dir — would happily say "reinstalled" while leaving the user on the
+    // old version. Compare the resolved binary's dir to cargo's install dir
+    // and warn if they don't agree.
     let resolved = doctor::which_on_path("nav");
     let cargo_bin_dir = doctor::cargo_install_bin_dir();
-    if let (Some(resolved_path), Some(install_dir)) = (resolved.as_ref(), cargo_bin_dir.as_ref())
-        && resolved_path.parent() != Some(install_dir.as_path())
-    {
-        eprintln!(
-            "nav: warning — resolved `nav` ({}) is outside cargo's install dir ({}). \
+    if let (Some(resolved_path), Some(install_dir)) = (resolved.as_ref(), cargo_bin_dir.as_ref()) {
+        let resolved_parent = resolved_path.parent();
+        if resolved_parent != Some(install_dir.as_path()) {
+            eprintln!(
+                "nav: warning — resolved `nav` ({}) is outside cargo's install dir ({}). \
                  Update your PATH to include {} before {}, or remove the shim binary.",
-            resolved_path.display(),
-            install_dir.display(),
-            install_dir.display(),
-            resolved_path
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-        );
+                resolved_path.display(),
+                install_dir.display(),
+                install_dir.display(),
+                resolved_parent
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            );
+        }
     }
 
     let post_version = resolved

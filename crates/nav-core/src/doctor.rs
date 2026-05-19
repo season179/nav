@@ -10,8 +10,9 @@
 
 use crate::auth::AuthConfig;
 use crate::cli::{Args, AuthMode, SandboxMode};
-use crate::project::ProjectContext;
+use crate::project::{ProjectContext, shorten_home};
 use crate::session::resolved_db_path;
+use clap::ValueEnum;
 use serde::Serialize;
 use std::env;
 use std::fs;
@@ -73,12 +74,17 @@ pub struct DoctorCheck {
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorReport {
     pub checks: Vec<DoctorCheck>,
-    /// True when at least one row failed. Callers use this as the process
-    /// exit code so `nav doctor` is scriptable.
-    pub has_failures: bool,
 }
 
 impl DoctorReport {
+    /// True when at least one row failed. `nav doctor` uses this as the
+    /// process exit code so the command is scriptable.
+    pub fn has_failures(&self) -> bool {
+        self.checks
+            .iter()
+            .any(|c| matches!(c.status, DoctorStatus::Fail))
+    }
+
     /// Render as `[ok]/[warn]/[fail] group/label — detail`, grouped by section
     /// with a one-line header per group. Mirrors what a human-grade health
     /// dashboard would print.
@@ -105,8 +111,6 @@ impl DoctorReport {
     }
 }
 
-/// Builder used by the run function so individual checks can be unit-tested
-/// in isolation against a synthetic input. The CLI just calls [`run`].
 struct DoctorBuilder {
     checks: Vec<DoctorCheck>,
 }
@@ -114,6 +118,18 @@ struct DoctorBuilder {
 impl DoctorBuilder {
     fn new() -> Self {
         Self { checks: Vec::new() }
+    }
+
+    fn ok(&mut self, group: DoctorGroup, label: impl Into<String>, detail: impl Into<String>) {
+        self.push(group, label, DoctorStatus::Ok, detail);
+    }
+
+    fn warn(&mut self, group: DoctorGroup, label: impl Into<String>, detail: impl Into<String>) {
+        self.push(group, label, DoctorStatus::Warn, detail);
+    }
+
+    fn fail(&mut self, group: DoctorGroup, label: impl Into<String>, detail: impl Into<String>) {
+        self.push(group, label, DoctorStatus::Fail, detail);
     }
 
     fn push(
@@ -131,14 +147,28 @@ impl DoctorBuilder {
         });
     }
 
+    /// Look up a binary on `PATH` and record either an `ok` row with the
+    /// resolved path or a `missing_status` row (warn/fail) with
+    /// `missing_detail`. Collapses the repeated `match which → Some/None →
+    /// ok/fail` triplet that doctor's runtime checks would otherwise repeat
+    /// once per binary.
+    fn check_on_path(
+        &mut self,
+        group: DoctorGroup,
+        label: &'static str,
+        ok_template: impl FnOnce(&Path) -> String,
+        missing_status: DoctorStatus,
+        missing_detail: &'static str,
+    ) {
+        match which_on_path(label) {
+            Some(path) => self.ok(group, label, ok_template(&path)),
+            None => self.push(group, label, missing_status, missing_detail),
+        }
+    }
+
     fn finish(self) -> DoctorReport {
-        let has_failures = self
-            .checks
-            .iter()
-            .any(|c| matches!(c.status, DoctorStatus::Fail));
         DoctorReport {
             checks: self.checks,
-            has_failures,
         }
     }
 }
@@ -162,121 +192,84 @@ fn check_runtime(b: &mut DoctorBuilder, args: &Args) {
     // `rg` is invoked by the `code_search` tool and nothing in Cargo.toml
     // surfaces that dependency. A missing binary turns every search call
     // into a confusing "command not found" trace, so doctor flags it loud.
-    match which_on_path("rg") {
-        Some(path) => b.push(
-            DoctorGroup::Runtime,
-            "rg",
-            DoctorStatus::Ok,
-            format!("ripgrep on PATH at {}", path.display()),
-        ),
-        None => b.push(
-            DoctorGroup::Runtime,
-            "rg",
-            DoctorStatus::Fail,
-            "ripgrep not on PATH — install with `brew install ripgrep` or your distro equivalent",
-        ),
-    }
-    match which_on_path("cargo") {
-        Some(path) => b.push(
-            DoctorGroup::Runtime,
-            "cargo",
-            DoctorStatus::Ok,
-            format!("cargo on PATH at {}", path.display()),
-        ),
-        None => b.push(
-            DoctorGroup::Runtime,
-            "cargo",
-            DoctorStatus::Warn,
-            "cargo not on PATH — `nav update` will fail until rustup/cargo is installed",
-        ),
-    }
+    b.check_on_path(
+        DoctorGroup::Runtime,
+        "rg",
+        |p| format!("ripgrep on PATH at {}", p.display()),
+        DoctorStatus::Fail,
+        "ripgrep not on PATH — install with `brew install ripgrep` or your distro equivalent",
+    );
+    b.check_on_path(
+        DoctorGroup::Runtime,
+        "cargo",
+        |p| format!("cargo on PATH at {}", p.display()),
+        DoctorStatus::Warn,
+        "cargo not on PATH — `nav update` will fail until rustup/cargo is installed",
+    );
     if cfg!(target_os = "macos") {
-        match which_on_path("sandbox-exec") {
-            Some(path) => b.push(
-                DoctorGroup::Runtime,
-                "sandbox-exec",
-                DoctorStatus::Ok,
-                format!("Seatbelt available at {}", path.display()),
-            ),
-            None => b.push(
-                DoctorGroup::Runtime,
-                "sandbox-exec",
-                DoctorStatus::Fail,
-                "sandbox-exec missing — macOS sandbox cannot be enforced",
-            ),
-        }
+        b.check_on_path(
+            DoctorGroup::Runtime,
+            "sandbox-exec",
+            |p| format!("Seatbelt available at {}", p.display()),
+            DoctorStatus::Fail,
+            "sandbox-exec missing — macOS sandbox cannot be enforced",
+        );
     }
-    let sandbox_label = match args.sandbox {
-        SandboxMode::ReadOnly => "read-only",
-        SandboxMode::WorkspaceWrite => "workspace-write",
-        SandboxMode::DangerFullAccess => "danger-full-access",
-    };
-    let status = if args.dangerously_bypass_approvals_and_sandbox
-        || matches!(args.sandbox, SandboxMode::DangerFullAccess)
-    {
+
+    let sandbox_label = value_enum_label(args.sandbox);
+    let bypassing = args.dangerously_bypass_approvals_and_sandbox;
+    let status = if bypassing || matches!(args.sandbox, SandboxMode::DangerFullAccess) {
         DoctorStatus::Warn
     } else {
         DoctorStatus::Ok
     };
-    let detail = if args.dangerously_bypass_approvals_and_sandbox {
+    let detail = if bypassing {
         format!("{sandbox_label} (--dangerously-bypass-approvals-and-sandbox active)")
     } else {
-        sandbox_label.to_string()
+        sandbox_label.clone()
     };
     b.push(DoctorGroup::Runtime, "sandbox mode", status, detail);
+}
+
+/// Reuse clap's `kebab-case` rename for `SandboxMode` / `AuthMode` so a new
+/// variant gets the right kebab name automatically — no second source of
+/// truth in this module. `to_possible_value()` owns the underlying buffer,
+/// so the value has to be returned as an owned `String`.
+fn value_enum_label<V: ValueEnum>(mode: V) -> String {
+    mode.to_possible_value()
+        .expect("type derives ValueEnum with one PossibleValue per variant")
+        .get_name()
+        .to_string()
 }
 
 // ── auth ────────────────────────────────────────────────────────────
 
 fn check_auth(b: &mut DoctorBuilder, args: &Args) {
-    let mode = match args.auth {
-        AuthMode::Chatgpt => "chatgpt",
-        AuthMode::ApiKey => "api-key",
-    };
-    b.push(
+    b.ok(
         DoctorGroup::Auth,
         "active mode",
-        DoctorStatus::Ok,
-        format!("--auth {mode}"),
+        format!("--auth {}", value_enum_label(args.auth)),
     );
-
     match crate::auth::load_auth(args) {
-        Ok(config) => {
-            b.push(
-                DoctorGroup::Auth,
-                "credential",
-                DoctorStatus::Ok,
-                redacted_summary(args, &config),
-            );
-        }
-        Err(err) => {
-            b.push(
-                DoctorGroup::Auth,
-                "credential",
-                DoctorStatus::Fail,
-                format!("{err:#}"),
-            );
-        }
+        Ok(config) => b.ok(
+            DoctorGroup::Auth,
+            "credential",
+            redacted_summary(args, &config),
+        ),
+        Err(err) => b.fail(DoctorGroup::Auth, "credential", format!("{err:#}")),
     }
 }
 
 fn redacted_summary(args: &Args, config: &AuthConfig) -> String {
     let endpoint = &config.http_base_url;
     let bearer_len = config.bearer.len();
-    let suffix: String = config.bearer.chars().rev().take(4).collect();
-    let suffix: String = suffix.chars().rev().collect();
-    match args.auth {
-        AuthMode::ApiKey => {
-            format!(
-                "OPENAI_API_KEY resolved (len {bearer_len}, ends …{suffix}); endpoint {endpoint}"
-            )
-        }
-        AuthMode::Chatgpt => {
-            format!(
-                "ChatGPT OAuth token resolved (len {bearer_len}, ends …{suffix}); endpoint {endpoint}"
-            )
-        }
-    }
+    let suffix_start = config.bearer.len().saturating_sub(4);
+    let suffix: String = config.bearer[suffix_start..].chars().collect();
+    let credential = match args.auth {
+        AuthMode::ApiKey => "OPENAI_API_KEY resolved",
+        AuthMode::Chatgpt => "ChatGPT OAuth token resolved",
+    };
+    format!("{credential} (len {bearer_len}, ends …{suffix}); endpoint {endpoint}")
 }
 
 // ── storage ─────────────────────────────────────────────────────────
@@ -285,34 +278,27 @@ fn check_storage(b: &mut DoctorBuilder, args: &Args) {
     let resolved = match resolved_db_path(args.db_path.clone()) {
         Ok(path) => path,
         Err(err) => {
-            b.push(
+            b.fail(
                 DoctorGroup::Storage,
                 "db path",
-                DoctorStatus::Fail,
                 format!("could not resolve session DB path: {err:#}"),
             );
             return;
         }
     };
-    b.push(
-        DoctorGroup::Storage,
-        "db path",
-        DoctorStatus::Ok,
-        format!("{}", resolved.display()),
-    );
+    b.ok(DoctorGroup::Storage, "db path", shorten_home(&resolved));
     let parent = resolved.parent().unwrap_or(Path::new("."));
+    let parent_display = shorten_home(parent);
     match write_probe(parent) {
-        Ok(()) => b.push(
+        Ok(()) => b.ok(
             DoctorGroup::Storage,
             "writable",
-            DoctorStatus::Ok,
-            format!("{} is writable", parent.display()),
+            format!("{parent_display} is writable"),
         ),
-        Err(err) => b.push(
+        Err(err) => b.fail(
             DoctorGroup::Storage,
             "writable",
-            DoctorStatus::Fail,
-            format!("cannot write under {}: {err}", parent.display()),
+            format!("cannot write under {parent_display}: {err}"),
         ),
     }
 }
@@ -330,91 +316,55 @@ fn write_probe(dir: &Path) -> Result<(), String> {
 // ── project ─────────────────────────────────────────────────────────
 
 fn check_project(b: &mut DoctorBuilder, cwd: &Path, project: &ProjectContext) {
-    b.push(
-        DoctorGroup::Project,
-        "cwd",
-        DoctorStatus::Ok,
-        cwd.display().to_string(),
-    );
-    let git_summary = if project.workspace.is_repo {
-        project
-            .branch_summary()
-            .unwrap_or_else(|| "(detached HEAD)".to_string())
-    } else {
-        "not a git repository".to_string()
-    };
-    let git_status = if project.workspace.is_repo {
-        DoctorStatus::Ok
-    } else {
-        DoctorStatus::Warn
-    };
-    b.push(DoctorGroup::Project, "git", git_status, git_summary);
+    b.ok(DoctorGroup::Project, "cwd", shorten_home(cwd));
 
-    let context_detail = project
-        .context_summary()
-        .unwrap_or_else(|| "no AGENTS.md or CLAUDE.md discovered".to_string());
-    let context_status = if project.context_files.is_empty() {
-        DoctorStatus::Warn
+    if project.workspace.is_repo {
+        let summary = project
+            .branch_summary()
+            .unwrap_or_else(|| "(detached HEAD)".to_string());
+        b.ok(DoctorGroup::Project, "git", summary);
     } else {
-        DoctorStatus::Ok
-    };
-    b.push(
-        DoctorGroup::Project,
-        "context files",
-        context_status,
-        context_detail,
-    );
+        b.warn(DoctorGroup::Project, "git", "not a git repository");
+    }
+
+    match project.context_summary() {
+        Some(summary) => b.ok(DoctorGroup::Project, "context files", summary),
+        None => b.warn(
+            DoctorGroup::Project,
+            "context files",
+            "no AGENTS.md or CLAUDE.md discovered",
+        ),
+    }
 
     let settings_detail = project
         .settings_summary(cwd)
         .unwrap_or_else(|| "no .nav/settings.json found (project or user)".to_string());
-    b.push(
-        DoctorGroup::Project,
-        "settings",
-        DoctorStatus::Ok,
-        settings_detail,
-    );
+    b.ok(DoctorGroup::Project, "settings", settings_detail);
 }
 
 // ── install ─────────────────────────────────────────────────────────
 
 fn check_install(b: &mut DoctorBuilder) {
-    let version = env!("CARGO_PKG_VERSION");
-    b.push(
+    b.ok(
         DoctorGroup::Install,
         "version",
-        DoctorStatus::Ok,
-        format!("nav {version}"),
+        format!("nav {}", env!("CARGO_PKG_VERSION")),
     );
-
-    match which_on_path("nav") {
-        Some(path) => b.push(
-            DoctorGroup::Install,
-            "resolved binary",
-            DoctorStatus::Ok,
-            path.display().to_string(),
-        ),
-        None => b.push(
-            DoctorGroup::Install,
-            "resolved binary",
-            DoctorStatus::Warn,
-            "nav not on PATH — running from cargo target dir is fine, otherwise add cargo's bin dir to PATH",
-        ),
-    }
+    b.check_on_path(
+        DoctorGroup::Install,
+        "nav",
+        |p| shorten_home(p),
+        DoctorStatus::Warn,
+        "nav not on PATH — running from cargo target dir is fine, otherwise add cargo's bin dir to PATH",
+    );
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     if Path::new(manifest_dir).exists() {
-        b.push(
-            DoctorGroup::Install,
-            "manifest dir",
-            DoctorStatus::Ok,
-            manifest_dir.to_string(),
-        );
+        b.ok(DoctorGroup::Install, "manifest dir", manifest_dir);
     } else {
-        b.push(
+        b.fail(
             DoctorGroup::Install,
             "manifest dir",
-            DoctorStatus::Fail,
             format!(
                 "manifest dir {manifest_dir} no longer exists — `nav update` will fail; reinstall from a current checkout"
             ),
@@ -502,7 +452,6 @@ mod tests {
     use super::*;
     use crate::cli::{Args, AuthMode, SandboxMode};
     use crate::project::ProjectContext;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn args_with_poisoned_codex_home() -> Args {
@@ -532,10 +481,8 @@ mod tests {
                     detail: "--auth chatgpt".into(),
                 },
             ],
-            has_failures: false,
         };
         let text = report.render_text();
-        // Groups are headed and each row uses the [tag] label — detail format.
         assert!(text.contains("runtime\n  [ok] rg — /opt/homebrew/bin/rg"));
         assert!(text.contains("auth\n  [warn] active mode — --auth chatgpt"));
     }
@@ -543,18 +490,16 @@ mod tests {
     #[test]
     fn has_failures_when_any_check_fails() {
         let mut b = DoctorBuilder::new();
-        b.push(DoctorGroup::Runtime, "x", DoctorStatus::Ok, "ok");
-        b.push(DoctorGroup::Runtime, "y", DoctorStatus::Fail, "boom");
-        let report = b.finish();
-        assert!(report.has_failures);
+        b.ok(DoctorGroup::Runtime, "x", "ok");
+        b.fail(DoctorGroup::Runtime, "y", "boom");
+        assert!(b.finish().has_failures());
     }
 
     #[test]
     fn has_failures_false_when_only_warns() {
         let mut b = DoctorBuilder::new();
-        b.push(DoctorGroup::Runtime, "x", DoctorStatus::Warn, "shrug");
-        let report = b.finish();
-        assert!(!report.has_failures);
+        b.warn(DoctorGroup::Runtime, "x", "shrug");
+        assert!(!b.finish().has_failures());
     }
 
     #[test]
@@ -566,8 +511,7 @@ mod tests {
         let args = args_with_poisoned_codex_home();
         let project = ProjectContext::default();
         let report = run(&args, tmp.path(), &project);
-        // Auth must have failed because the poisoned codex_home has no auth.json.
-        assert!(report.has_failures);
+        assert!(report.has_failures());
         let auth_fail = report
             .checks
             .iter()
@@ -667,11 +611,5 @@ mod tests {
         } else {
             unsafe { env::remove_var("CARGO_INSTALL_ROOT") };
         }
-    }
-
-    #[allow(dead_code)]
-    fn _path_buf_is_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<PathBuf>();
     }
 }

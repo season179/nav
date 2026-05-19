@@ -44,11 +44,9 @@ pub(super) async fn connect_sse(
     // 4xx for an unknown model is a common foot-gun; append a "did you mean…?"
     // hint so the operator sees the provider's authoritative error *and* a
     // concrete next step instead of just the raw JSON blob.
-    let hint = model_hint_from_body(&body_text);
-    let body = if hint.is_empty() {
-        body_text
-    } else {
-        format!("{body_text}{hint}")
+    let body = match model_hint_from_body(&body_text) {
+        Some(hint) => format!("{body_text} {hint}"),
+        None => body_text,
     };
     Err(TransportError::Http {
         status,

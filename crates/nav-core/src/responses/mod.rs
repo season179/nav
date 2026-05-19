@@ -91,18 +91,15 @@ pub(crate) fn detect_context_overflow(event: &Value) -> Option<String> {
     }
 }
 
-/// Returns a "did you mean" hint when an HTTP error body looks like a
-/// provider rejection of an unknown model. Empty string when nothing
-/// matches — callers append unconditionally. Recognized shapes:
+/// Returns a "did you mean…?" hint when an HTTP error body looks like a
+/// provider rejection of an unknown model. `None` means "no enrichment" —
+/// callers splice the hint into the surrounding message themselves.
+/// Recognized shapes:
 /// `{"error": {"code": "model_not_found", "message": "..."}}` and
 /// `{"error": {"type": "invalid_request_error", "message": "...model `gpt-…` does not exist..."}}`.
-pub(crate) fn model_hint_from_body(body: &str) -> String {
-    let Ok(json) = serde_json::from_str::<Value>(body) else {
-        return String::new();
-    };
-    let Some(err) = json.get("error") else {
-        return String::new();
-    };
+pub(crate) fn model_hint_from_body(body: &str) -> Option<String> {
+    let json: Value = serde_json::from_str(body).ok()?;
+    let err = json.get("error")?;
     let code = err.get("code").and_then(Value::as_str).unwrap_or_default();
     let typ = err.get("type").and_then(Value::as_str).unwrap_or_default();
     let message = err
@@ -115,9 +112,9 @@ pub(crate) fn model_hint_from_body(body: &str) -> String {
             && message.contains("model")
             && (message.contains("does not exist") || message.contains("not found")));
     if !looks_like_model_error {
-        return String::new();
+        return None;
     }
-    let attempted = extract_quoted_model(message).unwrap_or_default();
+    let attempted = extract_quoted_model(message)?;
     crate::models::did_you_mean(&attempted)
 }
 
