@@ -10,7 +10,15 @@ use crate::session::ExportFormat;
 // clap turns this struct into the CLI. Keeping options small makes the
 // educational path clear: model choice, auth choice, loop limit, and prompt.
 #[derive(Parser, Debug, Clone)]
-#[command(about = "A tiny Rust coding agent using the Responses API")]
+#[command(
+    name = "nav",
+    about = "A tiny Rust coding agent using the Responses API",
+    // Wire clap to the workspace version so `nav --version` is usable
+    // both by humans and by `run_upgrade`'s post-install verification.
+    // `name = "nav"` overrides clap's default of CARGO_PKG_NAME (which is
+    // "nav-core" here because Args lives in nav-core).
+    version
+)]
 pub struct Args {
     /// Model to use.
     #[arg(default_value = "gpt-5.5", long)]

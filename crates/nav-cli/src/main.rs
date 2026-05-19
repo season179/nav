@@ -22,9 +22,6 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let (mut args, provided) = Args::parse_with_sources();
-    if let Some(command) = args.command.clone() {
-        return run_cli_command(&args, command);
-    }
     if args.list_sessions {
         return list_sessions_command(&args);
     }
@@ -41,6 +38,13 @@ async fn main() -> Result<()> {
     // from settings, but a settings file can fill defaults.
     let project = Arc::new(load_project_context(&cwd));
     args.apply_settings(&project.settings, &provided);
+
+    // Subcommands run with the same merged args + project context the agent
+    // loop would see, so `nav doctor` and `nav export` reflect a configured
+    // project's `.nav/settings.json` instead of bare clap defaults.
+    if let Some(command) = args.command.clone() {
+        return run_cli_command(&args, &cwd, project.as_ref(), command);
+    }
 
     if !models::is_known_model_prefix(&args.model) {
         // Warn (not error) — a brand-new model the provider supports but
@@ -185,26 +189,28 @@ async fn main() -> Result<()> {
     result
 }
 
-fn run_cli_command(args: &Args, command: CliCommand) -> Result<()> {
+fn run_cli_command(
+    args: &Args,
+    cwd: &Path,
+    project: &ProjectContext,
+    command: CliCommand,
+) -> Result<()> {
     match command {
         CliCommand::Export {
             session_id,
             format,
             out,
         } => export_command(args, &session_id, format, out),
-        CliCommand::Doctor { json } => doctor_command(args, json),
+        CliCommand::Doctor { json } => doctor_command(args, cwd, project, json),
     }
 }
 
-/// Run every doctor check and exit non-zero on any `[fail]` row. Doctor runs
-/// *before* the agent loop, so the project context is loaded once here from
-/// the launch cwd — same code path the agent loop uses.
-fn doctor_command(args: &Args, json: bool) -> Result<()> {
-    let cwd = env::current_dir()
-        .and_then(|p| p.canonicalize())
-        .context("failed to canonicalize current directory")?;
-    let project = load_project_context(&cwd);
-    let report = doctor::run(args, &cwd, &project);
+/// Run every doctor check and exit non-zero on any `[fail]` row. The
+/// settings-merged `args` and pre-loaded `project` come from the caller so
+/// doctor reports the same configuration the agent loop would see — not the
+/// bare clap defaults.
+fn doctor_command(args: &Args, cwd: &Path, project: &ProjectContext, json: bool) -> Result<()> {
+    let report = doctor::run(args, cwd, project);
     if json {
         println!(
             "{}",
