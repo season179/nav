@@ -274,8 +274,12 @@ fn check_auth(b: &mut DoctorBuilder, args: &Args) {
 fn redacted_summary(args: &Args, config: &AuthConfig) -> String {
     let endpoint = &config.http_base_url;
     let bearer_len = config.bearer.len();
-    let suffix_start = config.bearer.len().saturating_sub(4);
-    let suffix: String = config.bearer[suffix_start..].chars().collect();
+    // Take the last 4 *chars*, not bytes — byte indexing panics if a
+    // non-ASCII character straddles the offset, which would crash the very
+    // command meant to diagnose malformed credentials.
+    let mut suffix_chars: Vec<char> = config.bearer.chars().rev().take(4).collect();
+    suffix_chars.reverse();
+    let suffix: String = suffix_chars.into_iter().collect();
     let credential = match args.auth {
         AuthMode::ApiKey => "OPENAI_API_KEY resolved",
         AuthMode::Chatgpt => "ChatGPT OAuth token resolved",
@@ -297,6 +301,18 @@ fn check_storage(b: &mut DoctorBuilder, args: &Args) {
             return;
         }
     };
+    // `:memory:` is a valid SQLite target that needs no disk write — the
+    // generic writability probe would otherwise touch the launch cwd and
+    // could report a spurious fail in a read-only directory.
+    if resolved == Path::new(":memory:") {
+        b.ok(DoctorGroup::Storage, "db path", ":memory:");
+        b.ok(
+            DoctorGroup::Storage,
+            "writable",
+            "in-memory database — no filesystem write needed",
+        );
+        return;
+    }
     b.ok(DoctorGroup::Storage, "db path", shorten_home(&resolved));
     let parent = resolved.parent().unwrap_or(Path::new("."));
     let parent_display = shorten_home(parent);
@@ -528,6 +544,45 @@ mod tests {
             .find(|c| matches!(c.group, DoctorGroup::Auth) && c.label == "credential")
             .expect("expected auth credential row");
         assert!(matches!(auth_fail.status, DoctorStatus::Fail));
+    }
+
+    #[test]
+    fn redacted_summary_handles_non_ascii_bearer() {
+        // Slicing by byte offset on a non-ASCII string panics; the suffix
+        // must come from a char-aware iterator instead.
+        let config = AuthConfig {
+            http_base_url: "https://api.openai.com/v1".into(),
+            websocket_url: "wss://api.openai.com/v1/responses".into(),
+            bearer: "abc😀de".into(),
+        };
+        let mut args = Args::test_default();
+        args.auth = AuthMode::ApiKey;
+        let summary = redacted_summary(&args, &config);
+        assert!(summary.contains("…"));
+        assert!(summary.contains("de"));
+    }
+
+    #[test]
+    fn check_storage_special_cases_memory_db() {
+        let mut args = Args::test_default();
+        args.db_path = Some(std::path::PathBuf::from(":memory:"));
+        let mut b = DoctorBuilder::new();
+        check_storage(&mut b, &args);
+        let storage_rows: Vec<_> = b
+            .checks
+            .iter()
+            .filter(|c| matches!(c.group, DoctorGroup::Storage))
+            .collect();
+        assert_eq!(storage_rows.len(), 2);
+        // Neither row probes the filesystem; both are ok.
+        for row in &storage_rows {
+            assert!(
+                matches!(row.status, DoctorStatus::Ok),
+                "row {} unexpectedly status {:?}",
+                row.label,
+                row.status
+            );
+        }
     }
 
     #[test]
