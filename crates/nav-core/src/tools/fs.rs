@@ -6,10 +6,19 @@ use std::{
 use tokio::process::Command;
 
 use super::ToolResult;
+use super::truncate::{GREP_MAX_LINE_LENGTH, truncate_line};
 use crate::mutation::{FileChangeKind, FileChangeSummary, MutationResult, summarize_changes};
 use crate::permissions::protected::{
     PROTECTED_READ_GLOBS, is_protected_metadata_write, is_protected_read,
 };
+
+/// Max grep matches returned to the model. Larger searches surface a
+/// trailer noting the dropped count so the model can refine the query
+/// rather than scrolling through pages of hits.
+const CODE_SEARCH_MAX_MATCHES: usize = 100;
+
+/// Max directory entries returned by `list_files`. Mirrors pi's `ls` cap.
+const LIST_FILES_MAX_ENTRIES: usize = 500;
 
 /// Post-canonicalize symlink-bypass check: refuse only when the resolved
 /// path lands under protected metadata via indirection (raw request didn't
@@ -212,7 +221,24 @@ pub(super) fn list_files(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Resu
         })
         .collect::<Result<Vec<_>>>()?;
     entries.sort();
-    Ok(serde_json::to_string_pretty(&entries)?)
+    apply_list_files_cap(entries)
+}
+
+/// Cap a sorted entry list to `LIST_FILES_MAX_ENTRIES` before serializing it
+/// as pretty JSON, appending a single-line trailer when entries were dropped.
+/// The trailer lives outside the JSON document so callers that already parse
+/// the array can ignore it; the model just reads it as plain text.
+fn apply_list_files_cap(mut entries: Vec<String>) -> Result<String> {
+    let total = entries.len();
+    let dropped = total.saturating_sub(LIST_FILES_MAX_ENTRIES);
+    if dropped > 0 {
+        entries.truncate(LIST_FILES_MAX_ENTRIES);
+    }
+    let mut out = serde_json::to_string_pretty(&entries)?;
+    if dropped > 0 {
+        out.push_str(&format!("\n[truncated {dropped} of {total} entries]\n"));
+    }
+    Ok(out)
 }
 
 pub(super) fn edit_file_with_metadata(
@@ -312,10 +338,35 @@ pub(super) async fn code_search(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() || output.status.code() == Some(1) {
-        Ok(stdout.into_owned())
+        Ok(apply_code_search_caps(&stdout))
     } else {
         Ok(format!("rg failed: {stderr}"))
     }
+}
+
+/// Clip each match line and cap the result at `CODE_SEARCH_MAX_MATCHES`.
+/// Runs before the global `bound(.., Head)` so the global byte/line cap
+/// rarely fires on grep output. Empty stdout (no matches) passes through.
+fn apply_code_search_caps(stdout: &str) -> String {
+    // `rg --line-number --no-heading` emits one match per line; the trailing
+    // empty split-element after the final newline is filtered out below.
+    let lines: Vec<&str> = stdout.lines().collect();
+    let total = lines.len();
+    if total == 0 {
+        return String::new();
+    }
+    let kept = total.min(CODE_SEARCH_MAX_MATCHES);
+    let mut out = String::new();
+    for line in lines.iter().take(kept) {
+        let (clipped, _) = truncate_line(line, GREP_MAX_LINE_LENGTH);
+        out.push_str(&clipped);
+        out.push('\n');
+    }
+    if total > kept {
+        let dropped = total - kept;
+        out.push_str(&format!("[truncated {dropped} of {total} matches]\n"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -512,6 +563,70 @@ mod tests {
             fs::read_to_string(workspace.join("file.txt")).unwrap(),
             "hello Season"
         );
+    }
+
+    #[test]
+    fn code_search_caps_to_one_hundred_matches() {
+        let mut stdout = String::new();
+        for i in 0..200 {
+            stdout.push_str(&format!("file.rs:{}:hit-{i}\n", i + 1));
+        }
+        let result = super::apply_code_search_caps(&stdout);
+        let match_lines = result.lines().filter(|l| l.starts_with("file.rs:")).count();
+        assert_eq!(match_lines, 100);
+        assert!(
+            result.contains("[truncated 100 of 200 matches]"),
+            "missing trailer in: {result}"
+        );
+        // The earliest matches are the ones we keep.
+        assert!(result.contains("file.rs:1:hit-0\n"));
+        assert!(!result.contains("file.rs:101:hit-100\n"));
+    }
+
+    #[test]
+    fn code_search_no_truncation_when_under_cap() {
+        let mut stdout = String::new();
+        for i in 0..5 {
+            stdout.push_str(&format!("file.rs:{}:hit-{i}\n", i + 1));
+        }
+        let result = super::apply_code_search_caps(&stdout);
+        assert_eq!(result, stdout);
+        assert!(!result.contains("[truncated"));
+    }
+
+    #[test]
+    fn code_search_truncates_overlong_lines() {
+        let mut stdout = String::new();
+        // Single match with a huge line — should be clipped to GREP_MAX_LINE_LENGTH.
+        let payload = "x".repeat(2000);
+        stdout.push_str(&format!("file.rs:1:{payload}\n"));
+        let result = super::apply_code_search_caps(&stdout);
+        assert!(result.contains("... [truncated]"));
+        // No matches-trailer (only one match total).
+        assert!(!result.contains("of 1 matches"));
+    }
+
+    #[test]
+    fn list_files_caps_to_five_hundred_entries() {
+        let entries: Vec<String> = (0..700).map(|i| format!("entry-{i:03}")).collect();
+        let result = super::apply_list_files_cap(entries).unwrap();
+        let occurrences = result.matches("entry-").count();
+        assert_eq!(occurrences, 500);
+        assert!(
+            result.contains("[truncated 200 of 700 entries]"),
+            "missing trailer in: {result}"
+        );
+        // Sort order preserved — first 500 (000..499) kept.
+        assert!(result.contains("entry-000"));
+        assert!(result.contains("entry-499"));
+        assert!(!result.contains("entry-500"));
+    }
+
+    #[test]
+    fn list_files_no_trailer_when_under_cap() {
+        let entries: Vec<String> = (0..10).map(|i| format!("entry-{i}")).collect();
+        let result = super::apply_list_files_cap(entries).unwrap();
+        assert!(!result.contains("[truncated"));
     }
 
     #[test]

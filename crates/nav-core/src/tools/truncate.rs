@@ -6,9 +6,19 @@
 //! whichever is hit first) and inserts a single human-readable marker noting
 //! what was dropped. Bounding happens once at the tool boundary so the same
 //! truncated `String` flows into both the prompt and the session log.
+//!
+//! Per-tool sub-caps live alongside this global cap: `code_search` clips
+//! individual match lines to `GREP_MAX_LINE_LENGTH` and caps to 100 matches;
+//! `list_files` caps directory entries to 500. The per-tool caps fire first
+//! at the source so the global cap below is rarely the binding limit. See
+//! `docs/per-turn-token-bounding-prd.md` for the rationale.
 
 pub const MAX_LINES: usize = 2000;
 pub const MAX_BYTES: usize = 50 * 1024;
+/// Per-line clip for grep matches. Long minified-file hits or generated-code
+/// lines can swamp the model context without adding signal; clipping each
+/// match line keeps the surrounding matches readable.
+pub const GREP_MAX_LINE_LENGTH: usize = 500;
 
 /// Truncation strategy chosen per tool.
 ///
@@ -55,6 +65,24 @@ fn bound_with_limits(
 
 fn marker(dropped_bytes: usize, dropped_lines: usize) -> String {
     format!("\n[truncated {dropped_bytes} bytes / {dropped_lines} lines]\n")
+}
+
+/// Clip a single line to fit `max_bytes`, appending `... [truncated]` when
+/// the line is over budget. The byte budget is enforced at a UTF-8
+/// character boundary so the returned text is always valid UTF-8.
+///
+/// Returns `(text, was_truncated)`. Mirrors pi's `truncateLine` shape so we
+/// can keep the grep-line clip behavior in sync.
+pub fn truncate_line(line: &str, max_bytes: usize) -> (String, bool) {
+    if line.len() <= max_bytes {
+        return (line.to_string(), false);
+    }
+    let prefix = byte_prefix(line, max_bytes);
+    let suffix = "... [truncated]";
+    let mut out = String::with_capacity(prefix.len() + suffix.len());
+    out.push_str(prefix);
+    out.push_str(suffix);
+    (out, true)
 }
 
 /// Largest UTF-8-safe prefix of `s` not exceeding `max` bytes. Walks back to
@@ -368,6 +396,38 @@ mod tests {
         assert_eq!(byte_suffix("éé", 2), "é");
         assert_eq!(byte_suffix("éé", 3), "é");
         assert_eq!(byte_suffix("éé", 4), "éé");
+    }
+
+    #[test]
+    fn truncate_line_passes_through_under_budget() {
+        let (text, was) = truncate_line("short line", 100);
+        assert_eq!(text, "short line");
+        assert!(!was);
+    }
+
+    #[test]
+    fn truncate_line_clips_over_budget_with_suffix() {
+        let input = "x".repeat(700);
+        let (text, was) = truncate_line(&input, 500);
+        assert!(was);
+        let suffix = "... [truncated]";
+        assert!(text.ends_with(suffix));
+        let body = &text[..text.len() - suffix.len()];
+        assert_eq!(body.len(), 500);
+        assert!(body.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn truncate_line_respects_utf8_boundary() {
+        // "é" is two bytes (0xC3 0xA9). Asking for a 1-byte budget on "ééé"
+        // must back up to a char boundary so we never produce invalid UTF-8.
+        let (text, was) = truncate_line("ééé", 1);
+        assert!(was);
+        let suffix = "... [truncated]";
+        assert!(text.ends_with(suffix));
+        let body = &text[..text.len() - suffix.len()];
+        // body is either "" (backed off below 1 byte) — valid UTF-8 either way.
+        assert!(body.is_empty() || body == "é");
     }
 
     #[test]
