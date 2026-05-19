@@ -1,4 +1,7 @@
-use nav_core::{CompactionTrigger, FileChangeSummary, FileDiffSummary, PatchApplyStatus, TurnDiff};
+use nav_core::{
+    CompactionTrigger, FileChangeSummary, FileDiffSummary, PatchApplyStatus, SessionSummary,
+    TurnDiff,
+};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -236,6 +239,70 @@ impl HistoryCell for SkillInvocationCell {
             format!("{} — {}", self.name, self.detail)
         };
         body_cell("◆", "skill", Color::Magenta, &body, width)
+    }
+}
+
+pub struct SessionListCell {
+    sessions: Vec<SessionSummary>,
+}
+
+impl SessionListCell {
+    pub fn new(sessions: Vec<SessionSummary>) -> Self {
+        Self { sessions }
+    }
+}
+
+impl HistoryCell for SessionListCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let body = if self.sessions.is_empty() {
+            "no stored sessions".to_string()
+        } else {
+            session_list_body(&self.sessions)
+        };
+        body_cell("◆", "sessions", Color::Cyan, &body, width)
+    }
+}
+
+fn session_list_body(sessions: &[SessionSummary]) -> String {
+    let mut parts = Vec::new();
+    for session in sessions {
+        let name = session.name.as_deref().unwrap_or("(unnamed)");
+        let title = session
+            .first_user_prompt
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("(no prompt yet)");
+        let turn_word = if session.turn_count == 1 {
+            "turn"
+        } else {
+            "turns"
+        };
+        parts.push(format!(
+            "{}  {}  created={}  active={}  {} {turn_word}",
+            session.id, name, session.created_at, session.last_active, session.turn_count
+        ));
+        parts.push(format!("  {title}"));
+    }
+    parts.join("\n")
+}
+
+pub struct SessionNoticeCell {
+    label: String,
+    message: String,
+}
+
+impl SessionNoticeCell {
+    pub fn new(label: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl HistoryCell for SessionNoticeCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        body_cell("◆", &self.label, Color::Cyan, &self.message, width)
     }
 }
 

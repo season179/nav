@@ -73,6 +73,8 @@ fn slash_shows_popup_and_he_filters_to_help() {
             "/exit",
             "/resume",
             "/sessions",
+            "/name",
+            "/export",
             "/compact"
         ]
     );

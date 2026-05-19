@@ -1,10 +1,11 @@
-use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::permissions::{AskForApproval, SandboxPolicy};
 use crate::project::Settings;
+use crate::session::ExportFormat;
 
 // clap turns this struct into the CLI. Keeping options small makes the
 // educational path clear: model choice, auth choice, loop limit, and prompt.
@@ -49,6 +50,15 @@ pub struct Args {
     /// List stored sessions and exit. Pair with `--cwd` to scope the listing.
     #[arg(long)]
     pub list_sessions: bool,
+
+    /// Open the TUI with a recent-session picker instead of starting on a
+    /// fresh empty session.
+    #[arg(long)]
+    pub pick_session: bool,
+
+    /// Set the initial display name for a newly-created session.
+    #[arg(long)]
+    pub name: Option<String>,
 
     /// Filter `--list-sessions` to one working directory.
     #[arg(long)]
@@ -102,7 +112,42 @@ pub struct Args {
     )]
     pub auto_compact_fraction: f32,
 
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
+
     pub prompt: Vec<String>,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum CliCommand {
+    /// Export a stored session transcript.
+    Export {
+        /// Full session ULID or unique prefix.
+        session_id: String,
+        /// Output format. When omitted, inferred from --out extension and
+        /// defaults to Markdown.
+        #[arg(long, value_enum)]
+        format: Option<CliExportFormat>,
+        /// Output path. When omitted, the transcript is written to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CliExportFormat {
+    Md,
+    Json,
+}
+
+impl From<CliExportFormat> for ExportFormat {
+    fn from(value: CliExportFormat) -> Self {
+        match value {
+            CliExportFormat::Md => ExportFormat::Markdown,
+            CliExportFormat::Json => ExportFormat::Json,
+        }
+    }
 }
 
 /// Set of argument IDs whose value came from an explicit user-supplied flag
@@ -196,6 +241,8 @@ impl Args {
             idle_timeout_secs: 30,
             resume: None,
             list_sessions: false,
+            pick_session: false,
+            name: None,
             cwd: None,
             db_path: None,
             json_events: false,
@@ -207,6 +254,7 @@ impl Args {
             // stub transport that wasn't set up for it.
             auto_compact_token_limit: 0,
             auto_compact_fraction: crate::agent::DEFAULT_AUTO_COMPACT_FRACTION,
+            command: None,
             prompt: vec!["test".into()],
         }
     }
@@ -346,6 +394,40 @@ mod tests {
     fn prompt_accepts_multiple_words() {
         let args = Args::try_parse_from(["nav", "list", "the", "files"]).unwrap();
         assert_eq!(args.prompt, vec!["list", "the", "files"]);
+    }
+
+    #[test]
+    fn parses_name_and_pick_session_flags() {
+        let args =
+            Args::try_parse_from(["nav", "--name", "release work", "--pick-session"]).unwrap();
+        assert_eq!(args.name.as_deref(), Some("release work"));
+        assert!(args.pick_session);
+    }
+
+    #[test]
+    fn parses_export_subcommand() {
+        let args = Args::try_parse_from([
+            "nav",
+            "export",
+            "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "--format",
+            "json",
+            "--out",
+            "transcript.json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(CliCommand::Export {
+                session_id,
+                format,
+                out,
+            }) => {
+                assert_eq!(session_id, "01HZZZZZZZZZZZZZZZZZZZZZZZ");
+                assert_eq!(format, Some(CliExportFormat::Json));
+                assert_eq!(out.as_deref(), Some(Path::new("transcript.json")));
+            }
+            other => panic!("expected export subcommand, got {other:?}"),
+        }
     }
 
     #[test]
