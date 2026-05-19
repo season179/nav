@@ -280,6 +280,92 @@ fn pending_queue_and_abort_events_render_as_control_rows() {
 }
 
 #[test]
+fn assistant_deltas_paint_incrementally_then_finalize() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "Hello, ".to_string(),
+    });
+    let mid = render_widget(&widget, 60, 6);
+    assert!(mid.contains("• assistant  Hello,"), "{mid}");
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "world!".to_string(),
+    });
+    let mid2 = render_widget(&widget, 60, 6);
+    assert!(mid2.contains("Hello, world!"), "{mid2}");
+
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "Hello, world!".to_string(),
+    });
+    let done = render_widget(&widget, 60, 6);
+    assert!(done.contains("• assistant  Hello, world!"), "{done}");
+    let count = done.matches("• assistant").count();
+    assert_eq!(count, 1, "expected a single assistant row, got:\n{done}");
+}
+
+#[test]
+fn assistant_done_without_deltas_still_renders_full_text() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "resumed text".to_string(),
+    });
+    let rendered = render_widget(&widget, 60, 6);
+    assert!(rendered.contains("• assistant  resumed text"), "{rendered}");
+}
+
+#[test]
+fn tool_call_mid_stream_finalizes_open_assistant_cell() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "thinking about it".to_string(),
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_1".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({ "command": ["ls"] }),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "second message".to_string(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "second message".to_string(),
+    });
+
+    let rendered = render_widget(&widget, 60, 12);
+    assert!(rendered.contains("thinking about it"), "{rendered}");
+    assert!(rendered.contains("second message"), "{rendered}");
+    assert_eq!(
+        rendered.matches("• assistant").count(),
+        2,
+        "expected two separate assistant rows, got:\n{rendered}"
+    );
+    let tool_idx = rendered.find("• tool").expect("tool row present");
+    let first_idx = rendered.find("thinking about it").unwrap();
+    let second_idx = rendered.find("second message").unwrap();
+    assert!(first_idx < tool_idx && tool_idx < second_idx, "{rendered}");
+}
+
+#[test]
+fn turn_aborted_mid_stream_preserves_partial_text() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "partial thought".to_string(),
+    });
+    widget.ingest(AgentEvent::TurnAborted {
+        turn_id: "turn-1".to_string(),
+        reason: "user interrupt".to_string(),
+    });
+
+    let rendered = render_widget(&widget, 70, 10);
+    assert!(rendered.contains("partial thought"), "{rendered}");
+    assert!(
+        rendered.contains("◆ aborted  turn-1 user interrupt"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn labeled_rows_wrap_without_clipping_first_line() {
     let mut widget = ChatWidget::new();
 
