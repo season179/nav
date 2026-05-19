@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -102,11 +102,21 @@ impl OutputAccumulator {
             let count = self.rolling.len();
             self.flush_oldest(count)?;
         }
-        if let Some(mut file) = self.spill.take() {
-            file.flush()
-                .with_context(|| format!("failed to flush {}", self.spill_path.display()))?;
-        }
-        let full = fs::read_to_string(&self.spill_path)
+        // Read the full spill back through the same handle we wrote to.
+        // Reopening by path would let a same-user process delete or rename
+        // the file between flush and read, turning a successful run into a
+        // readback error or surfacing a trailer path that no longer points
+        // at the file the model just got bounded content from.
+        let mut file = self
+            .spill
+            .take()
+            .expect("spill file present in the spill branch");
+        file.flush()
+            .with_context(|| format!("failed to flush {}", self.spill_path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("failed to seek {}", self.spill_path.display()))?;
+        let mut full = String::new();
+        file.read_to_string(&mut full)
             .with_context(|| format!("failed to read back {}", self.spill_path.display()))?;
         let bounded = bound(
             full,
@@ -114,14 +124,14 @@ impl OutputAccumulator {
                 head_lines: BASH_HEAD_LINES,
             },
         );
-        let abs = self
-            .spill_path
-            .canonicalize()
-            .unwrap_or_else(|_| self.spill_path.clone());
-        let content = format!("{bounded}\n[Full output: {}]\n", abs.display());
+        // `spill_path` is already an absolute path under the nav data dir
+        // (see `default_log_dir`), so we don't need a canonicalize step —
+        // skipping it also removes a TOCTOU window where the path could be
+        // swapped with a symlink between flush and canonicalize.
+        let content = format!("{bounded}\n[Full output: {}]\n", self.spill_path.display());
         Ok(AccumulatorOutput {
             content,
-            spill_path: Some(abs),
+            spill_path: Some(self.spill_path),
         })
     }
 
@@ -147,6 +157,7 @@ impl OutputAccumulator {
     fn open_spill(&mut self) -> Result<()> {
         for _ in 0..3 {
             match OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .open(&self.spill_path)

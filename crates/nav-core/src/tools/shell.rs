@@ -525,6 +525,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bash_cat_rewrite_bounds_large_file_without_spill() {
+        // The rewrite shortcut for `cat` goes through the same accumulator
+        // path as the native sandbox path, so a large rewritten read must
+        // produce the head/tail-bounded marker the global cap emits — and
+        // it must NOT trip the spill trailer (rewrites never spill: the
+        // rtk filter's byte/line limits keep the rendered output far below
+        // MAX_ROLLING_BYTES).
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let line = "z".repeat(200) + "\n";
+        let payload = line.repeat(400); // ~80 KB > MAX_BYTES, < MAX_ROLLING_BYTES
+        std::fs::write(cwd.join("big.txt"), &payload).unwrap();
+
+        let result = bash(&unchecked_permission_context(), &cwd, 5, "cat big.txt")
+            .await
+            .unwrap();
+        assert!(
+            result.contains("[truncated"),
+            "rewrite-path large output should be bounded: {}",
+            &result[..result.len().min(120)]
+        );
+        assert!(
+            !result.contains("[Full output:"),
+            "rewrite path should not spill"
+        );
+        assert!(
+            result.len() < 80 * 1024,
+            "bounded rewrite output was {} bytes",
+            result.len()
+        );
+    }
+
+    #[tokio::test]
     async fn bash_runs_in_cwd() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
