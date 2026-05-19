@@ -10,7 +10,7 @@ use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, Catalog, ControlPlane, OpenAiTransport, PendingInput, PendingInputDraft,
     PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
-    TurnControls, UserAttachment,
+    TurnControls, UserAttachment, build_context_report_with_replay_cwd,
     cli::{Args, sandbox_policy_from_args},
     shorten_home,
 };
@@ -523,6 +523,18 @@ pub async fn run(
                             Err(err) => chat.push_err(err),
                         }
                     }
+                    AppEvent::ShowContext { include_all } => {
+                        push_context_report(
+                            store.as_ref(),
+                            &session_id,
+                            &cwd,
+                            &args,
+                            skills.as_ref(),
+                            project.as_ref(),
+                            include_all,
+                            &mut chat,
+                        );
+                    }
                     AppEvent::ForkSession { at } => {
                         if turn_started_at.is_some() {
                             chat.ingest(AgentEvent::Error {
@@ -737,6 +749,37 @@ fn emit_local_event(
     }
     pane.apply_agent_event(&event);
     chat.ingest(event);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_context_report(
+    store: &SessionStore,
+    session_id: &SessionId,
+    cwd: &Path,
+    args: &Args,
+    skills: &Catalog,
+    project: &ProjectContext,
+    include_all: bool,
+    chat: &mut ChatWidget,
+) {
+    match store.load_session(session_id) {
+        Ok(events) => {
+            let replay_cwd = store
+                .session_cwd(session_id)
+                .unwrap_or_else(|_| cwd.to_path_buf());
+            let report = build_context_report_with_replay_cwd(
+                args,
+                cwd,
+                &replay_cwd,
+                &events,
+                skills,
+                Some(project),
+            );
+            chat.scroll_to_bottom();
+            chat.push_session_notice("context", report.render_text(include_all));
+        }
+        Err(err) => chat.push_err(err),
+    }
 }
 
 fn emit_pending_cleared(

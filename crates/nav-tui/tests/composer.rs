@@ -91,6 +91,7 @@ fn slash_shows_popup_and_he_filters_to_help() {
             "/sessions",
             "/name",
             "/export",
+            "/context",
             "/fork",
             "/tree",
             "/label",
