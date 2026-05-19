@@ -406,7 +406,18 @@ fn check_install(b: &mut DoctorBuilder, manifest_dir: &str) {
 /// `PATHEXT` dance.
 pub fn which_on_path(name: &str) -> Option<PathBuf> {
     let path_var = env::var_os("PATH")?;
-    for dir in env::split_paths(&path_var) {
+    which_in_dirs(name, env::split_paths(&path_var))
+}
+
+/// Walk `dirs` looking for `name`. Pulled out of [`which_on_path`] so tests
+/// can pass a synthetic search path without mutating the process-wide
+/// `PATH`, which races with anything else in the parallel test run that
+/// spawns a subprocess.
+fn which_in_dirs<I>(name: &str, dirs: I) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    for dir in dirs {
         let candidate = dir.join(name);
         if is_executable_file(&candidate) {
             return Some(candidate);
@@ -439,13 +450,28 @@ fn is_executable_file(path: &Path) -> bool {
 /// Returns `$CARGO_INSTALL_ROOT/bin` or `$CARGO_HOME/bin`, falling back to
 /// `~/.cargo/bin`.
 pub fn cargo_install_bin_dir() -> Option<PathBuf> {
-    if let Some(root) = env::var_os("CARGO_INSTALL_ROOT") {
+    cargo_install_bin_dir_from(
+        env::var_os("CARGO_INSTALL_ROOT").as_deref(),
+        env::var_os("CARGO_HOME").as_deref(),
+        dirs::home_dir,
+    )
+}
+
+/// Resolution logic for [`cargo_install_bin_dir`], split out so tests can
+/// inject synthetic env without mutating the process environment (which
+/// races with parallel tests that also read `CARGO_*` vars).
+fn cargo_install_bin_dir_from(
+    install_root: Option<&std::ffi::OsStr>,
+    cargo_home: Option<&std::ffi::OsStr>,
+    home_dir: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(root) = install_root {
         return Some(PathBuf::from(root).join("bin"));
     }
-    if let Some(home) = env::var_os("CARGO_HOME") {
+    if let Some(home) = cargo_home {
         return Some(PathBuf::from(home).join("bin"));
     }
-    dirs::home_dir().map(|h| h.join(".cargo").join("bin"))
+    home_dir().map(|h| h.join(".cargo").join("bin"))
 }
 
 /// Run a freshly installed binary with `--version` and return the trimmed
@@ -601,20 +627,34 @@ mod tests {
     }
 
     #[test]
-    fn which_returns_none_for_missing_binary() {
+    fn which_returns_none_when_no_dir_contains_binary() {
+        // Drive the inner helper directly with a known-empty dir so the
+        // assertion doesn't race with other tests that spawn subprocesses
+        // through the real $PATH.
         let tmp = TempDir::new().unwrap();
-        // Constrain PATH to an empty dir so the lookup deterministically misses.
-        let prev = env::var_os("PATH");
-        // SAFETY: tests in this module run with `cargo test --test-threads=1`
-        // is not guaranteed; this is best-effort. We restore PATH below.
-        unsafe { env::set_var("PATH", tmp.path()) };
-        let found = which_on_path("definitely-not-a-real-binary");
-        if let Some(prev) = prev {
-            unsafe { env::set_var("PATH", prev) };
-        } else {
-            unsafe { env::remove_var("PATH") };
-        }
+        let found = which_in_dirs(
+            "definitely-not-a-real-binary",
+            std::iter::once(tmp.path().to_path_buf()),
+        );
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn which_finds_executable_when_dir_has_it() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("nav-shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            let found = which_in_dirs("nav-shim", std::iter::once(tmp.path().to_path_buf()));
+            assert_eq!(found.as_deref(), Some(bin.as_path()));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = bin;
+        }
     }
 
     #[test]
@@ -673,15 +713,29 @@ mod tests {
 
     #[test]
     fn cargo_install_bin_dir_prefers_install_root() {
-        let tmp = TempDir::new().unwrap();
-        let prev = env::var_os("CARGO_INSTALL_ROOT");
-        unsafe { env::set_var("CARGO_INSTALL_ROOT", tmp.path()) };
-        let resolved = cargo_install_bin_dir().unwrap();
-        assert_eq!(resolved, tmp.path().join("bin"));
-        if let Some(prev) = prev {
-            unsafe { env::set_var("CARGO_INSTALL_ROOT", prev) };
-        } else {
-            unsafe { env::remove_var("CARGO_INSTALL_ROOT") };
-        }
+        let install_root = std::ffi::OsString::from("/tmp/install-root");
+        let cargo_home = std::ffi::OsString::from("/tmp/cargo-home");
+        let resolved = cargo_install_bin_dir_from(Some(&install_root), Some(&cargo_home), || {
+            Some(PathBuf::from("/tmp/home"))
+        })
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/install-root/bin"));
+    }
+
+    #[test]
+    fn cargo_install_bin_dir_falls_back_to_cargo_home() {
+        let cargo_home = std::ffi::OsString::from("/tmp/cargo-home");
+        let resolved = cargo_install_bin_dir_from(None, Some(&cargo_home), || {
+            Some(PathBuf::from("/tmp/home"))
+        })
+        .unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/cargo-home/bin"));
+    }
+
+    #[test]
+    fn cargo_install_bin_dir_falls_back_to_home_dot_cargo() {
+        let resolved =
+            cargo_install_bin_dir_from(None, None, || Some(PathBuf::from("/tmp/home"))).unwrap();
+        assert_eq!(resolved, PathBuf::from("/tmp/home/.cargo/bin"));
     }
 }
