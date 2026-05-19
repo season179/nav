@@ -53,6 +53,17 @@ pub struct ReportedCost {
     pub currency: String,
 }
 
+/// Rolling token totals for one session. Returned by
+/// [`SessionStore::session_token_totals`] so the agent loop can decide whether
+/// automatic compaction should fire before submitting the next turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionTokenTotals {
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_input_cached: u64,
+    pub tokens_reasoning: u64,
+}
+
 /// One row returned by [`SessionStore::list_sessions`], with the rollup fields
 /// the CLI's `--list-sessions` command formats.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,7 +212,15 @@ impl SessionStore {
                     "INSERT OR IGNORE INTO approval
                      (session_id, approval_id, requested_at, tool, command, path, reason)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![session_id, approval_id, now, tool, command_json, path, reason],
+                    params![
+                        session_id,
+                        approval_id,
+                        now,
+                        tool,
+                        command_json,
+                        path,
+                        reason
+                    ],
                 )?;
             }
             AgentEvent::ToolCallBlocked {
@@ -229,7 +248,10 @@ impl SessionStore {
     /// returned handle clones the underlying `Arc<SessionStore>` so the
     /// caller can move it into `ChannelGate::with_sink` without juggling
     /// borrows.
-    pub fn sink_for(self: &std::sync::Arc<Self>, session_id: impl Into<String>) -> SessionStoreSink {
+    pub fn sink_for(
+        self: &std::sync::Arc<Self>,
+        session_id: impl Into<String>,
+    ) -> SessionStoreSink {
         SessionStoreSink {
             store: std::sync::Arc::clone(self),
             session_id: session_id.into(),
@@ -325,19 +347,87 @@ impl SessionStore {
     /// Returns every durable event for a session in seq order. Each row's
     /// `data` column is parsed back into the `AgentEvent` it was serialised
     /// from, so callers can reconstruct the conversation transcript directly.
+    ///
+    /// Rows whose `kind` discriminant does not deserialize cleanly into the
+    /// current [`AgentEvent`] enum are skipped with a stderr warning. This
+    /// lets a newer nav write events a slightly older nav can still resume
+    /// past — losing one row is less disruptive than failing the whole
+    /// `--resume`.
     pub fn load_session(&self, session_id: &str) -> Result<Vec<AgentEvent>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT data FROM event WHERE session_id = ?1 ORDER BY seq ASC")?;
-        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        let mut stmt = conn
+            .prepare("SELECT seq, kind, data FROM event WHERE session_id = ?1 ORDER BY seq ASC")?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
         let mut events = Vec::new();
         for row in rows {
-            let data = row?;
-            let event: AgentEvent =
-                serde_json::from_str(&data).context("failed to deserialize stored event")?;
-            events.push(event);
+            let (seq, kind, data) = row?;
+            match serde_json::from_str::<AgentEvent>(&data) {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    eprintln!(
+                        "nav-core: skipping unknown event (session={session_id} seq={seq} kind={kind}): {err}"
+                    );
+                }
+            }
         }
         Ok(events)
+    }
+
+    /// Returns the `tokens_before` field from the most recent
+    /// `compaction_completed` event recorded for `session_id`, or `None` if
+    /// the session has never been compacted. Used as the baseline against
+    /// which post-checkpoint usage is measured for automatic compaction —
+    /// without it, once lifetime rolling tokens cross the threshold, every
+    /// later prompt would re-compact.
+    pub(crate) fn latest_checkpoint_tokens_before(&self, session_id: &str) -> Result<Option<u64>> {
+        let conn = self.lock();
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT data FROM event
+                 WHERE session_id = ?1 AND kind = 'compaction_completed'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(data) = row else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&data)
+            .context("failed to parse stored compaction_completed event")?;
+        Ok(value
+            .get("tokens_before")
+            .and_then(serde_json::Value::as_u64))
+    }
+
+    /// Returns the rolling token totals recorded against `session_id`. Used
+    /// by the compaction module to decide whether automatic compaction
+    /// should fire before submitting the next turn.
+    pub(crate) fn session_token_totals(&self, session_id: &str) -> Result<SessionTokenTotals> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT tokens_input, tokens_output, tokens_input_cached, tokens_reasoning
+                 FROM session WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(SessionTokenTotals {
+                        tokens_input: row.get::<_, i64>(0)? as u64,
+                        tokens_output: row.get::<_, i64>(1)? as u64,
+                        tokens_input_cached: row.get::<_, i64>(2)? as u64,
+                        tokens_reasoning: row.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        Ok(row)
     }
 
     /// Returns the launch cwd recorded for `session_id` at creation time.

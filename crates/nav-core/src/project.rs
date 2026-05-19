@@ -141,7 +141,7 @@ impl ContextScope {
 /// Every field is `Option<T>` so an absent key falls through to the next
 /// source in the precedence chain (project → user → clap default → explicit
 /// CLI flag).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub model: Option<String>,
@@ -152,6 +152,12 @@ pub struct Settings {
     /// When `true`, skip context-file discovery entirely. Useful for repos
     /// that intentionally do not want their `AGENTS.md` shipped to the model.
     pub disable_context_files: Option<bool>,
+    /// Per-model context-window budget used to decide when automatic
+    /// long-session compaction fires. Setting to `0` disables auto-compaction.
+    pub auto_compact_token_limit: Option<u64>,
+    /// Fraction of `auto_compact_token_limit` at which automatic compaction
+    /// fires. Defaults to [`crate::agent::DEFAULT_AUTO_COMPACT_FRACTION`].
+    pub auto_compact_fraction: Option<f32>,
 }
 
 impl Settings {
@@ -163,6 +169,10 @@ impl Settings {
         self.max_turns = other.max_turns.or(self.max_turns);
         self.bash_timeout_secs = other.bash_timeout_secs.or(self.bash_timeout_secs);
         self.disable_context_files = other.disable_context_files.or(self.disable_context_files);
+        self.auto_compact_token_limit = other
+            .auto_compact_token_limit
+            .or(self.auto_compact_token_limit);
+        self.auto_compact_fraction = other.auto_compact_fraction.or(self.auto_compact_fraction);
     }
 }
 

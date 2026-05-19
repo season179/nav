@@ -7,6 +7,11 @@ use std::path::Path;
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
+use super::compaction::{
+    SUMMARIZATION_PROMPT, build_replacement_history, collect_recent_user_messages,
+    is_compact_command, should_auto_compact,
+};
+use super::events::CompactionTrigger;
 use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::cli::Args;
 use crate::git_diff;
@@ -44,6 +49,34 @@ pub trait ResponsesTransport: Send + Sync {
 pub struct SessionBinding<'a> {
     pub store: &'a SessionStore,
     pub session_id: SessionId,
+}
+
+impl<'a> SessionBinding<'a> {
+    /// Lifetime cumulative `tokens_input` across all completed turns. Cached
+    /// tokens are a discounted subset of `tokens_input` in the Responses API
+    /// usage shape, so they are not added here — adding them would inflate
+    /// the auto-compaction signal by counting the same prompt twice.
+    fn rolling_input_tokens(&self) -> u64 {
+        self.store
+            .session_token_totals(&self.session_id)
+            .map(|totals| totals.tokens_input)
+            .unwrap_or(0)
+    }
+
+    /// Tokens spent since the latest `CompactionCompleted` checkpoint. Auto
+    /// compaction must decide against this, not the lifetime total, otherwise
+    /// once a session crosses the threshold every subsequent prompt would
+    /// re-compact because the lifetime counter never decreases.
+    fn post_checkpoint_input_tokens(&self) -> u64 {
+        let rolling = self.rolling_input_tokens();
+        let baseline = self
+            .store
+            .latest_checkpoint_tokens_before(&self.session_id)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        rolling.saturating_sub(baseline)
+    }
 }
 
 fn user_message_event(
@@ -150,6 +183,73 @@ pub async fn run_agent(
     permissions: PermissionContext,
 ) -> Result<()> {
     let mut input = initial_input.unwrap_or_default();
+
+    // Manual `/compact`: do not steer the compaction turn with the user's
+    // text. The compaction request is synthesized, and a follow-up prompt
+    // (if any) is queued by the frontend rather than appended here.
+    if is_compact_command(prompt) {
+        emit(
+            &events,
+            session,
+            user_message_event(prompt, display_prompt, attachments.clone()),
+        );
+        let tokens_before = session.map(|s| s.rolling_input_tokens()).unwrap_or(0);
+        return run_compaction_turn(
+            transport,
+            args,
+            cwd,
+            &mut input,
+            CompactionTrigger::Manual,
+            tokens_before,
+            session,
+            &events,
+            skills,
+            context,
+        )
+        .await
+        .map(|_| ());
+    }
+
+    // Automatic threshold compaction: if recorded rolling input tokens cross
+    // the configured threshold, compact before submitting so the incoming
+    // prompt isn't sacrificed to an overflow. The decision compares
+    // post-checkpoint usage (rolling minus the lifetime baseline stored at
+    // the last `CompactionCompleted`) so we don't re-compact every turn once
+    // the cumulative counter passes the threshold.
+    if let Some(binding) = session
+        && args.auto_compact_token_limit > 0
+    {
+        let decision = should_auto_compact(
+            binding.post_checkpoint_input_tokens(),
+            args.auto_compact_token_limit,
+            args.auto_compact_fraction,
+        );
+        if decision.should_compact && !input.is_empty() {
+            // `tokens_before` is the lifetime cumulative `tokens_input` at
+            // the moment of compaction — persisted onto `CompactionCompleted`
+            // and read back as the next baseline. Subtracting it from a
+            // future rolling total yields post-checkpoint pressure.
+            let tokens_before = binding.rolling_input_tokens();
+            // Don't fail the user's turn if compaction itself fails — we
+            // still want to take their next prompt from the pre-compact
+            // transcript. The CompactionFailed event already surfaces the
+            // failure to frontends.
+            let _ = run_compaction_turn(
+                transport,
+                args,
+                cwd,
+                &mut input,
+                CompactionTrigger::Auto,
+                tokens_before,
+                session,
+                &events,
+                skills,
+                context,
+            )
+            .await;
+        }
+    }
+
     let content = build_user_content(prompt, &attachments, cwd);
     emit(
         &events,
@@ -354,9 +454,14 @@ pub async fn run_agent(
             // exit the loop instead of feeding more tool calls or asking
             // the model for another turn.
             if aborted {
-                if let Err(err) =
-                    finalize_turn(&events, session, cwd, turn_had_mutation, &args.model, &usage)
-                {
+                if let Err(err) = finalize_turn(
+                    &events,
+                    session,
+                    cwd,
+                    turn_had_mutation,
+                    &args.model,
+                    &usage,
+                ) {
                     return fail(&events, session, err);
                 }
                 return Ok(());
@@ -375,6 +480,42 @@ pub async fn run_agent(
         }
         turns_used += 1;
     }
+}
+
+/// Upper bound on overflow-trim retries inside a single compaction turn.
+/// Bounded to keep a pathologically long text-only transcript from looping
+/// indefinitely if the model keeps responding with `context_length_exceeded`;
+/// 32 covers any realistic session — most run_agent overflow recovery is a
+/// single-shot drop.
+const MAX_COMPACTION_TRIMS: usize = 32;
+
+/// Trim one item from a compaction request that overflowed. Prefers dropping
+/// the oldest `function_call` + `function_call_output` pair (same shape as
+/// the live agent loop's one-shot recovery); falls back to dropping the
+/// oldest message item when no tool pair remains. The trailing item — the
+/// synthesised summarisation prompt that was appended just before the
+/// request — is preserved so the model still knows what we're asking for.
+///
+/// Returns the number of items removed (`0` if nothing was eligible).
+pub(super) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
+    let dropped_pair = drop_oldest_tool_pair(input);
+    if dropped_pair > 0 {
+        return dropped_pair;
+    }
+    // A text-only long session has no tool pairs, so shed the oldest user
+    // or assistant message instead. Without this fallback `/compact` would
+    // fail exactly when it's most needed.
+    if input.len() <= 1 {
+        return 0;
+    }
+    let trim_until = input.len() - 1;
+    for idx in 0..trim_until {
+        if input[idx].get("type").and_then(Value::as_str) == Some("message") {
+            input.remove(idx);
+            return 1;
+        }
+    }
+    0
 }
 
 /// Drop the oldest `function_call` + matching `function_call_output` pair from
@@ -525,6 +666,208 @@ pub(super) fn emit_stream_events(
         }
         _ => {}
     }
+}
+
+/// Run a single compaction turn. Mutates `input` in place: on success it is
+/// replaced with `[recent_user_messages_tail..., summary]`; on failure the
+/// caller's `input` is left untouched.
+///
+/// The compaction turn is non-steerable — the user's text (if any) is never
+/// fed into the summarisation prompt. Tool calls returned by the compaction
+/// turn are ignored: the only output we care about is the assistant's final
+/// text, which becomes the persisted handoff summary.
+#[allow(clippy::too_many_arguments)]
+async fn run_compaction_turn(
+    transport: &dyn ResponsesTransport,
+    args: &Args,
+    cwd: &Path,
+    input: &mut Vec<Value>,
+    trigger: CompactionTrigger,
+    tokens_before: u64,
+    session: Option<&SessionBinding<'_>>,
+    events: &UnboundedSender<AgentEvent>,
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+) -> Result<String, anyhow::Error> {
+    emit(
+        events,
+        session,
+        AgentEvent::CompactionStarted {
+            trigger,
+            tokens_before,
+        },
+    );
+
+    // The caller's `input` stays untouched until success — we mutate
+    // `compaction_input` instead, and only reassign on a good summary.
+    // That's the contract that lets a failed compaction leave the next
+    // turn replaying the same history as before.
+    let mut compaction_input = input.clone();
+    compaction_input.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": SUMMARIZATION_PROMPT,
+    }));
+
+    let body = responses::response_body(args, cwd, &compaction_input, skills, context);
+    let stream_result = transport.create(body, events.clone()).await;
+    let mut stream = match stream_result {
+        Ok(stream) => stream,
+        Err(err) => {
+            let message = format!("{err:#}");
+            emit(
+                events,
+                session,
+                AgentEvent::CompactionFailed {
+                    trigger,
+                    message: message.clone(),
+                },
+            );
+            return Err(anyhow!(message));
+        }
+    };
+
+    let mut collector = ResponseCollector::default();
+    let mut compaction_trims_used: usize = 0;
+    loop {
+        let value = match stream.next().await {
+            Some(Ok(value)) => value,
+            Some(Err(ResponsesError::ContextWindowExceeded { message }))
+                if compaction_trims_used < MAX_COMPACTION_TRIMS =>
+            {
+                let dropped = trim_for_compaction(&mut compaction_input);
+                if dropped == 0 {
+                    let msg = format!("compaction overflow with nothing left to drop: {message}");
+                    emit(
+                        events,
+                        session,
+                        AgentEvent::CompactionFailed {
+                            trigger,
+                            message: msg.clone(),
+                        },
+                    );
+                    return Err(anyhow!(msg));
+                }
+                compaction_trims_used += 1;
+                emit(
+                    events,
+                    session,
+                    AgentEvent::ContextTrimmed {
+                        dropped_pairs: dropped,
+                    },
+                );
+                let body = responses::response_body(args, cwd, &compaction_input, skills, context);
+                stream = match transport.create(body, events.clone()).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        let msg = format!("{err:#}");
+                        emit(
+                            events,
+                            session,
+                            AgentEvent::CompactionFailed {
+                                trigger,
+                                message: msg.clone(),
+                            },
+                        );
+                        return Err(anyhow!(msg));
+                    }
+                };
+                collector = ResponseCollector::default();
+                continue;
+            }
+            Some(Err(err)) => {
+                let message = format!("{err:#}");
+                emit(
+                    events,
+                    session,
+                    AgentEvent::CompactionFailed {
+                        trigger,
+                        message: message.clone(),
+                    },
+                );
+                return Err(anyhow!(message));
+            }
+            None => break,
+        };
+        // Don't emit message deltas to the live channel during compaction —
+        // a streaming summary inside the regular assistant cell would look
+        // like a normal answer. Frontends watch CompactionStarted/Completed.
+        match collector.push_event(&value, "Responses API (compact)") {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(err) => {
+                emit(
+                    events,
+                    session,
+                    AgentEvent::CompactionFailed {
+                        trigger,
+                        message: format!("{err:#}"),
+                    },
+                );
+                return Err(err);
+            }
+        }
+    }
+
+    let envelope = match collector.finish("Responses API (compact)") {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            emit(
+                events,
+                session,
+                AgentEvent::CompactionFailed {
+                    trigger,
+                    message: format!("{err:#}"),
+                },
+            );
+            return Err(err);
+        }
+    };
+    let summary = responses::assistant_text(&envelope).unwrap_or_default();
+    if summary.trim().is_empty() {
+        let message = "compaction summary was empty".to_string();
+        emit(
+            events,
+            session,
+            AgentEvent::CompactionFailed {
+                trigger,
+                message: message.clone(),
+            },
+        );
+        return Err(anyhow!(message));
+    }
+
+    // Persist the checkpoint *before* mutating the caller's live `input`.
+    // `emit` swallows append_event errors as a deliberate best-effort
+    // policy, so for compaction — where divergence between live state and
+    // the durable log would silently break `--resume` — we persist directly
+    // and surface a failure as `CompactionFailed`. The session is still
+    // safe to continue: the pre-compaction transcript stays in place.
+    let recent_users = collect_recent_user_messages(input);
+    let replaced_events = input.len();
+    let completed = AgentEvent::CompactionCompleted {
+        trigger,
+        summary: summary.clone(),
+        replaced_events,
+        tokens_before,
+    };
+    if let Some(binding) = session
+        && let Err(err) = binding.store.append_event(&binding.session_id, &completed)
+    {
+        let message = format!("failed to persist compaction checkpoint: {err:#}");
+        emit(
+            events,
+            session,
+            AgentEvent::CompactionFailed {
+                trigger,
+                message: message.clone(),
+            },
+        );
+        return Err(anyhow!(message));
+    }
+    *input = build_replacement_history(&summary, &recent_users);
+    let _ = events.send(completed);
+    Ok(summary)
 }
 
 pub(super) fn extract_message_text(item: &Value) -> Option<String> {

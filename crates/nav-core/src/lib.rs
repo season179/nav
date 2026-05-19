@@ -12,15 +12,13 @@ pub mod skills;
 pub mod tools;
 
 pub use agent::{
-    AgentEvent, EventStream, ResponsesTransport, SessionBinding, TurnUsage, UserAttachment,
-    rebuild_responses_input, run_agent,
+    AgentEvent, CompactionTrigger, EventStream, ResponsesTransport, SessionBinding, TurnUsage,
+    UserAttachment, rebuild_responses_input, run_agent,
 };
 pub use mutation::{
     FileChangeKind, FileChangeSummary, FileDiffSummary, MutationResult, PatchApplyStatus, TurnDiff,
 };
-pub use permissions::{
-    ApprovalReason, AskForApproval, BlockRule, ReviewDecision, SandboxPolicy,
-};
+pub use permissions::{ApprovalReason, AskForApproval, BlockRule, ReviewDecision, SandboxPolicy};
 pub use project::{
     ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,
     shorten_home,

@@ -72,6 +72,35 @@ pub fn into_raw_output(response: ResponseEnvelope) -> Vec<Value> {
     response.raw_output
 }
 
+/// Concatenated text of every assistant `message` item in the collected
+/// envelope. The Responses API does not stamp output messages with
+/// `role: assistant` (they are implicit), so any `type: message` item with
+/// a non-empty `output_text` / `text` body counts.
+///
+/// Used by the compaction path to recover the summary the model returned
+/// without re-driving the streaming event channel.
+pub(crate) fn assistant_text(response: &ResponseEnvelope) -> Option<String> {
+    let mut buf = String::new();
+    for item in &response.raw_output {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            let kind = part.get("type").and_then(Value::as_str);
+            if kind != Some("output_text") && kind != Some("text") {
+                continue;
+            }
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                buf.push_str(text);
+            }
+        }
+    }
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
 /// Normalizes the OpenAI Responses `usage` object into [`TurnUsage`].
 ///
 /// Maps `input_tokens` -> `tokens_input`,

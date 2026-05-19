@@ -53,6 +53,10 @@ pub(crate) fn dispatch_submit(
     let event = match text.as_str() {
         "/quit" | "/exit" => AppEvent::Quit,
         "/clear" => AppEvent::Clear,
+        // `/compact` is handled inside nav-core's `run_agent` — submit the
+        // literal text so the agent loop's `is_compact_command` check
+        // dispatches the non-steerable compaction turn.
+        "/compact" => AppEvent::Submit { text, images },
         _ => match classify_slash(&text, skills) {
             SlashAction::NotASkill => AppEvent::Submit { text, images },
             SlashAction::Inline { prompt } => AppEvent::Submit {
@@ -219,5 +223,24 @@ mod tests {
     fn prepend_pending_skill_returns_prompt_when_empty() {
         let merged = prepend_pending_skill(None, "do X");
         assert_eq!(merged, "do X");
+    }
+
+    #[test]
+    fn dispatch_submit_routes_compact_through_submit_path() {
+        // `/compact` is implemented inside nav-core, not as a local TUI
+        // gesture. dispatch_submit must forward the literal text so the
+        // agent loop's is_compact_command check fires.
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        dispatch_submit("/compact".to_string(), Vec::new(), &catalog, &tx);
+        let event = rx.try_recv().expect("event sent");
+        match event {
+            AppEvent::Submit { text, images } => {
+                assert_eq!(text, "/compact");
+                assert!(images.is_empty());
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
     }
 }

@@ -208,7 +208,9 @@ fn record_approval_decision_updates_row() {
         )
         .unwrap();
 
-    store.record_approval_decision(&id, "a1", "approved").unwrap();
+    store
+        .record_approval_decision(&id, "a1", "approved")
+        .unwrap();
 
     let conn = store.conn.lock().unwrap();
     let (decided_at, decision): (Option<i64>, Option<String>) = conn
@@ -475,4 +477,66 @@ fn session_cwd_returns_creation_cwd_regardless_of_caller() {
 fn session_cwd_errors_on_missing_session() {
     let (_dir, store) = open_temp_store();
     assert!(store.session_cwd("does-not-exist").is_err());
+}
+
+#[test]
+fn load_session_skips_unknown_event_kinds() {
+    // A forward-compatible session log: a newer nav writes an unknown
+    // event kind, and an older nav must still be able to load the session
+    // around it. Without the per-row fallback, a single unrecognised kind
+    // would brick --resume for every session that contains it.
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/tmp/proj");
+    let id = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+
+    store
+        .append_event(
+            &id,
+            &AgentEvent::UserMessage {
+                text: "first".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    // Insert a row with a discriminant the current AgentEvent enum does
+    // not know about. The COALESCE(MAX(seq)+1) pattern matches the
+    // production INSERT in append_event.
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO event (session_id, seq, created_at, kind, data)
+             VALUES (
+                 ?1,
+                 COALESCE((SELECT MAX(seq) FROM event WHERE session_id = ?1), -1) + 1,
+                 ?2, ?3, ?4
+             )",
+            params![
+                &id,
+                now_secs(),
+                "future_event_kind",
+                r#"{"kind":"future_event_kind","payload":42}"#,
+            ],
+        )
+        .unwrap();
+    }
+    store
+        .append_event(&id, &AgentEvent::AssistantMessageDone { text: "ok".into() })
+        .unwrap();
+
+    let loaded = store.load_session(&id).unwrap();
+    assert_eq!(
+        loaded,
+        vec![
+            AgentEvent::UserMessage {
+                text: "first".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone { text: "ok".into() },
+        ],
+        "unknown event row must be skipped, surrounding rows preserved"
+    );
 }
