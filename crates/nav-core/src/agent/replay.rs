@@ -50,6 +50,7 @@ pub fn rebuild_responses_input(events: &[AgentEvent], cwd: &Path) -> Vec<Value> 
             | AgentEvent::ToolCallApprovalRequest { .. }
             | AgentEvent::ToolCallBlocked { .. }
             | AgentEvent::TurnComplete { .. }
+            | AgentEvent::TurnAborted { .. }
             | AgentEvent::ProviderRetry { .. }
             | AgentEvent::ContextTrimmed { .. }
             | AgentEvent::Error { .. } => {}

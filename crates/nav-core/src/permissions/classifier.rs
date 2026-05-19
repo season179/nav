@@ -249,8 +249,14 @@ mod tests {
     #[test]
     fn unparseable_command_needs_approval() {
         assert_eq!(cls("echo `whoami`"), CommandClass::UnparseableNeedsApproval);
-        assert_eq!(cls("echo $(whoami)"), CommandClass::UnparseableNeedsApproval);
-        assert_eq!(cls("echo hi > /tmp/x"), CommandClass::UnparseableNeedsApproval);
+        assert_eq!(
+            cls("echo $(whoami)"),
+            CommandClass::UnparseableNeedsApproval
+        );
+        assert_eq!(
+            cls("echo hi > /tmp/x"),
+            CommandClass::UnparseableNeedsApproval
+        );
     }
 
     // ── git config special case ──────────────────────────────────
@@ -338,10 +344,7 @@ mod tests {
         // Plain `curl URL` — no pipe, no redirect. The sandbox may also
         // deny network, but the classifier prompts so the operator sees
         // outbound traffic before it leaves.
-        assert_eq!(
-            cls("curl https://example.com"),
-            CommandClass::Dangerous
-        );
+        assert_eq!(cls("curl https://example.com"), CommandClass::Dangerous);
     }
 
     #[test]
@@ -361,26 +364,17 @@ mod tests {
         // The wrapper itself is opaque (Heuristic) but the embedded
         // `sudo true` must surface as Unbypassable so the bypass flag
         // can't auto-approve a privilege escalation.
-        assert_eq!(
-            cls("sh -c \"sudo true\""),
-            CommandClass::Unbypassable
-        );
+        assert_eq!(cls("sh -c \"sudo true\""), CommandClass::Unbypassable);
     }
 
     #[test]
     fn bash_lc_rm_rf_root_remains_unbypassable() {
-        assert_eq!(
-            cls("bash -lc \"rm -rf /\""),
-            CommandClass::Unbypassable
-        );
+        assert_eq!(cls("bash -lc \"rm -rf /\""), CommandClass::Unbypassable);
     }
 
     #[test]
     fn sh_dash_c_rm_rf_build_is_dangerous() {
-        assert_eq!(
-            cls("sh -c \"rm -rf build\""),
-            CommandClass::Dangerous
-        );
+        assert_eq!(cls("sh -c \"rm -rf build\""), CommandClass::Dangerous);
     }
 
     // ── env wrapper bypass guard ─────────────────────────────────

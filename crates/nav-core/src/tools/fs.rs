@@ -420,8 +420,7 @@ mod tests {
         let workspace = temp.path().canonicalize().unwrap();
         fs::create_dir_all(workspace.join(".git")).unwrap();
         fs::write(workspace.join(".git/config"), "[core]").unwrap();
-        std::os::unix::fs::symlink(workspace.join(".git/config"), workspace.join("link"))
-            .unwrap();
+        std::os::unix::fs::symlink(workspace.join(".git/config"), workspace.join("link")).unwrap();
 
         let err = edit_file_with_metadata(&workspace, "link", "[core]", "x").unwrap_err();
         assert!(

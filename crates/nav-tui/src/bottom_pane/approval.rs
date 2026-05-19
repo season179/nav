@@ -66,9 +66,7 @@ impl ApprovalOverlay {
                 Some(ReviewDecision::Approved)
             }
             KeyCode::Char('a') | KeyCode::Char('A') => Some(ReviewDecision::ApprovedForSession),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                Some(ReviewDecision::Denied)
-            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(ReviewDecision::Denied),
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(ReviewDecision::Abort),
             _ => None,
         };

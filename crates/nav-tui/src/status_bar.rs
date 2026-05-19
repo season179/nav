@@ -72,6 +72,11 @@ impl<'a> Widget for StatusBar<'a> {
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
                 ));
+                spans.push(Span::styled("  ·  ", dim));
+                spans.push(Span::styled(
+                    "Esc abort",
+                    Style::default().fg(Color::Yellow),
+                ));
             }
         }
         Paragraph::new(Line::from(spans)).render(area, buf);

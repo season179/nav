@@ -22,7 +22,15 @@ pub const SAFELIST_BARE: &[&str] = &[
 /// `branch` is safe only with list-style flags (`branch tmp` writes under
 /// `.git/refs`).
 pub const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
-    "status", "diff", "log", "show", "remote", "rev-parse", "ls-files", "describe", "blame",
+    "status",
+    "diff",
+    "log",
+    "show",
+    "remote",
+    "rev-parse",
+    "ls-files",
+    "describe",
+    "blame",
 ];
 
 /// `cargo` subcommands that don't execute project code. **Not** a "read-only"
@@ -59,7 +67,9 @@ pub fn is_known_safe(argv: &[String]) -> bool {
 }
 
 fn find_is_safe(rest: &[String]) -> bool {
-    !rest.iter().any(|arg| FIND_UNSAFE_FLAGS.contains(&arg.as_str()))
+    !rest
+        .iter()
+        .any(|arg| FIND_UNSAFE_FLAGS.contains(&arg.as_str()))
 }
 
 fn git_is_safe(rest: &[String]) -> bool {

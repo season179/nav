@@ -141,9 +141,7 @@ impl From<tokio_tungstenite::tungstenite::Error> for TransportError {
 /// transient failure.
 pub fn should_retry(err: &TransportError) -> bool {
     match err {
-        TransportError::Http { status, .. } => {
-            status.as_u16() == 429 || status.is_server_error()
-        }
+        TransportError::Http { status, .. } => status.as_u16() == 429 || status.is_server_error(),
         TransportError::Timeout | TransportError::Network(_) => true,
         TransportError::ContextWindowExceeded { .. } | TransportError::Other(_) => false,
     }
@@ -184,11 +182,7 @@ impl RetryPolicy {
 /// supported; HTTP-date form is intentionally ignored (would pull in a date
 /// crate for a path we hit on rate limits only).
 pub fn parse_retry_after_seconds(value: &str) -> Option<Duration> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 /// Drives the attempt/sleep loop. `on_retry` is invoked before each backoff
@@ -381,12 +375,15 @@ mod tests {
             jitter: 0.0,
         };
         let count = std::sync::Mutex::new(0u32);
-        let result: Result<u32, TransportError> =
-            retry(&policy, |_, _, _| {}, || async {
+        let result: Result<u32, TransportError> = retry(
+            &policy,
+            |_, _, _| {},
+            || async {
                 *count.lock().unwrap() += 1;
                 Ok(42)
-            })
-            .await;
+            },
+        )
+        .await;
         assert_eq!(result.unwrap(), 42);
         assert_eq!(*count.lock().unwrap(), 1);
     }

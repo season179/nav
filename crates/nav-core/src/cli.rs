@@ -236,16 +236,13 @@ mod tests {
 
     #[test]
     fn approval_policy_parses_codex_names() {
-        let args =
-            Args::try_parse_from(["nav", "--approval-policy", "untrusted", "x"]).unwrap();
+        let args = Args::try_parse_from(["nav", "--approval-policy", "untrusted", "x"]).unwrap();
         assert_eq!(args.approval_policy, AskForApproval::UnlessTrusted);
 
-        let args =
-            Args::try_parse_from(["nav", "--approval-policy", "on-request", "x"]).unwrap();
+        let args = Args::try_parse_from(["nav", "--approval-policy", "on-request", "x"]).unwrap();
         assert_eq!(args.approval_policy, AskForApproval::OnRequest);
 
-        let args =
-            Args::try_parse_from(["nav", "--approval-policy", "never", "x"]).unwrap();
+        let args = Args::try_parse_from(["nav", "--approval-policy", "never", "x"]).unwrap();
         assert_eq!(args.approval_policy, AskForApproval::Never);
     }
 
@@ -263,12 +260,9 @@ mod tests {
 
     #[test]
     fn bypass_flag_parses() {
-        let args = Args::try_parse_from([
-            "nav",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "hi",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["nav", "--dangerously-bypass-approvals-and-sandbox", "hi"])
+                .unwrap();
         assert!(args.dangerously_bypass_approvals_and_sandbox);
     }
 

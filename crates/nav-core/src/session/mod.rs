@@ -201,7 +201,15 @@ impl SessionStore {
                     "INSERT OR IGNORE INTO approval
                      (session_id, approval_id, requested_at, tool, command, path, reason)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![session_id, approval_id, now, tool, command_json, path, reason],
+                    params![
+                        session_id,
+                        approval_id,
+                        now,
+                        tool,
+                        command_json,
+                        path,
+                        reason
+                    ],
                 )?;
             }
             AgentEvent::ToolCallBlocked {
@@ -229,7 +237,10 @@ impl SessionStore {
     /// returned handle clones the underlying `Arc<SessionStore>` so the
     /// caller can move it into `ChannelGate::with_sink` without juggling
     /// borrows.
-    pub fn sink_for(self: &std::sync::Arc<Self>, session_id: impl Into<String>) -> SessionStoreSink {
+    pub fn sink_for(
+        self: &std::sync::Arc<Self>,
+        session_id: impl Into<String>,
+    ) -> SessionStoreSink {
         SessionStoreSink {
             store: std::sync::Arc::clone(self),
             session_id: session_id.into(),

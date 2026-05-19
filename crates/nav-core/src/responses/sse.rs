@@ -76,10 +76,7 @@ async fn drive_sse_inner(
         let next = match timeout(idle_timeout, stream.next()).await {
             Ok(item) => item,
             Err(_) => {
-                bail!(
-                    "idle timeout: no SSE event for {}s",
-                    idle_timeout.as_secs()
-                );
+                bail!("idle timeout: no SSE event for {}s", idle_timeout.as_secs());
             }
         };
         let Some(chunk) = next else {

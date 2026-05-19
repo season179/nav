@@ -25,15 +25,10 @@ pub fn is_outside_workspace(workspace: &Path, candidate: &Path) -> bool {
 /// first target that resolves outside the workspace, if any. Also unwraps
 /// leading `command`/`exec`/`builtin` wrappers so `command cd /tmp` and
 /// `builtin cd /tmp` are caught the same as bare `cd`.
-pub fn find_external_cd<'a>(
-    workspace: &Path,
-    pipeline: &'a [Vec<String>],
-) -> Option<&'a str> {
+pub fn find_external_cd<'a>(workspace: &Path, pipeline: &'a [Vec<String>]) -> Option<&'a str> {
     for argv in pipeline {
         let mut start = 0usize;
-        while start < argv.len()
-            && matches!(argv[start].as_str(), "command" | "exec" | "builtin")
-        {
+        while start < argv.len() && matches!(argv[start].as_str(), "command" | "exec" | "builtin") {
             start += 1;
             // Skip over -p/-v/-V flags that `command` accepts.
             while start < argv.len() && argv[start].starts_with('-') {
@@ -141,18 +136,10 @@ mod tests {
     fn find_external_cd_unwraps_command_builtin() {
         let temp = tempdir().unwrap();
         let ws = temp.path().canonicalize().unwrap();
-        let pipeline = vec![vec![
-            "command".to_string(),
-            "cd".into(),
-            "/tmp".into(),
-        ]];
+        let pipeline = vec![vec!["command".to_string(), "cd".into(), "/tmp".into()]];
         assert_eq!(find_external_cd(&ws, &pipeline), Some("/tmp"));
 
-        let pipeline = vec![vec![
-            "builtin".to_string(),
-            "cd".into(),
-            "/tmp".into(),
-        ]];
+        let pipeline = vec![vec!["builtin".to_string(), "cd".into(), "/tmp".into()]];
         assert_eq!(find_external_cd(&ws, &pipeline), Some("/tmp"));
     }
 

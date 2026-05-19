@@ -20,6 +20,14 @@ pub(crate) enum AppEvent {
         skill_name: String,
         wrapped_body: String,
     },
+    /// `/steer <text>` — inject a steering message into the active turn
+    /// at the next safe model/tool boundary. If no turn is active, the
+    /// app loop downgrades this to a normal Submit so the message still
+    /// reaches the model.
+    Steer {
+        text: String,
+        images: Vec<PathBuf>,
+    },
 }
 
 pub(crate) fn is_ctrl_c(key: &KeyEvent) -> bool {
@@ -50,6 +58,15 @@ pub(crate) fn dispatch_submit(
     skills: &Catalog,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
+    if let Some(steer_text) = parse_steer_command(&text) {
+        app_tx
+            .send(AppEvent::Steer {
+                text: steer_text,
+                images,
+            })
+            .ok();
+        return;
+    }
     let event = match text.as_str() {
         "/quit" | "/exit" => AppEvent::Quit,
         "/clear" => AppEvent::Clear,
@@ -69,6 +86,26 @@ pub(crate) fn dispatch_submit(
         },
     };
     app_tx.send(event).ok();
+}
+
+/// Extract the payload of a `/steer …` command. Returns `Some("")` for
+/// the bare `/steer` line, `Some("…rest…")` when the command is followed
+/// by whitespace and a payload, and `None` when the input is not a
+/// steering command (so the caller can fall through to skill / submit
+/// handling). The whitespace requirement keeps `/steerfoo` from being
+/// mistaken for the steering gesture when a future skill named `steerfoo`
+/// could exist.
+pub fn parse_steer_command(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("/steer")?;
+    if rest.is_empty() {
+        return Some(String::new());
+    }
+    let mut chars = rest.chars();
+    let first = chars.next()?;
+    if !first.is_whitespace() {
+        return None;
+    }
+    Some(chars.as_str().trim_start().to_string())
 }
 
 /// Classification of a submitted composer line that may be a skill activation.
@@ -192,6 +229,29 @@ mod tests {
             }
             other => panic!("expected Inline, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_steer_command_returns_payload_when_followed_by_whitespace() {
+        assert_eq!(
+            parse_steer_command("/steer hello world").as_deref(),
+            Some("hello world")
+        );
+        // Newline counts as whitespace.
+        assert_eq!(
+            parse_steer_command("/steer\nactually use the other lib").as_deref(),
+            Some("actually use the other lib")
+        );
+    }
+
+    #[test]
+    fn parse_steer_command_handles_bare_command_and_unrelated_prefixes() {
+        assert_eq!(parse_steer_command("/steer").as_deref(), Some(""));
+        // No whitespace separator — leave alone so skill classification
+        // owns it.
+        assert!(parse_steer_command("/steering").is_none());
+        assert!(parse_steer_command("/steerfoo").is_none());
+        assert!(parse_steer_command("plain text").is_none());
     }
 
     #[test]

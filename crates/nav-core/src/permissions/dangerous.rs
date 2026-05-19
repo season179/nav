@@ -23,9 +23,7 @@ pub fn classify(argv: &[String]) -> Option<DangerKind> {
     if let Some(inner) = unwrap_env(argv) {
         return classify(&inner);
     }
-    if argv.first().map(String::as_str) == Some("env")
-        && argv.len() > 1
-    {
+    if argv.first().map(String::as_str) == Some("env") && argv.len() > 1 {
         // An `env` invocation we couldn't fully peel (e.g. unrecognized
         // VAR=VAL syntax). Treat as Heuristic so OnRequest prompts instead
         // of silently allowing a wrapped command.
@@ -144,9 +142,7 @@ fn unwrap_env(argv: &[String]) -> Option<Vec<String>> {
 fn is_var_assignment(a: &str) -> bool {
     if let Some((name, _)) = a.split_once('=') {
         !name.is_empty()
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
             && !name.as_bytes()[0].is_ascii_digit()
     } else {
         false
@@ -198,11 +194,7 @@ fn is_unbypassable(cmd: &str, argv: &[String]) -> bool {
         return true;
     }
     // dd if=… of=/dev/… — writing raw to a device.
-    if cmd == "dd"
-        && argv
-            .iter()
-            .any(|a| a.starts_with("of=/dev/"))
-    {
+    if cmd == "dd" && argv.iter().any(|a| a.starts_with("of=/dev/")) {
         return true;
     }
     // Fork bomb-ish shells (already rejected by parser via `&`, but be defensive).
@@ -235,7 +227,10 @@ fn is_heuristic_dangerous(cmd: &str, argv: &[String]) -> bool {
     // the classifier is the only gate. `curl URL | sh` is already
     // covered by `pipeline_streams_to_shell`; this catches plain
     // `curl URL`, `wget URL`, `nc host port`, etc.
-    if matches!(cmd, "curl" | "wget" | "nc" | "ncat" | "ssh" | "scp" | "sftp" | "rsync") {
+    if matches!(
+        cmd,
+        "curl" | "wget" | "nc" | "ncat" | "ssh" | "scp" | "sftp" | "rsync"
+    ) {
         return true;
     }
     // Force-push, hard reset, branch -D, clean -fd.
@@ -248,7 +243,9 @@ fn is_heuristic_dangerous(cmd: &str, argv: &[String]) -> bool {
             return true;
         }
         if rest.starts_with(&["clean"])
-            && rest.iter().any(|a| *a == "-f" || *a == "-fd" || *a == "-fx")
+            && rest
+                .iter()
+                .any(|a| *a == "-f" || *a == "-fd" || *a == "-fx")
         {
             return true;
         }
@@ -273,9 +270,7 @@ fn is_heuristic_dangerous(cmd: &str, argv: &[String]) -> bool {
     // segment `sh` (also false). Reject if the argv itself contains `sh` /
     // `bash` as the LAST token when invoked through pipe — that detection
     // happens in the pipeline-wrapper below.
-    if matches!(cmd, "npm" | "yarn" | "pnpm")
-        && argv.iter().any(|a| a == "publish")
-    {
+    if matches!(cmd, "npm" | "yarn" | "pnpm") && argv.iter().any(|a| a == "publish") {
         return true;
     }
     if cmd == "cargo" && argv.iter().any(|a| a == "publish" || a == "yank") {
@@ -342,9 +337,9 @@ fn git_subcommand_mutates_metadata(rest: &[&str]) -> bool {
                 return true;
             }
             // Listing flag present → positional is a filter pattern, not a name.
-            let listing = args.iter().any(|a| {
-                matches!(*a, "-a" | "--all" | "-l" | "--list" | "-r" | "--remotes")
-            });
+            let listing = args
+                .iter()
+                .any(|a| matches!(*a, "-a" | "--all" | "-l" | "--list" | "-r" | "--remotes"));
             if listing {
                 return false;
             }

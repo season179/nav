@@ -208,7 +208,9 @@ fn record_approval_decision_updates_row() {
         )
         .unwrap();
 
-    store.record_approval_decision(&id, "a1", "approved").unwrap();
+    store
+        .record_approval_decision(&id, "a1", "approved")
+        .unwrap();
 
     let conn = store.conn.lock().unwrap();
     let (decided_at, decision): (Option<i64>, Option<String>) = conn

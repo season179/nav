@@ -154,6 +154,23 @@ impl BottomPane {
         &self.composer
     }
 
+    /// Mutable composer access for programmatic edits (e.g. restoring a
+    /// queued follow-up into the buffer for the user to fix). Callers must
+    /// be aware that bypassing `handle_key` means popups won't auto-open —
+    /// `reconcile_popups` is called below so the slash/`@`-mention overlays
+    /// pick up the new buffer state.
+    pub fn composer_mut(&mut self) -> &mut Composer {
+        &mut self.composer
+    }
+
+    /// Replace the composer text from outside the key-event path (e.g. when
+    /// editing a queued follow-up). Also reconciles popups so the slash /
+    /// `@`-mention overlays reflect the new buffer state.
+    pub fn set_composer_text(&mut self, text: &str) {
+        self.composer.set_text(text);
+        self.reconcile_popups();
+    }
+
     pub fn has_overlay(&self) -> bool {
         self.view.is_some()
     }
@@ -235,8 +252,7 @@ impl BottomPane {
                             }
                             BottomPaneView::Approval(o) => {
                                 if let Some(decision) = o.take_decision() {
-                                    self.last_decision =
-                                        Some((o.approval_id.clone(), decision));
+                                    self.last_decision = Some((o.approval_id.clone(), decision));
                                 }
                             }
                         }

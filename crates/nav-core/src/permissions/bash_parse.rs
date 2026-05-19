@@ -18,7 +18,10 @@ impl std::fmt::Display for ShellParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ShellParseError::Unparseable => {
-                write!(f, "command uses a shell construct nav cannot statically analyze")
+                write!(
+                    f,
+                    "command uses a shell construct nav cannot statically analyze"
+                )
             }
         }
     }
@@ -64,7 +67,7 @@ fn reject_dangerous_constructs(command: &str) -> Result<(), ShellParseError> {
         let b = bytes[i];
         match (quote, b) {
             (Some(q), c) if c == q => quote = None,
-            (Some(b'\''), _) => {} // single-quoted: literal
+            (Some(b'\''), _) => {}         // single-quoted: literal
             (Some(b'"'), b'\\') => i += 1, // escape inside double quotes
             (Some(b'"'), b'`') => return Err(ShellParseError::Unparseable),
             (Some(b'"'), b'$') if peek(bytes, i + 1) == Some(b'(') => {
@@ -225,8 +228,14 @@ mod tests {
 
     #[test]
     fn empty_returns_empty() {
-        assert_eq!(parse_command_pipeline("").unwrap(), Vec::<Vec<String>>::new());
-        assert_eq!(parse_command_pipeline("   ").unwrap(), Vec::<Vec<String>>::new());
+        assert_eq!(
+            parse_command_pipeline("").unwrap(),
+            Vec::<Vec<String>>::new()
+        );
+        assert_eq!(
+            parse_command_pipeline("   ").unwrap(),
+            Vec::<Vec<String>>::new()
+        );
     }
 
     #[test]
@@ -270,10 +279,7 @@ mod tests {
     fn splits_on_pipe() {
         assert_eq!(
             parse("ls | grep foo"),
-            vec![
-                vec!["ls".to_string()],
-                vec!["grep".into(), "foo".into()],
-            ]
+            vec![vec!["ls".to_string()], vec!["grep".into(), "foo".into()],]
         );
     }
 
@@ -281,11 +287,7 @@ mod tests {
     fn splits_compound_pipeline() {
         assert_eq!(
             parse("a | b ; c"),
-            vec![
-                vec!["a".to_string()],
-                vec!["b".into()],
-                vec!["c".into()],
-            ]
+            vec![vec!["a".to_string()], vec!["b".into()], vec!["c".into()],]
         );
     }
 

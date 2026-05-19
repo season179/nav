@@ -11,13 +11,13 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::agent::{AbortSignal, SteeringQueue};
 use crate::permissions::approval::ApprovalGate;
 use crate::permissions::classifier::{CommandClass, classify_with_pipeline};
 use crate::permissions::dangerous;
 use crate::permissions::external::find_external_cd;
 use crate::permissions::protected::{
-    PROTECTED_METADATA_NAMES, glob_could_match, is_protected_metadata_write,
-    is_protected_read,
+    PROTECTED_METADATA_NAMES, glob_could_match, is_protected_metadata_write, is_protected_read,
 };
 use crate::permissions::{
     ApprovalReason, AskForApproval, BlockRule, SandboxPolicy, SessionAllowlist,
@@ -35,6 +35,17 @@ pub struct PermissionContext {
     /// with the same `(tool, key)` signature skip the modal. Shared across
     /// all turns in one nav run via `Arc`.
     pub session_allowlist: SessionAllowlist,
+    /// Turn-scoped abort flag. Cloned for each tool dispatch so the sandbox
+    /// runner and any future cancellable tools can race their work against
+    /// `abort.wait()`. Default is a never-tripped signal; the TUI replaces
+    /// it per turn so a stale abort doesn't leak from a prior turn.
+    pub abort: AbortSignal,
+    /// Turn-scoped steering queue. The agent loop drains it at safe
+    /// model/tool boundaries and folds each message into the next request
+    /// as a synthetic user message — letting the operator type a course
+    /// correction without stopping the active turn. Default is an empty
+    /// queue; the TUI replaces it per turn alongside `abort`.
+    pub steering: SteeringQueue,
 }
 
 /// Build the session-allowlist key for one tool invocation. Returning `None`
@@ -145,7 +156,9 @@ fn evaluate_bash(input: &Value, workspace: &Path, policy: AskForApproval) -> Pre
     // approval policy and sandbox mode (which `--dangerously-bypass-...`
     // and `--sandbox danger-full-access` would otherwise circumvent).
     if let Some(p) = pipeline.as_ref()
-        && let Some(argv) = p.iter().find(|a| dangerous::argv_writes_protected_metadata(a))
+        && let Some(argv) = p
+            .iter()
+            .find(|a| dangerous::argv_writes_protected_metadata(a))
     {
         let label = argv.join(" ");
         return PreflightOutcome::Block {
@@ -348,9 +361,8 @@ fn arg_references_protected_segment(arg: &str) -> bool {
             let abs = start + rel;
             let end = abs + name.len();
             let left_ok = abs == 0 || is_path_boundary_byte(bytes[abs - 1]);
-            let right_ok = end == bytes.len()
-                || bytes[end] == b'/'
-                || is_path_boundary_byte(bytes[end]);
+            let right_ok =
+                end == bytes.len() || bytes[end] == b'/' || is_path_boundary_byte(bytes[end]);
             if left_ok && right_ok {
                 return true;
             }
@@ -359,9 +371,7 @@ fn arg_references_protected_segment(arg: &str) -> bool {
     }
     // Glob-fuzzy scan: split into path-segment-shaped candidates and ask
     // whether any could expand to a protected name.
-    for segment in arg.split(|c: char| {
-        c.is_ascii() && is_path_boundary_byte(c as u8)
-    }) {
+    for segment in arg.split(|c: char| c.is_ascii() && is_path_boundary_byte(c as u8)) {
         if segment.is_empty() {
             continue;
         }

@@ -5,8 +5,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashMap;
 
 use crate::cells::{
-    AssistantMessageCell, ErrorCell, FileChangeCell, SkillInvocationCell, ToolCallCell,
-    ToolCallContext, ToolOutputCell, TurnDiffCell, UserMessageCell, WelcomeCell,
+    AssistantMessageCell, ErrorCell, FileChangeCell, SkillInvocationCell, ToolAbortedCell,
+    ToolCallCell, ToolCallContext, ToolOutputCell, TurnDiffCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -146,6 +146,9 @@ impl ChatWidget {
                 self.cells.push(Box::new(ErrorCell::new(format!(
                     "tool {tool} blocked ({rule}): {reason}"
                 ))));
+            }
+            AgentEvent::TurnAborted { reason } => {
+                self.cells.push(Box::new(ToolAbortedCell::new(reason)));
             }
         }
     }

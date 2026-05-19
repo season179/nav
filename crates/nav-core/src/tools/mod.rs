@@ -159,6 +159,8 @@ pub fn unchecked_permission_context() -> PermissionContext {
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         sandbox: Arc::new(PassthroughRunner),
         session_allowlist: SessionAllowlist::default(),
+        abort: crate::agent::AbortSignal::default(),
+        steering: crate::agent::SteeringQueue::default(),
     }
 }
 
@@ -274,8 +276,9 @@ pub async fn run_tool(
     let result: Result<ToolResult> = match name {
         "read_file" => fs::read_file(cwd, skill_dirs, string_arg(&input, "path")?)
             .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
-        "list_files" => fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?)
-            .map(ToolResult::text),
+        "list_files" => {
+            fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?).map(ToolResult::text)
+        }
         "bash" => shell::bash(
             permissions,
             cwd,
@@ -675,9 +678,8 @@ mod tests {
         fn request<'a>(
             &'a self,
             req: ApprovalRequest,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = ReviewDecision> + Send + 'a>,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ReviewDecision> + Send + 'a>>
+        {
             self.requests.lock().unwrap().push(req);
             let d = self.decision;
             Box::pin(async move { d })
@@ -691,6 +693,8 @@ mod tests {
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             sandbox: Arc::new(PassthroughRunner),
             session_allowlist: SessionAllowlist::default(),
+            abort: crate::agent::AbortSignal::default(),
+            steering: crate::agent::SteeringQueue::default(),
         }
     }
 
@@ -764,7 +768,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!outcome.is_error, "command should run after approval: {}", outcome.output);
+        assert!(
+            !outcome.is_error,
+            "command should run after approval: {}",
+            outcome.output
+        );
         assert_eq!(gate.requests().len(), 1);
         assert!(!cwd.join("build").exists());
     }
@@ -997,14 +1005,20 @@ mod tests {
     fn string_arg_rejects_missing_field() {
         let input = json!({"path": "foo.rs"});
         let err = string_arg(&input, "command").unwrap_err();
-        assert!(err.to_string().contains("missing string input field `command`"));
+        assert!(
+            err.to_string()
+                .contains("missing string input field `command`")
+        );
     }
 
     #[test]
     fn string_arg_rejects_non_string_field() {
         let input = json!({"path": 42});
         let err = string_arg(&input, "path").unwrap_err();
-        assert!(err.to_string().contains("missing string input field `path`"));
+        assert!(
+            err.to_string()
+                .contains("missing string input field `path`")
+        );
     }
 
     // ── unchecked context smoke ───────────────────────────────────
