@@ -204,9 +204,24 @@ small slice earlier.
      including the new v2→v3 migration, fork-copies-events,
      labels-round-trip, depth-ordered `walk_tree`, and
      cross-session FTS phrase coverage).
-3. [ ] Add optional git checkpointing: checkpoint/stash/restore support for
+3. [x] Add optional git checkpointing: checkpoint/stash/restore support for
    users who want reversible agent turns.
-   - Not started.
+   - Done in this worktree: `nav-core/src/git_checkpoint.rs` adds
+     stash-backed checkpoint, stash, restore, and nav-stash listing helpers.
+     `checkpoint` stores a nav-labelled stash then reapplies it so the
+     worktree stays dirty; `stash` stores and cleans; `restore` resolves a
+     target (or the newest nav checkpoint) and first safety-stashes any
+     current changes before applying. A durable `GitCheckpoint` `AgentEvent`
+     records checkpoint/stash/restore rows for TUI, NDJSON, and transcript
+     export. `--git-checkpoints` and `.nav/settings.json` `git_checkpoints`
+     enable automatic pre-turn checkpoints when a normal turn starts from a
+     dirty git worktree; `--no-git-checkpoints` opts out for one run. CLI
+     surface: `nav git checkpoint [label]`, `nav git stash [label]`,
+     `nav git restore [target]`, and `nav git list`; TUI surface:
+     `/checkpoint`, `/stash`, and `/restore`.
+   - Verified with `cargo test -p nav-core -p nav-cli -p nav-tui` and
+     `cargo clippy -p nav-core -p nav-cli -p nav-tui --all-targets -- -D
+     warnings`.
 4. [ ] Deepen extensibility: custom tools, MCP-style integrations, extension
    hooks, prompt templates, package installation, and themes.
    - Partial: skills system in `nav-core/src/skills.rs` provides

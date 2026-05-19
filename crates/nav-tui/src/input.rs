@@ -54,6 +54,15 @@ pub(crate) enum AppEvent {
     FindTranscript {
         query: String,
     },
+    GitCheckpoint {
+        label: Option<String>,
+    },
+    GitStash {
+        label: Option<String>,
+    },
+    GitRestore {
+        target: Option<String>,
+    },
     SlashError {
         message: String,
     },
@@ -226,6 +235,21 @@ fn parse_builtin_command(text: &str) -> Option<AppEvent> {
         }
         return Some(AppEvent::FindTranscript {
             query: rest.to_string(),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/checkpoint") {
+        return Some(AppEvent::GitCheckpoint {
+            label: (!rest.is_empty()).then(|| rest.to_string()),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/stash") {
+        return Some(AppEvent::GitStash {
+            label: (!rest.is_empty()).then(|| rest.to_string()),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/restore") {
+        return Some(AppEvent::GitRestore {
+            target: (!rest.is_empty()).then(|| rest.to_string()),
         });
     }
     None
@@ -492,6 +516,22 @@ mod tests {
         assert!(matches!(
             classify_slash("plain text", &catalog),
             SlashAction::NotASkill
+        ));
+    }
+
+    #[test]
+    fn parses_git_builtin_commands() {
+        assert!(matches!(
+            parse_builtin_command("/checkpoint before risky edit"),
+            Some(AppEvent::GitCheckpoint { label: Some(label) }) if label == "before risky edit"
+        ));
+        assert!(matches!(
+            parse_builtin_command("/stash"),
+            Some(AppEvent::GitStash { label: None })
+        ));
+        assert!(matches!(
+            parse_builtin_command("/restore stash@{2}"),
+            Some(AppEvent::GitRestore { target: Some(target) }) if target == "stash@{2}"
         ));
     }
 

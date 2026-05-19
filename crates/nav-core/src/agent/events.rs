@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::control::PendingInputMode;
+use crate::git_checkpoint::{GitCheckpointAction, GitCheckpointStatus};
 use crate::mutation::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
 use crate::permissions::ReviewDecision;
 
@@ -104,6 +105,18 @@ pub enum AgentEvent {
         files: Vec<FileDiffSummary>,
         unified_diff: String,
         truncated: bool,
+    },
+    /// A local git checkpoint/stash/restore operation completed. These
+    /// events are not model-facing; they are durable UI/audit rows so a user
+    /// can later see which reversible snapshots existed around a turn.
+    GitCheckpoint {
+        action: GitCheckpointAction,
+        status: GitCheckpointStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stash_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stash_oid: Option<String>,
+        message: String,
     },
     /// The agent needs the operator's permission before it can run a tool
     /// call. Surfaced for both `bash` (`command` populated) and `edit_file`
@@ -235,6 +248,7 @@ impl AgentEvent {
             AgentEvent::ToolCallOutput { .. } => "tool_call_output",
             AgentEvent::FileChange { .. } => "file_change",
             AgentEvent::TurnDiff { .. } => "turn_diff",
+            AgentEvent::GitCheckpoint { .. } => "git_checkpoint",
             AgentEvent::ToolCallApprovalRequest { .. } => "tool_call_approval_request",
             AgentEvent::ToolCallBlocked { .. } => "tool_call_blocked",
             AgentEvent::PendingInputQueued { .. } => "pending_input_queued",
@@ -262,6 +276,18 @@ impl AgentEvent {
             self,
             AgentEvent::AssistantMessageDelta { .. } | AgentEvent::ProviderRetry { .. }
         )
+    }
+}
+
+impl From<crate::git_checkpoint::GitCheckpointOutcome> for AgentEvent {
+    fn from(outcome: crate::git_checkpoint::GitCheckpointOutcome) -> Self {
+        AgentEvent::GitCheckpoint {
+            action: outcome.action,
+            status: outcome.status,
+            stash_ref: outcome.stash_ref,
+            stash_oid: outcome.stash_oid,
+            message: outcome.message,
+        }
     }
 }
 
@@ -519,6 +545,30 @@ mod tests {
             })
         );
         assert_eq!(event.kind(), "compaction_failed");
+        assert!(event.is_durable());
+    }
+
+    #[test]
+    fn git_checkpoint_wire_format() {
+        let event = AgentEvent::GitCheckpoint {
+            action: GitCheckpointAction::Checkpoint,
+            status: GitCheckpointStatus::Created,
+            stash_ref: Some("stash@{0}".into()),
+            stash_oid: Some("abc123".into()),
+            message: "nav checkpoint 01ABCDEF: before turn".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "git_checkpoint",
+                "action": "checkpoint",
+                "status": "created",
+                "stash_ref": "stash@{0}",
+                "stash_oid": "abc123",
+                "message": "nav checkpoint 01ABCDEF: before turn"
+            })
+        );
+        assert_eq!(event.kind(), "git_checkpoint");
         assert!(event.is_durable());
     }
 

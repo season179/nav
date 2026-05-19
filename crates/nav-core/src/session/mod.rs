@@ -315,6 +315,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             | AgentEvent::PendingInputDequeued { .. }
             | AgentEvent::FileChange { .. }
             | AgentEvent::TurnDiff { .. }
+            | AgentEvent::GitCheckpoint { .. }
             | AgentEvent::CompactionStarted { .. }
             | AgentEvent::CompactionFailed { .. } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);

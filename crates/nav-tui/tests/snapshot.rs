@@ -1,6 +1,6 @@
 use nav_core::{
-    AgentEvent, FileChangeKind, FileChangeSummary, FileDiffSummary, PatchApplyStatus,
-    PendingInputMode, SessionSummary, TurnUsage,
+    AgentEvent, FileChangeKind, FileChangeSummary, FileDiffSummary, GitCheckpointAction,
+    GitCheckpointStatus, PatchApplyStatus, PendingInputMode, SessionSummary, TurnUsage,
 };
 use nav_tui::ChatWidget;
 use ratatui::Terminal;
@@ -229,6 +229,25 @@ fn turn_diff_event_renders_modified_file_summary() {
     assert!(rendered.contains("modified note.txt (+1 -1)"), "{rendered}");
     assert!(rendered.contains("-old"), "{rendered}");
     assert!(rendered.contains("+new"), "{rendered}");
+}
+
+#[test]
+fn git_checkpoint_event_renders_restore_handle() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::GitCheckpoint {
+        action: GitCheckpointAction::Checkpoint,
+        status: GitCheckpointStatus::Created,
+        stash_ref: Some("stash@{0}".to_string()),
+        stash_oid: Some("1234567890abcdef".to_string()),
+        message: "nav checkpoint 01ABCDEF: before turn".to_string(),
+    });
+
+    let rendered = render_widget(&widget, 100, 8);
+
+    assert!(rendered.contains("◆ checkpoint  created"), "{rendered}");
+    assert!(rendered.contains("stash@{0} (1234567890ab)"), "{rendered}");
+    assert!(rendered.contains("nav checkpoint 01ABCDEF"), "{rendered}");
 }
 
 #[test]

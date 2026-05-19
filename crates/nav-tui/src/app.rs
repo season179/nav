@@ -12,7 +12,7 @@ use nav_core::{
     PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
     TurnControls, UserAttachment,
     cli::{Args, sandbox_policy_from_args},
-    shorten_home,
+    git_checkpoint, shorten_home,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -581,6 +581,39 @@ pub async fn run(
                             Err(err) => chat.push_err(err),
                         }
                     }
+                    AppEvent::GitCheckpoint { label } => {
+                        run_idle_git_action(
+                            "checkpoint",
+                            turn_started_at.is_some(),
+                            store.as_ref(),
+                            &session_id,
+                            &mut chat,
+                            &mut pane,
+                            || git_checkpoint::checkpoint(&cwd, Some(&session_id), label.as_deref()),
+                        );
+                    }
+                    AppEvent::GitStash { label } => {
+                        run_idle_git_action(
+                            "stash",
+                            turn_started_at.is_some(),
+                            store.as_ref(),
+                            &session_id,
+                            &mut chat,
+                            &mut pane,
+                            || git_checkpoint::stash(&cwd, Some(&session_id), label.as_deref()),
+                        );
+                    }
+                    AppEvent::GitRestore { target } => {
+                        run_idle_git_action(
+                            "restore",
+                            turn_started_at.is_some(),
+                            store.as_ref(),
+                            &session_id,
+                            &mut chat,
+                            &mut pane,
+                            || git_checkpoint::restore(&cwd, target.as_deref()),
+                        );
+                    }
                     AppEvent::SlashError { message } => {
                         chat.ingest(AgentEvent::Error { message });
                     }
@@ -756,6 +789,27 @@ fn emit_pending_cleared(
         chat,
         pane,
     );
+}
+
+fn run_idle_git_action(
+    name: &str,
+    turn_is_active: bool,
+    store: &SessionStore,
+    session_id: &SessionId,
+    chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
+    run: impl FnOnce() -> Result<git_checkpoint::GitCheckpointOutcome>,
+) {
+    if turn_is_active {
+        chat.ingest(AgentEvent::Error {
+            message: format!("cannot {name} while a turn is running"),
+        });
+        return;
+    }
+    match run() {
+        Ok(outcome) => emit_local_event(outcome.into(), store, session_id, chat, pane),
+        Err(err) => chat.push_err(err),
+    }
 }
 
 fn clear_pending_inputs(
@@ -1106,7 +1160,7 @@ fn turn_is_terminal(ev: &AgentEvent) -> bool {
 mod tests {
     use super::*;
 
-    use nav_core::CompactionTrigger;
+    use nav_core::{CompactionTrigger, GitCheckpointAction, GitCheckpointStatus};
 
     #[test]
     fn turn_is_terminal_for_turn_complete_and_error() {
@@ -1159,6 +1213,17 @@ mod tests {
         assert!(!turn_is_terminal(&AgentEvent::CompactionFailed {
             trigger: CompactionTrigger::Auto,
             message: "x".into(),
+        }));
+    }
+
+    #[test]
+    fn turn_is_terminal_excludes_git_checkpoint_events() {
+        assert!(!turn_is_terminal(&AgentEvent::GitCheckpoint {
+            action: GitCheckpointAction::Checkpoint,
+            status: GitCheckpointStatus::Failed,
+            stash_ref: None,
+            stash_oid: None,
+            message: "git checkpoint failed".into(),
         }));
     }
 

@@ -158,6 +158,9 @@ pub struct Settings {
     /// Fraction of `auto_compact_token_limit` at which automatic compaction
     /// fires. Defaults to [`crate::agent::DEFAULT_AUTO_COMPACT_FRACTION`].
     pub auto_compact_fraction: Option<f32>,
+    /// When true, create a git stash-backed checkpoint before each normal
+    /// agent turn that starts from a dirty worktree.
+    pub git_checkpoints: Option<bool>,
 }
 
 impl Settings {
@@ -173,6 +176,7 @@ impl Settings {
             .auto_compact_token_limit
             .or(self.auto_compact_token_limit);
         self.auto_compact_fraction = other.auto_compact_fraction.or(self.auto_compact_fraction);
+        self.git_checkpoints = other.git_checkpoints.or(self.git_checkpoints);
     }
 }
 

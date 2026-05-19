@@ -120,6 +120,17 @@ pub struct Args {
     )]
     pub auto_compact_fraction: f32,
 
+    /// Create a git stash-backed checkpoint before each normal agent turn
+    /// that starts from a dirty worktree. The worktree is restored
+    /// immediately after the checkpoint is stored.
+    #[arg(long)]
+    pub git_checkpoints: bool,
+
+    /// Disable git checkpoints even when enabled in `.nav/settings.json` or
+    /// `~/.nav/settings.json`.
+    #[arg(long, conflicts_with = "git_checkpoints")]
+    pub no_git_checkpoints: bool,
+
     #[command(subcommand)]
     pub command: Option<CliCommand>,
 
@@ -152,6 +163,11 @@ pub enum CliCommand {
     Sessions {
         #[command(subcommand)]
         action: SessionsAction,
+    },
+    /// Git checkpointing helpers for reversible worktree states.
+    Git {
+        #[command(subcommand)]
+        action: GitAction,
     },
 }
 
@@ -198,6 +214,27 @@ pub enum SessionsAction {
         #[arg(long)]
         label: Option<String>,
     },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum GitAction {
+    /// Save a checkpoint stash while keeping current files in place.
+    Checkpoint {
+        /// Optional label stored in the stash message.
+        label: Vec<String>,
+    },
+    /// Stash current changes and leave the worktree clean.
+    Stash {
+        /// Optional label stored in the stash message.
+        label: Vec<String>,
+    },
+    /// Apply a checkpoint/stash. Defaults to the newest nav checkpoint.
+    Restore {
+        /// Git stash ref, OID, or unique revision prefix.
+        target: Option<String>,
+    },
+    /// List nav-created checkpoints and stashes.
+    List,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -290,6 +327,13 @@ impl Args {
         {
             self.auto_compact_fraction = fraction;
         }
+        if provided.was_provided("no_git_checkpoints") {
+            self.git_checkpoints = false;
+        } else if let Some(enabled) = settings.git_checkpoints
+            && !provided.was_provided("git_checkpoints")
+        {
+            self.git_checkpoints = enabled;
+        }
     }
 
     /// Shared constructor for unit tests across modules.
@@ -320,6 +364,8 @@ impl Args {
             // stub transport that wasn't set up for it.
             auto_compact_token_limit: 0,
             auto_compact_fraction: crate::agent::DEFAULT_AUTO_COMPACT_FRACTION,
+            git_checkpoints: false,
+            no_git_checkpoints: false,
             command: None,
             prompt: vec!["test".into()],
         }
@@ -386,13 +432,15 @@ mod tests {
         assert_eq!(args.model, "gpt-5.5");
         assert!(matches!(args.auth, AuthMode::Chatgpt));
         assert!(matches!(args.transport, Transport::Websocket));
-        assert_eq!(args.max_turns, 8);
+        assert_eq!(args.max_turns, 10000);
         assert_eq!(args.bash_timeout_secs, 20);
         assert_eq!(args.prompt, vec!["hello"]);
         assert!(args.codex_home.is_none());
         assert_eq!(args.approval_policy, AskForApproval::OnRequest);
         assert_eq!(args.sandbox, SandboxMode::WorkspaceWrite);
         assert!(!args.dangerously_bypass_approvals_and_sandbox);
+        assert!(!args.git_checkpoints);
+        assert!(!args.no_git_checkpoints);
     }
 
     #[test]
@@ -497,6 +545,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_git_subcommands() {
+        let args = Args::try_parse_from(["nav", "git", "checkpoint", "before", "tests"]).unwrap();
+        assert_eq!(
+            args.command,
+            Some(CliCommand::Git {
+                action: GitAction::Checkpoint {
+                    label: vec!["before".into(), "tests".into()],
+                },
+            })
+        );
+
+        let args = Args::try_parse_from(["nav", "git", "restore", "stash@{2}"]).unwrap();
+        assert_eq!(
+            args.command,
+            Some(CliCommand::Git {
+                action: GitAction::Restore {
+                    target: Some("stash@{2}".into()),
+                },
+            })
+        );
+    }
+
+    #[test]
     fn allows_empty_prompt() {
         // clap Vec<String> accepts zero args; main.rs checks for emptiness.
         let args = Args::try_parse_from(["nav"]).unwrap();
@@ -527,6 +598,7 @@ mod tests {
         assert_eq!(args.max_turns, 20);
         // Untouched fields stay at clap defaults.
         assert_eq!(args.bash_timeout_secs, 20);
+        assert!(!args.git_checkpoints);
     }
 
     #[test]
@@ -564,5 +636,38 @@ mod tests {
         args.apply_settings(&settings, &provided);
         assert!(matches!(args.transport, Transport::Sse));
         assert!(matches!(args.auth, AuthMode::ApiKey));
+    }
+
+    #[test]
+    fn git_checkpoint_setting_applies_when_not_provided() {
+        let (mut args, provided) = matches(&["nav", "hi"]);
+        let settings = Settings {
+            git_checkpoints: Some(true),
+            ..Settings::default()
+        };
+        args.apply_settings(&settings, &provided);
+        assert!(args.git_checkpoints);
+
+        let (mut args, provided) = matches(&["nav", "--git-checkpoints", "hi"]);
+        let settings = Settings {
+            git_checkpoints: Some(false),
+            ..Settings::default()
+        };
+        args.apply_settings(&settings, &provided);
+        assert!(args.git_checkpoints);
+    }
+
+    #[test]
+    fn no_git_checkpoints_overrides_settings() {
+        let (mut args, provided) = matches(&["nav", "--no-git-checkpoints", "hi"]);
+        let settings = Settings {
+            git_checkpoints: Some(true),
+            ..Settings::default()
+        };
+
+        args.apply_settings(&settings, &provided);
+
+        assert!(!args.git_checkpoints);
+        assert!(args.no_git_checkpoints);
     }
 }

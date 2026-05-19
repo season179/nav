@@ -3,6 +3,7 @@ pub mod auth;
 pub mod cli;
 pub mod control;
 pub mod doctor;
+pub mod git_checkpoint;
 pub mod git_diff;
 pub mod models;
 pub mod mutation;
@@ -21,6 +22,9 @@ pub use agent::{
 pub use control::{
     ControlPlane, PendingInput, PendingInputDraft, PendingInputMode, PendingSkill,
     PendingSteeringQueue, TurnControls,
+};
+pub use git_checkpoint::{
+    GitCheckpointAction, GitCheckpointOutcome, GitCheckpointStatus, GitStashEntry,
 };
 pub use mutation::{
     FileChangeKind, FileChangeSummary, FileDiffSummary, MutationResult, PatchApplyStatus, TurnDiff,

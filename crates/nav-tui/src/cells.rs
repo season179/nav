@@ -1,6 +1,7 @@
 use nav_core::{
-    CompactionTrigger, FileChangeSummary, FileDiffSummary, PatchApplyStatus, PendingInputMode,
-    SessionSummary, SessionTreeNode, TranscriptHit, TurnDiff, layout_session_tree,
+    CompactionTrigger, FileChangeSummary, FileDiffSummary, GitCheckpointAction,
+    GitCheckpointStatus, PatchApplyStatus, PendingInputMode, SessionSummary, SessionTreeNode,
+    TranscriptHit, TurnDiff, layout_session_tree,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -690,6 +691,49 @@ impl HistoryCell for TurnDiffCell {
     }
 }
 
+pub struct GitCheckpointCell {
+    action: GitCheckpointAction,
+    status: GitCheckpointStatus,
+    stash_ref: Option<String>,
+    stash_oid: Option<String>,
+    message: String,
+}
+
+impl GitCheckpointCell {
+    pub fn new(
+        action: GitCheckpointAction,
+        status: GitCheckpointStatus,
+        stash_ref: Option<String>,
+        stash_oid: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            action,
+            status,
+            stash_ref,
+            stash_oid,
+            message: message.into(),
+        }
+    }
+}
+
+impl HistoryCell for GitCheckpointCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let color = match self.action {
+            GitCheckpointAction::Checkpoint => Color::Cyan,
+            GitCheckpointAction::Stash => Color::Magenta,
+            GitCheckpointAction::Restore => Color::Green,
+        };
+        body_cell(
+            "◆",
+            self.action.as_str(),
+            color,
+            &git_checkpoint_body(self),
+            width,
+        )
+    }
+}
+
 pub struct PendingInputCell {
     action: PendingInputAction,
     id: Option<String>,
@@ -886,6 +930,23 @@ fn turn_diff_body(diff: &TurnDiff) -> String {
         parts.push("full diff truncated".to_string());
     }
     parts.join("\n")
+}
+
+fn git_checkpoint_body(cell: &GitCheckpointCell) -> String {
+    let mut parts = vec![cell.status.as_str().to_string()];
+    if let Some(stash_ref) = &cell.stash_ref {
+        let mut stash = stash_ref.clone();
+        if let Some(oid) = &cell.stash_oid {
+            stash.push_str(&format!(" ({})", short_oid(oid)));
+        }
+        parts.push(stash);
+    }
+    parts.push(cell.message.clone());
+    parts.join("\n")
+}
+
+fn short_oid(oid: &str) -> String {
+    oid.chars().take(12).collect()
 }
 
 const DEFAULT_TOOL_OUTPUT_LINES: usize = 12;
