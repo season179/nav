@@ -23,6 +23,15 @@ impl StreamController {
         self.buffer.push_str(text);
     }
 
+    /// Replace the streamed buffer with `text`. Used on `AssistantMessageDone`
+    /// so the authoritative coalesced final from the provider wins over the
+    /// delta accumulator (which can drift on reconnect or whitespace
+    /// normalization).
+    pub fn replace_buffer(&mut self, text: &str) {
+        self.buffer.clear();
+        self.buffer.push_str(text);
+    }
+
     /// Mark the stream as complete. After this call the whole buffer is
     /// treated as stable, regardless of any open markdown block.
     pub fn finalize(&mut self) {

@@ -16,6 +16,13 @@ use crate::history::HistoryCell;
 pub struct ChatWidget {
     cells: Vec<Box<dyn HistoryCell>>,
     tool_calls: HashMap<String, ToolCallContext>,
+    /// In-flight streaming assistant cell, anchored to its eventual index
+    /// in `cells`. Held outside `cells` so deltas can mutate it in place;
+    /// control-plane rows that fire mid-stream (pending-input queue ops)
+    /// push past the anchor without closing, and the cell splices back
+    /// at the same anchor on close. Guarantees one cell per assistant
+    /// message even when local events interleave.
+    streaming_assistant: Option<(usize, AssistantMessageCell)>,
     /// `None` follows the newest transcript row. `Some(row)` pins the top of
     /// the viewport while the user is reading older output.
     scroll_top: Option<usize>,
@@ -26,6 +33,7 @@ impl ChatWidget {
         Self {
             cells: Vec::new(),
             tool_calls: HashMap::new(),
+            streaming_assistant: None,
             scroll_top: None,
         }
     }
@@ -37,17 +45,15 @@ impl ChatWidget {
     }
 
     pub fn push_skill(&mut self, name: impl Into<String>, detail: impl Into<String>) {
-        self.cells
-            .push(Box::new(SkillInvocationCell::new(name, detail)));
+        self.push_cell(SkillInvocationCell::new(name, detail));
     }
 
     pub fn push_session_list(&mut self, sessions: Vec<SessionSummary>) {
-        self.cells.push(Box::new(SessionListCell::new(sessions)));
+        self.push_cell(SessionListCell::new(sessions));
     }
 
     pub fn push_session_notice(&mut self, label: impl Into<String>, message: impl Into<String>) {
-        self.cells
-            .push(Box::new(SessionNoticeCell::new(label, message)));
+        self.push_cell(SessionNoticeCell::new(label, message));
     }
 
     /// Prepend a welcome cell that orients the user (model, cwd, session id).
@@ -61,21 +67,27 @@ impl ChatWidget {
         context_summary: Option<String>,
         settings_summary: Option<String>,
     ) {
-        self.cells.push(Box::new(WelcomeCell::new(
+        self.push_cell(WelcomeCell::new(
             model,
             cwd,
             session_id,
             branch_summary,
             context_summary,
             settings_summary,
-        )));
+        ));
     }
 
     /// Translate an agent event into a history cell and append it.
     ///
-    /// `AssistantMessageDelta` is currently ignored: the TUI shows assistant
-    /// text when `AssistantMessageDone` arrives. `TurnComplete` is handled by
-    /// the status bar in `run()`, not by the scrollback widget.
+    /// `AssistantMessageDelta` appends to the anchored in-flight streaming
+    /// cell. Events that end the assistant's message (tool calls, abort,
+    /// turn complete, retries, errors, compaction, the next user turn)
+    /// route through `push_cell`, which closes the streaming row by
+    /// splicing it back into `cells` at its anchor. Control-plane rows
+    /// that do NOT end the message (pending-input queue ops) route
+    /// through `push_local_cell` and render after the live stream without
+    /// finalizing it — preventing the single assistant message from
+    /// being split across two scrollback cells.
     pub fn ingest(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::UserMessage {
@@ -83,9 +95,29 @@ impl ChatWidget {
                 display_text,
                 attachments: _,
             } => {
+                self.close_streaming_assistant();
                 self.push_user_event(text, display_text);
             }
-            AgentEvent::AssistantMessageDelta { .. } | AgentEvent::TurnComplete { .. } => {}
+            AgentEvent::AssistantMessageDelta { text } => {
+                if self.streaming_assistant.is_none() {
+                    self.streaming_assistant =
+                        Some((self.cells.len(), AssistantMessageCell::streaming()));
+                }
+                if let Some((_, cell)) = self.streaming_assistant.as_mut() {
+                    cell.push_delta(&text);
+                }
+            }
+            AgentEvent::AssistantMessageDone { text } => {
+                if let Some((idx, mut cell)) = self.streaming_assistant.take() {
+                    cell.finalize_with(&text);
+                    self.cells.insert(idx, Box::new(cell));
+                } else {
+                    self.push_cell(AssistantMessageCell::new(text));
+                }
+            }
+            AgentEvent::TurnComplete { .. } | AgentEvent::ToolCallApprovalRequest { .. } => {
+                self.close_streaming_assistant();
+            }
             AgentEvent::ProviderRetry {
                 attempt,
                 max_attempts,
@@ -93,17 +125,14 @@ impl ChatWidget {
                 reason,
             } => {
                 let secs = delay_ms as f64 / 1000.0;
-                self.cells.push(Box::new(ErrorCell::new(format!(
+                self.push_cell(ErrorCell::new(format!(
                     "provider retry {attempt}/{max_attempts} after {secs:.1}s — {reason}"
-                ))));
+                )));
             }
             AgentEvent::ContextTrimmed { dropped_pairs } => {
-                self.cells.push(Box::new(ErrorCell::new(format!(
+                self.push_cell(ErrorCell::new(format!(
                     "context window exceeded — trimmed {dropped_pairs} oldest tool pair(s) and retried"
-                ))));
-            }
-            AgentEvent::AssistantMessageDone { text } => {
-                self.cells.push(Box::new(AssistantMessageCell::new(text)));
+                )));
             }
             AgentEvent::ToolCallStarted {
                 call_id,
@@ -112,7 +141,7 @@ impl ChatWidget {
             } => {
                 let cell = ToolCallCell::new(name, arguments);
                 self.tool_calls.insert(call_id, cell.context());
-                self.cells.push(Box::new(cell));
+                self.push_cell(cell);
             }
             AgentEvent::ToolCallOutput {
                 call_id,
@@ -120,9 +149,7 @@ impl ChatWidget {
                 is_error,
             } => {
                 let context = self.tool_calls.remove(&call_id);
-                self.cells.push(Box::new(ToolOutputCell::with_context(
-                    output, is_error, context,
-                )));
+                self.push_cell(ToolOutputCell::with_context(output, is_error, context));
             }
             AgentEvent::FileChange {
                 changes,
@@ -131,31 +158,24 @@ impl ChatWidget {
                 error,
                 ..
             } => {
-                self.cells.push(Box::new(FileChangeCell::new(
-                    changes, status, summary, error,
-                )));
+                self.push_cell(FileChangeCell::new(changes, status, summary, error));
             }
             AgentEvent::TurnDiff {
                 files,
                 unified_diff,
                 truncated,
             } => {
-                self.cells
-                    .push(Box::new(TurnDiffCell::new(files, unified_diff, truncated)));
+                self.push_cell(TurnDiffCell::new(files, unified_diff, truncated));
             }
             AgentEvent::Error { message } => {
-                self.cells.push(Box::new(ErrorCell::new(message)));
-            }
-            AgentEvent::ToolCallApprovalRequest { .. } => {
-                // Modal flow is handled by the bottom pane; nothing to add to
-                // the scrollback here. Wired up in slice 13/14.
+                self.push_cell(ErrorCell::new(message));
             }
             AgentEvent::ToolCallBlocked {
                 tool, reason, rule, ..
             } => {
-                self.cells.push(Box::new(ErrorCell::new(format!(
+                self.push_cell(ErrorCell::new(format!(
                     "tool {tool} blocked ({rule}): {reason}"
-                ))));
+                )));
             }
             AgentEvent::PendingInputQueued {
                 id,
@@ -165,12 +185,12 @@ impl ChatWidget {
                 skill_name,
                 ..
             } => {
-                self.cells.push(Box::new(PendingInputCell::queued(
+                self.push_local_cell(PendingInputCell::queued(
                     id,
                     mode,
                     display_text.unwrap_or(text),
                     skill_name,
-                )));
+                ));
             }
             AgentEvent::PendingInputEdited {
                 id,
@@ -179,32 +199,29 @@ impl ChatWidget {
                 skill_name,
                 ..
             } => {
-                self.cells.push(Box::new(PendingInputCell::edited(
+                self.push_local_cell(PendingInputCell::edited(
                     id,
                     display_text.unwrap_or(text),
                     skill_name,
-                )));
+                ));
             }
             AgentEvent::PendingInputRemoved { id } => {
-                self.cells.push(Box::new(PendingInputCell::removed(id)));
+                self.push_local_cell(PendingInputCell::removed(id));
             }
             AgentEvent::PendingInputCleared { ids } => {
-                self.cells.push(Box::new(PendingInputCell::cleared(ids)));
+                self.push_local_cell(PendingInputCell::cleared(ids));
             }
             AgentEvent::PendingInputDequeued { id, mode } => {
-                self.cells
-                    .push(Box::new(PendingInputCell::dequeued(id, mode)));
+                self.push_local_cell(PendingInputCell::dequeued(id, mode));
             }
             AgentEvent::TurnAborted { turn_id, reason } => {
-                self.cells
-                    .push(Box::new(TurnAbortedCell::new(turn_id, reason)));
+                self.push_cell(TurnAbortedCell::new(turn_id, reason));
             }
             AgentEvent::CompactionStarted {
                 trigger,
                 tokens_before,
             } => {
-                self.cells
-                    .push(Box::new(CompactionCell::started(trigger, tokens_before)));
+                self.push_cell(CompactionCell::started(trigger, tokens_before));
             }
             AgentEvent::CompactionCompleted {
                 trigger,
@@ -212,24 +229,24 @@ impl ChatWidget {
                 replaced_events,
                 tokens_before,
             } => {
-                self.cells.push(Box::new(CompactionCell::new(
+                self.push_cell(CompactionCell::new(
                     CompactionPhase::Completed,
                     trigger,
                     Some(summary),
                     Some(replaced_events),
                     tokens_before,
                     None,
-                )));
+                ));
             }
             AgentEvent::CompactionFailed { trigger, message } => {
-                self.cells.push(Box::new(CompactionCell::new(
+                self.push_cell(CompactionCell::new(
                     CompactionPhase::Failed,
                     trigger,
                     None,
                     None,
                     0,
                     Some(message),
-                )));
+                ));
             }
         }
     }
@@ -278,18 +295,57 @@ impl ChatWidget {
     }
 
     fn rendered_height(&self, width: u16) -> usize {
-        self.cells
-            .iter()
+        self.iter_cells()
             .map(|cell| cell.display_lines(width).len())
             .sum()
     }
 
     fn render_lines(&self, width: u16) -> Vec<ratatui::text::Line<'static>> {
-        let mut lines = Vec::new();
-        for cell in &self.cells {
-            lines.extend(cell.display_lines(width));
+        self.iter_cells()
+            .flat_map(|cell| cell.display_lines(width))
+            .collect()
+    }
+
+    fn iter_cells(&self) -> impl Iterator<Item = &dyn HistoryCell> {
+        let split = self
+            .streaming_assistant
+            .as_ref()
+            .map(|(idx, _)| (*idx).min(self.cells.len()))
+            .unwrap_or(self.cells.len());
+        let (head, tail) = self.cells.split_at(split);
+        head.iter()
+            .map(|cell| cell.as_ref())
+            .chain(
+                self.streaming_assistant
+                    .as_ref()
+                    .map(|(_, cell)| cell as &dyn HistoryCell),
+            )
+            .chain(tail.iter().map(|cell| cell.as_ref()))
+    }
+
+    /// Push a cell that ends the in-flight assistant message. Closes the
+    /// streaming row first so it splices into scrollback at its anchored
+    /// position before this cell appends after it.
+    fn push_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
+        self.close_streaming_assistant();
+        self.cells.push(Box::new(cell));
+    }
+
+    /// Push a control-plane cell (pending-input queue ops) that does NOT
+    /// end the assistant's in-flight message. The cell sits past the
+    /// streaming anchor in `cells`, so it renders after the streaming row
+    /// without finalizing it — `AssistantMessageDone` then splices the
+    /// single assistant cell into its anchored position.
+    fn push_local_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
+        self.cells.push(Box::new(cell));
+    }
+
+    fn close_streaming_assistant(&mut self) {
+        if let Some((idx, mut cell)) = self.streaming_assistant.take() {
+            cell.finalize();
+            let insert_at = idx.min(self.cells.len());
+            self.cells.insert(insert_at, Box::new(cell));
         }
-        lines
     }
 
     fn push_user_event(&mut self, text: String, display_text: Option<String>) {
@@ -305,7 +361,7 @@ impl ChatWidget {
     }
 
     fn push_user_cell(&mut self, text: impl Into<String>) {
-        self.cells.push(Box::new(UserMessageCell::new(text)));
+        self.push_cell(UserMessageCell::new(text));
     }
 }
 

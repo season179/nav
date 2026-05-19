@@ -331,6 +331,15 @@ impl AssistantMessageCell {
     pub fn finalize(&mut self) {
         self.controller.finalize();
     }
+
+    /// Replace the streamed buffer with the coalesced final `text` and
+    /// finalize. Trusts the provider's `AssistantMessageDone` payload over
+    /// the accumulated deltas — symmetric with the resume-path
+    /// [`AssistantMessageCell::new`].
+    pub fn finalize_with(&mut self, text: &str) {
+        self.controller.replace_buffer(text);
+        self.controller.finalize();
+    }
 }
 
 impl HistoryCell for AssistantMessageCell {

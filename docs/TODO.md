@@ -20,10 +20,30 @@ are the unchecked items at the top; shipped foundation stays here as evidence.
    - Verified with `cargo fmt --check` and
      `cargo test -p nav-core -p nav-tui` (458 nav-core tests, 69 nav-tui unit
      tests, 9 composer tests, 18 snapshot tests, plus doc-tests).
-2. [ ] Stream assistant output live in the TUI.
-   - Partial: `AssistantMessageDelta` events exist and streaming message cells
-     exist, but `nav-tui/src/widget.rs` explicitly ignores deltas and only
-     renders final `AssistantMessageDone` text.
+2. [x] Stream assistant output live in the TUI.
+   - Done in commit 9c55788: `ChatWidget` now holds a `streaming_assistant:
+     Option<AssistantMessageCell>` opened on the first
+     `AssistantMessageDelta`, appended on every subsequent delta, and
+     finalized into scrollback on `AssistantMessageDone`. A new
+     `close_streaming_assistant()` flushes the in-flight cell on
+     `TurnComplete`, `TurnAborted`, any tool-call event
+     (`ToolCallStarted` / `ToolCallOutput` / `ToolCallApprovalRequest` /
+     `ToolCallBlocked` / `FileChange` / `TurnDiff`), `UserMessage`,
+     `PendingInput*`, `Compaction*`, `ProviderRetry`, `ContextTrimmed`, and
+     `Error` so a later assistant message starts a fresh row. Mid-stream
+     `TurnAborted` preserves the partial text. Resume/replay still works
+     because deltas are not persisted (`replay.rs:87`,
+     `session/mod.rs:232,373`): only `AssistantMessageDone` fires and the
+     non-streaming `AssistantMessageCell::new(text)` path still paints the
+     full text. The render hot path reuses the existing
+     `StreamController::partitioned_lines` helper, so scrollback redraws
+     stay smooth.
+   - Verified with `cargo fmt --check` and `cargo test -p nav-core -p
+     nav-tui` (558 tests across 6 suites). New unit tests in
+     `crates/nav-tui/tests/snapshot.rs` cover incremental painting, the
+     resume-style `Done`-without-deltas path, mid-stream tool-call
+     interleaving (two separate assistant rows in chronological order), and
+     mid-stream `TurnAborted` preserving the partial text.
 3. [x] Finish interactive session management: TUI resume picker, real
    `/sessions` and `/resume` commands, named sessions, and exportable
    transcripts.
