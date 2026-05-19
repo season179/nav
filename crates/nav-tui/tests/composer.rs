@@ -39,7 +39,13 @@ fn typing_hello_then_enter_returns_submit() {
     assert_eq!(pane.composer().text(), "hello");
 
     let event = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(event, ComposerEvent::Submit("hello".to_string()));
+    assert_eq!(
+        event,
+        ComposerEvent::Submit {
+            text: "hello".to_string(),
+            images: Vec::new(),
+        }
+    );
     assert_eq!(pane.composer().text(), "");
     assert_eq!(pane.composer().history(), &["hello".to_string()]);
 }
@@ -83,7 +89,13 @@ fn exact_slash_command_enter_submits_without_second_enter() {
     type_text(&mut pane, "/exit");
     let event = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
 
-    assert_eq!(event, ComposerEvent::Submit("/exit".to_string()));
+    assert_eq!(
+        event,
+        ComposerEvent::Submit {
+            text: "/exit".to_string(),
+            images: Vec::new(),
+        }
+    );
     assert_eq!(pane.composer().text(), "");
     assert_eq!(pane.composer().history(), &["/exit".to_string()]);
 }
@@ -95,7 +107,13 @@ fn partial_slash_command_enter_completes_and_submits() {
     type_text(&mut pane, "/ex");
     let event = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
 
-    assert_eq!(event, ComposerEvent::Submit("/exit".to_string()));
+    assert_eq!(
+        event,
+        ComposerEvent::Submit {
+            text: "/exit".to_string(),
+            images: Vec::new(),
+        }
+    );
     assert_eq!(pane.composer().text(), "");
     assert_eq!(pane.composer().history(), &["/exit".to_string()]);
 }
@@ -148,7 +166,13 @@ fn up_arrow_recalls_previous_prompt() {
 
     type_text(&mut pane, "first");
     let event = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(event, ComposerEvent::Submit("first".to_string()));
+    assert_eq!(
+        event,
+        ComposerEvent::Submit {
+            text: "first".to_string(),
+            images: Vec::new(),
+        }
+    );
     assert_eq!(pane.composer().text(), "");
 
     press(&mut pane, KeyCode::Up, KeyModifiers::NONE);

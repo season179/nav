@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use base64::Engine;
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::future::Future;
@@ -6,7 +7,7 @@ use std::path::Path;
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{AgentEvent, TurnUsage};
+use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::cli::Args;
 use crate::responses::{self, ResponseCollector};
 use crate::session::{SessionId, SessionStore};
@@ -33,14 +34,83 @@ pub struct SessionBinding<'a> {
     pub session_id: SessionId,
 }
 
-fn user_message_event(prompt: &str, display_prompt: Option<&str>) -> AgentEvent {
+fn user_message_event(
+    prompt: &str,
+    display_prompt: Option<&str>,
+    attachments: Vec<UserAttachment>,
+) -> AgentEvent {
     let display_text = display_prompt
         .filter(|display| *display != prompt)
         .map(str::to_string);
     AgentEvent::UserMessage {
         text: prompt.to_string(),
         display_text,
+        attachments,
     }
+}
+
+/// Build the `content` part of a Responses API user message. Plain text turns
+/// stay as a single string (the historical shape); when attachments are
+/// present, return an array of typed content parts so the Responses API can
+/// see `input_text` alongside `input_image`. Images that fail to load are
+/// silently dropped — a bad path shouldn't block the turn.
+pub(super) fn build_user_content(
+    prompt: &str,
+    attachments: &[UserAttachment],
+    cwd: &Path,
+) -> Value {
+    if attachments.is_empty() {
+        return Value::String(prompt.to_string());
+    }
+    let mut parts: Vec<Value> = Vec::with_capacity(1 + attachments.len());
+    parts.push(json!({ "type": "input_text", "text": prompt }));
+    for attach in attachments {
+        match attach {
+            UserAttachment::Image { path } => {
+                if let Some(data_uri) = encode_image_data_uri(cwd, path) {
+                    parts.push(json!({
+                        "type": "input_image",
+                        "image_url": data_uri,
+                    }));
+                }
+            }
+        }
+    }
+    Value::Array(parts)
+}
+
+fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
+    // Defense-in-depth: nav's workspace contract says reads/writes for
+    // user-provided paths stay inside the workspace root. The TUI normally
+    // relativizes / copies pastes into <cwd>/.nav/clipboard/ before queuing
+    // them, but a path with `..` segments or a symlink that resolves outside
+    // would otherwise let us silently base64 arbitrary files (e.g.
+    // ~/.ssh/id_rsa) into the Responses request. Canonicalize both sides and
+    // require containment before reading.
+    let abs = if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        cwd.join(rel)
+    };
+    let canonical = abs.canonicalize().ok()?;
+    let cwd_canonical = cwd.canonicalize().ok()?;
+    if !canonical.starts_with(&cwd_canonical) {
+        return None;
+    }
+    let bytes = std::fs::read(&canonical).ok()?;
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| "png".to_string());
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(format!("data:{mime};base64,{encoded}"))
 }
 
 /// Drives the model/tool loop, emitting one [`AgentEvent`] per observable
@@ -59,17 +129,23 @@ pub async fn run_agent(
     cwd: &Path,
     prompt: &str,
     display_prompt: Option<&str>,
+    attachments: Vec<UserAttachment>,
     events: UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
     initial_input: Option<Vec<Value>>,
     skills: &Catalog,
 ) -> Result<()> {
     let mut input = initial_input.unwrap_or_default();
-    emit(&events, session, user_message_event(prompt, display_prompt));
+    let content = build_user_content(prompt, &attachments, cwd);
+    emit(
+        &events,
+        session,
+        user_message_event(prompt, display_prompt, attachments),
+    );
     input.push(json!({
         "type": "message",
         "role": "user",
-        "content": prompt,
+        "content": content,
     }));
 
     for _ in 0..args.max_turns {

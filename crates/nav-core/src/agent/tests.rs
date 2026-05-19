@@ -5,6 +5,7 @@ use anyhow::Result;
 use futures_util::stream;
 use serde_json::{Value, json};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Mutex;
 use tempfile::tempdir;
@@ -123,15 +124,19 @@ fn extract_message_text_returns_none_for_empty_content() {
 
 #[test]
 fn rebuild_responses_input_replays_user_text_not_display_text() {
-    let input = rebuild_responses_input(&[
-        AgentEvent::UserMessage {
-            text: "model-facing prompt".into(),
-            display_text: Some("visible prompt".into()),
-        },
-        AgentEvent::AssistantMessageDone {
-            text: "assistant reply".into(),
-        },
-    ]);
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "model-facing prompt".into(),
+                display_text: Some("visible prompt".into()),
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "assistant reply".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
 
     assert!(is_input_user_message(&input[0], "model-facing prompt"));
     assert!(is_input_assistant_message(&input[1], "assistant reply"));
@@ -139,25 +144,29 @@ fn rebuild_responses_input_replays_user_text_not_display_text() {
 
 #[test]
 fn rebuild_responses_input_skips_tool_events() {
-    let input = rebuild_responses_input(&[
-        AgentEvent::UserMessage {
-            text: "inspect".into(),
-            display_text: None,
-        },
-        AgentEvent::ToolCallStarted {
-            call_id: "call_1".into(),
-            name: "read_file".into(),
-            arguments: json!({"path": "Cargo.toml"}),
-        },
-        AgentEvent::ToolCallOutput {
-            call_id: "call_1".into(),
-            output: "contents".into(),
-            is_error: false,
-        },
-        AgentEvent::AssistantMessageDone {
-            text: "Cargo.toml is a Rust manifest.".into(),
-        },
-    ]);
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "inspect".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::ToolCallStarted {
+                call_id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "Cargo.toml"}),
+            },
+            AgentEvent::ToolCallOutput {
+                call_id: "call_1".into(),
+                output: "contents".into(),
+                is_error: false,
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "Cargo.toml is a Rust manifest.".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
 
     assert_eq!(input.len(), 2);
     assert!(is_input_user_message(&input[0], "inspect"));
@@ -165,6 +174,153 @@ fn rebuild_responses_input_skips_tool_events() {
         &input[1],
         "Cargo.toml is a Rust manifest."
     ));
+}
+
+#[test]
+fn rebuild_responses_input_carries_image_attachments_back_into_input() {
+    // PNG header bytes — encode_image_data_uri only reads from disk and
+    // base64s, no decoding, so the exact content doesn't need to be valid.
+    let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let dir = tempdir().unwrap();
+    let rel = PathBuf::from(".nav/clipboard/restored.png");
+    let abs = dir.path().join(&rel);
+    std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+    std::fs::write(&abs, bytes).unwrap();
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "look at this".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image { path: rel }],
+        }],
+        dir.path(),
+    );
+
+    assert_eq!(input.len(), 1);
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("attachments produce typed content array");
+    assert!(content.iter().any(|part| {
+        part.get("type").and_then(Value::as_str) == Some("input_text")
+            && part.get("text").and_then(Value::as_str) == Some("look at this")
+    }));
+    assert!(content.iter().any(|part| {
+        part.get("type").and_then(Value::as_str) == Some("input_image")
+            && part
+                .get("image_url")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.starts_with("data:image/png;base64,"))
+    }));
+}
+
+#[test]
+fn rebuild_responses_input_keeps_text_when_image_file_missing() {
+    let dir = tempdir().unwrap();
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "image gone".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image {
+                path: PathBuf::from(".nav/clipboard/missing.png"),
+            }],
+        }],
+        dir.path(),
+    );
+
+    // Missing image bytes degrade to the text-only typed parts array (no
+    // input_image part) rather than failing the resume.
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("attachments still trigger typed-parts shape");
+    assert!(
+        content
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image"))
+    );
+    assert!(
+        content
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+    );
+}
+
+#[test]
+fn image_attachment_with_dotdot_escape_is_dropped() {
+    // A relative attachment path containing `..` resolves outside cwd; even
+    // if the file exists and is readable, encode_image_data_uri must refuse
+    // to ship its bytes — that's the workspace-boundary contract.
+    let outer = tempdir().unwrap();
+    let outside = outer.path().join("secret.png");
+    std::fs::write(&outside, b"not really a png but doesn't matter").unwrap();
+    let cwd = outer.path().join("workspace");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "exfiltrate this".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image {
+                path: PathBuf::from("../secret.png"),
+            }],
+        }],
+        &cwd,
+    );
+
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("attachments produce typed parts");
+    assert!(
+        content
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image")),
+        "../ escape must not emit input_image: {content:?}"
+    );
+}
+
+#[test]
+fn image_attachment_via_symlink_escape_is_dropped() {
+    // A symlink inside the workspace that points outside must not be read
+    // and forwarded to the model. canonicalize() resolves the symlink before
+    // the containment check.
+    let outer = tempdir().unwrap();
+    let outside = outer.path().join("secret.png");
+    std::fs::write(&outside, b"x").unwrap();
+    let cwd = outer.path().join("workspace");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let link = cwd.join("evil.png");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(not(unix))]
+    {
+        // No portable symlink on non-unix; skip the assertion when it cannot
+        // be set up. The Linux/macOS CI path is the one we care about.
+        let _ = &link;
+        return;
+    }
+
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: "look".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image {
+                path: PathBuf::from("evil.png"),
+            }],
+        }],
+        &cwd,
+    );
+
+    let content = input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("attachments produce typed parts");
+    assert!(
+        content
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image"))
+    );
 }
 
 // ── emit_stream_events ────────────────────────────────────────
@@ -228,6 +384,7 @@ async fn run_agent_emits_single_error_when_transport_create_fails() {
         &cwd,
         "hello",
         None,
+        Vec::new(),
         tx,
         None,
         None,
@@ -305,6 +462,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         &cwd,
         "do the thing",
         None,
+        Vec::new(),
         tx,
         None,
         None,
@@ -324,7 +482,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
     assert!(
         matches!(
             events.first(),
-            Some(AgentEvent::UserMessage { text, display_text })
+            Some(AgentEvent::UserMessage { text, display_text, .. })
                 if text == "do the thing" && display_text.is_none()
         ),
         "unexpected first event: {:?}",
@@ -495,6 +653,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         &cwd,
         "first",
         None,
+        Vec::new(),
         tx1,
         Some(&binding_one),
         None,
@@ -518,7 +677,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
     ));
 
     // ── Resume: load events, rebuild input, run prompt "second".
-    let rebuilt = rebuild_responses_input(&stored_after_run1);
+    let rebuilt = rebuild_responses_input(&stored_after_run1, Path::new("/tmp"));
     // Sanity: the rebuilt input contains the prior user prompt and the
     // assistant reply in order.
     assert!(matches!(
@@ -543,6 +702,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         &cwd,
         "second",
         None,
+        Vec::new(),
         tx2,
         Some(&binding_two),
         Some(rebuilt),
@@ -591,4 +751,79 @@ async fn resume_replays_transcript_and_appends_new_events() {
         .filter(|e| matches!(e, AgentEvent::TurnComplete { .. }))
         .count();
     assert_eq!(turn_completes, 2);
+}
+
+#[tokio::test]
+async fn user_message_with_image_attachment_is_sent_as_input_image_content() {
+    use base64::Engine;
+    use std::path::PathBuf;
+
+    // Minimal turn: assistant replies with a plain message so the agent loop
+    // terminates after one round-trip without invoking tools.
+    let turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}],
+            },
+        }),
+        json!({"type": "response.completed", "response": {"usage": {}}}),
+    ];
+    let transport = StubTransport::new(vec![turn]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 1;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\nFAKEBYTES";
+    let rel = PathBuf::from("paste.png");
+    std::fs::write(cwd.join(&rel), png_bytes).unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "describe this",
+        None,
+        vec![UserAttachment::Image { path: rel }],
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+    )
+    .await
+    .expect("run_agent");
+    drop(rx.recv().await);
+    while rx.recv().await.is_some() {}
+
+    // The first request body's `input[0]` should be a user message whose
+    // content is an array containing both `input_text` and `input_image`.
+    let body = transport.bodies().remove(0);
+    let input = body.get("input").and_then(Value::as_array).expect("input");
+    let first = input.first().expect("first input item");
+    let content = first
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("content should be an array when attachments are present");
+    let parts: Vec<&str> = content
+        .iter()
+        .filter_map(|p| p.get("type").and_then(Value::as_str))
+        .collect();
+    assert!(parts.contains(&"input_text"), "missing input_text: {parts:?}");
+    assert!(parts.contains(&"input_image"), "missing input_image: {parts:?}");
+    let image_part = content
+        .iter()
+        .find(|p| p.get("type").and_then(Value::as_str) == Some("input_image"))
+        .expect("image part");
+    let url = image_part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .expect("image_url");
+    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
+    assert!(
+        url.starts_with("data:image/png;base64,") && url.contains(&expected_b64),
+        "unexpected image_url: {url}"
+    );
 }

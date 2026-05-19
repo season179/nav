@@ -7,7 +7,7 @@ pub mod skills;
 pub mod tools;
 
 pub use agent::{
-    AgentEvent, EventStream, ResponsesTransport, SessionBinding, TurnUsage,
+    AgentEvent, EventStream, ResponsesTransport, SessionBinding, TurnUsage, UserAttachment,
     rebuild_responses_input, run_agent,
 };
 pub use responses::OpenAiTransport;
