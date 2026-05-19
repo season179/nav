@@ -41,17 +41,15 @@ impl ChatWidget {
     }
 
     pub fn push_skill(&mut self, name: impl Into<String>, detail: impl Into<String>) {
-        self.cells
-            .push(Box::new(SkillInvocationCell::new(name, detail)));
+        self.push_cell(SkillInvocationCell::new(name, detail));
     }
 
     pub fn push_session_list(&mut self, sessions: Vec<SessionSummary>) {
-        self.cells.push(Box::new(SessionListCell::new(sessions)));
+        self.push_cell(SessionListCell::new(sessions));
     }
 
     pub fn push_session_notice(&mut self, label: impl Into<String>, message: impl Into<String>) {
-        self.cells
-            .push(Box::new(SessionNoticeCell::new(label, message)));
+        self.push_cell(SessionNoticeCell::new(label, message));
     }
 
     /// Prepend a welcome cell that orients the user (model, cwd, session id).
@@ -65,14 +63,14 @@ impl ChatWidget {
         context_summary: Option<String>,
         settings_summary: Option<String>,
     ) {
-        self.cells.push(Box::new(WelcomeCell::new(
+        self.push_cell(WelcomeCell::new(
             model,
             cwd,
             session_id,
             branch_summary,
             context_summary,
             settings_summary,
-        )));
+        ));
     }
 
     /// Translate an agent event into a history cell and append it.
@@ -100,7 +98,7 @@ impl ChatWidget {
             AgentEvent::AssistantMessageDone { text } => {
                 if let Some(mut cell) = self.streaming_assistant.take() {
                     cell.finalize_with(&text);
-                    self.cells.push(Box::new(cell));
+                    self.push_cell(cell);
                 } else {
                     self.push_cell(AssistantMessageCell::new(text));
                 }
@@ -333,7 +331,7 @@ impl ChatWidget {
     }
 
     fn push_user_cell(&mut self, text: impl Into<String>) {
-        self.cells.push(Box::new(UserMessageCell::new(text)));
+        self.push_cell(UserMessageCell::new(text));
     }
 }
 

@@ -347,6 +347,29 @@ fn tool_call_mid_stream_finalizes_open_assistant_cell() {
 }
 
 #[test]
+fn local_helpers_mid_stream_flush_streaming_first() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "first reply".to_string(),
+    });
+    widget.push_skill("zoom-out", "applied to this turn");
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "second reply".to_string(),
+    });
+
+    let rendered = render_widget(&widget, 70, 12);
+    let first_idx = rendered.find("first reply").expect("first assistant text");
+    let skill_idx = rendered.find("◆ skill").expect("skill row");
+    let second_idx = rendered
+        .find("second reply")
+        .expect("second assistant text");
+    assert!(
+        first_idx < skill_idx && skill_idx < second_idx,
+        "expected chronological order assistant→skill→assistant, got:\n{rendered}"
+    );
+}
+
+#[test]
 fn turn_aborted_mid_stream_preserves_partial_text() {
     let mut widget = ChatWidget::new();
     widget.ingest(AgentEvent::AssistantMessageDelta {
