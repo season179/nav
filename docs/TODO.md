@@ -145,9 +145,11 @@ small slice earlier.
    - Not started.
 4. [ ] Deepen extensibility: custom tools, MCP-style integrations, extension
    hooks, prompt templates, package installation, and themes.
-   - Partial: MCP integration referenced in `nav-tui/src/app.rs` and skills
-     system in `nav-core/src/skills.rs`. No extension hooks, prompt templates,
-     package install, or themes.
+   - Partial: skills system in `nav-core/src/skills.rs` provides
+     project/user-scope skill discovery and execution.
+   - Outstanding: MCP-style integrations (no client, transport, or tool
+     bridge yet), extension hooks, prompt templates, package install, and
+     themes.
 5. [ ] Polish headless integration: define a stable JSON/RPC contract for
    desktop, chat, and other non-TUI frontends.
    - Not started: NDJSON `AgentEvent` stream exists, but the wire format is
