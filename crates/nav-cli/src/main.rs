@@ -129,9 +129,14 @@ async fn main() -> Result<()> {
         session_id,
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let (permissions, _stdin_reader) =
-        build_ndjson_permissions(&args, &cwd, tx.clone(), Arc::clone(&store), &binding.session_id)
-            .await;
+    let (permissions, _stdin_reader) = build_ndjson_permissions(
+        &args,
+        &cwd,
+        tx.clone(),
+        Arc::clone(&store),
+        &binding.session_id,
+    )
+    .await;
 
     let agent = agent::run_agent(
         transport.as_ref(),
@@ -211,8 +216,7 @@ async fn build_ndjson_permissions(
         // decision/decided_at while the tool actually ran.
         let sink = Arc::new(store.sink_for(session_id.to_string()));
         let channel = ChannelGate::new(pending.clone(), events).with_sink(sink.clone());
-        let reader =
-            spawn_response_reader(tokio::io::stdin(), pending, Some(sink));
+        let reader = spawn_response_reader(tokio::io::stdin(), pending, Some(sink));
         (Arc::new(channel), Some(reader))
     };
 
@@ -227,7 +231,6 @@ async fn build_ndjson_permissions(
         reader,
     )
 }
-
 
 fn list_sessions_command(args: &Args) -> Result<()> {
     let store = SessionStore::open(args.db_path.clone())?;

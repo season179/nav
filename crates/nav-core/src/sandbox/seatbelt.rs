@@ -234,7 +234,10 @@ mod tests {
         // Sanity: deny rules must come AFTER the allow so seatbelt's
         // last-match-wins ordering blocks writes inside `.git`.
         let allow_idx = p
-            .find(&format!("(allow file-write* (subpath \"{}\"))", root.display()))
+            .find(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                root.display()
+            ))
             .expect("allow rule present");
         let deny_idx = p
             .find(&format!(
@@ -252,7 +255,10 @@ mod tests {
             network: true,
         };
         let p = build_profile(&policy).unwrap();
-        assert!(p.contains("(allow network*)"), "profile missing network allow");
+        assert!(
+            p.contains("(allow network*)"),
+            "profile missing network allow"
+        );
     }
 
     #[test]

@@ -250,12 +250,7 @@ mod tests {
         for i in 0..100 {
             input.push_str(&format!("{i}\n"));
         }
-        let result = bound_with_limits(
-            input,
-            TruncateMode::HeadTail { head_lines: 3 },
-            10,
-            10_000,
-        );
+        let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 3 }, 10, 10_000);
         // Head: 0,1,2
         assert!(result.starts_with("0\n1\n2\n"));
         // Tail: 93..99 (10 - 3 = 7 tail lines).
@@ -271,12 +266,7 @@ mod tests {
         // Build wide lines so byte budget hits before line budget.
         let line = "y".repeat(80) + "\n"; // 81 bytes
         let input = line.repeat(100); // 8100 bytes
-        let result = bound_with_limits(
-            input,
-            TruncateMode::HeadTail { head_lines: 2 },
-            50,
-            500,
-        );
+        let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 2 }, 50, 500);
         assert!(result.len() <= 600); // cap + marker headroom
         assert!(result.contains("[truncated"));
     }
@@ -285,17 +275,13 @@ mod tests {
     fn head_tail_does_not_overlap_head_and_tail_lines() {
         // 8 lines, asking for head=3 + tail=4 (max_lines=7). Line 3 must not
         // appear twice and line 7 must be present.
-        let input = (0..8)
-            .map(|i| format!("line{i}\n"))
-            .collect::<String>();
-        let result = bound_with_limits(
-            input,
-            TruncateMode::HeadTail { head_lines: 3 },
-            7,
-            10_000,
-        );
+        let input = (0..8).map(|i| format!("line{i}\n")).collect::<String>();
+        let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 3 }, 7, 10_000);
         let occurrences = result.matches("line3\n").count();
-        assert!(occurrences <= 1, "line3 appeared {occurrences} times: {result}");
+        assert!(
+            occurrences <= 1,
+            "line3 appeared {occurrences} times: {result}"
+        );
         assert!(result.contains("line0\n"));
         assert!(result.contains("line7\n"));
     }
@@ -333,15 +319,15 @@ mod tests {
         for i in 0..5 {
             input.push_str(&format!("tail{i}\n"));
         }
-        let result = bound_with_limits(
-            input,
-            TruncateMode::HeadTail { head_lines: 2 },
-            10,
-            1000,
-        );
+        let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 2 }, 10, 1000);
         let marker_start = result.find("\n[truncated").expect("marker present");
         let head = &result[..marker_start];
-        assert!(head.len() >= 100, "head was {} bytes: {:?}", head.len(), head);
+        assert!(
+            head.len() >= 100,
+            "head was {} bytes: {:?}",
+            head.len(),
+            head
+        );
         assert!(head.chars().all(|c| c == 'a'));
         // Tail still has the short trailing lines.
         let tail = &result[marker_start..];
@@ -357,12 +343,7 @@ mod tests {
             input.push_str(&format!("head{i}\n"));
         }
         input.push_str(&"z".repeat(3000));
-        let result = bound_with_limits(
-            input,
-            TruncateMode::HeadTail { head_lines: 3 },
-            10,
-            500,
-        );
+        let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 3 }, 10, 500);
         let marker_start = result.find("\n[truncated").expect("marker present");
         let head = &result[..marker_start];
         let tail = &result[marker_start..];
@@ -392,12 +373,7 @@ mod tests {
     #[test]
     fn head_tail_marker_between_segments() {
         let input = (0..10).map(|i| format!("{i}\n")).collect::<String>();
-        let result = bound_with_limits(
-            input,
-            TruncateMode::HeadTail { head_lines: 2 },
-            4,
-            10_000,
-        );
+        let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 2 }, 4, 10_000);
         let head_end = result.find("[truncated").expect("marker present");
         let head_part = &result[..head_end];
         let tail_part = &result[head_end..];

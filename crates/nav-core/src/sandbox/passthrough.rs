@@ -86,10 +86,7 @@ mod tests {
 
     #[tokio::test]
     async fn passthrough_captures_stderr_separately() {
-        let out = PassthroughRunner
-            .run(req("echo err >&2", 5))
-            .await
-            .unwrap();
+        let out = PassthroughRunner.run(req("echo err >&2", 5)).await.unwrap();
         assert!(out.stderr.contains("err"));
         assert!(!out.stdout.contains("err"));
     }
@@ -103,10 +100,7 @@ mod tests {
 
     #[tokio::test]
     async fn passthrough_times_out() {
-        let err = PassthroughRunner
-            .run(req("sleep 60", 1))
-            .await
-            .unwrap_err();
+        let err = PassthroughRunner.run(req("sleep 60", 1)).await.unwrap_err();
         assert!(err.to_string().contains("timed out"));
     }
 
