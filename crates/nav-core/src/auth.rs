@@ -40,7 +40,12 @@ pub fn load_auth(args: &Args) -> Result<AuthConfig> {
     match args.auth {
         AuthMode::ApiKey => {
             // API-key mode uses the public OpenAI API endpoint.
-            let key = env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
+            let key = env::var("OPENAI_API_KEY").map_err(|_| {
+                anyhow::anyhow!(
+                    "OPENAI_API_KEY is not set. Export it (e.g. `export OPENAI_API_KEY=sk-…`) \
+                     or re-run with `--auth chatgpt` (the default) to use a Codex ChatGPT login."
+                )
+            })?;
             Ok(AuthConfig {
                 http_base_url: "https://api.openai.com/v1".to_string(),
                 websocket_url: "wss://api.openai.com/v1/responses".to_string(),
@@ -56,22 +61,36 @@ pub fn load_auth(args: &Args) -> Result<AuthConfig> {
                 .clone()
                 .or_else(|| env::var_os("CODEX_HOME").map(PathBuf::from))
                 .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-                .context("could not determine CODEX_HOME or HOME")?;
+                .context(
+                    "could not determine CODEX_HOME or HOME. \
+                     Set HOME, set CODEX_HOME explicitly, or pass --codex-home <path>.",
+                )?;
             let auth_path = codex_home.join("auth.json");
-            let raw = fs::read_to_string(&auth_path)
-                .with_context(|| format!("failed to read {}", auth_path.display()))?;
-            let auth_file: CodexAuthFile =
-                serde_json::from_str(&raw).context("failed to parse Codex auth.json")?;
+            let raw = fs::read_to_string(&auth_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "could not read {}: {err}. Run `codex login` to create it, \
+                     or pass `--auth api-key` and set OPENAI_API_KEY.",
+                    auth_path.display()
+                )
+            })?;
+            let auth_file: CodexAuthFile = serde_json::from_str(&raw).map_err(|err| {
+                anyhow::anyhow!(
+                    "could not parse {} as Codex auth.json: {err}. \
+                     Re-run `codex login` to rewrite the file.",
+                    auth_path.display()
+                )
+            })?;
             if auth_file.auth_mode.as_deref() != Some("chatgpt") {
                 bail!(
-                    "{} is not in ChatGPT auth mode; run `codex login` and choose Sign in with ChatGPT",
+                    "{} is not in ChatGPT auth mode. Run `codex login` and choose \
+                     Sign in with ChatGPT, or pass `--auth api-key` and set OPENAI_API_KEY.",
                     auth_path.display()
                 );
             }
-            let bearer = auth_file
-                .tokens
-                .map(|tokens| tokens.access_token)
-                .context("Codex auth.json does not contain an access token")?;
+            let bearer = auth_file.tokens.map(|tokens| tokens.access_token).context(
+                "Codex auth.json does not contain an access token. \
+                     Re-run `codex login` and choose Sign in with ChatGPT.",
+            )?;
             Ok(AuthConfig {
                 http_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
                 websocket_url: "wss://chatgpt.com/backend-api/codex/responses".to_string(),
@@ -160,7 +179,10 @@ mod tests {
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
         let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
-        assert!(err.to_string().contains("not in ChatGPT auth mode"));
+        let msg = err.to_string();
+        assert!(msg.contains("not in ChatGPT auth mode"));
+        // The new message also points users at the alternative.
+        assert!(msg.contains("--auth api-key"));
     }
 
     #[test]
@@ -189,7 +211,11 @@ mod tests {
         let temp = tempdir().unwrap();
         let args = chatgpt_args(temp.path().join("nonexistent").to_path_buf());
         let err = load_auth(&args).unwrap_err();
-        assert!(err.to_string().contains("failed to read"));
+        let msg = err.to_string();
+        // Path included and an action ("codex login" or "--auth api-key").
+        assert!(msg.contains("could not read"));
+        assert!(msg.contains("codex login"));
+        assert!(msg.contains("--auth api-key"));
     }
 
     #[test]
@@ -198,7 +224,11 @@ mod tests {
         fs::write(temp.path().join("auth.json"), "not json").unwrap();
 
         let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
-        assert!(err.to_string().contains("parse"));
+        let msg = err.to_string();
+        // Path included and a concrete action.
+        assert!(msg.contains("parse"));
+        assert!(msg.contains("auth.json"));
+        assert!(msg.contains("codex login"));
     }
 
     #[test]

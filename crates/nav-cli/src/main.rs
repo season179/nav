@@ -9,7 +9,7 @@ use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
     SessionBinding, SessionStore, SessionSummary, agent, auth,
     cli::{Args, CliCommand, CliExportFormat, sandbox_policy_from_args},
-    discover_skills, load_project_context, rebuild_responses_input, shorten_home,
+    discover_skills, doctor, load_project_context, models, rebuild_responses_input, shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -22,9 +22,6 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let (mut args, provided) = Args::parse_with_sources();
-    if let Some(command) = args.command.clone() {
-        return run_cli_command(&args, command);
-    }
     if args.list_sessions {
         return list_sessions_command(&args);
     }
@@ -41,6 +38,25 @@ async fn main() -> Result<()> {
     // from settings, but a settings file can fill defaults.
     let project = Arc::new(load_project_context(&cwd));
     args.apply_settings(&project.settings, &provided);
+
+    // Subcommands run with the same merged args + project context the agent
+    // loop would see, so `nav doctor` and `nav export` reflect a configured
+    // project's `.nav/settings.json` instead of bare clap defaults.
+    if let Some(command) = args.command.clone() {
+        return run_cli_command(&args, &cwd, project.as_ref(), command);
+    }
+
+    if !models::is_known_model_prefix(&args.model) {
+        // Warn (not error) — a brand-new model the provider supports but
+        // nav's prefix list hasn't learned about yet should still work.
+        let hint = models::did_you_mean(&args.model)
+            .map(|h| format!(" {h}"))
+            .unwrap_or_default();
+        eprintln!(
+            "nav: --model `{}` doesn't match any known family prefix.{hint}",
+            args.model
+        );
+    }
 
     // Headless mode emits its startup banner here, before auth setup, so a
     // missing API key still shows the workspace summary first — useful when
@@ -173,14 +189,43 @@ async fn main() -> Result<()> {
     result
 }
 
-fn run_cli_command(args: &Args, command: CliCommand) -> Result<()> {
+fn run_cli_command(
+    args: &Args,
+    cwd: &Path,
+    project: &ProjectContext,
+    command: CliCommand,
+) -> Result<()> {
     match command {
         CliCommand::Export {
             session_id,
             format,
             out,
         } => export_command(args, &session_id, format, out),
+        CliCommand::Doctor { json } => doctor_command(args, cwd, project, json),
     }
+}
+
+/// Run every doctor check and exit non-zero on any `[fail]` row. The
+/// settings-merged `args` and pre-loaded `project` come from the caller so
+/// doctor reports the same configuration the agent loop would see — not the
+/// bare clap defaults. `CARGO_MANIFEST_DIR` is read here so doctor reports
+/// `nav-cli`'s manifest (the one `run_upgrade` installs from), not
+/// `nav-core`'s — those would be the same nav-core function called from a
+/// different crate.
+fn doctor_command(args: &Args, cwd: &Path, project: &ProjectContext, json: bool) -> Result<()> {
+    let report = doctor::run(args, cwd, project, env!("CARGO_MANIFEST_DIR"));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("doctor report serializes")
+        );
+    } else {
+        print!("{}", report.render_text());
+    }
+    if report.has_failures() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn export_command(
@@ -321,7 +366,19 @@ fn combine_prompt(args_prompt: &[String], stdin_prompt: Option<&str>) -> Option<
 // that checkout, `cargo install` fails with a clear message.
 fn run_upgrade() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    println!("Reinstalling nav from {manifest_dir}");
+    let pre_version = env!("CARGO_PKG_VERSION");
+
+    // Pre-flight the manifest dir ourselves so the error mentions nav's
+    // path explicitly. cargo's own "no such file or directory" leaves the
+    // user guessing which checkout it's looking for.
+    if !Path::new(manifest_dir).exists() {
+        bail!(
+            "cannot reinstall: manifest dir {manifest_dir} no longer exists. \
+             Re-clone the nav repo and run `cargo install --path <new-path> --force`."
+        );
+    }
+
+    println!("Reinstalling nav from {manifest_dir} (currently {pre_version})");
     let status = Command::new("cargo")
         .args(["install", "--path", manifest_dir, "--force"])
         .status()
@@ -329,7 +386,51 @@ fn run_upgrade() -> Result<()> {
     if !status.success() {
         bail!("`cargo install` exited with {status}");
     }
-    println!("nav reinstalled.");
+
+    // A silent PATH-shim mismatch — an older `nav` shadowing cargo's install
+    // dir — would happily say "reinstalled" while leaving the user on the
+    // old version. Compare the resolved binary's dir to cargo's install dir
+    // and warn if they don't agree.
+    let resolved = doctor::which_on_path("nav");
+    let cargo_bin_dir = doctor::cargo_install_bin_dir();
+    if let (Some(resolved_path), Some(install_dir)) = (resolved.as_ref(), cargo_bin_dir.as_ref()) {
+        let resolved_parent = resolved_path.parent();
+        if resolved_parent != Some(install_dir.as_path()) {
+            eprintln!(
+                "nav: warning — resolved `nav` ({}) is outside cargo's install dir ({}). \
+                 Update your PATH to include {} before {}, or remove the shim binary.",
+                resolved_path.display(),
+                install_dir.display(),
+                install_dir.display(),
+                resolved_parent
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
+    // Always read the cargo-installed binary directly for the post-install
+    // version. Falling back to whatever `PATH` resolves would report the
+    // shadow binary's version — the same case the warning above is for —
+    // and yield a bogus "already at X" summary when cargo's `bin/nav`
+    // genuinely changed underneath the shadow.
+    let post_install_bin = cargo_bin_dir
+        .as_ref()
+        .map(|dir| dir.join("nav"))
+        .filter(|p| p.exists());
+    let post_version = post_install_bin
+        .as_deref()
+        .or(resolved.as_deref())
+        .and_then(doctor::binary_version)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if post_version == "unknown" {
+        println!("nav reinstalled (currently {pre_version} — could not read post-install version)");
+    } else if post_version == pre_version {
+        println!("nav reinstalled (already at {post_version})");
+    } else {
+        println!("nav reinstalled (from {pre_version} → {post_version})");
+    }
     Ok(())
 }
 

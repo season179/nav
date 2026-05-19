@@ -1,5 +1,5 @@
 use super::retry::{TransportError, parse_retry_after_seconds};
-use super::{ResponsesError, detect_context_overflow, detect_http_overflow};
+use super::{ResponsesError, detect_context_overflow, detect_http_overflow, model_hint_from_body};
 use crate::auth::AuthConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
@@ -41,10 +41,17 @@ pub(super) async fn connect_sse(
     if let Some(message) = detect_http_overflow(&body_text) {
         return Err(TransportError::ContextWindowExceeded { message });
     }
+    // 4xx for an unknown model is a common foot-gun; append a "did you mean…?"
+    // hint so the operator sees the provider's authoritative error *and* a
+    // concrete next step instead of just the raw JSON blob.
+    let body = match model_hint_from_body(&body_text) {
+        Some(hint) => format!("{body_text} {hint}"),
+        None => body_text,
+    };
     Err(TransportError::Http {
         status,
         retry_after,
-        body: body_text,
+        body,
     })
 }
 

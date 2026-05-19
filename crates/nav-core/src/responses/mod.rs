@@ -91,6 +91,50 @@ pub(crate) fn detect_context_overflow(event: &Value) -> Option<String> {
     }
 }
 
+/// Returns a "did you mean…?" hint when an HTTP error body looks like a
+/// provider rejection of an unknown model. `None` means "no enrichment" —
+/// callers splice the hint into the surrounding message themselves.
+/// Recognized shapes:
+/// `{"error": {"code": "model_not_found", "message": "..."}}` and
+/// `{"error": {"type": "invalid_request_error", "message": "...model `gpt-…` does not exist..."}}`.
+pub(crate) fn model_hint_from_body(body: &str) -> Option<String> {
+    let json: Value = serde_json::from_str(body).ok()?;
+    let err = json.get("error")?;
+    let code = err.get("code").and_then(Value::as_str).unwrap_or_default();
+    let typ = err.get("type").and_then(Value::as_str).unwrap_or_default();
+    let message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let looks_like_model_error = code == "model_not_found"
+        || code == "invalid_model"
+        || (typ == "invalid_request_error"
+            && message.contains("model")
+            && (message.contains("does not exist") || message.contains("not found")));
+    if !looks_like_model_error {
+        return None;
+    }
+    let attempted = extract_quoted_model(message)?;
+    crate::models::did_you_mean(&attempted)
+}
+
+/// Pull a backtick- or single-quoted token out of `"The model \`gpt-5x\`
+/// does not exist…"` style messages. Defensive: when nothing matches we
+/// return `None` and the caller skips suggestion lookup.
+fn extract_quoted_model(message: &str) -> Option<String> {
+    for delim in ['`', '\'', '"'] {
+        if let Some(start) = message.find(delim)
+            && let Some(rel_end) = message[start + 1..].find(delim)
+        {
+            let candidate = &message[start + 1..start + 1 + rel_end];
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Returns the error message if an HTTP error response body indicates a
 /// context-window overflow. Used by the SSE and WebSocket connect paths so a
 /// 400 / handshake rejection routes through the same recovery as stream-time

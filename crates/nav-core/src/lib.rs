@@ -2,7 +2,9 @@ pub mod agent;
 pub mod auth;
 pub mod cli;
 pub mod control;
+pub mod doctor;
 pub mod git_diff;
+pub mod models;
 pub mod mutation;
 pub mod permissions;
 pub mod project;
@@ -31,6 +33,6 @@ pub use project::{
 pub use responses::{OpenAiTransport, RetryPolicy};
 pub use session::{
     ExportFormat, PROVIDER_OPENAI_RESPONSES, ReportedCost, ResolveSessionError, SessionId,
-    SessionStore, SessionSummary, export_events, infer_export_format,
+    SessionStore, SessionSummary, export_events, infer_export_format, resolved_db_path,
 };
 pub use skills::{Catalog, Skill, SkillScope, discover_skills};

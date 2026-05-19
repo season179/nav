@@ -73,10 +73,32 @@ are the unchecked items at the top; shipped foundation stays here as evidence.
      nav-tui unit tests, 7 composer tests, 16 snapshot tests). Deferred outside
      this checklist item: true mid-turn compaction inside an active tool loop;
      current automatic compaction runs before the next user turn.
-5. [ ] Improve install, auth, and diagnostics UX: add `nav doctor`, clearer
+5. [x] Improve install, auth, and diagnostics UX: add `nav doctor`, clearer
    login/auth/model errors, and reliable update/reinstall checks.
-   - Partial: contextual auth errors in `nav-core/src/auth.rs` and
-     `nav update/upgrade` are implemented. No `nav doctor`.
+   - Done in commit 5cb6bb3: `nav doctor` subcommand with runtime, auth,
+     storage, project, and install check groups
+     (`nav-core/src/doctor.rs`, `nav-core/src/cli.rs:121`,
+     `nav-cli/src/main.rs:177`); each row formatted as
+     `[ok]/[warn]/[fail] label — detail` with grouped headers and a
+     `--json` variant; exit code flips to 1 when any row fails.
+     Action-first auth errors in `nav-core/src/auth.rs` for missing
+     `OPENAI_API_KEY`, missing/parse-failing `auth.json`, and wrong
+     `auth_mode`. Model typo guard (`nav-core/src/models.rs`) plus
+     `did_you_mean` enrichment of provider 4xx bodies in
+     `nav-core/src/responses/{mod,sse,websocket}.rs`. `nav update`
+     reliability: manifest-dir pre-check, version diff via
+     `doctor::binary_version`, and PATH-shim warning against
+     `cargo_install_bin_dir` (`nav-cli/src/main.rs:run_upgrade`).
+   - Verified with `cargo fmt --all --check` and `cargo test -p
+     nav-core -p nav-cli` (484 tests). Manual: `nav doctor` on healthy
+     install (exit 0); `env -i HOME=$HOME PATH=/usr/bin:/bin nav
+     --auth api-key doctor` flips to exit 1 with `[fail]` on `rg`
+     (missing) and `credential` (missing key); `nav doctor` in `/tmp`
+     reports `not a git repository` and no context files; `nav doctor
+     --json` produces a parseable single object. Out of scope:
+     network reachability, TUI doctor panel, release-feed
+     auto-update. Connects to items 1, 3, 4, 6, 7, 8, 9 as the
+     diagnostics layer over the work they shipped.
 6. [x] Make permissions and execution safety first-class: command approval
    policy, dangerous-command gates, protected-file rules, external-directory
    detection, and a stronger sandbox story for shell execution.

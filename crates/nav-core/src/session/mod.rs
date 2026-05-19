@@ -766,6 +766,14 @@ impl SessionStore {
     }
 }
 
+/// Resolves the on-disk location of the session database without opening it.
+/// `nav doctor` calls this to surface the resolved path even when the DB
+/// file does not exist yet — the answer should be identical to what
+/// [`SessionStore::open`] would compute internally.
+pub fn resolved_db_path(path: Option<PathBuf>) -> Result<PathBuf> {
+    resolve_db_path(path)
+}
+
 /// Resolves the on-disk location of the session database. Absolute overrides
 /// are honored as-is; relative overrides mirror opencode's behavior by staying
 /// under nav's per-user data directory instead of the launch cwd.
