@@ -20,10 +20,8 @@ pub enum UserAttachment {
     /// always workspace-relative — the TUI relativizes / copies external
     /// paths into `<cwd>/.nav/clipboard/` before raising the event.
     Image { path: PathBuf },
-    /// Generic file attachment (text, source code, markdown, etc.) selected
-    /// via `@file` mention. Workspace-relative; bytes are loaded by the
-    /// transport at request time and emitted as an `input_text` part — only
-    /// UTF-8 decodable content is included.
+    /// Non-image file attached via `@file` mention. UTF-8 bodies are
+    /// emitted as an `input_text` part; binaries surface as an inline note.
     File { path: PathBuf },
 }
 

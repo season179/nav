@@ -3,6 +3,7 @@ use base64::Engine;
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::future::Future;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
@@ -24,13 +25,11 @@ use crate::project::ProjectContext;
 use crate::responses::{self, ResponseCollector, ResponsesError};
 use crate::session::{SessionId, SessionStore};
 use crate::skills::Catalog;
-use crate::tools::truncate::{TruncateMode, bound};
-use crate::tools::{self, PermissionContext};
+use crate::tools::truncate::{self, TruncateMode, bound};
+use crate::tools::{self, PermissionContext, preflight};
 
-/// Tool name used in the [`AgentEvent::ToolCallApprovalRequest`] event when
-/// an `@file` attachment resolves to a protected path. Surfaces in the
-/// approval modal so the operator can tell a file-attachment read from a
-/// `read_file` tool call.
+/// `tool` field surfaced on approval/block events for protected `@file`
+/// attachments. Lets the modal distinguish them from `read_file` calls.
 const ATTACHMENT_READ_TOOL: &str = "attachment_read";
 
 /// Stream of raw `Responses` API events yielded by a transport.
@@ -107,12 +106,10 @@ fn user_message_event(
 
 /// Build the `content` part of a Responses API user message. Plain text turns
 /// stay as a single string (the historical shape); when attachments are
-/// present, return an array of typed content parts so the Responses API can
-/// see `input_text` alongside `input_image`. Attachments that fail to load
-/// (path escapes workspace, unreadable file, non-UTF-8 file body) are
-/// dropped — a bad path shouldn't block the turn. Non-UTF-8 file
-/// attachments and skipped binary content surface as inline text notes
-/// rather than silent omissions so the model knows the path was requested.
+/// present, return an array of typed content parts so the Responses API
+/// sees `input_text` alongside `input_image`. Attachments that fail to load
+/// are dropped silently; non-UTF-8 or symlink-to-secret cases surface as
+/// inline text notes so the model knows the path was requested.
 pub(super) fn build_user_content(
     prompt: &str,
     attachments: &[UserAttachment],
@@ -121,12 +118,18 @@ pub(super) fn build_user_content(
     if attachments.is_empty() {
         return Value::String(prompt.to_string());
     }
+    // Canonicalize cwd once; resolve_workspace_path used to do this per
+    // attachment, which on a turn with N files meant N stat-walks of the
+    // workspace root.
+    let cwd_canonical = cwd.canonicalize().ok();
     let mut parts: Vec<Value> = Vec::with_capacity(1 + attachments.len());
     parts.push(json!({ "type": "input_text", "text": prompt }));
     for attach in attachments {
         match attach {
             UserAttachment::Image { path } => {
-                if let Some(data_uri) = encode_image_data_uri(cwd, path) {
+                if let Some(canonical) = resolve_workspace_path(cwd_canonical.as_deref(), cwd, path)
+                    && let Some(data_uri) = encode_image_data_uri(&canonical)
+                {
                     parts.push(json!({
                         "type": "input_image",
                         "image_url": data_uri,
@@ -134,7 +137,7 @@ pub(super) fn build_user_content(
                 }
             }
             UserAttachment::File { path } => {
-                if let Some(text) = load_file_attachment(cwd, path) {
+                if let Some(text) = load_file_attachment(cwd_canonical.as_deref(), cwd, path) {
                     parts.push(json!({
                         "type": "input_text",
                         "text": text,
@@ -146,29 +149,28 @@ pub(super) fn build_user_content(
     Value::Array(parts)
 }
 
-/// Canonicalize `rel` against `cwd` and require workspace containment.
-/// Shared by image and file attachments: nav's workspace contract says
-/// user-provided paths must resolve under the workspace root. A `..`-laden
-/// path or a symlink that escapes would otherwise let us silently include
-/// arbitrary files (e.g. `~/.ssh/id_rsa`) in the request. Returns `None`
-/// if the path can't be canonicalized or escapes the workspace.
-fn resolve_workspace_path(cwd: &Path, rel: &Path) -> Option<PathBuf> {
+/// Canonicalize `rel` against `cwd` and require workspace containment. A
+/// `..`-laden path or a symlink that escapes would otherwise let us
+/// silently include arbitrary files (e.g. `~/.ssh/id_rsa`) in the request.
+/// `cwd_canonical` is the pre-canonicalized cwd from the caller — passing
+/// `None` falls back to canonicalizing per call, used by code paths that
+/// don't have the canonical form handy.
+fn resolve_workspace_path(cwd_canonical: Option<&Path>, cwd: &Path, rel: &Path) -> Option<PathBuf> {
     let abs = if rel.is_absolute() {
         rel.to_path_buf()
     } else {
         cwd.join(rel)
     };
     let canonical = abs.canonicalize().ok()?;
-    let cwd_canonical = cwd.canonicalize().ok()?;
-    if !canonical.starts_with(&cwd_canonical) {
-        return None;
-    }
-    Some(canonical)
+    let cwd_canonical = match cwd_canonical {
+        Some(p) => p.to_path_buf(),
+        None => cwd.canonicalize().ok()?,
+    };
+    canonical.starts_with(&cwd_canonical).then_some(canonical)
 }
 
-fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
-    let canonical = resolve_workspace_path(cwd, rel)?;
-    let bytes = std::fs::read(&canonical).ok()?;
+fn encode_image_data_uri(canonical: &Path) -> Option<String> {
+    let bytes = std::fs::read(canonical).ok()?;
     let ext = canonical
         .extension()
         .and_then(|e| e.to_str())
@@ -184,29 +186,36 @@ fn encode_image_data_uri(cwd: &Path, rel: &Path) -> Option<String> {
     Some(format!("data:{mime};base64,{encoded}"))
 }
 
-/// Render a `File` attachment as a fenced block the model can read. UTF-8
-/// only — binary bodies fall back to a note so the model doesn't see mojibake
-/// or random base64 garbage. Truncation uses the same dual cap as tool
-/// outputs (50 KB / 2000 lines, head-only) so a 10 MB file doesn't blow up
-/// the request. Symlink reaches into protected reads (where the raw
-/// workspace-relative path looked fine, but the canonical path lands on a
-/// secret) are refused here even after gate approval, matching the
-/// read_file tool's symlink-bypass check.
-fn load_file_attachment(cwd: &Path, rel: &Path) -> Option<String> {
+/// Cap on how many bytes a single file attachment may pull off disk before
+/// truncation. `MAX_BYTES + 1` so a file at exactly the cap still has the
+/// next byte sampled — the marker would otherwise lie about whether
+/// anything was dropped.
+const FILE_ATTACHMENT_READ_CAP: u64 = (truncate::MAX_BYTES as u64) + 1;
+
+/// Render a `File` attachment as a fenced block. UTF-8 only; binary bodies
+/// fall back to a note. We read at most `FILE_ATTACHMENT_READ_CAP` bytes so
+/// a 1 GB attachment doesn't pull 1 GB into memory just to discard the
+/// tail. Symlink reaches into protected paths are refused inline even
+/// after gate approval — matches `read_file`'s symlink-bypass check.
+fn load_file_attachment(cwd_canonical: Option<&Path>, cwd: &Path, rel: &Path) -> Option<String> {
     let rel_display = rel.display().to_string();
-    let canonical = resolve_workspace_path(cwd, rel)?;
+    let canonical = resolve_workspace_path(cwd_canonical, cwd, rel)?;
     if is_protected_read(&canonical) && !is_protected_read(rel) {
         return Some(format!(
             "<attached file: {rel_display}>\n[refused: path resolves via symlink to a protected secret]\n</attached>",
         ));
     }
-    let bytes = std::fs::read(&canonical).ok()?;
-    let body = match std::str::from_utf8(&bytes) {
-        Ok(text) => text.to_string(),
-        Err(_) => {
+    let file = std::fs::File::open(&canonical).ok()?;
+    let mut bytes = Vec::new();
+    file.take(FILE_ATTACHMENT_READ_CAP)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let body = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(err) => {
             return Some(format!(
-                "<attached file: {rel_display}>\n[skipped: file is not valid UTF-8 ({} bytes)]\n</attached>",
-                bytes.len()
+                "<attached file: {rel_display}>\n[skipped: file is not valid UTF-8 ({} bytes read)]\n</attached>",
+                err.into_bytes().len()
             ));
         }
     };
@@ -216,13 +225,12 @@ fn load_file_attachment(cwd: &Path, rel: &Path) -> Option<String> {
     ))
 }
 
-/// For every `File` attachment that matches a [`is_protected_read`] glob,
-/// fire an approval request through the same gate `read_file` uses. The
-/// returned vector keeps only attachments that survived (approved + non-
-/// protected pass through). If any approval comes back as `Abort`, the
-/// second tuple element carries the abort reason — `run_agent` translates
-/// that into a `TurnAborted` event and returns without sending the turn,
-/// which mirrors how the tool dispatch handles a user-abort decision.
+/// Gate each `File` attachment whose path matches [`is_protected_read`]
+/// through the same approval flow the `read_file` tool uses. Under
+/// `AskForApproval::Never` the gate is short-circuited to `Denied` so a
+/// secret can't ride along when the operator isn't around to refuse. An
+/// `Abort` decision propagates as the abort reason in the returned tuple;
+/// `run_agent` turns it into a `TurnAborted` event.
 async fn gate_protected_attachments(
     attachments: Vec<UserAttachment>,
     permissions: &PermissionContext,
@@ -230,84 +238,59 @@ async fn gate_protected_attachments(
     events: &UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
 ) -> (Vec<UserAttachment>, Option<&'static str>) {
-    if !attachments.iter().any(|a| match a {
-        UserAttachment::File { path } => is_protected_read(path),
-        UserAttachment::Image { .. } => false,
-    }) {
+    if !attachments
+        .iter()
+        .any(|a| matches!(a, UserAttachment::File { path } if is_protected_read(path)))
+    {
         return (attachments, None);
     }
-    if matches!(
-        permissions.policy,
-        crate::permissions::AskForApproval::Never
-    ) {
-        // Never-policy: refuse silently and emit a blocked-style note. We
-        // can't ask the operator, and including a secret in the prompt would
-        // defeat the whole point of `protected_read`.
-        let kept: Vec<UserAttachment> = attachments
-            .into_iter()
-            .filter(|a| match a {
-                UserAttachment::File { path } => {
-                    if is_protected_read(path) {
-                        emit(
-                            events,
-                            session,
-                            AgentEvent::ToolCallBlocked {
-                                call_id: String::new(),
-                                tool: ATTACHMENT_READ_TOOL.to_string(),
-                                reason: format!(
-                                    "attachment {} is protected and approval policy is `never`; dropped",
-                                    path.display()
-                                ),
-                                rule: ApprovalReason::ProtectedRead.as_str().to_string(),
-                            },
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                }
-                UserAttachment::Image { .. } => true,
-            })
-            .collect();
-        return (kept, None);
-    }
 
+    let auto_denied = preflight::auto_denies_approvals(permissions.policy);
     let mut kept = Vec::with_capacity(attachments.len());
     for attach in attachments {
-        match &attach {
-            UserAttachment::File { path } if is_protected_read(path) => {
-                let request = ApprovalRequest {
+        let UserAttachment::File { path } = &attach else {
+            kept.push(attach);
+            continue;
+        };
+        if !is_protected_read(path) {
+            kept.push(attach);
+            continue;
+        }
+        let decision = if auto_denied {
+            ReviewDecision::Denied
+        } else {
+            permissions
+                .gate
+                .request(ApprovalRequest {
                     call_id: String::new(),
                     tool: ATTACHMENT_READ_TOOL.to_string(),
                     command: None,
                     path: Some(path.display().to_string()),
                     cwd: cwd.display().to_string(),
                     reason: ApprovalReason::ProtectedRead.as_str().to_string(),
-                };
-                match permissions.gate.request(request).await {
-                    ReviewDecision::Approved | ReviewDecision::ApprovedForSession => {
-                        kept.push(attach);
-                    }
-                    ReviewDecision::Denied => {
-                        // Surface as a `ToolCallBlocked` so the chat log
-                        // shows the operator chose to refuse the read.
-                        emit(
-                            events,
-                            session,
-                            AgentEvent::ToolCallBlocked {
-                                call_id: String::new(),
-                                tool: ATTACHMENT_READ_TOOL.to_string(),
-                                reason: format!("attachment {} denied by user", path.display()),
-                                rule: ApprovalReason::ProtectedRead.as_str().to_string(),
-                            },
-                        );
-                    }
-                    ReviewDecision::Abort => {
-                        return (Vec::new(), Some("attachment approval abort"));
-                    }
-                }
-            }
-            _ => kept.push(attach),
+                })
+                .await
+        };
+        match decision {
+            ReviewDecision::Approved | ReviewDecision::ApprovedForSession => kept.push(attach),
+            ReviewDecision::Denied => emit(
+                events,
+                session,
+                AgentEvent::ToolCallBlocked {
+                    call_id: String::new(),
+                    tool: ATTACHMENT_READ_TOOL.to_string(),
+                    reason: if auto_denied {
+                        format!(
+                            "attachment {} is protected and approval policy is `never`; dropped",
+                            path.display()
+                        )
+                    } else {
+                        format!("attachment {} denied by user", path.display())
+                    },
+                    rule: ApprovalReason::ProtectedRead.as_str().to_string(),
+                },
+            ),
+            ReviewDecision::Abort => return (Vec::new(), Some("attachment approval abort")),
         }
     }
     (kept, None)
@@ -442,11 +425,8 @@ pub async fn run_agent_with_control(
         }
     }
 
-    // A `File` attachment under `@.env` (or *.pem, *.key, SSH keys) counts as
-    // a read of that path. We gate it through the same `protected.rs` rules
-    // as the `read_file` tool so a secret is never silently base64'd into
-    // the Responses request because the user typed `@`. Aborting here exits
-    // the turn before the user-message event is emitted.
+    // Abort before emitting the user-message event so a denied `.env`
+    // doesn't show up in the transcript as a turn that almost happened.
     let (attachments, abort_reason) =
         gate_protected_attachments(attachments, &permissions, cwd, &events, session).await;
     if let Some(reason) = abort_reason {
@@ -540,9 +520,6 @@ pub async fn run_agent_with_control(
         let steering = drain_steering(&mut controls, &events, session);
         if !steering.is_empty() {
             for item in steering {
-                // Steering messages can carry attachments too; route them
-                // through the same protected-read gate as the initial turn
-                // so `/steer` with `@.env` cannot bypass approval.
                 let (attachments, abort_reason) = gate_protected_attachments(
                     item.attachments,
                     &permissions,

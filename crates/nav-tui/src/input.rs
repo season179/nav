@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nav_core::{Catalog, PendingInputMode, PendingSkill};
+use nav_core::{Catalog, PendingInputMode, PendingSkill, UserAttachment};
 use tokio::sync::mpsc;
 
 use crate::ChatWidget;
@@ -11,8 +11,7 @@ pub(crate) enum AppEvent {
     Submit {
         text: String,
         display_text: Option<String>,
-        images: Vec<PathBuf>,
-        files: Vec<PathBuf>,
+        attachments: Vec<UserAttachment>,
         mode: PendingInputMode,
         skill: Option<PendingSkill>,
     },
@@ -71,22 +70,20 @@ pub(crate) fn handle_scrollback_key(
 
 pub(crate) fn dispatch_submit(
     text: String,
-    images: Vec<PathBuf>,
-    files: Vec<PathBuf>,
+    attachments: Vec<UserAttachment>,
     skills: &Catalog,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     let event = match parse_builtin_command(&text) {
         Some(event) => event,
-        None => submit_event_for_text(text, images, files, skills),
+        None => submit_event_for_text(text, attachments, skills),
     };
     app_tx.send(event).ok();
 }
 
 fn submit_event_for_text(
     text: String,
-    images: Vec<PathBuf>,
-    files: Vec<PathBuf>,
+    attachments: Vec<UserAttachment>,
     skills: &Catalog,
 ) -> AppEvent {
     match text.as_str() {
@@ -97,21 +94,20 @@ fn submit_event_for_text(
         // `/compact` is handled inside nav-core's `run_agent` — submit the
         // literal text so the agent loop's `is_compact_command` check
         // dispatches the non-steerable compaction turn.
-        "/compact" => submit_event(text, None, images, files, PendingInputMode::FollowUp, None),
-        _ => skill_or_submit_event(text, images, files, skills),
+        "/compact" => submit_event(text, None, attachments, PendingInputMode::FollowUp, None),
+        _ => skill_or_submit_event(text, attachments, skills),
     }
 }
 
 fn skill_or_submit_event(
     text: String,
-    images: Vec<PathBuf>,
-    files: Vec<PathBuf>,
+    attachments: Vec<UserAttachment>,
     skills: &Catalog,
 ) -> AppEvent {
     match classify_slash(&text, skills) {
-        SlashAction::Control(control) => control.into_event(images, files),
+        SlashAction::Control(control) => control.into_event(attachments),
         SlashAction::NotASkill => {
-            submit_event(text, None, images, files, PendingInputMode::FollowUp, None)
+            submit_event(text, None, attachments, PendingInputMode::FollowUp, None)
         }
         SlashAction::Inline {
             skill_name,
@@ -120,8 +116,7 @@ fn skill_or_submit_event(
         } => submit_event(
             request.clone(),
             Some(request),
-            images,
-            files,
+            attachments,
             PendingInputMode::FollowUp,
             Some(PendingSkill {
                 name: skill_name,
@@ -180,16 +175,14 @@ fn slash_rest<'a>(text: &'a str, command: &str) -> Option<&'a str> {
 fn submit_event(
     text: String,
     display_text: Option<String>,
-    images: Vec<PathBuf>,
-    files: Vec<PathBuf>,
+    attachments: Vec<UserAttachment>,
     mode: PendingInputMode,
     skill: Option<PendingSkill>,
 ) -> AppEvent {
     AppEvent::Submit {
         text,
         display_text,
-        images,
-        files,
+        attachments,
         mode,
         skill,
     }
@@ -225,10 +218,10 @@ pub enum ControlCommand {
 }
 
 impl ControlCommand {
-    fn into_event(self, images: Vec<PathBuf>, files: Vec<PathBuf>) -> AppEvent {
+    fn into_event(self, attachments: Vec<UserAttachment>) -> AppEvent {
         match self {
             ControlCommand::Steer { text } => {
-                submit_event(text, None, images, files, PendingInputMode::Steering, None)
+                submit_event(text, None, attachments, PendingInputMode::Steering, None)
             }
             ControlCommand::EditPending { id, text } => AppEvent::EditPending { id, text },
             ControlCommand::RemovePending { id } => AppEvent::RemovePending { id },
@@ -412,18 +405,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let catalog = catalog_with_skill(dir.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        dispatch_submit(
-            "/compact".to_string(),
-            Vec::new(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch_submit("/compact".to_string(), Vec::new(), &catalog, &tx);
         let event = rx.try_recv().expect("event sent");
         match event {
-            AppEvent::Submit { text, images, .. } => {
+            AppEvent::Submit {
+                text, attachments, ..
+            } => {
                 assert_eq!(text, "/compact");
-                assert!(images.is_empty());
+                assert!(attachments.is_empty());
             }
             other => panic!("expected Submit, got {other:?}"),
         }
@@ -435,40 +424,22 @@ mod tests {
         let catalog = catalog_with_skill(dir.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
-        dispatch_submit(
-            "/sessions".to_string(),
-            Vec::new(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch_submit("/sessions".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::ListSessions));
 
-        dispatch_submit("/resume".to_string(), Vec::new(), Vec::new(), &catalog, &tx);
+        dispatch_submit("/resume".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::Resume { query: None }
         ));
 
-        dispatch_submit(
-            "/resume 01HZ".to_string(),
-            Vec::new(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch_submit("/resume 01HZ".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::Resume { query: Some(q) } if q == "01HZ"
         ));
 
-        dispatch_submit(
-            "/name release work".to_string(),
-            Vec::new(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch_submit("/name release work".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::NameSession { name } if name == "release work"
@@ -476,7 +447,6 @@ mod tests {
 
         dispatch_submit(
             "/export transcript.md".to_string(),
-            Vec::new(),
             Vec::new(),
             &catalog,
             &tx,
@@ -493,7 +463,7 @@ mod tests {
         let catalog = catalog_with_skill(dir.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
-        dispatch_submit("/name".to_string(), Vec::new(), Vec::new(), &catalog, &tx);
+        dispatch_submit("/name".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::SlashError { message } if message.contains("/name")
@@ -508,7 +478,6 @@ mod tests {
 
         dispatch_submit(
             "/steer add this context".to_string(),
-            Vec::new(),
             Vec::new(),
             &catalog,
             &tx,
@@ -525,7 +494,6 @@ mod tests {
         dispatch_submit(
             "/queue-edit pending-1 better wording".to_string(),
             Vec::new(),
-            Vec::new(),
             &catalog,
             &tx,
         );
@@ -537,7 +505,6 @@ mod tests {
         dispatch_submit(
             "/queue-remove pending-1".to_string(),
             Vec::new(),
-            Vec::new(),
             &catalog,
             &tx,
         );
@@ -546,16 +513,10 @@ mod tests {
             AppEvent::RemovePending { id } if id == "pending-1"
         ));
 
-        dispatch_submit(
-            "/queue-clear".to_string(),
-            Vec::new(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch_submit("/queue-clear".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::ClearPending));
 
-        dispatch_submit("/abort".to_string(), Vec::new(), Vec::new(), &catalog, &tx);
+        dispatch_submit("/abort".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::AbortTurn));
     }
 }

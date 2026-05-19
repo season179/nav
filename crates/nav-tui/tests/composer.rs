@@ -57,8 +57,7 @@ fn typing_hello_then_enter_returns_submit() {
         event,
         ComposerEvent::Submit {
             text: "hello".to_string(),
-            images: Vec::new(),
-            files: Vec::new(),
+            attachments: Vec::new(),
         }
     );
     assert_eq!(pane.composer().text(), "");
@@ -123,8 +122,7 @@ fn exact_slash_command_enter_submits_without_second_enter() {
         event,
         ComposerEvent::Submit {
             text: "/exit".to_string(),
-            images: Vec::new(),
-            files: Vec::new(),
+            attachments: Vec::new(),
         }
     );
     assert_eq!(pane.composer().text(), "");
@@ -142,8 +140,7 @@ fn partial_slash_command_enter_completes_and_submits() {
         event,
         ComposerEvent::Submit {
             text: "/exit".to_string(),
-            images: Vec::new(),
-            files: Vec::new(),
+            attachments: Vec::new(),
         }
     );
     assert_eq!(pane.composer().text(), "");
@@ -202,8 +199,7 @@ fn up_arrow_recalls_previous_prompt() {
         event,
         ComposerEvent::Submit {
             text: "first".to_string(),
-            images: Vec::new(),
-            files: Vec::new(),
+            attachments: Vec::new(),
         }
     );
     assert_eq!(pane.composer().text(), "");

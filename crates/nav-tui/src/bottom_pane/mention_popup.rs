@@ -163,12 +163,6 @@ impl FileMentionPopup {
         if !composer.replace_active_at_token(&quoted) {
             return InputResult::Unhandled;
         }
-        // Selecting an `@file` completion is the same gesture as pasting an
-        // image: the path lands in the buffer (so the user sees a chip and
-        // can edit around it) and the matching attachment is queued so the
-        // model receives the actual bytes on submit. Image extensions reuse
-        // the image-attachment path so the agent emits `input_image`; every
-        // other extension queues as a `UserAttachment::File`.
         let path = PathBuf::from(&raw);
         if is_image_extension(&raw) {
             composer.push_pending_image(path);
@@ -359,8 +353,13 @@ mod tests {
             &mut composer,
         );
         assert!(composer.text().contains("src/main.rs"));
-        let (_, _, files) = drain_submit(&mut composer);
-        assert_eq!(files, vec![PathBuf::from("src/main.rs")]);
+        let (_, attachments) = drain_submit(&mut composer);
+        assert_eq!(
+            attachments,
+            vec![nav_core::UserAttachment::File {
+                path: PathBuf::from("src/main.rs")
+            }]
+        );
     }
 
     #[test]
@@ -373,19 +372,21 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
             &mut composer,
         );
-        let (_, images, files) = drain_submit(&mut composer);
-        assert_eq!(images, vec![PathBuf::from("assets/cat.png")]);
-        assert!(files.is_empty());
+        let (_, attachments) = drain_submit(&mut composer);
+        assert_eq!(
+            attachments,
+            vec![nav_core::UserAttachment::Image {
+                path: PathBuf::from("assets/cat.png")
+            }]
+        );
     }
 
-    fn drain_submit(c: &mut Composer) -> (String, Vec<PathBuf>, Vec<PathBuf>) {
+    fn drain_submit(c: &mut Composer) -> (String, Vec<nav_core::UserAttachment>) {
         let event = c.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         match event {
-            super::super::composer::ComposerEvent::Submit {
-                text,
-                images,
-                files,
-            } => (text, images, files),
+            super::super::composer::ComposerEvent::Submit { text, attachments } => {
+                (text, attachments)
+            }
             other => panic!("expected Submit, got {other:?}"),
         }
     }
