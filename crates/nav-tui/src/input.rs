@@ -65,30 +65,38 @@ pub(crate) fn dispatch_submit(
 ) {
     let event = match parse_builtin_command(&text) {
         Some(event) => event,
-        None => match text.as_str() {
-            "/quit" | "/exit" => AppEvent::Quit,
-            "/clear" => AppEvent::Clear,
-            // `/compact` is handled inside nav-core's `run_agent` — submit the
-            // literal text so the agent loop's `is_compact_command` check
-            // dispatches the non-steerable compaction turn.
-            "/compact" => AppEvent::Submit { text, images },
-            _ => match classify_slash(&text, skills) {
-                SlashAction::NotASkill => AppEvent::Submit { text, images },
-                SlashAction::Inline { prompt } => AppEvent::Submit {
-                    text: prompt,
-                    images,
-                },
-                SlashAction::Queue {
-                    skill_name,
-                    wrapped_body,
-                } => AppEvent::QueueSkill {
-                    skill_name,
-                    wrapped_body,
-                },
-            },
-        },
+        None => submit_event_for_text(text, images, skills),
     };
     app_tx.send(event).ok();
+}
+
+fn submit_event_for_text(text: String, images: Vec<PathBuf>, skills: &Catalog) -> AppEvent {
+    match text.as_str() {
+        "/quit" | "/exit" => AppEvent::Quit,
+        "/clear" => AppEvent::Clear,
+        // `/compact` is handled inside nav-core's `run_agent` — submit the
+        // literal text so the agent loop's `is_compact_command` check
+        // dispatches the non-steerable compaction turn.
+        "/compact" => AppEvent::Submit { text, images },
+        _ => skill_or_submit_event(text, images, skills),
+    }
+}
+
+fn skill_or_submit_event(text: String, images: Vec<PathBuf>, skills: &Catalog) -> AppEvent {
+    match classify_slash(&text, skills) {
+        SlashAction::NotASkill => AppEvent::Submit { text, images },
+        SlashAction::Inline { prompt } => AppEvent::Submit {
+            text: prompt,
+            images,
+        },
+        SlashAction::Queue {
+            skill_name,
+            wrapped_body,
+        } => AppEvent::QueueSkill {
+            skill_name,
+            wrapped_body,
+        },
+    }
 }
 
 fn parse_builtin_command(text: &str) -> Option<AppEvent> {

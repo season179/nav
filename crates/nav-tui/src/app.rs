@@ -560,9 +560,8 @@ fn export_current_session(
     let events = store.load_session(session_id)?;
     let format = nav_core::infer_export_format(Some(&write_path), None);
     let rendered = nav_core::export_events(&events, format)?;
-    std::fs::write(&write_path, rendered)
-        .map_err(anyhow::Error::from)
-        .and_then(|_| Ok(display_path))
+    std::fs::write(&write_path, rendered)?;
+    Ok(display_path)
 }
 
 /// Returns true when `ev` marks the end of an in-flight TUI turn so the

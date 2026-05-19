@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -167,9 +168,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
                 attachments,
             } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
-                out.push_str("### User\n\n");
-                out.push_str(display_text.as_deref().unwrap_or(text));
-                out.push_str("\n\n");
+                push_section(&mut out, "User", display_text.as_deref().unwrap_or(text));
                 for attachment in attachments {
                     match attachment {
                         crate::agent::UserAttachment::Image { path } => {
@@ -183,9 +182,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             }
             AgentEvent::AssistantMessageDone { text } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
-                out.push_str("### Assistant\n\n");
-                out.push_str(text);
-                out.push_str("\n\n");
+                push_section(&mut out, "Assistant", text);
             }
             AgentEvent::ToolCallStarted {
                 call_id,
@@ -194,12 +191,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
                 tool_names.insert(call_id.clone(), name.clone());
-                out.push_str("<details>\n");
-                out.push_str(&format!("<summary>Tool call: {name}</summary>\n\n"));
-                out.push_str("```json\n");
-                out.push_str(&serde_json::to_string_pretty(arguments)?);
-                out.push_str("\n```\n");
-                out.push_str("</details>\n\n");
+                push_json_details(&mut out, &format!("Tool call: {name}"), arguments)?;
             }
             AgentEvent::ToolCallOutput {
                 call_id,
@@ -223,15 +215,11 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             }
             AgentEvent::Error { message } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
-                out.push_str("### Error\n\n");
-                out.push_str(message);
-                out.push_str("\n\n");
+                push_section(&mut out, "Error", message);
             }
             AgentEvent::CompactionCompleted { summary, .. } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
-                out.push_str("### Compaction summary\n\n");
-                out.push_str(summary);
-                out.push_str("\n\n");
+                push_section(&mut out, "Compaction summary", summary);
             }
             AgentEvent::TurnComplete { .. } => {
                 in_turn = false;
@@ -246,12 +234,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             | AgentEvent::CompactionStarted { .. }
             | AgentEvent::CompactionFailed { .. } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
-                out.push_str("<details>\n");
-                out.push_str(&format!("<summary>Event: {}</summary>\n\n", event.kind()));
-                out.push_str("```json\n");
-                out.push_str(&serde_json::to_string_pretty(event)?);
-                out.push_str("\n```\n");
-                out.push_str("</details>\n\n");
+                push_json_details(&mut out, &format!("Event: {}", event.kind()), event)?;
             }
         }
     }
@@ -266,6 +249,22 @@ fn start_turn(out: &mut String, turn: &mut usize, in_turn: &mut bool) {
     *turn += 1;
     *in_turn = true;
     out.push_str(&format!("## Turn {turn}\n\n"));
+}
+
+fn push_section(out: &mut String, heading: &str, body: &str) {
+    out.push_str(&format!("### {heading}\n\n"));
+    out.push_str(body);
+    out.push_str("\n\n");
+}
+
+fn push_json_details(out: &mut String, summary: &str, value: &impl Serialize) -> Result<()> {
+    out.push_str("<details>\n");
+    out.push_str(&format!("<summary>{summary}</summary>\n\n"));
+    out.push_str("```json\n");
+    out.push_str(&serde_json::to_string_pretty(value)?);
+    out.push_str("\n```\n");
+    out.push_str("</details>\n\n");
+    Ok(())
 }
 
 /// Owns the single SQLite connection used to persist a nav session. All
@@ -726,32 +725,21 @@ impl SessionStore {
                 query: query.to_string(),
             });
         }
+        let not_found = || ResolveSessionError::NotFound {
+            query: prefix.to_string(),
+        };
         let conn = self.lock();
         let mut stmt = conn
             .prepare("SELECT id FROM session WHERE id LIKE ?1 ORDER BY id ASC LIMIT 3")
-            .map_err(|_| ResolveSessionError::NotFound {
-                query: prefix.to_string(),
-            })?;
+            .map_err(|_| not_found())?;
         let rows = stmt
             .query_map(params![format!("{prefix}%")], |row| row.get::<_, String>(0))
-            .map_err(|_| ResolveSessionError::NotFound {
-                query: prefix.to_string(),
-            })?;
-        let mut matches = Vec::new();
-        for row in rows {
-            match row {
-                Ok(id) => matches.push(id),
-                Err(_) => {
-                    return Err(ResolveSessionError::NotFound {
-                        query: prefix.to_string(),
-                    });
-                }
-            }
-        }
+            .map_err(|_| not_found())?;
+        let mut matches: Vec<String> = rows
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|_| not_found())?;
         match matches.len() {
-            0 => Err(ResolveSessionError::NotFound {
-                query: prefix.to_string(),
-            }),
+            0 => Err(not_found()),
             1 => Ok(matches.remove(0)),
             _ => Err(ResolveSessionError::AmbiguousPrefix {
                 prefix: prefix.to_string(),
