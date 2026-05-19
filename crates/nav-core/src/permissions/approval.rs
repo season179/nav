@@ -1,10 +1,10 @@
 //! Approval gates: the bridge between the agent's pre-flight check and the
-//! frontend (TUI or NDJSON consumer) that asks the operator to approve.
+//! frontend (TUI or headless consumer) that asks the operator to approve.
 //!
 //! Two implementations:
 //! - [`ChannelGate`] — used by the TUI. Stores a `oneshot::Sender` per pending
 //!   approval; the TUI calls `respond()` from its event loop.
-//! - [`StdinGate`] — used by `--json-events`. Reads JSON lines from stdin
+//! - [`StdinGate`] — used by headless CLI modes. Reads JSON lines from stdin
 //!   into the same pending-approval map.
 //!
 //! Both share [`PendingApprovals`] so the wire-format symmetry is preserved.
@@ -19,6 +19,7 @@ use ulid::Ulid;
 
 use crate::agent::AgentEvent;
 use crate::permissions::ReviewDecision;
+use crate::protocol::{JSONRPC_VERSION, METHOD_APPROVAL_RESPOND};
 
 /// Request shape passed to `ApprovalGate::request`. The gate translates it
 /// into an `AgentEvent::ToolCallApprovalRequest` so the wire-format and the
@@ -211,8 +212,9 @@ impl ApprovalGate for AutoGate {
     }
 }
 
-/// Wire-format shape that NDJSON consumers send back on stdin when they
-/// answer a `tool_call_approval_request` event.
+/// Legacy wire-format shape that raw NDJSON consumers send back on stdin when
+/// they answer a `tool_call_approval_request` event. The stable JSON-RPC
+/// protocol accepts the same payload nested under `nav.approval.respond`.
 ///
 /// `kind` is informational ("approval_response"); the binding is by
 /// `approval_id`. Decisions match the snake_case names in `ReviewDecision`.
@@ -224,8 +226,28 @@ pub struct ApprovalResponse {
     pub decision: ReviewDecision,
 }
 
+#[derive(Debug, Deserialize)]
+struct JsonRpcApprovalResponse {
+    jsonrpc: String,
+    method: String,
+    params: ApprovalResponse,
+}
+
+fn parse_approval_response(line: &str) -> Option<ApprovalResponse> {
+    if let Ok(resp) = serde_json::from_str::<ApprovalResponse>(line) {
+        return Some(resp);
+    }
+
+    let rpc = serde_json::from_str::<JsonRpcApprovalResponse>(line).ok()?;
+    if rpc.jsonrpc != JSONRPC_VERSION || rpc.method != METHOD_APPROVAL_RESPOND {
+        return None;
+    }
+
+    Some(rpc.params)
+}
+
 /// Hook the response reader can call after parsing each approval — the
-/// NDJSON path uses this to mirror the operator's decision into SQLite so
+/// Headless CLI path uses this to mirror the operator's decision into SQLite so
 /// the `approval` table's `decided_at`/`decision` columns reflect what
 /// happened (matching the TUI's `record_approval_decision` call).
 pub trait DecisionRecorder: Send + Sync {
@@ -237,7 +259,7 @@ pub trait DecisionRecorder: Send + Sync {
 /// so awaiting gates return `Abort` rather than hanging forever.
 ///
 /// `recorder` is an optional persistence hook called *before* the oneshot
-/// resolves; in NDJSON mode the CLI wires this to `SessionStore` so the
+/// resolves; in headless mode the CLI wires this to `SessionStore` so the
 /// audit row's `decided_at`/`decision` columns are populated.
 ///
 /// Malformed lines and unknown approval_ids are logged at debug and dropped.
@@ -258,14 +280,14 @@ where
                     if trimmed.is_empty() {
                         continue;
                     }
-                    match serde_json::from_str::<ApprovalResponse>(trimmed) {
-                        Ok(resp) => {
+                    match parse_approval_response(trimmed) {
+                        Some(resp) => {
                             if let Some(r) = recorder.as_ref() {
                                 r.record(&resp.approval_id, resp.decision);
                             }
                             pending.respond(&resp.approval_id, resp.decision);
                         }
-                        Err(_) => {
+                        None => {
                             // Drop malformed lines silently; the consumer
                             // can retry. Without tracing infra wired up,
                             // logging would just be noise.
@@ -446,6 +468,25 @@ mod tests {
         let decision = rx.await.unwrap();
         assert_eq!(decision, ReviewDecision::Approved);
 
+        drop(writer);
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn stdin_reader_accepts_json_rpc_approval_line() {
+        let pending = PendingApprovals::default();
+        let (mut writer, reader) = duplex(160);
+        let handle = spawn_response_reader(reader, pending.clone(), None);
+
+        let (approval_id, rx) = pending.register();
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"nav.approval.respond\",\"params\":{{\"approval_id\":\"{}\",\"decision\":\"approved_for_session\"}}}}\n",
+            approval_id
+        );
+        writer.write_all(line.as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+
+        assert_eq!(rx.await.unwrap(), ReviewDecision::ApprovedForSession);
         drop(writer);
         let _ = handle.await;
     }

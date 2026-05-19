@@ -7,10 +7,11 @@ use nav_core::sandbox::select_for_platform;
 use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
-    SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, agent, auth,
+    SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, agent,
+    agent_event_notification, auth,
     cli::{Args, CliCommand, CliExportFormat, SessionsAction, sandbox_policy_from_args},
     discover_skills, doctor, layout_session_tree, load_project_context, models,
-    rebuild_responses_input, shorten_home,
+    rebuild_responses_input, session_started_notification, shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -63,9 +64,9 @@ async fn main() -> Result<()> {
     // missing API key still shows the workspace summary first — useful when
     // diagnosing "wait, which branch was I on?".
     let is_tty = std::io::stdout().is_terminal();
-    let is_ndjson_mode = !is_tty || args.json_events;
-    if is_ndjson_mode {
-        print_ndjson_banner(&args, &cwd, project.as_ref());
+    let is_headless_mode = !is_tty || args.json_events || args.json_rpc;
+    if is_headless_mode {
+        print_headless_banner(&args, &cwd, project.as_ref());
     }
 
     // Locked to launch cwd so the system prompt and slash popup never
@@ -114,25 +115,24 @@ async fn main() -> Result<()> {
         RetryPolicy::default(),
     ));
 
-    // Drain piped stdin up-front so it works regardless of which mode we end
-    // up in — interactive TUI (`cat prompt.txt | nav` seeds the composer with
-    // the file contents) or one-shot NDJSON (`echo … | nav --json-events`).
-    // Without this, the TTY-based branch below returns first and silently
-    // drops the pipe. Mirrors codex `exec`'s OptionalAppend/RequiredIfPiped.
-    let stdin_prompt = if std::io::stdin().is_terminal() {
-        None
-    } else {
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    // Raw mode keeps the convenience flow where piped stdin becomes prompt
+    // context. JSON-RPC reserves stdin for interactive protocol messages such
+    // as approval responses, so frontends must pass the prompt positionally.
+    let stdin_prompt = if should_read_stdin_as_prompt(&args, stdin_is_tty) {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
             .context("failed to read prompt from stdin")?;
         let trimmed = buf.trim_end_matches(['\n', '\r']).to_string();
         (!trimmed.is_empty()).then_some(trimmed)
+    } else {
+        None
     };
 
     let combined_prompt = combine_prompt(args.prompt.as_slice(), stdin_prompt.as_deref());
 
-    if !is_ndjson_mode {
+    if !is_headless_mode {
         return nav_tui::run(
             transport,
             args,
@@ -154,8 +154,14 @@ async fn main() -> Result<()> {
         store: store.as_ref(),
         session_id,
     };
+    if args.json_rpc {
+        let notification =
+            session_started_notification(&binding.session_id, &cwd, &args.model, args.transport);
+        let line = serde_json::to_string(&notification).expect("serialize session notification");
+        println!("{line}");
+    }
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let (permissions, _stdin_reader) = build_ndjson_permissions(
+    let (permissions, _stdin_reader) = build_headless_permissions(
         &args,
         &cwd,
         tx.clone(),
@@ -180,10 +186,13 @@ async fn main() -> Result<()> {
     );
     let drainer = async {
         while let Some(event) = rx.recv().await {
-            println!(
-                "{}",
+            let line = if args.json_rpc {
+                let notification = agent_event_notification(&event);
+                serde_json::to_string(&notification).expect("serialize event notification")
+            } else {
                 serde_json::to_string(&event).expect("serialize event")
-            );
+            };
+            println!("{line}");
         }
     };
     let (result, _) = tokio::join!(agent, drainer);
@@ -326,10 +335,11 @@ fn export_command(
     Ok(())
 }
 
-/// Build the permission context for a non-interactive (`--json-events` or
-/// piped) run. The reverse channel for approvals lives on stdin: a JSON line
-/// per response. If stdin is a TTY we silently downgrade to `Never` and warn.
-async fn build_ndjson_permissions(
+/// Build the permission context for a non-interactive (`--json-events`,
+/// `--json-rpc`, or piped) run. The reverse channel for approvals lives on
+/// stdin: a JSON line per response. If stdin is a TTY we silently downgrade to
+/// `Never` and warn.
+async fn build_headless_permissions(
     args: &Args,
     cwd: &Path,
     events: mpsc::UnboundedSender<AgentEvent>,
@@ -352,7 +362,7 @@ async fn build_ndjson_permissions(
     // through the auto-approving gate below, so a TTY stdin is fine.
     if !bypass && !stdin_piped && !matches!(policy, AskForApproval::Never) {
         eprintln!(
-            "nav: --json-events but stdin is a TTY; downgrading to --approval-policy never. \
+            "nav: headless mode but stdin is a TTY; downgrading to --approval-policy never. \
              Pipe approval responses on stdin to enable interactive approvals."
         );
         policy = AskForApproval::Never;
@@ -435,6 +445,10 @@ fn format_cost(summary: &SessionSummary) -> String {
 }
 fn is_upgrade_command(prompt: &[String]) -> bool {
     prompt.len() == 1 && matches!(prompt[0].as_str(), "update" | "upgrade")
+}
+
+fn should_read_stdin_as_prompt(args: &Args, stdin_is_tty: bool) -> bool {
+    !stdin_is_tty && !args.json_rpc
 }
 
 /// Merge positional prompt args with anything read from piped stdin. When
@@ -524,12 +538,10 @@ fn run_upgrade() -> Result<()> {
     Ok(())
 }
 
-/// One-shot startup banner emitted to stderr in NDJSON mode. Mirrors the lines
-/// the TUI welcome cell shows so headless frontends can still see which model,
-/// branch, and context files are in play. Stdout is reserved for `AgentEvent`
-/// NDJSON — adding a new event variant would force every external frontend to
-/// update, which is a steep cost for an observability nicety.
-fn print_ndjson_banner(args: &Args, cwd: &Path, project: &ProjectContext) {
+/// One-shot startup banner emitted to stderr in headless mode. Mirrors the
+/// lines the TUI welcome cell shows so frontends can still see which model,
+/// branch, and context files are in play. Stdout is reserved for machine data.
+fn print_headless_banner(args: &Args, cwd: &Path, project: &ProjectContext) {
     let mut header = format!("nav · model {} · cwd {}", args.model, shorten_home(cwd));
     if let Some(branch) = project.branch_summary() {
         header.push_str(&format!(" · branch {branch}"));
@@ -584,6 +596,18 @@ mod tests {
     fn combine_neither_returns_none() {
         let out = combine_prompt(&[], None);
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn json_rpc_reserves_stdin_for_approval_channel() {
+        let args = Args::try_parse_from(["nav", "--json-rpc", "hello"]).unwrap();
+        assert!(!should_read_stdin_as_prompt(&args, false));
+    }
+
+    #[test]
+    fn raw_headless_mode_can_use_piped_stdin_as_prompt_context() {
+        let args = Args::try_parse_from(["nav", "--json-events", "review"]).unwrap();
+        assert!(should_read_stdin_as_prompt(&args, false));
     }
 
     #[test]

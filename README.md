@@ -63,8 +63,8 @@ nav --auth api-key "Use OPENAI_API_KEY instead"
 ## TUI mode
 
 `cd` to your project and run `nav` with no arguments — when stdout is a tty
-and `--json-events` is not set, it launches the interactive TUI: chat
-transcript above, multi-line composer below.
+and no headless flag is set, it launches the interactive TUI: chat transcript
+above, multi-line composer below.
 
 ```sh
 cd ~/code/my-project
@@ -97,6 +97,18 @@ Each line is one `AgentEvent` as JSON (`assistant_message_delta`,
 `tool_call_started`, `file_change`, `turn_diff`, `turn_complete`, …). Non-tty
 stdout defaults to this mode automatically.
 
+For desktop, chat, and other non-TUI frontends, prefer the versioned JSON-RPC
+contract:
+
+```sh
+nav --json-rpc "list the files"
+```
+
+This emits newline-delimited JSON-RPC 2.0 notifications such as
+`nav.session.started` and `nav.event`, with `params.protocol_version: 1`.
+Approval responses can be written back to stdin as `nav.approval.respond`.
+See [docs/HEADLESS-PROTOCOL.md](docs/HEADLESS-PROTOCOL.md).
+
 ## Sessions
 
 Every run is persisted to a local SQLite database (default
@@ -118,10 +130,10 @@ today, so the column reads `—`).
 ## Desktop UI
 
 `nav-desktop` is the early Electron desktop shell for `nav`. It is intentionally
-small for now: a left sidebar, a main prompt area, and a persisted working-directory
-picker. If no workspace is selected, submitting from the prompt asks for one
-first, so the future Rust agent loop has an explicit filesystem boundary before
-it runs.
+small for now: a left sidebar, a main prompt area, and a persisted
+working-directory picker. It launches `nav --json-rpc` from the selected
+workspace, parses the stable headless protocol, and keeps a fallback parser for
+legacy raw `--json-events` output.
 
 Install the UI dependencies once:
 

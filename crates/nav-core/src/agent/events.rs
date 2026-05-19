@@ -109,7 +109,7 @@ pub enum AgentEvent {
     /// call. Surfaced for both `bash` (`command` populated) and `edit_file`
     /// (`path` populated). Frontends respond by either rendering an
     /// interactive prompt (TUI) or by emitting a matching
-    /// `ApprovalResponse` JSON line on stdin (NDJSON mode).
+    /// approval response JSON line on stdin (headless modes).
     ToolCallApprovalRequest {
         call_id: String,
         approval_id: String,

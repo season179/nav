@@ -8,6 +8,7 @@ pub mod models;
 pub mod mutation;
 pub mod permissions;
 pub mod project;
+pub mod protocol;
 pub mod responses;
 pub mod sandbox;
 pub mod session;
@@ -29,6 +30,10 @@ pub use permissions::{ApprovalReason, AskForApproval, BlockRule, ReviewDecision,
 pub use project::{
     ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,
     shorten_home,
+};
+pub use protocol::{
+    HEADLESS_PROTOCOL_VERSION, JSONRPC_VERSION, METHOD_AGENT_EVENT, METHOD_APPROVAL_RESPOND,
+    METHOD_SESSION_STARTED, agent_event_notification, session_started_notification,
 };
 pub use responses::{OpenAiTransport, RetryPolicy};
 pub use session::{

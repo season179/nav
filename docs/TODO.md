@@ -214,10 +214,17 @@ small slice earlier.
    - Outstanding: MCP-style integrations (no client, transport, or tool
      bridge yet), extension hooks, prompt templates, package install, and
      themes.
-5. [ ] Polish headless integration: define a stable JSON/RPC contract for
+5. [x] Polish headless integration: define a stable JSON/RPC contract for
    desktop, chat, and other non-TUI frontends.
-   - Not started: NDJSON `AgentEvent` stream exists, but the wire format is
-     not yet versioned or stabilized as a contract.
+   - Done: `nav --json-rpc` emits newline-delimited JSON-RPC 2.0
+     notifications with `params.protocol_version: 1`. The contract is
+     documented in `docs/HEADLESS-PROTOCOL.md`: `nav.session.started`
+     announces session/cwd/model/transport; `nav.event` wraps the stable
+     `AgentEvent` payload; `nav.approval.respond` is the stdin reverse
+     channel for `tool_call_approval_request`.
+   - `--json-events` remains the raw backward-compatible debugging stream.
+     `nav-desktop` now launches `--json-rpc` and its parser still accepts raw
+     `AgentEvent` lines for legacy output.
 6. [ ] Revisit subagents only after the single-agent workflow is strong; Pi is
    daily-usable without them.
    - Not started.
