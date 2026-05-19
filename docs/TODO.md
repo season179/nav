@@ -23,11 +23,18 @@ repo work before adding speculative features. Ranked by importance.
    - Partial: slash labels rendered in `nav-tui/src/bottom_pane/slash_popup.rs`
      and a Ctrl+C handler exists, but the labels do not dispatch to real
      handlers and turn-abort / message queueing are not implemented.
-4. [ ] Add reliability recovery: retry transient provider failures, handle
+4. [x] Add reliability recovery: retry transient provider failures, handle
    context overflow, tune timeouts, and bound long tool output before it reaches
-   the model/session log. (in-progress reliability-recovery-mechanisms)
-   - Not started in code: only the bash tool has a timeout; no retry, no
-     context-overflow handling, no tool-output bounding before the session log.
+   the model/session log.
+   - Done in commit 0b5624a (with follow-ups b4cc4c0, 9ff191f, 9b49327):
+     exponential-backoff retry with jitter + `Retry-After` in
+     `nav-core/src/responses/retry.rs`; one-shot context-window recovery
+     that drops the oldest tool pair and retries; SSE/WS idle timeouts
+     plus a new `--idle-timeout-secs` flag and reqwest `connect_timeout`
+     + `pool_idle_timeout`; tool-output truncation in
+     `nav-core/src/tools/truncate.rs` (50KB / 2000 lines, head-only for
+     `read_file`/`code_search`, head+tail for bash); new durable
+     `ProviderRetry` and `ContextTrimmed` `AgentEvent` variants.
 5. [x] Load project context and settings: discover `AGENTS.md` / `CLAUDE.md`,
    support `.nav/settings.json`, and show startup git/workspace status.
    - Done in commit 86d9e96: `AGENTS.md`/`CLAUDE.md` discovery at launch cwd
