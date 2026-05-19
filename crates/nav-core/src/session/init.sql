@@ -55,3 +55,20 @@ CREATE TABLE IF NOT EXISTS turn (
     error TEXT,
     PRIMARY KEY (session_id, turn_index)
 );
+
+CREATE TABLE IF NOT EXISTS approval (
+    session_id    TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    approval_id   TEXT NOT NULL,
+    requested_at  INTEGER NOT NULL,
+    decided_at    INTEGER,
+    tool          TEXT NOT NULL,
+    command       TEXT,
+    path          TEXT,
+    reason        TEXT NOT NULL,
+    decision      TEXT,
+    rule          TEXT,
+    PRIMARY KEY (session_id, approval_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_approval_session
+    ON approval(session_id, requested_at);

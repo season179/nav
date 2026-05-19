@@ -15,7 +15,7 @@ use crate::project::ProjectContext;
 use crate::responses::{self, ResponseCollector, ResponsesError};
 use crate::session::{SessionId, SessionStore};
 use crate::skills::Catalog;
-use crate::tools;
+use crate::tools::{self, PermissionContext};
 
 /// Stream of raw `Responses` API events yielded by a transport.
 ///
@@ -147,6 +147,7 @@ pub async fn run_agent(
     initial_input: Option<Vec<Value>>,
     skills: &Catalog,
     context: Option<&ProjectContext>,
+    permissions: PermissionContext,
 ) -> Result<()> {
     let mut input = initial_input.unwrap_or_default();
     let content = build_user_content(prompt, &attachments, cwd);
@@ -262,21 +263,46 @@ pub async fn run_agent(
                 cwd,
                 skills,
                 args.bash_timeout_secs,
+                &permissions,
+                &call_id,
                 &tool_name,
                 tool_arguments.clone(),
+                Some(&events),
             )
             .await;
-            let (output_text, is_error, mutation, failed_mutation_summary) = match result {
-                Ok(tool_result) => (tool_result.output, false, tool_result.mutation, None),
+            let (output_text, is_error, aborted, mutation, failed_mutation_summary) = match result {
+                Ok(outcome) => {
+                    if let Some(blocked) = outcome.blocked {
+                        emit(
+                            &events,
+                            session,
+                            AgentEvent::ToolCallBlocked {
+                                call_id: call_id.clone(),
+                                tool: tool_name.clone(),
+                                reason: blocked.reason,
+                                rule: blocked.rule,
+                            },
+                        );
+                    }
+                    let failed = if outcome.is_error && outcome.mutation.is_none() {
+                        tools::failed_mutation_summary(&tool_name, &tool_arguments)
+                            .map(|summary| (summary, outcome.output.clone()))
+                    } else {
+                        None
+                    };
+                    (
+                        outcome.output,
+                        outcome.is_error,
+                        outcome.aborted,
+                        outcome.mutation,
+                        failed,
+                    )
+                }
                 Err(err) => {
                     let error_text = format!("tool error: {err:#}");
-                    (
-                        error_text.clone(),
-                        true,
-                        None,
-                        tools::failed_mutation_summary(&tool_name, &tool_arguments)
-                            .map(|summary| (summary, error_text)),
-                    )
+                    let failed = tools::failed_mutation_summary(&tool_name, &tool_arguments)
+                        .map(|summary| (summary, error_text.clone()));
+                    (error_text, true, false, None, failed)
                 }
             };
 
@@ -314,13 +340,26 @@ pub async fn run_agent(
                     &events,
                     session,
                     AgentEvent::FileChange {
-                        call_id,
+                        call_id: call_id.clone(),
                         changes: Vec::new(),
                         status: PatchApplyStatus::Failed,
                         summary,
                         error: Some(error),
                     },
                 );
+            }
+
+            // Operator chose Abort on the approval modal (or the reverse
+            // channel sent {"decision":"abort"}). Finalize this turn and
+            // exit the loop instead of feeding more tool calls or asking
+            // the model for another turn.
+            if aborted {
+                if let Err(err) =
+                    finalize_turn(&events, session, cwd, turn_had_mutation, &args.model, &usage)
+                {
+                    return fail(&events, session, err);
+                }
+                return Ok(());
             }
         }
 

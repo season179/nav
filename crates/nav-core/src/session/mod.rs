@@ -183,7 +183,75 @@ impl SessionStore {
                 params![now, session_id],
             )?;
         }
+        // Mirror approval-related events into the side table so audits can
+        // join on (session_id, approval_id) without scanning the event log.
+        match event {
+            AgentEvent::ToolCallApprovalRequest {
+                approval_id,
+                tool,
+                command,
+                path,
+                reason,
+                ..
+            } => {
+                let command_json = command
+                    .as_ref()
+                    .map(|c| serde_json::to_string(c).unwrap_or_default());
+                tx.execute(
+                    "INSERT OR IGNORE INTO approval
+                     (session_id, approval_id, requested_at, tool, command, path, reason)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![session_id, approval_id, now, tool, command_json, path, reason],
+                )?;
+            }
+            AgentEvent::ToolCallBlocked {
+                call_id,
+                tool,
+                reason,
+                rule,
+            } => {
+                // Use call_id as the audit key for blocks (no approval_id
+                // was ever issued — the request was refused outright).
+                tx.execute(
+                    "INSERT OR IGNORE INTO approval
+                     (session_id, approval_id, requested_at, tool, reason, rule)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![session_id, call_id, now, tool, reason, rule],
+                )?;
+            }
+            _ => {}
+        }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Wrap this store in a [`DurableEventSink`] tied to one session. The
+    /// returned handle clones the underlying `Arc<SessionStore>` so the
+    /// caller can move it into `ChannelGate::with_sink` without juggling
+    /// borrows.
+    pub fn sink_for(self: &std::sync::Arc<Self>, session_id: impl Into<String>) -> SessionStoreSink {
+        SessionStoreSink {
+            store: std::sync::Arc::clone(self),
+            session_id: session_id.into(),
+        }
+    }
+
+    /// Record a user decision against a previously-requested approval.
+    /// Mirrors the `approval_response` JSON consumed by the NDJSON gate.
+    pub fn record_approval_decision(
+        &self,
+        session_id: &str,
+        approval_id: &str,
+        decision: &str,
+    ) -> Result<()> {
+        let now = now_secs();
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE approval
+             SET decided_at = ?1, decision = ?2
+             WHERE session_id = ?3 AND approval_id = ?4",
+            params![now, decision, session_id, approval_id],
+        )?;
         Ok(())
     }
 
@@ -386,6 +454,38 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// [`DurableEventSink`] adaptor that writes through a [`SessionStore`].
+///
+/// The `ChannelGate` lives outside `run_agent`'s emit path, so without this
+/// the approval-request event would only land on the live `events` channel
+/// and never reach SQLite — leaving `record_approval_decision` updating
+/// zero rows. Build one with [`SessionStore::sink_for`].
+pub struct SessionStoreSink {
+    store: std::sync::Arc<SessionStore>,
+    session_id: String,
+}
+
+impl crate::permissions::approval::DurableEventSink for SessionStoreSink {
+    fn persist(&self, event: &AgentEvent) {
+        if let Err(err) = self.store.append_event(&self.session_id, event) {
+            // Persistence is best-effort: a SQLite hiccup must not stall
+            // the live conversation. Log once and continue.
+            eprintln!("nav-core: failed to persist approval event: {err:#}");
+        }
+    }
+}
+
+impl crate::permissions::approval::DecisionRecorder for SessionStoreSink {
+    fn record(&self, approval_id: &str, decision: crate::permissions::ReviewDecision) {
+        if let Err(err) =
+            self.store
+                .record_approval_decision(&self.session_id, approval_id, decision.as_str())
+        {
+            eprintln!("nav-core: failed to record approval decision: {err:#}");
+        }
+    }
 }
 
 fn now_secs() -> i64 {

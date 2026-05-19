@@ -1,5 +1,6 @@
 mod fs;
 mod patch;
+pub mod preflight;
 mod shell;
 mod truncate;
 
@@ -7,7 +8,12 @@ use crate::mutation::MutationResult;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::agent::AgentEvent;
+use crate::permissions::approval::{ApprovalRequest, AutoGate};
+use crate::permissions::{AskForApproval, ReviewDecision, SandboxPolicy, SessionAllowlist};
+use crate::sandbox::PassthroughRunner;
 use crate::skills::Catalog;
 use truncate::{TruncateMode, bound};
 
@@ -15,6 +21,8 @@ use truncate::{TruncateMode, bound};
 // footers), so it gets head+tail. `read_file` / `code_search` are head-only
 // because the earliest matches/lines are the most useful.
 const BASH_HEAD_LINES: usize = 200;
+
+pub use preflight::{PermissionContext, PreflightOutcome};
 
 pub(super) fn tool_definitions() -> Vec<Value> {
     // These primitives mirror the workshop article, with `apply_patch` as the
@@ -122,35 +130,167 @@ impl ToolResult {
     }
 }
 
+/// Outcome of running a single tool call. Carries the rendered output the
+/// model sees plus whether anything was blocked (so the caller can emit the
+/// matching `ToolCallBlocked` event with a stable rule id) and whether the
+/// operator explicitly aborted the session (so the caller stops the loop
+/// instead of asking the model to retry). `mutation` is populated for
+/// successful filesystem-mutating tools (`edit_file`, `apply_patch`).
+pub struct ToolOutcome {
+    pub output: String,
+    pub is_error: bool,
+    pub blocked: Option<BlockedTool>,
+    pub aborted: bool,
+    pub mutation: Option<MutationResult>,
+}
+
+/// Why a tool call was refused before execution.
+pub struct BlockedTool {
+    pub rule: String,
+    pub reason: String,
+}
+
+/// Construct a permission context with no enforcement. Used by tests and by
+/// the legacy code paths that haven't been migrated to explicit policy yet.
+pub fn unchecked_permission_context() -> PermissionContext {
+    PermissionContext {
+        gate: Arc::new(AutoGate::approving()),
+        policy: AskForApproval::Never,
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        sandbox: Arc::new(PassthroughRunner),
+        session_allowlist: SessionAllowlist::default(),
+    }
+}
+
+/// Dispatch a tool call, applying the permission preflight first.
+// Bundling these into a single context struct just to satisfy clippy
+// would hide which arguments are per-call (`call_id`, `name`, `input`)
+// versus per-session (`permissions`, `skills`, `cwd`). The explicit list
+// keeps the trust boundary readable at the call site.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tool(
     cwd: &Path,
     skills: &Catalog,
     timeout_secs: u64,
+    permissions: &PermissionContext,
+    call_id: &str,
     name: &str,
     input: Value,
-) -> Result<ToolResult> {
+    events: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+) -> Result<ToolOutcome> {
     // central dispatch keeps the trust boundary obvious. The model asks;
     // this Rust match decides exactly which local capability is allowed.
-    // Skill directories are accepted as extra read roots; mutating tools stay
-    // workspace-only.
+    // Skill directories are accepted as extra read roots; mutating tools
+    // (`edit_file`, `apply_patch`) stay workspace-only.
+
+    let preflight = preflight::evaluate(name, &input, cwd, permissions.policy);
+    match preflight {
+        PreflightOutcome::Block { rule, reason } => {
+            return Ok(ToolOutcome {
+                output: format!("tool {name} blocked: {reason}"),
+                is_error: true,
+                blocked: Some(BlockedTool {
+                    rule: rule.as_str().to_string(),
+                    reason,
+                }),
+                aborted: false,
+                mutation: None,
+            });
+        }
+        PreflightOutcome::NeedsApproval {
+            reason,
+            command,
+            path,
+        } => {
+            // Honor a prior `ApprovedForSession` for this exact tool+key by
+            // skipping the gate. Block rules already short-circuited above,
+            // so the cache only ever bypasses approvals, not safety rules.
+            let cache_key = preflight::session_key(name, &input);
+            let preapproved = cache_key
+                .as_deref()
+                .is_some_and(|k| permissions.session_allowlist.contains(k));
+
+            if !preapproved {
+                if preflight::auto_denies_approvals(permissions.policy) {
+                    return Ok(ToolOutcome {
+                        output: format!(
+                            "tool {name} requires approval but policy is `never`; refusing",
+                        ),
+                        is_error: true,
+                        blocked: None,
+                        aborted: false,
+                        mutation: None,
+                    });
+                }
+                let request = ApprovalRequest {
+                    call_id: call_id.to_string(),
+                    tool: name.to_string(),
+                    command,
+                    path,
+                    cwd: cwd.display().to_string(),
+                    reason: reason.as_str().to_string(),
+                };
+                let decision = permissions.gate.request(request).await;
+                match decision {
+                    ReviewDecision::Approved => {}
+                    ReviewDecision::ApprovedForSession => {
+                        if let Some(k) = cache_key {
+                            permissions.session_allowlist.allow(k);
+                        }
+                    }
+                    ReviewDecision::Denied => {
+                        return Ok(ToolOutcome {
+                            output: format!("tool {name} denied by user"),
+                            is_error: true,
+                            blocked: None,
+                            aborted: false,
+                            mutation: None,
+                        });
+                    }
+                    ReviewDecision::Abort => {
+                        // `Abort` contracts as "stop the agent loop"; the
+                        // runner checks this flag and exits without
+                        // dispatching more tool calls or scheduling another
+                        // turn.
+                        return Ok(ToolOutcome {
+                            output: format!("tool {name} aborted by user"),
+                            is_error: true,
+                            blocked: None,
+                            aborted: true,
+                            mutation: None,
+                        });
+                    }
+                }
+            }
+        }
+        PreflightOutcome::Allow => {}
+    }
+    // `events` is reserved for future per-tool progress emissions (e.g.
+    // streaming sandbox stderr). Today only ApprovalRequest events flow
+    // through the gate, so the dispatch itself doesn't touch the channel.
+    let _ = events;
+
     let skill_dirs = skills.skill_dirs();
-    match name {
+    let result: Result<ToolResult> = match name {
         "read_file" => fs::read_file(cwd, skill_dirs, string_arg(&input, "path")?)
             .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
         "list_files" => fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?)
             .map(ToolResult::text),
-        "bash" => shell::bash(cwd, timeout_secs, string_arg(&input, "command")?)
-            .await
-            .map(|out| {
-                ToolResult::text(
-                    bound(
-                        out,
-                        TruncateMode::HeadTail {
-                            head_lines: BASH_HEAD_LINES,
-                        },
-                    ),
-                )
-            }),
+        "bash" => shell::bash(
+            permissions,
+            cwd,
+            timeout_secs,
+            string_arg(&input, "command")?,
+        )
+        .await
+        .map(|out| {
+            ToolResult::text(bound(
+                out,
+                TruncateMode::HeadTail {
+                    head_lines: BASH_HEAD_LINES,
+                },
+            ))
+        }),
         "edit_file" => fs::edit_file_with_metadata(
             cwd,
             string_arg(&input, "path")?,
@@ -167,6 +307,23 @@ pub async fn run_tool(
         .await
         .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
         other => Err(anyhow!("unknown tool: {other}")),
+    };
+
+    match result {
+        Ok(tool_result) => Ok(ToolOutcome {
+            output: tool_result.output,
+            is_error: false,
+            blocked: None,
+            aborted: false,
+            mutation: tool_result.mutation,
+        }),
+        Err(err) => Ok(ToolOutcome {
+            output: format!("tool error: {err:#}"),
+            is_error: true,
+            blocked: None,
+            aborted: false,
+            mutation: None,
+        }),
     }
 }
 
@@ -198,9 +355,14 @@ pub fn failed_mutation_summary(name: &str, input: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permissions::approval::{
+        ApprovalGate, ApprovalRequest, AutoGate, ChannelGate, PendingApprovals,
+    };
     use serde_json::json;
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use tokio::sync::mpsc::unbounded_channel;
 
     // ── tool_definitions ──────────────────────────────────────────
 
@@ -235,15 +397,29 @@ mod tests {
         }
     }
 
+    fn permissive_ctx() -> PermissionContext {
+        unchecked_permission_context()
+    }
+
     // ── run_tool dispatch ─────────────────────────────────────────
 
     #[tokio::test]
     async fn run_tool_rejects_unknown_tool() {
         let cwd = Path::new("/tmp");
-        let err = run_tool(cwd, &Catalog::default(), 5, "fly_away", json!({}))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown tool: fly_away"));
+        let outcome = run_tool(
+            cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "call1",
+            "fly_away",
+            json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.output.contains("unknown tool: fly_away"));
     }
 
     #[tokio::test]
@@ -252,17 +428,21 @@ mod tests {
         let cwd = temp.path().canonicalize().unwrap();
         fs::write(cwd.join("hello.txt"), "world").unwrap();
 
-        let result = run_tool(
+        let outcome = run_tool(
             &cwd,
             &Catalog::default(),
             5,
+            &permissive_ctx(),
+            "c1",
             "read_file",
             json!({"path": "hello.txt"}),
+            None,
         )
         .await
         .unwrap();
-        assert_eq!(result.output, "world");
-        assert!(result.mutation.is_none());
+        assert_eq!(outcome.output, "world");
+        assert!(!outcome.is_error);
+        assert!(outcome.mutation.is_none());
     }
 
     #[tokio::test]
@@ -272,16 +452,20 @@ mod tests {
         fs::write(cwd.join("a.txt"), "").unwrap();
         fs::create_dir(cwd.join("subdir")).unwrap();
 
-        let result = run_tool(
+        let outcome = run_tool(
             &cwd,
             &Catalog::default(),
             5,
+            &permissive_ctx(),
+            "c1",
             "list_files",
             json!({"path": "."}),
+            None,
         )
         .await
         .unwrap();
-        let parsed: Vec<String> = serde_json::from_str(&result.output).unwrap();
+        assert!(!outcome.is_error);
+        let parsed: Vec<String> = serde_json::from_str(&outcome.output).unwrap();
         assert!(parsed.contains(&"a.txt".to_string()));
         assert!(parsed.contains(&"subdir/".to_string()));
     }
@@ -294,41 +478,47 @@ mod tests {
         let temp = tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
 
-        let result = run_tool(
+        let outcome = run_tool(
             &cwd,
             &Catalog::default(),
             10,
+            &permissive_ctx(),
+            "c1",
             "bash",
             json!({"command": "yes hellohello | head -n 20000"}),
+            None,
         )
         .await
         .unwrap();
 
-        assert!(result.output.contains("[truncated"));
+        assert!(outcome.output.contains("[truncated"));
         assert!(
-            result.output.len() < 80 * 1024,
+            outcome.output.len() < 80 * 1024,
             "result was {} bytes",
-            result.output.len()
+            outcome.output.len()
         );
-        assert!(result.mutation.is_none());
+        assert!(outcome.mutation.is_none());
     }
 
     #[tokio::test]
     async fn run_tool_bash_dispatches() {
         let temp = tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
-
-        let result = run_tool(
+        let outcome = run_tool(
             &cwd,
             &Catalog::default(),
             5,
+            &permissive_ctx(),
+            "c1",
             "bash",
             json!({"command": "echo ok"}),
+            None,
         )
         .await
         .unwrap();
-        assert!(result.output.contains("ok"));
-        assert!(result.mutation.is_none());
+        assert!(outcome.output.contains("ok"));
+        assert!(!outcome.is_error);
+        assert!(outcome.mutation.is_none());
     }
 
     #[tokio::test]
@@ -337,17 +527,20 @@ mod tests {
         let cwd = temp.path().canonicalize().unwrap();
         fs::write(cwd.join("f.txt"), "hello world").unwrap();
 
-        let result = run_tool(
+        let outcome = run_tool(
             &cwd,
             &Catalog::default(),
             5,
+            &permissive_ctx(),
+            "c1",
             "edit_file",
             json!({"path": "f.txt", "old_str": "world", "new_str": "nav"}),
+            None,
         )
         .await
         .unwrap();
-        assert!(result.output.contains("edited"));
-        let mutation = result
+        assert!(outcome.output.contains("edited"));
+        let mutation = outcome
             .mutation
             .expect("edit_file should report mutation metadata");
         assert_eq!(mutation.changes.len(), 1);
@@ -363,20 +556,23 @@ mod tests {
         let cwd = temp.path().canonicalize().unwrap();
         fs::write(cwd.join("existing.txt"), "old\nline\n").unwrap();
 
-        let result = run_tool(
+        let outcome = run_tool(
             &cwd,
             &Catalog::default(),
             5,
+            &permissive_ctx(),
+            "c1",
             "apply_patch",
             json!({
                 "patch": "*** Begin Patch\n*** Update File: existing.txt\n@@\n-old\n+new\n line\n*** Add File: added.txt\n+hello\n*** End Patch\n"
             }),
+            None,
         )
         .await
         .unwrap();
 
-        assert!(result.output.contains("updated 2 files"));
-        let mutation = result
+        assert!(outcome.output.contains("updated 2 files"));
+        let mutation = outcome
             .mutation
             .expect("apply_patch should report mutation metadata");
         assert_eq!(mutation.changes.len(), 2);
@@ -420,35 +616,373 @@ mod tests {
             scope: SkillScope::User,
         }]);
 
-        let result = run_tool(
+        let outcome = run_tool(
             &cwd,
             &catalog,
             5,
+            &permissive_ctx(),
+            "c1",
             "read_file",
             json!({"path": skill_md.to_string_lossy()}),
+            None,
         )
         .await
         .unwrap();
-        assert!(result.output.contains("Skill body"));
+        assert!(outcome.output.contains("Skill body"));
     }
 
     #[tokio::test]
     async fn run_tool_rejects_absolute_path_outside_skill_dirs() {
         let temp = tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
-        let err = run_tool(
+        let outcome = run_tool(
             &cwd,
             &Catalog::default(),
             5,
+            &permissive_ctx(),
+            "c1",
             "read_file",
             json!({"path": "/etc/hosts"}),
+            None,
         )
         .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("absolute paths are only allowed"),
-            "unexpected error: {err}"
+        .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.output.contains("absolute paths are only allowed"));
+    }
+
+    // ── permission integration ────────────────────────────────────
+
+    /// Fake gate that records every request and returns a configurable decision.
+    struct RecordingGate {
+        decision: ReviewDecision,
+        requests: Mutex<Vec<ApprovalRequest>>,
+    }
+
+    impl RecordingGate {
+        fn new(decision: ReviewDecision) -> Self {
+            Self {
+                decision,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+        fn requests(&self) -> Vec<ApprovalRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl ApprovalGate for RecordingGate {
+        fn request<'a>(
+            &'a self,
+            req: ApprovalRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = ReviewDecision> + Send + 'a>,
+        > {
+            self.requests.lock().unwrap().push(req);
+            let d = self.decision;
+            Box::pin(async move { d })
+        }
+    }
+
+    fn ctx_with(gate: Arc<dyn ApprovalGate>, policy: AskForApproval) -> PermissionContext {
+        PermissionContext {
+            gate,
+            policy,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            sandbox: Arc::new(PassthroughRunner),
+            session_allowlist: SessionAllowlist::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unbypassable_command_emits_blocked() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::Approved));
+        let ctx = ctx_with(gate.clone(), AskForApproval::OnRequest);
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "bash",
+            json!({"command": "sudo true"}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.is_error);
+        let blocked = outcome.blocked.expect("expected blocked");
+        assert_eq!(blocked.rule, "unbypassable_dangerous");
+        assert!(gate.requests().is_empty(), "gate should not be asked");
+    }
+
+    #[tokio::test]
+    async fn protected_metadata_edit_blocked_unconditionally() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::Approved));
+        let ctx = ctx_with(gate.clone(), AskForApproval::Never);
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "edit_file",
+            json!({"path": ".git/config", "old_str": "", "new_str": "x"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error);
+        let blocked = outcome.blocked.expect("expected blocked");
+        assert_eq!(blocked.rule, "protected_metadata");
+    }
+
+    #[tokio::test]
+    async fn dangerous_command_asks_gate_then_runs() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(cwd.join("build")).unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::Approved));
+        let ctx = ctx_with(gate.clone(), AskForApproval::OnRequest);
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "bash",
+            json!({"command": "rm -rf build"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "command should run after approval: {}", outcome.output);
+        assert_eq!(gate.requests().len(), 1);
+        assert!(!cwd.join("build").exists());
+    }
+
+    #[tokio::test]
+    async fn dangerous_command_denied_returns_tool_error() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(cwd.join("build")).unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::Denied));
+        let ctx = ctx_with(gate, AskForApproval::OnRequest);
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "bash",
+            json!({"command": "rm -rf build"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.output.contains("denied"));
+        assert!(cwd.join("build").exists());
+    }
+
+    #[tokio::test]
+    async fn never_policy_auto_denies_approval_request() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::Approved));
+        let ctx = ctx_with(gate.clone(), AskForApproval::Never);
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "bash",
+            json!({"command": "rm -rf build"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.output.contains("requires approval"));
+        assert!(gate.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unless_trusted_asks_for_unknown_command() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::Approved));
+        let ctx = ctx_with(gate.clone(), AskForApproval::UnlessTrusted);
+
+        // `cargo test` is not on the safelist -> NeedsApproval under UnlessTrusted.
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "bash",
+            json!({"command": "cargo --version"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gate.requests().len(), 1);
+        assert!(!outcome.is_error, "should run after approval");
+    }
+
+    #[tokio::test]
+    async fn unless_trusted_skips_prompt_for_safelisted() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::Denied));
+        let ctx = ctx_with(gate.clone(), AskForApproval::UnlessTrusted);
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "bash",
+            json!({"command": "git status"}),
+            None,
+        )
+        .await
+        .unwrap();
+        // Safe → no gate request, even if the gate would deny.
+        assert!(gate.requests().is_empty());
+        assert!(!outcome.is_error);
+    }
+
+    #[tokio::test]
+    async fn approved_for_session_caches_subsequent_calls() {
+        // First call asks; user picks ApprovedForSession. Second call with
+        // the same argv should run without prompting.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(cwd.join("build")).unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::ApprovedForSession));
+        let ctx = ctx_with(gate.clone(), AskForApproval::OnRequest);
+
+        let _ = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "bash",
+            json!({"command": "rm -rf build"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(gate.requests().len(), 1, "first call asks");
+
+        // Recreate the file so the second call has something to do.
+        fs::create_dir_all(cwd.join("build")).unwrap();
+        let _ = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c2",
+            "bash",
+            json!({"command": "rm -rf build"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            gate.requests().len(),
+            1,
+            "second call should hit the session allowlist and skip the gate"
         );
+    }
+
+    #[tokio::test]
+    async fn approved_for_session_does_not_bypass_block_rules() {
+        // Even with a session allowlist primed for `sudo true`, the
+        // unbypassable rule still wins — the allowlist only short-circuits
+        // approvals, never refusals.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let gate = Arc::new(RecordingGate::new(ReviewDecision::Approved));
+        let ctx = ctx_with(gate.clone(), AskForApproval::OnRequest);
+        ctx.session_allowlist.allow("bash:sudo true".into());
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &ctx,
+            "c1",
+            "bash",
+            json!({"command": "sudo true"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error);
+        let blocked = outcome.blocked.expect("expected block");
+        assert_eq!(blocked.rule, "unbypassable_dangerous");
+    }
+
+    #[tokio::test]
+    async fn channel_gate_emits_event_for_approval() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let pending = PendingApprovals::default();
+        let (tx, mut rx) = unbounded_channel();
+        let gate = Arc::new(ChannelGate::new(pending.clone(), tx));
+        let ctx = ctx_with(gate.clone(), AskForApproval::OnRequest);
+
+        let cwd_for_call = cwd.clone();
+        let pending_clone = pending.clone();
+        let handle = tokio::spawn(async move {
+            run_tool(
+                &cwd_for_call,
+                &Catalog::default(),
+                5,
+                &ctx,
+                "c1",
+                "bash",
+                json!({"command": "rm -rf build"}),
+                None,
+            )
+            .await
+            .unwrap()
+        });
+
+        let event = rx.recv().await.expect("approval event");
+        let (approval_id, command, reason) = match event {
+            AgentEvent::ToolCallApprovalRequest {
+                approval_id,
+                command,
+                reason,
+                ..
+            } => (approval_id, command, reason),
+            other => panic!("unexpected event: {:?}", other),
+        };
+        assert_eq!(reason, "dangerous_pattern");
+        // Approval payload carries the raw command string (one Vec entry)
+        // so composite/piped commands aren't truncated on screen.
+        assert_eq!(command.unwrap(), vec!["rm -rf build".to_string()]);
+        pending_clone.respond(&approval_id, ReviewDecision::Approved);
+
+        let outcome = handle.await.unwrap();
+        assert!(!outcome.is_error, "command should run after approval");
     }
 
     // ── string_arg ────────────────────────────────────────────────
@@ -463,19 +997,40 @@ mod tests {
     fn string_arg_rejects_missing_field() {
         let input = json!({"path": "foo.rs"});
         let err = string_arg(&input, "command").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("missing string input field `command`")
-        );
+        assert!(err.to_string().contains("missing string input field `command`"));
     }
 
     #[test]
     fn string_arg_rejects_non_string_field() {
         let input = json!({"path": 42});
         let err = string_arg(&input, "path").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("missing string input field `path`")
-        );
+        assert!(err.to_string().contains("missing string input field `path`"));
+    }
+
+    // ── unchecked context smoke ───────────────────────────────────
+
+    #[tokio::test]
+    async fn unchecked_context_allows_everything_safe() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        // Even dangerous commands aren't *blocked* under unchecked context,
+        // because policy is Never and there's no gate. Unbypassable still
+        // blocks (that's the point).
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &unchecked_permission_context(),
+            "c1",
+            "bash",
+            json!({"command": "echo ok"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error);
+        assert!(outcome.output.contains("ok"));
+
+        let _ = AutoGate::denying(); // silence unused-import path
     }
 }

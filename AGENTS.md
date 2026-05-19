@@ -42,6 +42,24 @@ them from a `nav` task.
 - **`nav update` / `nav upgrade`** reinstalls from the compile-time
   `CARGO_MANIFEST_DIR`, not from `$PWD`. If that checkout moved, the upgrade
   fails loudly instead of silently using a stale path.
+- **Approval policy defaults to `on-request`.** Classifier-flagged
+  dangerous commands prompt the operator before running; unbypassable
+  patterns (`sudo`, `rm -rf /`, fork bomb, `mkfs*`, etc.) are refused even
+  with `--dangerously-bypass-approvals-and-sandbox`. CLI flags:
+  `--approval-policy {untrusted,on-request,never}` and
+  `--sandbox {read-only,workspace-write,danger-full-access}`.
+- **Sandbox defaults to `workspace-write`.** On macOS this is enforced via
+  `sandbox-exec` with an embedded `.sbpl` profile that allows reads
+  anywhere, writes only under the workspace root, and gates network. On
+  Linux/Windows the sandbox is currently passthrough — the classifier and
+  protected-metadata rules still apply.
+- **`.git`, `.agents`, `.nav` writes are blocked** regardless of approval
+  mode. Reads of `.env*`, `*.pem`, `*.key`, and SSH keys require approval
+  even when the path is in-tree.
+- **NDJSON approval reverse channel.** In `--json-events` mode with a piped
+  stdin, the agent reads JSON lines of the form
+  `{"kind":"approval_response","approval_id":"…","decision":"approved"}`.
+  On a TTY stdin we auto-downgrade to `--approval-policy never` and warn.
 
 ## Skills and filesystem boundaries
 

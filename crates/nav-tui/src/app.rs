@@ -3,8 +3,12 @@ use crossterm::event::{self, Event as CtEvent};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use nav_core::permissions::approval::{ApprovalGate, ChannelGate, PendingApprovals};
+use nav_core::sandbox::select_for_platform;
+use nav_core::tools::PermissionContext;
 use nav_core::{
-    AgentEvent, Catalog, OpenAiTransport, ProjectContext, SessionId, SessionStore, cli::Args,
+    AgentEvent, Catalog, OpenAiTransport, ProjectContext, SessionId, SessionStore,
+    cli::{Args, sandbox_policy_from_args},
     shorten_home,
 };
 use ratatui::Terminal;
@@ -16,7 +20,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::ChatWidget;
-use crate::bottom_pane;
+use crate::bottom_pane::{self, PendingApproval};
 use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
 use crate::status_bar::{AgentState, StatusBar};
 use crate::turn::{TurnSpawn, spawn_turn};
@@ -136,6 +140,38 @@ pub async fn run(
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppEvent>();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
+    // Permission plumbing: pick the gate based on policy. Bypass mode
+    // auto-approves through `AutoGate::approving()`; explicit `Never` policy
+    // refuses via the in-band short-circuit; otherwise the live TUI gates
+    // through `ChannelGate` so the operator can approve interactively.
+    let bypass = args.dangerously_bypass_approvals_and_sandbox;
+    let pending_approvals = PendingApprovals::default();
+    let sandbox_policy = sandbox_policy_from_args(&args, &cwd);
+    let (gate, policy): (Arc<dyn ApprovalGate>, _) = if bypass {
+        (
+            Arc::new(nav_core::permissions::approval::AutoGate::approving()),
+            // Force off `Never` so the gate is consulted instead of being
+            // short-circuited to a refusal by `auto_denies_approvals`.
+            nav_core::permissions::AskForApproval::OnRequest,
+        )
+    } else {
+        // Attach the session store as a durable sink so the approval
+        // request hits the SQLite audit table — without it, the later
+        // `record_approval_decision` UPDATE finds no row.
+        let channel = ChannelGate::new(pending_approvals.clone(), agent_tx.clone())
+            .with_sink(Arc::new(store.sink_for(session_id.clone())));
+        (Arc::new(channel), args.approval_policy)
+    };
+    let permissions = PermissionContext {
+        gate,
+        policy,
+        sandbox: Arc::from(select_for_platform(&sandbox_policy)),
+        sandbox_policy,
+        // Default empty; populated when the user picks `[a]llow for session`
+        // on the approval modal. Shared across spawned turns via Arc.
+        session_allowlist: nav_core::permissions::SessionAllowlist::default(),
+    };
+
     if let Some(prompt) = initial_prompt {
         app_tx
             .send(AppEvent::Submit {
@@ -192,6 +228,27 @@ pub async fn run(
                     turn_started_at = None;
                 }
                 if matches!(ev, AgentEvent::UserMessage { .. }) {
+                    continue;
+                }
+                if let AgentEvent::ToolCallApprovalRequest {
+                    approval_id,
+                    tool,
+                    command,
+                    path,
+                    cwd: req_cwd,
+                    reason,
+                    ..
+                } = &ev
+                {
+                    pane.enqueue_approval(PendingApproval {
+                        approval_id: approval_id.clone(),
+                        tool: tool.clone(),
+                        command: command.clone(),
+                        path: path.clone(),
+                        cwd: req_cwd.clone(),
+                        reason: reason.clone(),
+                    });
+                    chat.ingest(ev);
                     continue;
                 }
                 chat.ingest(ev);
@@ -255,6 +312,7 @@ pub async fn run(
                             agent_tx: agent_tx.clone(),
                             skills: Arc::clone(&skills),
                             project: Arc::clone(&project),
+                            permissions: permissions.clone(),
                         });
                         if let Err(err) = spawned {
                             chat.scroll_to_bottom();
@@ -309,6 +367,21 @@ pub async fn run(
                             pane.on_paste(&text);
                         }
                         _ => {}
+                    }
+                    if let Some((approval_id, decision)) =
+                        pane.take_approval_decision()
+                    {
+                        // Persist before signalling the agent so the row
+                        // is there if the user inspects --list-sessions
+                        // mid-turn.
+                        if let Err(err) = store.record_approval_decision(
+                            &session_id,
+                            &approval_id,
+                            decision.as_str(),
+                        ) {
+                            eprintln!("nav-tui: failed to record approval: {err:#}");
+                        }
+                        pending_approvals.respond(&approval_id, decision);
                     }
                 }
             }

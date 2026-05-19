@@ -136,6 +136,17 @@ impl ChatWidget {
             AgentEvent::Error { message } => {
                 self.cells.push(Box::new(ErrorCell::new(message)));
             }
+            AgentEvent::ToolCallApprovalRequest { .. } => {
+                // Modal flow is handled by the bottom pane; nothing to add to
+                // the scrollback here. Wired up in slice 13/14.
+            }
+            AgentEvent::ToolCallBlocked {
+                tool, reason, rule, ..
+            } => {
+                self.cells.push(Box::new(ErrorCell::new(format!(
+                    "tool {tool} blocked ({rule}): {reason}"
+                ))));
+            }
         }
     }
 

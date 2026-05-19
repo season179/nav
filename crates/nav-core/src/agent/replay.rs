@@ -47,6 +47,8 @@ pub fn rebuild_responses_input(events: &[AgentEvent], cwd: &Path) -> Vec<Value> 
             | AgentEvent::ToolCallOutput { .. }
             | AgentEvent::FileChange { .. }
             | AgentEvent::TurnDiff { .. }
+            | AgentEvent::ToolCallApprovalRequest { .. }
+            | AgentEvent::ToolCallBlocked { .. }
             | AgentEvent::TurnComplete { .. }
             | AgentEvent::ProviderRetry { .. }
             | AgentEvent::ContextTrimmed { .. }
