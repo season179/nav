@@ -8,7 +8,7 @@ use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
     SessionBinding, SessionStore, SessionSummary, agent, auth,
-    cli::{Args, sandbox_policy_from_args},
+    cli::{Args, CliCommand, CliExportFormat, sandbox_policy_from_args},
     discover_skills, load_project_context, rebuild_responses_input, shorten_home,
 };
 use std::env;
@@ -22,6 +22,9 @@ use tokio::sync::mpsc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let (mut args, provided) = Args::parse_with_sources();
+    if let Some(command) = args.command.clone() {
+        return run_cli_command(&args, command);
+    }
     if args.list_sessions {
         return list_sessions_command(&args);
     }
@@ -66,7 +69,13 @@ async fn main() -> Result<()> {
             )
         }
         None => {
-            let id = store.create_session(&cwd, PROVIDER_OPENAI_RESPONSES, &args.model, None)?;
+            let id = store.create_session_named(
+                &cwd,
+                PROVIDER_OPENAI_RESPONSES,
+                &args.model,
+                None,
+                args.name.as_deref(),
+            )?;
             (id, None, vec![])
         }
     };
@@ -162,6 +171,36 @@ async fn main() -> Result<()> {
     };
     let (result, _) = tokio::join!(agent, drainer);
     result
+}
+
+fn run_cli_command(args: &Args, command: CliCommand) -> Result<()> {
+    match command {
+        CliCommand::Export {
+            session_id,
+            format,
+            out,
+        } => export_command(args, &session_id, format, out),
+    }
+}
+
+fn export_command(
+    args: &Args,
+    session_id_or_prefix: &str,
+    format: Option<CliExportFormat>,
+    out: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let store = SessionStore::open(args.db_path.clone())?;
+    let session_id = store.resolve_session_id(session_id_or_prefix)?;
+    let events = store.load_session(&session_id)?;
+    let format = nav_core::infer_export_format(out.as_deref(), format.map(Into::into));
+    let rendered = nav_core::export_events(&events, format)?;
+    if let Some(path) = out {
+        std::fs::write(&path, rendered)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    } else {
+        print!("{rendered}");
+    }
+    Ok(())
 }
 
 /// Build the permission context for a non-interactive (`--json-events` or
@@ -326,6 +365,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
@@ -353,5 +393,40 @@ mod tests {
     fn combine_neither_returns_none() {
         let out = combine_prompt(&[], None);
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn export_command_writes_markdown_file_by_unique_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("nav.db");
+        let out_path = dir.path().join("transcript.md");
+        let store = SessionStore::open(Some(db_path.clone())).unwrap();
+        let id = store
+            .create_session(
+                Path::new("/repo"),
+                PROVIDER_OPENAI_RESPONSES,
+                "gpt-test",
+                None,
+            )
+            .unwrap();
+        store
+            .append_event(
+                &id,
+                &AgentEvent::UserMessage {
+                    text: "hello export".into(),
+                    display_text: None,
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let mut args = Args::try_parse_from(["nav", "test"]).unwrap();
+        args.db_path = Some(db_path);
+        export_command(&args, &id[..8], None, Some(out_path.clone())).unwrap();
+
+        let written = std::fs::read_to_string(out_path).unwrap();
+        assert!(written.contains("# nav transcript"));
+        assert!(written.contains("hello export"));
     }
 }

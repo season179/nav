@@ -18,6 +18,8 @@ pub const BUILTIN_SLASH_COMMANDS: &[&str] = &[
     "/exit",
     "/resume",
     "/sessions",
+    "/name",
+    "/export",
     "/compact",
 ];
 
@@ -32,8 +34,22 @@ impl SlashEntry {
     pub fn builtin(command: &str) -> Self {
         Self {
             command: command.to_string(),
-            description: None,
+            description: builtin_description(command).map(str::to_string),
         }
+    }
+}
+
+fn builtin_description(command: &str) -> Option<&'static str> {
+    match command {
+        "/help" => Some("show available commands"),
+        "/clear" => Some("clear visible transcript"),
+        "/quit" | "/exit" => Some("exit nav"),
+        "/resume" => Some("resume by ULID or open picker"),
+        "/sessions" => Some("list stored sessions"),
+        "/name" => Some("name this session"),
+        "/export" => Some("write transcript"),
+        "/compact" => Some("summarize long context"),
+        _ => None,
     }
 }
 
@@ -238,6 +254,27 @@ mod tests {
             .find(|e| e.command == "/foo")
             .expect("/foo entry");
         assert_eq!(foo.description.as_deref(), Some("do foo"));
+    }
+
+    #[test]
+    fn builtins_have_helpful_session_labels() {
+        let entries = build_slash_entries(&Catalog::default());
+        let sessions = entries
+            .iter()
+            .find(|e| e.command == "/sessions")
+            .expect("/sessions entry");
+        assert_eq!(
+            sessions.description.as_deref(),
+            Some("list stored sessions")
+        );
+        let resume = entries
+            .iter()
+            .find(|e| e.command == "/resume")
+            .expect("/resume entry");
+        assert_eq!(
+            resume.description.as_deref(),
+            Some("resume by ULID or open picker")
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::bottom_pane::{self, PendingApproval};
 use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
 use crate::status_bar::{AgentState, StatusBar};
 use crate::turn::{TurnSpawn, spawn_turn};
+use std::path::Path;
 
 /// Restores the terminal to a sane state when `run` returns.
 ///
@@ -87,7 +88,7 @@ pub async fn run(
     args: Args,
     cwd: PathBuf,
     store: Arc<SessionStore>,
-    session_id: SessionId,
+    mut session_id: SessionId,
     resume_events: Vec<AgentEvent>,
     initial_prompt: Option<String>,
     skills: Arc<Catalog>,
@@ -128,6 +129,9 @@ pub async fn run(
     }
     let mut pane =
         bottom_pane::BottomPane::with_entries(slash_entries, mention_entries, cwd.clone());
+    if args.pick_session {
+        open_session_picker(&store, &mut pane, Some(&session_id), &mut chat);
+    }
     let mut ctrl_c_count = 0u8;
     // A standalone `/<skill>` is a local TUI gesture, not a model turn. Hold
     // its wrapped body here and prepend it onto the next non-slash prompt.
@@ -149,33 +153,16 @@ pub async fn run(
     // auto-approves through `AutoGate::approving()`; explicit `Never` policy
     // refuses via the in-band short-circuit; otherwise the live TUI gates
     // through `ChannelGate` so the operator can approve interactively.
-    let bypass = args.dangerously_bypass_approvals_and_sandbox;
     let pending_approvals = PendingApprovals::default();
     let sandbox_policy = sandbox_policy_from_args(&args, &cwd);
-    let (gate, policy): (Arc<dyn ApprovalGate>, _) = if bypass {
-        (
-            Arc::new(nav_core::permissions::approval::AutoGate::approving()),
-            // Force off `Never` so the gate is consulted instead of being
-            // short-circuited to a refusal by `auto_denies_approvals`.
-            nav_core::permissions::AskForApproval::OnRequest,
-        )
-    } else {
-        // Attach the session store as a durable sink so the approval
-        // request hits the SQLite audit table — without it, the later
-        // `record_approval_decision` UPDATE finds no row.
-        let channel = ChannelGate::new(pending_approvals.clone(), agent_tx.clone())
-            .with_sink(Arc::new(store.sink_for(session_id.clone())));
-        (Arc::new(channel), args.approval_policy)
-    };
-    let permissions = PermissionContext {
-        gate,
-        policy,
-        sandbox: Arc::from(select_for_platform(&sandbox_policy)),
-        sandbox_policy,
-        // Default empty; populated when the user picks `[a]llow for session`
-        // on the approval modal. Shared across spawned turns via Arc.
-        session_allowlist: nav_core::permissions::SessionAllowlist::default(),
-    };
+    let mut permissions = build_tui_permissions(
+        &args,
+        Arc::clone(&store),
+        &session_id,
+        agent_tx.clone(),
+        pending_approvals.clone(),
+        &sandbox_policy,
+    );
 
     if let Some(prompt) = initial_prompt {
         app_tx
@@ -296,6 +283,83 @@ pub async fn run(
                         chat.push_user(format!("/{skill_name}"));
                         chat.push_skill(skill_name, "queued for the next prompt");
                     }
+                    AppEvent::ListSessions => {
+                        match store.list_sessions(None) {
+                            Ok(summaries) => {
+                                chat.scroll_to_bottom();
+                                chat.push_session_list(summaries);
+                            }
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        }
+                    }
+                    AppEvent::Resume { query: Some(query) } => {
+                        if turn_started_at.is_some() {
+                            chat.ingest(AgentEvent::Error {
+                                message: "cannot resume while a turn is running".to_string(),
+                            });
+                            continue;
+                        }
+                        match resume_session(&store, &query) {
+                            Ok((resolved, events)) => {
+                                session_id = resolved;
+                                permissions = build_tui_permissions(
+                                    &args,
+                                    Arc::clone(&store),
+                                    &session_id,
+                                    agent_tx.clone(),
+                                    pending_approvals.clone(),
+                                    &sandbox_policy,
+                                );
+                                chat = ChatWidget::new();
+                                for event in events {
+                                    chat.ingest(event);
+                                }
+                                chat.push_session_notice(
+                                    "resume",
+                                    format!("Resumed session {session_id}"),
+                                );
+                            }
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        }
+                    }
+                    AppEvent::Resume { query: None } => {
+                        if turn_started_at.is_some() {
+                            chat.ingest(AgentEvent::Error {
+                                message: "cannot resume while a turn is running".to_string(),
+                            });
+                            continue;
+                        }
+                        open_session_picker(&store, &mut pane, None, &mut chat);
+                    }
+                    AppEvent::NameSession { name } => {
+                        match store.set_session_name(&session_id, &name) {
+                            Ok(()) => chat.push_session_notice(
+                                "name",
+                                format!("Session name set to \"{}\"", name.trim()),
+                            ),
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        }
+                    }
+                    AppEvent::Export { path } => {
+                        match export_current_session(&store, &session_id, &cwd, path) {
+                            Ok(path) => chat.push_session_notice(
+                                "export",
+                                format!("Wrote transcript to {}", path.display()),
+                            ),
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        }
+                    }
+                    AppEvent::SlashError { message } => {
+                        chat.ingest(AgentEvent::Error { message });
+                    }
                     AppEvent::Submit {
                         text: raw_prompt,
                         images,
@@ -386,9 +450,7 @@ pub async fn run(
                         }
                         _ => {}
                     }
-                    if let Some((approval_id, decision)) =
-                        pane.take_approval_decision()
-                    {
+                    if let Some((approval_id, decision)) = pane.take_approval_decision() {
                         // Persist before signalling the agent so the row
                         // is there if the user inspects --list-sessions
                         // mid-turn.
@@ -401,6 +463,13 @@ pub async fn run(
                         }
                         pending_approvals.respond(&approval_id, decision);
                     }
+                    if let Some(session_id) = pane.take_session_selection() {
+                        app_tx
+                            .send(AppEvent::Resume {
+                                query: Some(session_id),
+                            })
+                            .ok();
+                    }
                 }
             }
         }
@@ -411,6 +480,89 @@ pub async fn run(
 fn spinner_frame(tick: u64) -> char {
     const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     FRAMES[(tick as usize) % FRAMES.len()]
+}
+
+fn build_tui_permissions(
+    args: &Args,
+    store: Arc<SessionStore>,
+    session_id: &str,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    pending_approvals: PendingApprovals,
+    sandbox_policy: &nav_core::SandboxPolicy,
+) -> PermissionContext {
+    let bypass = args.dangerously_bypass_approvals_and_sandbox;
+    let (gate, policy): (Arc<dyn ApprovalGate>, _) = if bypass {
+        (
+            Arc::new(nav_core::permissions::approval::AutoGate::approving()),
+            // Force off `Never` so the gate is consulted instead of being
+            // short-circuited to a refusal by `auto_denies_approvals`.
+            nav_core::permissions::AskForApproval::OnRequest,
+        )
+    } else {
+        // Attach the session store as a durable sink so the approval
+        // request hits the SQLite audit table — without it, the later
+        // `record_approval_decision` UPDATE finds no row. Rebuilt on TUI
+        // resume so approvals are recorded against the active session.
+        let channel = ChannelGate::new(pending_approvals, agent_tx)
+            .with_sink(Arc::new(store.sink_for(session_id.to_string())));
+        (Arc::new(channel), args.approval_policy)
+    };
+    PermissionContext {
+        gate,
+        policy,
+        sandbox: Arc::from(select_for_platform(sandbox_policy)),
+        sandbox_policy: sandbox_policy.clone(),
+        // Default empty; populated when the user picks `[a]llow for session`
+        // on the approval modal. Shared across spawned turns via Arc.
+        session_allowlist: nav_core::permissions::SessionAllowlist::default(),
+    }
+}
+
+fn resume_session(store: &SessionStore, query: &str) -> Result<(SessionId, Vec<AgentEvent>)> {
+    let session_id = store.resolve_session_id(query)?;
+    let events = store.load_session(&session_id)?;
+    Ok((session_id, events))
+}
+
+fn open_session_picker(
+    store: &SessionStore,
+    pane: &mut bottom_pane::BottomPane,
+    exclude_session_id: Option<&str>,
+    chat: &mut ChatWidget,
+) {
+    match store.list_sessions(None) {
+        Ok(summaries) => {
+            let entries = summaries
+                .iter()
+                .filter(|summary| Some(summary.id.as_str()) != exclude_session_id)
+                .map(bottom_pane::SessionPickerEntry::from_summary)
+                .collect();
+            pane.open_session_picker(entries);
+        }
+        Err(err) => chat.ingest(AgentEvent::Error {
+            message: format!("{err:#}"),
+        }),
+    }
+}
+
+fn export_current_session(
+    store: &SessionStore,
+    session_id: &str,
+    cwd: &Path,
+    path: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let display_path = path.unwrap_or_else(|| PathBuf::from(format!("{session_id}.md")));
+    let write_path = if display_path.is_absolute() {
+        display_path.clone()
+    } else {
+        cwd.join(&display_path)
+    };
+    let events = store.load_session(session_id)?;
+    let format = nav_core::infer_export_format(Some(&write_path), None);
+    let rendered = nav_core::export_events(&events, format)?;
+    std::fs::write(&write_path, rendered)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| Ok(display_path))
 }
 
 /// Returns true when `ev` marks the end of an in-flight TUI turn so the
@@ -514,5 +666,41 @@ mod tests {
                 "mouse capture prevents native terminal text selection: {seq:?}"
             );
         }
+    }
+
+    #[test]
+    fn open_session_picker_can_exclude_current_empty_session() {
+        let (_dir, store) = {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nav.db");
+            let store = SessionStore::open(Some(path)).unwrap();
+            (dir, store)
+        };
+        let current = store
+            .create_session(
+                Path::new("/repo"),
+                nav_core::PROVIDER_OPENAI_RESPONSES,
+                "gpt-test",
+                None,
+            )
+            .unwrap();
+        let other = store
+            .create_session(
+                Path::new("/repo"),
+                nav_core::PROVIDER_OPENAI_RESPONSES,
+                "gpt-test",
+                None,
+            )
+            .unwrap();
+        let mut pane = bottom_pane::BottomPane::new();
+        let mut chat = ChatWidget::new();
+
+        open_session_picker(&store, &mut pane, Some(&current), &mut chat);
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert_eq!(pane.take_session_selection(), Some(other));
     }
 }

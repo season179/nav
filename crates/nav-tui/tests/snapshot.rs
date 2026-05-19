@@ -1,5 +1,6 @@
 use nav_core::{
-    AgentEvent, FileChangeKind, FileChangeSummary, FileDiffSummary, PatchApplyStatus, TurnUsage,
+    AgentEvent, FileChangeKind, FileChangeSummary, FileDiffSummary, PatchApplyStatus,
+    SessionSummary, TurnUsage,
 };
 use nav_tui::ChatWidget;
 use ratatui::Terminal;
@@ -276,6 +277,59 @@ fn renders_full_turn_transcript() {
 
     let rendered = buffer_to_text(terminal.backend().buffer());
     insta::assert_snapshot!("full_turn_transcript", rendered);
+}
+
+#[test]
+fn renders_session_management_cells() {
+    let mut widget = ChatWidget::new();
+
+    widget.push_session_list(vec![
+        SessionSummary {
+            id: "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+            name: Some("release work".to_string()),
+            created_at: 100,
+            updated_at: 250,
+            last_active: 250,
+            cwd: "/repo/nav".to_string(),
+            provider: "openai-responses".to_string(),
+            model: "gpt-test".to_string(),
+            first_user_prompt: Some("Implement the resume picker".to_string()),
+            tokens_input: 10,
+            tokens_output: 5,
+            tokens_input_cached: 0,
+            tokens_reasoning: 0,
+            cost_micros_reported: 0,
+            turns_with_reported_cost: 0,
+            turns_total: 2,
+            turn_count: 2,
+            cost_currency: "USD".to_string(),
+        },
+        SessionSummary {
+            id: "01HYYYYYYYYYYYYYYYYYYYYYYYY".to_string(),
+            name: None,
+            created_at: 90,
+            updated_at: 120,
+            last_active: 120,
+            cwd: "/repo/nav".to_string(),
+            provider: "openai-responses".to_string(),
+            model: "gpt-test".to_string(),
+            first_user_prompt: None,
+            tokens_input: 0,
+            tokens_output: 0,
+            tokens_input_cached: 0,
+            tokens_reasoning: 0,
+            cost_micros_reported: 0,
+            turns_with_reported_cost: 0,
+            turns_total: 0,
+            turn_count: 0,
+            cost_currency: "USD".to_string(),
+        },
+    ]);
+    widget.push_session_notice("name", "Session name set to \"release work\"");
+    widget.push_session_notice("export", "Wrote transcript to transcript.md");
+
+    let rendered = render_widget(&widget, 96, 20);
+    insta::assert_snapshot!("session_management_cells", rendered);
 }
 
 #[test]

@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use super::approval::ApprovalOverlay;
 use super::composer::Composer;
 use super::mention_popup::FileMentionPopup;
+use super::session_picker::SessionPickerPopup;
 use super::slash_popup::SlashCommandPopup;
 
 /// Outcome of an overlay's attempt to handle a key.
@@ -23,6 +24,7 @@ pub enum BottomPaneView {
     SlashCommand(SlashCommandPopup),
     FileMention(FileMentionPopup),
     Approval(ApprovalOverlay),
+    SessionPicker(SessionPickerPopup),
 }
 
 impl BottomPaneView {
@@ -31,6 +33,7 @@ impl BottomPaneView {
             Self::SlashCommand(p) => p.handle_key(key, composer),
             Self::FileMention(p) => p.handle_key(key, composer),
             Self::Approval(p) => p.handle_key(key, composer),
+            Self::SessionPicker(p) => p.handle_key(key, composer),
         }
     }
 
@@ -39,6 +42,7 @@ impl BottomPaneView {
             Self::SlashCommand(p) => p.is_complete(),
             Self::FileMention(p) => p.is_complete(),
             Self::Approval(p) => p.is_complete(),
+            Self::SessionPicker(p) => p.is_complete(),
         }
     }
 
@@ -47,6 +51,7 @@ impl BottomPaneView {
             Self::SlashCommand(p) => p.desired_height(width),
             Self::FileMention(p) => p.desired_height(width),
             Self::Approval(p) => p.desired_height(width),
+            Self::SessionPicker(p) => p.desired_height(width),
         }
     }
 
@@ -55,6 +60,7 @@ impl BottomPaneView {
             Self::SlashCommand(p) => p.render(area, buf),
             Self::FileMention(p) => p.render(area, buf),
             Self::Approval(p) => p.render(area, buf),
+            Self::SessionPicker(p) => p.render(area, buf),
         }
     }
 
@@ -68,6 +74,8 @@ impl BottomPaneView {
             // Approval overlays don't react to composer changes; the modal
             // is decided by keystrokes only.
             Self::Approval(_) => {}
+            // Session picker is also a modal decision flow.
+            Self::SessionPicker(_) => {}
         }
     }
 }
