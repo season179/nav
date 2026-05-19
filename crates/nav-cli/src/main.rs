@@ -8,8 +8,8 @@ use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
     SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, agent, auth,
-    cli::{Args, CliCommand, CliExportFormat, SessionsAction, sandbox_policy_from_args},
-    discover_skills, doctor, layout_session_tree, load_project_context, models,
+    cli::{Args, CliCommand, CliExportFormat, GitAction, SessionsAction, sandbox_policy_from_args},
+    discover_skills, doctor, git_checkpoint, layout_session_tree, load_project_context, models,
     rebuild_responses_input, shorten_home,
 };
 use std::env;
@@ -204,7 +204,74 @@ fn run_cli_command(
         } => export_command(args, &session_id, format, out),
         CliCommand::Doctor { json } => doctor_command(args, cwd, project, json),
         CliCommand::Sessions { action } => sessions_command(args, action),
+        CliCommand::Git { action } => git_command(cwd, action),
     }
+}
+
+fn git_command(cwd: &Path, action: GitAction) -> Result<()> {
+    match action {
+        GitAction::Checkpoint { label } => {
+            let label = joined_label(label);
+            let outcome = git_checkpoint::checkpoint(cwd, None, label.as_deref())?;
+            print_git_outcome(&outcome);
+        }
+        GitAction::Stash { label } => {
+            let label = joined_label(label);
+            let outcome = git_checkpoint::stash(cwd, None, label.as_deref())?;
+            print_git_outcome(&outcome);
+        }
+        GitAction::Restore { target } => {
+            let outcome = git_checkpoint::restore(cwd, target.as_deref())?;
+            print_git_outcome(&outcome);
+        }
+        GitAction::List => {
+            let entries = git_checkpoint::list_nav_stashes(cwd)?;
+            if entries.is_empty() {
+                println!("(no nav checkpoints)");
+            } else {
+                for entry in entries {
+                    println!(
+                        "{}  {}  {}",
+                        entry.stash_ref,
+                        short_oid(&entry.oid),
+                        entry.subject
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn joined_label(words: Vec<String>) -> Option<String> {
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+fn print_git_outcome(outcome: &git_checkpoint::GitCheckpointOutcome) {
+    match outcome.status {
+        git_checkpoint::GitCheckpointStatus::NoChanges => {
+            println!("git {}: {}", outcome.action.as_str(), outcome.message);
+        }
+        _ => {
+            let stash_ref = outcome.stash_ref.as_deref().unwrap_or("-");
+            let oid = outcome
+                .stash_oid
+                .as_deref()
+                .map(short_oid)
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "git {} {}: {} ({oid})",
+                outcome.action.as_str(),
+                outcome.status.as_str(),
+                stash_ref,
+            );
+            println!("{}", outcome.message);
+        }
+    }
+}
+
+fn short_oid(oid: &str) -> String {
+    oid.chars().take(12).collect()
 }
 
 fn sessions_command(args: &Args, action: SessionsAction) -> Result<()> {

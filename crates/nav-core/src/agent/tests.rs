@@ -971,6 +971,78 @@ async fn run_agent_emits_expected_sequence_with_usage() {
 }
 
 #[tokio::test]
+async fn run_agent_git_checkpoints_dirty_worktree_before_user_message() {
+    let turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Done."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn]);
+    let mut args = Args::test_default();
+    args.git_checkpoints = true;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    git(&cwd, &["init"]);
+    git(&cwd, &["config", "user.name", "Nav Test"]);
+    git(&cwd, &["config", "user.email", "nav@example.test"]);
+    fs::write(cwd.join("tracked.txt"), "base\n").unwrap();
+    git(&cwd, &["add", "tracked.txt"]);
+    git(&cwd, &["commit", "-m", "init"]);
+    fs::write(cwd.join("tracked.txt"), "dirty\n").unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "do the thing",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent should succeed");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let checkpoint_pos = event_position(&events, "GitCheckpoint", |event| {
+        matches!(
+            event,
+            AgentEvent::GitCheckpoint {
+                action: crate::git_checkpoint::GitCheckpointAction::Checkpoint,
+                status: crate::git_checkpoint::GitCheckpointStatus::Created,
+                ..
+            }
+        )
+    });
+    let user_pos = event_position(&events, "UserMessage", |event| {
+        matches!(event, AgentEvent::UserMessage { .. })
+    });
+    assert!(checkpoint_pos < user_pos);
+    assert_eq!(
+        fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+        "dirty\n"
+    );
+    assert_eq!(
+        crate::git_checkpoint::list_nav_stashes(&cwd).unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn run_agent_injects_steering_before_dispatching_stale_tool_calls() {
     let turn_one = vec![
         json!({

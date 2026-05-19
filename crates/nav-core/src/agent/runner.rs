@@ -16,6 +16,7 @@ use super::events::CompactionTrigger;
 use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::cli::Args;
 use crate::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::git_checkpoint;
 use crate::git_diff;
 use crate::mutation::PatchApplyStatus;
 use crate::permissions::approval::ApprovalRequest;
@@ -425,6 +426,10 @@ pub async fn run_agent_with_control(
         }
     }
 
+    if args.git_checkpoints {
+        checkpoint_dirty_worktree(cwd, session, &events);
+    }
+
     // Abort before emitting the user-message event so a denied `.env`
     // doesn't show up in the transcript as a turn that almost happened.
     let (attachments, abort_reason) =
@@ -686,6 +691,32 @@ pub async fn run_agent_with_control(
             return fail(&events, session, err);
         }
         turns_used += 1;
+    }
+}
+
+fn checkpoint_dirty_worktree(
+    cwd: &Path,
+    session: Option<&SessionBinding<'_>>,
+    events: &UnboundedSender<AgentEvent>,
+) {
+    if !git_checkpoint::is_git_repo(cwd) {
+        return;
+    }
+    let session_id = session.map(|binding| binding.session_id.as_str());
+    match git_checkpoint::checkpoint(cwd, session_id, Some("before turn")) {
+        Ok(outcome) if outcome.status == git_checkpoint::GitCheckpointStatus::NoChanges => {}
+        Ok(outcome) => emit(events, session, outcome.into()),
+        Err(err) => emit(
+            events,
+            session,
+            AgentEvent::GitCheckpoint {
+                action: git_checkpoint::GitCheckpointAction::Checkpoint,
+                status: git_checkpoint::GitCheckpointStatus::Failed,
+                stash_ref: None,
+                stash_oid: None,
+                message: format!("git checkpoint failed: {err:#}"),
+            },
+        ),
     }
 }
 

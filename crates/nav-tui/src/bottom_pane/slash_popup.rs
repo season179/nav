@@ -27,6 +27,9 @@ pub const BUILTIN_SLASH_COMMANDS: &[&str] = &[
     "/unlabel",
     "/find",
     "/compact",
+    "/checkpoint",
+    "/stash",
+    "/restore",
     "/abort",
     "/steer",
     "/queue-edit",
@@ -66,6 +69,9 @@ fn builtin_description(command: &str) -> Option<&'static str> {
         "/unlabel" => Some("remove a label from this session"),
         "/find" => Some("search across transcripts"),
         "/compact" => Some("summarize long context"),
+        "/checkpoint" => Some("save reversible git checkpoint"),
+        "/stash" => Some("stash current git changes"),
+        "/restore" => Some("restore a nav git checkpoint"),
         _ => None,
     }
 }

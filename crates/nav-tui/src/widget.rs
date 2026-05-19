@@ -6,9 +6,9 @@ use std::collections::HashMap;
 
 use crate::cells::{
     AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell, FileChangeCell,
-    PendingInputCell, SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell,
-    ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell,
-    TurnDiffCell, UserMessageCell, WelcomeCell,
+    GitCheckpointCell, PendingInputCell, SessionListCell, SessionNoticeCell, SessionTreeCell,
+    SkillInvocationCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
+    TurnAbortedCell, TurnDiffCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -185,6 +185,17 @@ impl ChatWidget {
                 truncated,
             } => {
                 self.push_cell(TurnDiffCell::new(files, unified_diff, truncated));
+            }
+            AgentEvent::GitCheckpoint {
+                action,
+                status,
+                stash_ref,
+                stash_oid,
+                message,
+            } => {
+                self.push_cell(GitCheckpointCell::new(
+                    action, status, stash_ref, stash_oid, message,
+                ));
             }
             AgentEvent::Error { message } => {
                 self.push_cell(ErrorCell::new(message));
