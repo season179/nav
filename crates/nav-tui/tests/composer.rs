@@ -2,6 +2,7 @@
 //! [`ratatui::backend::TestBackend`] with simulated [`KeyEvent`]s.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use nav_core::{AgentEvent, PendingInputMode};
 use nav_tui::bottom_pane::{BottomPane, ComposerEvent};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -27,6 +28,19 @@ fn render(pane: &BottomPane, terminal: &mut Terminal<TestBackend>) {
             frame.render_widget(pane, area);
         })
         .expect("draw");
+}
+
+fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
+    let buf = terminal.backend().buffer();
+    let area = buf.area();
+    let mut out = String::new();
+    for y in 0..area.height {
+        for x in 0..area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
 }
 
 #[test]
@@ -75,7 +89,12 @@ fn slash_shows_popup_and_he_filters_to_help() {
             "/sessions",
             "/name",
             "/export",
-            "/compact"
+            "/compact",
+            "/abort",
+            "/steer",
+            "/queue-edit",
+            "/queue-remove",
+            "/queue-clear",
         ]
     );
 
@@ -188,4 +207,82 @@ fn up_arrow_recalls_previous_prompt() {
     press(&mut pane, KeyCode::Up, KeyModifiers::NONE);
     render(&pane, &mut terminal);
     assert_eq!(pane.composer().text(), "first");
+}
+
+#[test]
+fn bottom_pane_renders_pending_followups_and_steering_above_composer() {
+    let mut pane = BottomPane::new();
+    let mut terminal = Terminal::new(TestBackend::new(80, 10)).expect("terminal");
+
+    pane.apply_agent_event(&AgentEvent::PendingInputQueued {
+        id: "pending-1".into(),
+        mode: PendingInputMode::FollowUp,
+        text: "run tests next".into(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill_name: None,
+    });
+    pane.apply_agent_event(&AgentEvent::PendingInputQueued {
+        id: "pending-2".into(),
+        mode: PendingInputMode::Steering,
+        text: "avoid broad refactors".into(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill_name: None,
+    });
+
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+
+    assert!(rendered.contains("pending"), "{rendered}");
+    assert!(rendered.contains("pending-1 follow-up"), "{rendered}");
+    assert!(rendered.contains("run tests next"), "{rendered}");
+    assert!(rendered.contains("pending-2 steering"), "{rendered}");
+    assert!(rendered.contains("avoid broad refactors"), "{rendered}");
+}
+
+#[test]
+fn bottom_pane_updates_pending_preview_for_edit_remove_and_clear() {
+    let mut pane = BottomPane::new();
+    let mut terminal = Terminal::new(TestBackend::new(80, 10)).expect("terminal");
+
+    pane.apply_agent_event(&AgentEvent::PendingInputQueued {
+        id: "pending-1".into(),
+        mode: PendingInputMode::FollowUp,
+        text: "first wording".into(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill_name: None,
+    });
+    pane.apply_agent_event(&AgentEvent::PendingInputQueued {
+        id: "pending-2".into(),
+        mode: PendingInputMode::Steering,
+        text: "steer this".into(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill_name: None,
+    });
+    pane.apply_agent_event(&AgentEvent::PendingInputEdited {
+        id: "pending-1".into(),
+        text: "better wording".into(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill_name: None,
+    });
+    pane.apply_agent_event(&AgentEvent::PendingInputRemoved {
+        id: "pending-2".into(),
+    });
+
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+    assert!(rendered.contains("pending-1 follow-up"), "{rendered}");
+    assert!(rendered.contains("better wording"), "{rendered}");
+    assert!(!rendered.contains("pending-2"), "{rendered}");
+
+    pane.apply_agent_event(&AgentEvent::PendingInputCleared {
+        ids: vec!["pending-1".into()],
+    });
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+    assert!(!rendered.contains("pending-1"), "{rendered}");
 }

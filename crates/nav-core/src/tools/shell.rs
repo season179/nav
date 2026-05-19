@@ -19,10 +19,6 @@ pub(super) async fn bash(
         cwd: cwd.to_path_buf(),
         timeout: Duration::from_secs(timeout_secs),
         policy: permissions.sandbox_policy.clone(),
-        // Per-turn abort flag — racing it inside the sandbox runner is how
-        // a long-running bash command stops when the operator presses the
-        // abort key.
-        abort: permissions.abort.clone(),
     };
     let output = permissions.sandbox.run(req).await?;
     Ok(format!(

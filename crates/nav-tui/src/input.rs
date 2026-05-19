@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nav_core::Catalog;
+use nav_core::{Catalog, PendingInputMode, PendingSkill};
 use tokio::sync::mpsc;
 
 use crate::ChatWidget;
@@ -10,23 +10,26 @@ use crate::ChatWidget;
 pub(crate) enum AppEvent {
     Submit {
         text: String,
+        display_text: Option<String>,
         images: Vec<PathBuf>,
+        mode: PendingInputMode,
+        skill: Option<PendingSkill>,
     },
     Quit,
     Clear,
+    AbortTurn,
+    EditPending {
+        id: String,
+        text: String,
+    },
+    RemovePending {
+        id: String,
+    },
+    ClearPending,
     /// Standalone `/<skill>` - the wrapped body is held until the next
     /// non-slash prompt rather than fired as its own turn.
     QueueSkill {
-        skill_name: String,
-        wrapped_body: String,
-    },
-    /// `/steer <text>` — inject a steering message into the active turn
-    /// at the next safe model/tool boundary. If no turn is active, the
-    /// app loop downgrades this to a normal Submit so the message still
-    /// reaches the model.
-    Steer {
-        text: String,
-        images: Vec<PathBuf>,
+        skill: PendingSkill,
     },
     ListSessions,
     Resume {
@@ -71,15 +74,6 @@ pub(crate) fn dispatch_submit(
     skills: &Catalog,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
-    if let Some(steer_text) = parse_steer_command(&text) {
-        app_tx
-            .send(AppEvent::Steer {
-                text: steer_text,
-                images,
-            })
-            .ok();
-        return;
-    }
     let event = match parse_builtin_command(&text) {
         Some(event) => event,
         None => submit_event_for_text(text, images, skills),
@@ -87,51 +81,48 @@ pub(crate) fn dispatch_submit(
     app_tx.send(event).ok();
 }
 
-/// Extract the payload of a `/steer …` command. Returns `Some("")` for
-/// the bare `/steer` line, `Some("…rest…")` when the command is followed
-/// by whitespace and a payload, and `None` when the input is not a
-/// steering command (so the caller can fall through to skill / submit
-/// handling). The whitespace requirement keeps `/steerfoo` from being
-/// mistaken for the steering gesture when a future skill named `steerfoo`
-/// could exist.
-pub fn parse_steer_command(text: &str) -> Option<String> {
-    let rest = text.strip_prefix("/steer")?;
-    if rest.is_empty() {
-        return Some(String::new());
-    }
-    let mut chars = rest.chars();
-    let first = chars.next()?;
-    if !first.is_whitespace() {
-        return None;
-    }
-    Some(chars.as_str().trim_start().to_string())
-}
-
 fn submit_event_for_text(text: String, images: Vec<PathBuf>, skills: &Catalog) -> AppEvent {
     match text.as_str() {
         "/quit" | "/exit" => AppEvent::Quit,
         "/clear" => AppEvent::Clear,
+        "/abort" => AppEvent::AbortTurn,
+        "/queue-clear" => AppEvent::ClearPending,
         // `/compact` is handled inside nav-core's `run_agent` — submit the
         // literal text so the agent loop's `is_compact_command` check
         // dispatches the non-steerable compaction turn.
-        "/compact" => AppEvent::Submit { text, images },
+        "/compact" => submit_event(text, None, images, PendingInputMode::FollowUp, None),
         _ => skill_or_submit_event(text, images, skills),
     }
 }
 
 fn skill_or_submit_event(text: String, images: Vec<PathBuf>, skills: &Catalog) -> AppEvent {
     match classify_slash(&text, skills) {
-        SlashAction::NotASkill => AppEvent::Submit { text, images },
-        SlashAction::Inline { prompt } => AppEvent::Submit {
-            text: prompt,
+        SlashAction::Control(control) => control.into_event(images),
+        SlashAction::NotASkill => {
+            submit_event(text, None, images, PendingInputMode::FollowUp, None)
+        }
+        SlashAction::Inline {
+            skill_name,
+            wrapped_body,
+            request,
+        } => submit_event(
+            request.clone(),
+            Some(request),
             images,
-        },
+            PendingInputMode::FollowUp,
+            Some(PendingSkill {
+                name: skill_name,
+                wrapped_body,
+            }),
+        ),
         SlashAction::Queue {
             skill_name,
             wrapped_body,
         } => AppEvent::QueueSkill {
-            skill_name,
-            wrapped_body,
+            skill: PendingSkill {
+                name: skill_name,
+                wrapped_body,
+            },
         },
     }
 }
@@ -173,10 +164,27 @@ fn slash_rest<'a>(text: &'a str, command: &str) -> Option<&'a str> {
         .map(str::trim)
 }
 
+fn submit_event(
+    text: String,
+    display_text: Option<String>,
+    images: Vec<PathBuf>,
+    mode: PendingInputMode,
+    skill: Option<PendingSkill>,
+) -> AppEvent {
+    AppEvent::Submit {
+        text,
+        display_text,
+        images,
+        mode,
+        skill,
+    }
+}
+
 /// Classification of a submitted composer line that may be a skill activation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SlashAction {
     NotASkill,
+    Control(ControlCommand),
     /// Standalone `/<skill-name>`. The wrapped body should be queued and
     /// prepended to the next real prompt - sending it as its own turn would
     /// be lost, since each `run_agent` call replays no prior history.
@@ -186,8 +194,33 @@ pub enum SlashAction {
     },
     /// `/<skill-name> <request>` - wrap and request travel together.
     Inline {
-        prompt: String,
+        skill_name: String,
+        wrapped_body: String,
+        request: String,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ControlCommand {
+    Steer { text: String },
+    EditPending { id: String, text: String },
+    RemovePending { id: String },
+    ClearPending,
+    AbortTurn,
+}
+
+impl ControlCommand {
+    fn into_event(self, images: Vec<PathBuf>) -> AppEvent {
+        match self {
+            ControlCommand::Steer { text } => {
+                submit_event(text, None, images, PendingInputMode::Steering, None)
+            }
+            ControlCommand::EditPending { id, text } => AppEvent::EditPending { id, text },
+            ControlCommand::RemovePending { id } => AppEvent::RemovePending { id },
+            ControlCommand::ClearPending => AppEvent::ClearPending,
+            ControlCommand::AbortTurn => AppEvent::AbortTurn,
+        }
+    }
 }
 
 /// Wraps the leading `/<skill-name>` (if any) in a `<skill name=... dir=...>`
@@ -199,6 +232,9 @@ pub fn classify_slash(text: &str, skills: &Catalog) -> SlashAction {
     let Some(first_token) = trimmed.split_whitespace().next() else {
         return SlashAction::NotASkill;
     };
+    if let Some(control) = classify_control_command(trimmed, first_token) {
+        return SlashAction::Control(control);
+    }
     let Some(skill_name) = first_token.strip_prefix('/') else {
         return SlashAction::NotASkill;
     };
@@ -228,8 +264,33 @@ pub fn classify_slash(text: &str, skills: &Catalog) -> SlashAction {
         }
     } else {
         SlashAction::Inline {
-            prompt: format!("{wrapped_body}\n\n{rest}\n"),
+            skill_name: skill.name.clone(),
+            wrapped_body,
+            request: rest.to_string(),
         }
+    }
+}
+
+fn classify_control_command(trimmed: &str, first_token: &str) -> Option<ControlCommand> {
+    let rest = trimmed[first_token.len()..].trim_start();
+    match first_token {
+        "/abort" if rest.is_empty() => Some(ControlCommand::AbortTurn),
+        "/queue-clear" if rest.is_empty() => Some(ControlCommand::ClearPending),
+        "/steer" if !rest.is_empty() => Some(ControlCommand::Steer {
+            text: rest.to_string(),
+        }),
+        "/queue-remove" => (!rest.is_empty()).then(|| ControlCommand::RemovePending {
+            id: rest.to_string(),
+        }),
+        "/queue-edit" => {
+            let (id, text) = rest.split_once(char::is_whitespace)?;
+            let text = text.trim_start();
+            (!id.is_empty() && !text.is_empty()).then(|| ControlCommand::EditPending {
+                id: id.to_string(),
+                text: text.to_string(),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -288,35 +349,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let catalog = catalog_with_skill(dir.path());
         match classify_slash("/foo please help with X", &catalog) {
-            SlashAction::Inline { prompt } => {
-                assert!(prompt.contains("</skill>"));
-                assert!(prompt.contains("please help with X"));
+            SlashAction::Inline {
+                skill_name,
+                wrapped_body,
+                request,
+            } => {
+                assert_eq!(skill_name, "foo");
+                assert!(wrapped_body.contains("</skill>"));
+                assert_eq!(request, "please help with X");
             }
             other => panic!("expected Inline, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn parse_steer_command_returns_payload_when_followed_by_whitespace() {
-        assert_eq!(
-            parse_steer_command("/steer hello world").as_deref(),
-            Some("hello world")
-        );
-        // Newline counts as whitespace.
-        assert_eq!(
-            parse_steer_command("/steer\nactually use the other lib").as_deref(),
-            Some("actually use the other lib")
-        );
-    }
-
-    #[test]
-    fn parse_steer_command_handles_bare_command_and_unrelated_prefixes() {
-        assert_eq!(parse_steer_command("/steer").as_deref(), Some(""));
-        // No whitespace separator — leave alone so skill classification
-        // owns it.
-        assert!(parse_steer_command("/steering").is_none());
-        assert!(parse_steer_command("/steerfoo").is_none());
-        assert!(parse_steer_command("plain text").is_none());
     }
 
     #[test]
@@ -357,7 +400,7 @@ mod tests {
         dispatch_submit("/compact".to_string(), Vec::new(), &catalog, &tx);
         let event = rx.try_recv().expect("event sent");
         match event {
-            AppEvent::Submit { text, images } => {
+            AppEvent::Submit { text, images, .. } => {
                 assert_eq!(text, "/compact");
                 assert!(images.is_empty());
             }
@@ -415,5 +458,55 @@ mod tests {
             rx.try_recv().unwrap(),
             AppEvent::SlashError { message } if message.contains("/name")
         ));
+    }
+
+    #[test]
+    fn dispatch_submit_routes_control_commands_locally() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+
+        dispatch_submit(
+            "/steer add this context".to_string(),
+            Vec::new(),
+            &catalog,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::Submit {
+                text,
+                mode: nav_core::PendingInputMode::Steering,
+                ..
+            } if text == "add this context"
+        ));
+
+        dispatch_submit(
+            "/queue-edit pending-1 better wording".to_string(),
+            Vec::new(),
+            &catalog,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::EditPending { id, text } if id == "pending-1" && text == "better wording"
+        ));
+
+        dispatch_submit(
+            "/queue-remove pending-1".to_string(),
+            Vec::new(),
+            &catalog,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::RemovePending { id } if id == "pending-1"
+        ));
+
+        dispatch_submit("/queue-clear".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(rx.try_recv().unwrap(), AppEvent::ClearPending));
+
+        dispatch_submit("/abort".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(rx.try_recv().unwrap(), AppEvent::AbortTurn));
     }
 }

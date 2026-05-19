@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::control::PendingInputMode;
 use crate::mutation::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
 use crate::permissions::ReviewDecision;
 
@@ -124,17 +125,42 @@ pub enum AgentEvent {
         reason: String,
         rule: String,
     },
+    PendingInputQueued {
+        id: String,
+        mode: PendingInputMode,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<UserAttachment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill_name: Option<String>,
+    },
+    PendingInputEdited {
+        id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_text: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<UserAttachment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill_name: Option<String>,
+    },
+    PendingInputRemoved {
+        id: String,
+    },
+    PendingInputCleared {
+        ids: Vec<String>,
+    },
+    PendingInputDequeued {
+        id: String,
+        mode: PendingInputMode,
+    },
     TurnComplete {
         usage: TurnUsage,
     },
-    /// The turn was aborted by the operator before it could produce a normal
-    /// completion. Emitted exactly once per turn that ends in abort, in
-    /// place of `TurnComplete`. `reason` is a short human-readable label
-    /// ("user pressed esc", "approval modal abort", …) captured from the
-    /// originating [`crate::AbortSignal`]. Durable so resume + replay can
-    /// show the same outcome and so partial assistant text isn't treated as
-    /// a finished answer.
     TurnAborted {
+        turn_id: String,
         reason: String,
     },
     /// Emitted before sleeping during a retry of the streaming provider call.
@@ -206,6 +232,11 @@ impl AgentEvent {
             AgentEvent::TurnDiff { .. } => "turn_diff",
             AgentEvent::ToolCallApprovalRequest { .. } => "tool_call_approval_request",
             AgentEvent::ToolCallBlocked { .. } => "tool_call_blocked",
+            AgentEvent::PendingInputQueued { .. } => "pending_input_queued",
+            AgentEvent::PendingInputEdited { .. } => "pending_input_edited",
+            AgentEvent::PendingInputRemoved { .. } => "pending_input_removed",
+            AgentEvent::PendingInputCleared { .. } => "pending_input_cleared",
+            AgentEvent::PendingInputDequeued { .. } => "pending_input_dequeued",
             AgentEvent::TurnComplete { .. } => "turn_complete",
             AgentEvent::TurnAborted { .. } => "turn_aborted",
             AgentEvent::ProviderRetry { .. } => "provider_retry",
@@ -232,6 +263,7 @@ impl AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::PendingInputMode;
     use serde_json::json;
 
     #[test]
@@ -264,6 +296,101 @@ mod tests {
             })
         );
         assert_eq!(event.kind(), "tool_call_approval_request");
+        assert!(event.is_durable());
+    }
+
+    #[test]
+    fn pending_input_events_have_stable_wire_format() {
+        let event = AgentEvent::PendingInputQueued {
+            id: "pending-1".into(),
+            mode: PendingInputMode::FollowUp,
+            text: "next task".into(),
+            display_text: None,
+            attachments: vec![UserAttachment::Image {
+                path: "screens/one.png".into(),
+            }],
+            skill_name: Some("tdd".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "pending_input_queued",
+                "id": "pending-1",
+                "mode": "follow_up",
+                "text": "next task",
+                "attachments": [{"kind": "image", "path": "screens/one.png"}],
+                "skill_name": "tdd"
+            })
+        );
+        assert_eq!(event.kind(), "pending_input_queued");
+        assert!(event.is_durable());
+
+        assert_eq!(
+            serde_json::to_value(AgentEvent::PendingInputDequeued {
+                id: "pending-1".into(),
+                mode: PendingInputMode::FollowUp,
+            })
+            .unwrap(),
+            json!({
+                "kind": "pending_input_dequeued",
+                "id": "pending-1",
+                "mode": "follow_up"
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value(AgentEvent::PendingInputEdited {
+                id: "pending-1".into(),
+                text: "clearer next task".into(),
+                display_text: Some("clearer request".into()),
+                attachments: Vec::new(),
+                skill_name: None,
+            })
+            .unwrap(),
+            json!({
+                "kind": "pending_input_edited",
+                "id": "pending-1",
+                "text": "clearer next task",
+                "display_text": "clearer request"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AgentEvent::PendingInputRemoved {
+                id: "pending-1".into(),
+            })
+            .unwrap(),
+            json!({
+                "kind": "pending_input_removed",
+                "id": "pending-1"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(AgentEvent::PendingInputCleared {
+                ids: vec!["pending-1".into(), "pending-2".into()],
+            })
+            .unwrap(),
+            json!({
+                "kind": "pending_input_cleared",
+                "ids": ["pending-1", "pending-2"]
+            })
+        );
+    }
+
+    #[test]
+    fn abort_event_is_durable_and_separate_from_normal_completion() {
+        let event = AgentEvent::TurnAborted {
+            turn_id: "turn-1".into(),
+            reason: "user interrupt".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "turn_aborted",
+                "turn_id": "turn-1",
+                "reason": "user interrupt"
+            })
+        );
+        assert_eq!(event.kind(), "turn_aborted");
         assert!(event.is_durable());
     }
 
@@ -305,22 +432,6 @@ mod tests {
         );
         assert_eq!(event.kind(), "tool_call_blocked");
         assert!(event.is_durable());
-    }
-
-    #[test]
-    fn turn_aborted_is_durable_and_serializes_with_reason() {
-        let event = AgentEvent::TurnAborted {
-            reason: "user pressed esc".into(),
-        };
-        assert_eq!(event.kind(), "turn_aborted");
-        assert!(event.is_durable(), "TurnAborted must persist for replay");
-        assert_eq!(
-            serde_json::to_value(&event).unwrap(),
-            json!({
-                "kind": "turn_aborted",
-                "reason": "user pressed esc"
-            })
-        );
     }
 
     #[test]

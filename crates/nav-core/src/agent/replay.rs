@@ -33,16 +33,37 @@ pub fn rebuild_responses_input(events: &[AgentEvent], cwd: &Path) -> Vec<Value> 
     if let Some(slice) = latest_checkpoint_slice(events) {
         let mut input = Vec::with_capacity(slice.following.len() + 1);
         input.push(summary_message(&slice.summary));
-        for event in slice.following {
-            push_replay_event(&mut input, event, cwd);
-        }
+        push_replay_events(&mut input, slice.following, cwd);
         return input;
     }
     let mut input = Vec::new();
-    for event in events {
-        push_replay_event(&mut input, event, cwd);
-    }
+    push_replay_events(&mut input, events, cwd);
     input
+}
+
+fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path) {
+    let mut current_turn_start: Option<usize> = None;
+    for event in events {
+        match event {
+            AgentEvent::UserMessage { .. } => {
+                current_turn_start = Some(input.len());
+                push_replay_event(input, event, cwd);
+            }
+            AgentEvent::TurnComplete { .. }
+            | AgentEvent::CompactionCompleted { .. }
+            | AgentEvent::CompactionFailed { .. }
+            | AgentEvent::Error { .. } => {
+                push_replay_event(input, event, cwd);
+                current_turn_start = None;
+            }
+            AgentEvent::TurnAborted { .. } => {
+                if let Some(start) = current_turn_start.take() {
+                    input.truncate(start);
+                }
+            }
+            _ => push_replay_event(input, event, cwd),
+        }
+    }
 }
 
 fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
@@ -70,6 +91,11 @@ fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
         | AgentEvent::TurnDiff { .. }
         | AgentEvent::ToolCallApprovalRequest { .. }
         | AgentEvent::ToolCallBlocked { .. }
+        | AgentEvent::PendingInputQueued { .. }
+        | AgentEvent::PendingInputEdited { .. }
+        | AgentEvent::PendingInputRemoved { .. }
+        | AgentEvent::PendingInputCleared { .. }
+        | AgentEvent::PendingInputDequeued { .. }
         | AgentEvent::TurnComplete { .. }
         | AgentEvent::TurnAborted { .. }
         | AgentEvent::ProviderRetry { .. }

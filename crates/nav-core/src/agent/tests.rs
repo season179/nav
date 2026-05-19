@@ -1,6 +1,11 @@
 use super::*;
 use crate::cli::Args;
+use crate::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::permissions::approval::{ApprovalGate, ApprovalRequest};
+use crate::permissions::{AskForApproval, ReviewDecision, SandboxPolicy, SessionAllowlist};
+use crate::sandbox::PassthroughRunner;
 use crate::skills::Catalog;
+use crate::tools::PermissionContext;
 use anyhow::Result;
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -9,7 +14,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command as StdCommand;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
@@ -137,6 +142,27 @@ impl ResponsesTransport for FailingTransport {
         _events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = Result<EventStream>> + Send + 'a>> {
         Box::pin(async { Err(anyhow::anyhow!("network down")) })
+    }
+}
+
+struct AbortGate;
+
+impl ApprovalGate for AbortGate {
+    fn request<'a>(
+        &'a self,
+        _req: ApprovalRequest,
+    ) -> Pin<Box<dyn Future<Output = ReviewDecision> + Send + 'a>> {
+        Box::pin(async { ReviewDecision::Abort })
+    }
+}
+
+fn aborting_permission_context() -> PermissionContext {
+    PermissionContext {
+        gate: Arc::new(AbortGate),
+        policy: AskForApproval::OnRequest,
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        sandbox: Arc::new(PassthroughRunner),
+        session_allowlist: SessionAllowlist::default(),
     }
 }
 
@@ -297,6 +323,42 @@ fn rebuild_responses_input_skips_tool_events() {
         &input[1],
         "Cargo.toml is a Rust manifest."
     ));
+}
+
+#[test]
+fn rebuild_responses_input_skips_aborted_turn_partial_answer() {
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "previous".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "previous answer".into(),
+            },
+            AgentEvent::TurnComplete {
+                usage: TurnUsage::default(),
+            },
+            AgentEvent::UserMessage {
+                text: "do the wrong thing".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "partial answer that should not resume as complete".into(),
+            },
+            AgentEvent::TurnAborted {
+                turn_id: "turn-2".into(),
+                reason: "user interrupt".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
+
+    assert_eq!(input.len(), 2, "{input:#?}");
+    assert!(is_input_user_message(&input[0], "previous"));
+    assert!(is_input_assistant_message(&input[1], "previous answer"));
 }
 
 #[test]
@@ -706,6 +768,146 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         events.last().unwrap(),
         AgentEvent::TurnComplete { .. }
     ));
+}
+
+#[tokio::test]
+async fn run_agent_injects_steering_before_dispatching_stale_tool_calls() {
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo stale\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let turn_two = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Steered."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one, turn_two]);
+    let steering = PendingInput {
+        id: "pending-1".into(),
+        mode: PendingInputMode::Steering,
+        text: "do not run the stale shell command".into(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill: None,
+    };
+
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent_with_control(
+        &transport,
+        &args,
+        &cwd,
+        "start",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+        TurnControls::with_steering_items([steering]),
+    )
+    .await
+    .expect("run_agent");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PendingInputDequeued { id, mode } if id == "pending-1" && *mode == PendingInputMode::Steering)),
+        "expected steering dequeue event: {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. })),
+        "stale tool call should not dispatch after steering: {events:#?}"
+    );
+
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 2, "{bodies:#?}");
+    let second_input = bodies[1].get("input").and_then(Value::as_array).unwrap();
+    assert!(
+        second_input
+            .iter()
+            .any(|item| is_input_user_message(item, "do not run the stale shell command")),
+        "steering not injected into second model request: {second_input:#?}"
+    );
+}
+
+#[tokio::test]
+async fn run_agent_records_abort_from_approval_as_aborted_turn() {
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"rm -rf build\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one]);
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "clean build output",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        aborting_permission_context(),
+    )
+    .await
+    .expect("approval abort exits cleanly");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(
+        events.iter().any(|event| matches!(event, AgentEvent::TurnAborted { reason, .. } if reason.contains("approval"))),
+        "expected TurnAborted from approval abort: {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnComplete { .. })),
+        "aborted turn must not complete normally: {events:#?}"
+    );
 }
 
 #[tokio::test]
@@ -2011,364 +2213,4 @@ async fn create_failure_does_not_emit_retry_event_from_stub() {
     .await
     .expect_err("should fail");
     assert!(err.to_string().contains("network down"));
-}
-
-// ── abort behavior ──────────────────────────────────────────
-
-#[tokio::test]
-async fn run_agent_emits_turn_aborted_when_signal_tripped_before_run() {
-    // Trip the abort before run_agent gets a chance to send the request.
-    // The check at the top of the turns loop must convert this into a
-    // `TurnAborted` event and skip the model call entirely.
-    let args = Args::test_default();
-    let cwd_dir = tempdir().unwrap();
-    let cwd = cwd_dir.path().canonicalize().unwrap();
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-
-    let mut perms = crate::tools::unchecked_permission_context();
-    let abort = AbortSignal::new();
-    abort.trip("test pre-trip");
-    perms.abort = abort;
-
-    // Empty stub: if we wrongly fall through and send a request, the stub
-    // returns no events and the agent loop would block on collector.finish.
-    // The test verifies we never get there.
-    let transport = StubTransport::new(vec![]);
-
-    run_agent(
-        &transport,
-        &args,
-        &cwd,
-        "do not run",
-        None,
-        Vec::new(),
-        tx,
-        None,
-        None,
-        &Catalog::default(),
-        None,
-        perms,
-    )
-    .await
-    .expect("run_agent returns Ok on abort, not Err");
-
-    let mut events = Vec::new();
-    while let Some(event) = rx.recv().await {
-        events.push(event);
-    }
-    // Should emit the user_message echo, then TurnAborted — and no model
-    // request should have gone out (transport bodies vec stays empty).
-    assert!(transport.bodies().is_empty(), "model must not be called");
-    let aborted = events
-        .iter()
-        .find(|e| matches!(e, AgentEvent::TurnAborted { .. }))
-        .expect("expected TurnAborted event");
-    match aborted {
-        AgentEvent::TurnAborted { reason } => assert_eq!(reason, "test pre-trip"),
-        _ => unreachable!(),
-    }
-    // No TurnComplete should leak through.
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnComplete { .. })),
-        "abort must not emit TurnComplete: {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn run_agent_drains_steering_into_input_before_each_request() {
-    // Stage two model turns. Turn 1 produces a tool call so the loop
-    // takes another lap; before turn 2 starts the runner must drain any
-    // steering messages and fold them into the input so the next model
-    // request sees them. The transport records every request body it
-    // receives, which is how we assert the injection happened.
-    let turn_one = vec![
-        json!({
-            "type": "response.output_item.done",
-            "item": {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "bash",
-                "arguments": "{\"command\":\"echo hi\"}"
-            }
-        }),
-        json!({"type": "response.completed", "response": {}}),
-    ];
-    let turn_two = vec![
-        json!({
-            "type": "response.output_item.done",
-            "item": {
-                "type": "message",
-                "content": [{"type": "output_text", "text": "ok"}]
-            }
-        }),
-        json!({"type": "response.completed", "response": {}}),
-    ];
-    let transport = StubTransport::new(vec![turn_one, turn_two]);
-
-    let mut args = Args::test_default();
-    args.max_turns = 4;
-    let cwd_dir = tempdir().unwrap();
-    let cwd = cwd_dir.path().canonicalize().unwrap();
-
-    let mut perms = crate::tools::unchecked_permission_context();
-    let steering = SteeringQueue::new();
-    // Submit BEFORE run_agent — the runner's drain at the top of the
-    // very first turn will pick this up. Submitting after the first
-    // turn starts would race the test; this version is deterministic.
-    steering.submit(SteeringMessage::new("use the other lib"));
-    perms.steering = steering.clone();
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
-        &transport,
-        &args,
-        &cwd,
-        "do the thing",
-        None,
-        Vec::new(),
-        tx,
-        None,
-        None,
-        &Catalog::default(),
-        None,
-        perms,
-    )
-    .await
-    .expect("run_agent should succeed");
-
-    // The steering queue must have been drained.
-    assert!(steering.is_empty(), "steering must drain into the loop");
-
-    let mut events = Vec::new();
-    while let Some(event) = rx.recv().await {
-        events.push(event);
-    }
-    // Both the original prompt and the steering injection should appear
-    // as UserMessage events. Find the steering one specifically.
-    let steering_event = events
-        .iter()
-        .find(|e| {
-            matches!(
-                e,
-                AgentEvent::UserMessage { text, .. } if text == "use the other lib"
-            )
-        })
-        .expect("steering UserMessage should be emitted");
-    if let AgentEvent::UserMessage { display_text, .. } = steering_event {
-        // Steering is not a UI-only display nudge; it has the same
-        // model-facing text and `display_text` should be None.
-        assert!(display_text.is_none(), "steering carries no display_text");
-    }
-
-    // The very first request body must already contain the steering
-    // message because the drain runs before the request is sent.
-    let bodies = transport.bodies();
-    assert!(!bodies.is_empty(), "transport must have been called");
-    let first_input = bodies[0]
-        .get("input")
-        .and_then(Value::as_array)
-        .expect("input array")
-        .clone();
-    let steering_idx = input_position(&first_input, "steering message", |item| {
-        is_input_user_message(item, "use the other lib")
-    });
-    let prompt_idx = input_position(&first_input, "prompt message", |item| {
-        is_input_user_message(item, "do the thing")
-    });
-    // Steering should follow the original prompt — it's a course
-    // correction, not a replacement.
-    assert!(
-        steering_idx > prompt_idx,
-        "steering must appear after the original prompt in the input"
-    );
-}
-
-#[tokio::test]
-async fn run_agent_skips_second_tool_when_abort_trips_during_first() {
-    // Model emits two function_calls in one turn. We let tool 1 dispatch
-    // (it sleeps so the abort lands during its execution), trip abort,
-    // and assert tool 2's dispatch is skipped by the between-call check.
-    // This exercises the post-output abort guard, which the previous
-    // pre-tripped test never reached.
-    let turn = vec![
-        json!({
-            "type": "response.output_item.done",
-            "item": {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "bash",
-                "arguments": "{\"command\":\"sleep 5\"}"
-            }
-        }),
-        json!({
-            "type": "response.output_item.done",
-            "item": {
-                "type": "function_call",
-                "call_id": "call_2",
-                "name": "bash",
-                "arguments": "{\"command\":\"echo second\"}"
-            }
-        }),
-        json!({"type": "response.completed", "response": {}}),
-    ];
-    let transport = std::sync::Arc::new(StubTransport::new(vec![turn]));
-
-    let mut args = Args::test_default();
-    args.max_turns = 2;
-    args.bash_timeout_secs = 30;
-    let cwd_dir = tempdir().unwrap();
-    let cwd = cwd_dir.path().canonicalize().unwrap();
-    let abort = AbortSignal::new();
-    let mut perms = crate::tools::unchecked_permission_context();
-    perms.abort = abort.clone();
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let transport_for_task = std::sync::Arc::clone(&transport);
-    let cwd_for_task = cwd.clone();
-    let args_for_task = args.clone();
-    let run_handle = tokio::spawn(async move {
-        run_agent(
-            transport_for_task.as_ref(),
-            &args_for_task,
-            &cwd_for_task,
-            "hi",
-            None,
-            Vec::new(),
-            tx,
-            None,
-            None,
-            &Catalog::default(),
-            None,
-            perms,
-        )
-        .await
-    });
-
-    // Collect events; trip abort the moment tool 1 starts so the sandbox
-    // sees it during its `sleep 5` and the runner's check #4 catches the
-    // trip before tool 2 dispatches.
-    let mut events: Vec<AgentEvent> = Vec::new();
-    while let Some(event) = rx.recv().await {
-        let trip_now = matches!(
-            &event,
-            AgentEvent::ToolCallStarted { call_id, .. } if call_id == "call_1"
-        );
-        events.push(event);
-        if trip_now {
-            abort.trip("mid-turn abort");
-        }
-    }
-    run_handle
-        .await
-        .expect("run_agent task should not panic")
-        .expect("run_agent returns Ok on abort");
-
-    let second_started = events.iter().any(|e| {
-        matches!(
-            e,
-            AgentEvent::ToolCallStarted { call_id, .. } if call_id == "call_2"
-        )
-    });
-    assert!(
-        !second_started,
-        "tool 2 must not dispatch after mid-turn abort: {events:?}"
-    );
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
-        "expected TurnAborted: {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnComplete { .. })),
-        "abort must not emit TurnComplete: {events:?}"
-    );
-}
-
-#[tokio::test]
-async fn run_agent_does_not_emit_turn_complete_when_last_tool_aborts() {
-    // Regression: single-tool turn where abort fires during the tool's
-    // run. The sandbox returns "command aborted by user" as a tool error
-    // (Err branch), not via `outcome.aborted` (only the approval-modal
-    // path sets that). Without the post-loop abort guard the runner
-    // would fall through to `finalize_turn`, emit `TurnComplete`, then
-    // the next iteration's check #1 would emit `TurnAborted` — two
-    // mutually-exclusive turn outcomes for the same turn.
-    let turn = vec![
-        json!({
-            "type": "response.output_item.done",
-            "item": {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "bash",
-                "arguments": "{\"command\":\"sleep 5\"}"
-            }
-        }),
-        json!({"type": "response.completed", "response": {}}),
-    ];
-    let transport = std::sync::Arc::new(StubTransport::new(vec![turn]));
-
-    let mut args = Args::test_default();
-    args.max_turns = 2;
-    args.bash_timeout_secs = 30;
-    let cwd_dir = tempdir().unwrap();
-    let cwd = cwd_dir.path().canonicalize().unwrap();
-    let abort = AbortSignal::new();
-    let mut perms = crate::tools::unchecked_permission_context();
-    perms.abort = abort.clone();
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let transport_for_task = std::sync::Arc::clone(&transport);
-    let cwd_for_task = cwd.clone();
-    let args_for_task = args.clone();
-    let run_handle = tokio::spawn(async move {
-        run_agent(
-            transport_for_task.as_ref(),
-            &args_for_task,
-            &cwd_for_task,
-            "hi",
-            None,
-            Vec::new(),
-            tx,
-            None,
-            None,
-            &Catalog::default(),
-            None,
-            perms,
-        )
-        .await
-    });
-
-    let mut events: Vec<AgentEvent> = Vec::new();
-    while let Some(event) = rx.recv().await {
-        let trip_now = matches!(
-            &event,
-            AgentEvent::ToolCallStarted { call_id, .. } if call_id == "call_1"
-        );
-        events.push(event);
-        if trip_now {
-            abort.trip("mid-tool abort");
-        }
-    }
-    run_handle
-        .await
-        .expect("task should not panic")
-        .expect("run_agent returns Ok on abort");
-
-    assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnAborted { .. })),
-        "expected TurnAborted: {events:?}"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::TurnComplete { .. })),
-        "single-tool abort must not emit TurnComplete: {events:?}"
-    );
 }

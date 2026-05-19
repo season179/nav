@@ -7,25 +7,27 @@ use nav_core::permissions::approval::{ApprovalGate, ChannelGate, PendingApproval
 use nav_core::sandbox::select_for_platform;
 use nav_core::tools::PermissionContext;
 use nav_core::{
-    AgentEvent, Catalog, OpenAiTransport, ProjectContext, SessionId, SessionStore,
+    AgentEvent, Catalog, ControlPlane, OpenAiTransport, PendingInput, PendingInputDraft,
+    PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
+    TurnControls, UserAttachment,
     cli::{Args, sandbox_policy_from_args},
     shorten_home,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::ChatWidget;
 use crate::bottom_pane::{self, PendingApproval};
 use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
-use crate::pending_input::{PendingFollowUp, PendingQueue, QueuedSkill};
-use crate::pending_queue_widget::PendingQueueView;
 use crate::status_bar::{AgentState, StatusBar};
 use crate::turn::{TurnSpawn, spawn_turn};
+use std::path::Path;
 
 /// Restores the terminal to a sane state when `run` returns.
 ///
@@ -136,12 +138,11 @@ pub async fn run(
     let mut ctrl_c_count = 0u8;
     // A standalone `/<skill>` is a local TUI gesture, not a model turn. Hold
     // its wrapped body here and prepend it onto the next non-slash prompt.
-    let mut pending_skill: Option<(String, String)> = None;
+    let mut pending_skill: Option<PendingSkill> = None;
+    let mut control = ControlPlane::new();
+    let mut active_turn_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut active_steering_queue: Option<PendingSteeringQueue> = None;
     let mut turn_started_at: Option<Instant> = None;
-    // Follow-ups submitted while a turn is already in flight. Drained FIFO
-    // after the active turn settles so the session never runs two concurrent
-    // turns against the same store.
-    let mut pending_queue = PendingQueue::new();
     let mut spinner_tick: u64 = 0;
     let cwd_short = shorten_home(&cwd);
     let branch = project.workspace.branch.clone();
@@ -163,17 +164,15 @@ pub async fn run(
         pending_approvals.clone(),
         &sandbox_policy,
     );
-    // The per-turn handles currently in flight. Held outside the spawn so
-    // the input path can interact with them (trip abort, submit steering)
-    // without needing access to the spawned task.
-    let mut active_abort: Option<nav_core::AbortSignal> = None;
-    let mut active_steering: Option<nav_core::SteeringQueue> = None;
 
     if let Some(prompt) = initial_prompt {
         app_tx
             .send(AppEvent::Submit {
                 text: prompt,
+                display_text: None,
                 images: Vec::new(),
+                mode: PendingInputMode::FollowUp,
+                skill: None,
             })
             .ok();
     }
@@ -188,8 +187,6 @@ pub async fn run(
             None => AgentState::Ready,
         };
         let mut history_viewport = (1, 1);
-        let queue_previews = pending_queue.previews();
-        let steering_pending = active_steering.as_ref().map(|q| q.len()).unwrap_or(0);
         term.terminal.draw(|f| {
             use ratatui::layout::{Constraint, Layout};
             let area = f.area();
@@ -197,26 +194,16 @@ pub async fn run(
                 .desired_height(area.width)
                 .max(3)
                 .min(area.height.saturating_sub(2));
-            let queue_view = PendingQueueView::new(&queue_previews).with_steering(steering_pending);
-            // Cap queue height so the composer always keeps room. The min(…)
-            // call guards against a tiny terminal where the queue alone would
-            // squeeze the history viewport to zero rows.
-            let queue_h_raw = queue_view.desired_height();
-            let queue_h = queue_h_raw.min(area.height.saturating_sub(pane_h + 2));
             let chunks = Layout::vertical([
                 Constraint::Min(1),
-                Constraint::Length(queue_h),
                 Constraint::Length(pane_h),
                 Constraint::Length(1),
             ])
             .split(area);
             history_viewport = (chunks[0].width, chunks[0].height);
             f.render_widget(&chat, chunks[0]);
-            if queue_h > 0 {
-                f.render_widget(queue_view, chunks[1]);
-            }
-            f.render_widget(&pane, chunks[2]);
-            if let Some((cx, cy)) = pane.cursor_position(chunks[2]) {
+            f.render_widget(&pane, chunks[1]);
+            if let Some((cx, cy)) = pane.cursor_position(chunks[1]) {
                 f.set_cursor_position((cx, cy));
             }
             f.render_widget(
@@ -227,42 +214,54 @@ pub async fn run(
                     dirty,
                     state,
                 },
-                chunks[3],
+                chunks[2],
             );
         })?;
 
         tokio::select! {
             Some(ev) = agent_rx.recv() => {
-                let turn_settled = turn_is_terminal(&ev);
-                if turn_settled {
+                pane.apply_agent_event(&ev);
+                if let AgentEvent::PendingInputDequeued { id, .. } = &ev {
+                    control.remove_pending(id);
+                }
+                if turn_is_terminal(&ev) {
+                    let active_id = control.active().map(|active| active.id().to_string());
+                    if matches!(ev, AgentEvent::TurnAborted { .. })
+                        && let Some(id) = active_id.as_deref()
+                        && let Ok(abort) = control.abort_turn(id, "turn aborted")
+                    {
+                        emit_pending_cleared(
+                            abort.cleared_steering_ids,
+                            store.as_ref(),
+                            &session_id,
+                            &mut chat,
+                            &mut pane,
+                        );
+                    }
                     turn_started_at = None;
-                    // Drop the per-turn abort + steering handles. The
-                    // next spawn will create fresh ones so an Esc /
-                    // `/steer` arriving after the model has already
-                    // settled is a no-op, not an accidental abort or
-                    // injection into the next turn before it starts.
-                    active_abort = None;
-                    // Drain any steering message that landed between the
-                    // runner's final drain and the TUI receiving this
-                    // settle event. Without this rescue, `/steer` typed
-                    // in that tight window would sit in the queue until
-                    // we drop it below, vanishing without ever reaching
-                    // the model. Convert leftovers into follow-ups
-                    // *without* consuming `pending_skill` — a slash
-                    // skill the operator selected separately is bound
-                    // to their next typed prompt, not to a rescued
-                    // steering message.
-                    if let Some(queue) = active_steering.take() {
-                        for msg in queue.drain() {
-                            let images: Vec<PathBuf> = msg
-                                .attachments
-                                .into_iter()
-                                .map(|nav_core::UserAttachment::Image { path }| path)
-                                .collect();
-                            pending_queue.enqueue(msg.text.clone(), images, None);
-                            chat.scroll_to_bottom();
-                            chat.push_user(format!("[steering→queued] {}", msg.text));
-                        }
+                    active_turn_task = None;
+                    active_steering_queue = None;
+                    if let Some(id) = active_id
+                        && let Ok(settled) = control.finish_turn(&id)
+                    {
+                        start_next_follow_up(
+                            settled.next_follow_up,
+                            &mut control,
+                            &mut active_turn_task,
+                            &mut active_steering_queue,
+                            &mut turn_started_at,
+                            &transport,
+                            &args,
+                            &cwd,
+                            &store,
+                            &session_id,
+                            &agent_tx,
+                            &skills,
+                            &project,
+                            &permissions,
+                            &mut chat,
+                            &mut pane,
+                        );
                     }
                 }
                 if matches!(ev, AgentEvent::UserMessage { .. }) {
@@ -290,30 +289,6 @@ pub async fn run(
                     continue;
                 }
                 chat.ingest(ev);
-
-                if turn_settled {
-                    // Drain the next queued follow-up, if any, now that the
-                    // session is free again. Serializing here is load-bearing:
-                    // running two `run_agent` calls against the same session
-                    // store would race the transcript and double-charge the
-                    // model.
-                    drain_next_queued(
-                        &mut pending_queue,
-                        &mut chat,
-                        &mut turn_started_at,
-                        &mut active_abort,
-                        &mut active_steering,
-                        &transport,
-                        &args,
-                        &cwd,
-                        &store,
-                        &session_id,
-                        &agent_tx,
-                        &skills,
-                        &project,
-                        &permissions,
-                    );
-                }
             }
             Some(app) = app_rx.recv() => {
                 match app {
@@ -329,54 +304,113 @@ pub async fn run(
                             settings_summary.clone(),
                         );
                         pending_skill = None;
-                        // /clear is "reset my intent". Stale queued follow-ups
-                        // and pending steering would both surprise the user on
-                        // the next turn — wipe both.
-                        pending_queue.clear();
-                        if let Some(queue) = active_steering.as_ref() {
-                            queue.drain();
+                        clear_pending_inputs(
+                            &mut control,
+                            &active_steering_queue,
+                            store.as_ref(),
+                            &session_id,
+                            &mut chat,
+                            &mut pane,
+                        );
+                    }
+                    AppEvent::AbortTurn => {
+                        if let Some(active) = control.active().cloned() {
+                            let turn_id = active.id().to_string();
+                            let abort = control.abort_turn(&turn_id, "user interrupt").ok();
+                            pending_approvals.abort_pending();
+                            if let Some(handle) = active_turn_task.take() {
+                                handle.abort();
+                            }
+                            active_steering_queue = None;
+                            turn_started_at = None;
+                            if let Some(abort) = abort {
+                                emit_pending_cleared(
+                                    abort.cleared_steering_ids,
+                                    store.as_ref(),
+                                    &session_id,
+                                    &mut chat,
+                                    &mut pane,
+                                );
+                            }
+                            emit_local_event(
+                                AgentEvent::TurnAborted {
+                                    turn_id: turn_id.clone(),
+                                    reason: "user interrupt".into(),
+                                },
+                                store.as_ref(),
+                                &session_id,
+                                &mut chat,
+                                &mut pane,
+                            );
+                            if let Ok(settled) = control.finish_turn(&turn_id) {
+                                start_next_follow_up(
+                                    settled.next_follow_up,
+                                    &mut control,
+                                    &mut active_turn_task,
+                                    &mut active_steering_queue,
+                                    &mut turn_started_at,
+                                    &transport,
+                                    &args,
+                                    &cwd,
+                                    &store,
+                                    &session_id,
+                                    &agent_tx,
+                                    &skills,
+                                    &project,
+                                    &permissions,
+                                    &mut chat,
+                                    &mut pane,
+                                );
+                            }
                         }
                     }
-                    AppEvent::QueueSkill { skill_name, wrapped_body } => {
+                    AppEvent::EditPending { id, text } => {
+                        if let Some(item) = control.edit_pending(&id, text) {
+                            replace_active_steering(&active_steering_queue, &item);
+                            emit_local_event(
+                                AgentEvent::PendingInputEdited {
+                                    id: item.id,
+                                    text: item.text,
+                                    display_text: item.display_text,
+                                    attachments: item.attachments,
+                                    skill_name: item.skill.map(|skill| skill.name),
+                                },
+                                store.as_ref(),
+                                &session_id,
+                                &mut chat,
+                                &mut pane,
+                            );
+                        }
+                    }
+                    AppEvent::RemovePending { id } => {
+                        if let Some(item) = control.remove_pending(&id) {
+                            remove_active_steering(&active_steering_queue, &item.id);
+                            emit_local_event(
+                                AgentEvent::PendingInputRemoved { id: item.id },
+                                store.as_ref(),
+                                &session_id,
+                                &mut chat,
+                                &mut pane,
+                            );
+                        }
+                    }
+                    AppEvent::ClearPending => {
+                        clear_pending_inputs(
+                            &mut control,
+                            &active_steering_queue,
+                            store.as_ref(),
+                            &session_id,
+                            &mut chat,
+                            &mut pane,
+                        );
+                    }
+                    AppEvent::QueueSkill { skill } => {
                         // Replace any previously queued skill; selecting a new
                         // one before sending a prompt should override.
-                        pending_skill = Some((skill_name.clone(), wrapped_body));
+                        pending_skill = Some(skill.clone());
                         chat.scroll_to_bottom();
-                        chat.push_user(format!("/{skill_name}"));
-                        chat.push_skill(skill_name, "queued for the next prompt");
-                    }
-                    AppEvent::Steer { text, images } => {
-                        if text.trim().is_empty() {
-                            chat.scroll_to_bottom();
-                            chat.ingest(AgentEvent::Error {
-                                message: "/steer needs a message — try `/steer <text>`".into(),
-                            });
-                            continue;
-                        }
-                        if let Some(steering) = active_steering.as_ref() {
-                            // Active turn — submit into the per-turn
-                            // steering queue. The runner drains and folds
-                            // each message into the model's next request
-                            // at a safe boundary.
-                            let attachments: Vec<_> = images
-                                .into_iter()
-                                .map(|path| nav_core::UserAttachment::Image { path })
-                                .collect();
-                            steering.submit(nav_core::SteeringMessage::with_attachments(
-                                text.clone(),
-                                attachments,
-                            ));
-                            chat.scroll_to_bottom();
-                            chat.push_skill("steer", "queued for next model boundary");
-                            chat.push_user(format!("[steering] {text}"));
-                        } else {
-                            // No active turn — degrade to a normal Submit
-                            // so the user's message still reaches the
-                            // model rather than vanishing.
-                            app_tx
-                                .send(AppEvent::Submit { text, images })
-                                .ok();
-                        }
+                        chat.push_user(format!("/{}", skill.name));
+                        chat.push_skill(skill.name, "queued for the next prompt");
                     }
                     AppEvent::ListSessions => {
                         match store.list_sessions(None) {
@@ -456,72 +490,66 @@ pub async fn run(
                         chat.ingest(AgentEvent::Error { message });
                     }
                     AppEvent::Submit {
-                        text: raw_prompt,
+                        text,
+                        display_text,
                         images,
+                        mode,
+                        skill,
                     } => {
-                        // Active turn → queue the follow-up instead of racing
-                        // a second `run_agent`. Drain happens when the active
-                        // turn settles.
-                        if turn_started_at.is_some() {
-                            enqueue_busy_submit(
-                                &mut pending_queue,
-                                &mut pending_skill,
+                        let draft =
+                            pending_draft(text, display_text, images, mode, skill, &mut pending_skill);
+                        if control.active().is_some() {
+                            let item = match mode {
+                                PendingInputMode::FollowUp => control.enqueue_follow_up(draft),
+                                PendingInputMode::Steering => control.enqueue_steering(draft),
+                            };
+                            if item.mode == PendingInputMode::Steering {
+                                queue_active_steering(&active_steering_queue, item.clone());
+                            }
+                            emit_local_event(
+                                AgentEvent::PendingInputQueued {
+                                    id: item.id.clone(),
+                                    mode: item.mode,
+                                    text: item.text.clone(),
+                                    display_text: item.display_text.clone(),
+                                    attachments: item.attachments.clone(),
+                                    skill_name: item.skill.as_ref().map(|skill| skill.name.clone()),
+                                },
+                                store.as_ref(),
+                                &session_id,
                                 &mut chat,
-                                raw_prompt,
-                                images,
+                                &mut pane,
                             );
                             continue;
                         }
-
-                        let pending_skill_name =
-                            pending_skill.as_ref().map(|(name, _)| name.clone());
-                        let pending_skill_body =
-                            pending_skill.as_ref().map(|(_, body)| body.as_str());
-                        let attachments = images
-                            .into_iter()
-                            .map(|path| nav_core::UserAttachment::Image { path })
-                            .collect();
-                        // Fresh per-turn abort signal + steering queue.
-                        // Holding the clones here lets the key handler
-                        // trip the abort and the `/steer` command push
-                        // into the queue; the spawned `run_agent` checks
-                        // both at safe boundaries.
-                        let turn_abort = nav_core::AbortSignal::new();
-                        let turn_steering = nav_core::SteeringQueue::new();
-                        let mut turn_permissions = permissions.clone();
-                        turn_permissions.abort = turn_abort.clone();
-                        turn_permissions.steering = turn_steering.clone();
-                        let spawned = spawn_turn(TurnSpawn {
-                            transport: Arc::clone(&transport),
-                            args: args.clone(),
-                            cwd: cwd.clone(),
-                            store: Arc::clone(&store),
-                            session_id: session_id.clone(),
-                            raw_prompt: raw_prompt.clone(),
-                            pending_skill: pending_skill_body,
-                            attachments,
-                            agent_tx: agent_tx.clone(),
-                            skills: Arc::clone(&skills),
-                            project: Arc::clone(&project),
-                            permissions: turn_permissions,
-                        });
-                        if let Err(err) = spawned {
-                            chat.scroll_to_bottom();
+                        if mode == PendingInputMode::Steering {
                             chat.ingest(AgentEvent::Error {
-                                message: format!("{err:#}"),
+                                message: "steering can only be queued while a turn is active".into(),
                             });
                             continue;
                         }
-
-                        pending_skill = None;
-                        chat.scroll_to_bottom();
-                        if let Some(skill_name) = pending_skill_name {
-                            chat.push_skill(skill_name, "applied to this turn");
+                        let item = pending_input_for_immediate(draft);
+                        if let Err(err) = start_pending_turn(
+                            item,
+                            &mut control,
+                            &mut active_turn_task,
+                            &mut active_steering_queue,
+                            &mut turn_started_at,
+                            &transport,
+                            &args,
+                            &cwd,
+                            &store,
+                            &session_id,
+                            &agent_tx,
+                            &skills,
+                            &project,
+                            &permissions,
+                            &mut chat,
+                        ) {
+                            chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            });
                         }
-                        chat.push_user(raw_prompt);
-                        turn_started_at = Some(Instant::now());
-                        active_abort = Some(turn_abort);
-                        active_steering = Some(turn_steering);
                     }
                 }
             }
@@ -535,6 +563,11 @@ pub async fn run(
                     match event::read()? {
                         CtEvent::Key(key) => {
                             if is_ctrl_c(&key) {
+                                if control.active().is_some() {
+                                    ctrl_c_count = 0;
+                                    app_tx.send(AppEvent::AbortTurn).ok();
+                                    continue;
+                                }
                                 ctrl_c_count += 1;
                                 if ctrl_c_count >= 2 {
                                     app_tx.send(AppEvent::Quit).ok();
@@ -542,53 +575,6 @@ pub async fn run(
                                 continue;
                             }
                             ctrl_c_count = 0;
-                            // Esc while a turn is active and no overlay is up
-                            // is the abort gesture. Overlays (slash popup,
-                            // mention popup, approval modal) own Esc for
-                            // their own cancel semantics. With no active
-                            // turn, Esc falls through to the composer
-                            // (returns `Cancelled`, which the loop ignores).
-                            if is_abort_key(&key)
-                                && !pane.has_overlay()
-                                && let Some(abort) = active_abort.as_ref()
-                            {
-                                abort.trip("user pressed esc");
-                                continue;
-                            }
-                            // Queue controls. These intercept above the
-                            // composer because `Composer::handle_key` already
-                            // no-ops on Ctrl-modified character keys, so the
-                            // bindings don't clash with bash-style editing.
-                            if is_queue_edit_last(&key)
-                                && !pane.has_overlay()
-                                && let Some(last) = pending_queue.pop_last()
-                            {
-                                restore_for_edit(
-                                    &mut pane,
-                                    &mut pending_skill,
-                                    &mut chat,
-                                    last,
-                                );
-                                continue;
-                            }
-                            if is_queue_clear(&key) && !pane.has_overlay() {
-                                let had_follow_ups = !pending_queue.is_empty();
-                                let steering_count = active_steering
-                                    .as_ref()
-                                    .map(|q| q.len())
-                                    .unwrap_or(0);
-                                if had_follow_ups || steering_count > 0 {
-                                    pending_queue.clear();
-                                    if let Some(queue) = active_steering.as_ref() {
-                                        queue.drain();
-                                    }
-                                    chat.scroll_to_bottom();
-                                    chat.ingest(AgentEvent::Error {
-                                        message: "pending queue cleared".into(),
-                                    });
-                                    continue;
-                                }
-                            }
                             if handle_scrollback_key(&mut chat, &key, history_viewport) {
                                 continue;
                             }
@@ -635,133 +621,261 @@ pub async fn run(
     Ok(())
 }
 
-fn spinner_frame(tick: u64) -> char {
-    const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    FRAMES[(tick as usize) % FRAMES.len()]
-}
-
-fn is_queue_edit_last(key: &crossterm::event::KeyEvent) -> bool {
-    use crossterm::event::{KeyCode, KeyModifiers};
-    key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn is_queue_clear(key: &crossterm::event::KeyEvent) -> bool {
-    use crossterm::event::{KeyCode, KeyModifiers};
-    key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn is_abort_key(key: &crossterm::event::KeyEvent) -> bool {
-    // Single Esc with no modifiers. Two-tap Ctrl+C remains the quit
-    // gesture, and a typical Esc inside a popup still routes through the
-    // overlay's own cancel handler at the call site.
-    use crossterm::event::KeyCode;
-    key.code == KeyCode::Esc && key.modifiers.is_empty()
-}
-
-/// Capture a submit issued during an active turn into the follow-up queue.
-/// Snapshots the currently selected slash-skill so a later `/skill2` doesn't
-/// retroactively rewrite the activation of an earlier queued item.
-fn enqueue_busy_submit(
-    queue: &mut PendingQueue,
-    pending_skill: &mut Option<(String, String)>,
+fn emit_local_event(
+    event: AgentEvent,
+    store: &SessionStore,
+    session_id: &SessionId,
     chat: &mut ChatWidget,
-    raw_prompt: String,
-    images: Vec<PathBuf>,
-) -> u64 {
-    let skill_snapshot = pending_skill
-        .take()
-        .map(|(name, wrapped_body)| QueuedSkill { name, wrapped_body });
-    let skill_name_for_log = skill_snapshot.as_ref().map(|s| s.name.clone());
-    let id = queue.enqueue(raw_prompt.clone(), images, skill_snapshot);
-    chat.scroll_to_bottom();
-    if let Some(skill_name) = skill_name_for_log {
-        chat.push_skill(skill_name, "queued as a follow-up");
-    }
-    chat.push_user(format!("[queued] {raw_prompt}"));
-    id
-}
-
-fn restore_for_edit(
     pane: &mut bottom_pane::BottomPane,
-    pending_skill: &mut Option<(String, String)>,
-    chat: &mut ChatWidget,
-    item: PendingFollowUp,
 ) {
-    pane.set_composer_text(&item.text);
-    *pending_skill = item.skill.map(|s| (s.name, s.wrapped_body));
-    chat.scroll_to_bottom();
-    chat.ingest(AgentEvent::Error {
-        message: "edit queued follow-up — press Enter to resubmit".into(),
-    });
+    if let Err(err) = store.append_event(session_id, &event) {
+        eprintln!("nav-tui: failed to persist local event: {err:#}");
+    }
+    pane.apply_agent_event(&event);
+    chat.ingest(event);
 }
 
-/// Spawn the next queued follow-up after a turn settles. Mirrors the inline
-/// submit path so attachments, skill activation, and the visible transcript
-/// stay in lockstep with the synchronous case.
-#[allow(clippy::too_many_arguments)]
-fn drain_next_queued(
-    queue: &mut PendingQueue,
+fn emit_pending_cleared(
+    ids: Vec<String>,
+    store: &SessionStore,
+    session_id: &SessionId,
     chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    emit_local_event(
+        AgentEvent::PendingInputCleared { ids },
+        store,
+        session_id,
+        chat,
+        pane,
+    );
+}
+
+fn clear_pending_inputs(
+    control: &mut ControlPlane,
+    active_steering_queue: &Option<PendingSteeringQueue>,
+    store: &SessionStore,
+    session_id: &SessionId,
+    chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
+) {
+    let cleared = control.clear_pending();
+    if cleared.is_empty() {
+        return;
+    }
+    clear_active_steering(active_steering_queue);
+    emit_pending_cleared(
+        cleared.into_iter().map(|item| item.id).collect(),
+        store,
+        session_id,
+        chat,
+        pane,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_next_follow_up(
+    next: Option<PendingInput>,
+    control: &mut ControlPlane,
+    active_turn_task: &mut Option<tokio::task::JoinHandle<()>>,
+    active_steering_queue: &mut Option<PendingSteeringQueue>,
     turn_started_at: &mut Option<Instant>,
-    active_abort: &mut Option<nav_core::AbortSignal>,
-    active_steering: &mut Option<nav_core::SteeringQueue>,
     transport: &Arc<OpenAiTransport>,
     args: &Args,
-    cwd: &std::path::Path,
+    cwd: &PathBuf,
     store: &Arc<SessionStore>,
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
     skills: &Arc<Catalog>,
     project: &Arc<ProjectContext>,
     permissions: &PermissionContext,
+    chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
 ) {
-    let Some(item) = queue.drain_next() else {
+    let Some(next) = next else {
         return;
     };
-    let PendingFollowUp {
-        text,
-        attachments,
-        skill,
-        ..
-    } = item;
-    let (skill_name, skill_body) = match skill {
-        Some(s) => (Some(s.name), Some(s.wrapped_body)),
-        None => (None, None),
-    };
-    let turn_abort = nav_core::AbortSignal::new();
-    let turn_steering = nav_core::SteeringQueue::new();
-    let mut turn_permissions = permissions.clone();
-    turn_permissions.abort = turn_abort.clone();
-    turn_permissions.steering = turn_steering.clone();
-    let spawned = spawn_turn(TurnSpawn {
-        transport: Arc::clone(transport),
-        args: args.clone(),
-        cwd: cwd.to_path_buf(),
-        store: Arc::clone(store),
-        session_id: session_id.clone(),
-        raw_prompt: text.clone(),
-        pending_skill: skill_body.as_deref(),
-        attachments,
-        agent_tx: agent_tx.clone(),
-        skills: Arc::clone(skills),
-        project: Arc::clone(project),
-        permissions: turn_permissions,
-    });
-    if let Err(err) = spawned {
-        chat.scroll_to_bottom();
+    emit_local_event(
+        AgentEvent::PendingInputDequeued {
+            id: next.id.clone(),
+            mode: next.mode,
+        },
+        store.as_ref(),
+        session_id,
+        chat,
+        pane,
+    );
+    if let Err(err) = start_pending_turn(
+        next,
+        control,
+        active_turn_task,
+        active_steering_queue,
+        turn_started_at,
+        transport,
+        args,
+        cwd,
+        store,
+        session_id,
+        agent_tx,
+        skills,
+        project,
+        permissions,
+        chat,
+    ) {
         chat.ingest(AgentEvent::Error {
             message: format!("{err:#}"),
         });
+    }
+}
+
+fn queue_active_steering(queue: &Option<PendingSteeringQueue>, item: PendingInput) {
+    if item.mode != PendingInputMode::Steering {
         return;
     }
-    chat.scroll_to_bottom();
-    if let Some(name) = skill_name {
-        chat.push_skill(name, "applied to this turn");
+    let Some(queue) = queue else {
+        return;
+    };
+    queue.lock().unwrap().push_back(item);
+}
+
+fn replace_active_steering(queue: &Option<PendingSteeringQueue>, item: &PendingInput) {
+    if item.mode != PendingInputMode::Steering {
+        return;
     }
-    chat.push_user(text);
+    let Some(queue) = queue else {
+        return;
+    };
+    let mut queued = queue.lock().unwrap();
+    if let Some(existing) = queued.iter_mut().find(|existing| existing.id == item.id) {
+        *existing = item.clone();
+    }
+}
+
+fn remove_active_steering(queue: &Option<PendingSteeringQueue>, id: &str) {
+    let Some(queue) = queue else {
+        return;
+    };
+    let mut queued = queue.lock().unwrap();
+    if let Some(index) = queued.iter().position(|item| item.id == id) {
+        queued.remove(index);
+    }
+}
+
+fn clear_active_steering(queue: &Option<PendingSteeringQueue>) {
+    let Some(queue) = queue else {
+        return;
+    };
+    queue.lock().unwrap().clear();
+}
+
+fn pending_draft(
+    text: String,
+    display_text: Option<String>,
+    images: Vec<PathBuf>,
+    mode: PendingInputMode,
+    skill: Option<PendingSkill>,
+    pending_skill: &mut Option<PendingSkill>,
+) -> PendingInputDraft {
+    let skill = if mode == PendingInputMode::FollowUp {
+        skill.or_else(|| pending_skill.take())
+    } else {
+        skill
+    };
+    PendingInputDraft {
+        text,
+        display_text,
+        attachments: images
+            .into_iter()
+            .map(|path| UserAttachment::Image { path })
+            .collect(),
+        skill,
+    }
+}
+
+fn pending_input_for_immediate(draft: PendingInputDraft) -> PendingInput {
+    let display_text = draft
+        .display_text
+        .or_else(|| draft.skill.as_ref().map(|_| draft.text.clone()));
+    let visible_text = display_text.as_deref().unwrap_or(&draft.text);
+    PendingInput {
+        id: String::new(),
+        mode: PendingInputMode::FollowUp,
+        text: model_text(draft.skill.as_ref(), visible_text),
+        display_text,
+        attachments: draft.attachments,
+        skill: draft.skill,
+    }
+}
+
+fn model_text(skill: Option<&PendingSkill>, visible_text: &str) -> String {
+    match skill {
+        Some(skill) => format!("{}\n\n{}", skill.wrapped_body, visible_text),
+        None => visible_text.to_string(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_pending_turn(
+    item: PendingInput,
+    control: &mut ControlPlane,
+    active_turn_task: &mut Option<tokio::task::JoinHandle<()>>,
+    active_steering_queue: &mut Option<PendingSteeringQueue>,
+    turn_started_at: &mut Option<Instant>,
+    transport: &Arc<OpenAiTransport>,
+    args: &Args,
+    cwd: &PathBuf,
+    store: &Arc<SessionStore>,
+    session_id: &SessionId,
+    agent_tx: &mpsc::UnboundedSender<AgentEvent>,
+    skills: &Arc<Catalog>,
+    project: &Arc<ProjectContext>,
+    permissions: &PermissionContext,
+    chat: &mut ChatWidget,
+) -> Result<()> {
+    let active = control.start_turn()?;
+    let steering_queue = Arc::new(Mutex::new(VecDeque::new()));
+    let handle = match spawn_turn(TurnSpawn {
+        transport: Arc::clone(transport),
+        args: args.clone(),
+        cwd: cwd.clone(),
+        store: Arc::clone(store),
+        session_id: session_id.clone(),
+        model_prompt: item.text.clone(),
+        display_prompt: item.display_text.clone(),
+        attachments: item.attachments.clone(),
+        agent_tx: agent_tx.clone(),
+        skills: Arc::clone(skills),
+        project: Arc::clone(project),
+        permissions: permissions.clone(),
+        controls: TurnControls {
+            turn_id: Some(active.id().to_string()),
+            steering: Some(Arc::clone(&steering_queue)),
+        },
+    }) {
+        Ok(handle) => handle,
+        Err(err) => {
+            let _ = control.finish_turn(active.id());
+            return Err(err);
+        }
+    };
+
+    *active_turn_task = Some(handle);
+    *active_steering_queue = Some(steering_queue);
     *turn_started_at = Some(Instant::now());
-    *active_abort = Some(turn_abort);
-    *active_steering = Some(turn_steering);
+    chat.scroll_to_bottom();
+    if let Some(skill) = item.skill.as_ref() {
+        chat.push_skill(skill.name.clone(), "applied to this turn");
+    }
+    chat.push_user(item.visible_text().to_string());
+    Ok(())
+}
+
+fn spinner_frame(tick: u64) -> char {
+    const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[(tick as usize) % FRAMES.len()]
 }
 
 fn build_tui_permissions(
@@ -797,8 +911,6 @@ fn build_tui_permissions(
         // Default empty; populated when the user picks `[a]llow for session`
         // on the approval modal. Shared across spawned turns via Arc.
         session_allowlist: nav_core::permissions::SessionAllowlist::default(),
-        abort: nav_core::AbortSignal::default(),
-        steering: nav_core::SteeringQueue::default(),
     }
 }
 
@@ -861,8 +973,8 @@ fn turn_is_terminal(ev: &AgentEvent) -> bool {
     matches!(
         ev,
         AgentEvent::TurnComplete { .. }
-            | AgentEvent::Error { .. }
             | AgentEvent::TurnAborted { .. }
+            | AgentEvent::Error { .. }
             | AgentEvent::CompactionCompleted {
                 trigger: nav_core::CompactionTrigger::Manual,
                 ..
@@ -877,7 +989,6 @@ fn turn_is_terminal(ev: &AgentEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use nav_core::CompactionTrigger;
 
@@ -888,6 +999,10 @@ mod tests {
         }));
         assert!(turn_is_terminal(&AgentEvent::Error {
             message: "x".into()
+        }));
+        assert!(turn_is_terminal(&AgentEvent::TurnAborted {
+            turn_id: "turn-1".into(),
+            reason: "user interrupt".into(),
         }));
     }
 
@@ -951,172 +1066,6 @@ mod tests {
                 "mouse capture prevents native terminal text selection: {seq:?}"
             );
         }
-    }
-
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press)
-    }
-
-    #[test]
-    fn enqueue_busy_submit_appends_in_order_and_clears_pending_skill() {
-        let mut queue = PendingQueue::new();
-        let mut chat = ChatWidget::new();
-        let mut pending_skill: Option<(String, String)> = None;
-
-        enqueue_busy_submit(
-            &mut queue,
-            &mut pending_skill,
-            &mut chat,
-            "first".into(),
-            vec![],
-        );
-        // Selecting a skill before queueing the second prompt — the snapshot
-        // must travel with this specific item and not be retroactively reset
-        // when `pending_skill` changes again later.
-        pending_skill = Some(("foo".into(), "<skill name=\"foo\">body</skill>".into()));
-        enqueue_busy_submit(
-            &mut queue,
-            &mut pending_skill,
-            &mut chat,
-            "second".into(),
-            vec![],
-        );
-        // `pending_skill` is now cleared so the next standalone `/skillN`
-        // selection is the fresh source of truth.
-        assert!(pending_skill.is_none());
-
-        // Activating a new skill must not retroactively rewrite previously
-        // queued items.
-        pending_skill = Some(("bar".into(), "<skill name=\"bar\">body</skill>".into()));
-        enqueue_busy_submit(
-            &mut queue,
-            &mut pending_skill,
-            &mut chat,
-            "third".into(),
-            vec![],
-        );
-
-        let items: Vec<_> = queue.iter().collect();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].text, "first");
-        assert!(items[0].skill.is_none());
-        assert_eq!(items[1].text, "second");
-        assert_eq!(items[1].skill.as_ref().unwrap().name, "foo");
-        assert_eq!(items[2].text, "third");
-        assert_eq!(items[2].skill.as_ref().unwrap().name, "bar");
-    }
-
-    #[test]
-    fn enqueue_busy_submit_preserves_image_attachments() {
-        let mut queue = PendingQueue::new();
-        let mut chat = ChatWidget::new();
-        let mut pending_skill: Option<(String, String)> = None;
-        let images = vec![PathBuf::from(".nav/clipboard/a.png")];
-
-        enqueue_busy_submit(
-            &mut queue,
-            &mut pending_skill,
-            &mut chat,
-            "with image".into(),
-            images,
-        );
-
-        let item = queue.iter().next().unwrap();
-        assert_eq!(item.images.len(), 1);
-        match &item.attachments[0] {
-            nav_core::UserAttachment::Image { path } => {
-                assert_eq!(path, &PathBuf::from(".nav/clipboard/a.png"));
-            }
-        }
-    }
-
-    #[test]
-    fn restore_for_edit_repopulates_composer_and_skill() {
-        let mut pane = bottom_pane::BottomPane::new();
-        let mut chat = ChatWidget::new();
-        let mut pending_skill: Option<(String, String)> = None;
-        let item = PendingFollowUp {
-            id: 0,
-            text: "fix wording".into(),
-            images: vec![],
-            attachments: vec![],
-            skill: Some(QueuedSkill {
-                name: "foo".into(),
-                wrapped_body: "<skill name=\"foo\">body</skill>".into(),
-            }),
-        };
-
-        restore_for_edit(&mut pane, &mut pending_skill, &mut chat, item);
-
-        assert_eq!(pane.composer().text(), "fix wording");
-        assert_eq!(pending_skill.as_ref().unwrap().0, "foo");
-        assert!(pending_skill.as_ref().unwrap().1.contains("<skill"));
-    }
-
-    #[test]
-    fn queue_edit_last_keybinding_detection() {
-        assert!(is_queue_edit_last(&key(
-            KeyCode::Char('e'),
-            KeyModifiers::CONTROL
-        )));
-        // Plain `e` is composer typing, not a queue control.
-        assert!(!is_queue_edit_last(&key(
-            KeyCode::Char('e'),
-            KeyModifiers::NONE
-        )));
-        assert!(!is_queue_clear(&key(
-            KeyCode::Char('e'),
-            KeyModifiers::CONTROL
-        )));
-    }
-
-    #[test]
-    fn queue_clear_keybinding_detection() {
-        assert!(is_queue_clear(&key(
-            KeyCode::Char('x'),
-            KeyModifiers::CONTROL
-        )));
-        assert!(!is_queue_clear(&key(
-            KeyCode::Char('x'),
-            KeyModifiers::NONE
-        )));
-    }
-
-    #[test]
-    fn abort_key_only_fires_on_bare_esc() {
-        assert!(is_abort_key(&key(KeyCode::Esc, KeyModifiers::NONE)));
-        // Esc with modifiers shouldn't double as abort — leave room for
-        // user keybinds and let the overlay routing keep ownership.
-        assert!(!is_abort_key(&key(KeyCode::Esc, KeyModifiers::CONTROL)));
-        assert!(!is_abort_key(&key(KeyCode::Esc, KeyModifiers::SHIFT)));
-        assert!(!is_abort_key(&key(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        )));
-    }
-
-    #[tokio::test]
-    async fn pressing_abort_key_trips_the_active_signal() {
-        let abort = nav_core::AbortSignal::new();
-        let mut active_abort: Option<nav_core::AbortSignal> = Some(abort.clone());
-        let key_event = key(KeyCode::Esc, KeyModifiers::NONE);
-        assert!(is_abort_key(&key_event));
-
-        // Mirror the app-loop branch: when the key matches and a turn is
-        // active, the handle is tripped. The signal then resolves `wait`
-        // straight away so a sleeping bash future would unblock.
-        if is_abort_key(&key_event)
-            && let Some(handle) = active_abort.as_ref()
-        {
-            handle.trip("user pressed esc");
-        }
-        assert!(abort.is_aborted());
-        assert_eq!(abort.reason().as_deref(), Some("user pressed esc"));
-
-        // The app loop also clears `active_abort` when the turn settles,
-        // so a second Esc after settle would do nothing.
-        active_abort = None;
-        assert!(active_abort.is_none());
     }
 
     #[test]

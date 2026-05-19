@@ -21,6 +21,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[&str] = &[
     "/name",
     "/export",
     "/compact",
+    "/abort",
+    "/steer",
+    "/queue-edit",
+    "/queue-remove",
+    "/queue-clear",
 ];
 
 /// One row in the slash popup.

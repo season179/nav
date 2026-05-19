@@ -1,4 +1,5 @@
 use super::*;
+use crate::control::PendingInputMode;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -223,6 +224,57 @@ fn round_trip_create_append_load() {
     }
     let loaded = store.load_session(&id).unwrap();
     assert_eq!(loaded, events);
+}
+
+#[test]
+fn round_trip_pending_queue_and_abort_events() {
+    let (_dir, store) = open_temp_store();
+    let id = store
+        .create_session(
+            Path::new("/some/project"),
+            PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+        )
+        .unwrap();
+
+    let events = vec![
+        AgentEvent::PendingInputQueued {
+            id: "pending-1".into(),
+            mode: PendingInputMode::FollowUp,
+            text: "next".into(),
+            display_text: None,
+            attachments: Vec::new(),
+            skill_name: None,
+        },
+        AgentEvent::PendingInputEdited {
+            id: "pending-1".into(),
+            text: "next, but clearer".into(),
+            display_text: None,
+            attachments: Vec::new(),
+            skill_name: None,
+        },
+        AgentEvent::PendingInputRemoved {
+            id: "pending-2".into(),
+        },
+        AgentEvent::PendingInputCleared {
+            ids: vec!["pending-3".into(), "pending-4".into()],
+        },
+        AgentEvent::PendingInputDequeued {
+            id: "pending-1".into(),
+            mode: PendingInputMode::FollowUp,
+        },
+        AgentEvent::TurnAborted {
+            turn_id: "turn-1".into(),
+            reason: "user interrupt".into(),
+        },
+    ];
+
+    for event in &events {
+        store.append_event(&id, event).unwrap();
+    }
+
+    assert_eq!(store.load_session(&id).unwrap(), events);
 }
 
 #[test]

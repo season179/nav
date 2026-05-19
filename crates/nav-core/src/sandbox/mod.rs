@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::agent::AbortSignal;
 use crate::permissions::SandboxPolicy;
 
 pub mod passthrough;
@@ -42,11 +41,6 @@ pub struct SandboxRequest {
     pub cwd: PathBuf,
     pub timeout: Duration,
     pub policy: SandboxPolicy,
-    /// Turn-scoped cancellation signal. The runner races this against the
-    /// child's wait so a long-running bash command can be killed when the
-    /// operator presses the abort key. Default value is a never-tripped
-    /// signal, matching the prior "wait until timeout or exit" behavior.
-    pub abort: AbortSignal,
 }
 
 pub trait SandboxRunner: Send + Sync {
