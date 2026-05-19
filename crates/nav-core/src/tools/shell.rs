@@ -30,31 +30,32 @@ pub(super) async fn bash(
     timeout_secs: u64,
     command: &str,
 ) -> Result<String> {
-    if let Some(rewrite) = read_rewrite(command) {
-        return run_read_rewrite(cwd, rewrite);
-    }
-
-    // shell access is powerful and risky. The classifier already gated
-    // dangerous commands in `preflight`; here we just spawn under the
-    // sandbox runner chosen for the active policy.
-    let req = SandboxRequest {
-        command: command.to_string(),
-        cwd: cwd.to_path_buf(),
-        timeout: Duration::from_secs(timeout_secs),
-        policy: permissions.sandbox_policy.clone(),
+    // Both the read-rewrite shortcut and the native sandbox path produce a
+    // single combined string; feed it through the accumulator so the
+    // model-visible output is uniformly bounded and an oversize result
+    // spills to a log file under the nav data dir with a
+    // `[Full output: <path>]` trailer.
+    let combined = if let Some(rewrite) = read_rewrite(command) {
+        run_read_rewrite(cwd, rewrite)?
+    } else {
+        // shell access is powerful and risky. The classifier already gated
+        // dangerous commands in `preflight`; here we just spawn under the
+        // sandbox runner chosen for the active policy.
+        let req = SandboxRequest {
+            command: command.to_string(),
+            cwd: cwd.to_path_buf(),
+            timeout: Duration::from_secs(timeout_secs),
+            policy: permissions.sandbox_policy.clone(),
+        };
+        let output = permissions.sandbox.run(req).await?;
+        format!(
+            "status: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status_display, output.stdout, output.stderr
+        )
     };
-    let output = permissions.sandbox.run(req).await?;
-    let combined = format!(
-        "status: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status_display, output.stdout, output.stderr
-    );
-    // Feed through the accumulator so oversized output spills to a log
-    // file under the nav data dir and only the bounded head+tail window
-    // (plus a `[Full output: <path>]` trailer) reaches the model.
     let mut acc = OutputAccumulator::new("bash")?;
     acc.push(combined.as_bytes())?;
-    let result = acc.finish()?;
-    Ok(result.content)
+    Ok(acc.finish()?.content)
 }
 
 fn read_rewrite(command: &str) -> Option<ReadRewrite> {

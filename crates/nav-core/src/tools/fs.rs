@@ -6,7 +6,7 @@ use std::{
 use tokio::process::Command;
 
 use super::ToolResult;
-use super::truncate::{GREP_MAX_LINE_LENGTH, truncate_line};
+use super::truncate::{GREP_MAX_LINE_LENGTH, MAX_BYTES, truncate_line};
 use crate::mutation::{FileChangeKind, FileChangeSummary, MutationResult, summarize_changes};
 use crate::permissions::protected::{
     PROTECTED_READ_GLOBS, is_protected_metadata_write, is_protected_read,
@@ -224,17 +224,29 @@ pub(super) fn list_files(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Resu
     apply_list_files_cap(entries)
 }
 
-/// Cap a sorted entry list to `LIST_FILES_MAX_ENTRIES` before serializing it
-/// as pretty JSON, appending a single-line trailer when entries were dropped.
-/// The trailer lives outside the JSON document so callers that already parse
-/// the array can ignore it; the model just reads it as plain text.
+/// Cap a sorted entry list to `LIST_FILES_MAX_ENTRIES` AND `MAX_BYTES`
+/// before serializing it as pretty JSON, appending a single-line trailer
+/// when entries were dropped. The trailer lives outside the JSON document
+/// so callers that already parse the array can ignore it; the model just
+/// reads it as plain text.
 fn apply_list_files_cap(mut entries: Vec<String>) -> Result<String> {
     let total = entries.len();
-    let dropped = total.saturating_sub(LIST_FILES_MAX_ENTRIES);
+    let mut dropped = total.saturating_sub(LIST_FILES_MAX_ENTRIES);
     if dropped > 0 {
         entries.truncate(LIST_FILES_MAX_ENTRIES);
     }
+    // 500 entries with very long names can still exceed MAX_BYTES; drop from
+    // the tail until the serialized payload fits with headroom for the
+    // trailer. The 500-entry cap means at most a few pops in pathological
+    // cases, so the re-serialize cost stays bounded.
+    const TRAILER_RESERVE: usize = 64;
+    let byte_budget = MAX_BYTES.saturating_sub(TRAILER_RESERVE);
     let mut out = serde_json::to_string_pretty(&entries)?;
+    while out.len() > byte_budget && !entries.is_empty() {
+        entries.pop();
+        dropped += 1;
+        out = serde_json::to_string_pretty(&entries)?;
+    }
     if dropped > 0 {
         out.push_str(&format!("\n[truncated {dropped} of {total} entries]\n"));
     }
@@ -344,20 +356,35 @@ pub(super) async fn code_search(
     }
 }
 
-/// Clip each match line and cap the result at `CODE_SEARCH_MAX_MATCHES`.
-/// Runs before the global `bound(.., Head)` so the global byte/line cap
-/// rarely fires on grep output. Empty stdout (no matches) passes through.
+/// Clip each match line and cap the result at `CODE_SEARCH_MAX_MATCHES`
+/// AND at `MAX_BYTES` so the per-tool trailer survives the global head
+/// bound applied in `run_tool`. Empty stdout (no matches) passes through.
 fn apply_code_search_caps(stdout: &str) -> String {
-    let mut lines = stdout.lines();
+    // 100 clipped lines can exceed MAX_BYTES (100 * 515b + newlines > 50 KB).
+    // Reserve a small headroom so the PRD-specified `[truncated N of TOTAL
+    // matches]` trailer always fits before the global head bound trims it.
+    const TRAILER_RESERVE: usize = 64;
+    let line_budget = MAX_BYTES.saturating_sub(TRAILER_RESERVE);
+
+    let mut all = stdout.lines();
     let mut out = String::new();
     let mut kept = 0usize;
-    for line in lines.by_ref().take(CODE_SEARCH_MAX_MATCHES) {
+    let mut byte_budget_hit = false;
+
+    for line in all.by_ref().take(CODE_SEARCH_MAX_MATCHES) {
         let (clipped, _) = truncate_line(line, GREP_MAX_LINE_LENGTH);
+        if out.len() + clipped.len() + 1 > line_budget {
+            byte_budget_hit = true;
+            break;
+        }
         out.push_str(&clipped);
         out.push('\n');
         kept += 1;
     }
-    let dropped = lines.count();
+    // `all.count()` is the source-iterator remainder after `take(N)` consumed
+    // its quota or we broke out early. When we broke for budget, the
+    // already-consumed-but-rejected line isn't in that remainder, so add 1.
+    let dropped = all.count() + if byte_budget_hit { 1 } else { 0 };
     if dropped > 0 {
         let total = kept + dropped;
         out.push_str(&format!("[truncated {dropped} of {total} matches]\n"));

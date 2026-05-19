@@ -13,8 +13,8 @@
 //! [`sweep_old`] — see `docs/per-turn-token-bounding-prd.md`.
 
 use anyhow::{Context, Result};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,6 +34,8 @@ pub struct OutputAccumulator {
     rolling: Vec<u8>,
     spill: Option<File>,
     spill_path: PathBuf,
+    dir: PathBuf,
+    prefix: String,
 }
 
 pub struct AccumulatorOutput {
@@ -56,6 +58,8 @@ impl OutputAccumulator {
             rolling: Vec::new(),
             spill: None,
             spill_path: unique_path(dir, prefix),
+            dir: dir.to_path_buf(),
+            prefix: prefix.to_string(),
         })
     }
 
@@ -74,16 +78,23 @@ impl OutputAccumulator {
         Ok(())
     }
 
-    /// Finalize the accumulator. With no spill the buffered bytes are
-    /// returned as-is (small outputs stay verbatim). With a spill, the full
-    /// output is materialized on disk, the bounded model-visible window is
-    /// rendered via the existing head+tail truncator, and a single trailer
-    /// line `\n[Full output: <abs path>]\n` is appended last.
+    /// Finalize the accumulator. Output is always bounded via the
+    /// head+tail truncator so the model-visible window obeys `MAX_BYTES` /
+    /// `MAX_LINES` regardless of how big the rolling buffer grew. With a
+    /// spill, the full output is also materialized on disk and a single
+    /// trailer line `\n[Full output: <abs path>]\n` is appended last so the
+    /// operator can read everything that was dropped.
     pub fn finish(mut self) -> Result<AccumulatorOutput> {
         if self.spill.is_none() {
             let content = String::from_utf8_lossy(&self.rolling).into_owned();
-            return Ok(AccumulatorOutput {
+            let bounded = bound(
                 content,
+                TruncateMode::HeadTail {
+                    head_lines: BASH_HEAD_LINES,
+                },
+            );
+            return Ok(AccumulatorOutput {
+                content: bounded,
                 spill_path: None,
             });
         }
@@ -120,15 +131,44 @@ impl OutputAccumulator {
         }
         let count = count.min(self.rolling.len());
         if self.spill.is_none() {
-            let file = File::create(&self.spill_path)
-                .with_context(|| format!("failed to create {}", self.spill_path.display()))?;
-            self.spill = Some(file);
+            self.open_spill()?;
         }
         let file = self.spill.as_mut().expect("spill file just opened above");
         file.write_all(&self.rolling[..count])
             .with_context(|| format!("failed to write {}", self.spill_path.display()))?;
         self.rolling.drain(..count);
         Ok(())
+    }
+
+    /// Open the spill file with `create_new` so a concurrent process can't
+    /// silently clobber our log. On the (essentially impossible) collision —
+    /// same pid, same millisecond, same intra-process counter — pick a fresh
+    /// path and retry a bounded number of times.
+    fn open_spill(&mut self) -> Result<()> {
+        for _ in 0..3 {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.spill_path)
+            {
+                Ok(file) => {
+                    self.spill = Some(file);
+                    return Ok(());
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                    self.spill_path = unique_path(&self.dir, &self.prefix);
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to create {}", self.spill_path.display())
+                    });
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "failed to allocate a unique spill file in {} after 3 attempts",
+            self.dir.display()
+        ))
     }
 
     #[cfg(test)]
@@ -170,7 +210,13 @@ fn try_sweep_old() -> Result<()> {
             Err(_) => continue,
         };
         if mtime < cutoff {
-            let _ = fs::remove_file(entry.path());
+            let path = entry.path();
+            if let Err(err) = fs::remove_file(&path) {
+                eprintln!(
+                    "nav-core: failed to remove stale spill {}: {err}",
+                    path.display()
+                );
+            }
         }
     }
     Ok(())
@@ -189,7 +235,8 @@ fn unique_path(dir: &Path, prefix: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    dir.join(format!("{prefix}-{ts}-{seq}.log"))
+    let pid = std::process::id();
+    dir.join(format!("{prefix}-{ts}-{pid}-{seq}.log"))
 }
 
 #[cfg(test)]
@@ -250,5 +297,47 @@ mod tests {
         let out = acc.finish().unwrap();
         assert!(out.content.is_empty());
         assert!(out.spill_path.is_none());
+    }
+
+    #[test]
+    fn no_spill_payload_above_max_bytes_still_gets_bounded() {
+        // Output between MAX_BYTES and MAX_ROLLING_BYTES never triggers a
+        // spill, but it must still be bounded by `MAX_BYTES` / `MAX_LINES`
+        // before the model sees it. Without this, finish() used to return
+        // the raw 70 KB verbatim.
+        let dir = tempdir().unwrap();
+        let mut acc = OutputAccumulator::with_dir(dir.path(), "bash").unwrap();
+        let payload = "z".repeat(70 * 1024);
+        acc.push(payload.as_bytes()).unwrap();
+        let out = acc.finish().unwrap();
+        assert!(out.spill_path.is_none(), "70 KB should not spill");
+        assert!(
+            out.content.len() <= MAX_BYTES + 256,
+            "no-spill content was {} bytes; expected bounded near MAX_BYTES",
+            out.content.len()
+        );
+        assert!(out.content.contains("[truncated"));
+    }
+
+    #[test]
+    fn no_spill_line_overflow_still_gets_bounded() {
+        // Many tiny lines under the byte cap can still blow the line cap
+        // (MAX_LINES = 2000). finish() must enforce the line cap too.
+        let dir = tempdir().unwrap();
+        let mut acc = OutputAccumulator::with_dir(dir.path(), "bash").unwrap();
+        let payload: String = (0..5000).map(|i| format!("{i}\n")).collect();
+        acc.push(payload.as_bytes()).unwrap();
+        let out = acc.finish().unwrap();
+        assert!(
+            out.spill_path.is_none(),
+            "5000 short lines should not spill"
+        );
+        assert!(out.content.contains("[truncated"));
+        let kept_lines = out.content.lines().count();
+        // Head+tail with a marker line in the middle — well under 5000.
+        assert!(
+            kept_lines < 3000,
+            "kept {kept_lines} lines; expected line bound to fire"
+        );
     }
 }
