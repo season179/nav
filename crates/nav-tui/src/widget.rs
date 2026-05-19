@@ -76,6 +76,22 @@ impl ChatWidget {
                 self.push_user_event(text, display_text);
             }
             AgentEvent::AssistantMessageDelta { .. } | AgentEvent::TurnComplete { .. } => {}
+            AgentEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                delay_ms,
+                reason,
+            } => {
+                let secs = delay_ms as f64 / 1000.0;
+                self.cells.push(Box::new(ErrorCell::new(format!(
+                    "provider retry {attempt}/{max_attempts} after {secs:.1}s — {reason}"
+                ))));
+            }
+            AgentEvent::ContextTrimmed { dropped_pairs } => {
+                self.cells.push(Box::new(ErrorCell::new(format!(
+                    "context window exceeded — trimmed {dropped_pairs} oldest tool pair(s) and retried"
+                ))));
+            }
             AgentEvent::AssistantMessageDone { text } => {
                 self.cells.push(Box::new(AssistantMessageCell::new(text)));
             }

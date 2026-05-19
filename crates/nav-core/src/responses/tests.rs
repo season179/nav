@@ -9,6 +9,85 @@ use crate::skills::Catalog;
 use serde_json::json;
 use std::path::PathBuf;
 
+// ── detect_context_overflow ───────────────────────────────────
+
+#[test]
+fn detect_context_overflow_matches_top_level_error() {
+    let event = json!({
+        "type": "error",
+        "code": "context_length_exceeded",
+        "message": "Your input exceeds the model's context"
+    });
+    let msg = detect_context_overflow(&event).expect("should detect overflow");
+    assert!(msg.contains("exceeds the model's context"));
+}
+
+#[test]
+fn detect_context_overflow_matches_response_failed_shape() {
+    let event = json!({
+        "type": "response.failed",
+        "response": {
+            "error": {
+                "code": "context_window_exceeded",
+                "message": "Too long"
+            }
+        }
+    });
+    let msg = detect_context_overflow(&event).expect("should detect overflow");
+    assert_eq!(msg, "Too long");
+}
+
+#[test]
+fn detect_context_overflow_ignores_other_error_codes() {
+    let event = json!({
+        "type": "error",
+        "code": "rate_limit_exceeded",
+        "message": "Slow down"
+    });
+    assert!(detect_context_overflow(&event).is_none());
+}
+
+#[test]
+fn detect_context_overflow_ignores_non_error_events() {
+    let event = json!({"type": "response.completed", "response": {}});
+    assert!(detect_context_overflow(&event).is_none());
+}
+
+#[test]
+fn detect_http_overflow_matches_responses_api_error_body() {
+    let body = r#"{"error":{"code":"context_length_exceeded","message":"Your input is 220k tokens; the model supports 200k."}}"#;
+    let msg = detect_http_overflow(body).expect("should match");
+    assert!(msg.contains("220k tokens"));
+}
+
+#[test]
+fn detect_http_overflow_matches_window_alias() {
+    let body = r#"{"error":{"code":"context_window_exceeded","message":"too long"}}"#;
+    assert_eq!(detect_http_overflow(body).as_deref(), Some("too long"));
+}
+
+#[test]
+fn detect_http_overflow_ignores_other_errors() {
+    let body = r#"{"error":{"code":"invalid_request_error","message":"bad model"}}"#;
+    assert!(detect_http_overflow(body).is_none());
+}
+
+#[test]
+fn detect_http_overflow_ignores_non_json_body() {
+    assert!(detect_http_overflow("not json at all").is_none());
+    assert!(detect_http_overflow("").is_none());
+}
+
+#[test]
+fn responses_error_round_trips_to_anyhow() {
+    let err = ResponsesError::ContextWindowExceeded {
+        message: "boom".into(),
+    };
+    let anyhow_err: anyhow::Error = err.into();
+    assert!(anyhow_err.to_string().contains("context window exceeded"));
+    assert!(anyhow_err.to_string().contains("boom"));
+}
+
 // ── response_body ─────────────────────────────────────────────
 
 #[test]

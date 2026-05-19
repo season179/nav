@@ -1,14 +1,15 @@
 use anyhow::{Context, Result, bail};
 use nav_core::{
-    AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, SessionBinding,
-    SessionStore, SessionSummary, auth, cli::Args, discover_skills, load_project_context,
-    rebuild_responses_input, run_agent, shorten_home,
+    AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
+    SessionBinding, SessionStore, SessionSummary, auth, cli::Args, discover_skills,
+    load_project_context, rebuild_responses_input, run_agent, shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -64,10 +65,21 @@ async fn main() -> Result<()> {
     };
 
     let auth_config = auth::load_auth(&args)?;
+    // No global `.timeout()` — a streaming turn legitimately runs for minutes.
+    // The SSE/WS idle timeout below is what catches stuck streams.
     let client = reqwest::Client::builder()
         .default_headers(auth::default_headers(&auth_config)?)
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
         .build()?;
-    let transport = Arc::new(OpenAiTransport::new(client, auth_config, args.transport));
+    let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
+    let transport = Arc::new(OpenAiTransport::with_config(
+        client,
+        auth_config,
+        args.transport,
+        idle_timeout,
+        RetryPolicy::default(),
+    ));
 
     // Drain piped stdin up-front so it works regardless of which mode we end
     // up in — interactive TUI (`cat prompt.txt | nav` seeds the composer with

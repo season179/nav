@@ -15,7 +15,7 @@ pub use project::{
     ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,
     shorten_home,
 };
-pub use responses::OpenAiTransport;
+pub use responses::{OpenAiTransport, RetryPolicy};
 pub use session::{
     PROVIDER_OPENAI_RESPONSES, ReportedCost, SessionId, SessionStore, SessionSummary,
 };

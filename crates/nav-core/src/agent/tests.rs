@@ -13,15 +13,37 @@ use tokio::sync::mpsc;
 
 // ── stub transport ────────────────────────────────────────────
 
+/// One unit of stream output a stub can hand back per turn.
+///
+/// Used by the few tests that need to inject a transport error (e.g. a
+/// `context_length_exceeded`) into the middle of the agent loop. The normal
+/// "happy path" tests use `StubTransport::new(turns_of_values)`, which lifts
+/// `Value`s into `StubItem::Event` automatically.
+enum StubItem {
+    Event(Value),
+    Err(crate::responses::ResponsesError),
+}
+
 /// Pops one canned event list per `create()` call so each turn of the
 /// agent loop sees the next pre-recorded `Responses` API stream.
 struct StubTransport {
-    turns: Mutex<Vec<Vec<Value>>>,
+    turns: Mutex<Vec<Vec<StubItem>>>,
     bodies: Mutex<Vec<Value>>,
 }
 
 impl StubTransport {
     fn new(turns: Vec<Vec<Value>>) -> Self {
+        let turns = turns
+            .into_iter()
+            .map(|turn| turn.into_iter().map(StubItem::Event).collect())
+            .collect();
+        Self {
+            turns: Mutex::new(turns),
+            bodies: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_items(turns: Vec<Vec<StubItem>>) -> Self {
         Self {
             turns: Mutex::new(turns),
             bodies: Mutex::new(Vec::new()),
@@ -73,9 +95,10 @@ impl ResponsesTransport for StubTransport {
     fn create<'a>(
         &'a self,
         body: Value,
+        _events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = Result<EventStream>> + Send + 'a>> {
         self.bodies.lock().unwrap().push(body);
-        let events = {
+        let turn_events = {
             let mut guard = self.turns.lock().unwrap();
             if guard.is_empty() {
                 Vec::new()
@@ -84,7 +107,10 @@ impl ResponsesTransport for StubTransport {
             }
         };
         Box::pin(async move {
-            let s = stream::iter(events.into_iter().map(Ok));
+            let s = stream::iter(turn_events.into_iter().map(|item| match item {
+                StubItem::Event(value) => Ok(value),
+                StubItem::Err(err) => Err(err),
+            }));
             let boxed: EventStream = Box::pin(s);
             Ok(boxed)
         })
@@ -97,9 +123,55 @@ impl ResponsesTransport for FailingTransport {
     fn create<'a>(
         &'a self,
         _body: Value,
+        _events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = Result<EventStream>> + Send + 'a>> {
         Box::pin(async { Err(anyhow::anyhow!("network down")) })
     }
+}
+
+// ── drop_oldest_tool_pair ────────────────────────────────────
+
+#[test]
+fn drop_oldest_tool_pair_removes_first_call_and_matching_output() {
+    let mut input = vec![
+        json!({"type": "message", "role": "user", "content": "hi"}),
+        json!({"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "c1", "output": "first"}),
+        json!({"type": "function_call", "call_id": "c2", "name": "bash", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "c2", "output": "second"}),
+    ];
+    let dropped = drop_oldest_tool_pair(&mut input);
+    assert_eq!(dropped, 1);
+    assert_eq!(input.len(), 3);
+    // c2 pair survives; c1 entries are gone.
+    let kept_call_ids: Vec<&str> = input
+        .iter()
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(kept_call_ids, vec!["c2", "c2"]);
+}
+
+#[test]
+fn drop_oldest_tool_pair_returns_zero_when_no_calls() {
+    let mut input = vec![json!({"type": "message", "role": "user", "content": "hi"})];
+    let dropped = drop_oldest_tool_pair(&mut input);
+    assert_eq!(dropped, 0);
+    assert_eq!(input.len(), 1);
+}
+
+#[test]
+fn drop_oldest_tool_pair_handles_interleaved_items() {
+    // The matching `function_call_output` does not have to be immediately
+    // adjacent to its `function_call`.
+    let mut input = vec![
+        json!({"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"}),
+        json!({"type": "message", "role": "assistant", "content": "thinking..."}),
+        json!({"type": "function_call_output", "call_id": "c1", "output": "done"}),
+    ];
+    let dropped = drop_oldest_tool_pair(&mut input);
+    assert_eq!(dropped, 1);
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["type"], "message");
 }
 
 // ── extract_message_text ──────────────────────────────────────
@@ -837,4 +909,278 @@ async fn user_message_with_image_attachment_is_sent_as_input_image_content() {
         url.starts_with("data:image/png;base64,") && url.contains(&expected_b64),
         "unexpected image_url: {url}"
     );
+}
+
+// ── context-overflow recovery ─────────────────────────────────
+
+#[tokio::test]
+async fn overflow_one_shot_recovery_trims_and_continues() {
+    // Turn 1: model asks for a tool call.
+    let turn_one = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    // Turn 2: server says we blew the context window.
+    let turn_two = vec![StubItem::Err(
+        crate::responses::ResponsesError::ContextWindowExceeded {
+            message: "input is too long".into(),
+        },
+    )];
+    // Turn 3 (after recovery trims the oldest tool pair): model finishes.
+    let turn_three = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let transport = StubTransport::with_items(vec![turn_one, turn_two, turn_three]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 6;
+    let cwd = tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "go",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+    )
+    .await
+    .expect("recovery should succeed");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let trimmed = events
+        .iter()
+        .find(|e| matches!(e, AgentEvent::ContextTrimmed { .. }))
+        .expect("expected ContextTrimmed event");
+    assert!(matches!(
+        trimmed,
+        AgentEvent::ContextTrimmed { dropped_pairs } if *dropped_pairs == 1
+    ));
+
+    // The recovery-retry body (3rd `create()` call) must no longer contain
+    // the original `function_call` for call_1.
+    let bodies = transport.bodies();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "agent should make exactly 3 transport calls"
+    );
+    let recovery_input = bodies[2]
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("recovery body has input");
+    let has_call_1 = recovery_input.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("call_id").and_then(Value::as_str) == Some("call_1")
+    });
+    assert!(!has_call_1, "call_1 should have been trimmed");
+
+    // Recovery is one-shot; the flag is consumed. No need to assert directly.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AssistantMessageDone { text } if text == "ok"))
+    );
+}
+
+#[tokio::test]
+async fn overflow_recovery_does_not_consume_turn_budget() {
+    // With max_turns=2, the agent must still be able to (1) run a tool-call
+    // turn, (2) hit overflow, trim, (3) retry, and (4) finish — even though
+    // the trim+retry conceptually happens on what would have been the "last"
+    // turn. Recovery is bookkeeping, not a real model turn.
+    let turn_one = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let turn_two_overflow = vec![StubItem::Err(
+        crate::responses::ResponsesError::ContextWindowExceeded {
+            message: "too long".into(),
+        },
+    )];
+    let turn_three_after_trim = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "done"}]
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let transport = StubTransport::with_items(vec![
+        turn_one,
+        turn_two_overflow,
+        turn_three_after_trim,
+    ]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 2;
+    let cwd = tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "go",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+    )
+    .await
+    .expect("recovery on the last allowed turn should still succeed");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextTrimmed { dropped_pairs: 1 }))
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AssistantMessageDone { text } if text == "done"))
+    );
+    assert_eq!(transport.bodies().len(), 3, "3 transport calls expected");
+}
+
+#[tokio::test]
+async fn overflow_second_failure_surfaces_clean_error() {
+    // Turn 1: tool call to seed a droppable pair.
+    let turn_one = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    // First overflow.
+    let turn_two = vec![StubItem::Err(
+        crate::responses::ResponsesError::ContextWindowExceeded {
+            message: "too long".into(),
+        },
+    )];
+    // Second overflow — recovery already consumed, must surface as Error.
+    let turn_three = vec![StubItem::Err(
+        crate::responses::ResponsesError::ContextWindowExceeded {
+            message: "still too long".into(),
+        },
+    )];
+    let transport = StubTransport::with_items(vec![turn_one, turn_two, turn_three]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 6;
+    let cwd = tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    let err = run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "go",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+    )
+    .await
+    .expect_err("second overflow should fail");
+    assert!(err.to_string().contains("context window exceeded"));
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let trimmed_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ContextTrimmed { .. }))
+        .count();
+    assert_eq!(trimmed_count, 1, "recovery should only fire once");
+    let error_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Error { .. }))
+        .count();
+    assert_eq!(error_count, 1);
+}
+
+// ── transport-level retry plumbing ────────────────────────────
+
+#[tokio::test]
+async fn create_failure_does_not_emit_retry_event_from_stub() {
+    // The stub doesn't perform retry; this is here to lock in that the
+    // `events` parameter is wired through `create()` and unused stubs
+    // continue to compile (no behavioral assertion on retry — that's
+    // tested in `responses::retry` directly).
+    let cwd = tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    let err = run_agent(
+        &FailingTransport,
+        &Args::test_default(),
+        &cwd,
+        "hi",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+    )
+    .await
+    .expect_err("should fail");
+    assert!(err.to_string().contains("network down"));
 }
