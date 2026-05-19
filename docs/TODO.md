@@ -28,24 +28,18 @@ are the unchecked items at the top; shipped foundation stays here as evidence.
      session naming command, or transcript export.
 4. [x] Add long-session compaction: manual `/compact`, automatic threshold
    compaction, persisted summaries, and clear replay behavior after compaction.
-   - Done: first-class compaction path in `nav-core/src/agent/compaction.rs`
-     (Codex-style "context checkpoint handoff" prompt + replacement-history
-     builder). New durable `AgentEvent::Compaction{Started,Completed,Failed}`
-     variants persist through SQLite. `run_agent` detects `/compact`, runs a
-     non-steerable compaction turn, and replaces model-visible history with
-     `summary + recent user messages`. Replay slices from the latest
-     compaction checkpoint in `rebuild_responses_input` so a resumed session
-     never silently expands back to the full pre-compaction transcript.
-     `/compact` is a built-in TUI slash command; second prompts submitted
-     during compaction queue and fire on completion. Automatic compaction
-     fires before submitting a new turn when rolling session tokens cross
-     `auto_compact_fraction × auto_compact_token_limit` (CLI flags + project
-     settings). Existing overflow trim is kept as fallback inside both the
-     normal turn loop and the compaction turn itself.
-   - Outstanding (deferred): mid-turn auto-compaction during long tool loops
-     (PRD user story 18) is not implemented in this slice; the pre-turn
-     auto-compaction covers user story 17. Provider adapter cleanup
-     (PRD note 69) stays in the provider-adapters track.
+   - Done in commit 0a86743 (merged as 82484e1): first-class compaction module
+     with Codex-style checkpoint prompt + replacement-history builder; durable
+     `AgentEvent::Compaction{Started,Completed,Failed}` events; non-steerable
+     manual `/compact`; persisted SQLite checkpoints; replay slicing from the
+     latest checkpoint; TUI `/compact` routing, compaction cells, and queued
+     prompts while compaction is running; pre-turn automatic compaction via
+     `auto_compact_fraction × auto_compact_token_limit` CLI/settings; overflow
+     trim fallback for normal and compaction turns.
+   - Verified with `cargo test -p nav-core -p nav-tui` (438 nav-core tests, 63
+     nav-tui unit tests, 7 composer tests, 16 snapshot tests). Deferred outside
+     this checklist item: true mid-turn compaction inside an active tool loop;
+     current automatic compaction runs before the next user turn.
 5. [ ] Improve install, auth, and diagnostics UX: add `nav doctor`, clearer
    login/auth/model errors, and reliable update/reinstall checks.
    - Partial: contextual auth errors in `nav-core/src/auth.rs` and
