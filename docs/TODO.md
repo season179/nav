@@ -178,9 +178,32 @@ small slice earlier.
      cursor panic, popup Down-arrow, escaped paths, resumed-session
      attachment paths) shipped in commits 50def85, 729ea70, d93b1a5,
      262d0d4 before this work.
-2. [ ] Add advanced session workflows: fork/clone, tree navigation, branch
+2. [x] Add advanced session workflows: fork/clone, tree navigation, branch
    summaries, labels, and richer transcript search.
-   - Not started.
+   - Done in commit dc6cfd0: schema v3 migration adds
+     `session.parent_id`/`fork_point_seq`, a `label` table with
+     `idx_label_name`, and an `event_fts` FTS5 virtual table backed by
+     insert/delete triggers that extract `$.text` from user/assistant
+     event payloads (`nav-core/src/session/init.sql`,
+     `nav-core/src/session/mod.rs`). `SessionStore` gains
+     `fork_session`, `list_children`, `walk_tree`, `add_label`,
+     `remove_label`, `labels_for`, `list_by_label`, and
+     `search_transcript`, and `SessionSummary` carries `parent_id`,
+     `labels`, and `child_count` for the picker. The CLI exposes a new
+     `nav sessions {fork,tree,label,unlabel,search}` subcommand group;
+     `--list-sessions` keeps working and now indents children under
+     their parent and shows labels. TUI mirrors the surface with
+     `/fork [seq]`, `/tree`, `/label <text>`, `/unlabel <text>`, and
+     `/find <query>`; the `/sessions` cell auto-switches to tree mode
+     when any `parent_id` is present in the result set. Fork resume
+     reads its own event stream because parent events are copied at
+     fork time.
+   - Verified with `cargo fmt --all -- --check`, `cargo clippy
+     -p nav-core -p nav-cli -p nav-tui --all-targets`, and `cargo test
+     -p nav-core -p nav-cli -p nav-tui` (564 tests across 7 suites,
+     including the new v2→v3 migration, fork-copies-events,
+     labels-round-trip, depth-ordered `walk_tree`, and
+     cross-session FTS phrase coverage).
 3. [ ] Add optional git checkpointing: checkpoint/stash/restore support for
    users who want reversible agent turns.
    - Not started.
