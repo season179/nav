@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::composer::Composer;
 use super::view::InputResult;
+use crate::theme::Theme;
 
 /// One row in the @file mention popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ impl MentionEntry {
 /// matches codex `chat_composer.rs::insert_selected_path` semantics.
 pub struct FileMentionPopup {
     entries: Arc<[MentionEntry]>,
+    theme: Theme,
     /// Indices into `entries`, ranked by nucleo match score (best first).
     /// Truncated to [`MAX_VISIBLE`] so navigation never exceeds what's drawn.
     matches: Vec<usize>,
@@ -53,9 +55,10 @@ pub struct FileMentionPopup {
 const MAX_VISIBLE: usize = 8;
 
 impl FileMentionPopup {
-    pub fn new(entries: Arc<[MentionEntry]>, initial_query: &str) -> Self {
+    pub fn new(entries: Arc<[MentionEntry]>, initial_query: &str, theme: Theme) -> Self {
         let mut popup = Self {
             entries,
+            theme,
             matches: Vec::new(),
             selected: 0,
             completed: false,
@@ -176,7 +179,7 @@ impl FileMentionPopup {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let bg = Style::default().bg(crate::theme::POPUP_BG);
+        let bg = Style::default().bg(self.theme.popup_bg);
         Block::default().style(bg).render(area, buf);
 
         if self.matches.is_empty() {
@@ -287,7 +290,7 @@ mod tests {
 
     #[test]
     fn empty_query_surfaces_prefix() {
-        let popup = FileMentionPopup::new(entries(&["a.rs", "b.rs", "c.rs"]), "");
+        let popup = FileMentionPopup::new(entries(&["a.rs", "b.rs", "c.rs"]), "", Theme::default());
         let names: Vec<&str> = popup.matches().iter().map(|e| e.display.as_str()).collect();
         assert_eq!(names, vec!["a.rs", "b.rs", "c.rs"]);
     }
@@ -297,6 +300,7 @@ mod tests {
         let popup = FileMentionPopup::new(
             entries(&["src/main.rs", "tests/integration.rs", "src/composer.rs"]),
             "composer",
+            Theme::default(),
         );
         let first = popup
             .matches()
@@ -330,7 +334,8 @@ mod tests {
         // calls `set_query` with the same token on every keystroke. Prior to
         // the no-op guard, this reset `selected` to 0 and the user could
         // never move past the first row.
-        let mut popup = FileMentionPopup::new(entries(&["a.rs", "b.rs", "c.rs"]), "");
+        let mut popup =
+            FileMentionPopup::new(entries(&["a.rs", "b.rs", "c.rs"]), "", Theme::default());
         assert_eq!(popup.selected, 0);
         popup.handle_key(
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
@@ -344,7 +349,8 @@ mod tests {
 
     #[test]
     fn completing_non_image_path_queues_file_attachment() {
-        let mut popup = FileMentionPopup::new(entries(&["src/main.rs", "README.md"]), "");
+        let mut popup =
+            FileMentionPopup::new(entries(&["src/main.rs", "README.md"]), "", Theme::default());
         let mut composer = Composer::new();
         composer.insert_paste("@");
         popup.set_query("src/main");
@@ -364,7 +370,7 @@ mod tests {
 
     #[test]
     fn completing_image_path_queues_image_attachment() {
-        let mut popup = FileMentionPopup::new(entries(&["assets/cat.png"]), "");
+        let mut popup = FileMentionPopup::new(entries(&["assets/cat.png"]), "", Theme::default());
         let mut composer = Composer::new();
         composer.insert_paste("@");
         popup.set_query("cat");
@@ -405,7 +411,8 @@ mod tests {
     fn changing_query_resets_selection() {
         // Real query changes still reset to 0 so the user lands on the top
         // ranked result for the new pattern.
-        let mut popup = FileMentionPopup::new(entries(&["alpha", "beta", "gamma"]), "");
+        let mut popup =
+            FileMentionPopup::new(entries(&["alpha", "beta", "gamma"]), "", Theme::default());
         popup.handle_key(
             KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
             &mut Composer::new(),

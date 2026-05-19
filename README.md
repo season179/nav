@@ -85,6 +85,8 @@ Inside the TUI:
 - `Up` / `Down` recall earlier prompts from this session.
 - A leading `/` opens a slash-command popup (`/help`, `/clear`, `/context`,
   `/quit`, `/resume`, `/sessions`). Type to filter, Tab/Enter completes.
+- Prompt templates registered by extensions appear as `/prompt:<name>` and
+  wrap the next prompt with the template body.
 - `/quit` and `Ctrl+C` twice exit cleanly; `/clear` empties the transcript.
 - `/context [all]` estimates the current context distribution without sending
   a model turn.
@@ -161,3 +163,37 @@ bun run start
 
 Tool paths are resolved inside the current working directory.
 Absolute paths, parent traversal (`..`), and symbolic-link escapes are rejected.
+
+## Extensions
+
+Local extensions live under `<cwd>/.nav/extensions/<name>/extension.json` or
+`~/.nav/extensions/<name>/extension.json`. Project extensions shadow user
+extensions by registered prompt-template or theme name.
+
+```json
+{
+  "name": "team",
+  "description": "Team-local nav helpers",
+  "prompt_templates": [
+    {
+      "name": "review",
+      "description": "Review the current change",
+      "path": "prompts/review.md"
+    }
+  ],
+  "themes": [
+    {
+      "name": "night",
+      "colors": {
+        "composer_bg": "#111827",
+        "popup_bg": "#0f172a"
+      }
+    }
+  ]
+}
+```
+
+Use `/prompt:review <request>` in the TUI, or set `"theme": "night"` in
+`.nav/settings.json`. `nav extensions list` shows discovered manifests.
+Manifest sections for `custom_tools`, `mcp_servers`, `hooks`, and `packages`
+are counted for visibility but not executed yet.

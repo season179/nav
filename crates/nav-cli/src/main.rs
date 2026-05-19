@@ -9,9 +9,13 @@ use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
     SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, agent,
     agent_event_notification, auth,
-    cli::{Args, CliCommand, CliExportFormat, GitAction, SessionsAction, sandbox_policy_from_args},
-    discover_skills, doctor, git_checkpoint, layout_session_tree, load_project_context, models,
-    rebuild_responses_input, session_started_notification, shorten_home,
+    cli::{
+        Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, SessionsAction,
+        sandbox_policy_from_args,
+    },
+    discover_extensions, discover_skills, doctor, git_checkpoint, layout_session_tree,
+    load_project_context, models, rebuild_responses_input, session_started_notification,
+    shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -40,12 +44,13 @@ async fn main() -> Result<()> {
     // from settings, but a settings file can fill defaults.
     let project = Arc::new(load_project_context(&cwd));
     args.apply_settings(&project.settings, &provided);
+    let extensions = Arc::new(discover_extensions(&cwd));
 
     // Subcommands run with the same merged args + project context the agent
     // loop would see, so `nav doctor` and `nav export` reflect a configured
     // project's `.nav/settings.json` instead of bare clap defaults.
     if let Some(command) = args.command.clone() {
-        return run_cli_command(&args, &cwd, project.as_ref(), command);
+        return run_cli_command(&args, &cwd, project.as_ref(), extensions.as_ref(), command);
     }
 
     if !models::is_known_model_prefix(&args.model) {
@@ -66,7 +71,7 @@ async fn main() -> Result<()> {
     let is_tty = std::io::stdout().is_terminal();
     let is_headless_mode = !is_tty || args.json_events || args.json_rpc;
     if is_headless_mode {
-        print_headless_banner(&args, &cwd, project.as_ref());
+        print_headless_banner(&args, &cwd, project.as_ref(), extensions.as_ref());
     }
 
     // Locked to launch cwd so the system prompt and slash popup never
@@ -142,6 +147,7 @@ async fn main() -> Result<()> {
             resume_events,
             combined_prompt,
             skills,
+            extensions,
             project,
         )
         .await;
@@ -203,6 +209,7 @@ fn run_cli_command(
     args: &Args,
     cwd: &Path,
     project: &ProjectContext,
+    extensions: &nav_core::ExtensionCatalog,
     command: CliCommand,
 ) -> Result<()> {
     match command {
@@ -214,6 +221,7 @@ fn run_cli_command(
         CliCommand::Doctor { json } => doctor_command(args, cwd, project, json),
         CliCommand::Sessions { action } => sessions_command(args, action),
         CliCommand::Git { action } => git_command(cwd, action),
+        CliCommand::Extensions { action } => extensions_command(extensions, action),
     }
 }
 
@@ -246,6 +254,39 @@ fn git_command(cwd: &Path, action: GitAction) -> Result<()> {
                         entry.subject
                     );
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extensions_command(
+    extensions: &nav_core::ExtensionCatalog,
+    action: ExtensionsAction,
+) -> Result<()> {
+    match action {
+        ExtensionsAction::List => {
+            if extensions.is_empty() {
+                println!("(no extensions)");
+                return Ok(());
+            }
+            println!(
+                "{:<20}  {:<8}  {:>9}  {:>6}  {:>6}  {:>4}  {:>5}  {:>8}  manifest",
+                "name", "scope", "templates", "themes", "tools", "mcp", "hooks", "packages"
+            );
+            for extension in extensions.extensions() {
+                println!(
+                    "{:<20}  {:<8}  {:>9}  {:>6}  {:>6}  {:>4}  {:>5}  {:>8}  {}",
+                    truncate(&extension.name, 20),
+                    extension.scope.as_str(),
+                    extension.prompt_template_count,
+                    extension.theme_count,
+                    extension.custom_tool_count,
+                    extension.mcp_server_count,
+                    extension.hook_count,
+                    extension.package_count,
+                    extension.manifest_path.display()
+                );
             }
         }
     }
@@ -608,7 +649,12 @@ fn run_upgrade() -> Result<()> {
 /// One-shot startup banner emitted to stderr in headless mode. Mirrors the
 /// lines the TUI welcome cell shows so frontends can still see which model,
 /// branch, and context files are in play. Stdout is reserved for machine data.
-fn print_headless_banner(args: &Args, cwd: &Path, project: &ProjectContext) {
+fn print_headless_banner(
+    args: &Args,
+    cwd: &Path,
+    project: &ProjectContext,
+    extensions: &nav_core::ExtensionCatalog,
+) {
     let mut header = format!("nav · model {} · cwd {}", args.model, shorten_home(cwd));
     if let Some(branch) = project.branch_summary() {
         header.push_str(&format!(" · branch {branch}"));
@@ -619,6 +665,9 @@ fn print_headless_banner(args: &Args, cwd: &Path, project: &ProjectContext) {
     }
     if let Some(summary) = project.settings_summary(cwd) {
         eprintln!("settings: {summary}");
+    }
+    if let Some(summary) = extensions.summary() {
+        eprintln!("extensions: {summary}");
     }
 }
 

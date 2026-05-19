@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::composer::Composer;
 use super::view::InputResult;
+use crate::theme::Theme;
 
 /// Built-in slash commands the TUI always offers.
 pub const BUILTIN_SLASH_COMMANDS: &[&str] = &[
@@ -83,6 +84,7 @@ fn builtin_description(command: &str) -> Option<&'static str> {
 /// never clone an entry.
 pub struct SlashCommandPopup {
     entries: Arc<[SlashEntry]>,
+    theme: Theme,
     filter: String,
     matches: Vec<usize>,
     selected: usize,
@@ -90,10 +92,11 @@ pub struct SlashCommandPopup {
 }
 
 impl SlashCommandPopup {
-    pub fn new(entries: Arc<[SlashEntry]>) -> Self {
+    pub fn new(entries: Arc<[SlashEntry]>, theme: Theme) -> Self {
         let matches = (0..entries.len()).collect();
         Self {
             entries,
+            theme,
             filter: String::from("/"),
             matches,
             selected: 0,
@@ -121,7 +124,7 @@ impl SlashCommandPopup {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let bg = Style::default().bg(crate::theme::POPUP_BG);
+        let bg = Style::default().bg(self.theme.popup_bg);
         Block::default().style(bg).render(area, buf);
         let lines: Vec<Line<'_>> = self
             .matches
@@ -232,6 +235,16 @@ impl SlashCommandPopup {
 /// Built-ins come first, then one entry per skill keyed as `/<skill-name>`
 /// with the skill's description shown alongside.
 pub fn build_slash_entries(skills: &nav_core::Catalog) -> Arc<[SlashEntry]> {
+    build_slash_entries_with_extensions(skills, &nav_core::ExtensionCatalog::default())
+}
+
+/// Like [`build_slash_entries`], plus prompt templates registered by local
+/// extensions. Prompt template commands are namespaced as `/prompt:<name>` so
+/// they cannot collide with skills or built-ins.
+pub fn build_slash_entries_with_extensions(
+    skills: &nav_core::Catalog,
+    extensions: &nav_core::ExtensionCatalog,
+) -> Arc<[SlashEntry]> {
     let mut entries: Vec<SlashEntry> = BUILTIN_SLASH_COMMANDS
         .iter()
         .map(|cmd| SlashEntry::builtin(cmd))
@@ -242,13 +255,19 @@ pub fn build_slash_entries(skills: &nav_core::Catalog) -> Arc<[SlashEntry]> {
             description: Some(skill.description.clone()),
         });
     }
+    for template in extensions.prompt_templates() {
+        entries.push(SlashEntry {
+            command: format!("/prompt:{}", template.name),
+            description: Some(format!("template · {}", template.description)),
+        });
+    }
     entries.into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nav_core::{Catalog, Skill, SkillScope};
+    use nav_core::{Catalog, ExtensionCatalog, ExtensionScope, PromptTemplate, Skill, SkillScope};
 
     fn make_catalog() -> Catalog {
         Catalog::new(vec![Skill {
@@ -258,6 +277,21 @@ mod tests {
             skill_dir: "/tmp/foo".into(),
             scope: SkillScope::Project,
         }])
+    }
+
+    fn make_extensions() -> ExtensionCatalog {
+        ExtensionCatalog::new(
+            Vec::new(),
+            vec![PromptTemplate {
+                name: "review".into(),
+                description: "review changes".into(),
+                body_path: "/tmp/ext/review.md".into(),
+                extension_name: "demo".into(),
+                extension_dir: "/tmp/ext".into(),
+                scope: ExtensionScope::Project,
+            }],
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -277,6 +311,19 @@ mod tests {
             .find(|e| e.command == "/foo")
             .expect("/foo entry");
         assert_eq!(foo.description.as_deref(), Some("do foo"));
+    }
+
+    #[test]
+    fn prompt_templates_appear_as_namespaced_slash_entries() {
+        let entries = build_slash_entries_with_extensions(&Catalog::default(), &make_extensions());
+        let review = entries
+            .iter()
+            .find(|e| e.command == "/prompt:review")
+            .expect("/prompt:review entry");
+        assert_eq!(
+            review.description.as_deref(),
+            Some("template · review changes")
+        );
     }
 
     #[test]
@@ -302,7 +349,8 @@ mod tests {
 
     #[test]
     fn refilter_narrows_by_prefix() {
-        let mut popup = SlashCommandPopup::new(build_slash_entries(&make_catalog()));
+        let mut popup =
+            SlashCommandPopup::new(build_slash_entries(&make_catalog()), Theme::default());
         popup.on_composer_text_changed("/fo");
         let commands: Vec<&str> = popup.matches().iter().map(|e| e.command.as_str()).collect();
         // `/fo` matches both the catalog skill `/foo` and the builtin
@@ -314,7 +362,8 @@ mod tests {
 
     #[test]
     fn refilter_finds_builtin() {
-        let mut popup = SlashCommandPopup::new(build_slash_entries(&Catalog::default()));
+        let mut popup =
+            SlashCommandPopup::new(build_slash_entries(&Catalog::default()), Theme::default());
         popup.on_composer_text_changed("/he");
         let commands: Vec<&str> = popup.matches().iter().map(|e| e.command.as_str()).collect();
         assert_eq!(commands, vec!["/help"]);

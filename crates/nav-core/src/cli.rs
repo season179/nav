@@ -173,6 +173,18 @@ pub enum CliCommand {
         #[command(subcommand)]
         action: GitAction,
     },
+    /// Inspect local extensions discovered from `.nav/extensions` and
+    /// `~/.nav/extensions`.
+    Extensions {
+        #[command(subcommand)]
+        action: ExtensionsAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionsAction {
+    /// List discovered extension manifests and the surfaces they register.
+    List,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -578,6 +590,17 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn parses_extensions_list_subcommand() {
+        let args = Args::try_parse_from(["nav", "extensions", "list"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(CliCommand::Extensions {
+                action: ExtensionsAction::List
+            })
+        ));
     }
 
     #[test]

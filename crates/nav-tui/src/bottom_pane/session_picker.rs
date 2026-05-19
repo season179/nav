@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::composer::Composer;
 use super::view::InputResult;
+use crate::theme::Theme;
 
 /// One row in the recent-session picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ impl SessionPickerEntry {
 /// Bottom-pane popup for choosing a stored session to resume.
 pub struct SessionPickerPopup {
     entries: Vec<SessionPickerEntry>,
+    theme: Theme,
     selected: usize,
     completed: bool,
     selected_id: Option<String>,
@@ -44,8 +46,13 @@ const MAX_VISIBLE: usize = 8;
 
 impl SessionPickerPopup {
     pub fn new(entries: Vec<SessionPickerEntry>) -> Self {
+        Self::new_with_theme(entries, Theme::default())
+    }
+
+    pub fn new_with_theme(entries: Vec<SessionPickerEntry>, theme: Theme) -> Self {
         Self {
             entries,
+            theme,
             selected: 0,
             completed: false,
             selected_id: None,
@@ -104,7 +111,7 @@ impl SessionPickerPopup {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let bg = Style::default().bg(crate::theme::POPUP_BG);
+        let bg = Style::default().bg(self.theme.popup_bg);
         Block::default().style(bg).render(area, buf);
 
         if self.entries.is_empty() {

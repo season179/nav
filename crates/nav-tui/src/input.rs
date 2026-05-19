@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nav_core::{Catalog, PendingInputMode, PendingSkill, UserAttachment};
+use nav_core::{
+    Catalog, ExtensionCatalog, PendingInputMode, PendingSkill, UserAttachment, load_prompt_template,
+};
 use tokio::sync::mpsc;
 
 use crate::ChatWidget;
@@ -104,11 +106,12 @@ pub(crate) fn dispatch_submit(
     text: String,
     attachments: Vec<UserAttachment>,
     skills: &Catalog,
+    extensions: &ExtensionCatalog,
     app_tx: &mpsc::UnboundedSender<AppEvent>,
 ) {
     let event = match parse_builtin_command(&text) {
         Some(event) => event,
-        None => submit_event_for_text(text, attachments, skills),
+        None => submit_event_for_text(text, attachments, skills, extensions),
     };
     app_tx.send(event).ok();
 }
@@ -117,6 +120,7 @@ fn submit_event_for_text(
     text: String,
     attachments: Vec<UserAttachment>,
     skills: &Catalog,
+    extensions: &ExtensionCatalog,
 ) -> AppEvent {
     match text.as_str() {
         "/quit" | "/exit" => AppEvent::Quit,
@@ -127,7 +131,7 @@ fn submit_event_for_text(
         // literal text so the agent loop's `is_compact_command` check
         // dispatches the non-steerable compaction turn.
         "/compact" => submit_event(text, None, attachments, PendingInputMode::FollowUp, None),
-        _ => skill_or_submit_event(text, attachments, skills),
+        _ => skill_or_submit_event(text, attachments, skills, extensions),
     }
 }
 
@@ -135,8 +139,9 @@ fn skill_or_submit_event(
     text: String,
     attachments: Vec<UserAttachment>,
     skills: &Catalog,
+    extensions: &ExtensionCatalog,
 ) -> AppEvent {
-    match classify_slash(&text, skills) {
+    match classify_slash_with_extensions(&text, skills, extensions) {
         SlashAction::Control(control) => control.into_event(attachments),
         SlashAction::NotASkill => {
             submit_event(text, None, attachments, PendingInputMode::FollowUp, None)
@@ -340,12 +345,46 @@ impl ControlCommand {
 /// against the skill's directory. Scripts/references inside the SKILL.md
 /// are not read here - the model loads them on demand.
 pub fn classify_slash(text: &str, skills: &Catalog) -> SlashAction {
+    classify_slash_with_extensions(text, skills, &ExtensionCatalog::default())
+}
+
+pub fn classify_slash_with_extensions(
+    text: &str,
+    skills: &Catalog,
+    extensions: &ExtensionCatalog,
+) -> SlashAction {
     let trimmed = text.trim_start();
     let Some(first_token) = trimmed.split_whitespace().next() else {
         return SlashAction::NotASkill;
     };
     if let Some(control) = classify_control_command(trimmed, first_token) {
         return SlashAction::Control(control);
+    }
+    if let Some(template_name) = first_token.strip_prefix("/prompt:") {
+        let Some(template) = extensions.get_prompt_template(template_name) else {
+            return SlashAction::NotASkill;
+        };
+        let wrapped_body = load_prompt_template(template).unwrap_or_else(|err| {
+            format!(
+                "[nav: failed to read prompt template `{}` at {}: {err:#}]",
+                template.name,
+                template.body_path.display()
+            )
+        });
+        let rest = trimmed[first_token.len()..].trim_start();
+        let skill_name = format!("prompt:{}", template.name);
+        return if rest.is_empty() {
+            SlashAction::Queue {
+                skill_name,
+                wrapped_body,
+            }
+        } else {
+            SlashAction::Inline {
+                skill_name,
+                wrapped_body,
+                request: rest.to_string(),
+            }
+        };
     }
     let Some(skill_name) = first_token.strip_prefix('/') else {
         return SlashAction::NotASkill;
@@ -416,7 +455,9 @@ pub fn prepend_pending_skill(pending: Option<String>, prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nav_core::{AgentEvent, Catalog, Skill, SkillScope};
+    use nav_core::{
+        AgentEvent, Catalog, ExtensionCatalog, ExtensionScope, PromptTemplate, Skill, SkillScope,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -479,6 +520,35 @@ mod tests {
             skill_dir,
             scope: SkillScope::Project,
         }])
+    }
+
+    fn extensions_with_template(dir: &std::path::Path) -> ExtensionCatalog {
+        let extension_dir = dir.join("demo-extension");
+        fs::create_dir_all(&extension_dir).unwrap();
+        let body_path = extension_dir.join("review.md");
+        fs::write(&body_path, "Review the change carefully.\n").unwrap();
+        ExtensionCatalog::new(
+            Vec::new(),
+            vec![PromptTemplate {
+                name: "review".into(),
+                description: "review changes".into(),
+                body_path,
+                extension_name: "demo".into(),
+                extension_dir,
+                scope: ExtensionScope::Project,
+            }],
+            Vec::new(),
+        )
+    }
+
+    fn dispatch(text: &str, catalog: &Catalog, tx: &tokio::sync::mpsc::UnboundedSender<AppEvent>) {
+        dispatch_submit(
+            text.to_string(),
+            Vec::new(),
+            catalog,
+            &ExtensionCatalog::default(),
+            tx,
+        );
     }
 
     #[test]
@@ -545,6 +615,50 @@ mod tests {
             parse_builtin_command("/restore stash@{2}"),
             Some(AppEvent::GitRestore { target: Some(target) }) if target == "stash@{2}"
         ));
+    }
+
+    #[test]
+    fn classify_slash_queues_prompt_template() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let extensions = extensions_with_template(dir.path());
+
+        match classify_slash_with_extensions("/prompt:review", &catalog, &extensions) {
+            SlashAction::Queue {
+                skill_name,
+                wrapped_body,
+            } => {
+                assert_eq!(skill_name, "prompt:review");
+                assert!(wrapped_body.contains("<prompt_template name=\"review\""));
+                assert!(wrapped_body.contains("Review the change carefully."));
+                assert!(wrapped_body.trim_end().ends_with("</prompt_template>"));
+            }
+            other => panic!("expected Queue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_slash_inlines_prompt_template_with_request() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let extensions = extensions_with_template(dir.path());
+
+        match classify_slash_with_extensions(
+            "/prompt:review focus on regressions",
+            &catalog,
+            &extensions,
+        ) {
+            SlashAction::Inline {
+                skill_name,
+                wrapped_body,
+                request,
+            } => {
+                assert_eq!(skill_name, "prompt:review");
+                assert!(wrapped_body.contains("</prompt_template>"));
+                assert_eq!(request, "focus on regressions");
+            }
+            other => panic!("expected Inline, got {other:?}"),
+        }
     }
 
     #[test]
@@ -629,7 +743,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let catalog = catalog_with_skill(dir.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        dispatch_submit("/compact".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/compact", &catalog, &tx);
         let event = rx.try_recv().expect("event sent");
         match event {
             AppEvent::Submit {
@@ -648,33 +762,28 @@ mod tests {
         let catalog = catalog_with_skill(dir.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
-        dispatch_submit("/sessions".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/sessions", &catalog, &tx);
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::ListSessions));
 
-        dispatch_submit("/resume".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/resume", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::Resume { query: None }
         ));
 
-        dispatch_submit("/resume 01HZ".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/resume 01HZ", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::Resume { query: Some(q) } if q == "01HZ"
         ));
 
-        dispatch_submit("/name release work".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/name release work", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::NameSession { name } if name == "release work"
         ));
 
-        dispatch_submit(
-            "/export transcript.md".to_string(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch("/export transcript.md", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::Export { path: Some(path) } if path.as_path() == std::path::Path::new("transcript.md")
@@ -687,7 +796,7 @@ mod tests {
         let catalog = catalog_with_skill(dir.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
-        dispatch_submit("/name".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/name", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::SlashError { message } if message.contains("/name")
@@ -700,12 +809,7 @@ mod tests {
         let catalog = catalog_with_skill(dir.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
-        dispatch_submit(
-            "/steer add this context".to_string(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch("/steer add this context", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::Submit {
@@ -715,41 +819,31 @@ mod tests {
             } if text == "add this context"
         ));
 
-        dispatch_submit(
-            "/queue-edit pending-1 better wording".to_string(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch("/queue-edit pending-1 better wording", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::EditPending { id, text } if id == "pending-1" && text == "better wording"
         ));
 
-        dispatch_submit(
-            "/queue-remove pending-1".to_string(),
-            Vec::new(),
-            &catalog,
-            &tx,
-        );
+        dispatch("/queue-remove pending-1", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::RemovePending { id } if id == "pending-1"
         ));
 
-        dispatch_submit("/queue-clear".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/queue-clear", &catalog, &tx);
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::ClearPending));
 
-        dispatch_submit("/abort".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/abort", &catalog, &tx);
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::AbortTurn));
 
-        dispatch_submit("/context".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/context", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::ShowContext { include_all: false }
         ));
 
-        dispatch_submit("/context all".to_string(), Vec::new(), &catalog, &tx);
+        dispatch("/context all", &catalog, &tx);
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::ShowContext { include_all: true }
