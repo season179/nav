@@ -78,6 +78,45 @@ fn detect_http_overflow_ignores_non_json_body() {
     assert!(detect_http_overflow("").is_none());
 }
 
+// ── model_hint_from_body ──────────────────────────────────────
+
+#[test]
+fn model_hint_extracts_from_model_not_found_code() {
+    let body =
+        r#"{"error":{"code":"model_not_found","message":"The model `gpt-55` does not exist."}}"#;
+    let hint = model_hint_from_body(body);
+    assert!(
+        hint.contains("Did you mean"),
+        "expected suggestion in hint, got {hint:?}"
+    );
+    assert!(
+        hint.contains("gpt-5.5"),
+        "expected gpt-5.5 in hint, got {hint:?}"
+    );
+}
+
+#[test]
+fn model_hint_extracts_from_invalid_request_error() {
+    // The user typed `gpt-4oo` (one extra `o`) — the suggestion list should
+    // home in on `gpt-4o`.
+    let body = r#"{"error":{"type":"invalid_request_error","message":"The model `gpt-4oo` does not exist or you do not have access to it.","code":null}}"#;
+    let hint = model_hint_from_body(body);
+    assert!(hint.contains("Did you mean"), "got hint {hint:?}");
+    assert!(hint.contains("gpt-4o"));
+}
+
+#[test]
+fn model_hint_skips_unrelated_errors() {
+    let body = r#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#;
+    assert_eq!(model_hint_from_body(body), "");
+}
+
+#[test]
+fn model_hint_returns_empty_for_non_json() {
+    assert_eq!(model_hint_from_body("not json"), "");
+    assert_eq!(model_hint_from_body(""), "");
+}
+
 #[test]
 fn responses_error_round_trips_to_anyhow() {
     let err = ResponsesError::ContextWindowExceeded {

@@ -9,7 +9,7 @@ use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
     SessionBinding, SessionStore, SessionSummary, agent, auth,
     cli::{Args, CliCommand, CliExportFormat, sandbox_policy_from_args},
-    discover_skills, load_project_context, rebuild_responses_input, shorten_home,
+    discover_skills, doctor, load_project_context, models, rebuild_responses_input, shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -41,6 +41,17 @@ async fn main() -> Result<()> {
     // from settings, but a settings file can fill defaults.
     let project = Arc::new(load_project_context(&cwd));
     args.apply_settings(&project.settings, &provided);
+
+    // Typo guard: a model name that doesn't match any known family prefix is
+    // *probably* a typo. Warn (don't fail) so the user still gets the
+    // provider's authoritative answer if they meant a brand-new model.
+    if !models::is_known_model_prefix(&args.model) {
+        let hint = models::did_you_mean(&args.model);
+        eprintln!(
+            "nav: --model `{}` doesn't match any known family prefix.{hint}",
+            args.model
+        );
+    }
 
     // Headless mode emits its startup banner here, before auth setup, so a
     // missing API key still shows the workspace summary first — useful when
@@ -180,7 +191,31 @@ fn run_cli_command(args: &Args, command: CliCommand) -> Result<()> {
             format,
             out,
         } => export_command(args, &session_id, format, out),
+        CliCommand::Doctor { json } => doctor_command(args, json),
     }
+}
+
+/// Run every doctor check and exit non-zero on any `[fail]` row. Doctor runs
+/// *before* the agent loop, so the project context is loaded once here from
+/// the launch cwd — same code path the agent loop uses.
+fn doctor_command(args: &Args, json: bool) -> Result<()> {
+    let cwd = env::current_dir()
+        .and_then(|p| p.canonicalize())
+        .context("failed to canonicalize current directory")?;
+    let project = load_project_context(&cwd);
+    let report = doctor::run(args, &cwd, &project);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("doctor report serializes")
+        );
+    } else {
+        print!("{}", report.render_text());
+    }
+    if report.has_failures {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn export_command(
@@ -321,7 +356,19 @@ fn combine_prompt(args_prompt: &[String], stdin_prompt: Option<&str>) -> Option<
 // that checkout, `cargo install` fails with a clear message.
 fn run_upgrade() -> Result<()> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    println!("Reinstalling nav from {manifest_dir}");
+    let pre_version = env!("CARGO_PKG_VERSION");
+
+    // Pre-flight the manifest dir ourselves so the error mentions nav's
+    // path explicitly. cargo's own "no such file or directory" leaves the
+    // user guessing which checkout it's looking for.
+    if !Path::new(manifest_dir).exists() {
+        bail!(
+            "cannot reinstall: manifest dir {manifest_dir} no longer exists. \
+             Re-clone the nav repo and run `cargo install --path <new-path> --force`."
+        );
+    }
+
+    println!("Reinstalling nav from {manifest_dir} (currently {pre_version})");
     let status = Command::new("cargo")
         .args(["install", "--path", manifest_dir, "--force"])
         .status()
@@ -329,7 +376,42 @@ fn run_upgrade() -> Result<()> {
     if !status.success() {
         bail!("`cargo install` exited with {status}");
     }
-    println!("nav reinstalled.");
+
+    // Verify the reinstall actually took effect by running the new binary
+    // and parsing its --version. Without this step, a silent PATH-shim
+    // mismatch (where an older `nav` shadows cargo's install dir) would
+    // happily print "nav reinstalled." while leaving the user on the
+    // previous version.
+    let resolved = doctor::which_on_path("nav");
+    let cargo_bin_dir = doctor::cargo_install_bin_dir();
+    if let (Some(resolved_path), Some(install_dir)) = (resolved.as_ref(), cargo_bin_dir.as_ref())
+        && resolved_path.parent() != Some(install_dir.as_path())
+    {
+        eprintln!(
+            "nav: warning — resolved `nav` ({}) is outside cargo's install dir ({}). \
+                 Update your PATH to include {} before {}, or remove the shim binary.",
+            resolved_path.display(),
+            install_dir.display(),
+            install_dir.display(),
+            resolved_path
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+    }
+
+    let post_version = resolved
+        .as_deref()
+        .and_then(doctor::binary_version)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if post_version == "unknown" {
+        println!("nav reinstalled (currently {pre_version} — could not read post-install version)");
+    } else if post_version == pre_version {
+        println!("nav reinstalled (already at {post_version})");
+    } else {
+        println!("nav reinstalled (from {pre_version} → {post_version})");
+    }
     Ok(())
 }
 

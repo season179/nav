@@ -132,6 +132,14 @@ pub enum CliCommand {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// One-screen health check: runtime prerequisites, auth, storage,
+    /// project context, and install state. Exit code is 1 when any check
+    /// fails so it slots into CI / setup scripts.
+    Doctor {
+        /// Emit a single JSON object instead of the grouped text report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

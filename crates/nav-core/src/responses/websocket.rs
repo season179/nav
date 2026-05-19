@@ -1,5 +1,5 @@
 use super::retry::TransportError;
-use super::{ResponsesError, detect_context_overflow, detect_http_overflow};
+use super::{ResponsesError, detect_context_overflow, detect_http_overflow, model_hint_from_body};
 use crate::auth::AuthConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -64,6 +64,23 @@ fn reclassify_handshake_error(err: tokio_tungstenite::tungstenite::Error) -> Tra
         let body = String::from_utf8_lossy(bytes);
         if let Some(message) = detect_http_overflow(&body) {
             return TransportError::ContextWindowExceeded { message };
+        }
+        // Same "did you mean…?" enrichment as the SSE 4xx path so the
+        // websocket transport surfaces an actionable hint rather than the
+        // bare provider blob.
+        let hint = model_hint_from_body(&body);
+        if !hint.is_empty() {
+            let status = response.status();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(super::retry::parse_retry_after_seconds);
+            return TransportError::Http {
+                status,
+                retry_after,
+                body: format!("{body}{hint}"),
+            };
         }
     }
     TransportError::from(err)
