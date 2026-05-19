@@ -148,6 +148,56 @@ pub enum CliCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Advanced session workflows: fork, tree, labels, transcript search.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum SessionsAction {
+    /// Fork an existing session at a specific event seq (or "now" by default).
+    Fork {
+        /// Full session ULID or unique prefix to fork from.
+        session_id: String,
+        /// Event seq to fork at (inclusive). Omit to fork at the latest seq.
+        #[arg(long)]
+        at: Option<u64>,
+        /// Display name for the new forked session.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Show the parent → child tree rooted at this session.
+    Tree {
+        /// Full session ULID or unique prefix.
+        session_id: String,
+    },
+    /// Attach a label to a session.
+    Label {
+        /// Full session ULID or unique prefix.
+        session_id: String,
+        /// Label text.
+        label: String,
+    },
+    /// Detach a label from a session.
+    Unlabel {
+        /// Full session ULID or unique prefix.
+        session_id: String,
+        /// Label text.
+        label: String,
+    },
+    /// Full-text search the persisted transcript across every session.
+    Search {
+        /// FTS5 MATCH expression (raw phrase or boolean).
+        query: String,
+        /// Maximum number of hits to return.
+        #[arg(default_value_t = 20, long)]
+        limit: usize,
+        /// Restrict the search to sessions carrying this label.
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

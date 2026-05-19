@@ -486,6 +486,76 @@ pub async fn run(
                             }),
                         }
                     }
+                    AppEvent::ForkSession { at } => {
+                        if turn_started_at.is_some() {
+                            chat.ingest(AgentEvent::Error {
+                                message: "cannot fork while a turn is running".to_string(),
+                            });
+                            continue;
+                        }
+                        match store.fork_session(&session_id, at, None) {
+                            Ok(new_id) => chat.push_session_notice(
+                                "fork",
+                                format!(
+                                    "Forked session {} -> {} at {}",
+                                    session_id,
+                                    new_id,
+                                    at.map(|s| format!("seq={s}"))
+                                        .unwrap_or_else(|| "now".to_string()),
+                                ),
+                            ),
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        }
+                    }
+                    AppEvent::ShowTree => match resolve_tree_root(&store, &session_id) {
+                        Ok(root_id) => match store.walk_tree(&root_id) {
+                            Ok(nodes) => {
+                                chat.scroll_to_bottom();
+                                chat.push_session_tree(nodes);
+                            }
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        },
+                        Err(err) => chat.ingest(AgentEvent::Error {
+                            message: format!("{err:#}"),
+                        }),
+                    },
+                    AppEvent::AddLabel { label } => {
+                        match store.add_label(&session_id, &label) {
+                            Ok(()) => chat.push_session_notice(
+                                "label",
+                                format!("Added label \"{}\"", label.trim()),
+                            ),
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        }
+                    }
+                    AppEvent::RemoveLabel { label } => {
+                        match store.remove_label(&session_id, &label) {
+                            Ok(()) => chat.push_session_notice(
+                                "unlabel",
+                                format!("Removed label \"{}\"", label.trim()),
+                            ),
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        }
+                    }
+                    AppEvent::FindTranscript { query } => {
+                        match store.search_transcript(&query, 20, None) {
+                            Ok(hits) => {
+                                chat.scroll_to_bottom();
+                                chat.push_transcript_hits(query, hits);
+                            }
+                            Err(err) => chat.ingest(AgentEvent::Error {
+                                message: format!("{err:#}"),
+                            }),
+                        }
+                    }
                     AppEvent::SlashError { message } => {
                         chat.ingest(AgentEvent::Error { message });
                     }
@@ -941,6 +1011,27 @@ fn open_session_picker(
         Err(err) => chat.ingest(AgentEvent::Error {
             message: format!("{err:#}"),
         }),
+    }
+}
+
+/// Walk `parent_id` upward from `session_id` until we land on a row whose
+/// parent is `None` (or the chain leaves the local db). Used by `/tree` so a
+/// fork can still see its siblings and ancestors.
+fn resolve_tree_root(store: &SessionStore, session_id: &str) -> Result<String> {
+    let mut current = session_id.to_string();
+    let mut guard = 0u32;
+    loop {
+        guard += 1;
+        if guard > 1024 {
+            anyhow::bail!("session tree exceeds 1024 ancestors at {current}");
+        }
+        let Some(summary) = store.session_summary(&current)? else {
+            anyhow::bail!("session not found: {current}");
+        };
+        match summary.parent_id {
+            Some(parent) => current = parent,
+            None => return Ok(current),
+        }
     }
 }
 

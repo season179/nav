@@ -1,6 +1,6 @@
 use nav_core::{
     CompactionTrigger, FileChangeSummary, FileDiffSummary, PatchApplyStatus, PendingInputMode,
-    SessionSummary, TurnDiff,
+    SessionSummary, SessionTreeNode, TranscriptHit, TurnDiff,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -264,9 +264,21 @@ impl HistoryCell for SessionListCell {
 }
 
 fn session_list_body(sessions: &[SessionSummary]) -> String {
+    let any_parent = sessions.iter().any(|s| s.parent_id.is_some());
+    let layout = if any_parent {
+        layout_session_tree(sessions)
+    } else {
+        sessions.iter().map(|s| (0usize, s)).collect()
+    };
     let mut parts = Vec::new();
-    for session in sessions {
+    for (depth, session) in layout {
+        let indent = "  ".repeat(depth);
         let name = session.name.as_deref().unwrap_or("(unnamed)");
+        let labels = if session.labels.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", session.labels.join(","))
+        };
         let title = session
             .first_user_prompt
             .as_deref()
@@ -278,12 +290,45 @@ fn session_list_body(sessions: &[SessionSummary]) -> String {
             "turns"
         };
         parts.push(format!(
-            "{}  {}  created={}  active={}  {} {turn_word}",
-            session.id, name, session.created_at, session.last_active, session.turn_count
+            "{indent}{}  {name}  created={}  active={}  {} {turn_word}{labels}",
+            session.id, session.created_at, session.last_active, session.turn_count
         ));
-        parts.push(format!("  {title}"));
+        parts.push(format!("{indent}  {title}"));
     }
     parts.join("\n")
+}
+
+fn layout_session_tree(sessions: &[SessionSummary]) -> Vec<(usize, &SessionSummary)> {
+    use std::collections::{HashMap, HashSet};
+    let ids: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    let mut children_by_parent: HashMap<&str, Vec<&SessionSummary>> = HashMap::new();
+    let mut roots: Vec<&SessionSummary> = Vec::new();
+    for summary in sessions {
+        match summary.parent_id.as_deref() {
+            Some(parent) if ids.contains(parent) => {
+                children_by_parent.entry(parent).or_default().push(summary);
+            }
+            _ => roots.push(summary),
+        }
+    }
+    let mut out = Vec::new();
+    fn walk<'a>(
+        node: &'a SessionSummary,
+        depth: usize,
+        out: &mut Vec<(usize, &'a SessionSummary)>,
+        children_by_parent: &HashMap<&'a str, Vec<&'a SessionSummary>>,
+    ) {
+        out.push((depth, node));
+        if let Some(children) = children_by_parent.get(node.id.as_str()) {
+            for child in children {
+                walk(child, depth + 1, out, children_by_parent);
+            }
+        }
+    }
+    for root in roots {
+        walk(root, 0, &mut out, &children_by_parent);
+    }
+    out
 }
 
 pub struct SessionNoticeCell {
@@ -303,6 +348,76 @@ impl SessionNoticeCell {
 impl HistoryCell for SessionNoticeCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         body_cell("◆", &self.label, Color::Cyan, &self.message, width)
+    }
+}
+
+pub struct SessionTreeCell {
+    nodes: Vec<SessionTreeNode>,
+}
+
+impl SessionTreeCell {
+    pub fn new(nodes: Vec<SessionTreeNode>) -> Self {
+        Self { nodes }
+    }
+}
+
+impl HistoryCell for SessionTreeCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let body = if self.nodes.is_empty() {
+            "no descendants".to_string()
+        } else {
+            session_tree_body(&self.nodes)
+        };
+        body_cell("◆", "tree", Color::Cyan, &body, width)
+    }
+}
+
+fn session_tree_body(nodes: &[SessionTreeNode]) -> String {
+    let mut lines = Vec::new();
+    for node in nodes {
+        let indent = "  ".repeat(node.depth as usize);
+        let name = node.summary.name.as_deref().unwrap_or("(unnamed)");
+        let labels = if node.summary.labels.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", node.summary.labels.join(","))
+        };
+        lines.push(format!(
+            "{indent}{}  {name}  ({} turns){labels}",
+            node.summary.id, node.summary.turn_count,
+        ));
+    }
+    lines.join("\n")
+}
+
+pub struct TranscriptHitsCell {
+    query: String,
+    hits: Vec<TranscriptHit>,
+}
+
+impl TranscriptHitsCell {
+    pub fn new(query: String, hits: Vec<TranscriptHit>) -> Self {
+        Self { query, hits }
+    }
+}
+
+impl HistoryCell for TranscriptHitsCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let body = if self.hits.is_empty() {
+            format!("no matches for {:?}", self.query)
+        } else {
+            let mut parts = vec![format!("matches for {:?}:", self.query)];
+            for hit in &self.hits {
+                let name = hit.summary.name.as_deref().unwrap_or("(unnamed)");
+                parts.push(format!(
+                    "{}#{} [{}] {name}",
+                    &hit.session_id, hit.seq, hit.kind
+                ));
+                parts.push(format!("  {}", hit.snippet));
+            }
+            parts.join("\n")
+        };
+        body_cell("◆", "find", Color::Cyan, &body, width)
     }
 }
 

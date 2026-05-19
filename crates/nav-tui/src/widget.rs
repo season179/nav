@@ -1,4 +1,4 @@
-use nav_core::{AgentEvent, SessionSummary};
+use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Paragraph, Widget};
@@ -6,8 +6,9 @@ use std::collections::HashMap;
 
 use crate::cells::{
     AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell, FileChangeCell,
-    PendingInputCell, SessionListCell, SessionNoticeCell, SkillInvocationCell, ToolCallCell,
-    ToolCallContext, ToolOutputCell, TurnAbortedCell, TurnDiffCell, UserMessageCell, WelcomeCell,
+    PendingInputCell, SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell,
+    ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell,
+    TurnDiffCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -54,6 +55,15 @@ impl ChatWidget {
 
     pub fn push_session_notice(&mut self, label: impl Into<String>, message: impl Into<String>) {
         self.push_cell(SessionNoticeCell::new(label, message));
+    }
+
+    pub fn push_session_tree(&mut self, nodes: Vec<SessionTreeNode>) {
+        self.cells.push(Box::new(SessionTreeCell::new(nodes)));
+    }
+
+    pub fn push_transcript_hits(&mut self, query: String, hits: Vec<TranscriptHit>) {
+        self.cells
+            .push(Box::new(TranscriptHitsCell::new(query, hits)));
     }
 
     /// Prepend a welcome cell that orients the user (model, cwd, session id).
