@@ -17,6 +17,7 @@ rusqlite = { workspace = true, features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+similar.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 ulid.workspace = true

@@ -788,7 +788,7 @@
       <li><a href="#reading-order">A suggested reading order</a></li>
       <li><a href="#loop">The agent loop, step by step</a></li>
       <li><a href="#events">The AgentEvent bus</a></li>
-      <li><a href="#tools">The five tools the model can call</a></li>
+      <li><a href="#tools">The six tools the model can call</a></li>
       <li><a href="#transport">Talking to the model</a></li>
       <li><a href="#sessions">Sessions and resume</a></li>
       <li><a href="#tui">The TUI: how chat appears on screen</a></li>
@@ -844,7 +844,7 @@
 
       <aside class="mnote aside">
         <span class="label">Aside · desktop</span>
-        <code>nav-desktop/</code> exists at the root but this tour skips it. It's an early Electron shell that spawns <code>cargo run --bin nav -- &lt;prompt&gt;</code> and streams stdout/stderr into the page. Because stdout is a pipe, nav emits NDJSON events — but the desktop renderer doesn't parse them into rich cells yet.
+        <code>nav-desktop/</code> exists at the root but this tour mostly skips it. It's an early Electron shell that spawns <code>cargo run --bin nav -- --json-events &lt;prompt&gt;</code>, parses NDJSON events, and renders messages, tools, file changes, and turn diffs into the page.
       </aside>
 
       <div class="full tree">
@@ -856,7 +856,9 @@
 │   ├── src/<span class="focus">cli.rs</span>              <span class="note">Args (clap), shared by every frontend</span>
 │   ├── src/<span class="focus">auth.rs</span>             <span class="note">ChatGPT OAuth via ~/.codex/auth.json, or OPENAI_API_KEY</span>
 │   ├── src/responses/     <span class="note">request building, collection/parsing, WebSocket + SSE</span>
-│   ├── src/tools/         <span class="note">read_file, list_files, bash, edit_file, code_search</span>
+│   ├── src/tools/         <span class="note">read_file, list_files, bash, edit_file, apply_patch, code_search</span>
+│   ├── src/git_diff.rs    <span class="note">working-tree diff snapshots after file mutations</span>
+│   ├── src/mutation.rs    <span class="note">shared file-change and diff summary types</span>
 │   └── src/session/       <span class="note">SQLite event log; powers --list-sessions / --resume</span>
 │
 <span class="group">— Frontend</span>
@@ -897,7 +899,7 @@
         <li><code>crates/nav-core/src/cli.rs</code> — the CLI options. Tiny. Shows what knobs exist.</li>
         <li><code>crates/nav-core/src/agent/runner.rs</code> — start at <code>run_agent</code>. This is the model/tool loop.</li>
         <li><code>crates/nav-core/src/agent/events.rs</code> and <code>replay.rs</code> — the event contract and resume transcript builder.</li>
-        <li><code>crates/nav-core/src/tools/mod.rs</code> — the dispatcher; five tools, one match arm each.</li>
+        <li><code>crates/nav-core/src/tools/mod.rs</code> — the dispatcher; six tools, one match arm each.</li>
         <li><code>crates/nav-core/src/tools/fs.rs</code> — the workspace sandbox. Notice <code>resolve_inside</code>.</li>
         <li><code>crates/nav-core/src/responses/request.rs</code>, <code>collector.rs</code>, and <code>parser.rs</code> — request body, stream folding, output parsing.</li>
         <li><code>crates/nav-core/src/session/mod.rs</code> — SQLite event log behind <code>--resume</code>.</li>
@@ -945,11 +947,13 @@
     <span class="cmt">// 4. run each tool, append the model's call + our output to `input`</span>
     <span class="kw">for</span> call <span class="kw">in</span> calls {
         emit(<span class="fn">ToolCallStarted</span> { call_id, name, arguments });
-        <span class="kw">let</span> (text, is_error) = tools::run_tool(...).<span class="kw">await</span>;
+        <span class="kw">let</span> tool_result = tools::run_tool(...).<span class="kw">await</span>;
         input.push(function_call_output);
-        emit(<span class="fn">ToolCallOutput</span> { call_id, output: text, is_error });
+        emit(<span class="fn">ToolCallOutput</span> { call_id, output: tool_result.output, is_error });
+        emit(<span class="fn">FileChange</span> { ... });   <span class="cmt">// for mutating tools</span>
     }
 
+    emit(<span class="fn">TurnDiff</span> { ... });      <span class="cmt">// when the turn changed files</span>
     finalize_turn(...);  <span class="cmt">// loop and ask again</span>
 }</pre>
 
@@ -957,7 +961,7 @@
 
       <aside class="mnote why">
         <span class="label">Why this matters</span>
-        The model does not call local code directly. It asks for a tool in JSON; <code>tools::run_tool</code> dispatches by name; and Rust decides what actually runs. The file/search/edit tools enforce workspace path checks. <code>bash</code> is deliberately broader — it runs <code>sh -c</code> in the workspace with a timeout and captured output, but it is <em>not</em> a filesystem sandbox.
+        The model does not call local code directly. It asks for a tool in JSON; <code>tools::run_tool</code> dispatches by name; and Rust decides what actually runs. The file/search/edit/patch tools enforce workspace path checks. <code>bash</code> is deliberately broader — it runs <code>sh -c</code> in the workspace with a timeout and captured output, but it is <em>not</em> a filesystem sandbox.
       </aside>
     </section>
 
@@ -973,7 +977,7 @@
         <code>crates/nav-core/src/agent/events.rs</code> — <code>enum AgentEvent</code>.
       </aside>
 
-      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every frontend — TUI, NDJSON pipe, future Slack bot — reads the same seven variants:</p>
+      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every frontend — TUI, NDJSON pipe, future Slack bot — reads the same nine variants:</p>
 
       <div class="full flow">
         <div class="row">
@@ -997,6 +1001,14 @@
           <div class="what">The tool's result text. For <code>bash</code>, that includes status, stdout, and stderr. <code>is_error</code> lets the UI colour failures red.</div>
         </div>
         <div class="row">
+          <div class="who">FileChange</div>
+          <div class="what">Structured per-tool mutation metadata: changed paths, add/delete counts, a capped unified diff, and failed mutation summaries.</div>
+        </div>
+        <div class="row">
+          <div class="who">TurnDiff</div>
+          <div class="what">A working-tree diff snapshot after a turn that changed files, including tracked and untracked files when the workspace is a Git repo.</div>
+        </div>
+        <div class="row">
           <div class="who">TurnComplete</div>
           <div class="what">End of one model turn, with token usage. The TUI clears the spinner here.</div>
         </div>
@@ -1018,7 +1030,7 @@
     <section id="tools">
       <header class="section-head">
         <div class="num"><span class="ord">06</span><span class="label">Tools</span></div>
-        <h2>The five tools the <em>model</em> can call.</h2>
+        <h2>The six tools the <em>model</em> can call.</h2>
       </header>
 
       <aside class="mnote">
@@ -1026,7 +1038,7 @@
         <code>crates/nav-core/src/tools/</code> — <code>mod.rs</code>, <code>fs.rs</code>, <code>shell.rs</code>.
       </aside>
 
-      <p class="drop">The model is told, in JSON-Schema form, that it has exactly five functions to call. They are deliberately primitive — together they cover <em>inspect, find, change, verify</em>.</p>
+      <p class="drop">The model is told, in JSON-Schema form, that it has exactly six functions to call. They are deliberately primitive — together they cover <em>inspect, find, change, verify</em>.</p>
 
       <div class="full pair three">
         <div class="card">
@@ -1050,26 +1062,26 @@
           <p>If <code>old_str</code> is empty, <em>create</em> the file. Otherwise replace exactly one occurrence of <code>old_str</code> with <code>new_str</code>. Two matches = error.</p>
         </div>
         <div class="card">
-          <span class="ord">05 · FIND</span>
+          <span class="ord">05 · CHANGE</span>
+          <h4>apply_patch</h4>
+          <p>Apply a reviewable patch with add, update, move, and delete sections. Emits structured file-change metadata and diffs.</p>
+        </div>
+        <div class="card">
+          <span class="ord">06 · FIND</span>
           <h4>code_search</h4>
           <p>Shell out to <code>rg</code> (ripgrep). Exit code 1 (no matches) is treated as success — that's not an error.</p>
-        </div>
-        <div class="card muted">
-          <span class="ord">— · OMITTED</span>
-          <h4>(that's all)</h4>
-          <p>Notice what's <em>not</em> here: no <code>delete_file</code>, no <code>git_commit</code>, no <code>http_get</code>. Less surface = easier to reason about.</p>
         </div>
       </div>
 
       <h3>The workspace sandbox</h3>
 
-      <p>Every path used by <code>read_file</code>, <code>list_files</code>, <code>edit_file</code>, and <code>code_search</code> goes through <code>resolve_inside</code> (or <code>resolve_create_path</code>, for new files). These reject:</p>
+      <p>Every path used by <code>read_file</code>, <code>list_files</code>, <code>edit_file</code>, <code>apply_patch</code>, and <code>code_search</code> goes through a workspace resolver (<code>resolve_inside</code>, <code>resolve_create_path</code>, or <code>resolve_delete_path</code>). These reject:</p>
 
       <ul>
         <li>absolute paths (<code>/etc/passwd</code>)</li>
         <li>parent traversal (<code>../escape.txt</code>)</li>
         <li>symlinks that escape the workspace</li>
-        <li>(on create) any symlink anywhere in the new path</li>
+        <li>(on create/delete) any symlink anywhere in the target path</li>
       </ul>
 
       <aside class="mnote why">

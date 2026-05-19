@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::mutation::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
+
 /// A non-text input attached to a [`AgentEvent::UserMessage`]. Stored by path
 /// (workspace-relative) — the bytes are loaded by the transport at request
 /// time, so the session log doesn't bloat with base64. Resume rebuilds the
@@ -64,6 +66,19 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
     },
+    FileChange {
+        call_id: String,
+        changes: Vec<FileChangeSummary>,
+        status: PatchApplyStatus,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    TurnDiff {
+        files: Vec<FileDiffSummary>,
+        unified_diff: String,
+        truncated: bool,
+    },
     TurnComplete {
         usage: TurnUsage,
     },
@@ -98,6 +113,8 @@ impl AgentEvent {
             AgentEvent::AssistantMessageDone { .. } => "assistant_message_done",
             AgentEvent::ToolCallStarted { .. } => "tool_call_started",
             AgentEvent::ToolCallOutput { .. } => "tool_call_output",
+            AgentEvent::FileChange { .. } => "file_change",
+            AgentEvent::TurnDiff { .. } => "turn_diff",
             AgentEvent::TurnComplete { .. } => "turn_complete",
             AgentEvent::ProviderRetry { .. } => "provider_retry",
             AgentEvent::ContextTrimmed { .. } => "context_trimmed",

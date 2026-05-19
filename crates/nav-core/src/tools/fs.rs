@@ -5,7 +5,10 @@ use std::{
 };
 use tokio::process::Command;
 
-fn resolve_inside(root: &Path, requested: &str) -> Result<PathBuf> {
+use super::ToolResult;
+use crate::mutation::{FileChangeKind, FileChangeSummary, MutationResult, summarize_changes};
+
+pub(super) fn resolve_inside(root: &Path, requested: &str) -> Result<PathBuf> {
     resolve_under(root, &[], requested)
 }
 
@@ -38,7 +41,7 @@ fn resolve_under(root: &Path, extra_roots: &[PathBuf], requested: &str) -> Resul
     Ok(resolved)
 }
 
-fn resolve_create_path(root: &Path, requested: &str) -> Result<PathBuf> {
+pub(super) fn resolve_create_path(root: &Path, requested: &str) -> Result<PathBuf> {
     debug_assert_is_canonical(root);
     let path = relative_path(requested)?;
 
@@ -90,7 +93,31 @@ fn resolve_create_path(root: &Path, requested: &str) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn relative_path(requested: &str) -> Result<&Path> {
+pub(super) fn resolve_delete_path(root: &Path, requested: &str) -> Result<PathBuf> {
+    debug_assert_is_canonical(root);
+    let path = relative_path(requested)?;
+    let mut checked_prefix = root.to_path_buf();
+
+    for component in path.components() {
+        let candidate = checked_prefix.join(component.as_os_str());
+        let metadata = fs::symlink_metadata(&candidate)
+            .with_context(|| format!("failed to inspect {}", candidate.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!("symlink in path is not allowed: {}", candidate.display());
+        }
+        let resolved = candidate
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", candidate.display()))?;
+        if !resolved.starts_with(root) {
+            bail!("path escapes workspace: {}", resolved.display());
+        }
+        checked_prefix = resolved;
+    }
+
+    Ok(checked_prefix)
+}
+
+pub(super) fn relative_path(requested: &str) -> Result<&Path> {
     if requested.is_empty() {
         bail!("path is required");
     }
@@ -144,31 +171,65 @@ pub(super) fn list_files(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Resu
     Ok(serde_json::to_string_pretty(&entries)?)
 }
 
-pub(super) fn edit_file(cwd: &Path, path: &str, old_str: &str, new_str: &str) -> Result<String> {
+pub(super) fn edit_file_with_metadata(
+    cwd: &Path,
+    path: &str,
+    old_str: &str,
+    new_str: &str,
+) -> Result<ToolResult> {
     if old_str.is_empty() {
-        let path = resolve_create_path(cwd, path)?;
-        if path.exists() {
-            bail!("{} already exists", path.display());
+        let resolved = resolve_create_path(cwd, path)?;
+        if resolved.exists() {
+            bail!("{} already exists", resolved.display());
         }
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = resolved.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, new_str)?;
-        return Ok(format!("created {}", path.display()));
+        fs::write(&resolved, new_str)?;
+        let after_label = format!("b/{path}");
+        let change = FileChangeSummary::new(
+            path,
+            FileChangeKind::Add,
+            "",
+            new_str,
+            "/dev/null",
+            &after_label,
+        );
+        let changes = vec![change];
+        let summary = summarize_changes(&changes);
+        let output = format!("created {}", resolved.display());
+        return Ok(ToolResult::mutation(
+            output,
+            MutationResult { summary, changes },
+        ));
     }
 
-    let path = resolve_inside(cwd, path)?;
-    let original =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    // exact replacement is safer for a teaching agent than fuzzy patching.
-    // Requiring one match prevents accidental broad edits.
+    let resolved = resolve_inside(cwd, path)?;
+    let original = fs::read_to_string(&resolved)
+        .with_context(|| format!("failed to read {}", resolved.display()))?;
     let matches = original.matches(old_str).take(2).count();
     if matches != 1 {
         bail!("expected exactly one match for old_str, found {matches}");
     }
     let updated = original.replacen(old_str, new_str, 1);
-    fs::write(&path, updated)?;
-    Ok(format!("edited {}", path.display()))
+    fs::write(&resolved, &updated)?;
+    let before_label = format!("a/{path}");
+    let after_label = format!("b/{path}");
+    let change = FileChangeSummary::new(
+        path,
+        FileChangeKind::Update { move_path: None },
+        &original,
+        &updated,
+        &before_label,
+        &after_label,
+    );
+    let changes = vec![change];
+    let summary = summarize_changes(&changes);
+    let output = format!("edited {}", resolved.display());
+    Ok(ToolResult::mutation(
+        output,
+        MutationResult { summary, changes },
+    ))
 }
 
 pub(super) async fn code_search(
@@ -200,7 +261,7 @@ pub(super) async fn code_search(
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_file, read_file};
+    use super::{edit_file_with_metadata, read_file};
     use std::fs;
     use tempfile::tempdir;
 
@@ -214,7 +275,7 @@ mod tests {
         std::os::unix::fs::symlink(&escape, workspace.join("link")).unwrap();
         let workspace = workspace.canonicalize().unwrap();
 
-        let error = edit_file(&workspace, "link/file.txt", "", "pwned").unwrap_err();
+        let error = edit_file_with_metadata(&workspace, "link/file.txt", "", "pwned").unwrap_err();
 
         assert!(error.to_string().contains("symlink in path is not allowed"));
         assert!(!escape.exists());
@@ -225,9 +286,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let workspace = temp.path().canonicalize().unwrap();
 
-        let result = edit_file(&workspace, "subdir/file.txt", "", "hello").unwrap();
+        let result = edit_file_with_metadata(&workspace, "subdir/file.txt", "", "hello").unwrap();
 
-        assert!(result.contains("created"));
+        assert!(result.output.contains("created"));
         assert_eq!(
             fs::read_to_string(workspace.join("subdir/file.txt")).unwrap(),
             "hello"
@@ -239,7 +300,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let workspace = temp.path().canonicalize().unwrap();
 
-        let error = edit_file(&workspace, "/etc/passwd", "", "pwned").unwrap_err();
+        let error = edit_file_with_metadata(&workspace, "/etc/passwd", "", "pwned").unwrap_err();
 
         assert!(error.to_string().contains("absolute paths are not allowed"));
     }
@@ -266,7 +327,7 @@ mod tests {
         let workspace = temp.path().canonicalize().unwrap();
         fs::write(workspace.join("exists.txt"), "old").unwrap();
 
-        let error = edit_file(&workspace, "exists.txt", "", "new").unwrap_err();
+        let error = edit_file_with_metadata(&workspace, "exists.txt", "", "new").unwrap_err();
 
         assert!(error.to_string().contains("already exists"));
     }
@@ -276,7 +337,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let workspace = temp.path().canonicalize().unwrap();
 
-        let error = edit_file(&workspace, "../escape.txt", "", "x").unwrap_err();
+        let error = edit_file_with_metadata(&workspace, "../escape.txt", "", "x").unwrap_err();
 
         assert!(
             error
@@ -337,7 +398,7 @@ mod tests {
         let workspace = temp.path().canonicalize().unwrap();
         fs::write(workspace.join("file.txt"), "hello world").unwrap();
 
-        edit_file(&workspace, "file.txt", "world", "Season").unwrap();
+        edit_file_with_metadata(&workspace, "file.txt", "world", "Season").unwrap();
 
         assert_eq!(
             fs::read_to_string(workspace.join("file.txt")).unwrap(),
@@ -351,8 +412,8 @@ mod tests {
         let workspace = temp.path().canonicalize().unwrap();
         fs::write(workspace.join("file.txt"), "one two two").unwrap();
 
-        let missing = edit_file(&workspace, "file.txt", "three", "x").unwrap_err();
-        let repeated = edit_file(&workspace, "file.txt", "two", "x").unwrap_err();
+        let missing = edit_file_with_metadata(&workspace, "file.txt", "three", "x").unwrap_err();
+        let repeated = edit_file_with_metadata(&workspace, "file.txt", "two", "x").unwrap_err();
 
         assert!(missing.to_string().contains("expected exactly one match"));
         assert!(repeated.to_string().contains("expected exactly one match"));

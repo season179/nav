@@ -1,6 +1,8 @@
 pub mod agent;
 pub mod auth;
 pub mod cli;
+pub mod git_diff;
+pub mod mutation;
 pub mod project;
 pub mod responses;
 pub mod session;
@@ -10,6 +12,9 @@ pub mod tools;
 pub use agent::{
     AgentEvent, EventStream, ResponsesTransport, SessionBinding, TurnUsage, UserAttachment,
     rebuild_responses_input, run_agent,
+};
+pub use mutation::{
+    FileChangeKind, FileChangeSummary, FileDiffSummary, MutationResult, PatchApplyStatus, TurnDiff,
 };
 pub use project::{
     ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,

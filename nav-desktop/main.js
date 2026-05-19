@@ -2,6 +2,7 @@ const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { createNdjsonParser } = require("./agent-events");
 
 const APP_NAME = "nav-desktop";
 const APP_ROOT = path.resolve(__dirname, "..");
@@ -86,7 +87,17 @@ const runAgent = async (event, input) => {
   const manifestPath = path.join(APP_ROOT, "Cargo.toml");
   const child = spawn(
     CARGO_COMMAND,
-    ["run", "--quiet", "--manifest-path", manifestPath, "--bin", "nav", "--", prompt],
+    [
+      "run",
+      "--quiet",
+      "--manifest-path",
+      manifestPath,
+      "--bin",
+      "nav",
+      "--",
+      "--json-events",
+      prompt,
+    ],
     {
       cwd: workspace.path,
       env: process.env,
@@ -114,9 +125,18 @@ const runAgent = async (event, input) => {
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
 
+    const parser = createNdjsonParser({
+      onEvent: (agentEvent) => {
+        sendAgentEvent(webContents, { type: "agent_event", event: agentEvent });
+      },
+      onText: (chunk) => {
+        sendAgentEvent(webContents, { type: "stdout", text: chunk });
+      },
+    });
+
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
-      sendAgentEvent(webContents, { type: "stdout", text: chunk });
+      parser.push(chunk);
     });
 
     child.stderr.on("data", (chunk) => {
@@ -133,6 +153,7 @@ const runAgent = async (event, input) => {
     });
 
     child.on("close", (exitCode, signal) => {
+      parser.flush();
       const ok = exitCode === 0;
       sendAgentEvent(webContents, {
         type: "done",

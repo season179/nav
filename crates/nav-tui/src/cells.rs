@@ -1,3 +1,4 @@
+use nav_core::{FileChangeSummary, FileDiffSummary, PatchApplyStatus, TurnDiff};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -298,6 +299,8 @@ impl ToolCallContext {
             "bash" => string_arg(&self.arguments, "command")
                 .map(|cmd| format!("bash {}", truncate_inline(cmd)))
                 .unwrap_or_else(|| fallback_tool_summary(&self.name, &self.arguments)),
+            "apply_patch" => apply_patch_summary(&self.arguments)
+                .unwrap_or_else(|| fallback_tool_summary(&self.name, &self.arguments)),
             _ => fallback_tool_summary(&self.name, &self.arguments),
         }
     }
@@ -314,6 +317,38 @@ fn string_arg<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
 fn fallback_tool_summary(name: &str, arguments: &Value) -> String {
     let args = serde_json::to_string(arguments).unwrap_or_else(|_| "<unserializable>".to_string());
     format!("{name} {}", truncate_inline(&args))
+}
+
+fn apply_patch_summary(arguments: &Value) -> Option<String> {
+    let patch = string_arg(arguments, "patch")?;
+    let mut entries = Vec::new();
+    let mut last_update_index = None;
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            last_update_index = Some(entries.len());
+            entries.push(format!("M {}", display_path(path)));
+        } else if let Some(path) = line.strip_prefix("*** Move to: ") {
+            if let Some(index) = last_update_index {
+                entries[index].push_str(&format!(" -> {}", display_path(path)));
+            }
+        } else if let Some(path) = line.strip_prefix("*** Add File: ") {
+            last_update_index = None;
+            entries.push(format!("A {}", display_path(path)));
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            last_update_index = None;
+            entries.push(format!("D {}", display_path(path)));
+        }
+    }
+    if entries.is_empty() {
+        return Some("apply_patch".to_string());
+    }
+    let hidden = entries.len().saturating_sub(6);
+    entries.truncate(6);
+    let mut summary = format!("apply_patch {}", entries.join(", "));
+    if hidden > 0 {
+        summary.push_str(&format!(", … {hidden} more"));
+    }
+    Some(summary)
 }
 
 fn truncate_inline(text: &str) -> String {
@@ -407,9 +442,113 @@ impl HistoryCell for ToolOutputCell {
     }
 }
 
+pub struct FileChangeCell {
+    changes: Vec<FileChangeSummary>,
+    status: PatchApplyStatus,
+    summary: String,
+    error: Option<String>,
+}
+
+impl FileChangeCell {
+    pub fn new(
+        changes: Vec<FileChangeSummary>,
+        status: PatchApplyStatus,
+        summary: impl Into<String>,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            changes,
+            status,
+            summary: summary.into(),
+            error,
+        }
+    }
+}
+
+impl HistoryCell for FileChangeCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let label = match self.status {
+            PatchApplyStatus::Completed => "changed",
+            PatchApplyStatus::Failed => "failed",
+        };
+        let color = match self.status {
+            PatchApplyStatus::Completed => Color::Cyan,
+            PatchApplyStatus::Failed => Color::Red,
+        };
+        body_cell("◆", label, color, &file_change_body(self), width)
+    }
+}
+
+fn file_change_body(cell: &FileChangeCell) -> String {
+    let mut parts = vec![cell.summary.clone()];
+    if let Some(error) = &cell.error {
+        parts.push(error.clone());
+    }
+    for change in &cell.changes {
+        parts.push(format!(
+            "{} {} (+{} -{})",
+            change.status_letter(),
+            change.path_ref(),
+            change.additions,
+            change.deletions
+        ));
+        let diff = preview_output(&change.diff, 80, DIFF_PREVIEW_CHARS);
+        if !diff.is_empty() {
+            parts.push(diff);
+        }
+    }
+    parts.join("\n")
+}
+
+pub struct TurnDiffCell {
+    diff: TurnDiff,
+}
+
+impl TurnDiffCell {
+    pub fn new(files: Vec<FileDiffSummary>, unified_diff: String, truncated: bool) -> Self {
+        Self {
+            diff: TurnDiff {
+                files,
+                unified_diff,
+                truncated,
+            },
+        }
+    }
+}
+
+impl HistoryCell for TurnDiffCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        body_cell("◆", "diff", Color::Blue, &turn_diff_body(&self.diff), width)
+    }
+}
+
+fn turn_diff_body(diff: &TurnDiff) -> String {
+    let file_word = if diff.files.len() == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    let mut parts = vec![format!("{} {file_word} changed", diff.files.len())];
+    for file in &diff.files {
+        parts.push(format!(
+            "{} {} (+{} -{})",
+            file.status, file.path, file.additions, file.deletions
+        ));
+    }
+    let preview = preview_output(&diff.unified_diff, 80, DIFF_PREVIEW_CHARS);
+    if !preview.is_empty() {
+        parts.push(preview);
+    }
+    if diff.truncated {
+        parts.push("full diff truncated".to_string());
+    }
+    parts.join("\n")
+}
+
 const DEFAULT_TOOL_OUTPUT_LINES: usize = 12;
 const SKILL_TOOL_OUTPUT_LINES: usize = 4;
 const TOOL_OUTPUT_PREVIEW_CHARS: usize = 4000;
+const DIFF_PREVIEW_CHARS: usize = 4096;
 
 fn tool_output_body(output: &str, context: Option<&ToolCallContext>) -> String {
     let trimmed = output.trim_end_matches('\n');

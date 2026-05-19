@@ -45,6 +45,8 @@ pub fn rebuild_responses_input(events: &[AgentEvent], cwd: &Path) -> Vec<Value> 
             AgentEvent::AssistantMessageDelta { .. }
             | AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ToolCallOutput { .. }
+            | AgentEvent::FileChange { .. }
+            | AgentEvent::TurnDiff { .. }
             | AgentEvent::TurnComplete { .. }
             | AgentEvent::ProviderRetry { .. }
             | AgentEvent::ContextTrimmed { .. }

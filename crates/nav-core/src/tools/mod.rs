@@ -1,7 +1,9 @@
 mod fs;
+mod patch;
 mod shell;
 mod truncate;
 
+use crate::mutation::MutationResult;
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -15,8 +17,10 @@ use truncate::{TruncateMode, bound};
 const BASH_HEAD_LINES: usize = 200;
 
 pub(super) fn tool_definitions() -> Vec<Value> {
-    // these five primitives mirror the workshop article. Together they let
-    // the model inspect code, find code, change code, and verify with commands.
+    // These primitives mirror the workshop article, with `apply_patch` as the
+    // reviewable multi-file editing path learned from sibling agent projects.
+    // Together they let the model inspect code, find code, change code, and
+    // verify with commands.
     vec![
         json!({
             "type": "function",
@@ -68,6 +72,19 @@ pub(super) fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "type": "function",
+            "name": "apply_patch",
+            "description": "Apply a reviewable patch. Use Codex patch format: *** Begin Patch; file sections with *** Add File, *** Update File, optional *** Move to, or *** Delete File; + added lines, - removed lines, space context lines; then *** End Patch.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string" }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
             "name": "code_search",
             "description": "Search source text for a pattern, like ripgrep.",
             "parameters": {
@@ -83,38 +100,64 @@ pub(super) fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub output: String,
+    pub mutation: Option<MutationResult>,
+}
+
+impl ToolResult {
+    fn text(output: impl Into<String>) -> Self {
+        Self {
+            output: output.into(),
+            mutation: None,
+        }
+    }
+
+    pub(super) fn mutation(output: impl Into<String>, mutation: MutationResult) -> Self {
+        Self {
+            output: output.into(),
+            mutation: Some(mutation),
+        }
+    }
+}
+
 pub async fn run_tool(
     cwd: &Path,
     skills: &Catalog,
     timeout_secs: u64,
     name: &str,
     input: Value,
-) -> Result<String> {
+) -> Result<ToolResult> {
     // central dispatch keeps the trust boundary obvious. The model asks;
     // this Rust match decides exactly which local capability is allowed.
-    // Skill directories are accepted as extra read roots; writes
-    // (`edit_file`) stay workspace-only.
+    // Skill directories are accepted as extra read roots; mutating tools stay
+    // workspace-only.
     let skill_dirs = skills.skill_dirs();
     match name {
         "read_file" => fs::read_file(cwd, skill_dirs, string_arg(&input, "path")?)
-            .map(|out| bound(out, TruncateMode::Head)),
-        "list_files" => fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?),
+            .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
+        "list_files" => fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?)
+            .map(ToolResult::text),
         "bash" => shell::bash(cwd, timeout_secs, string_arg(&input, "command")?)
             .await
             .map(|out| {
-                bound(
-                    out,
-                    TruncateMode::HeadTail {
-                        head_lines: BASH_HEAD_LINES,
-                    },
+                ToolResult::text(
+                    bound(
+                        out,
+                        TruncateMode::HeadTail {
+                            head_lines: BASH_HEAD_LINES,
+                        },
+                    ),
                 )
             }),
-        "edit_file" => fs::edit_file(
+        "edit_file" => fs::edit_file_with_metadata(
             cwd,
             string_arg(&input, "path")?,
             string_arg(&input, "old_str")?,
             string_arg(&input, "new_str")?,
         ),
+        "apply_patch" => patch::apply_patch(cwd, string_arg(&input, "patch")?),
         "code_search" => fs::code_search(
             cwd,
             skill_dirs,
@@ -122,7 +165,7 @@ pub async fn run_tool(
             string_arg(&input, "path")?,
         )
         .await
-        .map(|out| bound(out, TruncateMode::Head)),
+        .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
         other => Err(anyhow!("unknown tool: {other}")),
     }
 }
@@ -132,6 +175,24 @@ fn string_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing string input field `{key}`"))
+}
+
+pub fn failed_mutation_summary(name: &str, input: &Value) -> Option<String> {
+    let paths = match name {
+        "edit_file" => string_arg(input, "path")
+            .ok()
+            .map(|path| vec![path.to_string()])?,
+        "apply_patch" => {
+            let patch = string_arg(input, "patch").ok()?;
+            let paths = patch::target_paths_from_patch(patch);
+            if paths.is_empty() {
+                return Some("failed to apply patch".to_string());
+            }
+            paths
+        }
+        _ => return None,
+    };
+    Some(format!("failed to mutate {}", paths.join(", ")))
 }
 
 #[cfg(test)]
@@ -144,9 +205,9 @@ mod tests {
     // ── tool_definitions ──────────────────────────────────────────
 
     #[test]
-    fn tool_definitions_returns_all_five_tools() {
+    fn tool_definitions_returns_all_six_tools() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 6);
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.get("name").and_then(Value::as_str))
@@ -156,6 +217,7 @@ mod tests {
             "list_files",
             "bash",
             "edit_file",
+            "apply_patch",
             "code_search",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
@@ -199,7 +261,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result, "world");
+        assert_eq!(result.output, "world");
+        assert!(result.mutation.is_none());
     }
 
     #[tokio::test]
@@ -218,7 +281,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let parsed: Vec<String> = serde_json::from_str(&result).unwrap();
+        let parsed: Vec<String> = serde_json::from_str(&result.output).unwrap();
         assert!(parsed.contains(&"a.txt".to_string()));
         assert!(parsed.contains(&"subdir/".to_string()));
     }
@@ -241,8 +304,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(result.contains("[truncated"));
-        assert!(result.len() < 80 * 1024, "result was {} bytes", result.len());
+        assert!(result.output.contains("[truncated"));
+        assert!(
+            result.output.len() < 80 * 1024,
+            "result was {} bytes",
+            result.output.len()
+        );
+        assert!(result.mutation.is_none());
     }
 
     #[tokio::test]
@@ -259,7 +327,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.contains("ok"));
+        assert!(result.output.contains("ok"));
+        assert!(result.mutation.is_none());
     }
 
     #[tokio::test]
@@ -277,8 +346,56 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.contains("edited"));
+        assert!(result.output.contains("edited"));
+        let mutation = result
+            .mutation
+            .expect("edit_file should report mutation metadata");
+        assert_eq!(mutation.changes.len(), 1);
+        assert_eq!(mutation.changes[0].path, "f.txt");
+        assert!(mutation.changes[0].diff.contains("-hello world"));
+        assert!(mutation.changes[0].diff.contains("+hello nav"));
         assert_eq!(fs::read_to_string(cwd.join("f.txt")).unwrap(), "hello nav");
+    }
+
+    #[tokio::test]
+    async fn run_tool_apply_patch_dispatches_with_multi_file_mutation_metadata() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::write(cwd.join("existing.txt"), "old\nline\n").unwrap();
+
+        let result = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            "apply_patch",
+            json!({
+                "patch": "*** Begin Patch\n*** Update File: existing.txt\n@@\n-old\n+new\n line\n*** Add File: added.txt\n+hello\n*** End Patch\n"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.output.contains("updated 2 files"));
+        let mutation = result
+            .mutation
+            .expect("apply_patch should report mutation metadata");
+        assert_eq!(mutation.changes.len(), 2);
+        assert_eq!(mutation.changes[0].path, "existing.txt");
+        assert_eq!(mutation.changes[0].additions, 1);
+        assert_eq!(mutation.changes[0].deletions, 1);
+        assert_eq!(mutation.changes[0].line_start, Some(1));
+        assert!(mutation.changes[0].diff.contains("-old"));
+        assert!(mutation.changes[0].diff.contains("+new"));
+        assert_eq!(mutation.changes[1].path, "added.txt");
+        assert_eq!(mutation.changes[1].additions, 1);
+        assert_eq!(
+            fs::read_to_string(cwd.join("existing.txt")).unwrap(),
+            "new\nline\n"
+        );
+        assert_eq!(
+            fs::read_to_string(cwd.join("added.txt")).unwrap(),
+            "hello\n"
+        );
     }
 
     #[tokio::test]
@@ -312,7 +429,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.contains("Skill body"));
+        assert!(result.output.contains("Skill body"));
     }
 
     #[tokio::test]

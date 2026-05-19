@@ -9,6 +9,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::cli::Args;
+use crate::git_diff;
+use crate::mutation::PatchApplyStatus;
 use crate::project::ProjectContext;
 use crate::responses::{self, ResponseCollector, ResponsesError};
 use crate::session::{SessionId, SessionStore};
@@ -231,7 +233,7 @@ pub async fn run_agent(
         };
 
         if calls.is_empty() {
-            if let Err(err) = finalize_turn(&events, session, &args.model, &usage) {
+            if let Err(err) = finalize_turn(&events, session, cwd, false, &args.model, &usage) {
                 return fail(&events, session, err);
             }
             return Ok(());
@@ -241,47 +243,95 @@ pub async fn run_agent(
         // We append the raw items so the next turn carries them alongside the
         // function_call_output items the agent appends below.
         input.extend(responses::into_raw_output(envelope));
+        let mut turn_had_mutation = false;
         for call in calls {
+            let call_id = call.call_id.clone();
             emit(
                 &events,
                 session,
                 AgentEvent::ToolCallStarted {
-                    call_id: call.call_id.clone(),
+                    call_id: call_id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                 },
             );
 
+            let tool_name = call.name.clone();
+            let tool_arguments = call.arguments.clone();
             let result = tools::run_tool(
                 cwd,
                 skills,
                 args.bash_timeout_secs,
-                &call.name,
-                call.arguments,
+                &tool_name,
+                tool_arguments.clone(),
             )
             .await;
-            let (output_text, is_error) = match result {
-                Ok(text) => (text, false),
-                Err(err) => (format!("tool error: {err:#}"), true),
+            let (output_text, is_error, mutation, failed_mutation_summary) = match result {
+                Ok(tool_result) => (tool_result.output, false, tool_result.mutation, None),
+                Err(err) => {
+                    let error_text = format!("tool error: {err:#}");
+                    (
+                        error_text.clone(),
+                        true,
+                        None,
+                        tools::failed_mutation_summary(&tool_name, &tool_arguments)
+                            .map(|summary| (summary, error_text)),
+                    )
+                }
             };
 
             input.push(json!({
                 "type": "function_call_output",
-                "call_id": call.call_id,
+                "call_id": call_id,
                 "output": output_text,
             }));
             emit(
                 &events,
                 session,
                 AgentEvent::ToolCallOutput {
-                    call_id: call.call_id,
-                    output: output_text,
+                    call_id: call_id.clone(),
+                    output: output_text.clone(),
                     is_error,
                 },
             );
+            if let Some(mutation) = mutation {
+                turn_had_mutation = true;
+                emit(
+                    &events,
+                    session,
+                    AgentEvent::FileChange {
+                        call_id: call_id.clone(),
+                        changes: mutation.changes,
+                        status: PatchApplyStatus::Completed,
+                        summary: mutation.summary,
+                        error: None,
+                    },
+                );
+            }
+            if let Some((summary, error)) = failed_mutation_summary {
+                turn_had_mutation = true;
+                emit(
+                    &events,
+                    session,
+                    AgentEvent::FileChange {
+                        call_id,
+                        changes: Vec::new(),
+                        status: PatchApplyStatus::Failed,
+                        summary,
+                        error: Some(error),
+                    },
+                );
+            }
         }
 
-        if let Err(err) = finalize_turn(&events, session, &args.model, &usage) {
+        if let Err(err) = finalize_turn(
+            &events,
+            session,
+            cwd,
+            turn_had_mutation,
+            &args.model,
+            &usage,
+        ) {
             return fail(&events, session, err);
         }
         turns_used += 1;
@@ -348,9 +398,26 @@ fn fail<T>(
 fn finalize_turn(
     events: &UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
+    cwd: &Path,
+    turn_had_mutation: bool,
     model: &str,
     usage: &TurnUsage,
 ) -> Result<()> {
+    if turn_had_mutation {
+        match git_diff::working_tree_diff(cwd) {
+            Ok(Some(diff)) => emit(
+                events,
+                session,
+                AgentEvent::TurnDiff {
+                    files: diff.files,
+                    unified_diff: diff.unified_diff,
+                    truncated: diff.truncated,
+                },
+            ),
+            Ok(None) => {}
+            Err(err) => eprintln!("nav-core: failed to collect working tree diff: {err:#}"),
+        }
+    }
     emit(
         events,
         session,

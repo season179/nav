@@ -94,8 +94,8 @@ nav --json-events "list the files" > events.ndjson
 ```
 
 Each line is one `AgentEvent` as JSON (`assistant_message_delta`,
-`tool_call_started`, `turn_complete`, …). Non-tty stdout defaults to this
-mode automatically.
+`tool_call_started`, `file_change`, `turn_diff`, `turn_complete`, …). Non-tty
+stdout defaults to this mode automatically.
 
 ## Sessions
 
@@ -141,6 +141,8 @@ bun run start
 - `list_files`: list a relative directory
 - `bash`: execute a shell command with a timeout
 - `edit_file`: create a file or replace an exact string
+- `apply_patch`: apply a reviewable multi-file patch with add/update/move/delete
+  sections
 - `code_search`: search with `rg`
 
 Tool paths are resolved inside the current working directory.

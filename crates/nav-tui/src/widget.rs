@@ -5,8 +5,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashMap;
 
 use crate::cells::{
-    AssistantMessageCell, ErrorCell, SkillInvocationCell, ToolCallCell, ToolCallContext,
-    ToolOutputCell, UserMessageCell, WelcomeCell,
+    AssistantMessageCell, ErrorCell, FileChangeCell, SkillInvocationCell, ToolCallCell,
+    ToolCallContext, ToolOutputCell, TurnDiffCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -113,6 +113,25 @@ impl ChatWidget {
                 self.cells.push(Box::new(ToolOutputCell::with_context(
                     output, is_error, context,
                 )));
+            }
+            AgentEvent::FileChange {
+                changes,
+                status,
+                summary,
+                error,
+                ..
+            } => {
+                self.cells.push(Box::new(FileChangeCell::new(
+                    changes, status, summary, error,
+                )));
+            }
+            AgentEvent::TurnDiff {
+                files,
+                unified_diff,
+                truncated,
+            } => {
+                self.cells
+                    .push(Box::new(TurnDiffCell::new(files, unified_diff, truncated)));
             }
             AgentEvent::Error { message } => {
                 self.cells.push(Box::new(ErrorCell::new(message)));
