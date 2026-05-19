@@ -71,6 +71,7 @@ fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
         | AgentEvent::ToolCallApprovalRequest { .. }
         | AgentEvent::ToolCallBlocked { .. }
         | AgentEvent::TurnComplete { .. }
+        | AgentEvent::TurnAborted { .. }
         | AgentEvent::ProviderRetry { .. }
         | AgentEvent::ContextTrimmed { .. }
         | AgentEvent::CompactionStarted { .. }

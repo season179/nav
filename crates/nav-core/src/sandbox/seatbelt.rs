@@ -51,13 +51,23 @@ impl SandboxRunner for SeatbeltRunner {
                 .spawn()
                 .with_context(|| format!("failed to spawn sandbox-exec for `{}`", req.command))?;
 
-            let output = match time::timeout(req.timeout, child.wait_with_output()).await {
-                Ok(output) => output?,
-                Err(_) => bail!(
-                    "command timed out after {}s: {}",
-                    req.timeout.as_secs(),
-                    req.command
-                ),
+            // Race child against timeout and the abort signal. `kill_on_drop`
+            // means dropping the child on abort sends SIGKILL to sandbox-exec
+            // and its wrapped shell. This mirrors `passthrough::run_with_command`.
+            let wait_fut = child.wait_with_output();
+            let output = tokio::select! {
+                biased;
+                _ = req.abort.wait() => {
+                    bail!("command aborted by user: {}", req.command);
+                }
+                result = time::timeout(req.timeout, wait_fut) => match result {
+                    Ok(output) => output?,
+                    Err(_) => bail!(
+                        "command timed out after {}s: {}",
+                        req.timeout.as_secs(),
+                        req.command
+                    ),
+                },
             };
 
             Ok(SandboxOutput {
@@ -175,6 +185,7 @@ mod tests {
             cwd,
             timeout: Duration::from_secs(10),
             policy,
+            abort: crate::agent::AbortSignal::default(),
         }
     }
 

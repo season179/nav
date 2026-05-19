@@ -270,6 +270,15 @@ pub async fn run_agent(
     let mut turns_used = 0usize;
 
     'turns: loop {
+        // Abort check #1: between turns / before opening the next stream.
+        // Catches aborts the operator pressed while the previous tool was
+        // still draining its output. This must come *before* the model
+        // request goes out, otherwise we burn tokens on a turn we'll
+        // immediately discard.
+        if permissions.abort.is_aborted() {
+            return finalize_abort(&events, session, cwd, &args.model, None, &permissions.abort);
+        }
+        drain_steering_into_input(&permissions.steering, &events, session, &mut input, cwd);
         if turns_used >= args.max_turns {
             return fail(
                 &events,
@@ -278,14 +287,67 @@ pub async fn run_agent(
             );
         }
         let body = responses::response_body(args, cwd, &input, skills, context);
-        let mut stream = match transport.create(body, events.clone()).await {
-            Ok(stream) => stream,
-            Err(err) => return fail(&events, session, err),
+        // Race the connect/retry against the abort signal so a hung
+        // transport (no network, blocked DNS) doesn't keep the runner
+        // pinned past an Esc press.
+        let create_result = tokio::select! {
+            biased;
+            _ = permissions.abort.wait() => None,
+            result = transport.create(body, events.clone()) => Some(result),
+        };
+        let mut stream = match create_result {
+            None => {
+                return finalize_abort(
+                    &events,
+                    session,
+                    cwd,
+                    &args.model,
+                    None,
+                    &permissions.abort,
+                );
+            }
+            Some(Ok(stream)) => stream,
+            Some(Err(err)) => {
+                // If the operator hit abort while we were connecting / retrying,
+                // surface that as `TurnAborted` rather than a generic `Error`
+                // event — the connection failure is a symptom of the abort.
+                if permissions.abort.is_aborted() {
+                    return finalize_abort(
+                        &events,
+                        session,
+                        cwd,
+                        &args.model,
+                        None,
+                        &permissions.abort,
+                    );
+                }
+                return fail(&events, session, err);
+            }
         };
 
         let mut collector = ResponseCollector::default();
         loop {
-            let event = match stream.next().await {
+            // Abort check #2: race the next streamed event against the abort
+            // signal so a long-running model response can be cut short the
+            // moment the operator presses the abort key. Without this race
+            // the loop blocks on `stream.next().await` until the provider
+            // hangs up.
+            let next = tokio::select! {
+                biased;
+                _ = permissions.abort.wait() => None,
+                ev = stream.next() => Some(ev),
+            };
+            if next.is_none() {
+                return finalize_abort(
+                    &events,
+                    session,
+                    cwd,
+                    &args.model,
+                    None,
+                    &permissions.abort,
+                );
+            }
+            let event = match next.unwrap() {
                 Some(Ok(event)) => event,
                 Some(Err(ResponsesError::ContextWindowExceeded { message }))
                     if !overflow_recovery_attempted =>
@@ -333,7 +395,61 @@ pub async fn run_agent(
             Err(err) => return fail(&events, session, err),
         };
 
+        // Abort check #3: model finished responding but the operator may
+        // have hit abort during the response. Bail before dispatching tools
+        // — or before emitting TurnComplete for a tool-less final response.
+        // Usage was collected from the envelope above so the aborted turn
+        // still appears in session accounting.
+        if permissions.abort.is_aborted() {
+            return finalize_abort(
+                &events,
+                session,
+                cwd,
+                &args.model,
+                Some(&usage),
+                &permissions.abort,
+            );
+        }
+
         if calls.is_empty() {
+            // If the operator used `/steer` while the model was giving its
+            // final answer, fold the steering into a follow-up request
+            // rather than dropping the messages on the floor. Drain
+            // atomically and use the result so a Ctrl+X / `/clear` from
+            // the TUI between an `is_empty()` check and a `drain()` call
+            // can't trick us into spending a model turn on an empty
+            // follow-up. The model turn that just finished consumed
+            // tokens, so record it in the session store before
+            // continuing — this is the same accounting `finalize_turn`
+            // does, minus the `TurnComplete` event (the user's gesture
+            // hasn't settled yet).
+            let pending_steering = permissions.steering.drain();
+            if !pending_steering.is_empty() {
+                if let Some(binding) = session
+                    && let Err(err) =
+                        binding
+                            .store
+                            .complete_turn(&binding.session_id, &args.model, &usage, None)
+                {
+                    return fail(&events, session, err);
+                }
+                input.extend(responses::into_raw_output(envelope));
+                for message in pending_steering {
+                    let content = build_user_content(&message.text, &message.attachments, cwd);
+                    emit(
+                        &events,
+                        session,
+                        user_message_event(&message.text, None, message.attachments),
+                    );
+                    input.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
+                turns_used += 1;
+                continue 'turns;
+            }
             if let Err(err) = finalize_turn(&events, session, cwd, false, &args.model, &usage) {
                 return fail(&events, session, err);
             }
@@ -346,6 +462,26 @@ pub async fn run_agent(
         input.extend(responses::into_raw_output(envelope));
         let mut turn_had_mutation = false;
         for call in calls {
+            // Abort check #4: between tool dispatches. Stops the *next* tool
+            // before it runs but lets the current one finish (the runner
+            // checks abort internally for cancellable tools like bash).
+            if permissions.abort.is_aborted() {
+                return finalize_abort(
+                    &events,
+                    session,
+                    cwd,
+                    &args.model,
+                    Some(&usage),
+                    &permissions.abort,
+                );
+            }
+            // Steering drained mid-loop would land a `user` message
+            // between `function_call_output` items, which the Responses
+            // API treats as malformed input (outputs must follow their
+            // paired call contiguously). Steering submitted during this
+            // turn is folded in at the top of the *next* iteration's
+            // 'turns loop — one model boundary later, but with a valid
+            // input shape.
             let call_id = call.call_id.clone();
             emit(
                 &events,
@@ -450,22 +586,39 @@ pub async fn run_agent(
             }
 
             // Operator chose Abort on the approval modal (or the reverse
-            // channel sent {"decision":"abort"}). Finalize this turn and
-            // exit the loop instead of feeding more tool calls or asking
-            // the model for another turn.
+            // channel sent {"decision":"abort"}). Funnel through the same
+            // finalize_abort path as Esc so transcript review sees the
+            // same `TurnAborted` + optional TurnDiff regardless of source.
             if aborted {
-                if let Err(err) = finalize_turn(
+                if !permissions.abort.is_aborted() {
+                    permissions.abort.trip("approval modal abort");
+                }
+                return finalize_abort(
                     &events,
                     session,
                     cwd,
-                    turn_had_mutation,
                     &args.model,
-                    &usage,
-                ) {
-                    return fail(&events, session, err);
-                }
-                return Ok(());
+                    Some(&usage),
+                    &permissions.abort,
+                );
             }
+        }
+
+        // Abort check #5: the last tool's sandbox may have observed the
+        // abort and bailed with an error without setting `aborted` on the
+        // tool outcome (only the approval-modal path does). Without this
+        // check we'd reach `finalize_turn` here, emit `TurnComplete`, and
+        // then the next iteration's check #1 would emit `TurnAborted` —
+        // violating the invariant that the two are mutually exclusive.
+        if permissions.abort.is_aborted() {
+            return finalize_abort(
+                &events,
+                session,
+                cwd,
+                &args.model,
+                Some(&usage),
+                &permissions.abort,
+            );
         }
 
         if let Err(err) = finalize_turn(
@@ -555,6 +708,79 @@ pub(super) fn drop_oldest_tool_pair(input: &mut Vec<Value>) -> usize {
     }
     input.remove(call_pos);
     1
+}
+
+/// Drain every pending [`super::SteeringMessage`] from `queue`, emit a
+/// `UserMessage` event so the transcript and session log record each
+/// injection, and append a `message`/`user` item to `input` so the next
+/// model request sees them. No-op when the queue is empty.
+fn drain_steering_into_input(
+    queue: &super::SteeringQueue,
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    input: &mut Vec<Value>,
+    cwd: &Path,
+) {
+    for message in queue.drain() {
+        let content = build_user_content(&message.text, &message.attachments, cwd);
+        emit(
+            events,
+            session,
+            user_message_event(&message.text, None, message.attachments),
+        );
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": content,
+        }));
+    }
+}
+
+/// Emit a `TurnAborted` event in place of `TurnComplete` and return success.
+/// Returning `Ok(())` is intentional: an abort is a normal turn outcome from
+/// the runner's perspective — partial state is recorded, the loop is unwound
+/// cleanly, and the session is ready for the next prompt. Emits a turn-diff
+/// first if the working tree has uncommitted changes so reviewers can see
+/// what the aborted turn left behind, regardless of which abort path fired.
+///
+/// When `usage` is `Some`, the aborted turn is rolled into the session
+/// `turn` table the same way [`finalize_turn`] does so any tokens already
+/// consumed before the abort (typical for aborts that fire after a model
+/// response was collected) are visible in session accounting. Pre-response
+/// abort sites pass `None` because no envelope was collected.
+fn finalize_abort(
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    cwd: &Path,
+    model: &str,
+    usage: Option<&TurnUsage>,
+    abort: &super::AbortSignal,
+) -> Result<()> {
+    // Record the turn row first so the durable log can't contain a
+    // `TurnAborted` event without a matching `turn` row when the
+    // accounting write fails. A write failure routes through `fail()`
+    // (emits `Error`) and bubbles up — no orphaned `TurnAborted`.
+    if let (Some(usage), Some(binding)) = (usage, session)
+        && let Err(err) = binding
+            .store
+            .complete_turn(&binding.session_id, model, usage, None)
+    {
+        return fail(events, session, err);
+    }
+    if let Ok(Some(diff)) = git_diff::working_tree_diff(cwd) {
+        emit(
+            events,
+            session,
+            AgentEvent::TurnDiff {
+                files: diff.files,
+                unified_diff: diff.unified_diff,
+                truncated: diff.truncated,
+            },
+        );
+    }
+    let reason = abort.reason().unwrap_or_else(|| "aborted".to_string());
+    emit(events, session, AgentEvent::TurnAborted { reason });
+    Ok(())
 }
 
 fn fail<T>(

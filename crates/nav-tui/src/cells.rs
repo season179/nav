@@ -882,3 +882,29 @@ impl HistoryCell for ErrorCell {
         body_cell("•", "error", Color::Red, &self.message, width)
     }
 }
+
+/// Visible marker that a turn was aborted by the operator. Rendered as its
+/// own labeled row (separate from generic errors) so transcript review can
+/// tell "the model said something wrong" from "the user stopped this".
+pub struct ToolAbortedCell {
+    reason: String,
+}
+
+impl ToolAbortedCell {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl HistoryCell for ToolAbortedCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let body = if self.reason.is_empty() {
+            "turn aborted".to_string()
+        } else {
+            format!("turn aborted — {}", self.reason)
+        };
+        body_cell("◆", "aborted", Color::Yellow, &body, width)
+    }
+}

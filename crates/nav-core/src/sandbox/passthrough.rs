@@ -41,13 +41,24 @@ pub(super) async fn run_with_command(
         .spawn()
         .with_context(|| format!("failed to spawn command `{}`", req.command))?;
 
-    let output = match time::timeout(req.timeout, child.wait_with_output()).await {
-        Ok(output) => output?,
-        Err(_) => bail!(
-            "command timed out after {}s: {}",
-            req.timeout.as_secs(),
-            req.command
-        ),
+    // Race the child against the timeout AND the abort signal. The first
+    // arm that resolves wins. `kill_on_drop` above means dropping the
+    // partially-consumed child sends SIGKILL, so the abort arm shedding
+    // its `child` borrow is enough to clean up.
+    let wait_fut = child.wait_with_output();
+    let output = tokio::select! {
+        biased;
+        _ = req.abort.wait() => {
+            bail!("command aborted by user: {}", req.command);
+        }
+        result = time::timeout(req.timeout, wait_fut) => match result {
+            Ok(output) => output?,
+            Err(_) => bail!(
+                "command timed out after {}s: {}",
+                req.timeout.as_secs(),
+                req.command
+            ),
+        },
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -74,6 +85,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             timeout: Duration::from_secs(timeout_secs),
             policy: SandboxPolicy::DangerFullAccess,
+            abort: crate::agent::AbortSignal::default(),
         }
     }
 
@@ -105,6 +117,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passthrough_aborts_long_running_command_quickly() {
+        use std::time::Instant;
+        // 60s sleep — without the abort race the runner would either return
+        // with a timeout error or sit until the child exited. Tripping the
+        // abort half a second in must return promptly with a "command
+        // aborted" error rather than running the full timeout window.
+        let abort = crate::agent::AbortSignal::new();
+        let req = SandboxRequest {
+            command: "sleep 60".into(),
+            cwd: PathBuf::from("/tmp"),
+            timeout: Duration::from_secs(30),
+            policy: SandboxPolicy::DangerFullAccess,
+            abort: abort.clone(),
+        };
+        let started = Instant::now();
+        let handle = tokio::spawn(async move { PassthroughRunner.run(req).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        abort.trip("test");
+        let result = handle.await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "abort must return promptly, took {elapsed:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("aborted by user"),
+            "expected abort error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn passthrough_runs_in_cwd() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
@@ -113,6 +157,7 @@ mod tests {
             cwd: cwd.clone(),
             timeout: Duration::from_secs(5),
             policy: SandboxPolicy::DangerFullAccess,
+            abort: crate::agent::AbortSignal::default(),
         };
         let out = PassthroughRunner.run(req).await.unwrap();
         assert!(out.stdout.contains(&cwd.display().to_string()));

@@ -9,11 +9,74 @@ are the unchecked items at the top; shipped foundation stays here as evidence.
 1. [ ] Add real interactive control: abort the current turn/tool, queue
    steering and follow-up messages while the agent is busy, and surface a
    visible/editable pending queue.
-   - Partial: slash labels render in `nav-tui/src/bottom_pane/slash_popup.rs`
-     and a Ctrl+C handler exists, but prompts submitted during an active turn
-     still return "agent is busy" in `nav-tui/src/app.rs`; Ctrl+C only counts
-     toward quitting; no turn-abort, running-tool abort, steering, or
-     follow-up queue is implemented.
+   - Partial: follow-up queueing slice done. Prompts submitted during an
+     active turn now flow into a `PendingQueue`
+     (`nav-tui/src/pending_input.rs`) instead of the old "agent is busy"
+     error. The queue is rendered above the composer
+     (`nav-tui/src/pending_queue_widget.rs`), drains FIFO when the active
+     turn settles (`drain_next_queued` in `nav-tui/src/app.rs`), preserves
+     each item's attachments and snapshotted slash-skill activation, and
+     supports Ctrl+E (edit most-recent) and Ctrl+X (clear queue). `/clear`
+     also clears the queue. Tested by unit tests in `pending_input.rs` and
+     `pending_queue_widget.rs` plus app-level helpers
+     (`enqueue_busy_submit`, `restore_for_edit`).
+   - Partial: turn/tool abort done. Esc while a turn is active trips an
+     `AbortSignal` (`nav-core/src/agent/abort.rs`) plumbed through
+     `PermissionContext` into the agent loop and `SandboxRequest`. The
+     runner checks the signal at five boundaries — between turns, during
+     stream consumption, post-response pre-dispatch, between tool
+     dispatches, and after the tool loop — kills any in-flight bash
+     child via `tokio::select!` against `abort.wait()`, races
+     `transport.create()` so a stuck connect can't outlive Esc, and
+     emits a durable `AgentEvent::TurnAborted` (with a transcript-side
+     `ToolAbortedCell` marker) in place of `TurnComplete`. All abort
+     paths (Esc + approval-modal Abort decision) funnel through a
+     unified `finalize_abort` that records the turn's tokens to the
+     session store *before* emitting the durable event, and emits a
+     `TurnDiff` when the working tree changed so reviewers see partial
+     state regardless of which abort path fired. The status bar
+     surfaces "Esc abort" while working. Tested by `agent/abort.rs`
+     (including the trip-reason write/publish ordering test),
+     `agent/tests.rs::{run_agent_emits_turn_aborted_when_signal_tripped_before_run,
+     run_agent_skips_second_tool_when_abort_trips_during_first,
+     run_agent_does_not_emit_turn_complete_when_last_tool_aborts}`,
+     `sandbox/passthrough.rs::passthrough_aborts_long_running_command_quickly`,
+     and `app.rs::{abort_key_only_fires_on_bare_esc,
+     pressing_abort_key_trips_the_active_signal}`.
+   - Partial: mid-turn steering done. `/steer <message>` during an
+     active turn pushes into a `SteeringQueue`
+     (`nav-core/src/agent/steering.rs`) clone shared with the runner
+     via `PermissionContext`. The agent loop drains the queue at the
+     top of the `'turns` loop before each model request, and if a
+     final response arrives with no tool calls but pending steering is
+     present, it appends the assistant response into `input`, folds
+     the steering in atomically, records the turn's tokens, and
+     re-enters `'turns` instead of dropping the user's nudge. With no
+     active turn `/steer` degrades to a normal Submit. Pending
+     steering is shown as its own row in the pending queue widget
+     (count + "injects at next model/tool boundary"). On terminal
+     turn events the TUI rescues any steering message that landed in
+     the post-final-drain race window by converting it into a
+     follow-up submit. Ctrl+X and `/clear` both drain the steering
+     queue alongside the follow-up queue. The slash command parser is
+     `parse_steer_command` in `nav-tui/src/input.rs`. Tested by
+     `agent/steering.rs` unit tests (push/drain order, drop-oldest cap,
+     atomic-counter consistency under concurrent submit/drain),
+     `agent/tests.rs::run_agent_drains_steering_into_input_before_each_request`,
+     `pending_queue_widget` (`empty_follow_up_queue_still_renders_steering_pending_row`,
+     `zero_steering_omits_steering_row`), and
+     `input.rs` (`parse_steer_command_returns_payload_when_followed_by_whitespace`,
+     `parse_steer_command_handles_bare_command_and_unrelated_prefixes`).
+   - Outstanding: queue state is not yet mirrored into the
+     `AgentEvent` stream, so non-TUI consumers can't see follow-up or
+     steering queue updates as structured events; per-item follow-up
+     removal beyond "edit last" / "clear all" is not wired (no focus
+     model in the queue widget today); abort doesn't currently clear
+     in-flight assistant deltas from the transcript (the
+     `AssistantMessageDone` event may still arrive after a
+     `TurnAborted` in races between provider streaming and the abort
+     check — story 14); `kill_on_drop` does not reach grandchildren of
+     `sh -c` pipelines (would need `setsid`/process-group setup).
    - Reference shape: Codex has an input queue / interrupt path; Pi supports
      streaming steering, queued follow-ups, and abort keybindings.
 2. [ ] Stream assistant output live in the TUI.

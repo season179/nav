@@ -266,6 +266,12 @@ async fn build_ndjson_permissions(
             sandbox_policy,
             sandbox,
             session_allowlist: nav_core::permissions::SessionAllowlist::default(),
+            // NDJSON mode has no interactive abort gesture today; the
+            // default never-tripped signal keeps tools running normally.
+            abort: nav_core::AbortSignal::default(),
+            // Same story for steering: no NDJSON reverse-channel command
+            // yet, so the queue stays empty and never injects.
+            steering: nav_core::SteeringQueue::default(),
         },
         reader,
     )

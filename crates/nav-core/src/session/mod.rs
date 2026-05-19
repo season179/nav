@@ -221,6 +221,11 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
                 start_turn(&mut out, &mut turn, &mut in_turn);
                 push_section(&mut out, "Compaction summary", summary);
             }
+            AgentEvent::TurnAborted { reason } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                push_section(&mut out, "Turn aborted", reason);
+                in_turn = false;
+            }
             AgentEvent::TurnComplete { .. } => {
                 in_turn = false;
             }

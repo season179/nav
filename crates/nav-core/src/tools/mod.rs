@@ -159,6 +159,8 @@ pub fn unchecked_permission_context() -> PermissionContext {
         sandbox_policy: SandboxPolicy::DangerFullAccess,
         sandbox: Arc::new(PassthroughRunner),
         session_allowlist: SessionAllowlist::default(),
+        abort: crate::agent::AbortSignal::default(),
+        steering: crate::agent::SteeringQueue::default(),
     }
 }
 
@@ -691,6 +693,8 @@ mod tests {
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             sandbox: Arc::new(PassthroughRunner),
             session_allowlist: SessionAllowlist::default(),
+            abort: crate::agent::AbortSignal::default(),
+            steering: crate::agent::SteeringQueue::default(),
         }
     }
 

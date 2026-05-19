@@ -12,8 +12,8 @@ pub mod skills;
 pub mod tools;
 
 pub use agent::{
-    AgentEvent, CompactionTrigger, EventStream, ResponsesTransport, SessionBinding, TurnUsage,
-    UserAttachment, rebuild_responses_input, run_agent,
+    AbortSignal, AgentEvent, CompactionTrigger, EventStream, ResponsesTransport, SessionBinding,
+    SteeringMessage, SteeringQueue, TurnUsage, UserAttachment, rebuild_responses_input, run_agent,
 };
 pub use mutation::{
     FileChangeKind, FileChangeSummary, FileDiffSummary, MutationResult, PatchApplyStatus, TurnDiff,
