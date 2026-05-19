@@ -1,0 +1,62 @@
+; nav macOS Seatbelt base policy.
+;
+; Goal: read-everywhere, write-nowhere by default. Writes are unlocked by
+; per-invocation augmentations appended at runtime: one (allow file-write*
+; (subpath "..."))) per writable root, optional network unlock.
+;
+; Distilled from codex's seatbelt_base_policy.sbpl + restricted_read_only
+; defaults. nav's tool surface (cargo, git, rg, sh) needs broader read access
+; than codex's Chromium-style isolation, so we open file-read* by default
+; rather than enumerating system framework subpaths.
+
+(version 1)
+
+; Closed by default.
+(deny default)
+
+; Process plumbing. Child processes inherit the policy.
+(allow process-exec)
+(allow process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+
+; Reads: anywhere on the filesystem.
+(allow file-read*)
+(allow file-test-existence)
+(allow file-read-metadata)
+(allow file-map-executable)
+
+; Writes to harmless devices that real programs need. Kept in the base
+; profile because process plumbing relies on these even for ReadOnly
+; commands (stdio routing, ttys, /dev/null).
+(allow file-write-data (literal "/dev/null"))
+(allow file-write-data (literal "/dev/zero"))
+(allow file-write* (regex #"^/dev/ttys[0-9]+$"))
+(allow file-write* (literal "/dev/ptmx"))
+(allow file-write* (literal "/dev/tty"))
+(allow file-write* (regex #"^/dev/fd/[12]$"))
+(allow file-ioctl (regex #"^/dev/.*$"))
+
+; Scratch space (/tmp, /var/tmp) is deliberately NOT in the base. It is
+; appended only by `WorkspaceWrite` profiles so `--sandbox read-only`
+; honors its contract ("denies writes") completely. Tools that need
+; scratch space cannot run under ReadOnly.
+
+; Basic system services. These cover the ambient capabilities most CLIs
+; assume — sysctls, mach lookups, posix shm/sem, pty setup.
+(allow pseudo-tty)
+(allow sysctl-read)
+(allow sysctl-write (sysctl-name "kern.grade_cputype"))
+(allow iokit-open)
+(allow mach-lookup)
+(allow user-preference-read)
+(allow ipc-posix-sem)
+(allow ipc-posix-shm-read*)
+(allow ipc-posix-shm-write-create)
+(allow ipc-posix-shm-write-data)
+(allow ipc-posix-shm-write-unlink)
+(allow system-mac-syscall)
+(allow system-fsctl)
+
+; Local syslog socket so log() calls don't blow up.
+(allow network-outbound (literal "/private/var/run/syslog"))

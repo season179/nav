@@ -54,6 +54,7 @@ fn schema_applies_on_fresh_temp_db() {
     );
     assert!(names.iter().any(|n| n == "event"));
     assert!(names.iter().any(|n| n == "turn"));
+    assert!(names.iter().any(|n| n == "approval"));
     assert!(names.iter().any(|n| n == "schema_version"));
 
     let version: i64 = conn
@@ -127,6 +128,130 @@ fn round_trip_create_append_load() {
     }
     let loaded = store.load_session(&id).unwrap();
     assert_eq!(loaded, events);
+}
+
+#[test]
+fn append_event_tool_call_approval_request_persists_to_approval_table() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/tmp/proj");
+    let id = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+
+    store
+        .append_event(
+            &id,
+            &AgentEvent::ToolCallApprovalRequest {
+                call_id: "c1".into(),
+                approval_id: "a1".into(),
+                tool: "bash".into(),
+                command: Some(vec!["rm".into(), "-rf".into(), "build".into()]),
+                path: None,
+                cwd: "/ws".into(),
+                reason: "dangerous_pattern".into(),
+                available_decisions: vec![],
+            },
+        )
+        .unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let (tool, command, reason, decided_at, decision): (
+        String,
+        Option<String>,
+        String,
+        Option<i64>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT tool, command, reason, decided_at, decision
+             FROM approval
+             WHERE session_id = ?1 AND approval_id = ?2",
+            params![&id, "a1"],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("approval row missing");
+    assert_eq!(tool, "bash");
+    assert_eq!(reason, "dangerous_pattern");
+    assert!(decided_at.is_none());
+    assert!(decision.is_none());
+    assert!(command.unwrap().contains("rm"));
+}
+
+#[test]
+fn record_approval_decision_updates_row() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/tmp/proj");
+    let id = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+    store
+        .append_event(
+            &id,
+            &AgentEvent::ToolCallApprovalRequest {
+                call_id: "c1".into(),
+                approval_id: "a1".into(),
+                tool: "bash".into(),
+                command: None,
+                path: None,
+                cwd: "/ws".into(),
+                reason: "dangerous_pattern".into(),
+                available_decisions: vec![],
+            },
+        )
+        .unwrap();
+
+    store.record_approval_decision(&id, "a1", "approved").unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let (decided_at, decision): (Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT decided_at, decision FROM approval WHERE session_id = ?1 AND approval_id = ?2",
+            params![&id, "a1"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(decided_at.is_some());
+    assert_eq!(decision.as_deref(), Some("approved"));
+}
+
+#[test]
+fn append_event_tool_call_blocked_writes_audit_row() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/tmp/proj");
+    let id = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+
+    store
+        .append_event(
+            &id,
+            &AgentEvent::ToolCallBlocked {
+                call_id: "c2".into(),
+                tool: "bash".into(),
+                reason: "command refused unconditionally".into(),
+                rule: "unbypassable_dangerous".into(),
+            },
+        )
+        .unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let (rule, decision): (String, Option<String>) = conn
+        .query_row(
+            "SELECT rule, decision FROM approval WHERE session_id = ?1 AND approval_id = ?2",
+            params![&id, "c2"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(rule, "unbypassable_dangerous");
+    assert!(decision.is_none());
 }
 
 #[test]

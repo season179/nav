@@ -3,8 +3,10 @@ pub mod auth;
 pub mod cli;
 pub mod git_diff;
 pub mod mutation;
+pub mod permissions;
 pub mod project;
 pub mod responses;
+pub mod sandbox;
 pub mod session;
 pub mod skills;
 pub mod tools;
@@ -15,6 +17,9 @@ pub use agent::{
 };
 pub use mutation::{
     FileChangeKind, FileChangeSummary, FileDiffSummary, MutationResult, PatchApplyStatus, TurnDiff,
+};
+pub use permissions::{
+    ApprovalReason, AskForApproval, BlockRule, ReviewDecision, SandboxPolicy,
 };
 pub use project::{
     ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,

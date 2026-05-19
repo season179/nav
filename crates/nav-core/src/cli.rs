@@ -1,8 +1,9 @@
 use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
 use serde::Deserialize;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::permissions::{AskForApproval, SandboxPolicy};
 use crate::project::Settings;
 
 // clap turns this struct into the CLI. Keeping options small makes the
@@ -62,6 +63,26 @@ pub struct Args {
     /// Emit newline-delimited JSON AgentEvent records to stdout.
     #[arg(long)]
     pub json_events: bool,
+
+    /// When to ask the user before running risky tool calls. `untrusted`
+    /// auto-runs only known-safe read-only commands; `on-request` lets the
+    /// classifier decide; `never` skips prompts entirely and reports
+    /// approval-required tools as errors to the model.
+    #[arg(long, value_enum, default_value_t = AskForApproval::OnRequest)]
+    pub approval_policy: AskForApproval,
+
+    /// Sandbox shape for the bash tool. `read-only` denies writes;
+    /// `workspace-write` allows writes under the workspace and the
+    /// standard scratch dirs (`/tmp`, `/var/tmp`); `danger-full-access`
+    /// disables sandboxing entirely. On non-macOS platforms the sandbox
+    /// is not yet enforced — the classifier still applies.
+    #[arg(long, value_enum, default_value_t = SandboxMode::WorkspaceWrite)]
+    pub sandbox: SandboxMode,
+
+    /// Bypass approval prompts AND sandbox enforcement. Unbypassable
+    /// dangerous commands and protected-metadata writes are still refused.
+    #[arg(long)]
+    pub dangerously_bypass_approvals_and_sandbox: bool,
 
     pub prompt: Vec<String>,
 }
@@ -150,8 +171,32 @@ impl Args {
             cwd: None,
             db_path: None,
             json_events: false,
+            approval_policy: AskForApproval::Never,
+            sandbox: SandboxMode::DangerFullAccess,
+            dangerously_bypass_approvals_and_sandbox: false,
             prompt: vec!["test".into()],
         }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+/// Resolve `--sandbox` plus the `--dangerously-bypass-...` flag into the
+/// runtime `SandboxPolicy`. Shared between CLI and TUI entry points.
+pub fn sandbox_policy_from_args(args: &Args, cwd: &Path) -> SandboxPolicy {
+    if args.dangerously_bypass_approvals_and_sandbox {
+        return SandboxPolicy::DangerFullAccess;
+    }
+    match args.sandbox {
+        SandboxMode::ReadOnly => SandboxPolicy::ReadOnly,
+        SandboxMode::WorkspaceWrite => SandboxPolicy::workspace_write(cwd.to_path_buf()),
+        SandboxMode::DangerFullAccess => SandboxPolicy::DangerFullAccess,
     }
 }
 
@@ -184,6 +229,47 @@ mod tests {
         assert_eq!(args.bash_timeout_secs, 20);
         assert_eq!(args.prompt, vec!["hello"]);
         assert!(args.codex_home.is_none());
+        assert_eq!(args.approval_policy, AskForApproval::OnRequest);
+        assert_eq!(args.sandbox, SandboxMode::WorkspaceWrite);
+        assert!(!args.dangerously_bypass_approvals_and_sandbox);
+    }
+
+    #[test]
+    fn approval_policy_parses_codex_names() {
+        let args =
+            Args::try_parse_from(["nav", "--approval-policy", "untrusted", "x"]).unwrap();
+        assert_eq!(args.approval_policy, AskForApproval::UnlessTrusted);
+
+        let args =
+            Args::try_parse_from(["nav", "--approval-policy", "on-request", "x"]).unwrap();
+        assert_eq!(args.approval_policy, AskForApproval::OnRequest);
+
+        let args =
+            Args::try_parse_from(["nav", "--approval-policy", "never", "x"]).unwrap();
+        assert_eq!(args.approval_policy, AskForApproval::Never);
+    }
+
+    #[test]
+    fn sandbox_mode_parses_kebab() {
+        let args = Args::try_parse_from(["nav", "--sandbox", "read-only", "x"]).unwrap();
+        assert_eq!(args.sandbox, SandboxMode::ReadOnly);
+
+        let args = Args::try_parse_from(["nav", "--sandbox", "workspace-write", "x"]).unwrap();
+        assert_eq!(args.sandbox, SandboxMode::WorkspaceWrite);
+
+        let args = Args::try_parse_from(["nav", "--sandbox", "danger-full-access", "x"]).unwrap();
+        assert_eq!(args.sandbox, SandboxMode::DangerFullAccess);
+    }
+
+    #[test]
+    fn bypass_flag_parses() {
+        let args = Args::try_parse_from([
+            "nav",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "hi",
+        ])
+        .unwrap();
+        assert!(args.dangerously_bypass_approvals_and_sandbox);
     }
 
     #[test]

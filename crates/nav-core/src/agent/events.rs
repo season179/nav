@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mutation::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
+use crate::permissions::ReviewDecision;
 
 /// A non-text input attached to a [`AgentEvent::UserMessage`]. Stored by path
 /// (workspace-relative) — the bytes are loaded by the transport at request
@@ -79,6 +80,31 @@ pub enum AgentEvent {
         unified_diff: String,
         truncated: bool,
     },
+    /// The agent needs the operator's permission before it can run a tool
+    /// call. Surfaced for both `bash` (`command` populated) and `edit_file`
+    /// (`path` populated). Frontends respond by either rendering an
+    /// interactive prompt (TUI) or by emitting a matching
+    /// `ApprovalResponse` JSON line on stdin (NDJSON mode).
+    ToolCallApprovalRequest {
+        call_id: String,
+        approval_id: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        cwd: String,
+        reason: String,
+        available_decisions: Vec<ReviewDecision>,
+    },
+    /// A tool call was refused before execution. Stable `rule` ids let
+    /// frontends localize or audit the rejection.
+    ToolCallBlocked {
+        call_id: String,
+        tool: String,
+        reason: String,
+        rule: String,
+    },
     TurnComplete {
         usage: TurnUsage,
     },
@@ -115,6 +141,8 @@ impl AgentEvent {
             AgentEvent::ToolCallOutput { .. } => "tool_call_output",
             AgentEvent::FileChange { .. } => "file_change",
             AgentEvent::TurnDiff { .. } => "turn_diff",
+            AgentEvent::ToolCallApprovalRequest { .. } => "tool_call_approval_request",
+            AgentEvent::ToolCallBlocked { .. } => "tool_call_blocked",
             AgentEvent::TurnComplete { .. } => "turn_complete",
             AgentEvent::ProviderRetry { .. } => "provider_retry",
             AgentEvent::ContextTrimmed { .. } => "context_trimmed",
@@ -131,5 +159,138 @@ impl AgentEvent {
             self,
             AgentEvent::AssistantMessageDelta { .. } | AgentEvent::ProviderRetry { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_call_approval_request_wire_format() {
+        let event = AgentEvent::ToolCallApprovalRequest {
+            call_id: "c1".into(),
+            approval_id: "a1".into(),
+            tool: "bash".into(),
+            command: Some(vec!["rm".into(), "-rf".into(), "build".into()]),
+            path: None,
+            cwd: "/ws".into(),
+            reason: "dangerous_pattern".into(),
+            available_decisions: vec![
+                ReviewDecision::Approved,
+                ReviewDecision::ApprovedForSession,
+                ReviewDecision::Denied,
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "tool_call_approval_request",
+                "call_id": "c1",
+                "approval_id": "a1",
+                "tool": "bash",
+                "command": ["rm", "-rf", "build"],
+                "cwd": "/ws",
+                "reason": "dangerous_pattern",
+                "available_decisions": ["approved", "approved_for_session", "denied"]
+            })
+        );
+        assert_eq!(event.kind(), "tool_call_approval_request");
+        assert!(event.is_durable());
+    }
+
+    #[test]
+    fn tool_call_approval_request_skips_none_fields() {
+        // edit_file approval uses `path` and omits `command`.
+        let event = AgentEvent::ToolCallApprovalRequest {
+            call_id: "c2".into(),
+            approval_id: "a2".into(),
+            tool: "edit_file".into(),
+            command: None,
+            path: Some("src/main.rs".into()),
+            cwd: "/ws".into(),
+            reason: "protected_metadata".into(),
+            available_decisions: vec![ReviewDecision::Approved, ReviewDecision::Denied],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert!(json.get("command").is_none(), "command should be skipped");
+        assert_eq!(json["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn tool_call_blocked_wire_format() {
+        let event = AgentEvent::ToolCallBlocked {
+            call_id: "c3".into(),
+            tool: "bash".into(),
+            reason: "command sudo is never allowed".into(),
+            rule: "unbypassable_dangerous".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "tool_call_blocked",
+                "call_id": "c3",
+                "tool": "bash",
+                "reason": "command sudo is never allowed",
+                "rule": "unbypassable_dangerous"
+            })
+        );
+        assert_eq!(event.kind(), "tool_call_blocked");
+        assert!(event.is_durable());
+    }
+
+    #[test]
+    fn existing_variants_kind_strings_unchanged() {
+        // Guard against accidental rename of the wire-format discriminant.
+        let cases = vec![
+            (
+                AgentEvent::UserMessage {
+                    text: "x".into(),
+                    display_text: None,
+                    attachments: Vec::new(),
+                },
+                "user_message",
+            ),
+            (
+                AgentEvent::AssistantMessageDelta { text: "x".into() },
+                "assistant_message_delta",
+            ),
+            (
+                AgentEvent::AssistantMessageDone { text: "x".into() },
+                "assistant_message_done",
+            ),
+            (
+                AgentEvent::ToolCallStarted {
+                    call_id: "c".into(),
+                    name: "n".into(),
+                    arguments: serde_json::Value::Null,
+                },
+                "tool_call_started",
+            ),
+            (
+                AgentEvent::ToolCallOutput {
+                    call_id: "c".into(),
+                    output: "o".into(),
+                    is_error: false,
+                },
+                "tool_call_output",
+            ),
+            (
+                AgentEvent::TurnComplete {
+                    usage: TurnUsage::default(),
+                },
+                "turn_complete",
+            ),
+            (
+                AgentEvent::Error {
+                    message: "m".into(),
+                },
+                "error",
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(event.kind(), expected);
+        }
     }
 }

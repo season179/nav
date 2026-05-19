@@ -1,72 +1,100 @@
-use anyhow::{Context, Result, bail};
-use std::{path::Path, process::Stdio};
-use tokio::{process::Command, time};
+use anyhow::Result;
+use std::path::Path;
+use std::time::Duration;
 
-pub(super) async fn bash(cwd: &Path, timeout_secs: u64, command: &str) -> Result<String> {
-    // shell access is powerful and risky. We run in the workspace, capture
-    // stdout/stderr for the model, and enforce a timeout so commands cannot hang.
-    let child = Command::new("sh")
-        .kill_on_drop(true)
-        .arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn command `{command}`"))?;
+use crate::sandbox::SandboxRequest;
+use crate::tools::preflight::PermissionContext;
 
-    let output = match time::timeout(
-        time::Duration::from_secs(timeout_secs),
-        child.wait_with_output(),
-    )
-    .await
-    {
-        Ok(output) => output?,
-        Err(_) => bail!("command timed out after {timeout_secs}s: {command}"),
+pub(super) async fn bash(
+    permissions: &PermissionContext,
+    cwd: &Path,
+    timeout_secs: u64,
+    command: &str,
+) -> Result<String> {
+    // shell access is powerful and risky. The classifier already gated
+    // dangerous commands in `preflight`; here we just spawn under the
+    // sandbox runner chosen for the active policy.
+    let req = SandboxRequest {
+        command: command.to_string(),
+        cwd: cwd.to_path_buf(),
+        timeout: Duration::from_secs(timeout_secs),
+        policy: permissions.sandbox_policy.clone(),
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let output = permissions.sandbox.run(req).await?;
     Ok(format!(
         "status: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status, stdout, stderr
+        output.status_display, output.stdout, output.stderr
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::unchecked_permission_context;
     use std::path::Path;
 
     #[tokio::test]
     async fn bash_captures_stdout() {
-        let result = bash(Path::new("/tmp"), 5, "echo hello").await.unwrap();
+        let result = bash(
+            &unchecked_permission_context(),
+            Path::new("/tmp"),
+            5,
+            "echo hello",
+        )
+        .await
+        .unwrap();
         assert!(result.contains("hello"));
         assert!(result.contains("status:"));
     }
 
     #[tokio::test]
     async fn bash_captures_stderr() {
-        let result = bash(Path::new("/tmp"), 5, "echo oops >&2").await.unwrap();
+        let result = bash(
+            &unchecked_permission_context(),
+            Path::new("/tmp"),
+            5,
+            "echo oops >&2",
+        )
+        .await
+        .unwrap();
         assert!(result.contains("stderr:\noops"));
     }
 
     #[tokio::test]
     async fn bash_reports_exit_status() {
-        // On Unix, ExitStatus Display is "exit status: N".
-        let result = bash(Path::new("/tmp"), 5, "exit 42").await.unwrap();
+        let result = bash(
+            &unchecked_permission_context(),
+            Path::new("/tmp"),
+            5,
+            "exit 42",
+        )
+        .await
+        .unwrap();
         assert!(result.contains("status: exit status: 42"));
     }
 
     #[tokio::test]
     async fn bash_reports_zero_exit() {
-        let result = bash(Path::new("/tmp"), 5, "true").await.unwrap();
+        let result = bash(
+            &unchecked_permission_context(),
+            Path::new("/tmp"),
+            5,
+            "true",
+        )
+        .await
+        .unwrap();
         assert!(result.contains("status: exit status: 0"));
     }
 
     #[tokio::test]
     async fn bash_timeout_returns_error() {
-        let result = bash(Path::new("/tmp"), 1, "sleep 60").await;
+        let result = bash(
+            &unchecked_permission_context(),
+            Path::new("/tmp"),
+            1,
+            "sleep 60",
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }
@@ -75,7 +103,9 @@ mod tests {
     async fn bash_runs_in_cwd() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
-        let result = bash(&cwd, 5, "pwd").await.unwrap();
+        let result = bash(&unchecked_permission_context(), &cwd, 5, "pwd")
+            .await
+            .unwrap();
         assert!(result.contains(&format!("stdout:\n{}", cwd.display())));
     }
 }

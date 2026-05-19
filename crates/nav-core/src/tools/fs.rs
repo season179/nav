@@ -7,6 +7,48 @@ use tokio::process::Command;
 
 use super::ToolResult;
 use crate::mutation::{FileChangeKind, FileChangeSummary, MutationResult, summarize_changes};
+use crate::permissions::protected::{
+    PROTECTED_READ_GLOBS, is_protected_metadata_write, is_protected_read,
+};
+
+/// Post-canonicalize symlink-bypass check: refuse only when the resolved
+/// path lands under protected metadata via indirection (raw request didn't
+/// already name it). Direct references like `.git/config` should never
+/// reach here — preflight `Block`s them — but if they do, the rule still
+/// applies and we bail unconditionally.
+fn ensure_not_protected_metadata(raw: &str, canonical: &Path) -> Result<()> {
+    if !is_protected_metadata_write(canonical) {
+        return Ok(());
+    }
+    if is_protected_metadata_write(raw) {
+        bail!(
+            "{} is protected metadata; writes are not allowed",
+            canonical.display()
+        );
+    }
+    bail!(
+        "{} resolves via symlink to protected metadata; writes refused",
+        canonical.display()
+    );
+}
+
+/// Symlink-bypass check for protected reads. When the raw request names
+/// the protected file directly (e.g. `read_file(".env")`), the preflight
+/// approval flow already gated this, so honor the approval and allow.
+/// Only refuse when the canonical path is protected *but* the raw request
+/// isn't — that's a symlink reaching into a secret.
+fn ensure_not_protected_read(raw: &str, canonical: &Path) -> Result<()> {
+    if !is_protected_read(canonical) {
+        return Ok(());
+    }
+    if is_protected_read(raw) {
+        return Ok(());
+    }
+    bail!(
+        "{} resolves via symlink to a protected secret; refused",
+        canonical.display()
+    );
+}
 
 pub(super) fn resolve_inside(root: &Path, requested: &str) -> Result<PathBuf> {
     resolve_under(root, &[], requested)
@@ -147,7 +189,9 @@ fn debug_assert_is_canonical(root: &Path) {
 }
 
 pub(super) fn read_file(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Result<String> {
+    let raw = path;
     let path = resolve_under(cwd, skill_dirs, path)?;
+    ensure_not_protected_read(raw, &path)?;
     if path.is_dir() {
         bail!("{} is a directory", path.display());
     }
@@ -177,8 +221,10 @@ pub(super) fn edit_file_with_metadata(
     old_str: &str,
     new_str: &str,
 ) -> Result<ToolResult> {
+    let raw = path;
     if old_str.is_empty() {
-        let resolved = resolve_create_path(cwd, path)?;
+        let resolved = resolve_create_path(cwd, raw)?;
+        ensure_not_protected_metadata(raw, &resolved)?;
         if resolved.exists() {
             bail!("{} already exists", resolved.display());
         }
@@ -204,19 +250,23 @@ pub(super) fn edit_file_with_metadata(
         ));
     }
 
-    let resolved = resolve_inside(cwd, path)?;
+    let resolved = resolve_inside(cwd, raw)?;
+    ensure_not_protected_metadata(raw, &resolved)?;
+    ensure_not_protected_read(raw, &resolved)?;
     let original = fs::read_to_string(&resolved)
         .with_context(|| format!("failed to read {}", resolved.display()))?;
+    // exact replacement is safer for a teaching agent than fuzzy patching.
+    // Requiring one match prevents accidental broad edits.
     let matches = original.matches(old_str).take(2).count();
     if matches != 1 {
         bail!("expected exactly one match for old_str, found {matches}");
     }
     let updated = original.replacen(old_str, new_str, 1);
     fs::write(&resolved, &updated)?;
-    let before_label = format!("a/{path}");
-    let after_label = format!("b/{path}");
+    let before_label = format!("a/{raw}");
+    let after_label = format!("b/{raw}");
     let change = FileChangeSummary::new(
-        path,
+        raw,
         FileChangeKind::Update { move_path: None },
         &original,
         &updated,
@@ -238,10 +288,19 @@ pub(super) async fn code_search(
     pattern: &str,
     path: &str,
 ) -> Result<String> {
-    let path = resolve_under(cwd, skill_dirs, path)?;
-    let output = Command::new("rg")
-        .arg("--line-number")
-        .arg("--no-heading")
+    let raw = path;
+    let path = resolve_under(cwd, skill_dirs, raw)?;
+    ensure_not_protected_read(raw, &path)?;
+    // Filter protected-read files out of the recursive search so
+    // `code_search(.., "certs/")` doesn't surface contents of
+    // `certs/server.pem` without the approval that a direct
+    // `read_file("certs/server.pem")` would require.
+    let mut cmd = Command::new("rg");
+    cmd.arg("--line-number").arg("--no-heading");
+    for glob in PROTECTED_READ_GLOBS {
+        cmd.arg("--glob").arg(format!("!{glob}"));
+    }
+    let output = cmd
         .arg("-e")
         .arg(pattern)
         .arg(&path)
@@ -319,6 +378,56 @@ mod tests {
         let error = read_file(&workspace, &[], "link").unwrap_err();
 
         assert!(error.to_string().contains("path escapes workspace"));
+    }
+
+    #[test]
+    fn read_file_allows_direct_dotenv_after_approval() {
+        // Approved direct reads of protected files must execute. The
+        // preflight already gated this; the fs layer's symlink-bypass
+        // check should not double-block.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        fs::write(workspace.join(".env"), "SECRET=1").unwrap();
+
+        let body = read_file(&workspace, &[], ".env").unwrap();
+        assert_eq!(body, "SECRET=1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_rejects_symlink_to_dotenv() {
+        // The preflight `is_protected_read` check runs on the raw request
+        // string; a workspace symlink `cfg -> .env` slips past it. The fs
+        // layer canonicalizes and must refuse.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        fs::write(workspace.join(".env"), "SECRET=1").unwrap();
+        std::os::unix::fs::symlink(workspace.join(".env"), workspace.join("cfg")).unwrap();
+
+        let err = read_file(&workspace, &[], "cfg").unwrap_err();
+        assert!(
+            err.to_string().contains("protected secret"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_file_rejects_symlink_to_git_config() {
+        // Symlink bypass for edit_file: `link -> .git/config` once let
+        // writes through because the preflight saw only `link`.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(workspace.join(".git")).unwrap();
+        fs::write(workspace.join(".git/config"), "[core]").unwrap();
+        std::os::unix::fs::symlink(workspace.join(".git/config"), workspace.join("link"))
+            .unwrap();
+
+        let err = edit_file_with_metadata(&workspace, "link", "[core]", "x").unwrap_err();
+        assert!(
+            err.to_string().contains("protected metadata"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

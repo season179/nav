@@ -184,6 +184,16 @@ impl HistoryCell for WelcomeCell {
             Span::styled("  not wired yet".to_string(), dim),
         ]));
         lines.push(Line::from(String::new()));
+        lines.push(Line::from(Span::styled(
+            "  nav asks before risky tools (rm -rf, force-push, .env reads).".to_string(),
+            dim,
+        )));
+        lines.push(Line::from(Span::styled(
+            "  Pass --approval-policy never to silence, or --sandbox read-only to harden."
+                .to_string(),
+            dim,
+        )));
+        lines.push(Line::from(String::new()));
         lines
     }
 }

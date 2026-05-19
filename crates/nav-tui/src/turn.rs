@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, Catalog, OpenAiTransport, ProjectContext, SessionBinding, SessionId, SessionStore,
     UserAttachment, cli::Args, rebuild_responses_input, run_agent,
@@ -21,6 +22,7 @@ pub(crate) struct TurnSpawn<'a> {
     pub agent_tx: mpsc::UnboundedSender<AgentEvent>,
     pub skills: Arc<Catalog>,
     pub project: Arc<ProjectContext>,
+    pub permissions: PermissionContext,
 }
 
 pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
@@ -53,6 +55,7 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
         agent_tx,
         skills,
         project,
+        permissions,
         ..
     } = request;
 
@@ -73,6 +76,7 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
             history_input,
             skills.as_ref(),
             Some(project.as_ref()),
+            permissions,
         )
         .await;
     });

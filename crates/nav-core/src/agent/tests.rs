@@ -473,6 +473,7 @@ async fn run_agent_emits_single_error_when_transport_create_fails() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect_err("transport failure should return an error");
@@ -552,6 +553,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await;
     result.expect("run_agent should succeed");
@@ -724,6 +726,7 @@ async fn run_agent_emits_file_change_and_turn_diff_for_patch_tool() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect("run_agent");
@@ -812,6 +815,7 @@ async fn run_agent_emits_failed_file_change_for_rejected_patch_tool() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect("run_agent continues after tool error");
@@ -913,6 +917,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect("first run_agent");
@@ -963,6 +968,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         Some(rebuilt),
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect("resumed run_agent");
@@ -1049,6 +1055,7 @@ async fn user_message_with_image_attachment_is_sent_as_input_image_content() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect("run_agent");
@@ -1145,6 +1152,7 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect("recovery should succeed");
@@ -1246,6 +1254,7 @@ async fn overflow_recovery_does_not_consume_turn_budget() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect("recovery on the last allowed turn should still succeed");
@@ -1314,6 +1323,7 @@ async fn overflow_second_failure_surfaces_clean_error() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect_err("second overflow should fail");
@@ -1359,6 +1369,7 @@ async fn create_failure_does_not_emit_retry_event_from_stub() {
         None,
         &Catalog::default(),
         None,
+        crate::tools::unchecked_permission_context(),
     )
     .await
     .expect_err("should fail");

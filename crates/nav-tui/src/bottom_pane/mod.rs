@@ -6,10 +6,12 @@
 //! overlay sees the key first, and the composer only sees keys the overlay
 //! explicitly returns [`InputResult::Unhandled`] for.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
+use nav_core::ReviewDecision;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -18,11 +20,13 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 
 use crate::theme::COMPOSER_BG;
 
+mod approval;
 mod composer;
 mod mention_popup;
 mod slash_popup;
 mod view;
 
+pub use approval::ApprovalOverlay;
 pub use composer::{Composer, ComposerEvent};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
 pub use slash_popup::{BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries};
@@ -32,6 +36,18 @@ pub use view::{BottomPaneView, InputResult};
 /// composer. Used in three lockstep places: pane-height math, cursor
 /// positioning, and the render-time horizontal split.
 const GUTTER_WIDTH: u16 = 2;
+
+/// One pending approval waiting to be displayed. Stored on `BottomPane` so
+/// new requests queue up while a modal is already on screen.
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    pub approval_id: String,
+    pub tool: String,
+    pub command: Option<Vec<String>>,
+    pub path: Option<String>,
+    pub cwd: String,
+    pub reason: String,
+}
 
 pub struct BottomPane {
     composer: Composer,
@@ -50,6 +66,10 @@ pub struct BottomPane {
     /// `<cwd>/.nav/clipboard/` without the event loop re-passing the path on
     /// every paste.
     cwd: PathBuf,
+    /// Approvals that arrived while another modal was already up.
+    pending_approvals: VecDeque<PendingApproval>,
+    /// Captured decision waiting to be drained by the app loop.
+    last_decision: Option<(String, ReviewDecision)>,
 }
 
 impl BottomPane {
@@ -86,6 +106,47 @@ impl BottomPane {
             slash_entries,
             mention_entries,
             cwd,
+            pending_approvals: VecDeque::new(),
+            last_decision: None,
+        }
+    }
+
+    /// Enqueue an approval request. Promotes to the active overlay if no
+    /// modal is already up. A misbehaving agent that fires faster than the
+    /// user can respond would otherwise grow memory unboundedly — cap the
+    /// queue and drop the oldest pending request if we hit it.
+    pub fn enqueue_approval(&mut self, pending: PendingApproval) {
+        const MAX_PENDING_APPROVALS: usize = 100;
+        if self.pending_approvals.len() >= MAX_PENDING_APPROVALS {
+            self.pending_approvals.pop_front();
+        }
+        self.pending_approvals.push_back(pending);
+        self.try_show_next_approval();
+    }
+
+    /// Drain the most recent decision, if any. The app loop calls this after
+    /// each key event and forwards the result to `PendingApprovals::respond`.
+    pub fn take_approval_decision(&mut self) -> Option<(String, ReviewDecision)> {
+        self.last_decision.take()
+    }
+
+    fn try_show_next_approval(&mut self) {
+        if self.view.is_some() {
+            return;
+        }
+        if let Some(next) = self.pending_approvals.pop_front() {
+            let total = self.pending_approvals.len() + 1;
+            let overlay = ApprovalOverlay::new(
+                next.approval_id,
+                next.tool,
+                next.command,
+                next.path,
+                next.cwd,
+                next.reason,
+                0,
+                total,
+            );
+            self.view = Some(BottomPaneView::Approval(overlay));
         }
     }
 
@@ -161,7 +222,10 @@ impl BottomPane {
                         // Remember which kind of popup just closed so we can
                         // suppress its auto-reopen until the user moves out of
                         // that context (slash prefix or @token). Without this
-                        // Esc would be a no-op.
+                        // Esc would be a no-op. For approval overlays, also
+                        // capture the decision before dropping — otherwise the
+                        // app loop never sees the user's choice and the tool
+                        // call hangs forever waiting on the oneshot.
                         match view {
                             BottomPaneView::SlashCommand(_) => {
                                 self.slash_popup_suppressed = true;
@@ -169,8 +233,16 @@ impl BottomPane {
                             BottomPaneView::FileMention(_) => {
                                 self.mention_popup_suppressed = true;
                             }
+                            BottomPaneView::Approval(o) => {
+                                if let Some(decision) = o.take_decision() {
+                                    self.last_decision =
+                                        Some((o.approval_id.clone(), decision));
+                                }
+                            }
                         }
                         self.view = None;
+                        // Promote the next queued approval, if any.
+                        self.try_show_next_approval();
                     }
                     self.reconcile_popups();
                     return ComposerEvent::Nothing;
@@ -266,6 +338,10 @@ impl BottomPane {
             }
             (Some(BottomPaneView::FileMention(p)), _, true) => {
                 p.set_query(mention_token.as_deref().unwrap_or(""));
+                return;
+            }
+            (Some(BottomPaneView::Approval(_)), _, _) => {
+                // Approval modal is unaffected by composer text changes.
                 return;
             }
             _ => {}
@@ -452,6 +528,49 @@ impl Widget for &BottomPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    fn approval(id: &str) -> PendingApproval {
+        PendingApproval {
+            approval_id: id.into(),
+            tool: "bash".into(),
+            command: Some(vec!["rm".into(), "-rf".into(), "build".into()]),
+            path: None,
+            cwd: "/ws".into(),
+            reason: "dangerous_pattern".into(),
+        }
+    }
+
+    #[test]
+    fn approval_decision_is_captured_before_overlay_drops() {
+        let mut pane = BottomPane::new();
+        pane.enqueue_approval(approval("a1"));
+        assert!(pane.has_overlay());
+        pane.handle_key(key(KeyCode::Char('y')));
+        assert!(!pane.has_overlay());
+        assert_eq!(
+            pane.take_approval_decision(),
+            Some(("a1".to_string(), ReviewDecision::Approved))
+        );
+    }
+
+    #[test]
+    fn next_queued_approval_promotes_after_decision() {
+        let mut pane = BottomPane::new();
+        pane.enqueue_approval(approval("a1"));
+        pane.enqueue_approval(approval("a2"));
+        pane.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(
+            pane.take_approval_decision(),
+            Some(("a1".to_string(), ReviewDecision::Denied))
+        );
+        // a2 should now be on screen.
+        assert!(pane.has_overlay());
+    }
 
     #[test]
     fn recognized_image_path_rejects_non_image_text() {

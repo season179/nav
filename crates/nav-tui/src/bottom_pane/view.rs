@@ -2,6 +2,7 @@ use crossterm::event::KeyEvent;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use super::approval::ApprovalOverlay;
 use super::composer::Composer;
 use super::mention_popup::FileMentionPopup;
 use super::slash_popup::SlashCommandPopup;
@@ -21,6 +22,7 @@ pub enum InputResult {
 pub enum BottomPaneView {
     SlashCommand(SlashCommandPopup),
     FileMention(FileMentionPopup),
+    Approval(ApprovalOverlay),
 }
 
 impl BottomPaneView {
@@ -28,6 +30,7 @@ impl BottomPaneView {
         match self {
             Self::SlashCommand(p) => p.handle_key(key, composer),
             Self::FileMention(p) => p.handle_key(key, composer),
+            Self::Approval(p) => p.handle_key(key, composer),
         }
     }
 
@@ -35,6 +38,7 @@ impl BottomPaneView {
         match self {
             Self::SlashCommand(p) => p.is_complete(),
             Self::FileMention(p) => p.is_complete(),
+            Self::Approval(p) => p.is_complete(),
         }
     }
 
@@ -42,6 +46,7 @@ impl BottomPaneView {
         match self {
             Self::SlashCommand(p) => p.desired_height(width),
             Self::FileMention(p) => p.desired_height(width),
+            Self::Approval(p) => p.desired_height(width),
         }
     }
 
@@ -49,6 +54,7 @@ impl BottomPaneView {
         match self {
             Self::SlashCommand(p) => p.render(area, buf),
             Self::FileMention(p) => p.render(area, buf),
+            Self::Approval(p) => p.render(area, buf),
         }
     }
 
@@ -59,6 +65,9 @@ impl BottomPaneView {
             // which has access to the composer's cursor — not just the first
             // line — so it doesn't need this generic hook.
             Self::FileMention(_) => {}
+            // Approval overlays don't react to composer changes; the modal
+            // is decided by keystrokes only.
+            Self::Approval(_) => {}
         }
     }
 }

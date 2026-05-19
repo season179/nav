@@ -1,8 +1,15 @@
 use anyhow::{Context, Result, bail};
+use nav_core::permissions::AskForApproval;
+use nav_core::permissions::approval::{
+    ApprovalGate, AutoGate, ChannelGate, PendingApprovals, spawn_response_reader,
+};
+use nav_core::sandbox::select_for_platform;
+use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
-    SessionBinding, SessionStore, SessionSummary, auth, cli::Args, discover_skills,
-    load_project_context, rebuild_responses_input, run_agent, shorten_home,
+    SessionBinding, SessionStore, SessionSummary, agent, auth,
+    cli::{Args, sandbox_policy_from_args},
+    discover_skills, load_project_context, rebuild_responses_input, shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -122,7 +129,11 @@ async fn main() -> Result<()> {
         session_id,
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let agent = run_agent(
+    let (permissions, _stdin_reader) =
+        build_ndjson_permissions(&args, &cwd, tx.clone(), Arc::clone(&store), &binding.session_id)
+            .await;
+
+    let agent = agent::run_agent(
         transport.as_ref(),
         &args,
         &cwd,
@@ -134,6 +145,7 @@ async fn main() -> Result<()> {
         initial_input,
         skills.as_ref(),
         Some(project.as_ref()),
+        permissions,
     );
     let drainer = async {
         while let Some(event) = rx.recv().await {
@@ -146,6 +158,76 @@ async fn main() -> Result<()> {
     let (result, _) = tokio::join!(agent, drainer);
     result
 }
+
+/// Build the permission context for a non-interactive (`--json-events` or
+/// piped) run. The reverse channel for approvals lives on stdin: a JSON line
+/// per response. If stdin is a TTY we silently downgrade to `Never` and warn.
+async fn build_ndjson_permissions(
+    args: &Args,
+    cwd: &Path,
+    events: mpsc::UnboundedSender<AgentEvent>,
+    store: Arc<SessionStore>,
+    session_id: &str,
+) -> (PermissionContext, Option<tokio::task::JoinHandle<()>>) {
+    let stdin_piped = !std::io::stdin().is_terminal();
+    let bypass = args.dangerously_bypass_approvals_and_sandbox;
+    // Under bypass, force the policy off `Never` so the auto-approve gate is
+    // actually consulted (the `Never` short-circuit in run_tool would
+    // otherwise refuse before the gate sees anything).
+    let mut policy = if bypass {
+        AskForApproval::OnRequest
+    } else {
+        args.approval_policy
+    };
+
+    // Only downgrade if we couldn't take responses from stdin AND we're not
+    // explicitly bypassing approvals — bypass mode handles approval gating
+    // through the auto-approving gate below, so a TTY stdin is fine.
+    if !bypass && !stdin_piped && !matches!(policy, AskForApproval::Never) {
+        eprintln!(
+            "nav: --json-events but stdin is a TTY; downgrading to --approval-policy never. \
+             Pipe approval responses on stdin to enable interactive approvals."
+        );
+        policy = AskForApproval::Never;
+    }
+
+    let sandbox_policy = sandbox_policy_from_args(args, cwd);
+    let sandbox = Arc::from(select_for_platform(&sandbox_policy));
+
+    let (gate, reader): (Arc<dyn ApprovalGate>, Option<tokio::task::JoinHandle<()>>) = if bypass {
+        // The bypass flag's contract is "auto-approve everything that would
+        // otherwise prompt." Anything that would still Block (unbypassable
+        // patterns, protected-metadata writes) is enforced before the gate
+        // is consulted.
+        (Arc::new(AutoGate::approving()), None)
+    } else if matches!(policy, AskForApproval::Never) {
+        (Arc::new(AutoGate::denying()), None)
+    } else {
+        let pending = PendingApprovals::default();
+        // One sink covers both legs of the audit row: the channel gate
+        // persists the request (`persist`), and the stdin reader records
+        // the operator's decision (`record`). Without the recorder leg,
+        // NDJSON-driven approvals would leave the row with NULL
+        // decision/decided_at while the tool actually ran.
+        let sink = Arc::new(store.sink_for(session_id.to_string()));
+        let channel = ChannelGate::new(pending.clone(), events).with_sink(sink.clone());
+        let reader =
+            spawn_response_reader(tokio::io::stdin(), pending, Some(sink));
+        (Arc::new(channel), Some(reader))
+    };
+
+    (
+        PermissionContext {
+            gate,
+            policy,
+            sandbox_policy,
+            sandbox,
+            session_allowlist: nav_core::permissions::SessionAllowlist::default(),
+        },
+        reader,
+    )
+}
+
 
 fn list_sessions_command(args: &Args) -> Result<()> {
     let store = SessionStore::open(args.db_path.clone())?;
