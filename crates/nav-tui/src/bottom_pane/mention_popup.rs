@@ -178,9 +178,7 @@ impl FileMentionPopup {
                 "  no files match",
                 bg.fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
             );
-            Paragraph::new(Line::from(hint))
-                .style(bg)
-                .render(area, buf);
+            Paragraph::new(Line::from(hint)).style(bg).render(area, buf);
             return;
         }
 

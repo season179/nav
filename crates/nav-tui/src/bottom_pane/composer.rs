@@ -654,7 +654,10 @@ mod tests {
         let buf = c.text();
         let base = format!("[Pasted Content {} chars]", LARGE_PASTE_CHAR_THRESHOLD + 5);
         let dup = format!("{base} #2");
-        assert!(buf.contains(&base), "buffer missing base placeholder: {buf:?}");
+        assert!(
+            buf.contains(&base),
+            "buffer missing base placeholder: {buf:?}"
+        );
         assert!(buf.contains(&dup), "buffer missing #2 placeholder: {buf:?}");
 
         let ComposerEvent::Submit { text: expanded, .. } = c.handle_key(enter()) else {
