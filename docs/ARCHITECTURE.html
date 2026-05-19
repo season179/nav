@@ -830,7 +830,7 @@
         </div>
       </div>
 
-      <p>A tiny binary <code>nav-cli</code> wires those two together. When stdout is a terminal and <code>--json-events</code> is not set, it launches the TUI. Otherwise — for example when you pass <code>--json-events</code> or pipe stdout to a file — it emits raw events as JSON, one per line.</p>
+      <p>A tiny binary <code>nav-cli</code> wires those two together. When stdout is a terminal and neither headless flag is set, it launches the TUI. <code>--json-events</code> still emits raw <code>AgentEvent</code> objects for debugging; <code>--json-rpc</code> is the stable protocol for desktop, chat, and other non-TUI frontends.</p>
     </section>
 
     <!-- 02 ─────────────────────────────────────────── -->
@@ -844,7 +844,7 @@
 
       <aside class="mnote aside">
         <span class="label">Aside · desktop</span>
-        <code>nav-desktop/</code> exists at the root but this tour mostly skips it. It's an early Electron shell that spawns <code>cargo run --bin nav -- --json-events &lt;prompt&gt;</code>, parses NDJSON events, and renders messages, tools, file changes, and turn diffs into the page.
+        <code>nav-desktop/</code> exists at the root but this tour mostly skips it. It's an early Electron shell that spawns <code>cargo run --bin nav -- --json-rpc &lt;prompt&gt;</code>, parses JSON-RPC notifications, and renders messages, tools, file changes, and turn diffs into the page.
       </aside>
 
       <div class="full tree">
@@ -977,7 +977,7 @@
         <code>crates/nav-core/src/agent/events.rs</code> — <code>enum AgentEvent</code>.
       </aside>
 
-      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every frontend — TUI, NDJSON pipe, future Slack bot — reads the same nine variants:</p>
+      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every frontend reads the same event model through its own adapter: the TUI consumes it in-process, <code>--json-events</code> prints raw events, and <code>--json-rpc</code> wraps them for desktop and chat frontends. The core event families are:</p>
 
       <div class="full flow">
         <div class="row">
@@ -1316,7 +1316,7 @@
         <h2>Try it <em>yourself</em>.</h2>
       </header>
 
-      <p class="drop">The fastest way to confirm any of the above is to run it and watch. Two prompts that exercise the main flow and the raw event stream:</p>
+      <p class="drop">The fastest way to confirm any of the above is to run it and watch. Two prompts that exercise the main flow and the headless protocol:</p>
 
       <aside class="mnote">
         <span class="label">End of tour</span>
@@ -1331,10 +1331,10 @@ nav "list the files and read README.md"</pre>
           <p>A typical run shows <code>list_files</code> arrive as a <code>ToolCallStarted</code> cell (yellow), its output as a <code>ToolOutputCell</code> (grey, attached with <code>└</code>), then <code>read_file</code>, then a final assistant message (green) summarising what it found. Compare that against the six events in section 5.</p>
         </div>
         <div class="try-card">
-          <h4>② Read the raw event stream</h4>
-          <pre data-lang="shell">nav --json-events "explain this repo" \
-  &gt; events.ndjson</pre>
-          <p>Same kind of agent run, but the TUI is off. Each line of <code>events.ndjson</code> is one <code>AgentEvent</code> as JSON. This is the wire format the CLI exposes for non-Rust frontends — and a fantastic debugger when something looks wrong in the TUI.</p>
+          <h4>② Read the headless protocol</h4>
+          <pre data-lang="shell">nav --json-rpc "explain this repo" \
+  &gt; protocol.ndjson</pre>
+          <p>Same kind of agent run, but the TUI is off. Each line of <code>protocol.ndjson</code> is a JSON-RPC 2.0 notification. <code>nav.session.started</code> announces the run, and <code>nav.event</code> wraps the same <code>AgentEvent</code> payloads the TUI consumes. Use <code>--json-events</code> when you want the older raw event stream for debugging.</p>
         </div>
       </div>
     </section>

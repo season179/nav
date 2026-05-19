@@ -82,6 +82,10 @@ pub struct Args {
     #[arg(long)]
     pub json_events: bool,
 
+    /// Emit versioned JSON-RPC notifications for non-TUI frontends.
+    #[arg(long)]
+    pub json_rpc: bool,
+
     /// When to ask the user before running risky tool calls. `untrusted`
     /// auto-runs only known-safe read-only commands; `on-request` lets the
     /// classifier decide; `never` skips prompts entirely and reports
@@ -356,6 +360,7 @@ impl Args {
             cwd: None,
             db_path: None,
             json_events: false,
+            json_rpc: false,
             approval_policy: AskForApproval::Never,
             sandbox: SandboxMode::DangerFullAccess,
             dangerously_bypass_approvals_and_sandbox: false,
@@ -436,6 +441,7 @@ mod tests {
         assert_eq!(args.bash_timeout_secs, 20);
         assert_eq!(args.prompt, vec!["hello"]);
         assert!(args.codex_home.is_none());
+        assert!(!args.json_rpc);
         assert_eq!(args.approval_policy, AskForApproval::OnRequest);
         assert_eq!(args.sandbox, SandboxMode::WorkspaceWrite);
         assert!(!args.dangerously_bypass_approvals_and_sandbox);
@@ -502,6 +508,13 @@ mod tests {
         assert_eq!(args.bash_timeout_secs, 60);
         assert_eq!(args.codex_home.unwrap().to_str().unwrap(), "/custom/path");
         assert_eq!(args.prompt, vec!["do", "stuff"]);
+    }
+
+    #[test]
+    fn parses_json_rpc_flag() {
+        let args = Args::try_parse_from(["nav", "--json-rpc", "hi"]).unwrap();
+        assert!(args.json_rpc);
+        assert_eq!(args.prompt, vec!["hi"]);
     }
 
     #[test]

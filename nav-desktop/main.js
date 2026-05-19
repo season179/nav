@@ -95,7 +95,7 @@ const runAgent = async (event, input) => {
       "--bin",
       "nav",
       "--",
-      "--json-events",
+      "--json-rpc",
       prompt,
     ],
     {
@@ -128,6 +128,9 @@ const runAgent = async (event, input) => {
     const parser = createNdjsonParser({
       onEvent: (agentEvent) => {
         sendAgentEvent(webContents, { type: "agent_event", event: agentEvent });
+      },
+      onProtocolEvent: (protocolEvent) => {
+        sendAgentEvent(webContents, { type: "protocol_event", event: protocolEvent });
       },
       onText: (chunk) => {
         sendAgentEvent(webContents, { type: "stdout", text: chunk });

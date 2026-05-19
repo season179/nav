@@ -1,4 +1,28 @@
-const createNdjsonParser = ({ onEvent, onText }) => {
+const unwrapProtocolMessage = (message) => {
+  if (!message || typeof message !== "object") {
+    return null;
+  }
+
+  if (message.jsonrpc === "2.0" && message.method === "nav.event") {
+    return { type: "agent_event", event: message.params?.event };
+  }
+
+  if (message.jsonrpc === "2.0" && message.method === "nav.session.started") {
+    return {
+      type: "protocol_event",
+      method: message.method,
+      params: message.params,
+    };
+  }
+
+  if (typeof message.kind === "string") {
+    return { type: "agent_event", event: message };
+  }
+
+  return null;
+};
+
+const createNdjsonParser = ({ onEvent, onProtocolEvent, onText }) => {
   let buffer = "";
 
   const pushLine = (line) => {
@@ -7,7 +31,15 @@ const createNdjsonParser = ({ onEvent, onText }) => {
       return;
     }
     try {
-      onEvent(JSON.parse(trimmed));
+      const parsed = JSON.parse(trimmed);
+      const message = unwrapProtocolMessage(parsed);
+      if (message?.type === "agent_event" && message.event) {
+        onEvent(message.event);
+      } else if (message?.type === "protocol_event") {
+        onProtocolEvent?.({ method: message.method, params: message.params });
+      } else {
+        onText?.(`${line}\n`);
+      }
     } catch {
       onText?.(`${line}\n`);
     }
@@ -29,4 +61,4 @@ const createNdjsonParser = ({ onEvent, onText }) => {
   };
 };
 
-module.exports = { createNdjsonParser };
+module.exports = { createNdjsonParser, unwrapProtocolMessage };
