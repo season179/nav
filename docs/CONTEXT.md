@@ -103,6 +103,32 @@ Skills that are malformed (missing description, unparseable frontmatter) are
 skipped with a diagnostic. Cosmetic issues like a `name`/directory mismatch
 warn but still load.
 
+## Extensions
+
+`nav` also has a small local extension manifest format. Discovery is scoped to
+the launch cwd, just like settings and skills:
+
+1. Read `<launch_cwd>/.nav/extensions/*/extension.json`.
+2. Read `~/.nav/extensions/*/extension.json`.
+3. Project prompt templates and themes shadow user entries with the same
+   registered `name`.
+
+The shipped runtime surface is intentionally narrow:
+
+- `prompt_templates` register markdown files that appear in the TUI slash
+  popup as `/prompt:<name>`. Submitting `/prompt:<name> <request>` wraps the
+  template body in a `<prompt_template ...>` block and sends it with the
+  visible request; submitting `/prompt:<name>` queues it for the next prompt.
+- `themes` register simple TUI color overrides. `.nav/settings.json` can set
+  `"theme": "<name>"`; unknown or invalid colors fall back to the built-in
+  dark theme.
+- `nav extensions list` prints discovered manifests and counts future-facing
+  sections.
+
+Manifest sections for `custom_tools`, `mcp_servers`, `hooks`, and `packages`
+are parsed only as counts for now. They are not executed; that keeps the first
+extension slice useful without adding an unaudited local command surface.
+
 ## Engineering Principles
 
 - Keep the educational path clear. A new contributor should still be able to

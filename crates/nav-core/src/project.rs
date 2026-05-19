@@ -161,6 +161,10 @@ pub struct Settings {
     /// When true, create a git stash-backed checkpoint before each normal
     /// agent turn that starts from a dirty worktree.
     pub git_checkpoints: Option<bool>,
+    /// Name of a TUI theme. `default` is built in; extension themes are
+    /// discovered from `.nav/extensions/*/extension.json` and
+    /// `~/.nav/extensions/*/extension.json`.
+    pub theme: Option<String>,
 }
 
 impl Settings {
@@ -177,6 +181,7 @@ impl Settings {
             .or(self.auto_compact_token_limit);
         self.auto_compact_fraction = other.auto_compact_fraction.or(self.auto_compact_fraction);
         self.git_checkpoints = other.git_checkpoints.or(self.git_checkpoints);
+        self.theme = other.theme.or(self.theme.take());
     }
 }
 
@@ -558,7 +563,7 @@ mod tests {
         let tmp_cwd = TempDir::new().unwrap();
         write(
             &tmp_home.path().join(".nav").join("settings.json"),
-            r#"{"model":"u","max_turns":99}"#,
+            r#"{"model":"u","max_turns":99,"theme":"night"}"#,
         );
         write(
             &tmp_cwd.path().join(".nav").join("settings.json"),
@@ -567,6 +572,7 @@ mod tests {
         let ctx = load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
         assert_eq!(ctx.settings.model.as_deref(), Some("p"));
         assert_eq!(ctx.settings.max_turns, Some(99));
+        assert_eq!(ctx.settings.theme.as_deref(), Some("night"));
         assert_eq!(ctx.settings_sources.len(), 2);
     }
 

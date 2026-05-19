@@ -8,9 +8,9 @@ use nav_core::permissions::approval::{ApprovalGate, ChannelGate, PendingApproval
 use nav_core::sandbox::select_for_platform;
 use nav_core::tools::PermissionContext;
 use nav_core::{
-    AgentEvent, Catalog, ControlPlane, OpenAiTransport, PendingInput, PendingInputDraft,
-    PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
-    TurnControls, UserAttachment, build_context_report_with_replay_cwd,
+    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, OpenAiTransport, PendingInput,
+    PendingInputDraft, PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext,
+    SessionId, SessionStore, TurnControls, UserAttachment, build_context_report_with_replay_cwd,
     cli::{Args, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };
@@ -28,6 +28,7 @@ use crate::ChatWidget;
 use crate::bottom_pane::{self, PendingApproval};
 use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
 use crate::status_bar::{AgentState, StatusBar};
+use crate::theme::Theme;
 use crate::turn::{TurnSpawn, spawn_turn};
 
 /// Restores the terminal to a sane state when `run` returns.
@@ -140,15 +141,19 @@ pub async fn run(
     resume_events: Vec<AgentEvent>,
     initial_prompt: Option<String>,
     skills: Arc<Catalog>,
+    extensions: Arc<ExtensionCatalog>,
     project: Arc<ProjectContext>,
 ) -> Result<()> {
+    let slash_entries =
+        bottom_pane::build_slash_entries_with_extensions(skills.as_ref(), extensions.as_ref());
+    let theme = Theme::from_extensions(project.settings.theme.as_deref(), extensions.as_ref());
+
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend)?;
     let mut term = TerminalGuard { terminal };
     enter_tui(term.terminal.backend_mut())?;
     install_panic_teardown_hook();
 
-    let slash_entries = bottom_pane::build_slash_entries(skills.as_ref());
     // Walk the workspace once at startup so the `@file` popup has something to
     // fuzzy-match against. A re-scan affordance can come later; an idle TUI
     // doesn't need a filesystem watcher to earn its keep.
@@ -175,8 +180,12 @@ pub async fn run(
     for ev in resume_events {
         chat.ingest(ev);
     }
-    let mut pane =
-        bottom_pane::BottomPane::with_entries(slash_entries, mention_entries, cwd.clone());
+    let mut pane = bottom_pane::BottomPane::with_entries_and_theme(
+        slash_entries,
+        mention_entries,
+        cwd.clone(),
+        theme,
+    );
     if args.pick_session {
         open_session_picker(&store, &mut pane, Some(&session_id), &mut chat);
     }
@@ -729,7 +738,13 @@ pub async fn run(
                             }
                             match pane.handle_key(key) {
                                 bottom_pane::ComposerEvent::Submit { text, attachments } => {
-                                    dispatch_submit(text, attachments, skills.as_ref(), &app_tx);
+                                    dispatch_submit(
+                                        text,
+                                        attachments,
+                                        skills.as_ref(),
+                                        extensions.as_ref(),
+                                        &app_tx,
+                                    );
                                 }
                                 bottom_pane::ComposerEvent::Nothing
                                 | bottom_pane::ComposerEvent::Cancelled => {}

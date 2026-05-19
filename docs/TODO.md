@@ -226,9 +226,16 @@ small slice earlier.
    hooks, prompt templates, package installation, and themes.
    - Partial: skills system in `nav-core/src/skills.rs` provides
      project/user-scope skill discovery and execution.
+   - Partial: local extension manifests in `nav-core/src/extensions.rs`
+     discover project/user extensions from `.nav/extensions/*/extension.json`
+     and `~/.nav/extensions/*/extension.json`; `nav extensions list` surfaces
+     registered prompt templates, themes, custom tools, MCP servers, hooks,
+     and packages. Prompt templates are usable in the TUI as `/prompt:<name>`
+     and can be queued or inlined like skills. Extension themes can set the
+     composer/popup colors via `"theme": "<name>"` in `.nav/settings.json`.
    - Outstanding: MCP-style integrations (no client, transport, or tool
-     bridge yet), extension hooks, prompt templates, package install, and
-     themes.
+     bridge yet), executable extension hooks, custom tool execution, package
+     install, and broader theming beyond composer/popup colors.
 5. [x] Polish headless integration: define a stable JSON/RPC contract for
    desktop, chat, and other non-TUI frontends.
    - Done: `nav --json-rpc` emits newline-delimited JSON-RPC 2.0

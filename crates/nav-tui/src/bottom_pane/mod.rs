@@ -19,7 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 
-use crate::theme::COMPOSER_BG;
+use crate::theme::Theme;
 
 mod approval;
 mod composer;
@@ -32,7 +32,10 @@ pub use approval::ApprovalOverlay;
 pub use composer::{Composer, ComposerEvent};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
 pub use session_picker::{SessionPickerEntry, SessionPickerPopup};
-pub use slash_popup::{BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries};
+pub use slash_popup::{
+    BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries,
+    build_slash_entries_with_extensions,
+};
 pub use view::{BottomPaneView, InputResult};
 
 /// Width of the gutter column that renders the `›` prompt next to the
@@ -65,6 +68,7 @@ pub struct BottomPane {
     mention_popup_suppressed: bool,
     slash_entries: Arc<[SlashEntry]>,
     mention_entries: Arc<[MentionEntry]>,
+    theme: Theme,
     /// Workspace root. Held so clipboard images can persist under
     /// `<cwd>/.nav/clipboard/` without the event loop re-passing the path on
     /// every paste.
@@ -112,6 +116,15 @@ impl BottomPane {
         mention_entries: Arc<[MentionEntry]>,
         cwd: PathBuf,
     ) -> Self {
+        Self::with_entries_and_theme(slash_entries, mention_entries, cwd, Theme::default())
+    }
+
+    pub fn with_entries_and_theme(
+        slash_entries: Arc<[SlashEntry]>,
+        mention_entries: Arc<[MentionEntry]>,
+        cwd: PathBuf,
+        theme: Theme,
+    ) -> Self {
         Self {
             composer: Composer::new(),
             view: None,
@@ -119,6 +132,7 @@ impl BottomPane {
             mention_popup_suppressed: false,
             slash_entries,
             mention_entries,
+            theme,
             cwd,
             pending_approvals: VecDeque::new(),
             last_decision: None,
@@ -193,9 +207,9 @@ impl BottomPane {
     }
 
     pub fn open_session_picker(&mut self, entries: Vec<SessionPickerEntry>) {
-        self.view = Some(BottomPaneView::SessionPicker(SessionPickerPopup::new(
-            entries,
-        )));
+        self.view = Some(BottomPaneView::SessionPicker(
+            SessionPickerPopup::new_with_theme(entries, self.theme),
+        ));
     }
 
     pub fn take_session_selection(&mut self) -> Option<String> {
@@ -442,13 +456,14 @@ impl BottomPane {
 
         // Slow path: open the right popup, or close whatever is open.
         if want_slash {
-            let mut popup = SlashCommandPopup::new(Arc::clone(&self.slash_entries));
+            let mut popup = SlashCommandPopup::new(Arc::clone(&self.slash_entries), self.theme);
             popup.on_composer_text_changed(&first_owned);
             self.view = (!popup.is_complete()).then_some(BottomPaneView::SlashCommand(popup));
         } else if want_mention {
             let popup = FileMentionPopup::new(
                 Arc::clone(&self.mention_entries),
                 mention_token.as_deref().unwrap_or(""),
+                self.theme,
             );
             self.view = Some(BottomPaneView::FileMention(popup));
         } else {
@@ -595,13 +610,13 @@ impl Widget for &BottomPane {
         }
 
         if queue_rect.height > 0 {
-            render_pending_preview(&self.pending_inputs, queue_rect, buf);
+            render_pending_preview(&self.pending_inputs, queue_rect, buf, &self.theme);
         }
 
         if composer_outer.height > 0 {
             // Fill the entire composer block with the input background so the
             // gutter, padding rows and text all sit on the same coloured rect.
-            let bg = Style::default().bg(COMPOSER_BG);
+            let bg = Style::default().bg(self.theme.composer_bg);
             Block::default().style(bg).render(composer_outer, buf);
 
             // One row of padding above and below the text so the block reads
@@ -630,13 +645,13 @@ impl Widget for &BottomPane {
                 ..gutter
             };
             prompt.render(gutter_first, buf);
-            self.composer.render(content, buf);
+            self.composer.render(content, buf, &self.theme);
         }
     }
 }
 
-fn render_pending_preview(items: &[PendingPreview], area: Rect, buf: &mut Buffer) {
-    let bg = Style::default().bg(COMPOSER_BG);
+fn render_pending_preview(items: &[PendingPreview], area: Rect, buf: &mut Buffer, theme: &Theme) {
+    let bg = Style::default().bg(theme.composer_bg);
     Block::default().style(bg).render(area, buf);
     let dim = bg.fg(Color::DarkGray);
     let accent = bg.fg(Color::Blue).add_modifier(Modifier::BOLD);

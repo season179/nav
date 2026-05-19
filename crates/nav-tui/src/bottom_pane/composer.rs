@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nav_core::UserAttachment;
 use ratatui::buffer::Buffer;
@@ -362,8 +363,8 @@ impl Composer {
         (0, row_offset)
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        let bg = Style::default().bg(crate::theme::COMPOSER_BG);
+    pub fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        let bg = Style::default().bg(theme.composer_bg);
         if self.is_empty() {
             let hint = Span::styled(
                 "Ask nav to do anything",
