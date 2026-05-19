@@ -347,6 +347,42 @@ fn tool_call_mid_stream_finalizes_open_assistant_cell() {
 }
 
 #[test]
+fn pending_input_mid_stream_keeps_single_assistant_cell() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "Hello ".to_string(),
+    });
+    widget.ingest(AgentEvent::PendingInputQueued {
+        id: "pending-1".to_string(),
+        mode: PendingInputMode::FollowUp,
+        text: "run tests next".to_string(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill_name: None,
+    });
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "world!".to_string(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "Hello world!".to_string(),
+    });
+
+    let rendered = render_widget(&widget, 70, 12);
+    assert_eq!(
+        rendered.matches("• assistant").count(),
+        1,
+        "pending-input mid-stream must not split assistant text into two cells:\n{rendered}"
+    );
+    assert!(rendered.contains("Hello world!"), "{rendered}");
+    let assistant_idx = rendered.find("Hello world!").unwrap();
+    let queue_idx = rendered.find("◆ queued").expect("queue row present");
+    assert!(
+        assistant_idx < queue_idx,
+        "assistant cell should splice in at its anchor, before the later queue row:\n{rendered}"
+    );
+}
+
+#[test]
 fn local_helpers_mid_stream_flush_streaming_first() {
     let mut widget = ChatWidget::new();
     widget.ingest(AgentEvent::AssistantMessageDelta {

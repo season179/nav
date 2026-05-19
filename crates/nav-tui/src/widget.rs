@@ -16,9 +16,13 @@ use crate::history::HistoryCell;
 pub struct ChatWidget {
     cells: Vec<Box<dyn HistoryCell>>,
     tool_calls: HashMap<String, ToolCallContext>,
-    /// In-flight streaming assistant cell. Held outside `cells` so deltas
-    /// can mutate it in place without re-boxing on every chunk.
-    streaming_assistant: Option<AssistantMessageCell>,
+    /// In-flight streaming assistant cell, anchored to its eventual index
+    /// in `cells`. Held outside `cells` so deltas can mutate it in place;
+    /// control-plane rows that fire mid-stream (pending-input queue ops)
+    /// push past the anchor without closing, and the cell splices back
+    /// at the same anchor on close. Guarantees one cell per assistant
+    /// message even when local events interleave.
+    streaming_assistant: Option<(usize, AssistantMessageCell)>,
     /// `None` follows the newest transcript row. `Some(row)` pins the top of
     /// the viewport while the user is reading older output.
     scroll_top: Option<usize>,
@@ -75,11 +79,15 @@ impl ChatWidget {
 
     /// Translate an agent event into a history cell and append it.
     ///
-    /// `AssistantMessageDelta` appends to the in-flight streaming cell;
-    /// every other variant flushes that cell first (via `push_cell` /
-    /// `close_streaming_assistant`) so the streaming row stays at the
-    /// visual tail. `TurnComplete` is otherwise handled by the status bar
-    /// in `run()`.
+    /// `AssistantMessageDelta` appends to the anchored in-flight streaming
+    /// cell. Events that end the assistant's message (tool calls, abort,
+    /// turn complete, retries, errors, compaction, the next user turn)
+    /// route through `push_cell`, which closes the streaming row by
+    /// splicing it back into `cells` at its anchor. Control-plane rows
+    /// that do NOT end the message (pending-input queue ops) route
+    /// through `push_local_cell` and render after the live stream without
+    /// finalizing it — preventing the single assistant message from
+    /// being split across two scrollback cells.
     pub fn ingest(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::UserMessage {
@@ -91,14 +99,18 @@ impl ChatWidget {
                 self.push_user_event(text, display_text);
             }
             AgentEvent::AssistantMessageDelta { text } => {
-                self.streaming_assistant
-                    .get_or_insert_with(AssistantMessageCell::streaming)
-                    .push_delta(&text);
+                if self.streaming_assistant.is_none() {
+                    self.streaming_assistant =
+                        Some((self.cells.len(), AssistantMessageCell::streaming()));
+                }
+                if let Some((_, cell)) = self.streaming_assistant.as_mut() {
+                    cell.push_delta(&text);
+                }
             }
             AgentEvent::AssistantMessageDone { text } => {
-                if let Some(mut cell) = self.streaming_assistant.take() {
+                if let Some((idx, mut cell)) = self.streaming_assistant.take() {
                     cell.finalize_with(&text);
-                    self.push_cell(cell);
+                    self.cells.insert(idx, Box::new(cell));
                 } else {
                     self.push_cell(AssistantMessageCell::new(text));
                 }
@@ -173,7 +185,7 @@ impl ChatWidget {
                 skill_name,
                 ..
             } => {
-                self.push_cell(PendingInputCell::queued(
+                self.push_local_cell(PendingInputCell::queued(
                     id,
                     mode,
                     display_text.unwrap_or(text),
@@ -187,20 +199,20 @@ impl ChatWidget {
                 skill_name,
                 ..
             } => {
-                self.push_cell(PendingInputCell::edited(
+                self.push_local_cell(PendingInputCell::edited(
                     id,
                     display_text.unwrap_or(text),
                     skill_name,
                 ));
             }
             AgentEvent::PendingInputRemoved { id } => {
-                self.push_cell(PendingInputCell::removed(id));
+                self.push_local_cell(PendingInputCell::removed(id));
             }
             AgentEvent::PendingInputCleared { ids } => {
-                self.push_cell(PendingInputCell::cleared(ids));
+                self.push_local_cell(PendingInputCell::cleared(ids));
             }
             AgentEvent::PendingInputDequeued { id, mode } => {
-                self.push_cell(PendingInputCell::dequeued(id, mode));
+                self.push_local_cell(PendingInputCell::dequeued(id, mode));
             }
             AgentEvent::TurnAborted { turn_id, reason } => {
                 self.push_cell(TurnAbortedCell::new(turn_id, reason));
@@ -295,26 +307,44 @@ impl ChatWidget {
     }
 
     fn iter_cells(&self) -> impl Iterator<Item = &dyn HistoryCell> {
-        self.cells.iter().map(|cell| cell.as_ref()).chain(
-            self.streaming_assistant
-                .as_ref()
-                .map(|c| c as &dyn HistoryCell),
-        )
+        let split = self
+            .streaming_assistant
+            .as_ref()
+            .map(|(idx, _)| (*idx).min(self.cells.len()))
+            .unwrap_or(self.cells.len());
+        let (head, tail) = self.cells.split_at(split);
+        head.iter()
+            .map(|cell| cell.as_ref())
+            .chain(
+                self.streaming_assistant
+                    .as_ref()
+                    .map(|(_, cell)| cell as &dyn HistoryCell),
+            )
+            .chain(tail.iter().map(|cell| cell.as_ref()))
     }
 
-    /// Push a cell to scrollback, flushing the in-flight streaming assistant
-    /// cell first so the streaming row stays at the visual tail. The single
-    /// dispatch point removes the "remember to call `close_streaming_assistant`
-    /// in every new event arm" footgun.
+    /// Push a cell that ends the in-flight assistant message. Closes the
+    /// streaming row first so it splices into scrollback at its anchored
+    /// position before this cell appends after it.
     fn push_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
         self.close_streaming_assistant();
         self.cells.push(Box::new(cell));
     }
 
+    /// Push a control-plane cell (pending-input queue ops) that does NOT
+    /// end the assistant's in-flight message. The cell sits past the
+    /// streaming anchor in `cells`, so it renders after the streaming row
+    /// without finalizing it — `AssistantMessageDone` then splices the
+    /// single assistant cell into its anchored position.
+    fn push_local_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
+        self.cells.push(Box::new(cell));
+    }
+
     fn close_streaming_assistant(&mut self) {
-        if let Some(mut cell) = self.streaming_assistant.take() {
+        if let Some((idx, mut cell)) = self.streaming_assistant.take() {
             cell.finalize();
-            self.cells.push(Box::new(cell));
+            let insert_at = idx.min(self.cells.len());
+            self.cells.insert(insert_at, Box::new(cell));
         }
     }
 
