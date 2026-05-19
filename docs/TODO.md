@@ -28,10 +28,13 @@ repo work before adding speculative features. Ranked by importance.
    the model/session log. (in-progress reliability-recovery-mechanisms)
    - Not started in code: only the bash tool has a timeout; no retry, no
      context-overflow handling, no tool-output bounding before the session log.
-5. [ ] Load project context and settings: discover `AGENTS.md` / `CLAUDE.md`,
-   support `.nav/settings.json`, and show startup git/workspace status. (in-progress project-context-bootstrap)
-   - Partial: `AGENTS.md` discovery is scoped to launch cwd. No
-     `.nav/settings.json` loader and no startup git/workspace status banner.
+5. [x] Load project context and settings: discover `AGENTS.md` / `CLAUDE.md`,
+   support `.nav/settings.json`, and show startup git/workspace status.
+   - Done in commit 86d9e96: `AGENTS.md`/`CLAUDE.md` discovery at launch cwd
+     and `~/.agents/` (`nav-core/src/project.rs`), `.nav/settings.json`
+     loader feeding CLI defaults (`nav-core/src/cli.rs`), and git/workspace
+     status surfaced in the TUI welcome cell, status bar, and NDJSON
+     startup banner (`nav-tui/src/{cells,status_bar}.rs`).
 6. [ ] Finish interactive session management: named sessions, resume picker,
    compaction, and exportable session transcripts.
    - Partial: SQLite session store at `$XDG_DATA_HOME/nav/nav.db` and
