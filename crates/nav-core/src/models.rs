@@ -42,7 +42,7 @@ pub fn suggest_models(model: &str, limit: usize) -> Vec<&'static str> {
             )
         })
         .collect();
-    scored.sort_by(|a, b| a.1.cmp(&b.1));
+    scored.sort_by_key(|candidate| candidate.1);
     // Cap at edit distance 3 — beyond that the suggestions become noise.
     scored
         .into_iter()

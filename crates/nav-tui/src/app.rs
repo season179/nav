@@ -17,7 +17,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -27,7 +27,6 @@ use crate::bottom_pane::{self, PendingApproval};
 use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
 use crate::status_bar::{AgentState, StatusBar};
 use crate::turn::{TurnSpawn, spawn_turn};
-use std::path::Path;
 
 /// Restores the terminal to a sane state when `run` returns.
 ///
@@ -739,7 +738,7 @@ fn start_next_follow_up(
     turn_started_at: &mut Option<Instant>,
     transport: &Arc<OpenAiTransport>,
     args: &Args,
-    cwd: &PathBuf,
+    cwd: &Path,
     store: &Arc<SessionStore>,
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
@@ -875,7 +874,7 @@ fn start_pending_turn(
     turn_started_at: &mut Option<Instant>,
     transport: &Arc<OpenAiTransport>,
     args: &Args,
-    cwd: &PathBuf,
+    cwd: &Path,
     store: &Arc<SessionStore>,
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
@@ -889,7 +888,7 @@ fn start_pending_turn(
     let handle = match spawn_turn(TurnSpawn {
         transport: Arc::clone(transport),
         args: args.clone(),
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         store: Arc::clone(store),
         session_id: session_id.clone(),
         model_prompt: item.text.clone(),

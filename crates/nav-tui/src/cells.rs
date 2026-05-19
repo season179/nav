@@ -1073,6 +1073,24 @@ fn compaction_body(cell: &CompactionCell) -> String {
     }
 }
 
+pub struct ErrorCell {
+    message: String,
+}
+
+impl ErrorCell {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl HistoryCell for ErrorCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        body_cell("•", "error", Color::Red, &self.message, width)
+    }
+}
+
 #[cfg(test)]
 mod compaction_cell_tests {
     use super::*;
@@ -1128,23 +1146,5 @@ mod compaction_cell_tests {
         assert!(rendered.contains("compaction failed"));
         assert!(rendered.contains("auto"));
         assert!(rendered.contains("transport closed"));
-    }
-}
-
-pub struct ErrorCell {
-    message: String,
-}
-
-impl ErrorCell {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl HistoryCell for ErrorCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        body_cell("•", "error", Color::Red, &self.message, width)
     }
 }

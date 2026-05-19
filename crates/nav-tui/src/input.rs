@@ -514,7 +514,7 @@ mod tests {
         );
         assert!(matches!(
             rx.try_recv().unwrap(),
-            AppEvent::Export { path: Some(path) } if path == PathBuf::from("transcript.md")
+            AppEvent::Export { path: Some(path) } if path.as_path() == std::path::Path::new("transcript.md")
         ));
     }
 

@@ -380,7 +380,7 @@ fn check_install(b: &mut DoctorBuilder, manifest_dir: &str) {
     b.check_on_path(
         DoctorGroup::Install,
         "nav",
-        |p| shorten_home(p),
+        shorten_home,
         DoctorStatus::Warn,
         "nav not on PATH — running from cargo target dir is fine, otherwise add cargo's bin dir to PATH",
     );
@@ -436,7 +436,7 @@ fn is_executable_file(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return metadata.permissions().mode() & 0o111 != 0;
+        metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
