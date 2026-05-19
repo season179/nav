@@ -11,12 +11,16 @@ repo work before adding speculative features. Ranked by importance.
    - Partial: workspace-boundary writes in `nav-core/src/tools/fs.rs`, bash
      timeout in `tools/shell.rs`. No approval policy, dangerous-command gates,
      protected-file rules, or sandbox yet.
-2. [ ] Improve the editing and diff workflow: patch-style edits, multi-file
+2. [x] Improve the editing and diff workflow: patch-style edits, multi-file
    mutation summaries, diff tracking, file references, and clearer "what
-   changed" review affordances. ()
-   - Partial: `edit_file` uses `old_str`/`new_str` string replacement
-     (`nav-core/src/tools/mod.rs`). No patch-style edits, multi-file summaries,
-     or diff tracking surfaced in the TUI.
+   changed" review affordances.
+   - Done in commit 2718a83: `apply_patch` tool with add/update/move/delete
+     sections (`nav-core/src/tools/patch.rs`); per-call multi-file mutation
+     summaries via the new `FileChange` `AgentEvent` and
+     `mutation::FileChangeSummary` (`nav-core/src/mutation.rs`); turn-level
+     unified-diff tracking via the `TurnDiff` event
+     (`nav-core/src/git_diff.rs`); new TUI cells render file-change /
+     turn-diff review output (`nav-tui/src/cells.rs`).
 3. [ ] Add real interactive control: abort the current turn, queue steering and
    follow-up messages while the agent is busy, and make `/help`, `/resume`, and
    `/sessions` real commands instead of popup labels.
