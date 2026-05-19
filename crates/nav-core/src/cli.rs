@@ -1,10 +1,11 @@
-use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum, parser::ValueSource};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::permissions::{AskForApproval, SandboxPolicy};
 use crate::project::Settings;
+use crate::session::ExportFormat;
 
 // clap turns this struct into the CLI. Keeping options small makes the
 // educational path clear: model choice, auth choice, loop limit, and prompt.
@@ -50,6 +51,15 @@ pub struct Args {
     #[arg(long)]
     pub list_sessions: bool,
 
+    /// Open the TUI with a recent-session picker instead of starting on a
+    /// fresh empty session.
+    #[arg(long)]
+    pub pick_session: bool,
+
+    /// Set the initial display name for a newly-created session.
+    #[arg(long)]
+    pub name: Option<String>,
+
     /// Filter `--list-sessions` to one working directory.
     #[arg(long)]
     pub cwd: Option<PathBuf>,
@@ -84,7 +94,60 @@ pub struct Args {
     #[arg(long)]
     pub dangerously_bypass_approvals_and_sandbox: bool,
 
+    /// Estimated model context budget used to decide when automatic
+    /// long-session compaction fires. nav compacts before submitting a turn
+    /// whose rolling session token count crosses
+    /// `auto_compact_fraction × auto_compact_token_limit`. Set to `0` to
+    /// disable automatic compaction; manual `/compact` still works.
+    #[arg(default_value_t = crate::agent::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT, long)]
+    pub auto_compact_token_limit: u64,
+
+    /// Fraction of [`Args::auto_compact_token_limit`] at which automatic
+    /// compaction fires. Defaults to `0.85` (Codex behavior); must be in
+    /// `0.0..=1.0`.
+    #[arg(
+        default_value_t = crate::agent::DEFAULT_AUTO_COMPACT_FRACTION,
+        long,
+        value_parser = parse_unit_fraction
+    )]
+    pub auto_compact_fraction: f32,
+
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
+
     pub prompt: Vec<String>,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum CliCommand {
+    /// Export a stored session transcript.
+    Export {
+        /// Full session ULID or unique prefix.
+        session_id: String,
+        /// Output format. When omitted, inferred from --out extension and
+        /// defaults to Markdown.
+        #[arg(long, value_enum)]
+        format: Option<CliExportFormat>,
+        /// Output path. When omitted, the transcript is written to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum CliExportFormat {
+    Md,
+    Json,
+}
+
+impl From<CliExportFormat> for ExportFormat {
+    fn from(value: CliExportFormat) -> Self {
+        match value {
+            CliExportFormat::Md => ExportFormat::Markdown,
+            CliExportFormat::Json => ExportFormat::Json,
+        }
+    }
 }
 
 /// Set of argument IDs whose value came from an explicit user-supplied flag
@@ -151,6 +214,16 @@ impl Args {
         {
             self.bash_timeout_secs = secs;
         }
+        if let Some(limit) = settings.auto_compact_token_limit
+            && !provided.was_provided("auto_compact_token_limit")
+        {
+            self.auto_compact_token_limit = limit;
+        }
+        if let Some(fraction) = settings.auto_compact_fraction
+            && !provided.was_provided("auto_compact_fraction")
+        {
+            self.auto_compact_fraction = fraction;
+        }
     }
 
     /// Shared constructor for unit tests across modules.
@@ -168,12 +241,20 @@ impl Args {
             idle_timeout_secs: 30,
             resume: None,
             list_sessions: false,
+            pick_session: false,
+            name: None,
             cwd: None,
             db_path: None,
             json_events: false,
             approval_policy: AskForApproval::Never,
             sandbox: SandboxMode::DangerFullAccess,
             dangerously_bypass_approvals_and_sandbox: false,
+            // Disable auto-compaction in tests by default so a `run_agent`
+            // unit test never accidentally triggers compaction against a
+            // stub transport that wasn't set up for it.
+            auto_compact_token_limit: 0,
+            auto_compact_fraction: crate::agent::DEFAULT_AUTO_COMPACT_FRACTION,
+            command: None,
             prompt: vec!["test".into()],
         }
     }
@@ -185,6 +266,20 @@ pub enum SandboxMode {
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
+}
+
+/// Parse and validate `--auto-compact-fraction`. Clap calls this on the raw
+/// string before storing into [`Args::auto_compact_fraction`]; rejecting
+/// out-of-range values here is friendlier than silently clamping `-1.0` to
+/// `0.0` (which would behave as "always compact").
+fn parse_unit_fraction(s: &str) -> Result<f32, String> {
+    let value: f32 = s
+        .parse()
+        .map_err(|err| format!("not a floating-point number: {err}"))?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(format!("must be in 0.0..=1.0 (got {value})"));
+    }
+    Ok(value)
 }
 
 /// Resolve `--sandbox` plus the `--dangerously-bypass-...` flag into the
@@ -302,6 +397,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_name_and_pick_session_flags() {
+        let args =
+            Args::try_parse_from(["nav", "--name", "release work", "--pick-session"]).unwrap();
+        assert_eq!(args.name.as_deref(), Some("release work"));
+        assert!(args.pick_session);
+    }
+
+    #[test]
+    fn parses_export_subcommand() {
+        let args = Args::try_parse_from([
+            "nav",
+            "export",
+            "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "--format",
+            "json",
+            "--out",
+            "transcript.json",
+        ])
+        .unwrap();
+        match args.command {
+            Some(CliCommand::Export {
+                session_id,
+                format,
+                out,
+            }) => {
+                assert_eq!(session_id, "01HZZZZZZZZZZZZZZZZZZZZZZZ");
+                assert_eq!(format, Some(CliExportFormat::Json));
+                assert_eq!(out.as_deref(), Some(Path::new("transcript.json")));
+            }
+            other => panic!("expected export subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn allows_empty_prompt() {
         // clap Vec<String> accepts zero args; main.rs checks for emptiness.
         let args = Args::try_parse_from(["nav"]).unwrap();
@@ -343,6 +472,19 @@ mod tests {
         };
         args.apply_settings(&settings, &provided);
         assert_eq!(args.model, "from-cli");
+    }
+
+    #[test]
+    fn rejects_out_of_range_auto_compact_fraction() {
+        // Without validation, --auto-compact-fraction -1 would silently
+        // clamp to 0.0 inside should_auto_compact, meaning every prompt
+        // would auto-compact. Validate at the CLI boundary instead.
+        assert!(Args::try_parse_from(["nav", "--auto-compact-fraction", "-1", "x"]).is_err());
+        assert!(Args::try_parse_from(["nav", "--auto-compact-fraction", "1.5", "x"]).is_err());
+        // Valid values still pass.
+        assert!(Args::try_parse_from(["nav", "--auto-compact-fraction", "0.0", "x"]).is_ok());
+        assert!(Args::try_parse_from(["nav", "--auto-compact-fraction", "0.5", "x"]).is_ok());
+        assert!(Args::try_parse_from(["nav", "--auto-compact-fraction", "1.0", "x"]).is_ok());
     }
 
     #[test]

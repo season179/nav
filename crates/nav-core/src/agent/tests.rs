@@ -185,6 +185,46 @@ fn drop_oldest_tool_pair_handles_interleaved_items() {
     assert_eq!(input[0]["type"], "message");
 }
 
+#[test]
+fn trim_for_compaction_falls_back_to_oldest_message_on_text_history() {
+    // Regression for codex review B-2: a text-only transcript with no
+    // tool pairs must still shed something on overflow, otherwise
+    // `/compact` fails exactly when it's supposed to help.
+    let mut input = vec![
+        json!({"type": "message", "role": "user", "content": "oldest"}),
+        json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "reply"}]}),
+        json!({"type": "message", "role": "user", "content": "newest"}),
+        // The trailing summarisation prompt that run_compaction_turn
+        // appends just before submitting. Must be preserved.
+        json!({"type": "message", "role": "user", "content": super::SUMMARIZATION_PROMPT}),
+    ];
+    let dropped = super::runner::trim_for_compaction(&mut input);
+    assert_eq!(dropped, 1);
+    assert_eq!(input.len(), 3);
+    // The synthesised summarisation prompt is still the last item.
+    let last_text = input
+        .last()
+        .and_then(|v| v.get("content"))
+        .and_then(Value::as_str);
+    assert_eq!(last_text, Some(super::SUMMARIZATION_PROMPT));
+    // "oldest" is gone; "newest" survives.
+    let contents: Vec<&str> = input
+        .iter()
+        .filter_map(|v| v.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(!contents.contains(&"oldest"));
+    assert!(contents.contains(&"newest"));
+}
+
+#[test]
+fn trim_for_compaction_returns_zero_when_only_prompt_remains() {
+    // Nothing eligible to drop — the synthesised prompt is sacred.
+    let mut input =
+        vec![json!({"type": "message", "role": "user", "content": super::SUMMARIZATION_PROMPT})];
+    assert_eq!(super::runner::trim_for_compaction(&mut input), 0);
+    assert_eq!(input.len(), 1);
+}
+
 // ── extract_message_text ──────────────────────────────────────
 
 #[test]
@@ -1343,6 +1383,606 @@ async fn overflow_second_failure_surfaces_clean_error() {
 }
 
 // ── transport-level retry plumbing ────────────────────────────
+
+// ── compaction integration ────────────────────────────────────
+
+/// Build a single-turn stub that returns one assistant message with the
+/// given text and a `response.completed` envelope. Used by the compaction
+/// tests as the stand-in for "the model wrote a summary."
+fn compact_turn_with_text(text: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": text}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ]
+}
+
+#[tokio::test]
+async fn manual_compact_emits_lifecycle_events_and_does_not_steer_prompt() {
+    // Manual `/compact` should run a non-steerable compaction turn:
+    // the user's prompt text never gets sent to the model. We assert that
+    // the body submitted to the transport contains the synthesized
+    // SUMMARIZATION_PROMPT, not the literal "/compact" text.
+    let transport = StubTransport::new(vec![compact_turn_with_text(
+        "handoff: did things, next: more things",
+    )]);
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "/compact",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("compact run");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    // Lifecycle: UserMessage("/compact") → CompactionStarted → CompactionCompleted.
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::UserMessage { text, .. }) if text == "/compact"
+    ));
+    let pos_started = event_position(
+        &events,
+        "CompactionStarted",
+        |e| matches!(e, AgentEvent::CompactionStarted { trigger, .. } if matches!(trigger, super::CompactionTrigger::Manual)),
+    );
+    let pos_completed = event_position(&events, "CompactionCompleted", |e| {
+        matches!(
+            e,
+            AgentEvent::CompactionCompleted { trigger, summary, .. }
+                if matches!(trigger, super::CompactionTrigger::Manual)
+                    && summary.contains("handoff: did things")
+        )
+    });
+    assert!(pos_started < pos_completed);
+
+    // Submitted body: SUMMARIZATION_PROMPT goes in, the slash-command text
+    // does not (non-steerable).
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 1, "compaction is a single turn");
+    let input = bodies[0].get("input").and_then(Value::as_array).unwrap();
+    let user_texts: Vec<&str> = input
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+        .filter_map(|item| item.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(
+        user_texts
+            .iter()
+            .any(|t| t.contains("CONTEXT CHECKPOINT COMPACTION")),
+        "summarization prompt should be the user content: {user_texts:?}"
+    );
+    assert!(
+        !user_texts.iter().any(|t| t.contains("/compact")),
+        "compaction turn must not be steered by the slash text: {user_texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn manual_compact_persists_checkpoint_for_replay() {
+    // After a successful compaction, the session log should hold the
+    // CompactionCompleted event, and rebuild_responses_input should slice
+    // from that checkpoint instead of replaying the full transcript.
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::session::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+
+    // 1) First turn: user says "first", model replies "ack".
+    let regular_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ack"}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {"usage": {"input_tokens": 5}}}),
+    ];
+    let transport_one = StubTransport::new(vec![regular_turn]);
+    let binding = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport_one,
+        &Args::test_default(),
+        &cwd,
+        "first",
+        None,
+        Vec::new(),
+        tx1,
+        Some(&binding),
+        None,
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("first turn");
+    while rx1.recv().await.is_some() {}
+
+    // 2) Manual /compact.
+    let prior = store.load_session(&session_id).unwrap();
+    let rebuilt = rebuild_responses_input(&prior, &cwd);
+    let transport_two = StubTransport::new(vec![compact_turn_with_text("HANDOFF: did first")]);
+    let binding = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport_two,
+        &Args::test_default(),
+        &cwd,
+        "/compact",
+        None,
+        Vec::new(),
+        tx2,
+        Some(&binding),
+        Some(rebuilt),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("compact turn");
+    while rx2.recv().await.is_some() {}
+
+    // The session log now contains a CompactionCompleted checkpoint.
+    let after_compact = store.load_session(&session_id).unwrap();
+    let checkpoint = after_compact
+        .iter()
+        .find(|e| matches!(e, AgentEvent::CompactionCompleted { .. }))
+        .expect("checkpoint persisted");
+    let summary = match checkpoint {
+        AgentEvent::CompactionCompleted { summary, .. } => summary.clone(),
+        _ => unreachable!(),
+    };
+    assert!(summary.contains("HANDOFF: did first"));
+
+    // Resume input must slice from the checkpoint: only one user message,
+    // and it's the synthesized summary (prefixed with SUMMARY_PREFIX).
+    let replay_input = rebuild_responses_input(&after_compact, &cwd);
+    assert_eq!(
+        replay_input.len(),
+        1,
+        "replay should not silently expand back to the old transcript"
+    );
+    let only_user = replay_input[0]
+        .get("content")
+        .and_then(Value::as_str)
+        .expect("synthesized summary is a plain-string user content");
+    assert!(only_user.starts_with(super::SUMMARY_PREFIX));
+    assert!(only_user.contains("HANDOFF: did first"));
+
+    // No leakage of the pre-compaction "first" / "ack" pair.
+    assert!(!only_user.contains("ack"));
+    let any_old = replay_input.iter().any(|item| {
+        item.get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s == "first" || s == "ack")
+    });
+    assert!(
+        !any_old,
+        "old transcript leaked into replay: {replay_input:?}"
+    );
+}
+
+#[tokio::test]
+async fn manual_compact_recovers_from_text_only_overflow() {
+    // Regression for codex review B-2: a text-only long session has no
+    // function-call pairs to shed, so the original recovery would always
+    // give up. The fallback must instead drop the oldest message and
+    // retry — exactly the scenario `/compact` exists to rescue.
+    let turn_overflow = vec![StubItem::Err(
+        crate::responses::ResponsesError::ContextWindowExceeded {
+            message: "input is too long".into(),
+        },
+    )];
+    // After the fallback trims one message, the second attempt succeeds
+    // and the model returns the handoff summary.
+    let turn_summary = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "HANDOFF: recovered"}]
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let transport = StubTransport::with_items(vec![turn_overflow, turn_summary]);
+
+    // Seed `input` directly via initial_input so the runner sees a text-only
+    // pre-compaction transcript. No function_call items.
+    let initial_input = vec![
+        json!({"type": "message", "role": "user", "content": "one"}),
+        json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "reply"}]}),
+        json!({"type": "message", "role": "user", "content": "two"}),
+    ];
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &Args::test_default(),
+        &cwd,
+        "/compact",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        Some(initial_input),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("compaction should recover from text-only overflow");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    // The runner emitted a ContextTrimmed and a CompactionCompleted.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextTrimmed { .. })),
+        "expected ContextTrimmed event"
+    );
+    let completed = events.iter().find_map(|e| match e {
+        AgentEvent::CompactionCompleted { summary, .. } => Some(summary.clone()),
+        _ => None,
+    });
+    assert_eq!(completed.as_deref(), Some("HANDOFF: recovered"));
+
+    // Second attempt's body must have one fewer item than the first.
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 2);
+    let first = bodies[0].get("input").and_then(Value::as_array).unwrap();
+    let second = bodies[1].get("input").and_then(Value::as_array).unwrap();
+    assert_eq!(second.len(), first.len() - 1);
+}
+
+#[tokio::test]
+async fn manual_compact_failure_emits_failed_event() {
+    // An empty summary is treated as a failure: the agent emits
+    // CompactionFailed and the next turn must still see the pre-compact
+    // transcript on resume.
+    let empty_turn = vec![json!({"type": "response.completed", "response": {}})];
+    let transport = StubTransport::new(vec![empty_turn]);
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    let err = run_agent(
+        &transport,
+        &Args::test_default(),
+        &cwd,
+        "/compact",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect_err("empty summary should fail");
+    assert!(err.to_string().contains("compaction summary"));
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::CompactionFailed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_fires_when_session_tokens_cross_threshold() {
+    // Pre-populate a session whose recorded `tokens_input` is above the
+    // auto-compact threshold, then submit a normal prompt. The runner
+    // should run compaction first, then proceed with the user's turn.
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::session::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+    // Seed the rolling token total by pretending an earlier turn consumed
+    // 95k input tokens. Append a TurnComplete event so append_event runs
+    // the rollup UPDATE.
+    store
+        .append_event(
+            &session_id,
+            &AgentEvent::UserMessage {
+                text: "huge".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .append_event(
+            &session_id,
+            &AgentEvent::TurnComplete {
+                usage: TurnUsage {
+                    tokens_input: 95_000,
+                    tokens_output: 0,
+                    tokens_input_cached: 0,
+                    tokens_reasoning: 0,
+                },
+            },
+        )
+        .unwrap();
+
+    // Threshold = 100k * 0.85 = 85k. 95k crosses.
+    let mut args = Args::test_default();
+    args.auto_compact_token_limit = 100_000;
+    args.auto_compact_fraction = 0.85;
+
+    // Two turns to the transport: first is the compaction summarisation,
+    // second is the user's actual prompt response.
+    let summarise_turn = compact_turn_with_text("HANDOFF: ongoing");
+    let user_turn = compact_turn_with_text("ack second");
+    let transport = StubTransport::new(vec![summarise_turn, user_turn]);
+    let binding = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let prior = store.load_session(&session_id).unwrap();
+    let rebuilt = rebuild_responses_input(&prior, &cwd);
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "regular prompt",
+        None,
+        Vec::new(),
+        tx,
+        Some(&binding),
+        Some(rebuilt),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("run with auto-compact");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let auto_started = events.iter().find(|e| {
+        matches!(
+            e,
+            AgentEvent::CompactionStarted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    assert!(auto_started.is_some(), "auto-compaction should have fired");
+    let auto_completed = events.iter().find(|e| {
+        matches!(
+            e,
+            AgentEvent::CompactionCompleted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    assert!(auto_completed.is_some());
+
+    // The user's actual prompt followed, and the second transport call
+    // saw the replacement history (summary + recent users) plus the new
+    // user prompt — not the raw 95k-token transcript.
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 2, "auto-compact + user turn");
+    let final_input = bodies[1].get("input").and_then(Value::as_array).unwrap();
+    let assistants: Vec<&Value> = final_input
+        .iter()
+        .filter(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
+        .collect();
+    assert!(
+        assistants.is_empty(),
+        "compaction should drop assistant items: {assistants:?}"
+    );
+    // The new user prompt is the last item in `input`.
+    let last = final_input.last().unwrap();
+    assert_eq!(
+        last.get("content").and_then(Value::as_str),
+        Some("regular prompt")
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_does_not_re_fire_after_checkpoint() {
+    // Regression for codex review B-3: rolling token totals are lifetime
+    // cumulative, so naive threshold checks would re-compact every turn
+    // after the first crossing. The runner must instead key off
+    // `rolling - latest_checkpoint.tokens_before` so a second prompt
+    // submitted shortly after a successful auto-compaction does NOT
+    // trigger compaction again.
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::session::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+    store
+        .append_event(
+            &session_id,
+            &AgentEvent::UserMessage {
+                text: "huge".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .append_event(
+            &session_id,
+            &AgentEvent::TurnComplete {
+                usage: TurnUsage {
+                    tokens_input: 95_000,
+                    tokens_output: 0,
+                    tokens_input_cached: 0,
+                    tokens_reasoning: 0,
+                },
+            },
+        )
+        .unwrap();
+
+    let mut args = Args::test_default();
+    args.auto_compact_token_limit = 100_000;
+    args.auto_compact_fraction = 0.85;
+
+    // First run: auto-compact + user turn.
+    let transport_one = StubTransport::new(vec![
+        compact_turn_with_text("HANDOFF: ongoing"),
+        compact_turn_with_text("ack"),
+    ]);
+    let binding_one = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let prior_one = store.load_session(&session_id).unwrap();
+    let rebuilt_one = rebuild_responses_input(&prior_one, &cwd);
+    let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport_one,
+        &args,
+        &cwd,
+        "first prompt",
+        None,
+        Vec::new(),
+        tx1,
+        Some(&binding_one),
+        Some(rebuilt_one),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("first run");
+    while rx1.recv().await.is_some() {}
+
+    // Second run: with the lifetime rolling counter still ≥ threshold, a
+    // naive implementation would compact again. We assert it does NOT.
+    let transport_two = StubTransport::new(vec![compact_turn_with_text("ack two")]);
+    let binding_two = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let prior_two = store.load_session(&session_id).unwrap();
+    let rebuilt_two = rebuild_responses_input(&prior_two, &cwd);
+    let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &transport_two,
+        &args,
+        &cwd,
+        "second prompt",
+        None,
+        Vec::new(),
+        tx2,
+        Some(&binding_two),
+        Some(rebuilt_two),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("second run");
+    let mut second_events = Vec::new();
+    while let Some(event) = rx2.recv().await {
+        second_events.push(event);
+    }
+
+    let second_started = second_events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::CompactionStarted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    assert!(
+        !second_started,
+        "second prompt must not trigger auto-compaction after a recent checkpoint: {second_events:?}"
+    );
+
+    // The durable log still has exactly one CompactionCompleted from the
+    // first run.
+    let after_both = store.load_session(&session_id).unwrap();
+    let checkpoints = after_both
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionCompleted { .. }))
+        .count();
+    assert_eq!(
+        checkpoints, 1,
+        "exactly one auto-compaction should have run"
+    );
+
+    // Only one transport call this run (the user turn) — no extra
+    // summarisation body.
+    let bodies = transport_two.bodies();
+    assert_eq!(bodies.len(), 1, "expected single user turn, no compaction");
+}
 
 #[tokio::test]
 async fn create_failure_does_not_emit_retry_event_from_stub() {

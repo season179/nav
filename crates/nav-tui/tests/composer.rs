@@ -66,7 +66,17 @@ fn slash_shows_popup_and_he_filters_to_help() {
         .collect();
     assert_eq!(
         commands,
-        vec!["/help", "/clear", "/quit", "/exit", "/resume", "/sessions"]
+        vec![
+            "/help",
+            "/clear",
+            "/quit",
+            "/exit",
+            "/resume",
+            "/sessions",
+            "/name",
+            "/export",
+            "/compact"
+        ]
     );
 
     type_text(&mut pane, "he");

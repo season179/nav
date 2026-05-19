@@ -68,6 +68,101 @@ fn schema_applies_on_fresh_temp_db() {
 }
 
 #[test]
+fn opening_v1_database_migrates_nullable_session_name() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nav.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );
+            INSERT INTO schema_version (version, applied_at) VALUES (1, 1);
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                cwd TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                title TEXT,
+                profile TEXT,
+                provider_meta TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                cost_currency TEXT NOT NULL DEFAULT 'USD',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                tokens_input INTEGER NOT NULL DEFAULT 0,
+                tokens_output INTEGER NOT NULL DEFAULT 0,
+                tokens_input_cached INTEGER NOT NULL DEFAULT 0,
+                tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                cost_micros_reported INTEGER NOT NULL DEFAULT 0,
+                turns_with_reported_cost INTEGER NOT NULL DEFAULT 0,
+                turns_total INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE event (
+                session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                data TEXT NOT NULL,
+                PRIMARY KEY (session_id, seq)
+            );
+            CREATE TABLE turn (
+                session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                turn_index INTEGER NOT NULL,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                model TEXT NOT NULL,
+                tokens_input INTEGER NOT NULL DEFAULT 0,
+                tokens_output INTEGER NOT NULL DEFAULT 0,
+                tokens_input_cached INTEGER NOT NULL DEFAULT 0,
+                tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                cost_micros INTEGER,
+                cost_currency TEXT NOT NULL DEFAULT 'USD',
+                cost_source TEXT NOT NULL DEFAULT 'unreported',
+                error TEXT,
+                PRIMARY KEY (session_id, turn_index)
+            );
+            CREATE TABLE approval (
+                session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                approval_id TEXT NOT NULL,
+                requested_at INTEGER NOT NULL,
+                decided_at INTEGER,
+                tool TEXT NOT NULL,
+                command TEXT,
+                path TEXT,
+                reason TEXT NOT NULL,
+                decision TEXT,
+                rule TEXT,
+                PRIMARY KEY (session_id, approval_id)
+            );
+            ",
+        )
+        .unwrap();
+    }
+
+    let store = SessionStore::open(Some(path)).unwrap();
+    let conn = store.conn.lock().unwrap();
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(session)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(columns.iter().any(|name| name == "name"), "{columns:?}");
+    let version: i64 = conn
+        .query_row(
+            "SELECT version FROM schema_version WHERE version = ?1",
+            params![SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
 fn pragmas_are_set_on_open() {
     let (_dir, store) = open_temp_store();
     let conn = store.conn.lock().unwrap();
@@ -461,6 +556,183 @@ fn list_sessions_filters_by_cwd_and_orders_by_updated_at_desc() {
 }
 
 #[test]
+fn list_sessions_includes_picker_metadata() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/proj/named");
+    let id = store
+        .create_session_named(
+            cwd,
+            PROVIDER_OPENAI_RESPONSES,
+            "gpt",
+            Some("default"),
+            Some("launch name"),
+        )
+        .unwrap();
+    store
+        .append_event(
+            &id,
+            &AgentEvent::UserMessage {
+                text: "first user prompt".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .complete_turn(&id, "gpt", &TurnUsage::default(), None)
+        .unwrap();
+
+    let summary = store.list_sessions(None).unwrap().remove(0);
+    assert_eq!(summary.id, id);
+    assert_eq!(summary.name.as_deref(), Some("launch name"));
+    assert_eq!(summary.created_at, summary.last_active);
+    assert_eq!(summary.updated_at, summary.last_active);
+    assert_eq!(summary.turn_count, 1);
+    assert_eq!(
+        summary.first_user_prompt.as_deref(),
+        Some("first user prompt")
+    );
+}
+
+#[test]
+fn set_session_name_updates_existing_session_without_requiring_uniqueness() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/proj");
+    let a = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt", None)
+        .unwrap();
+    let b = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt", None)
+        .unwrap();
+
+    store.set_session_name(&a, "same name").unwrap();
+    store.set_session_name(&b, "same name").unwrap();
+
+    let summaries = store.list_sessions(None).unwrap();
+    let names: Vec<_> = summaries.iter().map(|s| s.name.as_deref()).collect();
+    assert_eq!(names, vec![Some("same name"), Some("same name")]);
+}
+
+#[test]
+fn resolve_session_id_accepts_unique_prefix_and_rejects_ambiguous_prefix() {
+    let (_dir, store) = open_temp_store();
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session (id, cwd, provider, model, created_at, updated_at)
+             VALUES (?1, '/repo', ?2, 'gpt', 1, 1)",
+            params!["01AAAA00000000000000000000", PROVIDER_OPENAI_RESPONSES],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, cwd, provider, model, created_at, updated_at)
+             VALUES (?1, '/repo', ?2, 'gpt', 1, 1)",
+            params!["01AAAB00000000000000000000", PROVIDER_OPENAI_RESPONSES],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        store.resolve_session_id("01AAAA").unwrap(),
+        "01AAAA00000000000000000000"
+    );
+    assert!(matches!(
+        store.resolve_session_id("01AAA"),
+        Err(ResolveSessionError::AmbiguousPrefix { .. })
+    ));
+    assert!(matches!(
+        store.resolve_session_id("01ZZZ"),
+        Err(ResolveSessionError::NotFound { .. })
+    ));
+}
+
+#[test]
+fn infer_export_format_defaults_to_markdown_and_honors_json_extension() {
+    assert_eq!(infer_export_format(None, None), ExportFormat::Markdown);
+    assert_eq!(
+        infer_export_format(Some(Path::new("session.md")), None),
+        ExportFormat::Markdown
+    );
+    assert_eq!(
+        infer_export_format(Some(Path::new("session.json")), None),
+        ExportFormat::Json
+    );
+    assert_eq!(
+        infer_export_format(
+            Some(Path::new("session.json")),
+            Some(ExportFormat::Markdown)
+        ),
+        ExportFormat::Markdown
+    );
+}
+
+#[test]
+fn markdown_export_groups_turns_and_collapses_tool_calls() {
+    let events = vec![
+        AgentEvent::UserMessage {
+            text: "inspect the repo".into(),
+            display_text: None,
+            attachments: Vec::new(),
+        },
+        AgentEvent::ToolCallStarted {
+            call_id: "call-1".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "git status --short"}),
+        },
+        AgentEvent::ToolCallOutput {
+            call_id: "call-1".into(),
+            output: " M src/main.rs\n".into(),
+            is_error: false,
+        },
+        AgentEvent::AssistantMessageDone {
+            text: "The tree is dirty.".into(),
+        },
+        AgentEvent::TurnComplete {
+            usage: TurnUsage::default(),
+        },
+        AgentEvent::UserMessage {
+            text: "thanks".into(),
+            display_text: Some("thanks (display)".into()),
+            attachments: Vec::new(),
+        },
+    ];
+
+    let markdown = export_events(&events, ExportFormat::Markdown).unwrap();
+    assert!(markdown.contains("# nav transcript"));
+    assert!(markdown.contains("## Turn 1"));
+    assert!(markdown.contains("### User"));
+    assert!(markdown.contains("inspect the repo"));
+    assert!(markdown.contains("<details>"));
+    assert!(markdown.contains("<summary>Tool call: bash</summary>"));
+    assert!(markdown.contains("git status --short"));
+    assert!(markdown.contains("### Tool result"));
+    assert!(markdown.contains("M src/main.rs"));
+    assert!(markdown.contains("### Assistant"));
+    assert!(markdown.contains("The tree is dirty."));
+    assert!(markdown.contains("## Turn 2"));
+    assert!(markdown.contains("thanks (display)"));
+}
+
+#[test]
+fn json_export_reuses_agent_event_schema_as_array() {
+    let events = vec![
+        AgentEvent::UserMessage {
+            text: "hello".into(),
+            display_text: None,
+            attachments: Vec::new(),
+        },
+        AgentEvent::AssistantMessageDone { text: "hi".into() },
+    ];
+
+    let json = export_events(&events, ExportFormat::Json).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value[0]["kind"], "user_message");
+    assert_eq!(value[0]["text"], "hello");
+    assert_eq!(value[1]["kind"], "assistant_message_done");
+    assert_eq!(value[1]["text"], "hi");
+}
+
+#[test]
 fn session_cwd_returns_creation_cwd_regardless_of_caller() {
     // session_cwd is the contract that lets --resume re-resolve stored
     // attachment paths against the session's original workspace root even
@@ -477,4 +749,66 @@ fn session_cwd_returns_creation_cwd_regardless_of_caller() {
 fn session_cwd_errors_on_missing_session() {
     let (_dir, store) = open_temp_store();
     assert!(store.session_cwd("does-not-exist").is_err());
+}
+
+#[test]
+fn load_session_skips_unknown_event_kinds() {
+    // A forward-compatible session log: a newer nav writes an unknown
+    // event kind, and an older nav must still be able to load the session
+    // around it. Without the per-row fallback, a single unrecognised kind
+    // would brick --resume for every session that contains it.
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/tmp/proj");
+    let id = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+
+    store
+        .append_event(
+            &id,
+            &AgentEvent::UserMessage {
+                text: "first".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    // Insert a row with a discriminant the current AgentEvent enum does
+    // not know about. The COALESCE(MAX(seq)+1) pattern matches the
+    // production INSERT in append_event.
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO event (session_id, seq, created_at, kind, data)
+             VALUES (
+                 ?1,
+                 COALESCE((SELECT MAX(seq) FROM event WHERE session_id = ?1), -1) + 1,
+                 ?2, ?3, ?4
+             )",
+            params![
+                &id,
+                now_secs(),
+                "future_event_kind",
+                r#"{"kind":"future_event_kind","payload":42}"#,
+            ],
+        )
+        .unwrap();
+    }
+    store
+        .append_event(&id, &AgentEvent::AssistantMessageDone { text: "ok".into() })
+        .unwrap();
+
+    let loaded = store.load_session(&id).unwrap();
+    assert_eq!(
+        loaded,
+        vec![
+            AgentEvent::UserMessage {
+                text: "first".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone { text: "ok".into() },
+        ],
+        "unknown event row must be skipped, surrounding rows preserved"
+    );
 }

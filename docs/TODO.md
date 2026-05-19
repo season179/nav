@@ -83,18 +83,35 @@ are the unchecked items at the top; shipped foundation stays here as evidence.
    - Partial: `AssistantMessageDelta` events exist and streaming message cells
      exist, but `nav-tui/src/widget.rs` explicitly ignores deltas and only
      renders final `AssistantMessageDone` text.
-3. [ ] Finish interactive session management: TUI resume picker, real
+3. [x] Finish interactive session management: TUI resume picker, real
    `/sessions` and `/resume` commands, named sessions, and exportable
    transcripts.
-   - Partial: SQLite session store at `$XDG_DATA_HOME/nav/nav.db`,
-     `--resume <ULID>`, and `--list-sessions` exist. No TUI resume picker,
-     session naming command, or transcript export.
-4. [ ] Add long-session compaction: manual `/compact`, automatic threshold
+   - Done in commit 1b9278c: bottom-pane TUI resume picker via
+     `--pick-session` and bare `/resume`; `/sessions` cell backed by the same
+     session summary query as `--list-sessions`; `/resume <ulid-or-prefix>`
+     with unique-prefix resolution, ambiguous-prefix errors, and mid-turn
+     refusal; nullable non-unique session names via v2 SQLite migration,
+     `--name`, and `/name <text>`; transcript export via `/export [path]` and
+     `nav export <ulid> [--format md|json] [--out path]` with extension
+     inference, markdown sections/details, and JSON `AgentEvent` arrays.
+   - Verified with `cargo fmt --all`, `cargo test -p nav-core -p nav-tui`,
+     and `cargo test -p nav-cli`. Caveat: `cargo insta review` was unavailable
+     in this environment (`cargo` had no `insta` subcommand), so the generated
+     session-management cell snapshot was inspected and accepted manually.
+4. [x] Add long-session compaction: manual `/compact`, automatic threshold
    compaction, persisted summaries, and clear replay behavior after compaction.
-   - Partial: context-window overflow recovery can drop the oldest tool pair
-     and retry, but there is no user-visible compaction flow. Resume replay is
-     text-only and intentionally skips old tool-call events in
-     `nav-core/src/agent/replay.rs`.
+   - Done in commit 0a86743 (merged as 82484e1): first-class compaction module
+     with Codex-style checkpoint prompt + replacement-history builder; durable
+     `AgentEvent::Compaction{Started,Completed,Failed}` events; non-steerable
+     manual `/compact`; persisted SQLite checkpoints; replay slicing from the
+     latest checkpoint; TUI `/compact` routing, compaction cells, and queued
+     prompts while compaction is running; pre-turn automatic compaction via
+     `auto_compact_fraction × auto_compact_token_limit` CLI/settings; overflow
+     trim fallback for normal and compaction turns.
+   - Verified with `cargo test -p nav-core -p nav-tui` (438 nav-core tests, 63
+     nav-tui unit tests, 7 composer tests, 16 snapshot tests). Deferred outside
+     this checklist item: true mid-turn compaction inside an active tool loop;
+     current automatic compaction runs before the next user turn.
 5. [ ] Improve install, auth, and diagnostics UX: add `nav doctor`, clearer
    login/auth/model errors, and reliable update/reinstall checks.
    - Partial: contextual auth errors in `nav-core/src/auth.rs` and

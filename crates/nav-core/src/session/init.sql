@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS session (
     provider TEXT NOT NULL,
     model TEXT NOT NULL,
     title TEXT,
+    name TEXT,
     profile TEXT,
     provider_meta TEXT,
     status TEXT NOT NULL DEFAULT 'active',

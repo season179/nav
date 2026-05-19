@@ -28,6 +28,19 @@ pub(crate) enum AppEvent {
         text: String,
         images: Vec<PathBuf>,
     },
+    ListSessions,
+    Resume {
+        query: Option<String>,
+    },
+    NameSession {
+        name: String,
+    },
+    Export {
+        path: Option<PathBuf>,
+    },
+    SlashError {
+        message: String,
+    },
 }
 
 pub(crate) fn is_ctrl_c(key: &KeyEvent) -> bool {
@@ -67,23 +80,9 @@ pub(crate) fn dispatch_submit(
             .ok();
         return;
     }
-    let event = match text.as_str() {
-        "/quit" | "/exit" => AppEvent::Quit,
-        "/clear" => AppEvent::Clear,
-        _ => match classify_slash(&text, skills) {
-            SlashAction::NotASkill => AppEvent::Submit { text, images },
-            SlashAction::Inline { prompt } => AppEvent::Submit {
-                text: prompt,
-                images,
-            },
-            SlashAction::Queue {
-                skill_name,
-                wrapped_body,
-            } => AppEvent::QueueSkill {
-                skill_name,
-                wrapped_body,
-            },
-        },
+    let event = match parse_builtin_command(&text) {
+        Some(event) => event,
+        None => submit_event_for_text(text, images, skills),
     };
     app_tx.send(event).ok();
 }
@@ -106,6 +105,72 @@ pub fn parse_steer_command(text: &str) -> Option<String> {
         return None;
     }
     Some(chars.as_str().trim_start().to_string())
+}
+
+fn submit_event_for_text(text: String, images: Vec<PathBuf>, skills: &Catalog) -> AppEvent {
+    match text.as_str() {
+        "/quit" | "/exit" => AppEvent::Quit,
+        "/clear" => AppEvent::Clear,
+        // `/compact` is handled inside nav-core's `run_agent` — submit the
+        // literal text so the agent loop's `is_compact_command` check
+        // dispatches the non-steerable compaction turn.
+        "/compact" => AppEvent::Submit { text, images },
+        _ => skill_or_submit_event(text, images, skills),
+    }
+}
+
+fn skill_or_submit_event(text: String, images: Vec<PathBuf>, skills: &Catalog) -> AppEvent {
+    match classify_slash(&text, skills) {
+        SlashAction::NotASkill => AppEvent::Submit { text, images },
+        SlashAction::Inline { prompt } => AppEvent::Submit {
+            text: prompt,
+            images,
+        },
+        SlashAction::Queue {
+            skill_name,
+            wrapped_body,
+        } => AppEvent::QueueSkill {
+            skill_name,
+            wrapped_body,
+        },
+    }
+}
+
+fn parse_builtin_command(text: &str) -> Option<AppEvent> {
+    let trimmed = text.trim();
+    if trimmed == "/sessions" {
+        return Some(AppEvent::ListSessions);
+    }
+    if let Some(rest) = slash_rest(trimmed, "/resume") {
+        return Some(AppEvent::Resume {
+            query: (!rest.is_empty()).then(|| rest.to_string()),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/name") {
+        if rest.is_empty() {
+            return Some(AppEvent::SlashError {
+                message: "usage: /name <text>".to_string(),
+            });
+        }
+        return Some(AppEvent::NameSession {
+            name: rest.to_string(),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/export") {
+        return Some(AppEvent::Export {
+            path: (!rest.is_empty()).then(|| PathBuf::from(rest)),
+        });
+    }
+    None
+}
+
+fn slash_rest<'a>(text: &'a str, command: &str) -> Option<&'a str> {
+    if text == command {
+        return Some("");
+    }
+    text.strip_prefix(command)
+        .and_then(|rest| rest.strip_prefix(char::is_whitespace))
+        .map(str::trim)
 }
 
 /// Classification of a submitted composer line that may be a skill activation.
@@ -279,5 +344,76 @@ mod tests {
     fn prepend_pending_skill_returns_prompt_when_empty() {
         let merged = prepend_pending_skill(None, "do X");
         assert_eq!(merged, "do X");
+    }
+
+    #[test]
+    fn dispatch_submit_routes_compact_through_submit_path() {
+        // `/compact` is implemented inside nav-core, not as a local TUI
+        // gesture. dispatch_submit must forward the literal text so the
+        // agent loop's is_compact_command check fires.
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        dispatch_submit("/compact".to_string(), Vec::new(), &catalog, &tx);
+        let event = rx.try_recv().expect("event sent");
+        match event {
+            AppEvent::Submit { text, images } => {
+                assert_eq!(text, "/compact");
+                assert!(images.is_empty());
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_submit_routes_session_management_commands_locally() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+
+        dispatch_submit("/sessions".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(rx.try_recv().unwrap(), AppEvent::ListSessions));
+
+        dispatch_submit("/resume".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::Resume { query: None }
+        ));
+
+        dispatch_submit("/resume 01HZ".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::Resume { query: Some(q) } if q == "01HZ"
+        ));
+
+        dispatch_submit("/name release work".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::NameSession { name } if name == "release work"
+        ));
+
+        dispatch_submit(
+            "/export transcript.md".to_string(),
+            Vec::new(),
+            &catalog,
+            &tx,
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::Export { path: Some(path) } if path == PathBuf::from("transcript.md")
+        ));
+    }
+
+    #[test]
+    fn dispatch_submit_reports_missing_name_argument() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+
+        dispatch_submit("/name".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::SlashError { message } if message.contains("/name")
+        ));
     }
 }

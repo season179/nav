@@ -1,12 +1,13 @@
-use nav_core::AgentEvent;
+use nav_core::{AgentEvent, SessionSummary};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashMap;
 
 use crate::cells::{
-    AssistantMessageCell, ErrorCell, FileChangeCell, SkillInvocationCell, ToolAbortedCell,
-    ToolCallCell, ToolCallContext, ToolOutputCell, TurnDiffCell, UserMessageCell, WelcomeCell,
+    AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell, FileChangeCell,
+    SessionListCell, SessionNoticeCell, SkillInvocationCell, ToolAbortedCell, ToolCallCell,
+    ToolCallContext, ToolOutputCell, TurnDiffCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -38,6 +39,15 @@ impl ChatWidget {
     pub fn push_skill(&mut self, name: impl Into<String>, detail: impl Into<String>) {
         self.cells
             .push(Box::new(SkillInvocationCell::new(name, detail)));
+    }
+
+    pub fn push_session_list(&mut self, sessions: Vec<SessionSummary>) {
+        self.cells.push(Box::new(SessionListCell::new(sessions)));
+    }
+
+    pub fn push_session_notice(&mut self, label: impl Into<String>, message: impl Into<String>) {
+        self.cells
+            .push(Box::new(SessionNoticeCell::new(label, message)));
     }
 
     /// Prepend a welcome cell that orients the user (model, cwd, session id).
@@ -149,6 +159,38 @@ impl ChatWidget {
             }
             AgentEvent::TurnAborted { reason } => {
                 self.cells.push(Box::new(ToolAbortedCell::new(reason)));
+            }
+            AgentEvent::CompactionStarted {
+                trigger,
+                tokens_before,
+            } => {
+                self.cells
+                    .push(Box::new(CompactionCell::started(trigger, tokens_before)));
+            }
+            AgentEvent::CompactionCompleted {
+                trigger,
+                summary,
+                replaced_events,
+                tokens_before,
+            } => {
+                self.cells.push(Box::new(CompactionCell::new(
+                    CompactionPhase::Completed,
+                    trigger,
+                    Some(summary),
+                    Some(replaced_events),
+                    tokens_before,
+                    None,
+                )));
+            }
+            AgentEvent::CompactionFailed { trigger, message } => {
+                self.cells.push(Box::new(CompactionCell::new(
+                    CompactionPhase::Failed,
+                    trigger,
+                    None,
+                    None,
+                    0,
+                    Some(message),
+                )));
             }
         }
     }

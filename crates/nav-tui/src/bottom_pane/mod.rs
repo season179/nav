@@ -23,12 +23,14 @@ use crate::theme::COMPOSER_BG;
 mod approval;
 mod composer;
 mod mention_popup;
+mod session_picker;
 mod slash_popup;
 mod view;
 
 pub use approval::ApprovalOverlay;
 pub use composer::{Composer, ComposerEvent};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
+pub use session_picker::{SessionPickerEntry, SessionPickerPopup};
 pub use slash_popup::{BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries};
 pub use view::{BottomPaneView, InputResult};
 
@@ -70,6 +72,9 @@ pub struct BottomPane {
     pending_approvals: VecDeque<PendingApproval>,
     /// Captured decision waiting to be drained by the app loop.
     last_decision: Option<(String, ReviewDecision)>,
+    /// Captured session id from the picker, waiting to be drained by the app
+    /// loop and routed through the same `/resume <id>` path.
+    last_session_selection: Option<String>,
 }
 
 impl BottomPane {
@@ -108,6 +113,7 @@ impl BottomPane {
             cwd,
             pending_approvals: VecDeque::new(),
             last_decision: None,
+            last_session_selection: None,
         }
     }
 
@@ -128,6 +134,16 @@ impl BottomPane {
     /// each key event and forwards the result to `PendingApprovals::respond`.
     pub fn take_approval_decision(&mut self) -> Option<(String, ReviewDecision)> {
         self.last_decision.take()
+    }
+
+    pub fn open_session_picker(&mut self, entries: Vec<SessionPickerEntry>) {
+        self.view = Some(BottomPaneView::SessionPicker(SessionPickerPopup::new(
+            entries,
+        )));
+    }
+
+    pub fn take_session_selection(&mut self) -> Option<String> {
+        self.last_session_selection.take()
     }
 
     fn try_show_next_approval(&mut self) {
@@ -255,6 +271,11 @@ impl BottomPane {
                                     self.last_decision = Some((o.approval_id.clone(), decision));
                                 }
                             }
+                            BottomPaneView::SessionPicker(p) => {
+                                if let Some(session_id) = p.take_selection() {
+                                    self.last_session_selection = Some(session_id);
+                                }
+                            }
                         }
                         self.view = None;
                         // Promote the next queued approval, if any.
@@ -358,6 +379,10 @@ impl BottomPane {
             }
             (Some(BottomPaneView::Approval(_)), _, _) => {
                 // Approval modal is unaffected by composer text changes.
+                return;
+            }
+            (Some(BottomPaneView::SessionPicker(_)), _, _) => {
+                // Session picker is a modal decision flow, not a text popup.
                 return;
             }
             _ => {}
@@ -586,6 +611,27 @@ mod tests {
         );
         // a2 should now be on screen.
         assert!(pane.has_overlay());
+    }
+
+    #[test]
+    fn session_picker_selection_is_captured_before_overlay_drops() {
+        let mut pane = BottomPane::new();
+        pane.open_session_picker(vec![SessionPickerEntry {
+            id: "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+            name: Some("release work".to_string()),
+            created_at: 100,
+            last_active: 250,
+            turn_count: 2,
+            title: Some("Implement picker".to_string()),
+        }]);
+
+        assert!(pane.has_overlay());
+        pane.handle_key(key(KeyCode::Enter));
+        assert!(!pane.has_overlay());
+        assert_eq!(
+            pane.take_session_selection(),
+            Some("01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string())
+        );
     }
 
     #[test]

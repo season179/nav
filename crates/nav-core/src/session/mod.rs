@@ -11,6 +11,9 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,7 +27,7 @@ pub const INIT_SQL: &str = include_str!("init.sql");
 
 /// Current migration version. Bump (and add a new migration) whenever the
 /// schema changes incompatibly.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// `provider` value stored on every session created from `run_agent`. There is
 /// no `ModelProvider` trait yet; that arrives in a later slice.
@@ -53,15 +56,30 @@ pub struct ReportedCost {
     pub currency: String,
 }
 
+/// Rolling token totals for one session. Returned by
+/// [`SessionStore::session_token_totals`] so the agent loop can decide whether
+/// automatic compaction should fire before submitting the next turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionTokenTotals {
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_input_cached: u64,
+    pub tokens_reasoning: u64,
+}
+
 /// One row returned by [`SessionStore::list_sessions`], with the rollup fields
 /// the CLI's `--list-sessions` command formats.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
     pub id: String,
+    pub name: Option<String>,
+    pub created_at: i64,
     pub updated_at: i64,
+    pub last_active: i64,
     pub cwd: String,
     pub provider: String,
     pub model: String,
+    pub first_user_prompt: Option<String>,
     pub tokens_input: u64,
     pub tokens_output: u64,
     pub tokens_input_cached: u64,
@@ -69,7 +87,189 @@ pub struct SessionSummary {
     pub cost_micros_reported: i64,
     pub turns_with_reported_cost: u64,
     pub turns_total: u64,
+    pub turn_count: u64,
     pub cost_currency: String,
+}
+
+/// Transcript export formats supported by both the TUI `/export` command and
+/// the headless `nav export` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Markdown,
+    Json,
+}
+
+/// Error returned when resolving a user-supplied session ULID or prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveSessionError {
+    NotFound {
+        query: String,
+    },
+    AmbiguousPrefix {
+        prefix: String,
+        matches: Vec<String>,
+    },
+}
+
+impl fmt::Display for ResolveSessionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound { query } => write!(f, "session not found: {query}"),
+            Self::AmbiguousPrefix { prefix, matches } => {
+                write!(
+                    f,
+                    "session prefix {prefix:?} is ambiguous: {}",
+                    matches.join(", ")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolveSessionError {}
+
+/// Pick an export format from an explicit override or a path extension.
+/// Unknown/missing extensions default to Markdown.
+pub fn infer_export_format(path: Option<&Path>, explicit: Option<ExportFormat>) -> ExportFormat {
+    if let Some(format) = explicit {
+        return format;
+    }
+    let Some(path) = path else {
+        return ExportFormat::Markdown;
+    };
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("json") => ExportFormat::Json,
+        _ => ExportFormat::Markdown,
+    }
+}
+
+/// Render a durable `AgentEvent` stream as either Markdown or JSON. JSON uses
+/// the existing serde shape directly: one array element per `AgentEvent`.
+pub fn export_events(events: &[AgentEvent], format: ExportFormat) -> Result<String> {
+    match format {
+        ExportFormat::Markdown => export_events_markdown(events),
+        ExportFormat::Json => {
+            serde_json::to_string_pretty(events).context("failed to serialize transcript JSON")
+        }
+    }
+}
+
+fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
+    let mut out = String::from("# nav transcript\n\n");
+    let mut turn = 0usize;
+    let mut in_turn = false;
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+
+    for event in events {
+        match event {
+            AgentEvent::UserMessage {
+                text,
+                display_text,
+                attachments,
+            } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                push_section(&mut out, "User", display_text.as_deref().unwrap_or(text));
+                for attachment in attachments {
+                    match attachment {
+                        crate::agent::UserAttachment::Image { path } => {
+                            out.push_str(&format!("- attachment: image `{}`\n", path.display()));
+                        }
+                    }
+                }
+                if !attachments.is_empty() {
+                    out.push('\n');
+                }
+            }
+            AgentEvent::AssistantMessageDone { text } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                push_section(&mut out, "Assistant", text);
+            }
+            AgentEvent::ToolCallStarted {
+                call_id,
+                name,
+                arguments,
+            } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                tool_names.insert(call_id.clone(), name.clone());
+                push_json_details(&mut out, &format!("Tool call: {name}"), arguments)?;
+            }
+            AgentEvent::ToolCallOutput {
+                call_id,
+                output,
+                is_error,
+            } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                let label = if *is_error {
+                    "### Tool result (error)"
+                } else {
+                    "### Tool result"
+                };
+                out.push_str(label);
+                if let Some(name) = tool_names.get(call_id) {
+                    out.push_str(&format!(": {name}"));
+                }
+                out.push_str("\n\n");
+                out.push_str("```text\n");
+                out.push_str(output.trim_end_matches('\n'));
+                out.push_str("\n```\n\n");
+            }
+            AgentEvent::Error { message } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                push_section(&mut out, "Error", message);
+            }
+            AgentEvent::CompactionCompleted { summary, .. } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                push_section(&mut out, "Compaction summary", summary);
+            }
+            AgentEvent::TurnAborted { reason } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                push_section(&mut out, "Turn aborted", reason);
+                in_turn = false;
+            }
+            AgentEvent::TurnComplete { .. } => {
+                in_turn = false;
+            }
+            AgentEvent::AssistantMessageDelta { .. }
+            | AgentEvent::ProviderRetry { .. }
+            | AgentEvent::ContextTrimmed { .. }
+            | AgentEvent::ToolCallApprovalRequest { .. }
+            | AgentEvent::ToolCallBlocked { .. }
+            | AgentEvent::FileChange { .. }
+            | AgentEvent::TurnDiff { .. }
+            | AgentEvent::CompactionStarted { .. }
+            | AgentEvent::CompactionFailed { .. } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                push_json_details(&mut out, &format!("Event: {}", event.kind()), event)?;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn start_turn(out: &mut String, turn: &mut usize, in_turn: &mut bool) {
+    if *in_turn {
+        return;
+    }
+    *turn += 1;
+    *in_turn = true;
+    out.push_str(&format!("## Turn {turn}\n\n"));
+}
+
+fn push_section(out: &mut String, heading: &str, body: &str) {
+    out.push_str(&format!("### {heading}\n\n"));
+    out.push_str(body);
+    out.push_str("\n\n");
+}
+
+fn push_json_details(out: &mut String, summary: &str, value: &impl Serialize) -> Result<()> {
+    out.push_str("<details>\n");
+    out.push_str(&format!("<summary>{summary}</summary>\n\n"));
+    out.push_str("```json\n");
+    out.push_str(&serde_json::to_string_pretty(value)?);
+    out.push_str("\n```\n");
+    out.push_str("</details>\n\n");
+    Ok(())
 }
 
 /// Owns the single SQLite connection used to persist a nav session. All
@@ -122,16 +322,46 @@ impl SessionStore {
         model: &str,
         profile: Option<&str>,
     ) -> Result<SessionId> {
+        self.create_session_named(cwd, provider, model, profile, None)
+    }
+
+    /// Inserts a new `session` row with an optional human name and returns the
+    /// generated ULID. Names are display metadata only; they are intentionally
+    /// nullable and non-unique.
+    pub fn create_session_named(
+        &self,
+        cwd: &Path,
+        provider: &str,
+        model: &str,
+        profile: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<SessionId> {
         let id = Ulid::new().to_string();
         let now = now_secs();
         let cwd_str = cwd.to_string_lossy().into_owned();
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO session (id, cwd, provider, model, profile, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-            params![id, cwd_str, provider, model, profile, now],
+            "INSERT INTO session (id, cwd, provider, model, profile, name, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![id, cwd_str, provider, model, profile, name, now],
         )?;
         Ok(id)
+    }
+
+    /// Sets or replaces the display name for a session. Names are not unique;
+    /// the ULID remains the stable identity for resume/export.
+    pub fn set_session_name(&self, session_id: &str, name: &str) -> Result<()> {
+        let trimmed = name.trim();
+        anyhow::ensure!(!trimmed.is_empty(), "session name cannot be empty");
+        let conn = self.lock();
+        let updated = conn.execute(
+            "UPDATE session SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![trimmed, now_secs(), session_id],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("session not found: {session_id}");
+        }
+        Ok(())
     }
 
     /// Persists a durable event to the session log and bumps `updated_at`.
@@ -336,19 +566,87 @@ impl SessionStore {
     /// Returns every durable event for a session in seq order. Each row's
     /// `data` column is parsed back into the `AgentEvent` it was serialised
     /// from, so callers can reconstruct the conversation transcript directly.
+    ///
+    /// Rows whose `kind` discriminant does not deserialize cleanly into the
+    /// current [`AgentEvent`] enum are skipped with a stderr warning. This
+    /// lets a newer nav write events a slightly older nav can still resume
+    /// past — losing one row is less disruptive than failing the whole
+    /// `--resume`.
     pub fn load_session(&self, session_id: &str) -> Result<Vec<AgentEvent>> {
         let conn = self.lock();
-        let mut stmt =
-            conn.prepare("SELECT data FROM event WHERE session_id = ?1 ORDER BY seq ASC")?;
-        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        let mut stmt = conn
+            .prepare("SELECT seq, kind, data FROM event WHERE session_id = ?1 ORDER BY seq ASC")?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
         let mut events = Vec::new();
         for row in rows {
-            let data = row?;
-            let event: AgentEvent =
-                serde_json::from_str(&data).context("failed to deserialize stored event")?;
-            events.push(event);
+            let (seq, kind, data) = row?;
+            match serde_json::from_str::<AgentEvent>(&data) {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    eprintln!(
+                        "nav-core: skipping unknown event (session={session_id} seq={seq} kind={kind}): {err}"
+                    );
+                }
+            }
         }
         Ok(events)
+    }
+
+    /// Returns the `tokens_before` field from the most recent
+    /// `compaction_completed` event recorded for `session_id`, or `None` if
+    /// the session has never been compacted. Used as the baseline against
+    /// which post-checkpoint usage is measured for automatic compaction —
+    /// without it, once lifetime rolling tokens cross the threshold, every
+    /// later prompt would re-compact.
+    pub(crate) fn latest_checkpoint_tokens_before(&self, session_id: &str) -> Result<Option<u64>> {
+        let conn = self.lock();
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT data FROM event
+                 WHERE session_id = ?1 AND kind = 'compaction_completed'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(data) = row else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&data)
+            .context("failed to parse stored compaction_completed event")?;
+        Ok(value
+            .get("tokens_before")
+            .and_then(serde_json::Value::as_u64))
+    }
+
+    /// Returns the rolling token totals recorded against `session_id`. Used
+    /// by the compaction module to decide whether automatic compaction
+    /// should fire before submitting the next turn.
+    pub(crate) fn session_token_totals(&self, session_id: &str) -> Result<SessionTokenTotals> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT tokens_input, tokens_output, tokens_input_cached, tokens_reasoning
+                 FROM session WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(SessionTokenTotals {
+                        tokens_input: row.get::<_, i64>(0)? as u64,
+                        tokens_output: row.get::<_, i64>(1)? as u64,
+                        tokens_input_cached: row.get::<_, i64>(2)? as u64,
+                        tokens_reasoning: row.get::<_, i64>(3)? as u64,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))?;
+        Ok(row)
     }
 
     /// Returns the launch cwd recorded for `session_id` at creation time.
@@ -378,28 +676,40 @@ impl SessionStore {
         // when a path is supplied.
         let cwd_str: Option<String> = cwd.map(|p| p.to_string_lossy().into_owned());
         let mut stmt = conn.prepare(
-            "SELECT id, updated_at, cwd, provider, model,
+            "SELECT id, name, created_at, updated_at, cwd, provider, model,
                     tokens_input, tokens_output, tokens_input_cached, tokens_reasoning,
-                    cost_micros_reported, turns_with_reported_cost, turns_total, cost_currency
+                    cost_micros_reported, turns_with_reported_cost, turns_total, cost_currency,
+                    (
+                        SELECT data FROM event
+                        WHERE event.session_id = session.id AND kind = 'user_message'
+                        ORDER BY seq ASC
+                        LIMIT 1
+                    ) AS first_user_event
              FROM session
              WHERE ?1 IS NULL OR cwd = ?1
              ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map(params![cwd_str], |row| {
+            let turns_total = row.get::<_, i64>(13)? as u64;
             Ok(SessionSummary {
                 id: row.get(0)?,
-                updated_at: row.get(1)?,
-                cwd: row.get(2)?,
-                provider: row.get(3)?,
-                model: row.get(4)?,
-                tokens_input: row.get::<_, i64>(5)? as u64,
-                tokens_output: row.get::<_, i64>(6)? as u64,
-                tokens_input_cached: row.get::<_, i64>(7)? as u64,
-                tokens_reasoning: row.get::<_, i64>(8)? as u64,
-                cost_micros_reported: row.get(9)?,
-                turns_with_reported_cost: row.get::<_, i64>(10)? as u64,
-                turns_total: row.get::<_, i64>(11)? as u64,
-                cost_currency: row.get(12)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
+                last_active: row.get(3)?,
+                cwd: row.get(4)?,
+                provider: row.get(5)?,
+                model: row.get(6)?,
+                tokens_input: row.get::<_, i64>(7)? as u64,
+                tokens_output: row.get::<_, i64>(8)? as u64,
+                tokens_input_cached: row.get::<_, i64>(9)? as u64,
+                tokens_reasoning: row.get::<_, i64>(10)? as u64,
+                cost_micros_reported: row.get(11)?,
+                turns_with_reported_cost: row.get::<_, i64>(12)? as u64,
+                turns_total,
+                turn_count: turns_total,
+                cost_currency: row.get(14)?,
+                first_user_prompt: first_user_prompt_from_event_json(row.get(15)?),
             })
         })?;
         let mut summaries = Vec::new();
@@ -407,6 +717,40 @@ impl SessionStore {
             summaries.push(row?);
         }
         Ok(summaries)
+    }
+
+    /// Resolves a full session ULID or unique prefix into the canonical ULID.
+    pub fn resolve_session_id(
+        &self,
+        query: &str,
+    ) -> std::result::Result<SessionId, ResolveSessionError> {
+        let prefix = query.trim();
+        if prefix.is_empty() {
+            return Err(ResolveSessionError::NotFound {
+                query: query.to_string(),
+            });
+        }
+        let not_found = || ResolveSessionError::NotFound {
+            query: prefix.to_string(),
+        };
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM session WHERE id LIKE ?1 ORDER BY id ASC LIMIT 3")
+            .map_err(|_| not_found())?;
+        let rows = stmt
+            .query_map(params![format!("{prefix}%")], |row| row.get::<_, String>(0))
+            .map_err(|_| not_found())?;
+        let mut matches: Vec<String> = rows
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|_| not_found())?;
+        match matches.len() {
+            0 => Err(not_found()),
+            1 => Ok(matches.remove(0)),
+            _ => Err(ResolveSessionError::AmbiguousPrefix {
+                prefix: prefix.to_string(),
+                matches,
+            }),
+        }
     }
 
     /// Acquires the connection mutex. A panic here means another method
@@ -451,20 +795,51 @@ fn xdg_data_home() -> Option<PathBuf> {
 fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(INIT_SQL)
         .context("failed to apply nav-core schema")?;
-    let already_applied: Option<i64> = conn
-        .query_row(
-            "SELECT version FROM schema_version WHERE version = ?1",
-            params![SCHEMA_VERSION],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if already_applied.is_none() {
-        conn.execute(
-            "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
-            params![SCHEMA_VERSION, now_secs()],
-        )?;
+    record_schema_version(conn, 1)?;
+    if applied_schema_version(conn)? < 2 {
+        if !table_has_column(conn, "session", "name")? {
+            conn.execute_batch("ALTER TABLE session ADD COLUMN name TEXT")?;
+        }
+        record_schema_version(conn, 2)?;
     }
     Ok(())
+}
+
+fn applied_schema_version(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        })?
+        .unwrap_or(0))
+}
+
+fn record_schema_version(conn: &Connection, version: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+        params![version, now_secs()],
+    )?;
+    Ok(())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn first_user_prompt_from_event_json(data: Option<String>) -> Option<String> {
+    let data = data?;
+    match serde_json::from_str::<AgentEvent>(&data).ok()? {
+        AgentEvent::UserMessage {
+            text, display_text, ..
+        } => display_text.or(Some(text)),
+        _ => None,
+    }
 }
 
 /// [`DurableEventSink`] adaptor that writes through a [`SessionStore`].

@@ -19,6 +19,25 @@ pub enum UserAttachment {
     Image { path: PathBuf },
 }
 
+/// Provenance flag carried on every compaction lifecycle event so frontends can
+/// tell the user whether nav compacted because they typed `/compact` or because
+/// estimated token usage crossed the configured threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    Auto,
+}
+
+impl CompactionTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactionTrigger::Manual => "manual",
+            CompactionTrigger::Auto => "auto",
+        }
+    }
+}
+
 /// Normalized usage counters emitted at the end of each model turn.
 ///
 /// Each field counts tokens for a single response; providers that do not
@@ -134,6 +153,40 @@ pub enum AgentEvent {
     ContextTrimmed {
         dropped_pairs: usize,
     },
+    /// A compaction turn is about to start. `tokens_before` is the lifetime
+    /// cumulative `tokens_input` recorded against this session at the
+    /// moment of compaction; `0` if no session totals were available. Auto
+    /// compaction decisions read this back as a baseline so post-checkpoint
+    /// usage can be measured separately from lifetime totals. Frontends
+    /// should freeze the composer / queue new user prompts until the
+    /// matching `CompactionCompleted` or `CompactionFailed` arrives.
+    CompactionStarted {
+        trigger: CompactionTrigger,
+        tokens_before: u64,
+    },
+    /// The compaction turn finished successfully. `summary` is the persisted
+    /// handoff summary; subsequent turns replay from this checkpoint instead
+    /// of the full pre-compaction transcript. `replaced_events` reports how
+    /// many Responses-API input items (messages, function calls, function
+    /// outputs) are now hidden behind the summary in the model-visible
+    /// history. `tokens_before` matches the value on the paired
+    /// `CompactionStarted` — lifetime cumulative `tokens_input` at
+    /// compaction time, used as the baseline for the next auto-compaction
+    /// decision. Visible scrollback is preserved separately by the session
+    /// event log.
+    CompactionCompleted {
+        trigger: CompactionTrigger,
+        summary: String,
+        replaced_events: usize,
+        tokens_before: u64,
+    },
+    /// Compaction failed; `message` carries the underlying error. The session
+    /// is still using the pre-compaction transcript — the next turn replays
+    /// the same history as before.
+    CompactionFailed {
+        trigger: CompactionTrigger,
+        message: String,
+    },
     Error {
         message: String,
     },
@@ -157,6 +210,9 @@ impl AgentEvent {
             AgentEvent::TurnAborted { .. } => "turn_aborted",
             AgentEvent::ProviderRetry { .. } => "provider_retry",
             AgentEvent::ContextTrimmed { .. } => "context_trimmed",
+            AgentEvent::CompactionStarted { .. } => "compaction_started",
+            AgentEvent::CompactionCompleted { .. } => "compaction_completed",
+            AgentEvent::CompactionFailed { .. } => "compaction_failed",
             AgentEvent::Error { .. } => "error",
         }
     }
@@ -265,6 +321,64 @@ mod tests {
                 "reason": "user pressed esc"
             })
         );
+    }
+
+    #[test]
+    fn compaction_started_wire_format() {
+        let event = AgentEvent::CompactionStarted {
+            trigger: CompactionTrigger::Manual,
+            tokens_before: 12_345,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "compaction_started",
+                "trigger": "manual",
+                "tokens_before": 12345
+            })
+        );
+        assert_eq!(event.kind(), "compaction_started");
+        assert!(event.is_durable());
+    }
+
+    #[test]
+    fn compaction_completed_wire_format() {
+        let event = AgentEvent::CompactionCompleted {
+            trigger: CompactionTrigger::Auto,
+            summary: "did things".into(),
+            replaced_events: 8,
+            tokens_before: 200_000,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "compaction_completed",
+                "trigger": "auto",
+                "summary": "did things",
+                "replaced_events": 8,
+                "tokens_before": 200000
+            })
+        );
+        assert_eq!(event.kind(), "compaction_completed");
+        assert!(event.is_durable());
+    }
+
+    #[test]
+    fn compaction_failed_wire_format() {
+        let event = AgentEvent::CompactionFailed {
+            trigger: CompactionTrigger::Manual,
+            message: "transport closed".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "compaction_failed",
+                "trigger": "manual",
+                "message": "transport closed"
+            })
+        );
+        assert_eq!(event.kind(), "compaction_failed");
+        assert!(event.is_durable());
     }
 
     #[test]
