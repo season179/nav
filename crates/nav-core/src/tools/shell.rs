@@ -502,7 +502,6 @@ mod tests {
         )
         .await
         .unwrap();
-        // Trailer with the absolute path is appended at the end.
         let trailer_marker = "[Full output: ";
         let trailer_at = result
             .rfind(trailer_marker)
@@ -518,6 +517,10 @@ mod tests {
             "spill file is missing line 200000 (last 80 chars: {:?})",
             &on_disk[on_disk.len().saturating_sub(80)..]
         );
+        // The real nav data dir isn't hermetic here; clean up this run's
+        // spill so successive `cargo test` invocations don't accumulate
+        // files until the 7-day sweep catches them.
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

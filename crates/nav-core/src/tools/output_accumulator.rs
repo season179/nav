@@ -125,9 +125,9 @@ impl OutputAccumulator {
             self.spill = Some(file);
         }
         let file = self.spill.as_mut().expect("spill file just opened above");
-        let head: Vec<u8> = self.rolling.drain(..count).collect();
-        file.write_all(&head)
+        file.write_all(&self.rolling[..count])
             .with_context(|| format!("failed to write {}", self.spill_path.display()))?;
+        self.rolling.drain(..count);
         Ok(())
     }
 
@@ -177,16 +177,9 @@ fn try_sweep_old() -> Result<()> {
 }
 
 fn default_log_dir() -> Result<PathBuf> {
-    let base =
-        xdg_data_home().context("could not resolve XDG data directory for nav tool-output")?;
+    let base = crate::session::xdg_data_home()
+        .context("could not resolve XDG data directory for nav tool-output")?;
     Ok(base.join("nav").join("tool-output"))
-}
-
-fn xdg_data_home() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))
 }
 
 fn unique_path(dir: &Path, prefix: &str) -> PathBuf {

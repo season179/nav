@@ -1158,7 +1158,7 @@ fn default_db_path() -> Result<PathBuf> {
     Ok(default_db_dir()?.join("nav.db"))
 }
 
-fn xdg_data_home() -> Option<PathBuf> {
+pub(crate) fn xdg_data_home() -> Option<PathBuf> {
     env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())

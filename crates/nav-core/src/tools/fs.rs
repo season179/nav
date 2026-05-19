@@ -348,22 +348,18 @@ pub(super) async fn code_search(
 /// Runs before the global `bound(.., Head)` so the global byte/line cap
 /// rarely fires on grep output. Empty stdout (no matches) passes through.
 fn apply_code_search_caps(stdout: &str) -> String {
-    // `rg --line-number --no-heading` emits one match per line; the trailing
-    // empty split-element after the final newline is filtered out below.
-    let lines: Vec<&str> = stdout.lines().collect();
-    let total = lines.len();
-    if total == 0 {
-        return String::new();
-    }
-    let kept = total.min(CODE_SEARCH_MAX_MATCHES);
+    let mut lines = stdout.lines();
     let mut out = String::new();
-    for line in lines.iter().take(kept) {
+    let mut kept = 0usize;
+    for line in lines.by_ref().take(CODE_SEARCH_MAX_MATCHES) {
         let (clipped, _) = truncate_line(line, GREP_MAX_LINE_LENGTH);
         out.push_str(&clipped);
         out.push('\n');
+        kept += 1;
     }
-    if total > kept {
-        let dropped = total - kept;
+    let dropped = lines.count();
+    if dropped > 0 {
+        let total = kept + dropped;
         out.push_str(&format!("[truncated {dropped} of {total} matches]\n"));
     }
     out
