@@ -864,3 +864,375 @@ fn load_session_skips_unknown_event_kinds() {
         "unknown event row must be skipped, surrounding rows preserved"
     );
 }
+
+#[test]
+fn opening_v2_database_migrates_v3_columns_label_table_and_fts() {
+    // Pre-build a v2 schema by hand (matching the v2 ALTER … ADD COLUMN name)
+    // and confirm SessionStore::open applies the v3 migration on top without
+    // dropping any rows.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nav.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (
+                 version INTEGER PRIMARY KEY,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_version (version, applied_at) VALUES (1, 1);
+             INSERT INTO schema_version (version, applied_at) VALUES (2, 1);
+             CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 cwd TEXT NOT NULL,
+                 provider TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 title TEXT,
+                 name TEXT,
+                 profile TEXT,
+                 provider_meta TEXT,
+                 status TEXT NOT NULL DEFAULT 'active',
+                 cost_currency TEXT NOT NULL DEFAULT 'USD',
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 tokens_input INTEGER NOT NULL DEFAULT 0,
+                 tokens_output INTEGER NOT NULL DEFAULT 0,
+                 tokens_input_cached INTEGER NOT NULL DEFAULT 0,
+                 tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                 cost_micros_reported INTEGER NOT NULL DEFAULT 0,
+                 turns_with_reported_cost INTEGER NOT NULL DEFAULT 0,
+                 turns_total INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE event (
+                 session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                 seq INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 data TEXT NOT NULL,
+                 PRIMARY KEY (session_id, seq)
+             );
+             CREATE TABLE turn (
+                 session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                 turn_index INTEGER NOT NULL,
+                 started_at INTEGER NOT NULL,
+                 ended_at INTEGER,
+                 model TEXT NOT NULL,
+                 tokens_input INTEGER NOT NULL DEFAULT 0,
+                 tokens_output INTEGER NOT NULL DEFAULT 0,
+                 tokens_input_cached INTEGER NOT NULL DEFAULT 0,
+                 tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                 cost_micros INTEGER,
+                 cost_currency TEXT NOT NULL DEFAULT 'USD',
+                 cost_source TEXT NOT NULL DEFAULT 'unreported',
+                 error TEXT,
+                 PRIMARY KEY (session_id, turn_index)
+             );
+             CREATE TABLE approval (
+                 session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                 approval_id TEXT NOT NULL,
+                 requested_at INTEGER NOT NULL,
+                 decided_at INTEGER,
+                 tool TEXT NOT NULL,
+                 command TEXT,
+                 path TEXT,
+                 reason TEXT NOT NULL,
+                 decision TEXT,
+                 rule TEXT,
+                 PRIMARY KEY (session_id, approval_id)
+             );
+             INSERT INTO session (id, cwd, provider, model, created_at, updated_at)
+                 VALUES ('legacy-id', '/legacy', 'openai-responses', 'gpt-test', 10, 10);
+             INSERT INTO event (session_id, seq, created_at, kind, data)
+                 VALUES ('legacy-id', 0, 11, 'user_message',
+                         '{\"kind\":\"user_message\",\"text\":\"backfill-me\",\"display_text\":null,\"attachments\":[]}');",
+        )
+        .unwrap();
+    }
+
+    let store = SessionStore::open(Some(path)).unwrap();
+    let conn = store.conn.lock().unwrap();
+
+    // Schema migrated to v3.
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+
+    // New session columns landed and a legacy row still exists.
+    let columns: Vec<String> = conn
+        .prepare("PRAGMA table_info(session)")
+        .unwrap()
+        .query_map([], |row| row.get(1))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert!(columns.iter().any(|c| c == "parent_id"), "{columns:?}");
+    assert!(columns.iter().any(|c| c == "fork_point_seq"), "{columns:?}");
+
+    let parent_id: Option<String> = conn
+        .query_row(
+            "SELECT parent_id FROM session WHERE id = 'legacy-id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(parent_id.is_none());
+
+    // Label table exists and is empty.
+    let label_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM label", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(label_count, 0);
+
+    // Pre-existing user_message events were backfilled into FTS.
+    let fts_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM event_fts WHERE text MATCH 'backfill'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(fts_count, 1, "v3 migration must backfill the FTS table");
+}
+
+#[test]
+fn fork_session_copies_events_up_to_seq_and_records_parent_link() {
+    let (_dir, store) = open_temp_store();
+    let parent = store
+        .create_session(
+            Path::new("/proj"),
+            PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+        )
+        .unwrap();
+    let baseline_events = vec![
+        AgentEvent::UserMessage {
+            text: "first".into(),
+            display_text: None,
+            attachments: Vec::new(),
+        },
+        AgentEvent::AssistantMessageDone {
+            text: "first reply".into(),
+        },
+        AgentEvent::TurnComplete {
+            usage: TurnUsage {
+                tokens_input: 10,
+                tokens_output: 5,
+                tokens_input_cached: 0,
+                tokens_reasoning: 0,
+            },
+        },
+        AgentEvent::UserMessage {
+            text: "second".into(),
+            display_text: None,
+            attachments: Vec::new(),
+        },
+        AgentEvent::AssistantMessageDone {
+            text: "second reply".into(),
+        },
+        AgentEvent::TurnComplete {
+            usage: TurnUsage {
+                tokens_input: 7,
+                tokens_output: 3,
+                tokens_input_cached: 0,
+                tokens_reasoning: 0,
+            },
+        },
+    ];
+    for event in &baseline_events {
+        store.append_event(&parent, event).unwrap();
+    }
+
+    // Fork mid-conversation at seq 2 (after first turn_complete).
+    let mid = store
+        .fork_session(&parent, Some(2), Some("alt path"))
+        .unwrap();
+    let copied = store.load_session(&mid).unwrap();
+    assert_eq!(copied, baseline_events[..3]);
+
+    let summary = store.session_summary(&mid).unwrap().unwrap();
+    assert_eq!(summary.parent_id.as_deref(), Some(parent.as_str()));
+    assert_eq!(summary.name.as_deref(), Some("alt path"));
+    assert_eq!(summary.tokens_input, 10);
+    assert_eq!(summary.tokens_output, 5);
+
+    // Forking with `at_seq = None` copies every event and recomputes totals
+    // from each copied turn_complete payload.
+    let head = store.fork_session(&parent, None, None).unwrap();
+    let head_events = store.load_session(&head).unwrap();
+    assert_eq!(head_events, baseline_events);
+    let head_summary = store.session_summary(&head).unwrap().unwrap();
+    assert_eq!(head_summary.tokens_input, 17);
+    assert_eq!(head_summary.tokens_output, 8);
+}
+
+#[test]
+fn labels_round_trip_and_filter_listing() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/proj");
+    let alpha = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+    let beta = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+
+    store.add_label(&alpha, "release").unwrap();
+    store.add_label(&alpha, "wip").unwrap();
+    store.add_label(&beta, "release").unwrap();
+    // Repeating an add is a no-op.
+    store.add_label(&alpha, "release").unwrap();
+    assert!(store.add_label(&alpha, "  ").is_err());
+
+    let alpha_labels = store.labels_for(&alpha).unwrap();
+    assert_eq!(alpha_labels, vec!["release", "wip"]);
+
+    let release_sessions = store.list_by_label("release", None).unwrap();
+    let release_ids: Vec<&str> = release_sessions.iter().map(|s| s.id.as_str()).collect();
+    assert!(release_ids.contains(&alpha.as_str()));
+    assert!(release_ids.contains(&beta.as_str()));
+
+    // list_sessions surfaces labels on the summary directly.
+    let listing = store.list_sessions(Some(cwd)).unwrap();
+    let alpha_summary = listing.iter().find(|s| s.id == alpha).unwrap();
+    assert_eq!(alpha_summary.labels, vec!["release", "wip"]);
+
+    store.remove_label(&alpha, "wip").unwrap();
+    assert_eq!(store.labels_for(&alpha).unwrap(), vec!["release"]);
+}
+
+#[test]
+fn walk_tree_returns_depth_ordered_descendants() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/proj");
+    let root = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+    store
+        .append_event(
+            &root,
+            &AgentEvent::UserMessage {
+                text: "root start".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    let child_a = store.fork_session(&root, None, Some("child A")).unwrap();
+    let child_b = store.fork_session(&root, None, Some("child B")).unwrap();
+    let grand = store
+        .fork_session(&child_a, None, Some("grandchild"))
+        .unwrap();
+
+    let tree = store.walk_tree(&root).unwrap();
+    let depths: Vec<u32> = tree.iter().map(|node| node.depth).collect();
+    let ids: Vec<&str> = tree.iter().map(|node| node.summary.id.as_str()).collect();
+
+    assert!(
+        depths.windows(2).all(|w| w[0] <= w[1]),
+        "walk_tree must order by depth ascending: {depths:?}"
+    );
+    assert_eq!(ids[0], root);
+    assert!(ids.contains(&child_a.as_str()));
+    assert!(ids.contains(&child_b.as_str()));
+    assert!(ids.contains(&grand.as_str()));
+    // The grandchild is the only node at depth 2.
+    let depth_two: Vec<&str> = tree
+        .iter()
+        .filter(|node| node.depth == 2)
+        .map(|node| node.summary.id.as_str())
+        .collect();
+    assert_eq!(depth_two, vec![grand.as_str()]);
+
+    // child_count surfaces the immediate fan-out.
+    let root_summary = store.session_summary(&root).unwrap().unwrap();
+    assert_eq!(root_summary.child_count, 2);
+}
+
+#[test]
+fn fts_trigger_indexed_kinds_match_agent_event_kind_strings() {
+    // The v3 FTS triggers (event_fts_ai / event_fts_ad) hardcode three event
+    // kind strings. They must stay in lockstep with AgentEvent::kind() —
+    // otherwise renaming a variant silently breaks transcript search.
+    let user = AgentEvent::UserMessage {
+        text: "x".into(),
+        display_text: None,
+        attachments: Vec::new(),
+    };
+    let assistant_done = AgentEvent::AssistantMessageDone { text: "y".into() };
+    let assistant_delta = AgentEvent::AssistantMessageDelta { text: "z".into() };
+    assert_eq!(user.kind(), "user_message");
+    assert_eq!(assistant_done.kind(), "assistant_message_done");
+    assert_eq!(assistant_delta.kind(), "assistant_message_delta");
+
+    let triggers = include_str!("init.sql");
+    for kind in [
+        "'user_message'",
+        "'assistant_message_done'",
+        "'assistant_message_delta'",
+    ] {
+        assert!(
+            triggers.contains(kind),
+            "init.sql FTS triggers must list {kind} — keep them in sync with AgentEvent::kind()"
+        );
+    }
+}
+
+#[test]
+fn search_transcript_finds_phrase_across_sessions() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/proj");
+    let one = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+    let two = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+
+    for (id, prompt, reply) in [
+        (
+            &one,
+            "investigate purple flamingo migration",
+            "looking into the purple flamingo path",
+        ),
+        (&two, "fix bash sandbox", "sandboxed bash on macOS only"),
+    ] {
+        store
+            .append_event(
+                id,
+                &AgentEvent::UserMessage {
+                    text: prompt.to_string(),
+                    display_text: None,
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(id, &AgentEvent::AssistantMessageDone { text: reply.into() })
+            .unwrap();
+    }
+
+    let hits = store.search_transcript("flamingo", 10, None).unwrap();
+    let session_ids: std::collections::HashSet<&str> =
+        hits.iter().map(|h| h.session_id.as_str()).collect();
+    assert!(
+        session_ids.contains(one.as_str()),
+        "FTS should find phrase in the first session: {session_ids:?}"
+    );
+    // The second session has no 'flamingo' so its events must not appear.
+    assert!(!session_ids.contains(two.as_str()));
+
+    // Label-scoped search excludes sessions without the label.
+    store.add_label(&one, "investigation").unwrap();
+    let labelled = store
+        .search_transcript("flamingo", 10, Some("investigation"))
+        .unwrap();
+    assert!(labelled.iter().any(|h| h.session_id == one));
+
+    let empty = store
+        .search_transcript("flamingo", 10, Some("missing-label"))
+        .unwrap();
+    assert!(empty.is_empty());
+}

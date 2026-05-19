@@ -20,6 +20,11 @@ pub const BUILTIN_SLASH_COMMANDS: &[&str] = &[
     "/sessions",
     "/name",
     "/export",
+    "/fork",
+    "/tree",
+    "/label",
+    "/unlabel",
+    "/find",
     "/compact",
     "/abort",
     "/steer",
@@ -53,6 +58,11 @@ fn builtin_description(command: &str) -> Option<&'static str> {
         "/sessions" => Some("list stored sessions"),
         "/name" => Some("name this session"),
         "/export" => Some("write transcript"),
+        "/fork" => Some("fork session at seq (or now)"),
+        "/tree" => Some("show session fork tree"),
+        "/label" => Some("attach a label to this session"),
+        "/unlabel" => Some("remove a label from this session"),
+        "/find" => Some("search across transcripts"),
         "/compact" => Some("summarize long context"),
         _ => None,
     }
@@ -287,7 +297,11 @@ mod tests {
         let mut popup = SlashCommandPopup::new(build_slash_entries(&make_catalog()));
         popup.on_composer_text_changed("/fo");
         let commands: Vec<&str> = popup.matches().iter().map(|e| e.command.as_str()).collect();
-        assert_eq!(commands, vec!["/foo"]);
+        // `/fo` matches both the catalog skill `/foo` and the builtin
+        // `/fork`. Both should appear; the exact order is determined by the
+        // popup's stable ordering rather than this assertion.
+        assert!(commands.contains(&"/foo"));
+        assert!(commands.contains(&"/fork"));
     }
 
     #[test]

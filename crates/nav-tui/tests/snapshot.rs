@@ -496,6 +496,9 @@ fn renders_session_management_cells() {
             turns_total: 2,
             turn_count: 2,
             cost_currency: "USD".to_string(),
+            parent_id: None,
+            labels: Vec::new(),
+            child_count: 0,
         },
         SessionSummary {
             id: "01HYYYYYYYYYYYYYYYYYYYYYYYY".to_string(),
@@ -516,6 +519,9 @@ fn renders_session_management_cells() {
             turns_total: 0,
             turn_count: 0,
             cost_currency: "USD".to_string(),
+            parent_id: None,
+            labels: Vec::new(),
+            child_count: 0,
         },
     ]);
     widget.push_session_notice("name", "Session name set to \"release work\"");

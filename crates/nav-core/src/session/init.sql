@@ -22,8 +22,14 @@ CREATE TABLE IF NOT EXISTS session (
     tokens_reasoning INTEGER NOT NULL DEFAULT 0,
     cost_micros_reported INTEGER NOT NULL DEFAULT 0,
     turns_with_reported_cost INTEGER NOT NULL DEFAULT 0,
-    turns_total INTEGER NOT NULL DEFAULT 0
+    turns_total INTEGER NOT NULL DEFAULT 0,
+    parent_id TEXT REFERENCES session(id),
+    fork_point_seq INTEGER
 );
+
+-- idx_session_parent is created in the v3 migration step rather than here,
+-- so init.sql can run against a v1 database whose session table predates
+-- the parent_id column without `CREATE INDEX` failing.
 
 CREATE INDEX IF NOT EXISTS idx_session_cwd_updated_at
     ON session(cwd, updated_at DESC);
@@ -73,3 +79,41 @@ CREATE TABLE IF NOT EXISTS approval (
 
 CREATE INDEX IF NOT EXISTS idx_approval_session
     ON approval(session_id, requested_at);
+
+CREATE TABLE IF NOT EXISTS label (
+    session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_label_name
+    ON label(label);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(
+    session_id UNINDEXED,
+    seq UNINDEXED,
+    kind UNINDEXED,
+    text
+);
+
+CREATE TRIGGER IF NOT EXISTS event_fts_ai
+AFTER INSERT ON event
+WHEN NEW.kind IN ('user_message', 'assistant_message_done', 'assistant_message_delta')
+BEGIN
+    INSERT INTO event_fts (session_id, seq, kind, text)
+    VALUES (
+        NEW.session_id,
+        NEW.seq,
+        NEW.kind,
+        COALESCE(json_extract(NEW.data, '$.text'), '')
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS event_fts_ad
+AFTER DELETE ON event
+WHEN OLD.kind IN ('user_message', 'assistant_message_done', 'assistant_message_delta')
+BEGIN
+    DELETE FROM event_fts
+    WHERE session_id = OLD.session_id AND seq = OLD.seq;
+END;

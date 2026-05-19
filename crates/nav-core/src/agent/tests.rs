@@ -1314,7 +1314,7 @@ async fn run_agent_gates_protected_file_attachment_through_approval() {
         &transport,
         &Args::test_default(),
         &cwd,
-        "look".into(),
+        "look",
         None,
         vec![UserAttachment::File {
             path: PathBuf::from(".env"),
@@ -1336,12 +1336,14 @@ async fn run_agent_gates_protected_file_attachment_through_approval() {
     assert_eq!(requests[0].reason, "protected_read");
 
     // The denied attachment must not have its body in the outbound body.
-    let bodies = transport.bodies.lock().unwrap();
-    let serialized = bodies[0].to_string();
-    assert!(
-        !serialized.contains("hunter2"),
-        "denied secret leaked into request: {serialized}"
-    );
+    {
+        let bodies = transport.bodies.lock().unwrap();
+        let serialized = bodies[0].to_string();
+        assert!(
+            !serialized.contains("hunter2"),
+            "denied secret leaked into request: {serialized}"
+        );
+    }
 
     // The transcript records a Blocked event so the user understands the
     // attachment was refused.
@@ -1387,7 +1389,7 @@ async fn run_agent_includes_protected_file_attachment_when_approved() {
         &transport,
         &Args::test_default(),
         &cwd,
-        "look".into(),
+        "look",
         None,
         vec![UserAttachment::File {
             path: PathBuf::from(".env"),
@@ -1439,7 +1441,7 @@ async fn run_agent_aborts_turn_when_attachment_approval_aborts() {
         &transport,
         &Args::test_default(),
         &cwd,
-        "look".into(),
+        "look",
         None,
         vec![UserAttachment::File {
             path: PathBuf::from("id_rsa"),
@@ -1456,11 +1458,13 @@ async fn run_agent_aborts_turn_when_attachment_approval_aborts() {
 
     // No body should have been sent — the abort fires before the prompt is
     // emitted as a user message and before the transport is invoked.
-    let bodies = transport.bodies.lock().unwrap();
-    assert!(
-        bodies.is_empty(),
-        "aborted turn must not call the transport: {bodies:#?}"
-    );
+    {
+        let bodies = transport.bodies.lock().unwrap();
+        assert!(
+            bodies.is_empty(),
+            "aborted turn must not call the transport: {bodies:#?}"
+        );
+    }
 
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {

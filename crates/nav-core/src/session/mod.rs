@@ -27,7 +27,7 @@ pub const INIT_SQL: &str = include_str!("init.sql");
 
 /// Current migration version. Bump (and add a new migration) whenever the
 /// schema changes incompatibly.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// `provider` value stored on every session created from `run_agent`. There is
 /// no `ModelProvider` trait yet; that arrives in a later slice.
@@ -89,6 +89,77 @@ pub struct SessionSummary {
     pub turns_total: u64,
     pub turn_count: u64,
     pub cost_currency: String,
+    pub parent_id: Option<String>,
+    pub labels: Vec<String>,
+    pub child_count: u64,
+}
+
+/// One hit from [`SessionStore::search_transcript`]. The snippet is wrapped in
+/// SQLite's FTS5 `snippet()` markers so the CLI/TUI can highlight matches
+/// without re-running the tokenizer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptHit {
+    pub session_id: String,
+    pub seq: i64,
+    pub kind: String,
+    pub snippet: String,
+    pub summary: SessionSummary,
+}
+
+/// One node in the parent → child tree returned by [`SessionStore::walk_tree`].
+/// `depth` is the distance from the root passed in (root itself is depth 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTreeNode {
+    pub summary: SessionSummary,
+    pub depth: u32,
+}
+
+/// Group `summaries` so each child sits immediately after its parent when the
+/// parent is also in the input slice; otherwise treat the row as a root.
+/// Returns `(depth, summary)` pairs with `depth = 0` for roots and orphans —
+/// orphans appear at the end so nothing is silently dropped.
+///
+/// Shared between the CLI's `--list-sessions` formatter and the TUI's
+/// `/sessions` cell so the two surfaces never drift on indentation rules.
+pub fn layout_session_tree(summaries: &[SessionSummary]) -> Vec<(usize, &SessionSummary)> {
+    use std::collections::{HashMap, HashSet};
+    let ids: HashSet<&str> = summaries.iter().map(|s| s.id.as_str()).collect();
+    let mut children_by_parent: HashMap<&str, Vec<&SessionSummary>> = HashMap::new();
+    let mut roots: Vec<&SessionSummary> = Vec::new();
+    for summary in summaries {
+        match summary.parent_id.as_deref() {
+            Some(parent) if ids.contains(parent) => {
+                children_by_parent.entry(parent).or_default().push(summary);
+            }
+            _ => roots.push(summary),
+        }
+    }
+    fn walk<'a>(
+        node: &'a SessionSummary,
+        depth: usize,
+        out: &mut Vec<(usize, &'a SessionSummary)>,
+        children_by_parent: &mut HashMap<&'a str, Vec<&'a SessionSummary>>,
+    ) {
+        out.push((depth, node));
+        if let Some(children) = children_by_parent.remove(node.id.as_str()) {
+            for child in children {
+                walk(child, depth + 1, out, children_by_parent);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(summaries.len());
+    for root in roots {
+        walk(root, 0, &mut out, &mut children_by_parent);
+    }
+    // Anything still in `children_by_parent` is an orphan whose parent isn't
+    // visible (e.g. cwd-filtered out). Append at depth 0, newest first, so
+    // the row count matches the input length.
+    let mut leftover: Vec<&SessionSummary> = children_by_parent.into_values().flatten().collect();
+    leftover.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
+    for summary in leftover {
+        out.push((0, summary));
+    }
+    out
 }
 
 /// Transcript export formats supported by both the TUI `/export` command and
@@ -683,48 +754,330 @@ impl SessionStore {
         // disjunction so the index on `(cwd, updated_at DESC)` is still used
         // when a path is supplied.
         let cwd_str: Option<String> = cwd.map(|p| p.to_string_lossy().into_owned());
-        let mut stmt = conn.prepare(
-            "SELECT id, name, created_at, updated_at, cwd, provider, model,
-                    tokens_input, tokens_output, tokens_input_cached, tokens_reasoning,
-                    cost_micros_reported, turns_with_reported_cost, turns_total, cost_currency,
-                    (
-                        SELECT data FROM event
-                        WHERE event.session_id = session.id AND kind = 'user_message'
-                        ORDER BY seq ASC
-                        LIMIT 1
-                    ) AS first_user_event
-             FROM session
-             WHERE ?1 IS NULL OR cwd = ?1
-             ORDER BY updated_at DESC",
-        )?;
-        let rows = stmt.query_map(params![cwd_str], |row| {
-            let turns_total = row.get::<_, i64>(13)? as u64;
-            Ok(SessionSummary {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                created_at: row.get(2)?,
-                updated_at: row.get(3)?,
-                last_active: row.get(3)?,
-                cwd: row.get(4)?,
-                provider: row.get(5)?,
-                model: row.get(6)?,
-                tokens_input: row.get::<_, i64>(7)? as u64,
-                tokens_output: row.get::<_, i64>(8)? as u64,
-                tokens_input_cached: row.get::<_, i64>(9)? as u64,
-                tokens_reasoning: row.get::<_, i64>(10)? as u64,
-                cost_micros_reported: row.get(11)?,
-                turns_with_reported_cost: row.get::<_, i64>(12)? as u64,
-                turns_total,
-                turn_count: turns_total,
-                cost_currency: row.get(14)?,
-                first_user_prompt: first_user_prompt_from_event_json(row.get(15)?),
-            })
-        })?;
+        let mut stmt = conn.prepare(&summary_query(
+            "WHERE ?1 IS NULL OR cwd = ?1 ORDER BY updated_at DESC",
+        ))?;
+        let rows = stmt.query_map(params![cwd_str], summary_from_row)?;
         let mut summaries = Vec::new();
         for row in rows {
             summaries.push(row?);
         }
+        drop(stmt);
+        attach_labels(&conn, &mut summaries)?;
         Ok(summaries)
+    }
+
+    /// Return the `parent_id` of `session_id` if it exists. `Ok(None)` covers
+    /// both "session has no parent" and "session does not exist" — callers
+    /// walking ancestors don't usually need to distinguish those.
+    pub fn session_parent_id(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.lock();
+        let parent: Option<Option<String>> = conn
+            .query_row(
+                "SELECT parent_id FROM session WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(parent.flatten())
+    }
+
+    /// Fetch a single [`SessionSummary`] by canonical ULID. Returns `None`
+    /// when the session does not exist.
+    pub fn session_summary(&self, session_id: &str) -> Result<Option<SessionSummary>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&summary_query("WHERE id = ?1 LIMIT 1"))?;
+        let mut rows = stmt.query_map(params![session_id], summary_from_row)?;
+        let summary = match rows.next() {
+            Some(row) => Some(row?),
+            None => None,
+        };
+        drop(rows);
+        drop(stmt);
+        let mut summaries: Vec<SessionSummary> = summary.into_iter().collect();
+        attach_labels(&conn, &mut summaries)?;
+        Ok(summaries.into_iter().next())
+    }
+
+    /// Create a new session that copies events `[0..=at_seq]` from `source_id`
+    /// (or every event when `at_seq` is `None`), records `parent_id` +
+    /// `fork_point_seq`, and recomputes token totals from the copied turns.
+    pub fn fork_session(
+        &self,
+        source_id: &str,
+        at_seq: Option<u64>,
+        name: Option<&str>,
+    ) -> Result<SessionId> {
+        let new_id = Ulid::new().to_string();
+        let now = now_secs();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let parent_meta: Option<(String, String, String, Option<String>)> = tx
+            .query_row(
+                "SELECT cwd, provider, model, profile FROM session WHERE id = ?1",
+                params![source_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let (cwd, provider, model, profile) =
+            parent_meta.ok_or_else(|| anyhow::anyhow!("session not found: {source_id}"))?;
+
+        let max_seq: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(seq) FROM event WHERE session_id = ?1",
+                params![source_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+
+        // Resolve the actual fork-point seq from the requested upper bound.
+        // - explicit `at_seq` is clamped to the highest existing seq;
+        // - `None` means "fork at now" → the highest existing seq;
+        // - a parent with no events stays at NULL (root-equivalent fork).
+        let fork_seq: Option<i64> = match (at_seq, max_seq) {
+            (_, None) => None,
+            (None, Some(max)) => Some(max),
+            (Some(req), Some(max)) => Some((req as i64).min(max)),
+        };
+
+        tx.execute(
+            "INSERT INTO session (
+                id, cwd, provider, model, profile, name,
+                created_at, updated_at, parent_id, fork_point_seq
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9)",
+            params![
+                new_id, cwd, provider, model, profile, name, now, source_id, fork_seq
+            ],
+        )?;
+
+        if let Some(end) = fork_seq {
+            tx.execute(
+                "INSERT INTO event (session_id, seq, created_at, kind, data)
+                 SELECT ?1, seq, created_at, kind, data
+                 FROM event
+                 WHERE session_id = ?2 AND seq <= ?3",
+                params![new_id, source_id, end],
+            )?;
+
+            // Recompute the new session's rolling token totals by replaying
+            // each copied turn_complete payload. Selecting the JSON usage
+            // straight out of the event log avoids re-running the agent
+            // loop and stays consistent with append_event's roll-ups.
+            let (sum_in, sum_out, sum_in_cached, sum_reason): (i64, i64, i64, i64) = tx
+                .query_row(
+                    "SELECT
+                         COALESCE(SUM(CAST(json_extract(data, '$.usage.tokens_input') AS INTEGER)), 0),
+                         COALESCE(SUM(CAST(json_extract(data, '$.usage.tokens_output') AS INTEGER)), 0),
+                         COALESCE(SUM(CAST(json_extract(data, '$.usage.tokens_input_cached') AS INTEGER)), 0),
+                         COALESCE(SUM(CAST(json_extract(data, '$.usage.tokens_reasoning') AS INTEGER)), 0)
+                     FROM event
+                     WHERE session_id = ?1 AND kind = 'turn_complete'",
+                    params![new_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+            tx.execute(
+                "UPDATE session
+                 SET tokens_input = ?1,
+                     tokens_output = ?2,
+                     tokens_input_cached = ?3,
+                     tokens_reasoning = ?4
+                 WHERE id = ?5",
+                params![sum_in, sum_out, sum_in_cached, sum_reason, new_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(new_id)
+    }
+
+    /// Direct children of `parent_id`, ordered by creation time ascending.
+    pub fn list_children(&self, parent_id: &str) -> Result<Vec<SessionSummary>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&summary_query(
+            "WHERE parent_id = ?1 ORDER BY created_at ASC",
+        ))?;
+        let rows = stmt.query_map(params![parent_id], summary_from_row)?;
+        let mut summaries: Vec<SessionSummary> = rows.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        attach_labels(&conn, &mut summaries)?;
+        Ok(summaries)
+    }
+
+    /// Flat depth-ordered list of every descendant of `root_id`, including
+    /// the root itself at depth 0. Used by `/tree` and `nav sessions tree`.
+    ///
+    /// One recursive CTE collects `(id, depth)` for the whole subtree, then a
+    /// single join against the summary projection rehydrates each row; one
+    /// batched `attach_labels` populates labels in one more query. That keeps
+    /// the cost flat at three prepared statements regardless of tree size.
+    pub fn walk_tree(&self, root_id: &str) -> Result<Vec<SessionTreeNode>> {
+        let conn = self.lock();
+        let sql = format!(
+            "WITH RECURSIVE tree(id, depth) AS (
+                 SELECT id, 0 FROM session WHERE id = ?1
+                 UNION ALL
+                 SELECT s.id, tree.depth + 1
+                 FROM session AS s
+                 JOIN tree ON s.parent_id = tree.id
+             )
+             SELECT {SESSION_SUMMARY_COLUMNS}, tree.depth AS tree_depth
+             FROM session
+             JOIN tree ON tree.id = session.id
+             ORDER BY tree.depth ASC, session.created_at ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        // The CTE appends `tree_depth` after the 18 summary columns.
+        let rows = stmt.query_map(params![root_id], |row| {
+            let summary = summary_from_row(row)?;
+            let depth: i64 = row.get(18)?;
+            Ok(SessionTreeNode {
+                summary,
+                depth: depth.max(0) as u32,
+            })
+        })?;
+        let mut out: Vec<SessionTreeNode> = rows.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        if out.is_empty() {
+            anyhow::bail!("session not found: {root_id}");
+        }
+        let mut summaries: Vec<SessionSummary> =
+            out.iter().map(|node| node.summary.clone()).collect();
+        attach_labels(&conn, &mut summaries)?;
+        for (node, summary) in out.iter_mut().zip(summaries) {
+            node.summary = summary;
+        }
+        Ok(out)
+    }
+
+    /// Attach `label` to `session_id`. No-ops if the row already exists.
+    pub fn add_label(&self, session_id: &str, label: &str) -> Result<()> {
+        let trimmed = label.trim();
+        anyhow::ensure!(!trimmed.is_empty(), "label cannot be empty");
+        let conn = self.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO label (session_id, label, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![session_id, trimmed, now_secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Detach `label` from `session_id`. Silent when the label was not set.
+    pub fn remove_label(&self, session_id: &str, label: &str) -> Result<()> {
+        let trimmed = label.trim();
+        anyhow::ensure!(!trimmed.is_empty(), "label cannot be empty");
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM label WHERE session_id = ?1 AND label = ?2",
+            params![session_id, trimmed],
+        )?;
+        Ok(())
+    }
+
+    /// All labels currently attached to `session_id`, sorted alphabetically.
+    pub fn labels_for(&self, session_id: &str) -> Result<Vec<String>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT label FROM label WHERE session_id = ?1 ORDER BY label ASC")?;
+        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        let mut labels = Vec::new();
+        for row in rows {
+            labels.push(row?);
+        }
+        Ok(labels)
+    }
+
+    /// All sessions carrying `label`, newest first. Pair with `cwd` to scope
+    /// the listing to one workspace (mirrors `list_sessions`).
+    pub fn list_by_label(&self, label: &str, cwd: Option<&Path>) -> Result<Vec<SessionSummary>> {
+        let conn = self.lock();
+        let cwd_str: Option<String> = cwd.map(|p| p.to_string_lossy().into_owned());
+        let mut stmt = conn.prepare(&summary_query(
+            "WHERE id IN (SELECT session_id FROM label WHERE label = ?1)
+               AND (?2 IS NULL OR cwd = ?2)
+             ORDER BY updated_at DESC",
+        ))?;
+        let rows = stmt.query_map(params![label, cwd_str], summary_from_row)?;
+        let mut summaries: Vec<SessionSummary> = rows.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        attach_labels(&conn, &mut summaries)?;
+        Ok(summaries)
+    }
+
+    /// Run an FTS5 MATCH against the persisted user/assistant transcripts and
+    /// return up to `limit` hits, newest session first. `query` is passed
+    /// straight to FTS5 — callers that need to support arbitrary user input
+    /// (with quotes, OR, etc.) should hand the raw string in unchanged.
+    pub fn search_transcript(
+        &self,
+        query: &str,
+        limit: usize,
+        label: Option<&str>,
+    ) -> Result<Vec<TranscriptHit>> {
+        let trimmed = query.trim();
+        anyhow::ensure!(!trimmed.is_empty(), "search query cannot be empty");
+        let conn = self.lock();
+        let cap = (limit as i64).max(1);
+        let label_opt: Option<&str> = label;
+        // `?2 IS NULL OR session_id IN (...)` folds the unfiltered and
+        // label-filtered queries into one prepared statement; SQLite
+        // short-circuits the disjunction so the label index is still used
+        // when a label is supplied.
+        let mut stmt = conn.prepare(
+            "SELECT session_id, seq, kind,
+                    snippet(event_fts, 3, '[', ']', '…', 16) AS snippet
+             FROM event_fts
+             WHERE event_fts MATCH ?1
+               AND (?2 IS NULL
+                    OR session_id IN (SELECT session_id FROM label WHERE label = ?2))
+             ORDER BY rank, session_id, seq
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![trimmed, label_opt, cap], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let (session_id, seq, kind, snippet) = row?;
+            hits.push((session_id, seq, kind, snippet));
+        }
+        drop(stmt);
+        drop(conn);
+        let mut summary_cache: HashMap<String, SessionSummary> = HashMap::new();
+        let mut out = Vec::with_capacity(hits.len());
+        for (session_id, seq, kind, snippet) in hits {
+            let summary = match summary_cache.get(&session_id) {
+                Some(existing) => existing.clone(),
+                None => {
+                    let Some(loaded) = self.session_summary(&session_id)? else {
+                        continue;
+                    };
+                    summary_cache.insert(session_id.clone(), loaded.clone());
+                    loaded
+                }
+            };
+            out.push(TranscriptHit {
+                session_id,
+                seq,
+                kind,
+                snippet,
+                summary,
+            });
+        }
+        Ok(out)
     }
 
     /// Resolves a full session ULID or unique prefix into the canonical ULID.
@@ -818,6 +1171,68 @@ fn apply_schema(conn: &Connection) -> Result<()> {
         }
         record_schema_version(conn, 2)?;
     }
+    if applied_schema_version(conn)? < 3 {
+        // Idempotent against fresh databases (where init.sql already created
+        // everything) and v2 → v3 upgrades alike: ALTER only when missing,
+        // CREATE … IF NOT EXISTS for indexes, triggers, and the FTS table.
+        if !table_has_column(conn, "session", "parent_id")? {
+            conn.execute_batch(
+                "ALTER TABLE session ADD COLUMN parent_id TEXT REFERENCES session(id)",
+            )?;
+        }
+        if !table_has_column(conn, "session", "fork_point_seq")? {
+            conn.execute_batch("ALTER TABLE session ADD COLUMN fork_point_seq INTEGER")?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_session_parent ON session(parent_id);
+             CREATE TABLE IF NOT EXISTS label (
+                 session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+                 label TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY (session_id, label)
+             );
+             CREATE INDEX IF NOT EXISTS idx_label_name ON label(label);
+             CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(
+                 session_id UNINDEXED,
+                 seq UNINDEXED,
+                 kind UNINDEXED,
+                 text
+             );
+             CREATE TRIGGER IF NOT EXISTS event_fts_ai
+             AFTER INSERT ON event
+             WHEN NEW.kind IN ('user_message', 'assistant_message_done', 'assistant_message_delta')
+             BEGIN
+                 INSERT INTO event_fts (session_id, seq, kind, text)
+                 VALUES (
+                     NEW.session_id,
+                     NEW.seq,
+                     NEW.kind,
+                     COALESCE(json_extract(NEW.data, '$.text'), '')
+                 );
+             END;
+             CREATE TRIGGER IF NOT EXISTS event_fts_ad
+             AFTER DELETE ON event
+             WHEN OLD.kind IN ('user_message', 'assistant_message_done', 'assistant_message_delta')
+             BEGIN
+                 DELETE FROM event_fts
+                 WHERE session_id = OLD.session_id AND seq = OLD.seq;
+             END;",
+        )?;
+        // Backfill the FTS index with any user/assistant events that
+        // existed before the trigger was installed.
+        conn.execute(
+            "INSERT INTO event_fts (session_id, seq, kind, text)
+             SELECT session_id, seq, kind, COALESCE(json_extract(data, '$.text'), '')
+             FROM event
+             WHERE kind IN ('user_message', 'assistant_message_done', 'assistant_message_delta')
+               AND NOT EXISTS (
+                   SELECT 1 FROM event_fts AS f
+                   WHERE f.session_id = event.session_id AND f.seq = event.seq
+               )",
+            [],
+        )?;
+        record_schema_version(conn, 3)?;
+    }
     Ok(())
 }
 
@@ -846,6 +1261,104 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
         }
     }
     Ok(false)
+}
+
+/// Shared column list used by every `SessionSummary` query. The column order
+/// must stay in sync with [`summary_from_row`] (which reads by index).
+/// Every column is qualified with `session.` so the list is safe to embed
+/// inside a JOIN that introduces another table with overlapping column names
+/// (e.g. the `tree(id, depth)` CTE in [`walk_tree`]).
+const SESSION_SUMMARY_COLUMNS: &str =
+    "session.id, session.name, session.created_at, session.updated_at, session.cwd,
+     session.provider, session.model,
+     session.tokens_input, session.tokens_output, session.tokens_input_cached,
+     session.tokens_reasoning,
+     session.cost_micros_reported, session.turns_with_reported_cost, session.turns_total,
+     session.cost_currency,
+     (
+         SELECT data FROM event
+         WHERE event.session_id = session.id AND kind = 'user_message'
+         ORDER BY seq ASC
+         LIMIT 1
+     ) AS first_user_event,
+     session.parent_id,
+     (SELECT COUNT(*) FROM session AS child WHERE child.parent_id = session.id) AS child_count";
+
+/// `SELECT <SESSION_SUMMARY_COLUMNS> FROM session ` (trailing space included
+/// so callers can append `WHERE …` directly).
+fn summary_query(suffix: &str) -> String {
+    let prefix_len = "SELECT  FROM session ".len() + SESSION_SUMMARY_COLUMNS.len();
+    let mut sql = String::with_capacity(prefix_len + suffix.len());
+    sql.push_str("SELECT ");
+    sql.push_str(SESSION_SUMMARY_COLUMNS);
+    sql.push_str(" FROM session ");
+    sql.push_str(suffix);
+    sql
+}
+
+fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
+    let turns_total = row.get::<_, i64>(13)? as u64;
+    Ok(SessionSummary {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+        last_active: row.get(3)?,
+        cwd: row.get(4)?,
+        provider: row.get(5)?,
+        model: row.get(6)?,
+        tokens_input: row.get::<_, i64>(7)? as u64,
+        tokens_output: row.get::<_, i64>(8)? as u64,
+        tokens_input_cached: row.get::<_, i64>(9)? as u64,
+        tokens_reasoning: row.get::<_, i64>(10)? as u64,
+        cost_micros_reported: row.get(11)?,
+        turns_with_reported_cost: row.get::<_, i64>(12)? as u64,
+        turns_total,
+        turn_count: turns_total,
+        cost_currency: row.get(14)?,
+        first_user_prompt: first_user_prompt_from_event_json(row.get(15)?),
+        parent_id: row.get(16)?,
+        labels: Vec::new(),
+        child_count: row.get::<_, i64>(17)? as u64,
+    })
+}
+
+/// Populate [`SessionSummary::labels`] in one batched query rather than firing
+/// `labels_for` per row. Caller owns the conn lock.
+fn attach_labels(conn: &Connection, summaries: &mut [SessionSummary]) -> Result<()> {
+    if summaries.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = summaries.iter().map(|s| s.id.clone()).collect();
+    // SQLite's IN clause does not accept a bound parameter array, so we build
+    // a list of ?N placeholders matching the session count. This stays well
+    // under the default 999-parameter limit for any plausible listing.
+    let placeholders: String = (0..ids.len())
+        .map(|i| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT session_id, label FROM label
+         WHERE session_id IN ({placeholders})
+         ORDER BY label ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params_iter: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params_iter.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut by_id: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (sid, label) = row?;
+        by_id.entry(sid).or_default().push(label);
+    }
+    for summary in summaries.iter_mut() {
+        if let Some(labels) = by_id.remove(&summary.id) {
+            summary.labels = labels;
+        }
+    }
+    Ok(())
 }
 
 fn first_user_prompt_from_event_json(data: Option<String>) -> Option<String> {

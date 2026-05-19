@@ -7,9 +7,10 @@ use nav_core::sandbox::select_for_platform;
 use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
-    SessionBinding, SessionStore, SessionSummary, agent, auth,
-    cli::{Args, CliCommand, CliExportFormat, sandbox_policy_from_args},
-    discover_skills, doctor, load_project_context, models, rebuild_responses_input, shorten_home,
+    SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, agent, auth,
+    cli::{Args, CliCommand, CliExportFormat, SessionsAction, sandbox_policy_from_args},
+    discover_skills, doctor, layout_session_tree, load_project_context, models,
+    rebuild_responses_input, shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -202,6 +203,83 @@ fn run_cli_command(
             out,
         } => export_command(args, &session_id, format, out),
         CliCommand::Doctor { json } => doctor_command(args, cwd, project, json),
+        CliCommand::Sessions { action } => sessions_command(args, action),
+    }
+}
+
+fn sessions_command(args: &Args, action: SessionsAction) -> Result<()> {
+    let store = SessionStore::open(args.db_path.clone())?;
+    match action {
+        SessionsAction::Fork {
+            session_id,
+            at,
+            name,
+        } => {
+            let resolved = store.resolve_session_id(&session_id)?;
+            let new_id = store.fork_session(&resolved, at, name.as_deref())?;
+            println!("forked {resolved} -> {new_id}");
+        }
+        SessionsAction::Tree { session_id } => {
+            let resolved = store.resolve_session_id(&session_id)?;
+            let nodes = store.walk_tree(&resolved)?;
+            print_session_tree(&nodes);
+        }
+        SessionsAction::Label { session_id, label } => {
+            let resolved = store.resolve_session_id(&session_id)?;
+            store.add_label(&resolved, &label)?;
+            println!("labelled {resolved}: {label}");
+        }
+        SessionsAction::Unlabel { session_id, label } => {
+            let resolved = store.resolve_session_id(&session_id)?;
+            store.remove_label(&resolved, &label)?;
+            println!("unlabelled {resolved}: {label}");
+        }
+        SessionsAction::Search {
+            query,
+            limit,
+            label,
+        } => {
+            let hits = store.search_transcript(&query, limit, label.as_deref())?;
+            print_search_hits(&hits);
+        }
+    }
+    Ok(())
+}
+
+fn print_session_tree(nodes: &[SessionTreeNode]) {
+    if nodes.is_empty() {
+        println!("(empty tree)");
+        return;
+    }
+    for node in nodes {
+        let indent = "  ".repeat(node.depth as usize);
+        let summary = &node.summary;
+        let name = summary.name.as_deref().unwrap_or("(unnamed)");
+        let labels = if summary.labels.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", summary.labels.join(","))
+        };
+        let parent_marker = match summary.parent_id.as_deref() {
+            Some(parent) => format!(" (forked from {})", short_id(parent)),
+            None => String::new(),
+        };
+        println!(
+            "{indent}{} {name}  ({} turns){labels}{parent_marker}",
+            summary.id, summary.turn_count
+        );
+    }
+}
+
+fn print_search_hits(hits: &[TranscriptHit]) {
+    if hits.is_empty() {
+        println!("(no matches)");
+        return;
+    }
+    for hit in hits {
+        let name = hit.summary.name.as_deref().unwrap_or("(unnamed)");
+        println!("{}#{} [{}] {name}", hit.session_id, hit.seq, hit.kind);
+        println!("  {}", hit.snippet);
     }
 }
 
@@ -320,21 +398,33 @@ fn list_sessions_command(args: &Args) -> Result<()> {
     let store = SessionStore::open(args.db_path.clone())?;
     let summaries = store.list_sessions(args.cwd.as_deref())?;
     println!(
-        "{:<26}  {:<12}  {:<40}  {:<20}  {:>12}  {:>12}",
+        "{:<28}  {:<12}  {:<40}  {:<20}  {:>12}  {:>12}  labels",
         "id", "updated_at", "cwd", "model", "tokens_total", "cost"
     );
-    for summary in summaries {
+    let rows = layout_session_tree(&summaries);
+    for (indent, summary) in rows {
+        let id_field = format!("{}{}", "  ".repeat(indent), summary.id);
+        let labels = if summary.labels.is_empty() {
+            String::new()
+        } else {
+            summary.labels.join(",")
+        };
         println!(
-            "{:<26}  {:<12}  {:<40}  {:<20}  {:>12}  {:>12}",
-            summary.id,
+            "{:<28}  {:<12}  {:<40}  {:<20}  {:>12}  {:>12}  {}",
+            id_field,
             summary.updated_at,
             truncate(&summary.cwd, 40),
             truncate(&summary.model, 20),
             summary.tokens_input + summary.tokens_output,
-            format_cost(&summary)
+            format_cost(summary),
+            labels,
         );
     }
     Ok(())
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 fn format_cost(summary: &SessionSummary) -> String {
     if summary.turns_with_reported_cost == 0 {

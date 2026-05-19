@@ -41,6 +41,19 @@ pub(crate) enum AppEvent {
     Export {
         path: Option<PathBuf>,
     },
+    ForkSession {
+        at: Option<u64>,
+    },
+    ShowTree,
+    AddLabel {
+        label: String,
+    },
+    RemoveLabel {
+        label: String,
+    },
+    FindTranscript {
+        query: String,
+    },
     SlashError {
         message: String,
     },
@@ -158,6 +171,54 @@ fn parse_builtin_command(text: &str) -> Option<AppEvent> {
     if let Some(rest) = slash_rest(trimmed, "/export") {
         return Some(AppEvent::Export {
             path: (!rest.is_empty()).then(|| PathBuf::from(rest)),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/fork") {
+        let at = if rest.is_empty() {
+            None
+        } else {
+            match rest.parse::<u64>() {
+                Ok(seq) => Some(seq),
+                Err(_) => {
+                    return Some(AppEvent::SlashError {
+                        message: format!("usage: /fork [seq]  (got {rest:?})"),
+                    });
+                }
+            }
+        };
+        return Some(AppEvent::ForkSession { at });
+    }
+    if trimmed == "/tree" {
+        return Some(AppEvent::ShowTree);
+    }
+    if let Some(rest) = slash_rest(trimmed, "/label") {
+        if rest.is_empty() {
+            return Some(AppEvent::SlashError {
+                message: "usage: /label <text>".to_string(),
+            });
+        }
+        return Some(AppEvent::AddLabel {
+            label: rest.to_string(),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/unlabel") {
+        if rest.is_empty() {
+            return Some(AppEvent::SlashError {
+                message: "usage: /unlabel <text>".to_string(),
+            });
+        }
+        return Some(AppEvent::RemoveLabel {
+            label: rest.to_string(),
+        });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/find") {
+        if rest.is_empty() {
+            return Some(AppEvent::SlashError {
+                message: "usage: /find <query>".to_string(),
+            });
+        }
+        return Some(AppEvent::FindTranscript {
+            query: rest.to_string(),
         });
     }
     None
@@ -453,7 +514,7 @@ mod tests {
         );
         assert!(matches!(
             rx.try_recv().unwrap(),
-            AppEvent::Export { path: Some(path) } if path == PathBuf::from("transcript.md")
+            AppEvent::Export { path: Some(path) } if path.as_path() == std::path::Path::new("transcript.md")
         ));
     }
 
