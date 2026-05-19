@@ -3,7 +3,10 @@ use crossterm::event::{self, Event as CtEvent};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use nav_core::{AgentEvent, Catalog, OpenAiTransport, SessionId, SessionStore, cli::Args};
+use nav_core::{
+    AgentEvent, Catalog, OpenAiTransport, ProjectContext, SessionId, SessionStore, cli::Args,
+    shorten_home,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::{self, Stdout};
@@ -15,7 +18,7 @@ use tokio::sync::mpsc;
 use crate::ChatWidget;
 use crate::bottom_pane;
 use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
-use crate::status_bar::{AgentState, StatusBar, git_branch, shorten_home};
+use crate::status_bar::{AgentState, StatusBar};
 use crate::turn::{TurnSpawn, spawn_turn};
 
 /// Restores the terminal to a sane state when `run` returns.
@@ -74,8 +77,6 @@ fn install_panic_teardown_hook() {
     }));
 }
 
-// The TUI entrypoint mirrors the CLI bootstrap dependencies explicitly so the
-// construction boundary stays in main.rs instead of a catch-all config bag.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     transport: Arc<OpenAiTransport>,
@@ -86,6 +87,7 @@ pub async fn run(
     resume_events: Vec<AgentEvent>,
     initial_prompt: Option<String>,
     skills: Arc<Catalog>,
+    project: Arc<ProjectContext>,
 ) -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend)?;
@@ -94,10 +96,25 @@ pub async fn run(
     install_panic_teardown_hook();
 
     let slash_entries = bottom_pane::build_slash_entries(skills.as_ref());
+    // Walk the workspace once at startup so the `@file` popup has something to
+    // fuzzy-match against. A re-scan affordance can come later; an idle TUI
+    // doesn't need a filesystem watcher to earn its keep.
+    let mention_entries = bottom_pane::build_mention_entries(&cwd);
+
+    let branch_summary = project.branch_summary();
+    let context_summary = project.context_summary();
+    let settings_summary = project.settings_summary(&cwd);
 
     let mut chat = ChatWidget::new();
     if resume_events.is_empty() {
-        chat.push_welcome(&args.model, cwd.display().to_string(), &session_id);
+        chat.push_welcome(
+            &args.model,
+            cwd.display().to_string(),
+            &session_id,
+            branch_summary.clone(),
+            context_summary.clone(),
+            settings_summary.clone(),
+        );
     }
     // Rehydrate the visible scrollback at startup. Each submitted turn below
     // rebuilds model-facing history fresh from the session store because
@@ -105,7 +122,8 @@ pub async fn run(
     for ev in resume_events {
         chat.ingest(ev);
     }
-    let mut pane = bottom_pane::BottomPane::with_slash_entries(slash_entries);
+    let mut pane =
+        bottom_pane::BottomPane::with_entries(slash_entries, mention_entries, cwd.clone());
     let mut ctrl_c_count = 0u8;
     // A standalone `/<skill>` is a local TUI gesture, not a model turn. Hold
     // its wrapped body here and prepend it onto the next non-slash prompt.
@@ -113,12 +131,18 @@ pub async fn run(
     let mut turn_started_at: Option<Instant> = None;
     let mut spinner_tick: u64 = 0;
     let cwd_short = shorten_home(&cwd);
-    let branch = git_branch(&cwd);
+    let branch = project.workspace.branch.clone();
+    let dirty = project.workspace.dirty;
     let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppEvent>();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentEvent>();
 
     if let Some(prompt) = initial_prompt {
-        app_tx.send(AppEvent::Submit(prompt)).ok();
+        app_tx
+            .send(AppEvent::Submit {
+                text: prompt,
+                images: Vec::new(),
+            })
+            .ok();
     }
 
     loop {
@@ -155,6 +179,7 @@ pub async fn run(
                     model: &args.model,
                     cwd_short: &cwd_short,
                     branch: branch.as_deref(),
+                    dirty,
                     state,
                 },
                 chunks[2],
@@ -176,7 +201,14 @@ pub async fn run(
                     AppEvent::Quit => break,
                     AppEvent::Clear => {
                         chat = ChatWidget::new();
-                        chat.push_welcome(&args.model, cwd.display().to_string(), &session_id);
+                        chat.push_welcome(
+                            &args.model,
+                            cwd.display().to_string(),
+                            &session_id,
+                            branch_summary.clone(),
+                            context_summary.clone(),
+                            settings_summary.clone(),
+                        );
                         pending_skill = None;
                     }
                     AppEvent::QueueSkill { skill_name, wrapped_body } => {
@@ -187,7 +219,10 @@ pub async fn run(
                         chat.push_user(format!("/{skill_name}"));
                         chat.push_skill(skill_name, "queued for the next prompt");
                     }
-                    AppEvent::Submit(raw_prompt) => {
+                    AppEvent::Submit {
+                        text: raw_prompt,
+                        images,
+                    } => {
                         // Refuse a second prompt while a turn is still in flight.
                         // The Responses API gives no clean way to interleave two
                         // running turns on the same session, and we don't want to
@@ -204,6 +239,10 @@ pub async fn run(
                             pending_skill.as_ref().map(|(name, _)| name.clone());
                         let pending_skill_body =
                             pending_skill.as_ref().map(|(_, body)| body.as_str());
+                        let attachments = images
+                            .into_iter()
+                            .map(|path| nav_core::UserAttachment::Image { path })
+                            .collect();
                         let spawned = spawn_turn(TurnSpawn {
                             transport: Arc::clone(&transport),
                             args: args.clone(),
@@ -212,8 +251,10 @@ pub async fn run(
                             session_id: session_id.clone(),
                             raw_prompt: raw_prompt.clone(),
                             pending_skill: pending_skill_body,
+                            attachments,
                             agent_tx: agent_tx.clone(),
                             skills: Arc::clone(&skills),
+                            project: Arc::clone(&project),
                         });
                         if let Err(err) = spawned {
                             chat.scroll_to_bottom();
@@ -240,25 +281,34 @@ pub async fn run(
                 // typist never lags a redraw behind their keystrokes.
                 spinner_tick = spinner_tick.wrapping_add(1);
                 while event::poll(Duration::from_millis(0))? {
-                    if let CtEvent::Key(key) = event::read()? {
-                        if is_ctrl_c(&key) {
-                            ctrl_c_count += 1;
-                            if ctrl_c_count >= 2 {
-                                app_tx.send(AppEvent::Quit).ok();
+                    match event::read()? {
+                        CtEvent::Key(key) => {
+                            if is_ctrl_c(&key) {
+                                ctrl_c_count += 1;
+                                if ctrl_c_count >= 2 {
+                                    app_tx.send(AppEvent::Quit).ok();
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        ctrl_c_count = 0;
-                        if handle_scrollback_key(&mut chat, &key, history_viewport) {
-                            continue;
-                        }
-                        match pane.handle_key(key) {
-                            bottom_pane::ComposerEvent::Submit(text) => {
-                                dispatch_submit(text, skills.as_ref(), &app_tx);
+                            ctrl_c_count = 0;
+                            if handle_scrollback_key(&mut chat, &key, history_viewport) {
+                                continue;
                             }
-                            bottom_pane::ComposerEvent::Nothing
-                            | bottom_pane::ComposerEvent::Cancelled => {}
+                            match pane.handle_key(key) {
+                                bottom_pane::ComposerEvent::Submit { text, images } => {
+                                    dispatch_submit(text, images, skills.as_ref(), &app_tx);
+                                }
+                                bottom_pane::ComposerEvent::Nothing
+                                | bottom_pane::ComposerEvent::Cancelled => {}
+                            }
                         }
+                        CtEvent::Paste(text) => {
+                            // Bracketed paste was enabled at TUI entry
+                            // (see write_tui_enter_sequences); without this
+                            // arm the payload would be silently dropped.
+                            pane.on_paste(&text);
+                        }
+                        _ => {}
                     }
                 }
             }

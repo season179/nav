@@ -1,5 +1,9 @@
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum, parser::ValueSource};
+use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+use crate::project::Settings;
 
 // clap turns this struct into the CLI. Keeping options small makes the
 // educational path clear: model choice, auth choice, loop limit, and prompt.
@@ -62,7 +66,72 @@ pub struct Args {
     pub prompt: Vec<String>,
 }
 
+/// Set of argument IDs whose value came from an explicit user-supplied flag
+/// rather than clap's default. [`Args::apply_settings`] uses it to skip
+/// fields the user already provided on the command line, so the precedence
+/// chain is: explicit CLI > project settings > user settings > clap default.
+#[derive(Debug, Clone, Default)]
+pub struct ProvidedArgs(HashSet<String>);
+
+impl ProvidedArgs {
+    fn was_provided(&self, name: &str) -> bool {
+        self.0.contains(name)
+    }
+}
+
 impl Args {
+    /// Like [`Args::parse`] but also returns the set of argument IDs the user
+    /// supplied explicitly. Pair with [`Args::apply_settings`] to merge a
+    /// `.nav/settings.json` without clobbering flags the user actually typed.
+    pub fn parse_with_sources() -> (Self, ProvidedArgs) {
+        let matches = Args::command().get_matches();
+        Self::from_matches_with_sources(matches)
+            .expect("clap matches must round-trip through FromArgMatches")
+    }
+
+    fn from_matches_with_sources(
+        matches: clap::ArgMatches,
+    ) -> Result<(Self, ProvidedArgs), clap::Error> {
+        let mut provided: HashSet<String> = HashSet::new();
+        for id in matches.ids() {
+            if matches.value_source(id.as_str()) == Some(ValueSource::CommandLine) {
+                provided.insert(id.as_str().to_string());
+            }
+        }
+        let args = Args::from_arg_matches(&matches)?;
+        Ok((args, ProvidedArgs(provided)))
+    }
+
+    /// Fills in `Args` fields that clap defaulted from `settings`. Any field
+    /// the user passed on the CLI (tracked via `provided`) is left untouched.
+    pub fn apply_settings(&mut self, settings: &Settings, provided: &ProvidedArgs) {
+        if let Some(model) = settings.model.as_deref()
+            && !provided.was_provided("model")
+        {
+            self.model = model.to_string();
+        }
+        if let Some(auth) = settings.auth
+            && !provided.was_provided("auth")
+        {
+            self.auth = auth;
+        }
+        if let Some(transport) = settings.transport
+            && !provided.was_provided("transport")
+        {
+            self.transport = transport;
+        }
+        if let Some(max_turns) = settings.max_turns
+            && !provided.was_provided("max_turns")
+        {
+            self.max_turns = max_turns;
+        }
+        if let Some(secs) = settings.bash_timeout_secs
+            && !provided.was_provided("bash_timeout_secs")
+        {
+            self.bash_timeout_secs = secs;
+        }
+    }
+
     /// Shared constructor for unit tests across modules.
     #[cfg(test)]
     pub fn test_default() -> Self {
@@ -86,13 +155,15 @@ impl Args {
     }
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, ValueEnum, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum AuthMode {
     Chatgpt,
     ApiKey,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, ValueEnum, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum Transport {
     Websocket,
     Sse,
@@ -161,5 +232,49 @@ mod tests {
     fn rejects_unknown_flags() {
         let result = Args::try_parse_from(["nav", "--bogus", "hi"]);
         assert!(result.is_err());
+    }
+
+    fn matches(argv: &[&str]) -> (Args, ProvidedArgs) {
+        let m = Args::command().try_get_matches_from(argv).unwrap();
+        Args::from_matches_with_sources(m).unwrap()
+    }
+
+    #[test]
+    fn settings_fill_in_defaulted_args() {
+        let (mut args, provided) = matches(&["nav", "hello"]);
+        let settings = Settings {
+            model: Some("custom-model".into()),
+            max_turns: Some(20),
+            ..Settings::default()
+        };
+        args.apply_settings(&settings, &provided);
+        assert_eq!(args.model, "custom-model");
+        assert_eq!(args.max_turns, 20);
+        // Untouched fields stay at clap defaults.
+        assert_eq!(args.bash_timeout_secs, 20);
+    }
+
+    #[test]
+    fn explicit_cli_flag_beats_settings() {
+        let (mut args, provided) = matches(&["nav", "--model", "from-cli", "hi"]);
+        let settings = Settings {
+            model: Some("from-settings".into()),
+            ..Settings::default()
+        };
+        args.apply_settings(&settings, &provided);
+        assert_eq!(args.model, "from-cli");
+    }
+
+    #[test]
+    fn enum_settings_apply_when_not_provided() {
+        let (mut args, provided) = matches(&["nav", "hi"]);
+        let settings = Settings {
+            transport: Some(Transport::Sse),
+            auth: Some(AuthMode::ApiKey),
+            ..Settings::default()
+        };
+        args.apply_settings(&settings, &provided);
+        assert!(matches!(args.transport, Transport::Sse));
+        assert!(matches!(args.auth, AuthMode::ApiKey));
     }
 }

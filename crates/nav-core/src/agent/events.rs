@@ -1,5 +1,20 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// A non-text input attached to a [`AgentEvent::UserMessage`]. Stored by path
+/// (workspace-relative) — the bytes are loaded by the transport at request
+/// time, so the session log doesn't bloat with base64. Resume rebuilds the
+/// same input shape from the stored paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UserAttachment {
+    /// Pasted clipboard image or a recognized image-file paste. Path is
+    /// always workspace-relative — the TUI relativizes / copies external
+    /// paths into `<cwd>/.nav/clipboard/` before raising the event.
+    Image { path: PathBuf },
+}
 
 /// Normalized usage counters emitted at the end of each model turn.
 ///
@@ -28,6 +43,10 @@ pub enum AgentEvent {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_text: Option<String>,
+        /// Non-text inputs (currently just clipboard / pasted images).
+        /// `default` keeps old session-log rows readable after upgrade.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<UserAttachment>,
     },
     AssistantMessageDelta {
         text: String,

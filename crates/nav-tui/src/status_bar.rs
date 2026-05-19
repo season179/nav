@@ -8,13 +8,15 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use std::path::Path;
 use std::time::Duration;
 
 pub struct StatusBar<'a> {
     pub model: &'a str,
     pub cwd_short: &'a str,
     pub branch: Option<&'a str>,
+    /// Append a yellow `✱` after the branch span when the worktree has
+    /// uncommitted changes. False when not in a repo.
+    pub dirty: bool,
     pub state: AgentState,
 }
 
@@ -45,6 +47,12 @@ impl<'a> Widget for StatusBar<'a> {
                 branch.to_string(),
                 Style::default().fg(Color::Green),
             ));
+            if self.dirty {
+                spans.push(Span::styled(
+                    " ✱".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
         }
         spans.push(sep);
         match self.state {
@@ -68,32 +76,4 @@ impl<'a> Widget for StatusBar<'a> {
         }
         Paragraph::new(Line::from(spans)).render(area, buf);
     }
-}
-
-/// Read the current git branch by parsing `.git/HEAD` directly — fast,
-/// dependency-free, and works the same whether `cwd` is the repo root or a
-/// subdirectory (we walk up). Returns `None` when not in a repo.
-pub fn git_branch(cwd: &Path) -> Option<String> {
-    let mut dir = cwd;
-    loop {
-        let head = dir.join(".git").join("HEAD");
-        if let Ok(contents) = std::fs::read_to_string(&head) {
-            if let Some(rest) = contents.strip_prefix("ref: refs/heads/") {
-                return Some(rest.trim().to_string());
-            }
-            return contents.trim().get(..7).map(str::to_string);
-        }
-        dir = dir.parent()?;
-    }
-}
-
-/// Replace the user's home directory prefix with `~` so the status bar stays
-/// readable in deep nested paths.
-pub fn shorten_home(path: &Path) -> String {
-    if let Some(home) = dirs::home_dir()
-        && let Ok(rel) = path.strip_prefix(&home)
-    {
-        return format!("~/{}", rel.display());
-    }
-    path.display().to_string()
 }

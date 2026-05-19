@@ -48,6 +48,20 @@ them from a `nav` task.
 - Skill discovery is scoped to **launch cwd only** — no upward walk to
   ancestors. Project skills (`.agents/skills/`) shadow user skills
   (`~/.agents/skills/`) by parsed `name`; the shadow is logged with both paths.
+- **Project context (`AGENTS.md`, `CLAUDE.md`) follows the same rule.**
+  Discovery is cwd-only at `<launch_cwd>/{AGENTS.md,CLAUDE.md}` plus a
+  user-scope fallback at `~/.agents/{AGENTS.md,CLAUDE.md}`. Files are deduped
+  by canonical path (so a `CLAUDE.md → AGENTS.md` symlink loads once) and
+  prepended to the Responses API `instructions` field in user-then-project
+  order. Set `disable_context_files: true` in `.nav/settings.json` to skip
+  this entirely.
+- **Project settings live at `<launch_cwd>/.nav/settings.json` and
+  `~/.nav/settings.json`.** Same scoping: no upward walk. Project overrides
+  user; explicit CLI flags beat both. Schema is the subset of CLI flags that
+  make sense as defaults: `model`, `auth`, `transport`, `max_turns`,
+  `bash_timeout_secs`, `disable_context_files`. Unknown keys reject the file
+  with an eprintln; malformed JSON falls back to defaults (startup never
+  blocks on broken settings).
 - **Writes are workspace-only.** `edit_file` rejects absolute paths, `..`, and
   symlink escapes. Reads under any catalog `skill_dir` are allowed but writes
   are not — that asymmetry is intentional, not a bug to fix.

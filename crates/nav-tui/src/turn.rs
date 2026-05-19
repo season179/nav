@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use nav_core::{
-    AgentEvent, Catalog, OpenAiTransport, SessionBinding, SessionId, SessionStore, cli::Args,
-    rebuild_responses_input, run_agent,
+    AgentEvent, Catalog, OpenAiTransport, ProjectContext, SessionBinding, SessionId, SessionStore,
+    UserAttachment, cli::Args, rebuild_responses_input, run_agent,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,8 +17,10 @@ pub(crate) struct TurnSpawn<'a> {
     pub session_id: SessionId,
     pub raw_prompt: String,
     pub pending_skill: Option<&'a str>,
+    pub attachments: Vec<UserAttachment>,
     pub agent_tx: mpsc::UnboundedSender<AgentEvent>,
     pub skills: Arc<Catalog>,
+    pub project: Arc<ProjectContext>,
 }
 
 pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
@@ -26,7 +28,14 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
         .store
         .load_session(&request.session_id)
         .context("failed to load session history")?;
-    let history_input = Some(rebuild_responses_input(&history_events));
+    // Replay resolves stored image attachment paths against the session's
+    // original cwd, not the resumed process's, so a resume from a different
+    // directory still reattaches images saved during the original session.
+    let session_cwd = request
+        .store
+        .session_cwd(&request.session_id)
+        .unwrap_or_else(|_| request.cwd.clone());
+    let history_input = Some(rebuild_responses_input(&history_events, &session_cwd));
     // Scrollback shows the typed text; the wrapped SKILL.md goes only to the
     // model-facing payload.
     let display_prompt = request.raw_prompt.clone();
@@ -40,8 +49,10 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
         cwd,
         store,
         session_id,
+        attachments,
         agent_tx,
         skills,
+        project,
         ..
     } = request;
 
@@ -56,10 +67,12 @@ pub(crate) fn spawn_turn(request: TurnSpawn<'_>) -> Result<()> {
             &cwd,
             &prompt,
             Some(&display_prompt),
+            attachments,
             agent_tx.clone(),
             Some(&binding),
             history_input,
             skills.as_ref(),
+            Some(project.as_ref()),
         )
         .await;
     });

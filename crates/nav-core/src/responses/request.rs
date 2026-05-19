@@ -1,4 +1,5 @@
 use crate::cli::Args;
+use crate::project::ProjectContext;
 use crate::skills::Catalog;
 use crate::tools::tool_definitions;
 use serde_json::{Value, json};
@@ -9,12 +10,18 @@ use std::path::Path;
 ///
 /// Exposed at crate level so the agent loop and tests can share it with the
 /// transport implementations without duplicating the schema.
-pub(crate) fn response_body(args: &Args, cwd: &Path, input: &[Value], skills: &Catalog) -> Value {
+pub(crate) fn response_body(
+    args: &Args,
+    cwd: &Path,
+    input: &[Value],
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+) -> Value {
     // tools are just JSON descriptions. The model decides whether to emit
     // a function_call item; Rust remains responsible for actually doing work.
     json!({
         "model": args.model,
-        "instructions": build_instructions(cwd, skills),
+        "instructions": build_instructions(cwd, skills, context),
         "input": input,
         // store=false keeps the demo honest: nav manages the transcript itself,
         // and no server-side stored conversation is needed for the agent loop.
@@ -26,7 +33,7 @@ pub(crate) fn response_body(args: &Args, cwd: &Path, input: &[Value], skills: &C
     })
 }
 
-fn build_instructions(cwd: &Path, skills: &Catalog) -> String {
+fn build_instructions(cwd: &Path, skills: &Catalog, context: Option<&ProjectContext>) -> String {
     let mut out = format!(
         "You are a small coding agent running in {}. Use tools to inspect, edit, search, and verify code. Prefer small, explicit steps. Paths must be relative.",
         cwd.display()
@@ -52,6 +59,25 @@ fn build_instructions(cwd: &Path, skills: &Catalog) -> String {
              relative resources mentioned in a SKILL.md against that skill's \
              skill_dir.",
         );
+    }
+    if let Some(context) = context
+        && !context.context_files.is_empty()
+    {
+        out.push_str(
+            "\n\nProject context follows. Treat each block as authoritative \
+             guidance for this workspace.\n",
+        );
+        // user-scope first, project last — project gets the strongest recency
+        // anchor at the end of the instructions.
+        for file in &context.context_files {
+            let _ = write!(
+                out,
+                "\n--- BEGIN {name} ({scope}) ---\n{body}\n--- END {name} ({scope}) ---\n",
+                name = file.display_name,
+                scope = file.scope.as_str(),
+                body = file.bytes.trim_end_matches('\n'),
+            );
+        }
     }
     out
 }
