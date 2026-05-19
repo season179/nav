@@ -105,6 +105,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passthrough_kills_child_when_future_is_aborted() {
+        let temp = tempfile::tempdir().unwrap();
+        let done = temp.path().join("done");
+        let req = SandboxRequest {
+            command: format!("sleep 1; touch {}", done.display()),
+            cwd: temp.path().to_path_buf(),
+            timeout: Duration::from_secs(10),
+            policy: SandboxPolicy::DangerFullAccess,
+        };
+
+        let handle = tokio::spawn(async move { PassthroughRunner.run(req).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.abort();
+        let result = handle.await;
+        assert!(result.is_err(), "aborted task should not complete normally");
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !done.exists(),
+            "aborted shell child should not continue and create marker"
+        );
+    }
+
+    #[tokio::test]
     async fn passthrough_runs_in_cwd() {
         let temp = tempfile::tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();

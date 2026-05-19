@@ -224,11 +224,21 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             AgentEvent::TurnComplete { .. } => {
                 in_turn = false;
             }
+            AgentEvent::TurnAborted { turn_id, reason } => {
+                start_turn(&mut out, &mut turn, &mut in_turn);
+                push_section(&mut out, "Turn aborted", &format!("{turn_id}: {reason}"));
+                in_turn = false;
+            }
             AgentEvent::AssistantMessageDelta { .. }
             | AgentEvent::ProviderRetry { .. }
             | AgentEvent::ContextTrimmed { .. }
             | AgentEvent::ToolCallApprovalRequest { .. }
             | AgentEvent::ToolCallBlocked { .. }
+            | AgentEvent::PendingInputQueued { .. }
+            | AgentEvent::PendingInputEdited { .. }
+            | AgentEvent::PendingInputRemoved { .. }
+            | AgentEvent::PendingInputCleared { .. }
+            | AgentEvent::PendingInputDequeued { .. }
             | AgentEvent::FileChange { .. }
             | AgentEvent::TurnDiff { .. }
             | AgentEvent::CompactionStarted { .. }

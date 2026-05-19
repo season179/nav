@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
 use nav_core::ReviewDecision;
+use nav_core::{AgentEvent, PendingInputMode};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -75,6 +76,14 @@ pub struct BottomPane {
     /// Captured session id from the picker, waiting to be drained by the app
     /// loop and routed through the same `/resume <id>` path.
     last_session_selection: Option<String>,
+    pending_inputs: Vec<PendingPreview>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingPreview {
+    id: String,
+    mode: PendingInputMode,
+    text: String,
 }
 
 impl BottomPane {
@@ -114,6 +123,53 @@ impl BottomPane {
             pending_approvals: VecDeque::new(),
             last_decision: None,
             last_session_selection: None,
+            pending_inputs: Vec::new(),
+        }
+    }
+
+    pub fn apply_agent_event(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::PendingInputQueued {
+                id,
+                mode,
+                text,
+                display_text,
+                ..
+            } => {
+                self.pending_inputs.push(PendingPreview {
+                    id: id.clone(),
+                    mode: *mode,
+                    text: display_text.clone().unwrap_or_else(|| text.clone()),
+                });
+            }
+            AgentEvent::PendingInputEdited {
+                id,
+                text,
+                display_text,
+                ..
+            } => {
+                if let Some(pending) = self.pending_inputs.iter_mut().find(|item| item.id == *id) {
+                    pending.text = display_text.clone().unwrap_or_else(|| text.clone());
+                }
+            }
+            AgentEvent::PendingInputRemoved { id } => {
+                self.pending_inputs.retain(|item| item.id != *id);
+            }
+            AgentEvent::PendingInputCleared { ids } => {
+                if ids.is_empty() {
+                    self.pending_inputs.clear();
+                } else {
+                    self.pending_inputs.retain(|item| !ids.contains(&item.id));
+                }
+            }
+            AgentEvent::PendingInputDequeued { id, .. } => {
+                self.pending_inputs.retain(|item| item.id != *id);
+            }
+            AgentEvent::TurnAborted { .. } => {
+                self.pending_inputs
+                    .retain(|item| item.mode != PendingInputMode::Steering);
+            }
+            _ => {}
         }
     }
 
@@ -287,7 +343,9 @@ impl BottomPane {
             .as_ref()
             .map(|v| v.desired_height(width))
             .unwrap_or(0);
-        composer_h.saturating_add(overlay_h)
+        composer_h
+            .saturating_add(overlay_h)
+            .saturating_add(self.pending_preview_height())
     }
 
     /// Absolute screen position of the composer caret, given the rect the
@@ -301,8 +359,15 @@ impl BottomPane {
             .as_ref()
             .map(|v| v.desired_height(pane_area.width))
             .unwrap_or(0);
-        let composer_y = pane_area.y.saturating_add(overlay_h);
-        let composer_h = pane_area.height.saturating_sub(overlay_h);
+        let queue_h = self.pending_preview_height();
+        let composer_y = pane_area
+            .y
+            .saturating_add(overlay_h)
+            .saturating_add(queue_h);
+        let composer_h = pane_area
+            .height
+            .saturating_sub(overlay_h)
+            .saturating_sub(queue_h);
         if composer_h <= 1 {
             return None;
         }
@@ -384,6 +449,14 @@ impl BottomPane {
             self.view = Some(BottomPaneView::FileMention(popup));
         } else {
             self.view = None;
+        }
+    }
+
+    fn pending_preview_height(&self) -> u16 {
+        if self.pending_inputs.is_empty() {
+            0
+        } else {
+            1 + self.pending_inputs.len().min(4) as u16
         }
     }
 }
@@ -503,13 +576,22 @@ impl Widget for &BottomPane {
             .as_ref()
             .map(|v| v.desired_height(area.width))
             .unwrap_or(0);
-        let [overlay_rect, composer_outer] =
-            Layout::vertical([Constraint::Length(overlay_h), Constraint::Min(1)]).areas(area);
+        let queue_h = self.pending_preview_height();
+        let [overlay_rect, queue_rect, composer_outer] = Layout::vertical([
+            Constraint::Length(overlay_h),
+            Constraint::Length(queue_h),
+            Constraint::Min(1),
+        ])
+        .areas(area);
 
         if let Some(view) = self.view.as_ref()
             && overlay_rect.height > 0
         {
             view.render(overlay_rect, buf);
+        }
+
+        if queue_rect.height > 0 {
+            render_pending_preview(&self.pending_inputs, queue_rect, buf);
         }
 
         if composer_outer.height > 0 {
@@ -547,6 +629,46 @@ impl Widget for &BottomPane {
             self.composer.render(content, buf);
         }
     }
+}
+
+fn render_pending_preview(items: &[PendingPreview], area: Rect, buf: &mut Buffer) {
+    let bg = Style::default().bg(COMPOSER_BG);
+    Block::default().style(bg).render(area, buf);
+    let dim = bg.fg(Color::DarkGray);
+    let accent = bg.fg(Color::Blue).add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  pending", accent),
+        Span::styled(
+            "  edit: /queue-edit <id> ...  remove: /queue-remove <id>  clear: /queue-clear",
+            dim,
+        ),
+    ])];
+    for item in items.iter().take(4) {
+        lines.push(Line::from(vec![
+            Span::styled("  • ", dim),
+            Span::styled(item.id.clone(), accent),
+            Span::styled(format!(" {}  ", pending_mode_label(item.mode)), dim),
+            Span::styled(truncate_preview(&item.text), bg.fg(Color::White)),
+        ]));
+    }
+    Paragraph::new(lines).style(bg).render(area, buf);
+}
+
+fn pending_mode_label(mode: PendingInputMode) -> &'static str {
+    match mode {
+        PendingInputMode::FollowUp => "follow-up",
+        PendingInputMode::Steering => "steering",
+    }
+}
+
+fn truncate_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    if text.chars().count() <= MAX_CHARS {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(MAX_CHARS).collect::<String>();
+    out.push('…');
+    out
 }
 
 #[cfg(test)]

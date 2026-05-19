@@ -14,6 +14,7 @@ use super::compaction::{
 use super::events::CompactionTrigger;
 use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::cli::Args;
+use crate::control::{PendingInput, PendingInputMode, TurnControls};
 use crate::git_diff;
 use crate::mutation::PatchApplyStatus;
 use crate::project::ProjectContext;
@@ -182,6 +183,43 @@ pub async fn run_agent(
     context: Option<&ProjectContext>,
     permissions: PermissionContext,
 ) -> Result<()> {
+    run_agent_with_control(
+        transport,
+        args,
+        cwd,
+        prompt,
+        display_prompt,
+        attachments,
+        events,
+        session,
+        initial_input,
+        skills,
+        context,
+        permissions,
+        TurnControls::default(),
+    )
+    .await
+}
+
+/// Variant of [`run_agent`] used by interactive frontends that can steer or
+/// abort an active turn. The plain CLI path calls [`run_agent`] above with no
+/// control channels.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_with_control(
+    transport: &dyn ResponsesTransport,
+    args: &Args,
+    cwd: &Path,
+    prompt: &str,
+    display_prompt: Option<&str>,
+    attachments: Vec<UserAttachment>,
+    events: UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    initial_input: Option<Vec<Value>>,
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+    permissions: PermissionContext,
+    mut controls: TurnControls,
+) -> Result<()> {
     let mut input = initial_input.unwrap_or_default();
 
     // Manual `/compact`: do not steer the compaction turn with the user's
@@ -333,6 +371,18 @@ pub async fn run_agent(
             Err(err) => return fail(&events, session, err),
         };
 
+        let steering = drain_steering(&mut controls, &events, session);
+        if !steering.is_empty() {
+            for item in steering {
+                input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": build_user_content(&item.text, &item.attachments, cwd),
+                }));
+            }
+            continue 'turns;
+        }
+
         if calls.is_empty() {
             if let Err(err) = finalize_turn(&events, session, cwd, false, &args.model, &usage) {
                 return fail(&events, session, err);
@@ -454,16 +504,15 @@ pub async fn run_agent(
             // exit the loop instead of feeding more tool calls or asking
             // the model for another turn.
             if aborted {
-                if let Err(err) = finalize_turn(
+                if turn_had_mutation {
+                    emit_turn_diff(&events, session, cwd);
+                }
+                emit_turn_aborted(
                     &events,
                     session,
-                    cwd,
-                    turn_had_mutation,
-                    &args.model,
-                    &usage,
-                ) {
-                    return fail(&events, session, err);
-                }
+                    controls.turn_id.as_deref(),
+                    "approval abort",
+                );
                 return Ok(());
             }
         }
@@ -480,6 +529,58 @@ pub async fn run_agent(
         }
         turns_used += 1;
     }
+}
+
+fn drain_steering(
+    controls: &mut TurnControls,
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+) -> Vec<PendingInput> {
+    let Some(queue) = controls.steering.as_ref() else {
+        return Vec::new();
+    };
+    let drained: Vec<_> = queue
+        .lock()
+        .unwrap()
+        .drain(..)
+        .filter(|item| item.mode == PendingInputMode::Steering)
+        .collect();
+    for item in &drained {
+        emit(
+            events,
+            session,
+            AgentEvent::PendingInputDequeued {
+                id: item.id.clone(),
+                mode: item.mode,
+            },
+        );
+        emit(
+            events,
+            session,
+            user_message_event(
+                &item.text,
+                item.display_text.as_deref(),
+                item.attachments.clone(),
+            ),
+        );
+    }
+    drained
+}
+
+fn emit_turn_aborted(
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    turn_id: Option<&str>,
+    reason: impl Into<String>,
+) {
+    emit(
+        events,
+        session,
+        AgentEvent::TurnAborted {
+            turn_id: turn_id.unwrap_or("turn").to_string(),
+            reason: reason.into(),
+        },
+    );
 }
 
 /// Upper bound on overflow-trim retries inside a single compaction turn.
@@ -584,19 +685,7 @@ fn finalize_turn(
     usage: &TurnUsage,
 ) -> Result<()> {
     if turn_had_mutation {
-        match git_diff::working_tree_diff(cwd) {
-            Ok(Some(diff)) => emit(
-                events,
-                session,
-                AgentEvent::TurnDiff {
-                    files: diff.files,
-                    unified_diff: diff.unified_diff,
-                    truncated: diff.truncated,
-                },
-            ),
-            Ok(None) => {}
-            Err(err) => eprintln!("nav-core: failed to collect working tree diff: {err:#}"),
-        }
+        emit_turn_diff(events, session, cwd);
     }
     emit(
         events,
@@ -611,6 +700,26 @@ fn finalize_turn(
             .complete_turn(&binding.session_id, model, usage, None)?;
     }
     Ok(())
+}
+
+fn emit_turn_diff(
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    cwd: &Path,
+) {
+    match git_diff::working_tree_diff(cwd) {
+        Ok(Some(diff)) => emit(
+            events,
+            session,
+            AgentEvent::TurnDiff {
+                files: diff.files,
+                unified_diff: diff.unified_diff,
+                truncated: diff.truncated,
+            },
+        ),
+        Ok(None) => {}
+        Err(err) => eprintln!("nav-core: failed to collect working tree diff: {err:#}"),
+    }
 }
 
 /// Routes an `AgentEvent` to the live `events` channel and, if a session is

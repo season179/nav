@@ -11,7 +11,9 @@ pub use compaction::{
 };
 pub use events::{AgentEvent, CompactionTrigger, TurnUsage, UserAttachment};
 pub use replay::rebuild_responses_input;
-pub use runner::{EventStream, ResponsesTransport, SessionBinding, run_agent};
+pub use runner::{
+    EventStream, ResponsesTransport, SessionBinding, run_agent, run_agent_with_control,
+};
 
 #[cfg(test)]
 use runner::{drop_oldest_tool_pair, emit_stream_events, extract_message_text};

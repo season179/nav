@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use crate::cells::{
     AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell, FileChangeCell,
-    SessionListCell, SessionNoticeCell, SkillInvocationCell, ToolCallCell, ToolCallContext,
-    ToolOutputCell, TurnDiffCell, UserMessageCell, WelcomeCell,
+    PendingInputCell, SessionListCell, SessionNoticeCell, SkillInvocationCell, ToolCallCell,
+    ToolCallContext, ToolOutputCell, TurnAbortedCell, TurnDiffCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 
@@ -156,6 +156,48 @@ impl ChatWidget {
                 self.cells.push(Box::new(ErrorCell::new(format!(
                     "tool {tool} blocked ({rule}): {reason}"
                 ))));
+            }
+            AgentEvent::PendingInputQueued {
+                id,
+                mode,
+                text,
+                display_text,
+                skill_name,
+                ..
+            } => {
+                self.cells.push(Box::new(PendingInputCell::queued(
+                    id,
+                    mode,
+                    display_text.unwrap_or(text),
+                    skill_name,
+                )));
+            }
+            AgentEvent::PendingInputEdited {
+                id,
+                text,
+                display_text,
+                skill_name,
+                ..
+            } => {
+                self.cells.push(Box::new(PendingInputCell::edited(
+                    id,
+                    display_text.unwrap_or(text),
+                    skill_name,
+                )));
+            }
+            AgentEvent::PendingInputRemoved { id } => {
+                self.cells.push(Box::new(PendingInputCell::removed(id)));
+            }
+            AgentEvent::PendingInputCleared { ids } => {
+                self.cells.push(Box::new(PendingInputCell::cleared(ids)));
+            }
+            AgentEvent::PendingInputDequeued { id, mode } => {
+                self.cells
+                    .push(Box::new(PendingInputCell::dequeued(id, mode)));
+            }
+            AgentEvent::TurnAborted { turn_id, reason } => {
+                self.cells
+                    .push(Box::new(TurnAbortedCell::new(turn_id, reason)));
             }
             AgentEvent::CompactionStarted {
                 trigger,

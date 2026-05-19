@@ -1,6 +1,6 @@
 use nav_core::{
     AgentEvent, FileChangeKind, FileChangeSummary, FileDiffSummary, PatchApplyStatus,
-    SessionSummary, TurnUsage,
+    PendingInputMode, SessionSummary, TurnUsage,
 };
 use nav_tui::ChatWidget;
 use ratatui::Terminal;
@@ -229,6 +229,54 @@ fn turn_diff_event_renders_modified_file_summary() {
     assert!(rendered.contains("modified note.txt (+1 -1)"), "{rendered}");
     assert!(rendered.contains("-old"), "{rendered}");
     assert!(rendered.contains("+new"), "{rendered}");
+}
+
+#[test]
+fn pending_queue_and_abort_events_render_as_control_rows() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::PendingInputQueued {
+        id: "pending-1".to_string(),
+        mode: PendingInputMode::FollowUp,
+        text: "run tests next".to_string(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill_name: Some("tdd".to_string()),
+    });
+    widget.ingest(AgentEvent::PendingInputEdited {
+        id: "pending-1".to_string(),
+        text: "run focused tests next".to_string(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill_name: Some("tdd".to_string()),
+    });
+    widget.ingest(AgentEvent::PendingInputDequeued {
+        id: "pending-1".to_string(),
+        mode: PendingInputMode::FollowUp,
+    });
+    widget.ingest(AgentEvent::TurnAborted {
+        turn_id: "turn-1".to_string(),
+        reason: "user interrupt".to_string(),
+    });
+
+    let rendered = render_widget(&widget, 100, 16);
+
+    assert!(
+        rendered.contains("◆ queued  pending-1 follow-up"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("run tests next"), "{rendered}");
+    assert!(rendered.contains("tdd skill"), "{rendered}");
+    assert!(rendered.contains("◆ edited  pending-1"), "{rendered}");
+    assert!(rendered.contains("run focused tests next"), "{rendered}");
+    assert!(
+        rendered.contains("◆ dequeued  pending-1 follow-up"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("◆ aborted  turn-1 user interrupt"),
+        "{rendered}"
+    );
 }
 
 #[test]

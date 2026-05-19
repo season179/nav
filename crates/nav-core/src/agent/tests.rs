@@ -1,6 +1,11 @@
 use super::*;
 use crate::cli::Args;
+use crate::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::permissions::approval::{ApprovalGate, ApprovalRequest};
+use crate::permissions::{AskForApproval, ReviewDecision, SandboxPolicy, SessionAllowlist};
+use crate::sandbox::PassthroughRunner;
 use crate::skills::Catalog;
+use crate::tools::PermissionContext;
 use anyhow::Result;
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -9,7 +14,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command as StdCommand;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
@@ -137,6 +142,27 @@ impl ResponsesTransport for FailingTransport {
         _events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = Result<EventStream>> + Send + 'a>> {
         Box::pin(async { Err(anyhow::anyhow!("network down")) })
+    }
+}
+
+struct AbortGate;
+
+impl ApprovalGate for AbortGate {
+    fn request<'a>(
+        &'a self,
+        _req: ApprovalRequest,
+    ) -> Pin<Box<dyn Future<Output = ReviewDecision> + Send + 'a>> {
+        Box::pin(async { ReviewDecision::Abort })
+    }
+}
+
+fn aborting_permission_context() -> PermissionContext {
+    PermissionContext {
+        gate: Arc::new(AbortGate),
+        policy: AskForApproval::OnRequest,
+        sandbox_policy: SandboxPolicy::DangerFullAccess,
+        sandbox: Arc::new(PassthroughRunner),
+        session_allowlist: SessionAllowlist::default(),
     }
 }
 
@@ -297,6 +323,42 @@ fn rebuild_responses_input_skips_tool_events() {
         &input[1],
         "Cargo.toml is a Rust manifest."
     ));
+}
+
+#[test]
+fn rebuild_responses_input_skips_aborted_turn_partial_answer() {
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "previous".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "previous answer".into(),
+            },
+            AgentEvent::TurnComplete {
+                usage: TurnUsage::default(),
+            },
+            AgentEvent::UserMessage {
+                text: "do the wrong thing".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "partial answer that should not resume as complete".into(),
+            },
+            AgentEvent::TurnAborted {
+                turn_id: "turn-2".into(),
+                reason: "user interrupt".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
+
+    assert_eq!(input.len(), 2, "{input:#?}");
+    assert!(is_input_user_message(&input[0], "previous"));
+    assert!(is_input_assistant_message(&input[1], "previous answer"));
 }
 
 #[test]
@@ -706,6 +768,146 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         events.last().unwrap(),
         AgentEvent::TurnComplete { .. }
     ));
+}
+
+#[tokio::test]
+async fn run_agent_injects_steering_before_dispatching_stale_tool_calls() {
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo stale\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let turn_two = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Steered."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one, turn_two]);
+    let steering = PendingInput {
+        id: "pending-1".into(),
+        mode: PendingInputMode::Steering,
+        text: "do not run the stale shell command".into(),
+        display_text: None,
+        attachments: Vec::new(),
+        skill: None,
+    };
+
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent_with_control(
+        &transport,
+        &args,
+        &cwd,
+        "start",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+        TurnControls::with_steering_items([steering]),
+    )
+    .await
+    .expect("run_agent");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::PendingInputDequeued { id, mode } if id == "pending-1" && *mode == PendingInputMode::Steering)),
+        "expected steering dequeue event: {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolCallStarted { .. })),
+        "stale tool call should not dispatch after steering: {events:#?}"
+    );
+
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 2, "{bodies:#?}");
+    let second_input = bodies[1].get("input").and_then(Value::as_array).unwrap();
+    assert!(
+        second_input
+            .iter()
+            .any(|item| is_input_user_message(item, "do not run the stale shell command")),
+        "steering not injected into second model request: {second_input:#?}"
+    );
+}
+
+#[tokio::test]
+async fn run_agent_records_abort_from_approval_as_aborted_turn() {
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"rm -rf build\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one]);
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "clean build output",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        aborting_permission_context(),
+    )
+    .await
+    .expect("approval abort exits cleanly");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(
+        events.iter().any(|event| matches!(event, AgentEvent::TurnAborted { reason, .. } if reason.contains("approval"))),
+        "expected TurnAborted from approval abort: {events:#?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnComplete { .. })),
+        "aborted turn must not complete normally: {events:#?}"
+    );
 }
 
 #[tokio::test]

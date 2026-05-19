@@ -90,6 +90,16 @@ impl PendingApprovals {
             let _ = tx.send(ReviewDecision::Abort);
         }
     }
+
+    /// Resolve currently pending approvals with `Abort` without closing the
+    /// channel. Used by an interactive frontend aborting one active turn while
+    /// keeping the session alive for future turns and approvals.
+    pub fn abort_pending(&self) {
+        let mut guard = self.inner.lock().expect("poisoned");
+        for (_, tx) in guard.map.drain() {
+            let _ = tx.send(ReviewDecision::Abort);
+        }
+    }
 }
 
 /// Sink for the durable side-effects normally done by `run_agent`'s
@@ -358,6 +368,33 @@ mod tests {
         pending.abort_all();
 
         assert_eq!(waiter.await.unwrap(), ReviewDecision::Abort);
+    }
+
+    #[tokio::test]
+    async fn abort_pending_does_not_close_future_requests() {
+        let pending = PendingApprovals::default();
+        let (tx, mut rx) = unbounded_channel();
+        let gate = Arc::new(ChannelGate::new(pending.clone(), tx));
+
+        let gate2 = gate.clone();
+        let waiter = tokio::spawn(async move { gate2.request(req("c1")).await });
+        let first_event = rx.recv().await.expect("first request emitted");
+        assert!(matches!(
+            first_event,
+            AgentEvent::ToolCallApprovalRequest { .. }
+        ));
+        pending.abort_pending();
+        assert_eq!(waiter.await.unwrap(), ReviewDecision::Abort);
+
+        let gate3 = gate.clone();
+        let second = tokio::spawn(async move { gate3.request(req("c2")).await });
+        let event = rx.recv().await.expect("second request emitted");
+        let approval_id = match event {
+            AgentEvent::ToolCallApprovalRequest { approval_id, .. } => approval_id,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        pending.respond(&approval_id, ReviewDecision::Approved);
+        assert_eq!(second.await.unwrap(), ReviewDecision::Approved);
     }
 
     #[tokio::test]

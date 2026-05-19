@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod auth;
 pub mod cli;
+pub mod control;
 pub mod git_diff;
 pub mod mutation;
 pub mod permissions;
@@ -13,7 +14,11 @@ pub mod tools;
 
 pub use agent::{
     AgentEvent, CompactionTrigger, EventStream, ResponsesTransport, SessionBinding, TurnUsage,
-    UserAttachment, rebuild_responses_input, run_agent,
+    UserAttachment, rebuild_responses_input, run_agent, run_agent_with_control,
+};
+pub use control::{
+    ControlPlane, PendingInput, PendingInputDraft, PendingInputMode, PendingSkill,
+    PendingSteeringQueue, TurnControls,
 };
 pub use mutation::{
     FileChangeKind, FileChangeSummary, FileDiffSummary, MutationResult, PatchApplyStatus, TurnDiff,

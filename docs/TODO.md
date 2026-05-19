@@ -6,16 +6,20 @@ Minimum bar: nav should feel safe, resumable, and controllable for ordinary
 repo work before adding speculative features. The current daily-driver blockers
 are the unchecked items at the top; shipped foundation stays here as evidence.
 
-1. [ ] Add real interactive control: abort the current turn/tool, queue
+1. [x] Add real interactive control: abort the current turn/tool, queue
    steering and follow-up messages while the agent is busy, and surface a
    visible/editable pending queue.
-   - Partial: slash labels render in `nav-tui/src/bottom_pane/slash_popup.rs`
-     and a Ctrl+C handler exists, but prompts submitted during an active turn
-     still return "agent is busy" in `nav-tui/src/app.rs`; Ctrl+C only counts
-     toward quitting; no turn-abort, running-tool abort, steering, or
-     follow-up queue is implemented.
-   - Reference shape: Codex has an input queue / interrupt path; Pi supports
-     streaming steering, queued follow-ups, and abort keybindings.
+   - Done in worktree branch `codex/main-worktree-20260519`: `ControlPlane`
+     serializes active turns and pending inputs; active TUI submissions become
+     queued follow-ups or `/steer` messages; `/abort` and Ctrl+C abort the
+     active turn and pending approvals; `/queue-edit`, `/queue-remove`, and
+     `/queue-clear` update the visible pending queue. The runner drains
+     steering at the next safe model/tool boundary and skips stale tool calls
+     when steering is injected. Durable `AgentEvent` variants record queued,
+     edited, removed, cleared, dequeued, and aborted control actions.
+   - Verified with `cargo fmt --check` and
+     `cargo test -p nav-core -p nav-tui` (458 nav-core tests, 69 nav-tui unit
+     tests, 9 composer tests, 18 snapshot tests, plus doc-tests).
 2. [ ] Stream assistant output live in the TUI.
    - Partial: `AssistantMessageDelta` events exist and streaming message cells
      exist, but `nav-tui/src/widget.rs` explicitly ignores deltas and only
