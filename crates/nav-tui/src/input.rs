@@ -41,6 +41,9 @@ pub(crate) enum AppEvent {
     Export {
         path: Option<PathBuf>,
     },
+    ShowContext {
+        include_all: bool,
+    },
     ForkSession {
         at: Option<u64>,
     },
@@ -179,6 +182,15 @@ fn parse_builtin_command(text: &str) -> Option<AppEvent> {
         return Some(AppEvent::Export {
             path: (!rest.is_empty()).then(|| PathBuf::from(rest)),
         });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/context") {
+        return match rest {
+            "" => Some(AppEvent::ShowContext { include_all: false }),
+            "all" => Some(AppEvent::ShowContext { include_all: true }),
+            _ => Some(AppEvent::SlashError {
+                message: "usage: /context [all]".to_string(),
+            }),
+        };
     }
     if let Some(rest) = slash_rest(trimmed, "/fork") {
         let at = if rest.is_empty() {
@@ -690,5 +702,17 @@ mod tests {
 
         dispatch_submit("/abort".to_string(), Vec::new(), &catalog, &tx);
         assert!(matches!(rx.try_recv().unwrap(), AppEvent::AbortTurn));
+
+        dispatch_submit("/context".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::ShowContext { include_all: false }
+        ));
+
+        dispatch_submit("/context all".to_string(), Vec::new(), &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::ShowContext { include_all: true }
+        ));
     }
 }

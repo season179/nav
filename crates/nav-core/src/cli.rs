@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(args.model, "gpt-5.5");
         assert!(matches!(args.auth, AuthMode::Chatgpt));
         assert!(matches!(args.transport, Transport::Websocket));
-        assert_eq!(args.max_turns, 8);
+        assert_eq!(args.max_turns, 10000);
         assert_eq!(args.bash_timeout_secs, 20);
         assert_eq!(args.prompt, vec!["hello"]);
         assert!(args.codex_home.is_none());

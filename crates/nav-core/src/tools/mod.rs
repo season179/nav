@@ -24,7 +24,7 @@ const BASH_HEAD_LINES: usize = 200;
 
 pub use preflight::{PermissionContext, PreflightOutcome};
 
-pub(super) fn tool_definitions() -> Vec<Value> {
+pub(crate) fn tool_definitions() -> Vec<Value> {
     // These primitives mirror the workshop article, with `apply_patch` as the
     // reviewable multi-file editing path learned from sibling agent projects.
     // Together they let the model inspect code, find code, change code, and
