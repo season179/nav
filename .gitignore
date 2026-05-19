@@ -39,3 +39,6 @@ out/
 # from a sub-directory and writes `<launch_cwd>/.nav/clipboard/` —
 # without it git anchors the rule to repo root only.
 **/.nav/clipboard/
+
+# Claude Code agent worktrees
+.claude/worktrees/
