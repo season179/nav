@@ -26,12 +26,26 @@ are the unchecked items at the top; shipped foundation stays here as evidence.
    - Partial: SQLite session store at `$XDG_DATA_HOME/nav/nav.db`,
      `--resume <ULID>`, and `--list-sessions` exist. No TUI resume picker,
      session naming command, or transcript export.
-4. [ ] Add long-session compaction: manual `/compact`, automatic threshold
+4. [x] Add long-session compaction: manual `/compact`, automatic threshold
    compaction, persisted summaries, and clear replay behavior after compaction.
-   - Partial: context-window overflow recovery can drop the oldest tool pair
-     and retry, but there is no user-visible compaction flow. Resume replay is
-     text-only and intentionally skips old tool-call events in
-     `nav-core/src/agent/replay.rs`.
+   - Done: first-class compaction path in `nav-core/src/agent/compaction.rs`
+     (Codex-style "context checkpoint handoff" prompt + replacement-history
+     builder). New durable `AgentEvent::Compaction{Started,Completed,Failed}`
+     variants persist through SQLite. `run_agent` detects `/compact`, runs a
+     non-steerable compaction turn, and replaces model-visible history with
+     `summary + recent user messages`. Replay slices from the latest
+     compaction checkpoint in `rebuild_responses_input` so a resumed session
+     never silently expands back to the full pre-compaction transcript.
+     `/compact` is a built-in TUI slash command; second prompts submitted
+     during compaction queue and fire on completion. Automatic compaction
+     fires before submitting a new turn when rolling session tokens cross
+     `auto_compact_fraction × auto_compact_token_limit` (CLI flags + project
+     settings). Existing overflow trim is kept as fallback inside both the
+     normal turn loop and the compaction turn itself.
+   - Outstanding (deferred): mid-turn auto-compaction during long tool loops
+     (PRD user story 18) is not implemented in this slice; the pre-turn
+     auto-compaction covers user story 17. Provider adapter cleanup
+     (PRD note 69) stays in the provider-adapters track.
 5. [ ] Improve install, auth, and diagnostics UX: add `nav doctor`, clearer
    login/auth/model errors, and reliable update/reinstall checks.
    - Partial: contextual auth errors in `nav-core/src/auth.rs` and

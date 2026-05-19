@@ -235,8 +235,7 @@ impl BottomPane {
                             }
                             BottomPaneView::Approval(o) => {
                                 if let Some(decision) = o.take_decision() {
-                                    self.last_decision =
-                                        Some((o.approval_id.clone(), decision));
+                                    self.last_decision = Some((o.approval_id.clone(), decision));
                                 }
                             }
                         }

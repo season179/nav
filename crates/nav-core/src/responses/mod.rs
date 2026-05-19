@@ -19,7 +19,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 pub(crate) use collector::ResponseCollector;
 pub use parser::{ToolCall, into_raw_output, process_response};
-pub(crate) use parser::{function_calls_from, turn_usage_from};
+pub(crate) use parser::{assistant_text, function_calls_from, turn_usage_from};
 pub(crate) use request::response_body;
 pub use retry::RetryPolicy;
 
@@ -169,10 +169,10 @@ impl ResponsesTransport for OpenAiTransport {
     ) -> Pin<
         Box<
             dyn Future<
-                Output = Result<
-                    Pin<Box<dyn Stream<Item = Result<Value, ResponsesError>> + Send>>,
-                >,
-            > + Send
+                    Output = Result<
+                        Pin<Box<dyn Stream<Item = Result<Value, ResponsesError>> + Send>>,
+                    >,
+                > + Send
                 + 'a,
         >,
     > {
@@ -188,14 +188,15 @@ impl ResponsesTransport for OpenAiTransport {
             // would duplicate text already emitted to the user / session log.
             // The body is cloned per attempt because connect_* consumes it.
             let max_attempts = policy.max_attempts;
-            let on_retry = |attempt: u32, delay: std::time::Duration, err: &retry::TransportError| {
-                let _ = events.send(AgentEvent::ProviderRetry {
-                    attempt,
-                    max_attempts,
-                    delay_ms: delay.as_millis() as u64,
-                    reason: err.to_string(),
-                });
-            };
+            let on_retry =
+                |attempt: u32, delay: std::time::Duration, err: &retry::TransportError| {
+                    let _ = events.send(AgentEvent::ProviderRetry {
+                        attempt,
+                        max_attempts,
+                        delay_ms: delay.as_millis() as u64,
+                        reason: err.to_string(),
+                    });
+                };
 
             match transport {
                 Transport::Websocket => {

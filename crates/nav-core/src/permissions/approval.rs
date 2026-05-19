@@ -75,13 +75,7 @@ impl PendingApprovals {
     /// Resolve a pending approval. Unknown ids are silently dropped — they
     /// might belong to a session that already aborted.
     pub fn respond(&self, approval_id: &str, decision: ReviewDecision) {
-        if let Some(tx) = self
-            .inner
-            .lock()
-            .expect("poisoned")
-            .map
-            .remove(approval_id)
-        {
+        if let Some(tx) = self.inner.lock().expect("poisoned").map.remove(approval_id) {
             let _ = tx.send(decision);
         }
     }

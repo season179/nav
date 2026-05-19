@@ -25,10 +25,7 @@ pub(super) type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Build the WebSocket request, connect, and send the initial
 /// `response.create` envelope. Failures map to `TransportError` so the retry
 /// wrapper can decide whether to re-try (HTTP/network/timeout) or surface.
-pub(super) async fn connect_ws(
-    auth: &AuthConfig,
-    body: Value,
-) -> Result<WsStream, TransportError> {
+pub(super) async fn connect_ws(auth: &AuthConfig, body: Value) -> Result<WsStream, TransportError> {
     let mut body = body;
     body["type"] = json!("response.create");
 
@@ -40,9 +37,10 @@ pub(super) async fn connect_ws(
     let bearer = WsHeaderValue::from_str(&format!("Bearer {}", auth.bearer))
         .map_err(|err| TransportError::Other(err.into()))?;
     request.headers_mut().insert(WS_AUTHORIZATION, bearer);
-    request
-        .headers_mut()
-        .insert(WS_CONTENT_TYPE, WsHeaderValue::from_static("application/json"));
+    request.headers_mut().insert(
+        WS_CONTENT_TYPE,
+        WsHeaderValue::from_static("application/json"),
+    );
 
     let (mut socket, _) = match connect_async(request).await {
         Ok(pair) => pair,

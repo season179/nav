@@ -16,8 +16,7 @@ use crate::permissions::classifier::{CommandClass, classify_with_pipeline};
 use crate::permissions::dangerous;
 use crate::permissions::external::find_external_cd;
 use crate::permissions::protected::{
-    PROTECTED_METADATA_NAMES, glob_could_match, is_protected_metadata_write,
-    is_protected_read,
+    PROTECTED_METADATA_NAMES, glob_could_match, is_protected_metadata_write, is_protected_read,
 };
 use crate::permissions::{
     ApprovalReason, AskForApproval, BlockRule, SandboxPolicy, SessionAllowlist,
@@ -145,7 +144,9 @@ fn evaluate_bash(input: &Value, workspace: &Path, policy: AskForApproval) -> Pre
     // approval policy and sandbox mode (which `--dangerously-bypass-...`
     // and `--sandbox danger-full-access` would otherwise circumvent).
     if let Some(p) = pipeline.as_ref()
-        && let Some(argv) = p.iter().find(|a| dangerous::argv_writes_protected_metadata(a))
+        && let Some(argv) = p
+            .iter()
+            .find(|a| dangerous::argv_writes_protected_metadata(a))
     {
         let label = argv.join(" ");
         return PreflightOutcome::Block {
@@ -348,9 +349,8 @@ fn arg_references_protected_segment(arg: &str) -> bool {
             let abs = start + rel;
             let end = abs + name.len();
             let left_ok = abs == 0 || is_path_boundary_byte(bytes[abs - 1]);
-            let right_ok = end == bytes.len()
-                || bytes[end] == b'/'
-                || is_path_boundary_byte(bytes[end]);
+            let right_ok =
+                end == bytes.len() || bytes[end] == b'/' || is_path_boundary_byte(bytes[end]);
             if left_ok && right_ok {
                 return true;
             }
@@ -359,9 +359,7 @@ fn arg_references_protected_segment(arg: &str) -> bool {
     }
     // Glob-fuzzy scan: split into path-segment-shaped candidates and ask
     // whether any could expand to a protected name.
-    for segment in arg.split(|c: char| {
-        c.is_ascii() && is_path_boundary_byte(c as u8)
-    }) {
+    for segment in arg.split(|c: char| c.is_ascii() && is_path_boundary_byte(c as u8)) {
         if segment.is_empty() {
             continue;
         }

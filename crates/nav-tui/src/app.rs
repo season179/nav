@@ -132,6 +132,11 @@ pub async fn run(
     // A standalone `/<skill>` is a local TUI gesture, not a model turn. Hold
     // its wrapped body here and prepend it onto the next non-slash prompt.
     let mut pending_skill: Option<(String, String)> = None;
+    // Buffered prompts submitted while a turn is in flight. Lets the user
+    // keep typing during a manual compaction (or any other long turn)
+    // without losing input.
+    let mut queued_submissions: std::collections::VecDeque<(String, Vec<PathBuf>)> =
+        std::collections::VecDeque::new();
     let mut turn_started_at: Option<Instant> = None;
     let mut spinner_tick: u64 = 0;
     let cwd_short = shorten_home(&cwd);
@@ -224,8 +229,18 @@ pub async fn run(
 
         tokio::select! {
             Some(ev) = agent_rx.recv() => {
-                if matches!(ev, AgentEvent::TurnComplete { .. } | AgentEvent::Error { .. }) {
+                if turn_is_terminal(&ev) {
                     turn_started_at = None;
+                    // Drain one queued prompt now that the agent is free.
+                    // We hand it back through the AppEvent loop so it goes
+                    // through the same Submit path (skill-classify, spawn,
+                    // display) the user would have hit if they'd typed it
+                    // a moment later.
+                    if let Some((text, images)) = queued_submissions.pop_front() {
+                        app_tx
+                            .send(AppEvent::Submit { text, images })
+                            .ok();
+                    }
                 }
                 if matches!(ev, AgentEvent::UserMessage { .. }) {
                     continue;
@@ -267,6 +282,11 @@ pub async fn run(
                             settings_summary.clone(),
                         );
                         pending_skill = None;
+                        // Drop any prompts that were buffered against the
+                        // pre-clear transcript — surfacing them now would
+                        // look like input the user re-typed into the fresh
+                        // chat.
+                        queued_submissions.clear();
                     }
                     AppEvent::QueueSkill { skill_name, wrapped_body } => {
                         // Replace any previously queued skill; selecting a new
@@ -280,15 +300,13 @@ pub async fn run(
                         text: raw_prompt,
                         images,
                     } => {
-                        // Refuse a second prompt while a turn is still in flight.
-                        // The Responses API gives no clean way to interleave two
-                        // running turns on the same session, and we don't want to
-                        // race the spinner / token rollups with two in-flight runs.
+                        // Turn already in flight: queue the new submission
+                        // and surface it as a pending line so the user can
+                        // see it landed.
                         if turn_started_at.is_some() {
                             chat.scroll_to_bottom();
-                            chat.ingest(AgentEvent::Error {
-                                message: "agent is busy; wait for the current turn to finish".into(),
-                            });
+                            chat.push_user(format!("(queued) {raw_prompt}"));
+                            queued_submissions.push_back((raw_prompt, images));
                             continue;
                         }
 
@@ -395,9 +413,86 @@ fn spinner_frame(tick: u64) -> char {
     FRAMES[(tick as usize) % FRAMES.len()]
 }
 
+/// Returns true when `ev` marks the end of an in-flight TUI turn so the
+/// composer can be re-enabled and one queued prompt drained.
+///
+/// Manual `/compact` exits `run_agent` after `CompactionCompleted` /
+/// `CompactionFailed` without an accompanying `TurnComplete`, so without
+/// these arms the TUI would never clear `turn_started_at` and queued
+/// prompts would pile up indefinitely. Auto-compaction is deliberately
+/// excluded — it is followed by the real user turn inside the same
+/// `run_agent` call, and that turn emits its own `TurnComplete`.
+fn turn_is_terminal(ev: &AgentEvent) -> bool {
+    matches!(
+        ev,
+        AgentEvent::TurnComplete { .. }
+            | AgentEvent::Error { .. }
+            | AgentEvent::CompactionCompleted {
+                trigger: nav_core::CompactionTrigger::Manual,
+                ..
+            }
+            | AgentEvent::CompactionFailed {
+                trigger: nav_core::CompactionTrigger::Manual,
+                ..
+            }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use nav_core::CompactionTrigger;
+
+    #[test]
+    fn turn_is_terminal_for_turn_complete_and_error() {
+        assert!(turn_is_terminal(&AgentEvent::TurnComplete {
+            usage: nav_core::TurnUsage::default()
+        }));
+        assert!(turn_is_terminal(&AgentEvent::Error {
+            message: "x".into()
+        }));
+    }
+
+    #[test]
+    fn turn_is_terminal_for_manual_compaction_lifecycle() {
+        // Manual /compact exits run_agent without a TurnComplete, so the
+        // TUI must also accept its lifecycle events as turn-terminal —
+        // otherwise turn_started_at never clears and queued prompts
+        // pile up forever.
+        assert!(turn_is_terminal(&AgentEvent::CompactionCompleted {
+            trigger: CompactionTrigger::Manual,
+            summary: "s".into(),
+            replaced_events: 0,
+            tokens_before: 0,
+        }));
+        assert!(turn_is_terminal(&AgentEvent::CompactionFailed {
+            trigger: CompactionTrigger::Manual,
+            message: "x".into(),
+        }));
+    }
+
+    #[test]
+    fn turn_is_terminal_excludes_auto_compaction_lifecycle() {
+        // Auto compaction is followed by the real user turn inside the
+        // same run_agent call; that turn emits TurnComplete and drains
+        // the queue. If auto-compaction events were terminal we would
+        // double-drain.
+        assert!(!turn_is_terminal(&AgentEvent::CompactionStarted {
+            trigger: CompactionTrigger::Auto,
+            tokens_before: 0,
+        }));
+        assert!(!turn_is_terminal(&AgentEvent::CompactionCompleted {
+            trigger: CompactionTrigger::Auto,
+            summary: "s".into(),
+            replaced_events: 0,
+            tokens_before: 0,
+        }));
+        assert!(!turn_is_terminal(&AgentEvent::CompactionFailed {
+            trigger: CompactionTrigger::Auto,
+            message: "x".into(),
+        }));
+    }
 
     #[test]
     fn tui_enter_sequences_do_not_enable_mouse_capture() {

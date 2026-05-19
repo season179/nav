@@ -11,8 +11,15 @@ use super::composer::Composer;
 use super::view::InputResult;
 
 /// Built-in slash commands the TUI always offers.
-pub const BUILTIN_SLASH_COMMANDS: &[&str] =
-    &["/help", "/clear", "/quit", "/exit", "/resume", "/sessions"];
+pub const BUILTIN_SLASH_COMMANDS: &[&str] = &[
+    "/help",
+    "/clear",
+    "/quit",
+    "/exit",
+    "/resume",
+    "/sessions",
+    "/compact",
+];
 
 /// One row in the slash popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
