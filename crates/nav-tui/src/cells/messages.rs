@@ -1,23 +1,33 @@
+use ratatui::style::Color;
 use ratatui::text::Line;
 
 use crate::history::HistoryCell;
 use crate::streaming::StreamController;
+use crate::theme::Theme;
 
 use super::row::{TranscriptRow, TranscriptRowKind, body_width_for_label, finish_row_lines};
 
 pub struct UserMessageCell {
     text: String,
+    surface: Color,
 }
 
 impl UserMessageCell {
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self::with_surface(text, Theme::default().composer_bg)
+    }
+
+    pub(crate) fn with_surface(text: impl Into<String>, surface: Color) -> Self {
+        Self {
+            text: text.into(),
+            surface,
+        }
     }
 }
 
 impl HistoryCell for UserMessageCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        TranscriptRow::new(TranscriptRowKind::UserMessage, self.text.as_str()).render(width)
+        TranscriptRow::user_message(self.text.as_str(), self.surface).render(width)
     }
 }
 

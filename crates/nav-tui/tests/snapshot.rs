@@ -62,7 +62,7 @@ fn wrapped_skill_prompt_renders_as_skill_then_user_request() {
 
     assert!(rendered.contains("◆ skill  zoom-out"), "{rendered}");
     assert!(
-        rendered.contains("› user  Inspect the TUI modules."),
+        rendered.contains("› Inspect the TUI modules."),
         "{rendered}"
     );
     assert!(!rendered.contains("<skill"), "{rendered}");
@@ -83,7 +83,7 @@ fn wrapped_skill_prompt_uses_outer_closing_tag() {
 
     assert!(rendered.contains("◆ skill  zoom-out"), "{rendered}");
     assert!(
-        rendered.contains("› user  Inspect the TUI modules."),
+        rendered.contains("› Inspect the TUI modules."),
         "{rendered}"
     );
     assert!(!rendered.contains("Do not render"), "{rendered}");
@@ -103,7 +103,7 @@ fn literal_skill_xml_without_nav_dir_attribute_stays_user_text() {
 
     assert!(!rendered.contains("◆ skill"), "{rendered}");
     assert!(
-        rendered.contains("› user  <skill name=\"literal\">"),
+        rendered.contains("› <skill name=\"literal\">"),
         "{rendered}"
     );
 }

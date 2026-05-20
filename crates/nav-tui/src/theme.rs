@@ -1,5 +1,8 @@
 use ratatui::style::Color;
 
+pub(crate) const DEFAULT_COMPOSER_BG: Color = Color::Rgb(38, 38, 48);
+const DEFAULT_POPUP_BG: Color = Color::Rgb(30, 30, 36);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     /// Filled background colour for the composer block. Slightly lighter than a
@@ -49,8 +52,8 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            composer_bg: Color::Rgb(38, 38, 48),
-            popup_bg: Color::Rgb(30, 30, 36),
+            composer_bg: DEFAULT_COMPOSER_BG,
+            popup_bg: DEFAULT_POPUP_BG,
         }
     }
 }

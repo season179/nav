@@ -3,7 +3,12 @@ use std::borrow::Cow;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::theme::DEFAULT_COMPOSER_BG;
+
 use super::wrapping::render_body;
+
+const BODY_INDENT: &str = "  ";
+const BODY_INDENT_WIDTH: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TranscriptRowKind {
@@ -43,60 +48,100 @@ pub(crate) struct TranscriptRowStyle {
     glyph: &'static str,
     label: &'static str,
     color: Color,
+    layout: TranscriptRowLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptRowLayout {
+    Labeled,
+    UserBox { surface: Color },
 }
 
 impl TranscriptRowKind {
     pub(crate) fn style(self) -> TranscriptRowStyle {
         match self {
-            Self::UserMessage => TranscriptRowStyle::new("›", "user", Color::Cyan),
-            Self::AssistantMessage => TranscriptRowStyle::new("•", "assistant", Color::Green),
-            Self::ToolCall => TranscriptRowStyle::new("•", "tool", Color::Yellow),
-            Self::ToolOutput => TranscriptRowStyle::new("└", "output", Color::DarkGray),
-            Self::ToolError => TranscriptRowStyle::new("└", "error", Color::Red),
-            Self::SkillInvocation => TranscriptRowStyle::new("◆", "skill", Color::Magenta),
-            Self::SessionList => TranscriptRowStyle::new("◆", "sessions", Color::Cyan),
-            Self::SessionNotice => TranscriptRowStyle::new("◆", "notice", Color::Cyan),
-            Self::SessionTree => TranscriptRowStyle::new("◆", "tree", Color::Cyan),
-            Self::TranscriptHits => TranscriptRowStyle::new("◆", "find", Color::Cyan),
-            Self::SubagentStarted => TranscriptRowStyle::new("*", "subagent", Color::Blue),
-            Self::SubagentCompleted => TranscriptRowStyle::new("*", "subagent", Color::Green),
-            Self::SubagentFailed => TranscriptRowStyle::new("*", "subagent", Color::Red),
-            Self::FileChanged => TranscriptRowStyle::new("◆", "changed", Color::Cyan),
-            Self::FileChangeFailed => TranscriptRowStyle::new("◆", "failed", Color::Red),
-            Self::TurnDiff => TranscriptRowStyle::new("◆", "diff", Color::Blue),
-            Self::GitCheckpoint => TranscriptRowStyle::new("◆", "checkpoint", Color::Cyan),
-            Self::GitStash => TranscriptRowStyle::new("◆", "stash", Color::Magenta),
-            Self::GitRestore => TranscriptRowStyle::new("◆", "restore", Color::Green),
-            Self::PendingQueued => TranscriptRowStyle::new("◆", "queued", Color::Blue),
-            Self::PendingEdited => TranscriptRowStyle::new("◆", "edited", Color::Blue),
-            Self::PendingRemoved => TranscriptRowStyle::new("◆", "removed", Color::DarkGray),
-            Self::PendingCleared => TranscriptRowStyle::new("◆", "cleared", Color::DarkGray),
-            Self::PendingDequeued => TranscriptRowStyle::new("◆", "dequeued", Color::Blue),
-            Self::TurnAborted => TranscriptRowStyle::new("◆", "aborted", Color::Red),
-            Self::CompactionStarted => TranscriptRowStyle::new("◆", "compact", Color::Magenta),
-            Self::CompactionCompleted => TranscriptRowStyle::new("◆", "compacted", Color::Magenta),
-            Self::CompactionFailed => TranscriptRowStyle::new("◆", "compact!", Color::Red),
-            Self::Error => TranscriptRowStyle::new("•", "error", Color::Red),
+            Self::UserMessage => TranscriptRowStyle::user_box("›", DEFAULT_COMPOSER_BG),
+            Self::AssistantMessage => TranscriptRowStyle::labeled("•", "assistant", Color::Green),
+            Self::ToolCall => TranscriptRowStyle::labeled("•", "tool", Color::Yellow),
+            Self::ToolOutput => TranscriptRowStyle::labeled("└", "output", Color::DarkGray),
+            Self::ToolError => TranscriptRowStyle::labeled("└", "error", Color::Red),
+            Self::SkillInvocation => TranscriptRowStyle::labeled("◆", "skill", Color::Magenta),
+            Self::SessionList => TranscriptRowStyle::labeled("◆", "sessions", Color::Cyan),
+            Self::SessionNotice => TranscriptRowStyle::labeled("◆", "notice", Color::Cyan),
+            Self::SessionTree => TranscriptRowStyle::labeled("◆", "tree", Color::Cyan),
+            Self::TranscriptHits => TranscriptRowStyle::labeled("◆", "find", Color::Cyan),
+            Self::SubagentStarted => TranscriptRowStyle::labeled("*", "subagent", Color::Blue),
+            Self::SubagentCompleted => TranscriptRowStyle::labeled("*", "subagent", Color::Green),
+            Self::SubagentFailed => TranscriptRowStyle::labeled("*", "subagent", Color::Red),
+            Self::FileChanged => TranscriptRowStyle::labeled("◆", "changed", Color::Cyan),
+            Self::FileChangeFailed => TranscriptRowStyle::labeled("◆", "failed", Color::Red),
+            Self::TurnDiff => TranscriptRowStyle::labeled("◆", "diff", Color::Blue),
+            Self::GitCheckpoint => TranscriptRowStyle::labeled("◆", "checkpoint", Color::Cyan),
+            Self::GitStash => TranscriptRowStyle::labeled("◆", "stash", Color::Magenta),
+            Self::GitRestore => TranscriptRowStyle::labeled("◆", "restore", Color::Green),
+            Self::PendingQueued => TranscriptRowStyle::labeled("◆", "queued", Color::Blue),
+            Self::PendingEdited => TranscriptRowStyle::labeled("◆", "edited", Color::Blue),
+            Self::PendingRemoved => TranscriptRowStyle::labeled("◆", "removed", Color::DarkGray),
+            Self::PendingCleared => TranscriptRowStyle::labeled("◆", "cleared", Color::DarkGray),
+            Self::PendingDequeued => TranscriptRowStyle::labeled("◆", "dequeued", Color::Blue),
+            Self::TurnAborted => TranscriptRowStyle::labeled("◆", "aborted", Color::Red),
+            Self::CompactionStarted => TranscriptRowStyle::labeled("◆", "compact", Color::Magenta),
+            Self::CompactionCompleted => {
+                TranscriptRowStyle::labeled("◆", "compacted", Color::Magenta)
+            }
+            Self::CompactionFailed => TranscriptRowStyle::labeled("◆", "compact!", Color::Red),
+            Self::Error => TranscriptRowStyle::labeled("•", "error", Color::Red),
         }
     }
 }
 
 impl TranscriptRowStyle {
-    const fn new(glyph: &'static str, label: &'static str, color: Color) -> Self {
+    const fn labeled(glyph: &'static str, label: &'static str, color: Color) -> Self {
         Self {
             glyph,
             label,
             color,
+            layout: TranscriptRowLayout::Labeled,
+        }
+    }
+
+    const fn user_box(glyph: &'static str, surface: Color) -> Self {
+        Self {
+            glyph,
+            label: "",
+            color: Color::White,
+            layout: TranscriptRowLayout::UserBox { surface },
+        }
+    }
+
+    fn with_user_surface(self, surface: Color) -> Self {
+        match self.layout {
+            TranscriptRowLayout::UserBox { .. } => Self {
+                layout: TranscriptRowLayout::UserBox { surface },
+                ..self
+            },
+            TranscriptRowLayout::Labeled => self,
         }
     }
 
     pub(crate) fn label(self) -> &'static str {
         self.label
     }
+
+    fn body_width(self, width: u16, label: &str) -> u16 {
+        body_width_for_prefix(width, self.prefix_width(label))
+    }
+
+    fn prefix_width(self, label: &str) -> usize {
+        match self.layout {
+            TranscriptRowLayout::Labeled => labeled_prefix_width(self.glyph, label),
+            TranscriptRowLayout::UserBox { .. } => self.glyph.chars().count().saturating_add(1),
+        }
+    }
 }
 
 pub(crate) struct TranscriptRow<'a> {
-    kind: TranscriptRowKind,
+    style: TranscriptRowStyle,
     label: Cow<'a, str>,
     body: Cow<'a, str>,
 }
@@ -105,7 +150,7 @@ impl<'a> TranscriptRow<'a> {
     pub(crate) fn new(kind: TranscriptRowKind, body: impl Into<Cow<'a, str>>) -> Self {
         let style = kind.style();
         Self {
-            kind,
+            style,
             label: Cow::Borrowed(style.label()),
             body: body.into(),
         }
@@ -116,26 +161,44 @@ impl<'a> TranscriptRow<'a> {
         label: impl Into<Cow<'a, str>>,
         body: impl Into<Cow<'a, str>>,
     ) -> Self {
+        let style = kind.style();
         Self {
-            kind,
+            style,
             label: label.into(),
             body: body.into(),
         }
     }
 
+    pub(crate) fn user_message(body: impl Into<Cow<'a, str>>, surface: Color) -> Self {
+        let style = TranscriptRowKind::UserMessage
+            .style()
+            .with_user_surface(surface);
+        Self {
+            style,
+            label: Cow::Borrowed(""),
+            body: body.into(),
+        }
+    }
+
     fn body_width(&self, width: u16) -> u16 {
-        body_width_for_label(width, &self.label)
+        self.style.body_width(width, &self.label)
     }
 
     pub(crate) fn render(self, width: u16) -> Vec<Line<'static>> {
         let lines = render_body(&self.body, self.body_width(width));
-        finish_row_lines(self.kind, &self.label, lines)
+        match self.style.layout {
+            TranscriptRowLayout::Labeled => {
+                finish_labeled_row_lines(self.style, &self.label, lines)
+            }
+            TranscriptRowLayout::UserBox { surface } => {
+                finish_user_box_lines(self.style, lines, width, surface)
+            }
+        }
     }
 }
 
-/// Replace the leading two-space pad on `lines[0]` with a styled row header.
-/// Continuation lines keep the two-space pad so body text aligns under the
-/// transcript gutter for every semantic row type.
+/// Replace the leading two-space body indent on `lines[0]` with styled row
+/// chrome. Continuation lines keep the indent so body text has a stable gutter.
 fn apply_gutter_header(lines: &mut [Line<'static>], style: TranscriptRowStyle, label: &str) {
     let Some(first) = lines.first_mut() else {
         return;
@@ -143,33 +206,116 @@ fn apply_gutter_header(lines: &mut [Line<'static>], style: TranscriptRowStyle, l
     let Some(span) = first.spans.first_mut() else {
         return;
     };
-    let rest = span.content.strip_prefix("  ").unwrap_or(&span.content);
+    let rest = span
+        .content
+        .strip_prefix(BODY_INDENT)
+        .unwrap_or(&span.content);
     let rest_owned = rest.to_string();
     let trailing = std::mem::take(&mut first.spans).into_iter().skip(1);
-    let mut spans = Vec::with_capacity(4);
-    let label_style = label_style(style.color);
-    spans.push(Span::styled(format!("{} ", style.glyph), label_style));
-    spans.push(Span::styled(label.to_string(), label_style));
-    if !rest_owned.is_empty() {
-        spans.push(Span::styled(
-            "  ".to_string(),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+    let mut spans = row_header_spans(style, label, !rest_owned.is_empty());
     spans.push(Span::raw(rest_owned));
     spans.extend(trailing);
     first.spans = spans;
 }
 
+fn row_header_spans(style: TranscriptRowStyle, label: &str, has_body: bool) -> Vec<Span<'static>> {
+    match style.layout {
+        TranscriptRowLayout::Labeled => labeled_header_spans(style, label, has_body),
+        TranscriptRowLayout::UserBox { .. } => user_box_header_spans(style),
+    }
+}
+
+fn labeled_header_spans(
+    style: TranscriptRowStyle,
+    label: &str,
+    has_body: bool,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(4);
+    let label_style = label_style(style.color);
+    spans.push(Span::styled(format!("{} ", style.glyph), label_style));
+    spans.push(Span::styled(label.to_string(), label_style));
+    if has_body {
+        spans.push(Span::styled(
+            "  ".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
+}
+
+fn user_box_header_spans(style: TranscriptRowStyle) -> Vec<Span<'static>> {
+    let prompt_style = Style::default()
+        .fg(style.color)
+        .add_modifier(Modifier::BOLD);
+    vec![Span::styled(format!("{} ", style.glyph), prompt_style)]
+}
+
+fn finish_user_box_lines(
+    style: TranscriptRowStyle,
+    mut lines: Vec<Line<'static>>,
+    width: u16,
+    surface: Color,
+) -> Vec<Line<'static>> {
+    if lines.is_empty() {
+        lines.push(Line::from(BODY_INDENT.to_string()));
+    }
+    apply_gutter_header(&mut lines, style, "");
+
+    let mut out = Vec::with_capacity(lines.len() + 3);
+    out.push(user_box_padding_line(width, surface));
+    out.extend(lines.into_iter().map(|mut line| {
+        style_user_box_line(&mut line, width, surface);
+        line
+    }));
+    out.push(user_box_padding_line(width, surface));
+    out.push(Line::from(String::new()));
+    out
+}
+
+fn user_box_padding_line(width: u16, surface: Color) -> Line<'static> {
+    let mut line = Line::from(Span::raw(" ".repeat(width as usize)));
+    line.style = user_box_style(surface);
+    line
+}
+
+fn style_user_box_line(line: &mut Line<'static>, width: u16, surface: Color) {
+    line.style = user_box_style(surface);
+    let used_width = line_text_width(line);
+    let target_width = width as usize;
+    if target_width > used_width {
+        line.spans
+            .push(Span::raw(" ".repeat(target_width - used_width)));
+    }
+}
+
+fn user_box_style(surface: Color) -> Style {
+    Style::default().fg(Color::White).bg(surface)
+}
+
+fn line_text_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
+}
+
 pub(crate) fn finish_row_lines(
     kind: TranscriptRowKind,
+    label: &str,
+    lines: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
+    finish_labeled_row_lines(kind.style(), label, lines)
+}
+
+fn finish_labeled_row_lines(
+    style: TranscriptRowStyle,
     label: &str,
     mut lines: Vec<Line<'static>>,
 ) -> Vec<Line<'static>> {
     if lines.is_empty() {
-        lines.push(Line::from("  ".to_string()));
+        lines.push(Line::from(BODY_INDENT.to_string()));
     }
-    apply_gutter_header(&mut lines, kind.style(), label);
+    apply_gutter_header(&mut lines, style, label);
     lines.push(Line::from(String::new()));
     lines
 }
@@ -179,34 +325,43 @@ fn label_style(color: Color) -> Style {
 }
 
 pub(crate) fn body_width_for_label(width: u16, label: &str) -> u16 {
-    let header_width = 1usize
-        .saturating_add(1)
-        .saturating_add(label.chars().count())
-        .saturating_add(2);
-    let extra_width = header_width.saturating_sub(2);
+    let prefix_width = labeled_prefix_width("•", label);
+    body_width_for_prefix(width, prefix_width)
+}
+
+fn body_width_for_prefix(width: u16, prefix_width: usize) -> u16 {
+    let extra_width = prefix_width.saturating_sub(BODY_INDENT_WIDTH);
     let extra_width = u16::try_from(extra_width).unwrap_or(u16::MAX);
     width.saturating_sub(extra_width)
+}
+
+fn labeled_prefix_width(glyph: &str, label: &str) -> usize {
+    glyph
+        .chars()
+        .count()
+        .saturating_add(1)
+        .saturating_add(label.chars().count())
+        .saturating_add(2)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn first_line_text(kind: TranscriptRowKind, body: &str) -> String {
-        let lines = TranscriptRow::new(kind, body).render(80);
-        lines[0]
-            .spans
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
     }
 
+    fn first_line_text(kind: TranscriptRowKind, body: &str) -> String {
+        let lines = TranscriptRow::new(kind, body).render(80);
+        line_text(&lines[0])
+    }
+
     #[test]
     fn core_semantic_rows_have_distinct_stable_chrome() {
-        assert_eq!(
-            first_line_text(TranscriptRowKind::UserMessage, "hello"),
-            "› user  hello"
-        );
         assert_eq!(
             first_line_text(TranscriptRowKind::AssistantMessage, "hello"),
             "• assistant  hello"
@@ -223,6 +378,19 @@ mod tests {
             first_line_text(TranscriptRowKind::ToolError, "permission denied"),
             "└ error  permission denied"
         );
+    }
+
+    #[test]
+    fn user_message_uses_composer_surface_box() {
+        let surface = Color::Rgb(1, 2, 3);
+        let lines = TranscriptRow::user_message("hello", surface).render(12);
+
+        assert_eq!(line_text(&lines[0]).chars().count(), 12);
+        assert_eq!(line_text(&lines[1]).trim_end(), "› hello");
+        assert_eq!(line_text(&lines[1]).chars().count(), 12);
+        assert_eq!(lines[0].style.bg, Some(surface));
+        assert_eq!(lines[1].style.bg, Some(surface));
+        assert_eq!(lines[2].style.bg, Some(surface));
     }
 
     #[test]

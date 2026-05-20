@@ -163,7 +163,7 @@ pub async fn run(
     let context_summary = project.context_summary();
     let settings_summary = project.settings_summary(&cwd);
 
-    let mut chat = ChatWidget::new();
+    let mut chat = ChatWidget::with_theme(theme);
     if resume_events.is_empty() {
         chat.push_welcome(
             &args.model,
@@ -348,7 +348,7 @@ pub async fn run(
                 match app {
                     AppEvent::Quit => break,
                     AppEvent::Clear => {
-                        chat = ChatWidget::new();
+                        chat = ChatWidget::with_theme(theme);
                         chat.push_welcome(
                             &args.model,
                             cwd.display().to_string(),
@@ -493,7 +493,7 @@ pub async fn run(
                                     pending_approvals.clone(),
                                     &sandbox_policy,
                                 );
-                                chat = ChatWidget::new();
+                                chat = ChatWidget::with_theme(theme);
                                 for event in events {
                                     chat.ingest(event);
                                 }

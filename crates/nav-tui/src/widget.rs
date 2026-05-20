@@ -11,11 +11,13 @@ use crate::cells::{
     TranscriptHitsCell, TurnAbortedCell, TurnDiffCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
+use crate::theme::Theme;
 
 /// Flat scrollback widget. Holds the full history as a vector of cells and
 /// renders a viewport over their flattened lines.
 pub struct ChatWidget {
     cells: Vec<Box<dyn HistoryCell>>,
+    theme: Theme,
     tool_calls: HashMap<String, ToolCallContext>,
     subagent_labels: HashMap<String, String>,
     /// In-flight streaming assistant cell, anchored to its eventual index
@@ -32,8 +34,13 @@ pub struct ChatWidget {
 
 impl ChatWidget {
     pub fn new() -> Self {
+        Self::with_theme(Theme::default())
+    }
+
+    pub(crate) fn with_theme(theme: Theme) -> Self {
         Self {
             cells: Vec::new(),
+            theme,
             tool_calls: HashMap::new(),
             subagent_labels: HashMap::new(),
             streaming_assistant: None,
@@ -410,7 +417,7 @@ impl ChatWidget {
     }
 
     fn push_user_cell(&mut self, text: impl Into<String>) {
-        self.push_cell(UserMessageCell::new(text));
+        self.push_cell(UserMessageCell::with_surface(text, self.theme.composer_bg));
     }
 }
 
