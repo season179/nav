@@ -1227,7 +1227,7 @@ mod compaction_cell_tests {
         let cell = CompactionCell::new(
             CompactionPhase::Completed,
             CompactionTrigger::Manual,
-            Some("did things; next step Y".into()),
+            Some("## Goal\nship it\n\n## Next Steps\n1. step Y".into()),
             Some(5),
             42_000,
             None,
@@ -1245,7 +1245,8 @@ mod compaction_cell_tests {
             .join("\n");
         assert!(rendered.contains("compaction complete"));
         assert!(rendered.contains("manual"));
-        assert!(rendered.contains("did things; next step Y"));
+        assert!(rendered.contains("## Goal"));
+        assert!(rendered.contains("## Next Steps"));
         assert!(rendered.contains("Heads up"));
     }
 

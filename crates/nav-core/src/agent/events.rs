@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::compaction::CompactionDetails;
 use crate::control::PendingInputMode;
 use crate::git_checkpoint::{GitCheckpointAction, GitCheckpointStatus};
 use crate::mutation::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
@@ -237,6 +238,8 @@ pub enum AgentEvent {
         summary: String,
         replaced_events: usize,
         tokens_before: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<CompactionDetails>,
     },
     /// Compaction failed; `message` carries the underlying error. The session
     /// is still using the pre-compaction transcript — the next turn replays
@@ -567,6 +570,10 @@ mod tests {
             summary: "did things".into(),
             replaced_events: 8,
             tokens_before: 200_000,
+            details: Some(CompactionDetails {
+                read_files: vec!["src/lib.rs".into()],
+                modified_files: vec!["src/main.rs".into()],
+            }),
         };
         assert_eq!(
             serde_json::to_value(&event).unwrap(),
@@ -575,7 +582,11 @@ mod tests {
                 "trigger": "auto",
                 "summary": "did things",
                 "replaced_events": 8,
-                "tokens_before": 200000
+                "tokens_before": 200000,
+                "details": {
+                    "read_files": ["src/lib.rs"],
+                    "modified_files": ["src/main.rs"]
+                }
             })
         );
         assert_eq!(event.kind(), "compaction_completed");

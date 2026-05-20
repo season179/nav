@@ -276,6 +276,7 @@ impl ChatWidget {
                 summary,
                 replaced_events,
                 tokens_before,
+                ..
             } => {
                 self.push_cell(CompactionCell::new(
                     CompactionPhase::Completed,

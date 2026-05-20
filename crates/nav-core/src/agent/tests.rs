@@ -2350,9 +2350,15 @@ async fn manual_compact_emits_lifecycle_events_and_does_not_steer_prompt() {
     let pos_completed = event_position(&events, "CompactionCompleted", |e| {
         matches!(
             e,
-            AgentEvent::CompactionCompleted { trigger, summary, .. }
+            AgentEvent::CompactionCompleted {
+                trigger,
+                summary,
+                details,
+                ..
+            }
                 if matches!(trigger, super::CompactionTrigger::Manual)
                     && summary.contains("handoff: did things")
+                    && details.is_none()
         )
     });
     assert!(pos_started < pos_completed);
@@ -2373,7 +2379,7 @@ async fn manual_compact_emits_lifecycle_events_and_does_not_steer_prompt() {
     assert!(
         user_texts
             .iter()
-            .any(|t| t.contains("CONTEXT CHECKPOINT COMPACTION")),
+            .any(|t| t.contains("structured context checkpoint summary") && t.contains("## Goal")),
         "summarization prompt should be the user content: {user_texts:?}"
     );
     assert!(
@@ -2504,6 +2510,150 @@ async fn manual_compact_persists_checkpoint_for_replay() {
 }
 
 #[tokio::test]
+async fn manual_compact_persists_file_ops_details_for_replay() {
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::session::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+    let initial_input = vec![
+        json!({"type": "message", "role": "user", "content": "inspect and edit"}),
+        json!({"type": "function_call", "call_id": "read", "name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"}),
+        json!({"type": "function_call_output", "call_id": "read", "output": "file contents"}),
+        json!({"type": "function_call", "call_id": "edit", "name": "edit_file", "arguments": "{\"path\":\"src/main.rs\",\"old_str\":\"a\",\"new_str\":\"b\"}"}),
+        json!({"type": "function_call_output", "call_id": "edit", "output": "edited"}),
+    ];
+    let transport = StubTransport::new(vec![compact_turn_with_text("## Goal\nkeep going")]);
+    let binding = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &Args::test_default(),
+        &cwd,
+        "/compact",
+        None,
+        Vec::new(),
+        tx,
+        Some(&binding),
+        Some(initial_input),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("compact turn");
+    while rx.recv().await.is_some() {}
+
+    let events = store.load_session(&session_id).unwrap();
+    let checkpoint = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::CompactionCompleted {
+                summary, details, ..
+            } => Some((summary, details.as_ref().expect("details"))),
+            _ => None,
+        })
+        .expect("checkpoint persisted");
+
+    assert!(
+        checkpoint
+            .0
+            .contains("<read-files>\nsrc/lib.rs\n</read-files>")
+    );
+    assert!(
+        checkpoint
+            .0
+            .contains("<modified-files>\nsrc/main.rs\n</modified-files>")
+    );
+    assert_eq!(checkpoint.1.read_files, vec!["src/lib.rs"]);
+    assert_eq!(checkpoint.1.modified_files, vec!["src/main.rs"]);
+
+    let replay_input = rebuild_responses_input(&events, &cwd);
+    let replay_summary = replay_input[0]
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(replay_summary.contains("<read-files>\nsrc/lib.rs\n</read-files>"));
+    assert!(replay_summary.contains("<modified-files>\nsrc/main.rs\n</modified-files>"));
+}
+
+#[tokio::test]
+async fn consecutive_compactions_use_incremental_smaller_prompt() {
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let large_first_input = vec![
+        json!({"type": "message", "role": "user", "content": "first task ".repeat(2_000)}),
+        json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "large answer ".repeat(1_000)}]}),
+    ];
+    let first_transport = StubTransport::new(vec![compact_turn_with_text("## Goal\nfirst")]);
+    let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &first_transport,
+        &Args::test_default(),
+        &cwd,
+        "/compact",
+        None,
+        Vec::new(),
+        tx1,
+        None,
+        Some(large_first_input),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("first compact");
+    while rx1.recv().await.is_some() {}
+    let first_bodies = first_transport.bodies();
+    let first_prompt = first_bodies[0]["input"][0]["content"]
+        .as_str()
+        .expect("first prompt");
+
+    let second_input = vec![
+        super::summary_message("## Goal\nfirst"),
+        json!({"type": "message", "role": "user", "content": "small follow-up"}),
+    ];
+    let second_transport = StubTransport::new(vec![compact_turn_with_text("## Goal\nsecond")]);
+    let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent(
+        &second_transport,
+        &Args::test_default(),
+        &cwd,
+        "/compact",
+        None,
+        Vec::new(),
+        tx2,
+        None,
+        Some(second_input),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("second compact");
+    while rx2.recv().await.is_some() {}
+    let second_bodies = second_transport.bodies();
+    let second_prompt = second_bodies[0]["input"][0]["content"]
+        .as_str()
+        .expect("second prompt");
+
+    assert!(second_prompt.contains("<previous-summary>\n## Goal\nfirst\n</previous-summary>"));
+    assert!(second_prompt.len() < first_prompt.len());
+}
+
+#[tokio::test]
 async fn manual_compact_recovers_from_text_only_overflow() {
     // Regression for codex review B-2: a text-only long session has no
     // function-call pairs to shed, so the original recovery would always
@@ -2574,12 +2724,14 @@ async fn manual_compact_recovers_from_text_only_overflow() {
     });
     assert_eq!(completed.as_deref(), Some("HANDOFF: recovered"));
 
-    // Second attempt's body must have one fewer item than the first.
+    // Second attempt's serialized conversation must be smaller than the first.
     let bodies = transport.bodies();
     assert_eq!(bodies.len(), 2);
     let first = bodies[0].get("input").and_then(Value::as_array).unwrap();
     let second = bodies[1].get("input").and_then(Value::as_array).unwrap();
-    assert_eq!(second.len(), first.len() - 1);
+    let first_prompt = first[0].get("content").and_then(Value::as_str).unwrap();
+    let second_prompt = second[0].get("content").and_then(Value::as_str).unwrap();
+    assert!(second_prompt.len() < first_prompt.len());
 }
 
 #[tokio::test]
@@ -2723,7 +2875,7 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
     assert!(auto_completed.is_some());
 
     // The user's actual prompt followed, and the second transport call
-    // saw the replacement history (summary + recent users) plus the new
+    // saw the replacement history (summary + recent context) plus the new
     // user prompt — not the raw 95k-token transcript.
     let bodies = transport.bodies();
     assert_eq!(bodies.len(), 2, "auto-compact + user turn");
@@ -2742,6 +2894,75 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
         last.get("content").and_then(Value::as_str),
         Some("regular prompt")
     );
+}
+
+#[tokio::test]
+async fn auto_compact_fires_when_estimated_input_crosses_threshold() {
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::session::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+    let binding = SessionBinding {
+        store: &store,
+        session_id,
+    };
+
+    let mut args = Args::test_default();
+    args.auto_compact_token_limit = 500;
+    args.auto_compact_fraction = 1.0;
+
+    let initial_input = vec![json!({
+        "type": "message",
+        "role": "user",
+        "content": "large replay ".repeat(500),
+    })];
+    let summarise_turn = compact_turn_with_text("HANDOFF: estimated pressure");
+    let user_turn = compact_turn_with_text("ack after estimate");
+    let transport = StubTransport::new(vec![summarise_turn, user_turn]);
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent(
+        &transport,
+        &args,
+        &cwd,
+        "regular prompt",
+        None,
+        Vec::new(),
+        tx,
+        Some(&binding),
+        Some(initial_input),
+        &Catalog::default(),
+        None,
+        crate::tools::unchecked_permission_context(),
+    )
+    .await
+    .expect("run with estimated auto-compact");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::CompactionStarted {
+                trigger: super::CompactionTrigger::Auto,
+                ..
+            }
+        )),
+        "auto-compaction should have fired from estimated replay tokens"
+    );
+    assert_eq!(transport.bodies().len(), 2, "auto-compact + user turn");
 }
 
 #[tokio::test]

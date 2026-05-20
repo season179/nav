@@ -4,9 +4,9 @@ mod replay;
 mod runner;
 
 pub use compaction::{
-    AutoCompactDecision, COMPACT_SLASH, CheckpointSlice, DEFAULT_AUTO_COMPACT_FRACTION,
-    DEFAULT_AUTO_COMPACT_TOKEN_LIMIT, SUMMARIZATION_PROMPT, SUMMARY_PREFIX,
-    build_replacement_history, collect_recent_user_messages, is_compact_command,
+    AutoCompactDecision, COMPACT_SLASH, CheckpointSlice, CompactionDetails,
+    DEFAULT_AUTO_COMPACT_FRACTION, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT, SUMMARIZATION_PROMPT,
+    SUMMARY_PREFIX, build_replacement_history, collect_recent_user_messages, is_compact_command,
     is_summary_message, latest_checkpoint_slice, should_auto_compact, summary_message,
 };
 pub use events::{AgentEvent, CompactionTrigger, TurnUsage, UserAttachment};

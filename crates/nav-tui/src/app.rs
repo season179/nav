@@ -1245,6 +1245,7 @@ mod tests {
             summary: "s".into(),
             replaced_events: 0,
             tokens_before: 0,
+            details: None,
         }));
         assert!(turn_is_terminal(&AgentEvent::CompactionFailed {
             trigger: CompactionTrigger::Manual,
@@ -1267,6 +1268,7 @@ mod tests {
             summary: "s".into(),
             replaced_events: 0,
             tokens_before: 0,
+            details: None,
         }));
         assert!(!turn_is_terminal(&AgentEvent::CompactionFailed {
             trigger: CompactionTrigger::Auto,

@@ -108,16 +108,18 @@ pub struct Args {
 
     /// Estimated model context budget used to decide when automatic
     /// long-session compaction fires. nav compacts before submitting a turn
-    /// whose rolling session token count crosses
-    /// `auto_compact_fraction × auto_compact_token_limit`. Set to `0` to
-    /// disable automatic compaction; manual `/compact` still works.
+    /// whose estimated or recorded context pressure crosses the earlier of
+    /// `auto_compact_fraction × auto_compact_token_limit` and the configured
+    /// context window minus nav's reserve headroom. Set to `0` to disable
+    /// automatic compaction; manual `/compact` still works.
     #[arg(default_value_t = crate::agent::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT, long)]
     pub auto_compact_token_limit: u64,
 
     /// Fraction of [`Args::auto_compact_token_limit`] at which automatic
-    /// compaction fires. Defaults to `1.0`, so the firing point lines up
-    /// exactly with the token limit (200K). Lower values pull the firing
-    /// point in earlier; must be in `0.0..=1.0`.
+    /// compaction can fire. Defaults to `1.0`; nav's reserve headroom still
+    /// pulls the default firing point slightly below the configured context
+    /// window. Lower values pull the firing point in earlier; must be in
+    /// `0.0..=1.0`.
     #[arg(
         default_value_t = crate::agent::DEFAULT_AUTO_COMPACT_FRACTION,
         long,
