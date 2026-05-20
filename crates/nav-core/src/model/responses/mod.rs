@@ -6,7 +6,7 @@ mod sse;
 pub mod types;
 mod websocket;
 
-use crate::agent::AgentEvent;
+use crate::agent_loop::AgentEvent;
 use crate::model::{EventStream, ResponsesTransport};
 use crate::{cli::Transport, model::auth::AuthConfig};
 use anyhow::{Result, anyhow};

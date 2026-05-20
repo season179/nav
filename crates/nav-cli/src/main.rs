@@ -1,22 +1,23 @@
 use anyhow::{Context, Result, bail};
-use nav_core::guardrails::PermissionContext;
-use nav_core::permissions::AskForApproval;
-use nav_core::permissions::approval::{
+use nav_core::guardrails::approval::{
     ApprovalGate, AutoGate, ChannelGate, PendingApprovals, spawn_response_reader,
 };
-use nav_core::sandbox::select_for_platform;
+use nav_core::guardrails::{
+    AskForApproval, PermissionContext, SessionAllowlist, select_for_platform,
+};
 use nav_core::{
-    AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
-    SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, agent,
+    AgentEvent, AgentTurnRequest, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext,
+    RetryPolicy, SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit,
     agent_event_notification,
     cli::{
         Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, SessionsAction,
         sandbox_policy_from_args,
     },
-    discover_extensions, discover_skills, doctor, git_checkpoint, layout_session_tree,
+    discover_extensions, discover_skills, git_checkpoint, layout_session_tree,
     load_project_context,
     model::{auth, names},
-    rebuild_responses_input, session_started_notification, shorten_home,
+    rebuild_responses_input, run_agent, session_started_notification, shorten_home,
+    verify::doctor,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -178,19 +179,18 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    let agent = agent::run_agent(
-        transport.as_ref(),
-        &args,
-        &cwd,
-        &prompt,
-        None,
-        Vec::new(),
-        tx,
-        Some(&binding),
-        initial_input,
-        skills.as_ref(),
-        Some(project.as_ref()),
-        permissions,
+    let agent = run_agent(
+        AgentTurnRequest::new(
+            transport.as_ref(),
+            &args,
+            &cwd,
+            &prompt,
+            tx,
+            skills.as_ref(),
+            permissions,
+        )
+        .with_session(Some(&binding), initial_input)
+        .with_context(Some(project.as_ref())),
     );
     let drainer = async {
         while let Some(event) = rx.recv().await {
@@ -508,7 +508,7 @@ async fn build_headless_permissions(
             policy,
             sandbox_policy,
             sandbox,
-            session_allowlist: nav_core::permissions::SessionAllowlist::default(),
+            session_allowlist: SessionAllowlist::default(),
         },
         reader,
     )

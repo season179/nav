@@ -4,9 +4,10 @@ use crossterm::event::{self, Event as CtEvent};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use nav_core::guardrails::PermissionContext;
-use nav_core::permissions::approval::{ApprovalGate, ChannelGate, PendingApprovals};
-use nav_core::sandbox::select_for_platform;
+use nav_core::guardrails::approval::{ApprovalGate, AutoGate, ChannelGate, PendingApprovals};
+use nav_core::guardrails::{
+    AskForApproval, PermissionContext, SessionAllowlist, select_for_platform,
+};
 use nav_core::{
     AgentEvent, Catalog, ControlPlane, ExtensionCatalog, OpenAiTransport, PendingInput,
     PendingInputDraft, PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext,
@@ -1100,10 +1101,10 @@ fn build_tui_permissions(
     let bypass = args.dangerously_bypass_approvals_and_sandbox;
     let (gate, policy): (Arc<dyn ApprovalGate>, _) = if bypass {
         (
-            Arc::new(nav_core::permissions::approval::AutoGate::approving()),
+            Arc::new(AutoGate::approving()),
             // Force off `Never` so the gate is consulted instead of being
             // short-circuited to a refusal by `auto_denies_approvals`.
-            nav_core::permissions::AskForApproval::OnRequest,
+            AskForApproval::OnRequest,
         )
     } else {
         // Attach the session store as a durable sink so the approval
@@ -1121,7 +1122,7 @@ fn build_tui_permissions(
         sandbox_policy: sandbox_policy.clone(),
         // Default empty; populated when the user picks `[a]llow for session`
         // on the approval modal. Shared across spawned turns via Arc.
-        session_allowlist: nav_core::permissions::SessionAllowlist::default(),
+        session_allowlist: SessionAllowlist::default(),
     }
 }
 

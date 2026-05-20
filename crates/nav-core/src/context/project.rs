@@ -156,7 +156,7 @@ pub struct Settings {
     /// long-session compaction fires. Setting to `0` disables auto-compaction.
     pub auto_compact_token_limit: Option<u64>,
     /// Fraction of `auto_compact_token_limit` at which automatic compaction
-    /// fires. Defaults to [`crate::agent::DEFAULT_AUTO_COMPACT_FRACTION`].
+    /// fires. Defaults to [`crate::context::compaction::DEFAULT_AUTO_COMPACT_FRACTION`].
     pub auto_compact_fraction: Option<f32>,
     /// When true, create a git stash-backed checkpoint before each normal
     /// agent turn that starts from a dirty worktree.

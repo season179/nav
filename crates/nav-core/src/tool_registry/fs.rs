@@ -7,7 +7,7 @@ use tokio::process::Command;
 
 use super::ToolResult;
 use super::truncate::{GREP_MAX_LINE_LENGTH, MAX_BYTES, truncate_line};
-use crate::permissions::protected::{
+use crate::guardrails::protected::{
     PROTECTED_READ_GLOBS, is_protected_metadata_write, is_protected_read,
 };
 use crate::verify::{FileChangeKind, FileChangeSummary, MutationResult, summarize_changes};

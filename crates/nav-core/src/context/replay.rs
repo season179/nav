@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::agent::AgentEvent;
+use crate::agent_loop::AgentEvent;
 use crate::agent_loop::runner::build_user_content;
 use crate::context::compaction::{latest_checkpoint_slice, summary_message};
 

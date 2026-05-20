@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::agent::{AgentEvent, TurnUsage};
+use crate::agent_loop::{AgentEvent, TurnUsage};
 use crate::cli::Args;
 use crate::context::{Catalog, ProjectContext};
 use crate::context::{InstructionSectionKind, instruction_sections};
@@ -482,7 +482,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::agent::UserAttachment;
+    use crate::agent_loop::UserAttachment;
     use crate::context::{Catalog, ContextFile, ContextScope, ProjectContext, Skill, SkillScope};
 
     #[test]

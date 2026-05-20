@@ -1,14 +1,16 @@
+use super::compaction_turn::trim_for_compaction;
 use super::control::{PendingInput, PendingInputMode, TurnControls};
 use super::runner::{drop_oldest_tool_pair, emit_stream_events, extract_message_text};
 use super::*;
 use crate::cli::Args;
 use crate::context::compaction::{SUMMARIZATION_PROMPT, SUMMARY_PREFIX, summary_message};
 use crate::context::replay::rebuild_responses_input;
-use crate::guardrails::PermissionContext;
-use crate::permissions::approval::{ApprovalGate, ApprovalRequest};
-use crate::permissions::{AskForApproval, ReviewDecision, SandboxPolicy, SessionAllowlist};
-use crate::sandbox::PassthroughRunner;
-use crate::skills::Catalog;
+use crate::context::{Catalog, ProjectContext};
+use crate::guardrails::approval::{ApprovalGate, ApprovalRequest};
+use crate::guardrails::{
+    AskForApproval, PassthroughRunner, PermissionContext, ReviewDecision, SandboxPolicy,
+    SessionAllowlist,
+};
 use crate::tool_registry::{SPAWN_SUBAGENT_TOOL, unchecked_permission_context};
 use anyhow::Result;
 use futures_util::stream;
@@ -21,6 +23,58 @@ use std::process::Command as StdCommand;
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_for_test(
+    transport: &dyn ResponsesTransport,
+    args: &Args,
+    cwd: &Path,
+    prompt: &str,
+    display_prompt: Option<&str>,
+    attachments: Vec<UserAttachment>,
+    events: mpsc::UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    initial_input: Option<Vec<Value>>,
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+    permissions: PermissionContext,
+) -> Result<()> {
+    super::run_agent(
+        AgentTurnRequest::new(transport, args, cwd, prompt, events, skills, permissions)
+            .with_display_prompt(display_prompt)
+            .with_attachments(attachments)
+            .with_session(session, initial_input)
+            .with_context(context),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_for_test_with_controls(
+    transport: &dyn ResponsesTransport,
+    args: &Args,
+    cwd: &Path,
+    prompt: &str,
+    display_prompt: Option<&str>,
+    attachments: Vec<UserAttachment>,
+    events: mpsc::UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    initial_input: Option<Vec<Value>>,
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+    permissions: PermissionContext,
+    controls: TurnControls,
+) -> Result<()> {
+    super::run_agent(
+        AgentTurnRequest::new(transport, args, cwd, prompt, events, skills, permissions)
+            .with_display_prompt(display_prompt)
+            .with_attachments(attachments)
+            .with_session(session, initial_input)
+            .with_context(context)
+            .with_controls(controls),
+    )
+    .await
+}
 
 // ── stub transport ────────────────────────────────────────────
 
@@ -278,7 +332,7 @@ fn trim_for_compaction_falls_back_to_oldest_message_on_text_history() {
         // appends just before submitting. Must be preserved.
         json!({"type": "message", "role": "user", "content": SUMMARIZATION_PROMPT}),
     ];
-    let dropped = super::runner::trim_for_compaction(&mut input);
+    let dropped = trim_for_compaction(&mut input);
     assert_eq!(dropped, 1);
     assert_eq!(input.len(), 3);
     // The synthesised summarisation prompt is still the last item.
@@ -301,7 +355,7 @@ fn trim_for_compaction_returns_zero_when_only_prompt_remains() {
     // Nothing eligible to drop — the synthesised prompt is sacred.
     let mut input =
         vec![json!({"type": "message", "role": "user", "content": SUMMARIZATION_PROMPT})];
-    assert_eq!(super::runner::trim_for_compaction(&mut input), 0);
+    assert_eq!(trim_for_compaction(&mut input), 0);
     assert_eq!(input.len(), 1);
 }
 
@@ -767,7 +821,7 @@ async fn run_agent_emits_single_error_when_transport_create_fails() {
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let err = run_agent(
+    let err = run_agent_for_test(
         &FailingTransport,
         &args,
         &cwd,
@@ -847,7 +901,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
     let cwd = cwd_dir.path().canonicalize().unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    let result = run_agent(
+    let result = run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -1000,7 +1054,7 @@ async fn run_agent_git_checkpoints_dirty_worktree_before_user_message() {
     fs::write(cwd.join("tracked.txt"), "dirty\n").unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -1088,7 +1142,7 @@ async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -1235,7 +1289,7 @@ async fn subagent_scope_blocks_hallucinated_mutating_tool() {
     fs::write(cwd.join("note.txt"), "old\n").unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -1308,7 +1362,7 @@ async fn run_agent_injects_steering_before_dispatching_stale_tool_calls() {
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent_with_control(
+    run_agent_for_test_with_controls(
         &transport,
         &args,
         &cwd,
@@ -1375,7 +1429,7 @@ async fn run_agent_records_abort_from_approval_as_aborted_turn() {
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -1455,7 +1509,7 @@ async fn run_agent_emits_file_change_and_turn_diff_for_patch_tool() {
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -1489,7 +1543,7 @@ async fn run_agent_emits_file_change_and_turn_diff_for_patch_tool() {
             event,
             AgentEvent::FileChange { call_id, changes, status, .. }
                 if call_id == "call_patch"
-                    && *status == crate::mutation::PatchApplyStatus::Completed
+                    && *status == crate::verify::PatchApplyStatus::Completed
                     && changes.len() == 1
                     && changes[0].path == "note.txt"
                     && changes[0].diff.contains("-old")
@@ -1544,7 +1598,7 @@ async fn run_agent_emits_failed_file_change_for_rejected_patch_tool() {
     fs::write(cwd.join("note.txt"), "old\n").unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport,
         &Args::test_default(),
         &cwd,
@@ -1572,7 +1626,7 @@ async fn run_agent_emits_failed_file_change_for_rejected_patch_tool() {
             AgentEvent::FileChange { call_id, changes, status, summary, error }
                 if call_id == "call_patch"
                     && changes.is_empty()
-                    && *status == crate::mutation::PatchApplyStatus::Failed
+                    && *status == crate::verify::PatchApplyStatus::Failed
                     && summary.contains("note.txt")
                     && error.as_deref().is_some_and(|message| message.contains("tool error"))
         )
@@ -1609,7 +1663,7 @@ async fn run_agent_gates_protected_file_attachment_through_approval() {
 
     let transport = StubTransport::new(vec![turn]);
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport,
         &Args::test_default(),
         &cwd,
@@ -1684,7 +1738,7 @@ async fn run_agent_includes_protected_file_attachment_when_approved() {
 
     let transport = StubTransport::new(vec![turn]);
     let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport,
         &Args::test_default(),
         &cwd,
@@ -1736,7 +1790,7 @@ async fn run_agent_aborts_turn_when_attachment_approval_aborts() {
     let permissions = aborting_permission_context();
     let transport = StubTransport::new(vec![turn]);
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport,
         &Args::test_default(),
         &cwd,
@@ -1793,13 +1847,13 @@ async fn run_agent_aborts_turn_when_attachment_approval_aborts() {
 async fn resume_replays_transcript_and_appends_new_events() {
     let db_dir = tempdir().unwrap();
     let store =
-        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
     let cwd_dir = tempdir().unwrap();
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let session_id = store
         .create_session(
             &cwd,
-            crate::session::PROVIDER_OPENAI_RESPONSES,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
             "test-model",
             None,
         )
@@ -1849,7 +1903,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         session_id: session_id.clone(),
     };
     let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport_one,
         &args,
         &cwd,
@@ -1900,7 +1954,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         session_id: session_id.clone(),
     };
     let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport_two,
         &args,
         &cwd,
@@ -1987,7 +2041,7 @@ async fn user_message_with_image_attachment_is_sent_as_input_image_content() {
     std::fs::write(cwd.join(&rel), png_bytes).unwrap();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -2084,7 +2138,7 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
     let cwd = cwd.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -2183,7 +2237,7 @@ async fn overflow_recovery_does_not_consume_turn_budget() {
     let cwd = cwd.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -2252,7 +2306,7 @@ async fn overflow_second_failure_surfaces_clean_error() {
     let cwd = cwd.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let err = run_agent(
+    let err = run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -2320,7 +2374,7 @@ async fn manual_compact_emits_lifecycle_events_and_does_not_steer_prompt() {
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -2399,13 +2453,13 @@ async fn manual_compact_persists_checkpoint_for_replay() {
     // from that checkpoint instead of replaying the full transcript.
     let db_dir = tempdir().unwrap();
     let store =
-        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
     let cwd_dir = tempdir().unwrap();
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let session_id = store
         .create_session(
             &cwd,
-            crate::session::PROVIDER_OPENAI_RESPONSES,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
             "test-model",
             None,
         )
@@ -2428,7 +2482,7 @@ async fn manual_compact_persists_checkpoint_for_replay() {
         session_id: session_id.clone(),
     };
     let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport_one,
         &Args::test_default(),
         &cwd,
@@ -2455,7 +2509,7 @@ async fn manual_compact_persists_checkpoint_for_replay() {
         session_id: session_id.clone(),
     };
     let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport_two,
         &Args::test_default(),
         &cwd,
@@ -2517,13 +2571,13 @@ async fn manual_compact_persists_checkpoint_for_replay() {
 async fn manual_compact_persists_file_ops_details_for_replay() {
     let db_dir = tempdir().unwrap();
     let store =
-        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
     let cwd_dir = tempdir().unwrap();
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let session_id = store
         .create_session(
             &cwd,
-            crate::session::PROVIDER_OPENAI_RESPONSES,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
             "test-model",
             None,
         )
@@ -2542,7 +2596,7 @@ async fn manual_compact_persists_file_ops_details_for_replay() {
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &Args::test_default(),
         &cwd,
@@ -2603,7 +2657,7 @@ async fn consecutive_compactions_use_incremental_smaller_prompt() {
     ];
     let first_transport = StubTransport::new(vec![compact_turn_with_text("## Goal\nfirst")]);
     let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &first_transport,
         &Args::test_default(),
         &cwd,
@@ -2631,7 +2685,7 @@ async fn consecutive_compactions_use_incremental_smaller_prompt() {
     ];
     let second_transport = StubTransport::new(vec![compact_turn_with_text("## Goal\nsecond")]);
     let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &second_transport,
         &Args::test_default(),
         &cwd,
@@ -2693,7 +2747,7 @@ async fn manual_compact_recovers_from_text_only_overflow() {
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &Args::test_default(),
         &cwd,
@@ -2749,7 +2803,7 @@ async fn manual_compact_failure_emits_failed_event() {
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let err = run_agent(
+    let err = run_agent_for_test(
         &transport,
         &Args::test_default(),
         &cwd,
@@ -2785,13 +2839,13 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
     // should run compaction first, then proceed with the user's turn.
     let db_dir = tempdir().unwrap();
     let store =
-        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
     let cwd_dir = tempdir().unwrap();
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let session_id = store
         .create_session(
             &cwd,
-            crate::session::PROVIDER_OPENAI_RESPONSES,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
             "test-model",
             None,
         )
@@ -2840,7 +2894,7 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
     let prior = store.load_session(&session_id).unwrap();
     let rebuilt = rebuild_responses_input(&prior, &cwd);
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -2904,13 +2958,13 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
 async fn auto_compact_fires_when_estimated_input_crosses_threshold() {
     let db_dir = tempdir().unwrap();
     let store =
-        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
     let cwd_dir = tempdir().unwrap();
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let session_id = store
         .create_session(
             &cwd,
-            crate::session::PROVIDER_OPENAI_RESPONSES,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
             "test-model",
             None,
         )
@@ -2934,7 +2988,7 @@ async fn auto_compact_fires_when_estimated_input_crosses_threshold() {
     let transport = StubTransport::new(vec![summarise_turn, user_turn]);
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    run_agent(
+    run_agent_for_test(
         &transport,
         &args,
         &cwd,
@@ -2979,13 +3033,13 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
     // trigger compaction again.
     let db_dir = tempdir().unwrap();
     let store =
-        crate::session::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
     let cwd_dir = tempdir().unwrap();
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let session_id = store
         .create_session(
             &cwd,
-            crate::session::PROVIDER_OPENAI_RESPONSES,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
             "test-model",
             None,
         )
@@ -3030,7 +3084,7 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
     let prior_one = store.load_session(&session_id).unwrap();
     let rebuilt_one = rebuild_responses_input(&prior_one, &cwd);
     let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport_one,
         &args,
         &cwd,
@@ -3058,7 +3112,7 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
     let prior_two = store.load_session(&session_id).unwrap();
     let rebuilt_two = rebuild_responses_input(&prior_two, &cwd);
     let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
-    run_agent(
+    run_agent_for_test(
         &transport_two,
         &args,
         &cwd,
@@ -3119,7 +3173,7 @@ async fn create_failure_does_not_emit_retry_event_from_stub() {
     let cwd = cwd.path().canonicalize().unwrap();
     let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let err = run_agent(
+    let err = run_agent_for_test(
         &FailingTransport,
         &Args::test_default(),
         &cwd,

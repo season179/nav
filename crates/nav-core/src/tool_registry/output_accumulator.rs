@@ -6,11 +6,11 @@
 //! to a per-call log file, so the model gets the bounded view it can act on
 //! while the full output stays available on disk for the operator.
 //!
-//! Workspace-independent: spill files live under `<nav_data_dir>/tool-output/`,
-//! never under the workspace root. The accumulator is the only writer of
-//! these files, so the `edit_file` workspace-only write rule does not need
-//! to cover them. Cleanup of stale files happens at startup via
-//! [`sweep_old`] — see `docs/per-turn-token-bounding-prd.md`.
+//! Workspace-independent: spill files prefer `<nav_data_dir>/tool-output/`
+//! and fall back to the system temp dir if the data dir is not writable. They
+//! never live under the workspace root. The accumulator is the only writer of
+//! these files, so the `edit_file` workspace-only write rule does not need to
+//! cover them. Cleanup of stale files happens at startup via [`sweep_old`].
 
 use anyhow::{Context, Result};
 use std::fs::{self, File, OpenOptions};
@@ -44,9 +44,9 @@ pub struct AccumulatorOutput {
 }
 
 impl OutputAccumulator {
-    /// Construct a new accumulator that will spill to `<nav_data_dir>/tool-output/`.
+    /// Construct a new accumulator that spills to the first writable log dir.
     pub fn new(prefix: &str) -> Result<Self> {
-        let dir = default_log_dir()?;
+        let dir = writable_log_dir(default_log_dir()?)?;
         Self::with_dir(&dir, prefix)
     }
 
@@ -124,10 +124,10 @@ impl OutputAccumulator {
                 head_lines: BASH_HEAD_LINES,
             },
         );
-        // `spill_path` is already an absolute path under the nav data dir
-        // (see `default_log_dir`), so we don't need a canonicalize step —
-        // skipping it also removes a TOCTOU window where the path could be
-        // swapped with a symlink between flush and canonicalize.
+        // `spill_path` is already absolute under the selected log directory,
+        // so we don't need a canonicalize step. Skipping it also removes a
+        // TOCTOU window where the path could be swapped with a symlink
+        // between flush and canonicalize.
         let content = format!("{bounded}\n[Full output: {}]\n", self.spill_path.display());
         Ok(AccumulatorOutput {
             content,
@@ -198,13 +198,22 @@ pub fn sweep_old() {
 
 fn try_sweep_old() -> Result<()> {
     let dir = default_log_dir()?;
+    sweep_dir(&dir)?;
+    let fallback = fallback_log_dir();
+    if fallback != dir {
+        sweep_dir(&fallback)?;
+    }
+    Ok(())
+}
+
+fn sweep_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
     let cutoff = SystemTime::now()
         .checked_sub(SEVEN_DAYS)
         .unwrap_or(UNIX_EPOCH);
-    for entry in fs::read_dir(&dir).with_context(|| format!("failed to list {}", dir.display()))? {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to list {}", dir.display()))? {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -237,6 +246,39 @@ fn default_log_dir() -> Result<PathBuf> {
     let base = crate::context::session::xdg_data_home()
         .context("could not resolve XDG data directory for nav tool-output")?;
     Ok(base.join("nav").join("tool-output"))
+}
+
+fn fallback_log_dir() -> PathBuf {
+    std::env::temp_dir().join("nav").join("tool-output")
+}
+
+fn writable_log_dir(preferred: PathBuf) -> Result<PathBuf> {
+    match ensure_writable_dir(&preferred) {
+        Ok(()) => Ok(preferred),
+        Err(preferred_err) => {
+            let fallback = fallback_log_dir();
+            ensure_writable_dir(&fallback).with_context(|| {
+                format!(
+                    "preferred tool-output dir {} was not writable ({preferred_err:#}); fallback {} also failed",
+                    preferred.display(),
+                    fallback.display()
+                )
+            })?;
+            Ok(fallback)
+        }
+    }
+}
+
+fn ensure_writable_dir(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let probe = unique_path(dir, "probe");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .with_context(|| format!("failed to create {}", probe.display()))?;
+    fs::remove_file(&probe).with_context(|| format!("failed to remove {}", probe.display()))?;
+    Ok(())
 }
 
 fn unique_path(dir: &Path, prefix: &str) -> PathBuf {

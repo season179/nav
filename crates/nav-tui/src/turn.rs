@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use nav_core::guardrails::PermissionContext;
 use nav_core::{
-    AgentEvent, Catalog, OpenAiTransport, ProjectContext, SessionBinding, SessionId, SessionStore,
-    TurnControls, UserAttachment, cli::Args, rebuild_responses_input, run_agent_with_control,
+    AgentEvent, AgentTurnRequest, Catalog, OpenAiTransport, ProjectContext, SessionBinding,
+    SessionId, SessionStore, TurnControls, UserAttachment, cli::Args, rebuild_responses_input,
+    run_agent,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,20 +60,21 @@ pub(crate) fn spawn_turn(request: TurnSpawn) -> Result<tokio::task::JoinHandle<(
             store: store.as_ref(),
             session_id,
         };
-        let _ = run_agent_with_control(
-            transport.as_ref(),
-            &args,
-            &cwd,
-            &model_prompt,
-            display_prompt.as_deref(),
-            attachments,
-            agent_tx.clone(),
-            Some(&binding),
-            history_input,
-            skills.as_ref(),
-            Some(project.as_ref()),
-            permissions,
-            controls,
+        let _ = run_agent(
+            AgentTurnRequest::new(
+                transport.as_ref(),
+                &args,
+                &cwd,
+                &model_prompt,
+                agent_tx.clone(),
+                skills.as_ref(),
+                permissions,
+            )
+            .with_display_prompt(display_prompt.as_deref())
+            .with_attachments(attachments)
+            .with_session(Some(&binding), history_input)
+            .with_context(Some(project.as_ref()))
+            .with_controls(controls),
         )
         .await;
     });
