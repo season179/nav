@@ -372,6 +372,101 @@ fn record_approval_decision_updates_row() {
 }
 
 #[test]
+fn append_event_tool_call_approval_decision_updates_audit_row() {
+    let (_dir, store) = open_temp_store();
+    let cwd = Path::new("/tmp/proj");
+    let id = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+    store
+        .append_event(
+            &id,
+            &AgentEvent::ToolCallApprovalRequest {
+                call_id: "c1".into(),
+                approval_id: "a1".into(),
+                tool: "bash".into(),
+                command: None,
+                path: None,
+                cwd: "/ws".into(),
+                reason: "dangerous_pattern".into(),
+                available_decisions: vec![],
+            },
+        )
+        .unwrap();
+
+    store
+        .append_event(
+            &id,
+            &AgentEvent::ToolCallApprovalDecision {
+                approval_id: "a1".into(),
+                decision: crate::ReviewDecision::ApprovedForSession,
+            },
+        )
+        .unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let (decided_at, decision): (Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT decided_at, decision FROM approval WHERE session_id = ?1 AND approval_id = ?2",
+            params![&id, "a1"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(decided_at.is_some());
+    assert_eq!(decision.as_deref(), Some("approved_for_session"));
+}
+
+#[test]
+fn session_store_sink_records_approval_decision_as_event() {
+    let (_dir, store) = open_temp_store();
+    let store = std::sync::Arc::new(store);
+    let cwd = Path::new("/tmp/proj");
+    let id = store
+        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
+        .unwrap();
+    store
+        .append_event(
+            &id,
+            &AgentEvent::ToolCallApprovalRequest {
+                call_id: "c1".into(),
+                approval_id: "a1".into(),
+                tool: "bash".into(),
+                command: None,
+                path: None,
+                cwd: "/ws".into(),
+                reason: "dangerous_pattern".into(),
+                available_decisions: vec![],
+            },
+        )
+        .unwrap();
+
+    let sink = store.sink_for(id.to_string());
+    crate::permissions::approval::DecisionRecorder::record(
+        &sink,
+        "a1",
+        crate::ReviewDecision::Denied,
+    );
+
+    let events = store.load_session(&id).unwrap();
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::ToolCallApprovalDecision {
+            approval_id,
+            decision: crate::ReviewDecision::Denied,
+        }) if approval_id == "a1"
+    ));
+    let conn = store.conn.lock().unwrap();
+    let decision: Option<String> = conn
+        .query_row(
+            "SELECT decision FROM approval WHERE session_id = ?1 AND approval_id = ?2",
+            params![&id, "a1"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(decision.as_deref(), Some("denied"));
+}
+
+#[test]
 fn append_event_tool_call_blocked_writes_audit_row() {
     let (_dir, store) = open_temp_store();
     let cwd = Path::new("/tmp/proj");

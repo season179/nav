@@ -759,16 +759,16 @@ pub async fn run(
                         _ => {}
                     }
                     if let Some((approval_id, decision)) = pane.take_approval_decision() {
-                        // Persist before signalling the agent so the row
-                        // is there if the user inspects --list-sessions
-                        // mid-turn.
-                        if let Err(err) = store.record_approval_decision(
+                        emit_local_event(
+                            AgentEvent::ToolCallApprovalDecision {
+                                approval_id: approval_id.clone(),
+                                decision,
+                            },
+                            &store,
                             &session_id,
-                            &approval_id,
-                            decision.as_str(),
-                        ) {
-                            eprintln!("nav-tui: failed to record approval: {err:#}");
-                        }
+                            &mut chat,
+                            &mut pane,
+                        );
                         pending_approvals.respond(&approval_id, decision);
                     }
                     if let Some(session_id) = pane.take_session_selection() {
@@ -1107,9 +1107,9 @@ fn build_tui_permissions(
         )
     } else {
         // Attach the session store as a durable sink so the approval
-        // request hits the SQLite audit table — without it, the later
-        // `record_approval_decision` UPDATE finds no row. Rebuilt on TUI
-        // resume so approvals are recorded against the active session.
+        // request hits the SQLite audit table; the later decision event
+        // updates that same row. Rebuilt on TUI resume so approvals are
+        // recorded against the active session.
         let channel = ChannelGate::new(pending_approvals, agent_tx)
             .with_sink(Arc::new(store.sink_for(session_id.to_string())));
         (Arc::new(channel), args.approval_policy)

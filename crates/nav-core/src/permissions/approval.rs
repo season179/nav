@@ -118,8 +118,8 @@ pub struct ChannelGate {
     available_decisions: Vec<ReviewDecision>,
     /// Optional durable sink. When set, the gate writes the approval-request
     /// event through this sink before forwarding on `events`. Without it,
-    /// the `approval` audit row never exists and the TUI's subsequent
-    /// `record_approval_decision` call updates zero rows.
+    /// the `approval` audit row never exists and a later decision event has
+    /// no row to update.
     sink: Option<Arc<dyn DurableEventSink>>,
 }
 
@@ -249,7 +249,7 @@ fn parse_approval_response(line: &str) -> Option<ApprovalResponse> {
 /// Hook the response reader can call after parsing each approval — the
 /// Headless CLI path uses this to mirror the operator's decision into SQLite so
 /// the `approval` table's `decided_at`/`decision` columns reflect what
-/// happened (matching the TUI's `record_approval_decision` call).
+/// happened (matching the TUI's durable approval-decision event).
 pub trait DecisionRecorder: Send + Sync {
     fn record(&self, approval_id: &str, decision: ReviewDecision);
 }

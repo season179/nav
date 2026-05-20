@@ -6,10 +6,13 @@ expression: rendered
 › list files in the repo
 
 
-• tool  shell {"command":["ls"]}
+• Running  shell {"command":["ls"]}
 
-└ output  2 lines, 14 chars
-  Cargo.toml
-  src
+• Ran  shell {"command":["ls"]}
+  └ 2 lines, 14 chars
+    Cargo.toml
+    src
 
-• assistant  Two entries: Cargo.toml and src.
+• Two entries: Cargo.toml and src.
+
+─ turn complete ────────────────────────────────────────────

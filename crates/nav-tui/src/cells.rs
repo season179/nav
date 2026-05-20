@@ -20,6 +20,6 @@ pub use messages::{AssistantMessageCell, SkillInvocationCell, UserMessageCell};
 pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use sessions::{SessionListCell, SessionNoticeCell, SessionTreeCell, TranscriptHitsCell};
 pub use subagents::SubagentCell;
-pub use system::ErrorCell;
+pub use system::{ApprovalDecisionCell, ErrorCell, NoticeCell, TurnSeparatorCell};
 pub use tools::{ToolCallCell, ToolOutputCell};
 pub use welcome::WelcomeCell;

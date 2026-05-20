@@ -1,3 +1,4 @@
+use nav_core::UserAttachment;
 use ratatui::style::Color;
 use ratatui::text::Line;
 
@@ -5,10 +6,11 @@ use crate::history::HistoryCell;
 use crate::streaming::StreamController;
 use crate::theme::Theme;
 
-use super::row::{TranscriptRow, TranscriptRowKind, body_width_for_label, finish_row_lines};
+use super::row::{TranscriptRow, TranscriptRowKind, finish_row_lines};
 
 pub struct UserMessageCell {
     text: String,
+    attachments: Vec<UserAttachment>,
     surface: Color,
 }
 
@@ -20,6 +22,19 @@ impl UserMessageCell {
     pub(crate) fn with_surface(text: impl Into<String>, surface: Color) -> Self {
         Self {
             text: text.into(),
+            attachments: Vec::new(),
+            surface,
+        }
+    }
+
+    pub(crate) fn with_attachments(
+        text: impl Into<String>,
+        attachments: Vec<UserAttachment>,
+        surface: Color,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            attachments,
             surface,
         }
     }
@@ -27,7 +42,25 @@ impl UserMessageCell {
 
 impl HistoryCell for UserMessageCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        TranscriptRow::user_message(self.text.as_str(), self.surface).render(width)
+        let body = user_message_body(&self.text, &self.attachments);
+        TranscriptRow::user_message(body, self.surface).render(width)
+    }
+}
+
+fn user_message_body(text: &str, attachments: &[UserAttachment]) -> String {
+    let mut lines = Vec::new();
+    let text = text.trim_end_matches('\n');
+    if !text.is_empty() {
+        lines.push(text.to_string());
+    }
+    lines.extend(attachments.iter().map(attachment_label));
+    lines.join("\n")
+}
+
+fn attachment_label(attachment: &UserAttachment) -> String {
+    match attachment {
+        UserAttachment::Image { path } => format!("[image] {}", path.display()),
+        UserAttachment::File { path } => format!("[file] {}", path.display()),
     }
 }
 
@@ -70,7 +103,7 @@ impl AssistantMessageCell {
 impl HistoryCell for AssistantMessageCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let style = TranscriptRowKind::AssistantMessage.style();
-        let render_width = body_width_for_label(width, style.label());
+        let render_width = style.body_width(width, style.label());
         let (stable, tail) = self.controller.partitioned_lines(render_width);
         let mut out: Vec<Line<'static>> = Vec::with_capacity(stable.len() + tail.len() + 1);
         out.extend(stable);
@@ -101,5 +134,79 @@ impl HistoryCell for SkillInvocationCell {
             format!("{} — {}", self.name, self.detail)
         };
         TranscriptRow::new(TranscriptRowKind::SkillInvocation, body).render(width)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn lines_text(lines: &[Line<'_>]) -> String {
+        let mut out = String::new();
+        for line in lines {
+            for span in &line.spans {
+                out.push_str(&span.content);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn assistant_message_uses_codex_bullet_without_label() {
+        let cell = AssistantMessageCell::new(
+            "This assistant reply wraps cleanly under the bullet marker.",
+        );
+
+        insta::assert_snapshot!(lines_text(&cell.display_lines(36)), @r"
+        • This assistant reply wraps cleanly
+           under the bullet marker.
+
+        ");
+    }
+
+    #[test]
+    fn streaming_assistant_keeps_table_tail_under_same_bullet_shape() {
+        let mut cell = AssistantMessageCell::streaming();
+        cell.push_delta("Quick summary:\n");
+        cell.push_delta("| a | b |\n");
+        cell.push_delta("|---|---|\n");
+
+        insta::assert_snapshot!(lines_text(&cell.display_lines(40)), @r"
+        • Quick summary:
+          | a | b |
+          |---|---|
+
+        ");
+    }
+
+    #[test]
+    fn user_attachments_render_inside_message_box() {
+        let cell = UserMessageCell::with_attachments(
+            "Look here",
+            vec![
+                UserAttachment::Image {
+                    path: PathBuf::from(".nav/clipboard/shot.png"),
+                },
+                UserAttachment::File {
+                    path: PathBuf::from("src/main.rs"),
+                },
+            ],
+            Color::Rgb(1, 2, 3),
+        );
+        let lines = cell.display_lines(48);
+
+        let rendered = lines_text(&lines);
+        assert!(rendered.contains("› Look here"));
+        assert!(rendered.contains("  [image] .nav/clipboard/shot.png"));
+        assert!(rendered.contains("  [file] src/main.rs"));
+        assert!(
+            lines
+                .iter()
+                .take(5)
+                .all(|line| line.style.bg == Some(Color::Rgb(1, 2, 3)))
+        );
     }
 }

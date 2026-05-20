@@ -307,6 +307,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             | AgentEvent::ProviderRetry { .. }
             | AgentEvent::ContextTrimmed { .. }
             | AgentEvent::ToolCallApprovalRequest { .. }
+            | AgentEvent::ToolCallApprovalDecision { .. }
             | AgentEvent::ToolCallBlocked { .. }
             | AgentEvent::PendingInputQueued { .. }
             | AgentEvent::PendingInputEdited { .. }
@@ -538,6 +539,17 @@ impl SessionStore {
                      (session_id, approval_id, requested_at, tool, reason, rule)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![session_id, call_id, now, tool, reason, rule],
+                )?;
+            }
+            AgentEvent::ToolCallApprovalDecision {
+                approval_id,
+                decision,
+            } => {
+                tx.execute(
+                    "UPDATE approval
+                     SET decided_at = ?1, decision = ?2
+                     WHERE session_id = ?3 AND approval_id = ?4",
+                    params![now, decision.as_str(), session_id, approval_id],
                 )?;
             }
             _ => {}
@@ -1379,8 +1391,8 @@ fn first_user_prompt_from_event_json(data: Option<String>) -> Option<String> {
 ///
 /// The `ChannelGate` lives outside `run_agent`'s emit path, so without this
 /// the approval-request event would only land on the live `events` channel
-/// and never reach SQLite — leaving `record_approval_decision` updating
-/// zero rows. Build one with [`SessionStore::sink_for`].
+/// and never reach SQLite, leaving the later approval decision with no audit
+/// row to update. Build one with [`SessionStore::sink_for`].
 pub struct SessionStoreSink {
     store: std::sync::Arc<SessionStore>,
     session_id: String,
@@ -1398,11 +1410,12 @@ impl crate::permissions::approval::DurableEventSink for SessionStoreSink {
 
 impl crate::permissions::approval::DecisionRecorder for SessionStoreSink {
     fn record(&self, approval_id: &str, decision: crate::permissions::ReviewDecision) {
-        if let Err(err) =
-            self.store
-                .record_approval_decision(&self.session_id, approval_id, decision.as_str())
-        {
-            eprintln!("nav-core: failed to record approval decision: {err:#}");
+        let event = AgentEvent::ToolCallApprovalDecision {
+            approval_id: approval_id.to_string(),
+            decision,
+        };
+        if let Err(err) = self.store.append_event(&self.session_id, &event) {
+            eprintln!("nav-core: failed to persist approval decision: {err:#}");
         }
     }
 }

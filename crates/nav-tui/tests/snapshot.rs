@@ -1,6 +1,7 @@
 use nav_core::{
     AgentEvent, FileChangeKind, FileChangeSummary, FileDiffSummary, GitCheckpointAction,
-    GitCheckpointStatus, PatchApplyStatus, PendingInputMode, SessionSummary, TurnUsage,
+    GitCheckpointStatus, PatchApplyStatus, PendingInputMode, ReviewDecision, SessionSummary,
+    TurnUsage, UserAttachment,
 };
 use nav_tui::ChatWidget;
 use ratatui::Terminal;
@@ -109,6 +110,74 @@ fn literal_skill_xml_without_nav_dir_attribute_stays_user_text() {
 }
 
 #[test]
+fn user_message_attachments_render_in_submitted_box() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::UserMessage {
+        text: "See attached".to_string(),
+        display_text: None,
+        attachments: vec![
+            UserAttachment::Image {
+                path: ".nav/clipboard/shot.png".into(),
+            },
+            UserAttachment::File {
+                path: "src/main.rs".into(),
+            },
+        ],
+    });
+
+    let rendered = render_widget(&widget, 80, 8);
+    assert!(rendered.contains("› See attached"), "{rendered}");
+    assert!(
+        rendered.contains("  [image] .nav/clipboard/shot.png"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("  [file] src/main.rs"), "{rendered}");
+}
+
+#[test]
+fn approval_decision_event_renders_audit_row() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallApprovalDecision {
+        approval_id: "approval-1".to_string(),
+        decision: ReviewDecision::ApprovedForSession,
+    });
+
+    let rendered = render_widget(&widget, 80, 4);
+    assert!(
+        rendered.contains("✓ approved matching tool calls for this session"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn pure_conversation_turn_complete_does_not_render_separator() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::UserMessage {
+        text: "hello".to_string(),
+        display_text: None,
+        attachments: Vec::new(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "Hi there.".to_string(),
+    });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage {
+            tokens_input: 10,
+            tokens_output: 2,
+            ..TurnUsage::default()
+        },
+    });
+
+    let rendered = render_widget(&widget, 80, 10);
+    assert!(rendered.contains("• Hi there."), "{rendered}");
+    assert!(!rendered.contains("─ 10 in, 2 out"), "{rendered}");
+    assert!(!rendered.contains("turn complete"), "{rendered}");
+}
+
+#[test]
 fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
     let mut widget = ChatWidget::new();
 
@@ -131,10 +200,14 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
     let rendered = render_widget(&widget, 90, 20);
 
     assert!(
-        rendered.contains("• tool  read_file SKILL.md (zoom-out skill)"),
+        rendered.contains("• Exploring\n  Read SKILL.md (zoom-out skill)"),
         "{rendered}"
     );
-    assert!(rendered.contains("└ output  20 lines"), "{rendered}");
+    assert!(
+        rendered.contains("• Explored  Read SKILL.md (zoom-out skill)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("  └ 20 lines"), "{rendered}");
     assert!(rendered.contains("line 03"), "{rendered}");
     assert!(rendered.contains("… 16 more lines hidden"), "{rendered}");
     assert!(!rendered.contains("line 19"), "{rendered}");
@@ -155,7 +228,7 @@ fn apply_patch_tool_row_summarizes_patch_paths() {
     let rendered = render_widget(&widget, 100, 8);
 
     assert!(
-        rendered.contains("• tool  apply_patch M src/lib.rs, A src/new.rs"),
+        rendered.contains("• Running  apply_patch M src/lib.rs, A src/new.rs"),
         "{rendered}"
     );
     assert!(!rendered.contains("*** Begin Patch"), "{rendered}");
@@ -176,7 +249,7 @@ fn apply_patch_tool_row_summarizes_moves() {
     let rendered = render_widget(&widget, 100, 8);
 
     assert!(
-        rendered.contains("• tool  apply_patch M old.rs -> new.rs"),
+        rendered.contains("• Running  apply_patch M old.rs -> new.rs"),
         "{rendered}"
     );
 }
@@ -343,7 +416,7 @@ fn assistant_deltas_paint_incrementally_then_finalize() {
         text: "Hello, ".to_string(),
     });
     let mid = render_widget(&widget, 60, 6);
-    assert!(mid.contains("• assistant  Hello,"), "{mid}");
+    assert!(mid.contains("• Hello,"), "{mid}");
 
     widget.ingest(AgentEvent::AssistantMessageDelta {
         text: "world!".to_string(),
@@ -355,8 +428,8 @@ fn assistant_deltas_paint_incrementally_then_finalize() {
         text: "Hello, world!".to_string(),
     });
     let done = render_widget(&widget, 60, 6);
-    assert!(done.contains("• assistant  Hello, world!"), "{done}");
-    let count = done.matches("• assistant").count();
+    assert!(done.contains("• Hello, world!"), "{done}");
+    let count = done.matches("• Hello, world!").count();
     assert_eq!(count, 1, "expected a single assistant row, got:\n{done}");
 }
 
@@ -367,7 +440,7 @@ fn assistant_done_without_deltas_still_renders_full_text() {
         text: "resumed text".to_string(),
     });
     let rendered = render_widget(&widget, 60, 6);
-    assert!(rendered.contains("• assistant  resumed text"), "{rendered}");
+    assert!(rendered.contains("• resumed text"), "{rendered}");
 }
 
 #[test]
@@ -392,11 +465,12 @@ fn tool_call_mid_stream_finalizes_open_assistant_cell() {
     assert!(rendered.contains("thinking about it"), "{rendered}");
     assert!(rendered.contains("second message"), "{rendered}");
     assert_eq!(
-        rendered.matches("• assistant").count(),
+        rendered.matches("• thinking about it").count()
+            + rendered.matches("• second message").count(),
         2,
         "expected two separate assistant rows, got:\n{rendered}"
     );
-    let tool_idx = rendered.find("• tool").expect("tool row present");
+    let tool_idx = rendered.find("• Running").expect("tool row present");
     let first_idx = rendered.find("thinking about it").unwrap();
     let second_idx = rendered.find("second message").unwrap();
     assert!(first_idx < tool_idx && tool_idx < second_idx, "{rendered}");
@@ -425,7 +499,7 @@ fn pending_input_mid_stream_keeps_single_assistant_cell() {
 
     let rendered = render_widget(&widget, 70, 12);
     assert_eq!(
-        rendered.matches("• assistant").count(),
+        rendered.matches("• Hello world!").count(),
         1,
         "pending-input mid-stream must not split assistant text into two cells:\n{rendered}"
     );

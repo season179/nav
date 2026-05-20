@@ -95,6 +95,7 @@ fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
         | AgentEvent::TurnDiff { .. }
         | AgentEvent::GitCheckpoint { .. }
         | AgentEvent::ToolCallApprovalRequest { .. }
+        | AgentEvent::ToolCallApprovalDecision { .. }
         | AgentEvent::ToolCallBlocked { .. }
         | AgentEvent::PendingInputQueued { .. }
         | AgentEvent::PendingInputEdited { .. }

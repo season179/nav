@@ -150,6 +150,13 @@ pub enum AgentEvent {
         reason: String,
         available_decisions: Vec<ReviewDecision>,
     },
+    /// The operator answered a pending approval request. This is durable UI
+    /// audit data; replay ignores it for model context, while the session
+    /// approval side table mirrors the same decision for queries.
+    ToolCallApprovalDecision {
+        approval_id: String,
+        decision: ReviewDecision,
+    },
     /// A tool call was refused before execution. Stable `rule` ids let
     /// frontends localize or audit the rejection.
     ToolCallBlocked {
@@ -270,6 +277,7 @@ impl AgentEvent {
             AgentEvent::TurnDiff { .. } => "turn_diff",
             AgentEvent::GitCheckpoint { .. } => "git_checkpoint",
             AgentEvent::ToolCallApprovalRequest { .. } => "tool_call_approval_request",
+            AgentEvent::ToolCallApprovalDecision { .. } => "tool_call_approval_decision",
             AgentEvent::ToolCallBlocked { .. } => "tool_call_blocked",
             AgentEvent::PendingInputQueued { .. } => "pending_input_queued",
             AgentEvent::PendingInputEdited { .. } => "pending_input_edited",
@@ -347,6 +355,25 @@ mod tests {
             })
         );
         assert_eq!(event.kind(), "tool_call_approval_request");
+        assert!(event.is_durable());
+    }
+
+    #[test]
+    fn tool_call_approval_decision_wire_format() {
+        let event = AgentEvent::ToolCallApprovalDecision {
+            approval_id: "a1".into(),
+            decision: ReviewDecision::ApprovedForSession,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "tool_call_approval_decision",
+                "approval_id": "a1",
+                "decision": "approved_for_session",
+            })
+        );
+        assert_eq!(event.kind(), "tool_call_approval_decision");
         assert!(event.is_durable());
     }
 

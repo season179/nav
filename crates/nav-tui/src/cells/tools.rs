@@ -26,27 +26,96 @@ impl ToolCallContext {
         }
     }
 
-    fn summary(&self) -> String {
+    fn started_row(&self) -> (&'static str, String) {
+        self.visual().started_row()
+    }
+
+    fn completed_row(&self, is_error: bool) -> (&'static str, String) {
+        self.visual().completed_row(is_error)
+    }
+
+    fn visual(&self) -> ToolVisual {
         match self.name.as_str() {
-            tool @ ("read_file" | "list_files" | "edit_file") => self
-                .path_tool_summary(tool)
-                .unwrap_or_else(|| fallback_tool_summary(&self.name, &self.arguments)),
+            "read_file" => self.path_exploration("Read"),
+            "list_files" => self.path_exploration("List"),
+            "edit_file" => self
+                .path_arg()
+                .map(|path| ToolVisual::Other {
+                    target: format!("edit_file {}", display_path(path)),
+                })
+                .unwrap_or_else(|| self.fallback_visual()),
             "code_search" => {
                 let pattern = string_arg(&self.arguments, "pattern").unwrap_or("<pattern>");
                 let path = string_arg(&self.arguments, "path").unwrap_or(".");
-                format!("code_search {:?} in {}", pattern, display_path(path))
+                ToolVisual::Exploration {
+                    action: "Search",
+                    target: format!("{pattern:?} in {}", display_path(path)),
+                }
             }
             "bash" => string_arg(&self.arguments, "command")
-                .map(|cmd| format!("bash {}", truncate_inline(cmd)))
-                .unwrap_or_else(|| fallback_tool_summary(&self.name, &self.arguments)),
+                .map(|cmd| ToolVisual::Command {
+                    target: truncate_inline(cmd),
+                })
+                .unwrap_or_else(|| self.fallback_visual()),
             "apply_patch" => apply_patch_summary(&self.arguments)
-                .unwrap_or_else(|| fallback_tool_summary(&self.name, &self.arguments)),
-            _ => fallback_tool_summary(&self.name, &self.arguments),
+                .map(|target| ToolVisual::Other { target })
+                .unwrap_or_else(|| self.fallback_visual()),
+            _ => self.fallback_visual(),
         }
     }
 
-    fn path_tool_summary(&self, tool: &str) -> Option<String> {
-        string_arg(&self.arguments, "path").map(|path| format!("{tool} {}", display_path(path)))
+    fn path_arg(&self) -> Option<&str> {
+        string_arg(&self.arguments, "path")
+    }
+
+    fn path_exploration(&self, action: &'static str) -> ToolVisual {
+        self.path_arg()
+            .map(|path| ToolVisual::Exploration {
+                action,
+                target: display_path(path),
+            })
+            .unwrap_or_else(|| self.fallback_visual())
+    }
+
+    fn fallback_visual(&self) -> ToolVisual {
+        ToolVisual::Other {
+            target: fallback_tool_summary(&self.name, &self.arguments),
+        }
+    }
+}
+
+enum ToolVisual {
+    Command {
+        target: String,
+    },
+    Exploration {
+        action: &'static str,
+        target: String,
+    },
+    Other {
+        target: String,
+    },
+}
+
+impl ToolVisual {
+    fn started_row(self) -> (&'static str, String) {
+        match self {
+            Self::Command { target } | Self::Other { target } => ("Running", target),
+            Self::Exploration { action, target } => ("Exploring", format!("\n{action} {target}")),
+        }
+    }
+
+    fn completed_row(self, is_error: bool) -> (&'static str, String) {
+        match (is_error, self) {
+            (true, Self::Command { target } | Self::Other { target }) => ("Failed", target),
+            (true, Self::Exploration { action, target }) => {
+                ("Failed", format!("{action} {target}"))
+            }
+            (false, Self::Command { target } | Self::Other { target }) => ("Ran", target),
+            (false, Self::Exploration { action, target }) => {
+                ("Explored", format!("{action} {target}"))
+            }
+        }
     }
 }
 
@@ -138,7 +207,8 @@ impl ToolCallCell {
 
 impl HistoryCell for ToolCallCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        TranscriptRow::new(TranscriptRowKind::ToolCall, self.context.summary()).render(width)
+        let (label, body) = self.context.started_row();
+        TranscriptRow::with_label(TranscriptRowKind::ToolCall, label, body).render(width)
     }
 }
 
@@ -177,12 +247,17 @@ impl HistoryCell for ToolOutputCell {
         } else {
             TranscriptRowKind::ToolOutput
         };
-        let body = tool_output_body(&self.output, self.context.as_ref());
-        TranscriptRow::new(kind, body).render(width)
+        let (label, summary) = match self.context.as_ref() {
+            Some(context) => context.completed_row(self.is_error),
+            None if self.is_error => ("Failed", "tool output".to_string()),
+            None => ("Ran", "tool output".to_string()),
+        };
+        let body = tool_output_body(summary, &self.output, self.context.as_ref());
+        TranscriptRow::with_label(kind, label, body).render(width)
     }
 }
 
-fn tool_output_body(output: &str, context: Option<&ToolCallContext>) -> String {
+fn tool_output_body(summary: String, output: &str, context: Option<&ToolCallContext>) -> String {
     let trimmed = output.trim_end_matches('\n');
     let preview = preview_output(
         trimmed,
@@ -190,10 +265,17 @@ fn tool_output_body(output: &str, context: Option<&ToolCallContext>) -> String {
         preview_char_limit(context),
     );
     let stats = output_stats(trimmed);
+    let mut body = summary;
+    body.push_str("\n└ ");
+    body.push_str(&stats);
     if preview.is_empty() {
-        stats
+        body
     } else {
-        format!("{stats}\n{preview}")
+        for line in preview.lines() {
+            body.push_str("\n  ");
+            body.push_str(line);
+        }
+        body
     }
 }
 
@@ -232,4 +314,78 @@ fn is_skill_file_read(context: &ToolCallContext) -> bool {
         && string_arg(&context.arguments, "path")
             .and_then(skill_name_from_skill_md_path)
             .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn lines_text(lines: &[Line<'_>]) -> String {
+        let mut out = String::new();
+        for line in lines {
+            for span in &line.spans {
+                out.push_str(&span.content);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn bash_tool_uses_running_and_ran_language() {
+        let started = ToolCallCell::new("bash", json!({ "command": "pwd" }));
+        assert!(lines_text(&started.display_lines(80)).starts_with("• Running  pwd\n"));
+
+        let output = ToolOutputCell::with_context(
+            "/Users/season/Personal/nav\n",
+            false,
+            Some(started.context()),
+        );
+        let rendered = lines_text(&output.display_lines(80));
+        assert!(rendered.starts_with("• Ran  pwd\n"));
+        assert!(rendered.contains("  └ 1 line, 26 chars\n"));
+        assert!(rendered.contains("    /Users/season/Personal/nav\n"));
+    }
+
+    #[test]
+    fn read_list_and_search_render_as_exploration() {
+        let read = ToolCallCell::new("read_file", json!({ "path": "src/main.rs" }));
+        assert!(
+            lines_text(&read.display_lines(80)).starts_with("• Exploring\n  Read src/main.rs\n")
+        );
+
+        let list = ToolCallCell::new("list_files", json!({ "path": "src" }));
+        assert!(lines_text(&list.display_lines(80)).starts_with("• Exploring\n  List src\n"));
+
+        let search = ToolCallCell::new(
+            "code_search",
+            json!({ "pattern": "AgentEvent", "path": "crates" }),
+        );
+        assert!(
+            lines_text(&search.display_lines(80))
+                .starts_with("• Exploring\n  Search \"AgentEvent\" in crates\n")
+        );
+    }
+
+    #[test]
+    fn failed_tool_uses_failed_row_and_output_gutter() {
+        let started = ToolCallCell::new("bash", json!({ "command": "false" }));
+        let output = ToolOutputCell::with_context("exit status 1", true, Some(started.context()));
+        let rendered = lines_text(&output.display_lines(80));
+
+        assert!(rendered.starts_with("■ Failed  false\n"));
+        assert!(rendered.contains("  └ 1 line, 13 chars\n"));
+        assert!(rendered.contains("    exit status 1\n"));
+    }
+
+    #[test]
+    fn failed_exploration_keeps_the_action_in_the_summary() {
+        let started = ToolCallCell::new("read_file", json!({ "path": "src/main.rs" }));
+        let output =
+            ToolOutputCell::with_context("permission denied", true, Some(started.context()));
+        let rendered = lines_text(&output.display_lines(80));
+
+        assert!(rendered.starts_with("■ Failed  Read src/main.rs\n"));
+    }
 }

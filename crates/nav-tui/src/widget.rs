@@ -5,10 +5,11 @@ use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashMap;
 
 use crate::cells::{
-    AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell, FileChangeCell,
-    GitCheckpointCell, PendingInputCell, SessionListCell, SessionNoticeCell, SessionTreeCell,
-    SkillInvocationCell, SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell,
-    TranscriptHitsCell, TurnAbortedCell, TurnDiffCell, UserMessageCell, WelcomeCell,
+    ApprovalDecisionCell, AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell,
+    FileChangeCell, GitCheckpointCell, NoticeCell, PendingInputCell, SessionListCell,
+    SessionNoticeCell, SessionTreeCell, SkillInvocationCell, SubagentCell, ToolCallCell,
+    ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell, TurnDiffCell,
+    TurnSeparatorCell, UserMessageCell, WelcomeCell,
 };
 use crate::history::HistoryCell;
 use crate::theme::Theme;
@@ -20,6 +21,7 @@ pub struct ChatWidget {
     theme: Theme,
     tool_calls: HashMap<String, ToolCallContext>,
     subagent_labels: HashMap<String, String>,
+    turn_has_work: bool,
     /// In-flight streaming assistant cell, anchored to its eventual index
     /// in `cells`. Held outside `cells` so deltas can mutate it in place;
     /// control-plane rows that fire mid-stream (pending-input queue ops)
@@ -43,6 +45,7 @@ impl ChatWidget {
             theme,
             tool_calls: HashMap::new(),
             subagent_labels: HashMap::new(),
+            turn_has_work: false,
             streaming_assistant: None,
             scroll_top: None,
         }
@@ -51,7 +54,7 @@ impl ChatWidget {
     /// Append a user-authored message before the agent loop echoes the durable
     /// event back. Resume uses `AgentEvent::UserMessage` directly.
     pub fn push_user(&mut self, text: impl Into<String>) {
-        self.push_user_event(text.into(), None);
+        self.push_user_event(text.into(), None, Vec::new());
     }
 
     pub fn push_skill(&mut self, name: impl Into<String>, detail: impl Into<String>) {
@@ -121,10 +124,11 @@ impl ChatWidget {
             AgentEvent::UserMessage {
                 text,
                 display_text,
-                attachments: _,
+                attachments,
             } => {
                 self.close_streaming_assistant();
-                self.push_user_event(text, display_text);
+                self.turn_has_work = false;
+                self.push_user_event(text, display_text, attachments);
             }
             AgentEvent::AssistantMessageDelta { text } => {
                 if self.streaming_assistant.is_none() {
@@ -143,8 +147,18 @@ impl ChatWidget {
                     self.push_cell(AssistantMessageCell::new(text));
                 }
             }
-            AgentEvent::TurnComplete { .. } | AgentEvent::ToolCallApprovalRequest { .. } => {
+            AgentEvent::TurnComplete { usage } => {
                 self.close_streaming_assistant();
+                if self.turn_has_work {
+                    self.push_cell(TurnSeparatorCell::new(usage));
+                }
+                self.turn_has_work = false;
+            }
+            AgentEvent::ToolCallApprovalRequest { .. } => {
+                self.close_streaming_assistant();
+            }
+            AgentEvent::ToolCallApprovalDecision { decision, .. } => {
+                self.push_cell(ApprovalDecisionCell::new(decision));
             }
             AgentEvent::ProviderRetry {
                 attempt,
@@ -153,12 +167,12 @@ impl ChatWidget {
                 reason,
             } => {
                 let secs = delay_ms as f64 / 1000.0;
-                self.push_cell(ErrorCell::new(format!(
+                self.push_cell(NoticeCell::warning(format!(
                     "provider retry {attempt}/{max_attempts} after {secs:.1}s — {reason}"
                 )));
             }
             AgentEvent::ContextTrimmed { dropped_pairs } => {
-                self.push_cell(ErrorCell::new(format!(
+                self.push_cell(NoticeCell::warning(format!(
                     "context window exceeded — trimmed {dropped_pairs} oldest tool pair(s) and retried"
                 )));
             }
@@ -169,7 +183,7 @@ impl ChatWidget {
             } => {
                 let cell = ToolCallCell::new(name, arguments);
                 self.tool_calls.insert(call_id, cell.context());
-                self.push_cell(cell);
+                self.push_work_cell(cell);
             }
             AgentEvent::ToolCallOutput {
                 call_id,
@@ -177,7 +191,7 @@ impl ChatWidget {
                 is_error,
             } => {
                 let context = self.tool_calls.remove(&call_id);
-                self.push_cell(ToolOutputCell::with_context(output, is_error, context));
+                self.push_work_cell(ToolOutputCell::with_context(output, is_error, context));
             }
             AgentEvent::SubagentStarted { id, label, task } => {
                 if let Some(label) = label.clone() {
@@ -185,15 +199,15 @@ impl ChatWidget {
                 } else {
                     self.subagent_labels.remove(&id);
                 }
-                self.push_cell(SubagentCell::started(id, label, task));
+                self.push_work_cell(SubagentCell::started(id, label, task));
             }
             AgentEvent::SubagentCompleted { id, summary } => {
                 let label = self.subagent_labels.remove(&id);
-                self.push_cell(SubagentCell::completed(id, label, summary));
+                self.push_work_cell(SubagentCell::completed(id, label, summary));
             }
             AgentEvent::SubagentFailed { id, message } => {
                 let label = self.subagent_labels.remove(&id);
-                self.push_cell(SubagentCell::failed(id, label, message));
+                self.push_work_cell(SubagentCell::failed(id, label, message));
             }
             AgentEvent::FileChange {
                 changes,
@@ -202,14 +216,14 @@ impl ChatWidget {
                 error,
                 ..
             } => {
-                self.push_cell(FileChangeCell::new(changes, status, summary, error));
+                self.push_work_cell(FileChangeCell::new(changes, status, summary, error));
             }
             AgentEvent::TurnDiff {
                 files,
                 unified_diff,
                 truncated,
             } => {
-                self.push_cell(TurnDiffCell::new(files, unified_diff, truncated));
+                self.push_work_cell(TurnDiffCell::new(files, unified_diff, truncated));
             }
             AgentEvent::GitCheckpoint {
                 action,
@@ -218,7 +232,7 @@ impl ChatWidget {
                 stash_oid,
                 message,
             } => {
-                self.push_cell(GitCheckpointCell::new(
+                self.push_work_cell(GitCheckpointCell::new(
                     action, status, stash_ref, stash_oid, message,
                 ));
             }
@@ -228,7 +242,7 @@ impl ChatWidget {
             AgentEvent::ToolCallBlocked {
                 tool, reason, rule, ..
             } => {
-                self.push_cell(ErrorCell::new(format!(
+                self.push_work_cell(NoticeCell::error(format!(
                     "tool {tool} blocked ({rule}): {reason}"
                 )));
             }
@@ -276,7 +290,7 @@ impl ChatWidget {
                 trigger,
                 tokens_before,
             } => {
-                self.push_cell(CompactionCell::started(trigger, tokens_before));
+                self.push_work_cell(CompactionCell::started(trigger, tokens_before));
             }
             AgentEvent::CompactionCompleted {
                 trigger,
@@ -285,7 +299,7 @@ impl ChatWidget {
                 tokens_before,
                 ..
             } => {
-                self.push_cell(CompactionCell::new(
+                self.push_work_cell(CompactionCell::new(
                     CompactionPhase::Completed,
                     trigger,
                     Some(summary),
@@ -295,7 +309,7 @@ impl ChatWidget {
                 ));
             }
             AgentEvent::CompactionFailed { trigger, message } => {
-                self.push_cell(CompactionCell::new(
+                self.push_work_cell(CompactionCell::new(
                     CompactionPhase::Failed,
                     trigger,
                     None,
@@ -387,6 +401,11 @@ impl ChatWidget {
         self.cells.push(Box::new(cell));
     }
 
+    fn push_work_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
+        self.turn_has_work = true;
+        self.push_cell(cell);
+    }
+
     /// Push a control-plane cell (pending-input queue ops) that does NOT
     /// end the assistant's in-flight message. The cell sits past the
     /// streaming anchor in `cells`, so it renders after the streaming row
@@ -404,20 +423,33 @@ impl ChatWidget {
         }
     }
 
-    fn push_user_event(&mut self, text: String, display_text: Option<String>) {
+    fn push_user_event(
+        &mut self,
+        text: String,
+        display_text: Option<String>,
+        attachments: Vec<nav_core::UserAttachment>,
+    ) {
         if let Some(skill) = parse_skill_prompt(&text) {
             self.push_skill(skill.name, "applied to this turn");
             let visible_text = display_text.unwrap_or(skill.request);
-            if !visible_text.trim().is_empty() {
-                self.push_user_cell(visible_text);
+            if !visible_text.trim().is_empty() || !attachments.is_empty() {
+                self.push_user_cell(visible_text, attachments);
             }
             return;
         }
-        self.push_user_cell(display_text.unwrap_or(text));
+        self.push_user_cell(display_text.unwrap_or(text), attachments);
     }
 
-    fn push_user_cell(&mut self, text: impl Into<String>) {
-        self.push_cell(UserMessageCell::with_surface(text, self.theme.composer_bg));
+    fn push_user_cell(
+        &mut self,
+        text: impl Into<String>,
+        attachments: Vec<nav_core::UserAttachment>,
+    ) {
+        self.push_cell(UserMessageCell::with_attachments(
+            text,
+            attachments,
+            self.theme.composer_bg,
+        ));
     }
 }
 
