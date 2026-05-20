@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::oneshot;
 use ulid::Ulid;
 
-use crate::agent::AgentEvent;
+use crate::agent_loop::AgentEvent;
 use crate::agent_loop::protocol::{JSONRPC_VERSION, METHOD_APPROVAL_RESPOND};
 use crate::permissions::ReviewDecision;
 

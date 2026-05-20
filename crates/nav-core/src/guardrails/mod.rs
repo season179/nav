@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crate::agent::{AgentEvent, UserAttachment};
+use crate::agent_loop::{AgentEvent, UserAttachment};
 use crate::permissions::approval::ApprovalRequest;
 use crate::permissions::protected::is_protected_read;
 
@@ -123,6 +123,12 @@ pub mod permissions {
 
 pub mod preflight;
 
+pub mod protected {
+    //! Protected file and metadata path rules.
+
+    pub use crate::permissions::protected::*;
+}
+
 pub mod sandbox {
     //! Platform sandbox adapters.
 
@@ -134,7 +140,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use crate::agent::UserAttachment;
+    use crate::agent_loop::UserAttachment;
     use crate::guardrails::PermissionContext;
     use crate::guardrails::{ATTACHMENT_READ_TOOL, gate_protected_attachments};
     use crate::permissions::approval::AutoGate;
@@ -187,7 +193,7 @@ mod tests {
 
         assert!(outcome.attachments.is_empty());
         assert_eq!(outcome.abort_reason, None);
-        let [crate::agent::AgentEvent::ToolCallBlocked { tool, rule, .. }] =
+        let [crate::agent_loop::AgentEvent::ToolCallBlocked { tool, rule, .. }] =
             outcome.blocked_events.as_slice()
         else {
             panic!("expected one blocked attachment event");

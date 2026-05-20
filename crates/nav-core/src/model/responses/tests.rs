@@ -2,10 +2,10 @@ use super::collector::decode_completed_response;
 use super::parser::function_calls;
 use super::types::{MessagePart, ResponseEnvelope, ResponseItem};
 use super::*;
-use crate::agent::TurnUsage;
+use crate::agent_loop::TurnUsage;
 use crate::cli::Args;
-use crate::project::{ContextFile, ContextScope, ProjectContext};
-use crate::skills::Catalog;
+use crate::context::Catalog;
+use crate::context::{ContextFile, ContextScope, ProjectContext};
 use crate::tool_registry::{SPAWN_SUBAGENT_TOOL, ToolAccess};
 use serde_json::json;
 use std::path::PathBuf;
@@ -162,7 +162,7 @@ fn response_body_passes_input_through() {
 
 #[test]
 fn response_body_lists_skills_when_present() {
-    use crate::skills::{Skill, SkillScope};
+    use crate::context::{Skill, SkillScope};
     let args = Args::test_default();
     let cwd = std::path::Path::new("/tmp");
     let catalog = Catalog::new(vec![Skill {

@@ -27,9 +27,8 @@ CREATE TABLE IF NOT EXISTS session (
     fork_point_seq INTEGER
 );
 
--- idx_session_parent is created in the v3 migration step rather than here,
--- so init.sql can run against a v1 database whose session table predates
--- the parent_id column without `CREATE INDEX` failing.
+CREATE INDEX IF NOT EXISTS idx_session_parent
+    ON session(parent_id);
 
 CREATE INDEX IF NOT EXISTS idx_session_cwd_updated_at
     ON session(cwd, updated_at DESC);

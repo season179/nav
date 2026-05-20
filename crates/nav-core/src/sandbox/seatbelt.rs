@@ -16,8 +16,8 @@ use anyhow::{Context, Result, bail};
 use tokio::{process::Command, time};
 
 use super::{SandboxOutput, SandboxRequest, SandboxRunner};
+use crate::guardrails::protected::PROTECTED_METADATA_NAMES;
 use crate::permissions::SandboxPolicy;
-use crate::permissions::protected::PROTECTED_METADATA_NAMES;
 
 /// Hard-coded path; matches codex. Resolving via `$PATH` would let a
 /// poisoned PATH defeat the sandbox.

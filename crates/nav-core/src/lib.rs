@@ -2,42 +2,24 @@
 //!
 //! The crate is organized around the six visible parts of the agent harness:
 //! tool registry, model, context management, guardrails, agent loop, and
-//! verify. The older flat module names remain available as compatibility
-//! exports while the implementation is moved behind those reader-facing parts.
+//! verify.
 
 pub mod agent_loop;
+pub mod cli;
 pub mod context;
+pub mod git_checkpoint;
 pub mod guardrails;
 pub mod model;
 pub mod tool_registry;
 pub mod verify;
 
-// Compatibility modules. New code should prefer the six harness modules above
-// when there is an obvious owner, but these paths stay public for downstream
-// callers and for incremental refactoring.
-pub mod agent;
-pub mod auth;
-pub mod cli;
-pub mod context_report;
-pub mod control;
-pub mod doctor;
-pub mod extensions;
-pub mod git_checkpoint;
-pub mod git_diff;
-pub mod models;
-pub mod mutation;
-pub mod permissions;
-pub mod project;
-pub mod protocol;
-pub mod responses;
-pub mod sandbox;
-pub mod session;
-pub mod skills;
-pub mod tools;
+mod permissions;
+mod sandbox;
 
+pub use agent_loop::AgentTurnRequest;
 pub use agent_loop::{
     AgentEvent, CompactionTrigger, EventStream, ResponsesTransport, SessionBinding, TurnUsage,
-    UserAttachment, run_agent, run_agent_with_control,
+    UserAttachment, run_agent,
 };
 pub use agent_loop::{
     ControlPlane, PendingInput, PendingInputDraft, PendingInputMode, PendingSkill,
@@ -68,8 +50,8 @@ pub use context::{
 pub use git_checkpoint::{
     GitCheckpointAction, GitCheckpointOutcome, GitCheckpointStatus, GitStashEntry,
 };
+pub use guardrails::{ApprovalReason, AskForApproval, BlockRule, ReviewDecision, SandboxPolicy};
 pub use model::{OpenAiTransport, RetryPolicy};
-pub use permissions::{ApprovalReason, AskForApproval, BlockRule, ReviewDecision, SandboxPolicy};
 pub use verify::{
     FileChangeKind, FileChangeSummary, FileDiffSummary, MutationResult, PatchApplyStatus, TurnDiff,
 };

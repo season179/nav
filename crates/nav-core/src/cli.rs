@@ -3,8 +3,9 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::context::compaction::{DEFAULT_AUTO_COMPACT_FRACTION, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT};
 use crate::context::{ExportFormat, Settings};
-use crate::permissions::{AskForApproval, SandboxPolicy};
+use crate::guardrails::{AskForApproval, SandboxPolicy};
 
 // clap turns this struct into the CLI. Keeping options small makes the
 // educational path clear: model choice, auth choice, loop limit, and prompt.
@@ -111,7 +112,7 @@ pub struct Args {
     /// `auto_compact_fraction × auto_compact_token_limit` and the configured
     /// context window minus nav's reserve headroom. Set to `0` to disable
     /// automatic compaction; manual `/compact` still works.
-    #[arg(default_value_t = crate::agent::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT, long)]
+    #[arg(default_value_t = DEFAULT_AUTO_COMPACT_TOKEN_LIMIT, long)]
     pub auto_compact_token_limit: u64,
 
     /// Fraction of [`Args::auto_compact_token_limit`] at which automatic
@@ -120,7 +121,7 @@ pub struct Args {
     /// window. Lower values pull the firing point in earlier; must be in
     /// `0.0..=1.0`.
     #[arg(
-        default_value_t = crate::agent::DEFAULT_AUTO_COMPACT_FRACTION,
+        default_value_t = DEFAULT_AUTO_COMPACT_FRACTION,
         long,
         value_parser = parse_unit_fraction
     )]
@@ -382,7 +383,7 @@ impl Args {
             // unit test never accidentally triggers compaction against a
             // stub transport that wasn't set up for it.
             auto_compact_token_limit: 0,
-            auto_compact_fraction: crate::agent::DEFAULT_AUTO_COMPACT_FRACTION,
+            auto_compact_fraction: DEFAULT_AUTO_COMPACT_FRACTION,
             git_checkpoints: false,
             no_git_checkpoints: false,
             command: None,

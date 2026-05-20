@@ -9,9 +9,10 @@ use super::{SPAWN_SUBAGENT_TOOL, ToolAccess};
 use super::{fs, patch, preflight, shell};
 use crate::agent_loop::AgentEvent;
 use crate::context::Catalog;
-use crate::permissions::approval::{ApprovalRequest, AutoGate};
-use crate::permissions::{AskForApproval, ReviewDecision, SandboxPolicy, SessionAllowlist};
-use crate::sandbox::PassthroughRunner;
+use crate::guardrails::approval::{ApprovalRequest, AutoGate};
+use crate::guardrails::{
+    AskForApproval, PassthroughRunner, ReviewDecision, SandboxPolicy, SessionAllowlist,
+};
 use crate::verify::MutationResult;
 
 pub use crate::guardrails::preflight::{PermissionContext, PreflightOutcome};
@@ -58,8 +59,8 @@ pub struct BlockedTool {
     pub reason: String,
 }
 
-/// Construct a permission context with no enforcement. Used by tests and by
-/// the legacy code paths that haven't been migrated to explicit policy yet.
+/// Construct a permission context with no enforcement. Used by tests and
+/// narrow internal flows that intentionally bypass policy setup.
 pub fn unchecked_permission_context() -> PermissionContext {
     PermissionContext {
         gate: Arc::new(AutoGate::approving()),
@@ -257,7 +258,7 @@ pub fn failed_mutation_summary(name: &str, input: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::permissions::approval::{
+    use crate::guardrails::approval::{
         ApprovalGate, ApprovalRequest, AutoGate, ChannelGate, PendingApprovals,
     };
     use crate::tool_registry::tool_definitions;
@@ -518,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_reads_skill_md_under_skill_dir() {
-        use crate::skills::{Skill, SkillScope};
+        use crate::context::{Skill, SkillScope};
         let temp = tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
         let skill_home = tempdir().unwrap();

@@ -69,90 +69,72 @@ fn schema_applies_on_fresh_temp_db() {
 }
 
 #[test]
-fn opening_v1_database_migrates_nullable_session_name() {
+fn stale_schema_resets_to_current_empty_store() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("nav.db");
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
-            "
-            CREATE TABLE schema_version (
-                version INTEGER PRIMARY KEY,
-                applied_at INTEGER NOT NULL
-            );
-            INSERT INTO schema_version (version, applied_at) VALUES (1, 1);
-            CREATE TABLE session (
-                id TEXT PRIMARY KEY,
-                cwd TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                model TEXT NOT NULL,
-                title TEXT,
-                profile TEXT,
-                provider_meta TEXT,
-                status TEXT NOT NULL DEFAULT 'active',
-                cost_currency TEXT NOT NULL DEFAULT 'USD',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                tokens_input INTEGER NOT NULL DEFAULT 0,
-                tokens_output INTEGER NOT NULL DEFAULT 0,
-                tokens_input_cached INTEGER NOT NULL DEFAULT 0,
-                tokens_reasoning INTEGER NOT NULL DEFAULT 0,
-                cost_micros_reported INTEGER NOT NULL DEFAULT 0,
-                turns_with_reported_cost INTEGER NOT NULL DEFAULT 0,
-                turns_total INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE event (
-                session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-                seq INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                data TEXT NOT NULL,
-                PRIMARY KEY (session_id, seq)
-            );
-            CREATE TABLE turn (
-                session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-                turn_index INTEGER NOT NULL,
-                started_at INTEGER NOT NULL,
-                ended_at INTEGER,
-                model TEXT NOT NULL,
-                tokens_input INTEGER NOT NULL DEFAULT 0,
-                tokens_output INTEGER NOT NULL DEFAULT 0,
-                tokens_input_cached INTEGER NOT NULL DEFAULT 0,
-                tokens_reasoning INTEGER NOT NULL DEFAULT 0,
-                cost_micros INTEGER,
-                cost_currency TEXT NOT NULL DEFAULT 'USD',
-                cost_source TEXT NOT NULL DEFAULT 'unreported',
-                error TEXT,
-                PRIMARY KEY (session_id, turn_index)
-            );
-            CREATE TABLE approval (
-                session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-                approval_id TEXT NOT NULL,
-                requested_at INTEGER NOT NULL,
-                decided_at INTEGER,
-                tool TEXT NOT NULL,
-                command TEXT,
-                path TEXT,
-                reason TEXT NOT NULL,
-                decision TEXT,
-                rule TEXT,
-                PRIMARY KEY (session_id, approval_id)
-            );
-            ",
+            "CREATE TABLE schema_version (
+                 version INTEGER PRIMARY KEY,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_version (version, applied_at) VALUES (2, 1);
+             CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 cwd TEXT NOT NULL,
+                 provider TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO session (id, cwd, provider, model, created_at, updated_at)
+                 VALUES ('stale-id', '/stale', 'openai-responses', 'gpt-test', 1, 1);",
         )
         .unwrap();
     }
 
     let store = SessionStore::open(Some(path)).unwrap();
+    assert!(store.list_sessions(None).unwrap().is_empty());
     let conn = store.conn.lock().unwrap();
-    let columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(session)")
-        .unwrap()
-        .query_map([], |row| row.get(1))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    assert!(columns.iter().any(|name| name == "name"), "{columns:?}");
+    let version: i64 = conn
+        .query_row(
+            "SELECT version FROM schema_version WHERE version = ?1",
+            params![SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
+fn empty_schema_version_with_sessions_resets_to_current_empty_store() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nav.db");
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (
+                 version INTEGER PRIMARY KEY,
+                 applied_at INTEGER NOT NULL
+             );
+             CREATE TABLE session (
+                 id TEXT PRIMARY KEY,
+                 cwd TEXT NOT NULL,
+                 provider TEXT NOT NULL,
+                 model TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             INSERT INTO session (id, cwd, provider, model, created_at, updated_at)
+                 VALUES ('stale-id', '/stale', 'openai-responses', 'gpt-test', 1, 1);",
+        )
+        .unwrap();
+    }
+
+    let store = SessionStore::open(Some(path)).unwrap();
+    assert!(store.list_sessions(None).unwrap().is_empty());
+    let conn = store.conn.lock().unwrap();
     let version: i64 = conn
         .query_row(
             "SELECT version FROM schema_version WHERE version = ?1",
@@ -441,7 +423,7 @@ fn session_store_sink_records_approval_decision_as_event() {
         .unwrap();
 
     let sink = store.sink_for(id.to_string());
-    crate::permissions::approval::DecisionRecorder::record(
+    crate::guardrails::approval::DecisionRecorder::record(
         &sink,
         "a1",
         crate::ReviewDecision::Denied,
@@ -896,199 +878,6 @@ fn session_cwd_returns_creation_cwd_regardless_of_caller() {
 fn session_cwd_errors_on_missing_session() {
     let (_dir, store) = open_temp_store();
     assert!(store.session_cwd("does-not-exist").is_err());
-}
-
-#[test]
-fn load_session_skips_unknown_event_kinds() {
-    // A forward-compatible session log: a newer nav writes an unknown
-    // event kind, and an older nav must still be able to load the session
-    // around it. Without the per-row fallback, a single unrecognised kind
-    // would brick --resume for every session that contains it.
-    let (_dir, store) = open_temp_store();
-    let cwd = Path::new("/tmp/proj");
-    let id = store
-        .create_session(cwd, PROVIDER_OPENAI_RESPONSES, "gpt-test", None)
-        .unwrap();
-
-    store
-        .append_event(
-            &id,
-            &AgentEvent::UserMessage {
-                text: "first".into(),
-                display_text: None,
-                attachments: Vec::new(),
-            },
-        )
-        .unwrap();
-    // Insert a row with a discriminant the current AgentEvent enum does
-    // not know about. The COALESCE(MAX(seq)+1) pattern matches the
-    // production INSERT in append_event.
-    {
-        let conn = store.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO event (session_id, seq, created_at, kind, data)
-             VALUES (
-                 ?1,
-                 COALESCE((SELECT MAX(seq) FROM event WHERE session_id = ?1), -1) + 1,
-                 ?2, ?3, ?4
-             )",
-            params![
-                &id,
-                now_secs(),
-                "future_event_kind",
-                r#"{"kind":"future_event_kind","payload":42}"#,
-            ],
-        )
-        .unwrap();
-    }
-    store
-        .append_event(&id, &AgentEvent::AssistantMessageDone { text: "ok".into() })
-        .unwrap();
-
-    let loaded = store.load_session(&id).unwrap();
-    assert_eq!(
-        loaded,
-        vec![
-            AgentEvent::UserMessage {
-                text: "first".into(),
-                display_text: None,
-                attachments: Vec::new(),
-            },
-            AgentEvent::AssistantMessageDone { text: "ok".into() },
-        ],
-        "unknown event row must be skipped, surrounding rows preserved"
-    );
-}
-
-#[test]
-fn opening_v2_database_migrates_v3_columns_label_table_and_fts() {
-    // Pre-build a v2 schema by hand (matching the v2 ALTER … ADD COLUMN name)
-    // and confirm SessionStore::open applies the v3 migration on top without
-    // dropping any rows.
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("nav.db");
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE schema_version (
-                 version INTEGER PRIMARY KEY,
-                 applied_at INTEGER NOT NULL
-             );
-             INSERT INTO schema_version (version, applied_at) VALUES (1, 1);
-             INSERT INTO schema_version (version, applied_at) VALUES (2, 1);
-             CREATE TABLE session (
-                 id TEXT PRIMARY KEY,
-                 cwd TEXT NOT NULL,
-                 provider TEXT NOT NULL,
-                 model TEXT NOT NULL,
-                 title TEXT,
-                 name TEXT,
-                 profile TEXT,
-                 provider_meta TEXT,
-                 status TEXT NOT NULL DEFAULT 'active',
-                 cost_currency TEXT NOT NULL DEFAULT 'USD',
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL,
-                 tokens_input INTEGER NOT NULL DEFAULT 0,
-                 tokens_output INTEGER NOT NULL DEFAULT 0,
-                 tokens_input_cached INTEGER NOT NULL DEFAULT 0,
-                 tokens_reasoning INTEGER NOT NULL DEFAULT 0,
-                 cost_micros_reported INTEGER NOT NULL DEFAULT 0,
-                 turns_with_reported_cost INTEGER NOT NULL DEFAULT 0,
-                 turns_total INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE TABLE event (
-                 session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-                 seq INTEGER NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 data TEXT NOT NULL,
-                 PRIMARY KEY (session_id, seq)
-             );
-             CREATE TABLE turn (
-                 session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-                 turn_index INTEGER NOT NULL,
-                 started_at INTEGER NOT NULL,
-                 ended_at INTEGER,
-                 model TEXT NOT NULL,
-                 tokens_input INTEGER NOT NULL DEFAULT 0,
-                 tokens_output INTEGER NOT NULL DEFAULT 0,
-                 tokens_input_cached INTEGER NOT NULL DEFAULT 0,
-                 tokens_reasoning INTEGER NOT NULL DEFAULT 0,
-                 cost_micros INTEGER,
-                 cost_currency TEXT NOT NULL DEFAULT 'USD',
-                 cost_source TEXT NOT NULL DEFAULT 'unreported',
-                 error TEXT,
-                 PRIMARY KEY (session_id, turn_index)
-             );
-             CREATE TABLE approval (
-                 session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-                 approval_id TEXT NOT NULL,
-                 requested_at INTEGER NOT NULL,
-                 decided_at INTEGER,
-                 tool TEXT NOT NULL,
-                 command TEXT,
-                 path TEXT,
-                 reason TEXT NOT NULL,
-                 decision TEXT,
-                 rule TEXT,
-                 PRIMARY KEY (session_id, approval_id)
-             );
-             INSERT INTO session (id, cwd, provider, model, created_at, updated_at)
-                 VALUES ('legacy-id', '/legacy', 'openai-responses', 'gpt-test', 10, 10);
-             INSERT INTO event (session_id, seq, created_at, kind, data)
-                 VALUES ('legacy-id', 0, 11, 'user_message',
-                         '{\"kind\":\"user_message\",\"text\":\"backfill-me\",\"display_text\":null,\"attachments\":[]}');",
-        )
-        .unwrap();
-    }
-
-    let store = SessionStore::open(Some(path)).unwrap();
-    let conn = store.conn.lock().unwrap();
-
-    // Schema migrated to v3.
-    let version: i64 = conn
-        .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(version, SCHEMA_VERSION);
-
-    // New session columns landed and a legacy row still exists.
-    let columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(session)")
-        .unwrap()
-        .query_map([], |row| row.get(1))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    assert!(columns.iter().any(|c| c == "parent_id"), "{columns:?}");
-    assert!(columns.iter().any(|c| c == "fork_point_seq"), "{columns:?}");
-
-    let parent_id: Option<String> = conn
-        .query_row(
-            "SELECT parent_id FROM session WHERE id = 'legacy-id'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(parent_id.is_none());
-
-    // Label table exists and is empty.
-    let label_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM label", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(label_count, 0);
-
-    // Pre-existing user_message events were backfilled into FTS.
-    let fts_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM event_fts WHERE text MATCH 'backfill'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(fts_count, 1, "v3 migration must backfill the FTS table");
 }
 
 #[test]

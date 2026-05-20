@@ -2,8 +2,8 @@
 //!
 //! A `SessionStore` owns one connection (guarded by a `Mutex`) into a single
 //! database file. The first call to `open` applies `init.sql` and records the
-//! migration in `schema_version`; subsequent calls are idempotent because every
-//! `CREATE` statement uses `IF NOT EXISTS`.
+//! schema version in `schema_version`; subsequent calls are idempotent because
+//! every `CREATE` statement uses `IF NOT EXISTS`.
 //!
 //! Cost is never derived from token counts. Every turn is recorded with
 //! `cost_source = 'unreported'` and `cost_micros = NULL` unless the caller
@@ -20,13 +20,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 use ulid::Ulid;
 
-use crate::agent::{AgentEvent, TurnUsage};
+use crate::agent_loop::{AgentEvent, TurnUsage};
 
 /// The schema embedded into the binary; applied once on first open.
 pub const INIT_SQL: &str = include_str!("init.sql");
 
-/// Current migration version. Bump (and add a new migration) whenever the
-/// schema changes incompatibly.
+/// Current schema version. Bump when the fresh schema shape changes.
 pub const SCHEMA_VERSION: i64 = 3;
 
 /// `provider` value stored on every session created from `run_agent`. There is
@@ -242,10 +241,10 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
                 push_section(&mut out, "User", display_text.as_deref().unwrap_or(text));
                 for attachment in attachments {
                     match attachment {
-                        crate::agent::UserAttachment::Image { path } => {
+                        crate::agent_loop::UserAttachment::Image { path } => {
                             out.push_str(&format!("- attachment: image `{}`\n", path.display()));
                         }
-                        crate::agent::UserAttachment::File { path } => {
+                        crate::agent_loop::UserAttachment::File { path } => {
                             out.push_str(&format!("- attachment: file `{}`\n", path.display()));
                         }
                     }
@@ -364,8 +363,8 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// Opens (and migrates) the session database. When `path` is `None` the
-    /// XDG data directory — `$XDG_DATA_HOME/nav/nav.db`, falling back to
+    /// Opens the session database. When `path` is `None` the XDG data
+    /// directory — `$XDG_DATA_HOME/nav/nav.db`, falling back to
     /// `~/.local/share/nav/nav.db` — is used. Relative overrides are resolved
     /// inside that same nav data directory. Echoes the resolved pragma values
     /// to stderr so misconfiguration is visible at startup.
@@ -662,33 +661,20 @@ impl SessionStore {
     /// `data` column is parsed back into the `AgentEvent` it was serialised
     /// from, so callers can reconstruct the conversation transcript directly.
     ///
-    /// Rows whose `kind` discriminant does not deserialize cleanly into the
-    /// current [`AgentEvent`] enum are skipped with a stderr warning. This
-    /// lets a newer nav write events a slightly older nav can still resume
-    /// past — losing one row is less disruptive than failing the whole
-    /// `--resume`.
     pub fn load_session(&self, session_id: &str) -> Result<Vec<AgentEvent>> {
         let conn = self.lock();
-        let mut stmt = conn
-            .prepare("SELECT seq, kind, data FROM event WHERE session_id = ?1 ORDER BY seq ASC")?;
+        let mut stmt =
+            conn.prepare("SELECT seq, data FROM event WHERE session_id = ?1 ORDER BY seq ASC")?;
         let rows = stmt.query_map(params![session_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut events = Vec::new();
         for row in rows {
-            let (seq, kind, data) = row?;
-            match serde_json::from_str::<AgentEvent>(&data) {
-                Ok(event) => events.push(event),
-                Err(err) => {
-                    eprintln!(
-                        "nav-core: skipping unknown event (session={session_id} seq={seq} kind={kind}): {err}"
-                    );
-                }
-            }
+            let (seq, data) = row?;
+            let event = serde_json::from_str::<AgentEvent>(&data).with_context(|| {
+                format!("failed to parse event row (session={session_id} seq={seq})")
+            })?;
+            events.push(event);
         }
         Ok(events)
     }
@@ -1178,86 +1164,51 @@ pub(crate) fn xdg_data_home() -> Option<PathBuf> {
 }
 
 fn apply_schema(conn: &Connection) -> Result<()> {
+    if schema_is_stale(conn)? {
+        reset_schema(conn)?;
+    }
     conn.execute_batch(INIT_SQL)
         .context("failed to apply nav-core schema")?;
-    record_schema_version(conn, 1)?;
-    if applied_schema_version(conn)? < 2 {
-        if !table_has_column(conn, "session", "name")? {
-            conn.execute_batch("ALTER TABLE session ADD COLUMN name TEXT")?;
-        }
-        record_schema_version(conn, 2)?;
-    }
-    if applied_schema_version(conn)? < 3 {
-        // Idempotent against fresh databases (where init.sql already created
-        // everything) and v2 → v3 upgrades alike: ALTER only when missing,
-        // CREATE … IF NOT EXISTS for indexes, triggers, and the FTS table.
-        if !table_has_column(conn, "session", "parent_id")? {
-            conn.execute_batch(
-                "ALTER TABLE session ADD COLUMN parent_id TEXT REFERENCES session(id)",
-            )?;
-        }
-        if !table_has_column(conn, "session", "fork_point_seq")? {
-            conn.execute_batch("ALTER TABLE session ADD COLUMN fork_point_seq INTEGER")?;
-        }
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_session_parent ON session(parent_id);
-             CREATE TABLE IF NOT EXISTS label (
-                 session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
-                 label TEXT NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 PRIMARY KEY (session_id, label)
-             );
-             CREATE INDEX IF NOT EXISTS idx_label_name ON label(label);
-             CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(
-                 session_id UNINDEXED,
-                 seq UNINDEXED,
-                 kind UNINDEXED,
-                 text
-             );
-             CREATE TRIGGER IF NOT EXISTS event_fts_ai
-             AFTER INSERT ON event
-             WHEN NEW.kind IN ('user_message', 'assistant_message_done', 'assistant_message_delta')
-             BEGIN
-                 INSERT INTO event_fts (session_id, seq, kind, text)
-                 VALUES (
-                     NEW.session_id,
-                     NEW.seq,
-                     NEW.kind,
-                     COALESCE(json_extract(NEW.data, '$.text'), '')
-                 );
-             END;
-             CREATE TRIGGER IF NOT EXISTS event_fts_ad
-             AFTER DELETE ON event
-             WHEN OLD.kind IN ('user_message', 'assistant_message_done', 'assistant_message_delta')
-             BEGIN
-                 DELETE FROM event_fts
-                 WHERE session_id = OLD.session_id AND seq = OLD.seq;
-             END;",
-        )?;
-        // Backfill the FTS index with any user/assistant events that
-        // existed before the trigger was installed.
-        conn.execute(
-            "INSERT INTO event_fts (session_id, seq, kind, text)
-             SELECT session_id, seq, kind, COALESCE(json_extract(data, '$.text'), '')
-             FROM event
-             WHERE kind IN ('user_message', 'assistant_message_done', 'assistant_message_delta')
-               AND NOT EXISTS (
-                   SELECT 1 FROM event_fts AS f
-                   WHERE f.session_id = event.session_id AND f.seq = event.seq
-               )",
-            [],
-        )?;
-        record_schema_version(conn, 3)?;
-    }
+    record_schema_version(conn, SCHEMA_VERSION)?;
     Ok(())
 }
 
-fn applied_schema_version(conn: &Connection) -> Result<i64> {
-    Ok(conn
+fn schema_is_stale(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "schema_version")? {
+        return table_exists(conn, "session");
+    }
+    let version = conn
         .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
             row.get::<_, Option<i64>>(0)
-        })?
-        .unwrap_or(0))
+        })
+        .optional()?
+        .flatten();
+    Ok(version != Some(SCHEMA_VERSION))
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn reset_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS event_fts_ai;
+         DROP TRIGGER IF EXISTS event_fts_ad;
+         DROP TABLE IF EXISTS event_fts;
+         DROP TABLE IF EXISTS label;
+         DROP TABLE IF EXISTS approval;
+         DROP TABLE IF EXISTS turn;
+         DROP TABLE IF EXISTS event;
+         DROP TABLE IF EXISTS session;
+         DROP TABLE IF EXISTS schema_version;",
+    )
+    .context("failed to reset stale nav session schema")?;
+    Ok(())
 }
 
 fn record_schema_version(conn: &Connection, version: i64) -> Result<()> {
@@ -1266,17 +1217,6 @@ fn record_schema_version(conn: &Connection, version: i64) -> Result<()> {
         params![version, now_secs()],
     )?;
     Ok(())
-}
-
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Shared column list used by every `SessionSummary` query. The column order
@@ -1398,7 +1338,7 @@ pub struct SessionStoreSink {
     session_id: String,
 }
 
-impl crate::permissions::approval::DurableEventSink for SessionStoreSink {
+impl crate::guardrails::approval::DurableEventSink for SessionStoreSink {
     fn persist(&self, event: &AgentEvent) {
         if let Err(err) = self.store.append_event(&self.session_id, event) {
             // Persistence is best-effort: a SQLite hiccup must not stall
@@ -1408,8 +1348,8 @@ impl crate::permissions::approval::DurableEventSink for SessionStoreSink {
     }
 }
 
-impl crate::permissions::approval::DecisionRecorder for SessionStoreSink {
-    fn record(&self, approval_id: &str, decision: crate::permissions::ReviewDecision) {
+impl crate::guardrails::approval::DecisionRecorder for SessionStoreSink {
+    fn record(&self, approval_id: &str, decision: crate::guardrails::ReviewDecision) {
         let event = AgentEvent::ToolCallApprovalDecision {
             approval_id: approval_id.to_string(),
             decision,

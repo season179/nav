@@ -6,15 +6,13 @@ use serde_json::Value;
 use crate::agent_loop::control::PendingInputMode;
 use crate::context::compaction::CompactionDetails;
 use crate::git_checkpoint::{GitCheckpointAction, GitCheckpointStatus};
-use crate::permissions::ReviewDecision;
+use crate::guardrails::ReviewDecision;
 use crate::verify::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
 
 /// A non-text input attached to a [`AgentEvent::UserMessage`]. Stored by path
 /// (workspace-relative) — the bytes are loaded by the transport at request
 /// time, so the session log doesn't bloat with base64. Resume rebuilds the
-/// same input shape from the stored paths. The `kind` tag is part of the
-/// wire format, so adding a variant is backwards-compatible: an old session
-/// log full of `Image` rows still deserializes into the new enum.
+/// same input shape from the stored paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UserAttachment {
@@ -60,7 +58,7 @@ pub struct TurnUsage {
     pub tokens_reasoning: u64,
 }
 
-/// Single, ordered events produced by [`crate::agent::run_agent`].
+/// Single, ordered events produced by [`crate::agent_loop::run_agent`].
 ///
 /// `UserMessage` records the exact model-facing prompt for replay and an
 /// optional UI-facing display string. `AssistantMessageDelta` is the transient
@@ -73,8 +71,8 @@ pub enum AgentEvent {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         display_text: Option<String>,
-        /// Non-text inputs (currently just clipboard / pasted images).
-        /// `default` keeps old session-log rows readable after upgrade.
+        /// Non-text inputs. Empty attachment lists are omitted from stored
+        /// JSON, so deserialization supplies an empty list by default.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<UserAttachment>,
     },
@@ -501,17 +499,14 @@ mod tests {
     }
 
     #[test]
-    fn user_attachment_image_rows_still_deserialize() {
-        // Backwards compatibility: an old session log row with `kind: "image"`
-        // must still parse after the File variant was added.
-        let parsed: UserAttachment =
-            serde_json::from_value(json!({"kind": "image", "path": "a.png"})).unwrap();
-        assert_eq!(
-            parsed,
-            UserAttachment::Image {
-                path: "a.png".into()
-            }
-        );
+    fn user_attachment_image_variant_round_trips() {
+        let attach = UserAttachment::Image {
+            path: "a.png".into(),
+        };
+        let json = serde_json::to_value(&attach).unwrap();
+        assert_eq!(json, json!({"kind": "image", "path": "a.png"}));
+        let parsed: UserAttachment = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, attach);
     }
 
     #[test]

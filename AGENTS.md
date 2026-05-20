@@ -24,9 +24,8 @@ whenever possible:
    evidence, and future structured verification output.
 
 Prefer locality: put new behavior behind the part that owns it, and keep
-`agent/runner.rs` focused on the loop instead of accumulating cross-cutting
-detail. See [docs/six-part-agent-harness-refactor.md](docs/six-part-agent-harness-refactor.md)
-for the current refactor plan.
+`agent_loop/runner.rs` focused on the loop instead of accumulating
+cross-cutting detail.
 
 ## Read-Only References
 

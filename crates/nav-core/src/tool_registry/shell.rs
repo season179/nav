@@ -3,7 +3,7 @@ use std::path::{Component, Path};
 use std::time::Duration;
 
 use crate::guardrails::PermissionContext;
-use crate::sandbox::SandboxRequest;
+use crate::guardrails::SandboxRequest;
 use crate::tool_registry::output_accumulator::OutputAccumulator;
 use crate::{permissions::bash_parse::parse_command_pipeline, tool_registry::fs};
 

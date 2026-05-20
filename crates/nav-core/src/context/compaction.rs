@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::agent::AgentEvent;
+use crate::agent_loop::AgentEvent;
 
 /// Initial compaction prompt. The runner wraps the serialized conversation in
 /// `<conversation>` tags before appending this instruction.
@@ -900,7 +900,7 @@ pub fn summary_message(summary: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::CompactionTrigger;
+    use crate::agent_loop::CompactionTrigger;
 
     #[test]
     fn detects_manual_compact_slash() {

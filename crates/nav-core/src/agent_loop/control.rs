@@ -289,7 +289,7 @@ fn model_text(skill: Option<&PendingSkill>, visible_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::UserAttachment;
+    use crate::agent_loop::UserAttachment;
     use std::path::PathBuf;
 
     fn image(path: &str) -> UserAttachment {

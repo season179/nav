@@ -8,20 +8,17 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::events::CompactionTrigger;
 use super::{AgentEvent, TurnUsage, UserAttachment};
+use crate::agent_loop::compaction_turn::{CompactionTurnRequest, run_compaction_turn};
 use crate::agent_loop::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
-use crate::context::compaction::{
-    append_compaction_details, build_history_summary_prompt, build_replacement_history,
-    build_turn_prefix_summary_prompt, estimate_input_tokens, is_compact_command,
-    merge_split_turn_summary, prepare_compaction, should_auto_compact,
-};
+use crate::context::compaction::{estimate_input_tokens, is_compact_command, should_auto_compact};
 use crate::context::{Catalog, ProjectContext, SessionId, SessionStore};
 use crate::git_checkpoint;
+use crate::guardrails::protected::is_protected_read;
 use crate::guardrails::{self, PermissionContext};
 use crate::model::ResponsesTransport;
 use crate::model::responses::{self, ResponseCollector, ResponsesError};
-use crate::permissions::protected::is_protected_read;
-use crate::permissions::{AskForApproval, SandboxPolicy, SessionAllowlist};
 use crate::tool_registry;
 use crate::tool_registry::truncate::{self, TruncateMode, bound};
 use crate::verify::{self, PatchApplyStatus};
@@ -32,6 +29,84 @@ use crate::verify::{self, PatchApplyStatus};
 pub struct SessionBinding<'a> {
     pub store: &'a SessionStore,
     pub session_id: SessionId,
+}
+
+/// Everything needed to run one user turn through the agent loop.
+///
+/// The request is intentionally a named struct instead of a long positional
+/// function signature: call sites should make each dependency visible by name.
+pub struct AgentTurnRequest<'a> {
+    pub transport: &'a dyn ResponsesTransport,
+    pub args: &'a Args,
+    pub cwd: &'a Path,
+    pub prompt: &'a str,
+    pub display_prompt: Option<&'a str>,
+    pub attachments: Vec<UserAttachment>,
+    pub events: UnboundedSender<AgentEvent>,
+    pub session: Option<&'a SessionBinding<'a>>,
+    pub initial_input: Option<Vec<Value>>,
+    pub skills: &'a Catalog,
+    pub context: Option<&'a ProjectContext>,
+    pub permissions: PermissionContext,
+    pub controls: TurnControls,
+}
+
+impl<'a> AgentTurnRequest<'a> {
+    pub fn new(
+        transport: &'a dyn ResponsesTransport,
+        args: &'a Args,
+        cwd: &'a Path,
+        prompt: &'a str,
+        events: UnboundedSender<AgentEvent>,
+        skills: &'a Catalog,
+        permissions: PermissionContext,
+    ) -> Self {
+        Self {
+            transport,
+            args,
+            cwd,
+            prompt,
+            display_prompt: None,
+            attachments: Vec::new(),
+            events,
+            session: None,
+            initial_input: None,
+            skills,
+            context: None,
+            permissions,
+            controls: TurnControls::default(),
+        }
+    }
+
+    pub fn with_display_prompt(mut self, display_prompt: Option<&'a str>) -> Self {
+        self.display_prompt = display_prompt;
+        self
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<UserAttachment>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
+    pub fn with_session(
+        mut self,
+        session: Option<&'a SessionBinding<'a>>,
+        initial_input: Option<Vec<Value>>,
+    ) -> Self {
+        self.session = session;
+        self.initial_input = initial_input;
+        self
+    }
+
+    pub fn with_context(mut self, context: Option<&'a ProjectContext>) -> Self {
+        self.context = context;
+        self
+    }
+
+    pub fn with_controls(mut self, controls: TurnControls) -> Self {
+        self.controls = controls;
+        self
+    }
 }
 
 impl<'a> SessionBinding<'a> {
@@ -219,81 +294,28 @@ async fn apply_attachment_guardrails(
 /// `initial_input` lets callers rehydrate the Responses API transcript from a
 /// stored session before appending the new user prompt. `display_prompt` is
 /// stored only for renderers; replay always uses `prompt`.
-// This is the core dependency-injection boundary for transports, persistence,
-// and skills; keeping those dependencies explicit makes tests easier to audit.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_agent(
-    transport: &dyn ResponsesTransport,
-    args: &Args,
-    cwd: &Path,
-    prompt: &str,
-    display_prompt: Option<&str>,
-    attachments: Vec<UserAttachment>,
-    events: UnboundedSender<AgentEvent>,
-    session: Option<&SessionBinding<'_>>,
-    initial_input: Option<Vec<Value>>,
-    skills: &Catalog,
-    context: Option<&ProjectContext>,
-    permissions: PermissionContext,
-) -> Result<()> {
-    run_agent_with_control(
-        transport,
-        args,
-        cwd,
-        prompt,
-        display_prompt,
-        attachments,
-        events,
-        session,
-        initial_input,
-        skills,
-        context,
-        permissions,
-        TurnControls::default(),
-    )
-    .await
-}
-
-/// Variant of [`run_agent`] used by interactive frontends that can steer or
-/// abort an active turn. The plain CLI path calls [`run_agent`] above with no
-/// control channels.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_agent_with_control(
-    transport: &dyn ResponsesTransport,
-    args: &Args,
-    cwd: &Path,
-    prompt: &str,
-    display_prompt: Option<&str>,
-    attachments: Vec<UserAttachment>,
-    events: UnboundedSender<AgentEvent>,
-    session: Option<&SessionBinding<'_>>,
-    initial_input: Option<Vec<Value>>,
-    skills: &Catalog,
-    context: Option<&ProjectContext>,
-    permissions: PermissionContext,
-    controls: TurnControls,
-) -> Result<()> {
+pub async fn run_agent(request: AgentTurnRequest<'_>) -> Result<()> {
     run_agent_inner(
-        transport,
-        args,
-        cwd,
-        prompt,
-        display_prompt,
-        attachments,
-        events,
-        session,
-        initial_input,
-        skills,
-        context,
-        permissions,
-        controls,
+        request.transport,
+        request.args,
+        request.cwd,
+        request.prompt,
+        request.display_prompt,
+        request.attachments,
+        request.events,
+        request.session,
+        request.initial_input,
+        request.skills,
+        request.context,
+        request.permissions,
+        request.controls,
         responses::ResponseBodyOptions::default(),
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_agent_inner(
+pub(super) async fn run_agent_inner(
     transport: &dyn ResponsesTransport,
     args: &Args,
     cwd: &Path,
@@ -322,16 +344,18 @@ async fn run_agent_inner(
         );
         let tokens_before = session.map(|s| s.rolling_input_tokens()).unwrap_or(0);
         return run_compaction_turn(
-            transport,
-            args,
-            cwd,
+            CompactionTurnRequest {
+                transport,
+                args,
+                cwd,
+                trigger: CompactionTrigger::Manual,
+                tokens_before,
+                session,
+                events: &events,
+                skills,
+                context,
+            },
             &mut input,
-            CompactionTrigger::Manual,
-            tokens_before,
-            session,
-            &events,
-            skills,
-            context,
         )
         .await
         .map(|_| ());
@@ -365,16 +389,18 @@ async fn run_agent_inner(
             // transcript. The CompactionFailed event already surfaces the
             // failure to frontends.
             let _ = run_compaction_turn(
-                transport,
-                args,
-                cwd,
+                CompactionTurnRequest {
+                    transport,
+                    args,
+                    cwd,
+                    trigger: CompactionTrigger::Auto,
+                    tokens_before,
+                    session,
+                    events: &events,
+                    skills,
+                    context,
+                },
                 &mut input,
-                CompactionTrigger::Auto,
-                tokens_before,
-                session,
-                &events,
-                skills,
-                context,
             )
             .await;
         }
@@ -529,18 +555,18 @@ async fn run_agent_inner(
             let tool_arguments = call.arguments.clone();
             let result =
                 if tool_name == tool_registry::SPAWN_SUBAGENT_TOOL && options.include_subagents {
-                    Ok(run_subagent_tool(
+                    Ok(run_subagent_tool(SubagentToolRequest {
                         transport,
                         args,
                         cwd,
                         skills,
                         context,
-                        permissions.clone(),
-                        &events,
-                        session,
-                        &call_id,
-                        &tool_arguments,
-                    )
+                        permissions: permissions.clone(),
+                        parent_events: &events,
+                        parent_session: session,
+                        call_id: &call_id,
+                        arguments: &tool_arguments,
+                    })
                     .await)
                 } else if !options.allows_tool(&tool_name) {
                     Ok(blocked_tool_outcome(
@@ -735,125 +761,6 @@ fn drain_steering(
     drained
 }
 
-const SUBAGENT_MAX_TURNS: usize = 8;
-
-#[allow(clippy::too_many_arguments)]
-async fn run_subagent_tool(
-    transport: &dyn ResponsesTransport,
-    args: &Args,
-    cwd: &Path,
-    skills: &Catalog,
-    context: Option<&ProjectContext>,
-    permissions: PermissionContext,
-    parent_events: &UnboundedSender<AgentEvent>,
-    parent_session: Option<&SessionBinding<'_>>,
-    call_id: &str,
-    input: &Value,
-) -> tool_registry::ToolOutcome {
-    let Some(task) = input.get("task").and_then(Value::as_str).map(str::trim) else {
-        return error_tool_outcome("tool error: missing string input field `task`");
-    };
-    if task.is_empty() {
-        return error_tool_outcome("tool error: `task` must not be empty");
-    }
-
-    let label = input
-        .get("label")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    emit(
-        parent_events,
-        parent_session,
-        AgentEvent::SubagentStarted {
-            id: call_id.to_string(),
-            label: label.clone(),
-            task: task.to_string(),
-        },
-    );
-
-    let mut subagent_args = args.clone();
-    subagent_args.max_turns = subagent_args.max_turns.clamp(1, SUBAGENT_MAX_TURNS);
-    subagent_args.auto_compact_token_limit = 0;
-
-    let worker_prompt = subagent_prompt(label.as_deref(), task);
-    let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let worker_result = Box::pin(run_agent_inner(
-        transport,
-        &subagent_args,
-        cwd,
-        &worker_prompt,
-        None,
-        Vec::new(),
-        worker_tx,
-        None,
-        None,
-        skills,
-        context,
-        subagent_permissions(permissions),
-        TurnControls::default(),
-        responses::ResponseBodyOptions::read_only(),
-    ))
-    .await;
-
-    let mut worker_events = Vec::new();
-    while let Some(event) = worker_rx.recv().await {
-        worker_events.push(event);
-    }
-
-    match worker_result {
-        Ok(()) => {
-            if let Some(summary) = final_subagent_summary(&worker_events) {
-                let bounded = bound(summary, TruncateMode::Head);
-                emit(
-                    parent_events,
-                    parent_session,
-                    AgentEvent::SubagentCompleted {
-                        id: call_id.to_string(),
-                        summary: bounded.clone(),
-                    },
-                );
-                text_tool_outcome(format!(
-                    "subagent {} completed:\n{}",
-                    subagent_display_name(call_id, label.as_deref()),
-                    bounded
-                ))
-            } else {
-                let message = "subagent finished without a final assistant message".to_string();
-                emit_subagent_failed(parent_events, parent_session, call_id, &message);
-                error_tool_outcome(format!("tool error: {message}"))
-            }
-        }
-        Err(err) => {
-            let message =
-                final_subagent_error(&worker_events).unwrap_or_else(|| format!("{err:#}"));
-            emit_subagent_failed(parent_events, parent_session, call_id, &message);
-            error_tool_outcome(format!("tool error: subagent failed: {message}"))
-        }
-    }
-}
-
-fn text_tool_outcome(output: impl Into<String>) -> tool_registry::ToolOutcome {
-    tool_registry::ToolOutcome {
-        output: output.into(),
-        is_error: false,
-        blocked: None,
-        aborted: false,
-        mutation: None,
-    }
-}
-
-fn error_tool_outcome(output: impl Into<String>) -> tool_registry::ToolOutcome {
-    tool_registry::ToolOutcome {
-        output: output.into(),
-        is_error: true,
-        blocked: None,
-        aborted: false,
-        mutation: None,
-    }
-}
-
 fn blocked_tool_outcome(name: &str, reason: &str, rule: &str) -> tool_registry::ToolOutcome {
     tool_registry::ToolOutcome {
         output: format!("tool {name} blocked: {reason}"),
@@ -864,68 +771,6 @@ fn blocked_tool_outcome(name: &str, reason: &str, rule: &str) -> tool_registry::
         }),
         aborted: false,
         mutation: None,
-    }
-}
-
-fn subagent_prompt(label: Option<&str>, task: &str) -> String {
-    let label_line = label
-        .map(|value| format!("Label: {value}\n"))
-        .unwrap_or_default();
-    format!(
-        "You are a focused nav subagent.\n\
-         {label_line}\
-         Work independently on the task below. You may inspect files with \
-         read_file, list_files, and code_search. You cannot edit files, run \
-         shell commands, request approvals, or spawn more agents. Return a \
-         concise final summary with findings, files checked, and remaining \
-         uncertainty.\n\n\
-         Task:\n{task}"
-    )
-}
-
-fn subagent_permissions(mut permissions: PermissionContext) -> PermissionContext {
-    permissions.policy = AskForApproval::Never;
-    permissions.sandbox_policy = SandboxPolicy::ReadOnly;
-    permissions.session_allowlist = SessionAllowlist::default();
-    permissions
-}
-
-fn final_subagent_summary(events: &[AgentEvent]) -> Option<String> {
-    events.iter().rev().find_map(|event| match event {
-        AgentEvent::AssistantMessageDone { text } if !text.trim().is_empty() => {
-            Some(text.trim().to_string())
-        }
-        _ => None,
-    })
-}
-
-fn final_subagent_error(events: &[AgentEvent]) -> Option<String> {
-    events.iter().rev().find_map(|event| match event {
-        AgentEvent::Error { message } => Some(message.clone()),
-        _ => None,
-    })
-}
-
-fn emit_subagent_failed(
-    events: &UnboundedSender<AgentEvent>,
-    session: Option<&SessionBinding<'_>>,
-    id: &str,
-    message: &str,
-) {
-    emit(
-        events,
-        session,
-        AgentEvent::SubagentFailed {
-            id: id.to_string(),
-            message: message.to_string(),
-        },
-    );
-}
-
-fn subagent_display_name(id: &str, label: Option<&str>) -> String {
-    match label {
-        Some(label) => format!("{label} ({id})"),
-        None => id.to_string(),
     }
 }
 
@@ -943,42 +788,6 @@ fn emit_turn_aborted(
             reason: reason.into(),
         },
     );
-}
-
-/// Upper bound on overflow-trim retries inside a single compaction turn.
-/// Bounded to keep a pathologically long text-only transcript from looping
-/// indefinitely if the model keeps responding with `context_length_exceeded`;
-/// 32 covers any realistic session — most run_agent overflow recovery is a
-/// single-shot drop.
-const MAX_COMPACTION_TRIMS: usize = 32;
-
-/// Trim one item from a compaction request that overflowed. Prefers dropping
-/// the oldest `function_call` + `function_call_output` pair (same shape as
-/// the live agent loop's one-shot recovery); falls back to dropping the
-/// oldest message item when no tool pair remains. The trailing item — the
-/// synthesised summarisation prompt that was appended just before the
-/// request — is preserved so the model still knows what we're asking for.
-///
-/// Returns the number of items removed (`0` if nothing was eligible).
-pub(crate) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
-    let dropped_pair = drop_oldest_tool_pair(input);
-    if dropped_pair > 0 {
-        return dropped_pair;
-    }
-    // A text-only long session has no tool pairs, so shed the oldest user
-    // or assistant message instead. Without this fallback `/compact` would
-    // fail exactly when it's most needed.
-    if input.len() <= 1 {
-        return 0;
-    }
-    let trim_until = input.len() - 1;
-    for idx in 0..trim_until {
-        if input[idx].get("type").and_then(Value::as_str) == Some("message") {
-            input.remove(idx);
-            return 1;
-        }
-    }
-    0
 }
 
 /// Drop the oldest `function_call` + matching `function_call_output` pair from
@@ -1128,235 +937,6 @@ pub(crate) fn emit_stream_events(
             }
         }
         _ => {}
-    }
-}
-
-/// Run a single compaction turn. Mutates `input` in place: on success it is
-/// replaced with `[summary, recent_context_suffix...]`; on failure the caller's
-/// `input` is left untouched.
-///
-/// The compaction request is non-steerable — the manual `/compact` command is
-/// not fed into the summarisation prompt. Tool calls returned by the compaction
-/// turn are ignored: the only output we care about is the assistant's final
-/// text, which becomes the persisted handoff summary.
-#[allow(clippy::too_many_arguments)]
-async fn run_compaction_turn(
-    transport: &dyn ResponsesTransport,
-    args: &Args,
-    cwd: &Path,
-    input: &mut Vec<Value>,
-    trigger: CompactionTrigger,
-    tokens_before: u64,
-    session: Option<&SessionBinding<'_>>,
-    events: &UnboundedSender<AgentEvent>,
-    skills: &Catalog,
-    context: Option<&ProjectContext>,
-) -> Result<String, anyhow::Error> {
-    emit(
-        events,
-        session,
-        AgentEvent::CompactionStarted {
-            trigger,
-            tokens_before,
-        },
-    );
-
-    let preparation = prepare_compaction(input);
-    let summary_result = if preparation.is_split_turn() {
-        let history = request_compaction_summary(
-            transport,
-            args,
-            cwd,
-            preparation.summary_source.clone(),
-            preparation.previous_summary.clone(),
-            CompactionPromptKind::History,
-            session,
-            events,
-            skills,
-            context,
-        );
-        let turn_prefix = request_compaction_summary(
-            transport,
-            args,
-            cwd,
-            preparation.turn_prefix_source.clone(),
-            None,
-            CompactionPromptKind::TurnPrefix,
-            session,
-            events,
-            skills,
-            context,
-        );
-        tokio::try_join!(history, turn_prefix).map(|(history_summary, turn_prefix_summary)| {
-            merge_split_turn_summary(&history_summary, &turn_prefix_summary)
-        })
-    } else {
-        request_compaction_summary(
-            transport,
-            args,
-            cwd,
-            preparation.summary_source.clone(),
-            preparation.previous_summary.clone(),
-            CompactionPromptKind::History,
-            session,
-            events,
-            skills,
-            context,
-        )
-        .await
-    };
-    let summary = match summary_result {
-        Ok(summary) => append_compaction_details(&summary, &preparation.details),
-        Err(err) => {
-            let message = format!("{err:#}");
-            emit(
-                events,
-                session,
-                AgentEvent::CompactionFailed {
-                    trigger,
-                    message: message.clone(),
-                },
-            );
-            return Err(anyhow!(message));
-        }
-    };
-    if summary.trim().is_empty() {
-        let message = "compaction summary was empty".to_string();
-        emit(
-            events,
-            session,
-            AgentEvent::CompactionFailed {
-                trigger,
-                message: message.clone(),
-            },
-        );
-        return Err(anyhow!(message));
-    }
-
-    // Persist the checkpoint *before* mutating the caller's live `input`.
-    // `emit` swallows append_event errors as a deliberate best-effort
-    // policy, so for compaction — where divergence between live state and
-    // the durable log would silently break `--resume` — we persist directly
-    // and surface a failure as `CompactionFailed`. The session is still
-    // safe to continue: the pre-compaction transcript stays in place.
-    let completed = AgentEvent::CompactionCompleted {
-        trigger,
-        summary: summary.clone(),
-        replaced_events: preparation.replaced_events,
-        tokens_before,
-        details: (!preparation.details.is_empty()).then_some(preparation.details.clone()),
-    };
-    if let Some(binding) = session
-        && let Err(err) = binding.store.append_event(&binding.session_id, &completed)
-    {
-        let message = format!("failed to persist compaction checkpoint: {err:#}");
-        emit(
-            events,
-            session,
-            AgentEvent::CompactionFailed {
-                trigger,
-                message: message.clone(),
-            },
-        );
-        return Err(anyhow!(message));
-    }
-    *input = build_replacement_history(&summary, &preparation.recent_context);
-    let _ = events.send(completed);
-    Ok(summary)
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CompactionPromptKind {
-    History,
-    TurnPrefix,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn request_compaction_summary(
-    transport: &dyn ResponsesTransport,
-    args: &Args,
-    cwd: &Path,
-    mut source: Vec<Value>,
-    previous_summary: Option<String>,
-    kind: CompactionPromptKind,
-    session: Option<&SessionBinding<'_>>,
-    events: &UnboundedSender<AgentEvent>,
-    skills: &Catalog,
-    context: Option<&ProjectContext>,
-) -> Result<String, anyhow::Error> {
-    let mut compaction_trims_used: usize = 0;
-    loop {
-        let prompt = match kind {
-            CompactionPromptKind::History => {
-                build_history_summary_prompt(&source, previous_summary.as_deref())
-            }
-            CompactionPromptKind::TurnPrefix => build_turn_prefix_summary_prompt(&source),
-        };
-        let compaction_input = vec![json!({
-            "type": "message",
-            "role": "user",
-            "content": prompt,
-        })];
-        let body = responses::response_body_with_options(
-            args,
-            cwd,
-            &compaction_input,
-            skills,
-            context,
-            responses::ResponseBodyOptions::read_only(),
-        );
-        let mut stream = transport
-            .create(body, events.clone())
-            .await
-            .map_err(|err| anyhow!("{err:#}"))?;
-        let mut collector = ResponseCollector::default();
-        let mut retry_after_trim = false;
-
-        loop {
-            let value = match stream.next().await {
-                Some(Ok(value)) => value,
-                Some(Err(ResponsesError::ContextWindowExceeded { message }))
-                    if compaction_trims_used < MAX_COMPACTION_TRIMS =>
-                {
-                    let dropped = trim_for_compaction(&mut source);
-                    if dropped == 0 {
-                        return Err(anyhow!(
-                            "compaction overflow with nothing left to drop: {message}"
-                        ));
-                    }
-                    compaction_trims_used += 1;
-                    emit(
-                        events,
-                        session,
-                        AgentEvent::ContextTrimmed {
-                            dropped_pairs: dropped,
-                        },
-                    );
-                    retry_after_trim = true;
-                    break;
-                }
-                Some(Err(err)) => return Err(anyhow!("{err:#}")),
-                None => break,
-            };
-            // Don't emit message deltas to the live channel during compaction —
-            // a streaming summary inside the regular assistant cell would look
-            // like a normal answer. Frontends watch CompactionStarted/Completed.
-            match collector.push_event(&value, "Responses API (compact)") {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(err) => return Err(err),
-            }
-        }
-
-        if retry_after_trim {
-            continue;
-        }
-        let envelope = collector.finish("Responses API (compact)")?;
-        let summary = responses::assistant_text(&envelope).unwrap_or_default();
-        if summary.trim().is_empty() {
-            return Err(anyhow!("compaction summary was empty"));
-        }
-        return Ok(summary);
     }
 }
 

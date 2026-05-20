@@ -846,15 +846,14 @@
 <span class="root">nav/</span>
 <span class="group">— Library</span>
 ├── <span class="focus">crates/nav-core/</span>           <span class="note">the loop, tools, transport, sessions</span>
-│   ├── src/<span class="focus">agent.rs</span>            <span class="note">small facade for agent modules</span>
-│   ├── src/agent/        <span class="note">events, replay, and run_agent runner</span>
+│   ├── src/<span class="focus">lib.rs</span>              <span class="note">six reader-facing harness roots</span>
+│   ├── src/agent_loop/   <span class="note">events, protocol, control, and run_agent runner</span>
 │   ├── src/<span class="focus">cli.rs</span>              <span class="note">Args (clap), shared by every frontend</span>
-│   ├── src/<span class="focus">auth.rs</span>             <span class="note">ChatGPT OAuth via ~/.codex/auth.json, or OPENAI_API_KEY</span>
-│   ├── src/responses/     <span class="note">request building, collection/parsing, WebSocket + SSE</span>
-│   ├── src/tools/         <span class="note">read_file, list_files, bash, edit_file, apply_patch, code_search</span>
-│   ├── src/git_diff.rs    <span class="note">working-tree diff snapshots after file mutations</span>
-│   ├── src/mutation.rs    <span class="note">shared file-change and diff summary types</span>
-│   └── src/session/       <span class="note">SQLite event log; powers --list-sessions / --resume</span>
+│   ├── src/model/        <span class="note">auth, request building, WebSocket + SSE</span>
+│   ├── src/tool_registry/<span class="note">tool schemas, dispatch, filesystem, shell, patch</span>
+│   ├── src/context/      <span class="note">project context, skills, replay, compaction, sessions</span>
+│   ├── src/guardrails/   <span class="note">approval policy, preflight, protected paths, sandbox facade</span>
+│   └── src/verify/       <span class="note">working-tree diffs, mutation summaries, doctor checks</span>
 │
 <span class="group">— Frontend</span>
 ├── <span class="focus">crates/nav-tui/</span>             <span class="note">terminal chat UI</span>
@@ -892,12 +891,12 @@
 
       <ol>
         <li><code>crates/nav-core/src/cli.rs</code> — the CLI options. Tiny. Shows what knobs exist.</li>
-        <li><code>crates/nav-core/src/agent/runner.rs</code> — start at <code>run_agent</code>. This is the model/tool loop.</li>
-        <li><code>crates/nav-core/src/agent/events.rs</code> and <code>replay.rs</code> — the event contract and resume transcript builder.</li>
-        <li><code>crates/nav-core/src/tools/mod.rs</code> — the dispatcher; six tools, one match arm each.</li>
-        <li><code>crates/nav-core/src/tools/fs.rs</code> — the workspace sandbox. Notice <code>resolve_inside</code>.</li>
-        <li><code>crates/nav-core/src/responses/request.rs</code>, <code>collector.rs</code>, and <code>parser.rs</code> — request body, stream folding, output parsing.</li>
-        <li><code>crates/nav-core/src/session/mod.rs</code> — SQLite event log behind <code>--resume</code>.</li>
+        <li><code>crates/nav-core/src/agent_loop/runner.rs</code> — start at <code>run_agent</code>. This is the model/tool loop.</li>
+        <li><code>crates/nav-core/src/agent_loop/events.rs</code> and <code>context/replay.rs</code> — the event contract and resume transcript builder.</li>
+        <li><code>crates/nav-core/src/tool_registry/dispatch.rs</code> — the dispatcher; the model-visible tools enter here.</li>
+        <li><code>crates/nav-core/src/tool_registry/fs.rs</code> — workspace file safety. Notice <code>resolve_inside</code>.</li>
+        <li><code>crates/nav-core/src/model/responses/request.rs</code>, <code>collector.rs</code>, and <code>parser.rs</code> — request body, stream folding, output parsing.</li>
+        <li><code>crates/nav-core/src/context/session/mod.rs</code> — SQLite event log behind <code>--resume</code>.</li>
         <li><code>crates/nav-tui/src/app.rs</code> — the TUI's <code>run()</code>: <code>tokio::select!</code> over keys + agent events.</li>
         <li><code>crates/nav-tui/src/input.rs</code> and <code>turn.rs</code> — command classification and background turn spawning.</li>
         <li><code>crates/nav-tui/src/widget.rs</code> + <code>cells.rs</code> — how each event becomes a row on screen.</li>
@@ -915,10 +914,10 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-core/src/agent/runner.rs</code> — function <code>run_agent</code>.
+        <code>crates/nav-core/src/agent_loop/runner.rs</code> — function <code>run_agent</code>.
       </aside>
 
-      <p class="drop">Open <code>agent/runner.rs</code> and find <code>run_agent</code>. Strip out the bookkeeping and you're left with this skeleton:</p>
+      <p class="drop">Open <code>agent_loop/runner.rs</code> and find <code>run_agent</code>. Strip out the bookkeeping and you're left with this skeleton:</p>
 
       <pre data-lang="rust">for _ in 0..args.max_turns {
     <span class="cmt">// 1. ask the model</span>
@@ -969,7 +968,7 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-core/src/agent/events.rs</code> — <code>enum AgentEvent</code>.
+        <code>crates/nav-core/src/agent_loop/events.rs</code> — <code>enum AgentEvent</code>.
       </aside>
 
       <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every surface reads the same event model through its own adapter: the TUI consumes it in-process, <code>--json-events</code> prints raw events, and <code>--json-rpc</code> wraps them for future non-TUI experiments. The core event families are:</p>
@@ -1030,7 +1029,7 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-core/src/tools/</code> — <code>mod.rs</code>, <code>fs.rs</code>, <code>shell.rs</code>.
+        <code>crates/nav-core/src/tool_registry/</code> — <code>dispatch.rs</code>, <code>fs.rs</code>, <code>shell.rs</code>.
       </aside>
 
       <p class="drop">The model is told, in JSON-Schema form, that it has exactly six functions to call. They are deliberately primitive — together they cover <em>inspect, find, change, verify</em>.</p>
@@ -1094,7 +1093,7 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-core/src/responses/</code> — <code>request.rs</code>, <code>collector.rs</code>, <code>parser.rs</code>, <code>websocket.rs</code>, <code>sse.rs</code>, <code>types.rs</code>.
+        <code>crates/nav-core/src/model/responses/</code> — <code>request.rs</code>, <code>collector.rs</code>, <code>parser.rs</code>, <code>websocket.rs</code>, <code>sse.rs</code>, <code>types.rs</code>.
       </aside>
 
       <p class="drop">The model lives behind OpenAI's <em>Responses</em> API. nav speaks to it two ways:</p>
@@ -1117,7 +1116,7 @@
 
       <h3>Authentication, briefly</h3>
 
-      <p><code>auth.rs</code> resolves to one of two backends:</p>
+      <p><code>model/auth.rs</code> resolves to one of two backends:</p>
 
       <ul>
         <li><strong>ChatGPT</strong> (default) — reads <code>~/.codex/auth.json</code> (written by <code>codex login</code>) and uses the OAuth access token against <code>chatgpt.com/backend-api/codex</code>.</li>
@@ -1136,10 +1135,10 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-core/src/session/mod.rs</code>.
+        <code>crates/nav-core/src/context/session/mod.rs</code>.
       </aside>
 
-      <p class="drop">Every run is persisted to a SQLite file (default <code>$XDG_DATA_HOME/nav/nav.db</code>, falling back to <code>~/.local/share/nav/nav.db</code>). Three main tables, plus a small <code>schema_version</code> table for migrations:</p>
+      <p class="drop">Every run is persisted to a SQLite file (default <code>$XDG_DATA_HOME/nav/nav.db</code>, falling back to <code>~/.local/share/nav/nav.db</code>). Three main tables, plus a small <code>schema_version</code> table for the current schema:</p>
 
       <ul>
         <li><code>session</code> — one row per run, with rollups (cwd, model, token totals).</li>
@@ -1147,7 +1146,7 @@
         <li><code>turn</code> — one row per model turn, with usage + (optional) cost.</li>
       </ul>
 
-      <p><code>--list-sessions</code> reads <code>session</code> with a rollup query. <code>--resume &lt;id&gt;</code> loads every event for that session in order and hands them to <code>rebuild_responses_input</code> in <code>agent/replay.rs</code>, which translates durable user/assistant messages back into the wire format the Responses API expects for "here is the conversation so far." Tool events remain visible in scrollback, but replay skips them because old session rows do not include the encrypted reasoning items required to safely replay stateless tool-call items.</p>
+      <p><code>--list-sessions</code> reads <code>session</code> with a rollup query. <code>--resume &lt;id&gt;</code> loads every event for that session in order and hands them to <code>rebuild_responses_input</code> in <code>context/replay.rs</code>, which translates durable user/assistant messages back into the wire format the Responses API expects for "here is the conversation so far." Tool events remain visible in scrollback, but replay skips derived tool-output events because only the model's raw output items are safe to carry forward.</p>
 
       <aside class="mnote why">
         <span class="label">Why this matters</span>

@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::agent::AgentEvent;
+use crate::agent_loop::AgentEvent;
 
 pub use auth::{AuthConfig, load_auth};
 pub use names::did_you_mean;

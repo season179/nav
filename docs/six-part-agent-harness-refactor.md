@@ -18,11 +18,10 @@ small modules, plain names, explicit trust boundaries, and readable code.
 
 ## Implementation Status
 
-This branch now moves the implementation behind the six reader-facing module
-roots: `tool_registry`, `model`, `context`, `guardrails`, `agent_loop`, and
-`verify`. The older flat module names remain as compatibility shims, so
-downstream imports can keep compiling while new code has an obvious conceptual
-home.
+This branch now exposes the six reader-facing module roots directly:
+`tool_registry`, `model`, `context`, `guardrails`, `agent_loop`, and `verify`.
+The older flat module shims were removed, and in-repo callers now use the new
+owners directly.
 
 ## Original Shape
 
