@@ -1,6 +1,6 @@
 use super::retry::TransportError;
 use super::{ResponsesError, detect_context_overflow, detect_http_overflow, model_hint_from_body};
-use crate::auth::AuthConfig;
+use crate::model::auth::AuthConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};

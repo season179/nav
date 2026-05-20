@@ -6,6 +6,7 @@ use crate::agent::TurnUsage;
 use crate::cli::Args;
 use crate::project::{ContextFile, ContextScope, ProjectContext};
 use crate::skills::Catalog;
+use crate::tool_registry::{SPAWN_SUBAGENT_TOOL, ToolAccess};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -229,13 +230,13 @@ fn response_body_omits_context_section_when_no_files() {
 #[test]
 fn response_body_options_gate_subagent_calls_with_subagent_toggle() {
     let without_subagents = ResponseBodyOptions {
-        tool_access: crate::tools::ToolAccess::Full,
+        tool_access: ToolAccess::Full,
         include_subagents: false,
     };
     assert!(without_subagents.allows_tool("apply_patch"));
-    assert!(!without_subagents.allows_tool(crate::tools::SPAWN_SUBAGENT_TOOL));
+    assert!(!without_subagents.allows_tool(SPAWN_SUBAGENT_TOOL));
 
-    assert!(ResponseBodyOptions::default().allows_tool(crate::tools::SPAWN_SUBAGENT_TOOL));
+    assert!(ResponseBodyOptions::default().allows_tool(SPAWN_SUBAGENT_TOOL));
     assert!(ResponseBodyOptions::read_only().allows_tool("read_file"));
     assert!(!ResponseBodyOptions::read_only().allows_tool("apply_patch"));
 }

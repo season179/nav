@@ -3,9 +3,8 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::context::{ExportFormat, Settings};
 use crate::permissions::{AskForApproval, SandboxPolicy};
-use crate::project::Settings;
-use crate::session::ExportFormat;
 
 // clap turns this struct into the CLI. Keeping options small makes the
 // educational path clear: model choice, auth choice, loop limit, and prompt.

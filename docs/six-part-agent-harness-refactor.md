@@ -16,10 +16,19 @@ The goal is not to make `nav` more abstract. The goal is to make the existing
 behavior easier to find, audit, and explain. Preserve the educational feel:
 small modules, plain names, explicit trust boundaries, and readable code.
 
-## Current Shape
+## Implementation Status
 
-`nav` already has all six parts, but the source tree does not make them obvious.
-The current crate root exposes a flat list of implementation modules:
+This branch now moves the implementation behind the six reader-facing module
+roots: `tool_registry`, `model`, `context`, `guardrails`, `agent_loop`, and
+`verify`. The older flat module names remain as compatibility shims, so
+downstream imports can keep compiling while new code has an obvious conceptual
+home.
+
+## Original Shape
+
+Before this refactor, `nav` already had all six parts, but the source tree did
+not make them obvious. The old crate root exposed a flat list of implementation
+modules:
 
 - `agent`
 - `auth`
@@ -41,17 +50,17 @@ The current crate root exposes a flat list of implementation modules:
 - `skills`
 - `tools`
 
-This works mechanically, but a new reader has to infer the harness shape from
+This worked mechanically, but a new reader had to infer the harness shape from
 many peer modules. The biggest reading burden is `agent/runner.rs`: it is the
 right narrative center, but it also touches compaction, protected attachments,
 model requests, tool execution, mutation reporting, turn diffs, session
 persistence, subagents, and context-window recovery.
 
-## Current Six-Part Map
+## Original Six-Part Map
 
 ### 1. Tool Registry
 
-Current files:
+Original files:
 
 - `crates/nav-core/src/tools/mod.rs`
 - `crates/nav-core/src/tools/fs.rs`
@@ -61,7 +70,7 @@ Current files:
 - `crates/nav-core/src/tools/truncate.rs`
 - `crates/nav-core/src/tools/output_accumulator.rs`
 
-Current responsibilities:
+Responsibilities:
 
 - Define model-visible tool schemas.
 - Gate tools by agent scope with `ToolAccess`.
@@ -78,7 +87,7 @@ it is not named as a first-class module.
 
 ### 2. Model
 
-Current files:
+Original files:
 
 - `crates/nav-core/src/responses/mod.rs`
 - `crates/nav-core/src/responses/request.rs`
@@ -91,7 +100,7 @@ Current files:
 - `crates/nav-core/src/models.rs`
 - `crates/nav-core/src/auth.rs`
 
-Current responsibilities:
+Responsibilities:
 
 - Build Responses API request bodies.
 - Hold provider transport adapters.
@@ -109,7 +118,7 @@ currently tangled.
 
 ### 3. Context Management
 
-Current files:
+Original files:
 
 - `crates/nav-core/src/project.rs`
 - `crates/nav-core/src/skills.rs`
@@ -120,7 +129,7 @@ Current files:
 - `crates/nav-core/src/context_report.rs`
 - `crates/nav-core/src/responses/request.rs`
 
-Current responsibilities:
+Responsibilities:
 
 - Load project and user context files.
 - Load settings and workspace status.
@@ -139,7 +148,7 @@ compaction, context reports, and request construction. The core concept is
 
 ### 4. Guardrails
 
-Current files:
+Original files:
 
 - `crates/nav-core/src/permissions/mod.rs`
 - `crates/nav-core/src/permissions/preflight.rs`
@@ -156,7 +165,7 @@ Current files:
 - `crates/nav-core/src/tools/fs.rs`
 - `crates/nav-core/src/agent/runner.rs`
 
-Current responsibilities:
+Responsibilities:
 
 - Classify shell commands.
 - Ask for approval when policy requires it.
@@ -174,7 +183,7 @@ story requires chasing several modules.
 
 ### 5. Agent Loop
 
-Current files:
+Original files:
 
 - `crates/nav-core/src/agent/runner.rs`
 - `crates/nav-core/src/agent/events.rs`
@@ -183,7 +192,7 @@ Current files:
 - `crates/nav-cli/src/main.rs`
 - `crates/nav-tui/src/turn.rs`
 
-Current responsibilities:
+Responsibilities:
 
 - Accept a user prompt.
 - Optionally compact before the turn.
@@ -204,7 +213,7 @@ high-level harness loop; helper modules should carry the heavy detail.
 
 ### 6. Verify
 
-Current files:
+Original files:
 
 - `crates/nav-core/src/git_diff.rs`
 - `crates/nav-core/src/mutation.rs`
@@ -212,7 +221,7 @@ Current files:
 - `crates/nav-core/src/agent/runner.rs`
 - `crates/nav-core/src/tools/shell.rs`
 
-Current responsibilities:
+Responsibilities:
 
 - Summarize mutations from `edit_file` and `apply_patch`.
 - Emit `FileChange` events.

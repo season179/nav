@@ -234,7 +234,7 @@ fn try_sweep_old() -> Result<()> {
 }
 
 fn default_log_dir() -> Result<PathBuf> {
-    let base = crate::session::xdg_data_home()
+    let base = crate::context::session::xdg_data_home()
         .context("could not resolve XDG data directory for nav tool-output")?;
     Ok(base.join("nav").join("tool-output"))
 }

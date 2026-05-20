@@ -2,9 +2,9 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::AgentEvent;
-use super::compaction::{latest_checkpoint_slice, summary_message};
-use super::runner::build_user_content;
+use crate::agent::AgentEvent;
+use crate::agent_loop::runner::build_user_content;
+use crate::context::compaction::{latest_checkpoint_slice, summary_message};
 
 /// Reconstructs the Responses API `input` array from a previously persisted
 /// event log so that `--resume` can replay the same conversation state.

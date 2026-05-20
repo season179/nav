@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::PendingInputMode;
+use crate::agent_loop::control::PendingInputMode;
 use serde_json::json;
 use tempfile::tempdir;
 

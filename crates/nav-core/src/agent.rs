@@ -1,22 +1,26 @@
-pub mod compaction;
-mod events;
-mod replay;
-mod runner;
-
-pub use compaction::{
+pub use crate::agent_loop::events::{AgentEvent, CompactionTrigger, TurnUsage, UserAttachment};
+pub use crate::agent_loop::runner::{SessionBinding, run_agent, run_agent_with_control};
+pub use crate::context::compaction::{
     AutoCompactDecision, COMPACT_SLASH, CheckpointSlice, CompactionDetails,
     DEFAULT_AUTO_COMPACT_FRACTION, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT, SUMMARIZATION_PROMPT,
     SUMMARY_PREFIX, build_replacement_history, collect_recent_user_messages, is_compact_command,
     is_summary_message, latest_checkpoint_slice, should_auto_compact, summary_message,
 };
-pub use events::{AgentEvent, CompactionTrigger, TurnUsage, UserAttachment};
-pub use replay::rebuild_responses_input;
-pub use runner::{
-    EventStream, ResponsesTransport, SessionBinding, run_agent, run_agent_with_control,
-};
+pub use crate::context::replay::rebuild_responses_input;
+pub use crate::model::{EventStream, ResponsesTransport};
 
-#[cfg(test)]
-use runner::{drop_oldest_tool_pair, emit_stream_events, extract_message_text};
+pub mod compaction {
+    //! Compatibility exports for context compaction.
+    //!
+    //! New code should import this through [`crate::context::compaction`].
 
-#[cfg(test)]
-mod tests;
+    pub use crate::context::compaction::*;
+}
+
+pub mod replay {
+    //! Compatibility exports for context replay.
+    //!
+    //! New code should import this through [`crate::context::replay`].
+
+    pub use crate::context::replay::*;
+}

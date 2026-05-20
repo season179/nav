@@ -1,0 +1,266 @@
+use crate::cli::{Args, AuthMode};
+use anyhow::{Context, Result, bail};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde::Deserialize;
+use std::{env, fmt, fs, path::PathBuf};
+
+// the rest of the code only needs two facts after auth is resolved:
+// which HTTP/WebSocket endpoint to call and which bearer token to attach.
+pub struct AuthConfig {
+    pub(crate) http_base_url: String,
+    pub(crate) websocket_url: String,
+    pub(crate) bearer: String,
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthConfig")
+            .field("http_base_url", &self.http_base_url)
+            .field("websocket_url", &self.websocket_url)
+            .field("bearer", &"Bearer[REDACTED]")
+            .finish()
+    }
+}
+
+// Codex's ChatGPT login stores OAuth credentials in ~/.codex/auth.json.
+// We model only the fields this demo needs instead of the whole file.
+#[derive(Deserialize)]
+struct CodexAuthFile {
+    auth_mode: Option<String>,
+    tokens: Option<CodexTokens>,
+}
+
+#[derive(Deserialize)]
+struct CodexTokens {
+    access_token: String,
+}
+
+pub fn load_auth(args: &Args) -> Result<AuthConfig> {
+    match args.auth {
+        AuthMode::ApiKey => {
+            // API-key mode uses the public OpenAI API endpoint.
+            let key = env::var("OPENAI_API_KEY").map_err(|_| {
+                anyhow::anyhow!(
+                    "OPENAI_API_KEY is not set. Export it (e.g. `export OPENAI_API_KEY=sk-…`) \
+                     or re-run with `--auth chatgpt` (the default) to use a Codex ChatGPT login."
+                )
+            })?;
+            Ok(AuthConfig {
+                http_base_url: "https://api.openai.com/v1".to_string(),
+                websocket_url: "wss://api.openai.com/v1/responses".to_string(),
+                bearer: key,
+            })
+        }
+        AuthMode::Chatgpt => {
+            // ChatGPT subscription auth is not the same as OPENAI_API_KEY.
+            // Codex stores an OAuth access token locally; the Codex backend
+            // accepts that token at chatgpt.com/backend-api/codex.
+            let codex_home = args
+                .codex_home
+                .clone()
+                .or_else(|| env::var_os("CODEX_HOME").map(PathBuf::from))
+                .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+                .context(
+                    "could not determine CODEX_HOME or HOME. \
+                     Set HOME, set CODEX_HOME explicitly, or pass --codex-home <path>.",
+                )?;
+            let auth_path = codex_home.join("auth.json");
+            let raw = fs::read_to_string(&auth_path).map_err(|err| {
+                anyhow::anyhow!(
+                    "could not read {}: {err}. Run `codex login` to create it, \
+                     or pass `--auth api-key` and set OPENAI_API_KEY.",
+                    auth_path.display()
+                )
+            })?;
+            let auth_file: CodexAuthFile = serde_json::from_str(&raw).map_err(|err| {
+                anyhow::anyhow!(
+                    "could not parse {} as Codex auth.json: {err}. \
+                     Re-run `codex login` to rewrite the file.",
+                    auth_path.display()
+                )
+            })?;
+            if auth_file.auth_mode.as_deref() != Some("chatgpt") {
+                bail!(
+                    "{} is not in ChatGPT auth mode. Run `codex login` and choose \
+                     Sign in with ChatGPT, or pass `--auth api-key` and set OPENAI_API_KEY.",
+                    auth_path.display()
+                );
+            }
+            let bearer = auth_file.tokens.map(|tokens| tokens.access_token).context(
+                "Codex auth.json does not contain an access token. \
+                     Re-run `codex login` and choose Sign in with ChatGPT.",
+            )?;
+            Ok(AuthConfig {
+                http_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                websocket_url: "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+                bearer,
+            })
+        }
+    }
+}
+
+pub fn default_headers(auth: &AuthConfig) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", auth.bearer))?,
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    // the Codex backend requires streaming, so the client asks for SSE.
+    headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+    Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Args, AuthMode};
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn chatgpt_args(codex_home: std::path::PathBuf) -> Args {
+        let mut args = Args::test_default();
+        args.auth = AuthMode::Chatgpt;
+        args.codex_home = Some(codex_home);
+        args
+    }
+
+    // ── default_headers ───────────────────────────────────────────
+
+    #[test]
+    fn default_headers_sets_authorization() {
+        let auth = AuthConfig {
+            http_base_url: "https://example.com".into(),
+            websocket_url: "wss://example.com".into(),
+            bearer: "tok-123".into(),
+        };
+        let headers = default_headers(&auth).unwrap();
+        let auth_val = headers.get("authorization").unwrap().to_str().unwrap();
+        assert_eq!(auth_val, "Bearer tok-123");
+    }
+
+    #[test]
+    fn default_headers_sets_content_type_and_accept() {
+        let auth = AuthConfig {
+            http_base_url: "https://example.com".into(),
+            websocket_url: "wss://example.com".into(),
+            bearer: "tok".into(),
+        };
+        let headers = default_headers(&auth).unwrap();
+        assert_eq!(
+            headers.get("content-type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            headers.get("accept").unwrap().to_str().unwrap(),
+            "text/event-stream"
+        );
+    }
+
+    // ── ChatGPT auth loading ─────────────────────────────────────
+
+    #[test]
+    fn chatgpt_reads_valid_auth_file() {
+        let temp = tempdir().unwrap();
+        let auth_json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"tok_abc"}}"#;
+        fs::write(temp.path().join("auth.json"), auth_json).unwrap();
+
+        let auth = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap();
+        assert_eq!(auth.bearer, "tok_abc");
+        assert!(auth.http_base_url.contains("chatgpt.com"));
+        assert!(auth.websocket_url.contains("chatgpt.com"));
+    }
+
+    #[test]
+    fn chatgpt_rejects_non_chatgpt_auth_mode() {
+        let temp = tempdir().unwrap();
+        let auth_json = r#"{"auth_mode":"api_key","tokens":{"access_token":"tok"}}"#;
+        fs::write(temp.path().join("auth.json"), auth_json).unwrap();
+
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not in ChatGPT auth mode"));
+        // The new message also points users at the alternative.
+        assert!(msg.contains("--auth api-key"));
+    }
+
+    #[test]
+    fn chatgpt_rejects_missing_tokens() {
+        let temp = tempdir().unwrap();
+        let auth_json = r#"{"auth_mode":"chatgpt"}"#;
+        fs::write(temp.path().join("auth.json"), auth_json).unwrap();
+
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("access token"));
+    }
+
+    #[test]
+    fn chatgpt_rejects_empty_tokens_object() {
+        let temp = tempdir().unwrap();
+        // tokens:{} fails serde parse because access_token is non-Optional String.
+        let auth_json = r#"{"auth_mode":"chatgpt","tokens":{}}"#;
+        fs::write(temp.path().join("auth.json"), auth_json).unwrap();
+
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("parse"));
+    }
+
+    #[test]
+    fn chatgpt_rejects_missing_auth_file() {
+        let temp = tempdir().unwrap();
+        let args = chatgpt_args(temp.path().join("nonexistent").to_path_buf());
+        let err = load_auth(&args).unwrap_err();
+        let msg = err.to_string();
+        // Path included and an action ("codex login" or "--auth api-key").
+        assert!(msg.contains("could not read"));
+        assert!(msg.contains("codex login"));
+        assert!(msg.contains("--auth api-key"));
+    }
+
+    #[test]
+    fn chatgpt_rejects_malformed_json() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("auth.json"), "not json").unwrap();
+
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        let msg = err.to_string();
+        // Path included and a concrete action.
+        assert!(msg.contains("parse"));
+        assert!(msg.contains("auth.json"));
+        assert!(msg.contains("codex login"));
+    }
+
+    #[test]
+    fn chatgpt_handles_null_auth_mode() {
+        let temp = tempdir().unwrap();
+        let auth_json = r#"{"auth_mode":null,"tokens":{"access_token":"tok"}}"#;
+        fs::write(temp.path().join("auth.json"), auth_json).unwrap();
+
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        assert!(err.to_string().contains("not in ChatGPT auth mode"));
+    }
+
+    // ── API key auth loading ─────────────────────────────────────
+    // API-key mode reads OPENAI_API_KEY from the environment.
+    // These env-var tests are omitted because set_var/remove_var are unsafe
+    // in Rust 2024 and the tests race under parallel execution. The code path
+    // is trivial (env::var -> construct AuthConfig); the ChatGPT file-based
+    // tests above provide meaningful coverage of the auth loading structure.
+
+    // ── AuthConfig debug ──────────────────────────────────────────
+
+    #[test]
+    fn auth_config_debug_redacts_bearer() {
+        let auth = AuthConfig {
+            http_base_url: "https://x.com".into(),
+            websocket_url: "wss://x.com".into(),
+            bearer: "super-secret".into(),
+        };
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("https://x.com"));
+        assert!(debug.contains("wss://x.com"));
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("super-secret"));
+    }
+}

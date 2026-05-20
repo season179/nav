@@ -4,9 +4,9 @@ use crossterm::event::{self, Event as CtEvent};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use nav_core::guardrails::PermissionContext;
 use nav_core::permissions::approval::{ApprovalGate, ChannelGate, PendingApprovals};
 use nav_core::sandbox::select_for_platform;
-use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, Catalog, ControlPlane, ExtensionCatalog, OpenAiTransport, PendingInput,
     PendingInputDraft, PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext,

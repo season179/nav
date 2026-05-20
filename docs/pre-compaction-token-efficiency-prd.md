@@ -264,7 +264,7 @@ Run at minimum:
 ```text
 cargo test -p nav-core replay
 cargo test -p nav-core context_report
-cargo test -p nav-core tools::
+cargo test -p nav-core tool_registry::
 cargo test -p nav-tui
 ```
 

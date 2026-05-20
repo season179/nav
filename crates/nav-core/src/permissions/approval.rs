@@ -18,8 +18,8 @@ use tokio::sync::oneshot;
 use ulid::Ulid;
 
 use crate::agent::AgentEvent;
+use crate::agent_loop::protocol::{JSONRPC_VERSION, METHOD_APPROVAL_RESPOND};
 use crate::permissions::ReviewDecision;
-use crate::protocol::{JSONRPC_VERSION, METHOD_APPROVAL_RESPOND};
 
 /// Request shape passed to `ApprovalGate::request`. The gate translates it
 /// into an `AgentEvent::ToolCallApprovalRequest` so the wire-format and the
