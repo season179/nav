@@ -7,7 +7,7 @@
 //! explicitly returns [`InputResult::Unhandled`] for.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
@@ -22,15 +22,19 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 use crate::theme::Theme;
 
 mod approval;
+mod clipboard;
 mod composer;
 mod mention_popup;
+mod pending_preview;
 mod session_picker;
 mod slash_popup;
 mod view;
 
 pub use approval::ApprovalOverlay;
+use clipboard::{recognized_image_path, try_save_clipboard_image, workspace_relative_image};
 pub use composer::{Composer, ComposerEvent};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
+use pending_preview::{PendingPreview, render_pending_preview};
 pub use session_picker::{SessionPickerEntry, SessionPickerPopup};
 pub use slash_popup::{
     BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries,
@@ -81,13 +85,6 @@ pub struct BottomPane {
     /// loop and routed through the same `/resume <id>` path.
     last_session_selection: Option<String>,
     pending_inputs: Vec<PendingPreview>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingPreview {
-    id: String,
-    mode: PendingInputMode,
-    text: String,
 }
 
 impl BottomPane {
@@ -486,105 +483,6 @@ impl Default for BottomPane {
     }
 }
 
-/// Try to read an image from the system clipboard and persist it under
-/// `<cwd>/.nav/clipboard/` so it lives inside the read sandbox. Returns the
-/// workspace-relative path that should be inserted into the composer. Any
-/// failure (no clipboard image, IO error, encode error) yields `None` so the
-/// caller can fall back to text handling.
-fn try_save_clipboard_image(cwd: &Path) -> Option<String> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    let img = clipboard.get_image().ok()?;
-    let width = u32::try_from(img.width).ok()?;
-    let height = u32::try_from(img.height).ok()?;
-    let buf = image::RgbaImage::from_raw(width, height, img.bytes.into_owned())?;
-
-    let dir = cwd.join(".nav").join("clipboard");
-    std::fs::create_dir_all(&dir).ok()?;
-    let filename = format!("{}.png", uuid::Uuid::new_v4().simple());
-    let abs = dir.join(&filename);
-    image::DynamicImage::ImageRgba8(buf)
-        .save_with_format(&abs, image::ImageFormat::Png)
-        .ok()?;
-
-    let rel = PathBuf::from(".nav").join("clipboard").join(filename);
-    Some(rel.to_string_lossy().into_owned())
-}
-
-/// Turn a pasted-image absolute or relative path into a workspace-relative
-/// path the agent can actually `read_file`. Paths whose canonical form lives
-/// inside `cwd` get relativized; everything else is copied into
-/// `<cwd>/.nav/clipboard/` so the read sandbox in nav-core can actually read
-/// the bytes. Without resolving relative paths against `cwd` first, a paste
-/// like `../screenshot.png` from a sub-directory of the workspace passes
-/// through unchanged, then `encode_image_data_uri` silently drops it because
-/// it escapes the canonicalized cwd. Returns `None` only when both the
-/// containment check fails and the fallback copy fails.
-fn workspace_relative_image(cwd: &Path, cleaned: &str) -> Option<String> {
-    let path = Path::new(cleaned);
-    let abs_for_check = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    let canonical = abs_for_check
-        .canonicalize()
-        .ok()
-        .or_else(|| Some(abs_for_check.clone()))?;
-    let cwd_canonical = cwd.canonicalize().ok().unwrap_or_else(|| cwd.to_path_buf());
-
-    // Already inside the workspace? Hand back the cwd-relative form so the
-    // composer shows a short, recognizable path and so the runner's
-    // containment check downstream agrees.
-    if let Ok(rel) = canonical.strip_prefix(&cwd_canonical) {
-        return Some(rel.to_string_lossy().into_owned());
-    }
-
-    // Outside the workspace — copy in. Use the canonical path as the source
-    // so we follow any symlink the user pointed at, but the destination is
-    // always under `.nav/clipboard/`.
-    let dir = cwd.join(".nav").join("clipboard");
-    std::fs::create_dir_all(&dir).ok()?;
-    let ext = canonical
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("png");
-    let filename = format!("{}.{ext}", uuid::Uuid::new_v4().simple());
-    let dest = dir.join(&filename);
-    std::fs::copy(&canonical, &dest).ok()?;
-    let rel = PathBuf::from(".nav").join("clipboard").join(filename);
-    Some(rel.to_string_lossy().into_owned())
-}
-
-/// If `s` looks like a path to a readable image file, return the cleaned
-/// path. The check is intentionally cheap — extension match against
-/// `image::ImageFormat` + a single `image_dimensions` probe — so a non-image
-/// paste falls through with negligible cost. The probe earns its keep by
-/// rejecting wrong-extension or corrupted files before they end up in the
-/// prompt.
-///
-/// File URLs (`file:///tmp/My%20Image.png`) are parsed with `url::Url` so
-/// percent-encoded spaces and non-ASCII characters round-trip back into the
-/// real filesystem path before the probe. A bare path strip wouldn't decode
-/// `%20`, leaving an image with a space in its name as plain text instead of
-/// an attachment.
-fn recognized_image_path(s: &str) -> Option<String> {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let path: PathBuf = if let Ok(url) = url::Url::parse(trimmed)
-        && url.scheme() == "file"
-    {
-        url.to_file_path().ok()?
-    } else {
-        PathBuf::from(trimmed)
-    };
-    let ext = path.extension().and_then(|e| e.to_str())?;
-    image::ImageFormat::from_extension(ext)?;
-    image::image_dimensions(&path).ok()?;
-    Some(path.to_string_lossy().into_owned())
-}
-
 impl Widget for &BottomPane {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
@@ -648,46 +546,6 @@ impl Widget for &BottomPane {
             self.composer.render(content, buf, &self.theme);
         }
     }
-}
-
-fn render_pending_preview(items: &[PendingPreview], area: Rect, buf: &mut Buffer, theme: &Theme) {
-    let bg = Style::default().bg(theme.composer_bg);
-    Block::default().style(bg).render(area, buf);
-    let dim = bg.fg(Color::DarkGray);
-    let accent = bg.fg(Color::Blue).add_modifier(Modifier::BOLD);
-    let mut lines = vec![Line::from(vec![
-        Span::styled("  pending", accent),
-        Span::styled(
-            "  edit: /queue-edit <id> ...  remove: /queue-remove <id>  clear: /queue-clear",
-            dim,
-        ),
-    ])];
-    for item in items.iter().take(4) {
-        lines.push(Line::from(vec![
-            Span::styled("  • ", dim),
-            Span::styled(item.id.clone(), accent),
-            Span::styled(format!(" {}  ", pending_mode_label(item.mode)), dim),
-            Span::styled(truncate_preview(&item.text), bg.fg(Color::White)),
-        ]));
-    }
-    Paragraph::new(lines).style(bg).render(area, buf);
-}
-
-fn pending_mode_label(mode: PendingInputMode) -> &'static str {
-    match mode {
-        PendingInputMode::FollowUp => "follow-up",
-        PendingInputMode::Steering => "steering",
-    }
-}
-
-fn truncate_preview(text: &str) -> String {
-    const MAX_CHARS: usize = 80;
-    if text.chars().count() <= MAX_CHARS {
-        return text.to_string();
-    }
-    let mut out = text.chars().take(MAX_CHARS).collect::<String>();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]
@@ -782,123 +640,5 @@ mod tests {
             title: Some("Implement picker".to_string()),
         }]);
         assert!(!pane.can_scroll_transcript_with_arrows());
-    }
-
-    #[test]
-    fn recognized_image_path_rejects_non_image_text() {
-        assert_eq!(recognized_image_path("just some text"), None);
-        assert_eq!(recognized_image_path(""), None);
-        assert_eq!(recognized_image_path("/etc/passwd"), None);
-    }
-
-    #[test]
-    fn recognized_image_path_rejects_nonexistent_image_extension() {
-        // Extension matches but the file doesn't exist — must not return Some.
-        assert_eq!(recognized_image_path("/tmp/does-not-exist.png"), None);
-    }
-
-    #[test]
-    fn recognized_image_path_accepts_real_png_and_strips_file_prefix() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sample.png");
-        // 1x1 transparent PNG, written via the image crate so the probe agrees.
-        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
-        image::DynamicImage::ImageRgba8(img)
-            .save_with_format(&path, image::ImageFormat::Png)
-            .unwrap();
-
-        let path_str = path.to_string_lossy().into_owned();
-        assert_eq!(recognized_image_path(&path_str), Some(path_str.clone()));
-        let file_url = format!("file://{}", path_str);
-        assert_eq!(recognized_image_path(&file_url), Some(path_str));
-    }
-
-    #[test]
-    fn recognized_image_path_decodes_percent_encoded_file_url() {
-        // Filename with a space (very common on macOS / GNOME screenshots).
-        // A bare `strip_prefix("file://")` leaves `%20` in the path and the
-        // dimensions probe fails — the image silently falls through as text.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("My Image.png");
-        write_png(&path);
-
-        // Build a file:// URL with proper percent-encoding via the `url` crate
-        // so the test asserts the real decoding path, not just a hand-rolled
-        // string.
-        let url = url::Url::from_file_path(&path).expect("valid file path");
-        let encoded = url.as_str();
-        assert!(
-            encoded.contains("%20"),
-            "expected encoded space in test fixture: {encoded}"
-        );
-
-        let decoded = recognized_image_path(encoded).expect("encoded file URL must resolve");
-        assert_eq!(decoded, path.to_string_lossy());
-    }
-
-    fn write_png(path: &Path) {
-        let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
-        image::DynamicImage::ImageRgba8(img)
-            .save_with_format(path, image::ImageFormat::Png)
-            .unwrap();
-    }
-
-    #[test]
-    fn workspace_relative_passes_relative_through() {
-        // A relative path that resolves *inside* cwd round-trips back to the
-        // canonical workspace-relative form. The file has to exist so the
-        // canonicalization step can resolve symlinks on macOS where `/tmp`
-        // is a symlink to `/private/tmp`.
-        let dir = tempfile::tempdir().unwrap();
-        let png = dir.path().join("screenshots").join("foo.png");
-        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
-        write_png(&png);
-        let out = workspace_relative_image(dir.path(), "screenshots/foo.png").unwrap();
-        assert_eq!(out, "screenshots/foo.png");
-    }
-
-    #[test]
-    fn workspace_relative_strips_cwd_prefix_for_in_workspace_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let png = dir.path().join("a").join("b.png");
-        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
-        write_png(&png);
-        let out = workspace_relative_image(dir.path(), &png.to_string_lossy()).unwrap();
-        assert_eq!(out, "a/b.png");
-    }
-
-    #[test]
-    fn workspace_relative_copies_external_path_into_clipboard_dir() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let src = src_dir.path().join("outside.png");
-        write_png(&src);
-
-        let cwd = tempfile::tempdir().unwrap();
-        let out = workspace_relative_image(cwd.path(), &src.to_string_lossy()).unwrap();
-        assert!(
-            out.starts_with(".nav/clipboard/") && out.ends_with(".png"),
-            "expected workspace-relative copy, got {out:?}"
-        );
-        assert!(cwd.path().join(&out).exists());
-    }
-
-    #[test]
-    fn workspace_relative_copies_relative_path_that_escapes_cwd() {
-        // Running `nav` from `repo/subdir` and pasting `../outside.png` —
-        // resolves outside the launch cwd. Returning the literal `../` path
-        // would later be silently dropped by the runner's containment check,
-        // so the image must be copied into `<cwd>/.nav/clipboard/` instead.
-        let outer = tempfile::tempdir().unwrap();
-        let outside = outer.path().join("escapes.png");
-        write_png(&outside);
-        let cwd = outer.path().join("workspace");
-        std::fs::create_dir_all(&cwd).unwrap();
-
-        let out = workspace_relative_image(&cwd, "../escapes.png").unwrap();
-        assert!(
-            out.starts_with(".nav/clipboard/") && out.ends_with(".png"),
-            "relative escape must be copied in, got {out:?}"
-        );
-        assert!(cwd.join(&out).exists());
     }
 }
