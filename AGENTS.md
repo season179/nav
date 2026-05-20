@@ -25,7 +25,6 @@ them from a `nav` task.
 
 - `rg` (ripgrep) on `PATH` — the `code_search` tool shells out to it and
   nothing in `Cargo.toml` will tell you this.
-- Desktop UI uses **`bun`**, not npm: `bun install && bun run start`.
 
 ## Runtime defaults that are easy to miss
 
