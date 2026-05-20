@@ -1,199 +1,344 @@
 # nav
 
-`nav` is a small Rust coding agent built on the Responses API.
+`nav` is a learning project: a Rust coding-agent harness built to understand
+how coding agents actually work by building one.
 
-This keeps the spirit of Geoffrey Huntley's workshop: a coding agent is a loop
-that can read, edit, search, run commands, and report back. The project started
-as an educational implementation, but now also has a second goal: become a
-usable local coding agent with a real product surface. Keep the simple learning
-path intact, but prefer designs that can grow into reliable day-to-day use.
+The first goal is learning. `nav` should keep the agent loop, tool plumbing,
+transport, approvals, session replay, compaction, and frontend contracts close
+enough to the surface that they can be studied and changed without digging
+through a giant framework.
 
-See [CONTEXT.md](CONTEXT.md) for the current product direction and engineering
-priorities. If you want to read the code, start with the guided tour in
-[ARCHITECTURE.html](ARCHITECTURE.html) — it walks through `nav-core` and
-`nav-tui` in plain English and tells you which files to open in which order.
+The second goal is personal usefulness. As the harness gets clearer, it should
+also become good enough for real work in this checkout and nearby projects: safe
+around the workspace, explicit about what it is doing, resumable after longer
+sessions, and pleasant enough to use from the terminal or desktop.
 
-By default it uses the ChatGPT OAuth credentials stored by Codex in
-`~/.codex/auth.json` and calls the Codex Responses backend directly over
-WebSocket.
+## Current Focus
 
-WebSocket mode keeps each turn on one low-latency transport. The SSE
-transport is still available with `--transport sse` because plain HTTP is useful
-for learning the shape of streamed Responses events.
+- **Learn the harness:** keep the model loop, tool calls, event stream,
+  approval flow, replay, and compaction behavior understandable from the code.
+- **Make it useful for me:** inspect files, edit code, run commands, show
+  diffs, ask for approval when needed, and keep a durable local session log.
+- **Understand long sessions:** support manual and automatic compaction, then
+  improve normal pre-compaction turns so old tool output does not bloat context
+  or disappear in a confusing way.
+- **Expose clean frontend seams:** keep one Rust agent loop and expose it
+  through the TUI, raw NDJSON, JSON-RPC, desktop, and future experiments.
+- **Stay local and auditable:** use local SQLite for history, default to
+  ChatGPT OAuth or an explicit API key, restrict file writes to the workspace,
+  and make shell approval/sandbox behavior visible.
 
-## Prerequisites
+For the broader project context, read [docs/CONTEXT.md](docs/CONTEXT.md). For a
+guided code tour, open [docs/ARCHITECTURE.html](docs/ARCHITECTURE.html).
 
-- `rg` from ripgrep must be on `PATH` for the `code_search` tool.
+## What Works Today
+
+- A terminal TUI when you run `nav` in a real terminal.
+- Headless raw events with `--json-events`.
+- Versioned JSON-RPC notifications with `--json-rpc` for desktop and other
+  non-TUI frontends.
+- Session persistence, resume, export, fork, labels, transcript search, and
+  session trees.
+- Workspace-aware tools: read files, list files, search with ripgrep, run
+  shell commands, edit files, apply patches, and spawn read-only helper agents.
+- Approval prompts, dangerous-command blocking, protected-file checks, and a
+  macOS sandbox for shell commands.
+- Manual `/compact`, automatic pre-turn compaction, context reports, and
+  bounded tool output.
+- A small Electron desktop shell under `nav-desktop/`.
+
+Learning threads still in progress:
+
+- Budgeted replay of prior tool calls/results before compaction.
+- Native `read_file` slicing with `offset` and `limit`.
+- Observability that helps explain real runs: tokens, tools, retries,
+  approvals, compactions, and failures.
+- Frontend experiments beyond the terminal/desktop when they teach something
+  useful about harness boundaries.
+
+## Requirements
+
+- Rust toolchain with Cargo.
+- `rg` from ripgrep on `PATH`; `code_search` shells out to it.
+- Codex login for the default ChatGPT OAuth flow, or `OPENAI_API_KEY` for raw
+  API-key mode.
+- `bun` if you want to run the desktop UI.
 
 ## Setup
 
-```sh
-cargo run -- "Create fizzbuzz.rs and run it"
-```
-
-Sign in with ChatGPT once through Codex so `~/.codex/auth.json` exists:
+Sign in once through Codex so `~/.codex/auth.json` exists:
 
 ```sh
 codex login
 ```
 
-## Usage
+Run from source:
 
 ```sh
-cargo run -- "List the files and explain what this project does"
-cargo run -- --model gpt-5.5 "Add tests for the CLI argument parser"
-cargo run -- --transport sse "Use the HTTP/SSE transport instead"
-cargo run -- --auth api-key "Use OPENAI_API_KEY instead"
+cargo run -- "List the files and explain this project"
 ```
 
-`gpt-5.5` is the default model name used by this demo for the Codex backend; use
-`--model` to choose a model your backend/account exposes. For `--auth api-key`,
-set `OPENAI_API_KEY` first.
-
-After installing:
+Install the `nav` binary from this checkout:
 
 ```sh
 cargo install --path crates/nav-cli
-nav "List the files and explain what this project does"
-nav --model gpt-5.5 "Add tests for the CLI argument parser"
-nav --transport sse "Use the HTTP/SSE transport instead"
-nav --auth api-key "Use OPENAI_API_KEY instead"
+nav "List the files and explain this project"
 ```
 
-## TUI mode
+By default `nav` uses:
 
-`cd` to your project and run `nav` with no arguments — when stdout is a tty
-and no headless flag is set, it launches the interactive TUI: chat transcript
-above, multi-line composer below.
+- model: `gpt-5.5`
+- auth: ChatGPT OAuth from `~/.codex/auth.json`
+- transport: WebSocket
+- approval policy: `on-request`
+- sandbox: `workspace-write`
+
+Use an API key instead:
+
+```sh
+OPENAI_API_KEY=... nav --auth api-key "Run the test suite"
+```
+
+Run a quick local health check:
+
+```sh
+nav doctor
+nav doctor --json
+```
+
+## Terminal TUI
+
+Run `nav` with no prompt in a terminal:
 
 ```sh
 cd ~/code/my-project
 nav
 ```
 
-Pass a prompt to seed the first turn and skip having to type it in the
-composer:
+The TUI shows the transcript above and a multi-line composer below.
 
-```sh
-nav "kick off the session"
-```
+Useful keys and commands:
 
-Inside the TUI:
+- `Enter` submits. `Shift+Enter` inserts a newline.
+- `Ctrl+U` clears to the start of the line.
+- `Ctrl+W` deletes the previous word.
+- `Up` and `Down` recall earlier prompts from the same session.
+- `/help` shows slash commands.
+- `/clear` clears the visible transcript.
+- `/context` estimates what the next model request will contain.
+- `/context all` expands the context report into item-level rows.
+- `/compact` summarizes older history and continues from the checkpoint.
+- `/sessions` lists stored sessions.
+- `/resume` opens the session picker.
+- `/quit` exits. Press `Ctrl+C` twice to exit cleanly.
 
-- `Enter` submits, `Shift+Enter` inserts a newline.
-- `Ctrl+U` clears to start of line, `Ctrl+W` deletes the previous word.
-- `Up` / `Down` recall earlier prompts from this session.
-- A leading `/` opens a slash-command popup (`/help`, `/clear`, `/context`,
-  `/quit`, `/resume`, `/sessions`). Type to filter, Tab/Enter completes.
-- Prompt templates registered by extensions appear as `/prompt:<name>` and
-  wrap the next prompt with the template body.
-- `/quit` and `Ctrl+C` twice exit cleanly; `/clear` empties the transcript.
-- `/context [all]` estimates the current context distribution without sending
-  a model turn.
+Prompt templates and skills also appear in the slash popup when discovered.
 
-To bypass the TUI and stream raw events:
+## Headless Modes
+
+Use raw NDJSON when you want one `AgentEvent` per line:
 
 ```sh
 nav --json-events "list the files" > events.ndjson
 ```
 
-Each line is one `AgentEvent` as JSON (`assistant_message_delta`,
-`tool_call_started`, `file_change`, `turn_diff`, `turn_complete`, …). Non-tty
-stdout defaults to this mode automatically.
-
-For desktop, chat, and other non-TUI frontends, prefer the versioned JSON-RPC
-contract:
+Use JSON-RPC for desktop, chat, or another frontend:
 
 ```sh
 nav --json-rpc "list the files"
 ```
 
-This emits newline-delimited JSON-RPC 2.0 notifications such as
-`nav.session.started` and `nav.event`, with `params.protocol_version: 1`.
-Approval responses can be written back to stdin as `nav.approval.respond`.
-See [docs/HEADLESS-PROTOCOL.md](docs/HEADLESS-PROTOCOL.md).
+JSON-RPC mode emits newline-delimited JSON-RPC 2.0 notifications:
+
+- `nav.session.started` announces `protocol_version`, session id, cwd, model,
+  and transport.
+- `nav.event` wraps the same `AgentEvent` payloads the TUI consumes.
+- `nav.approval.respond` can be written to stdin to answer approval requests.
+
+If stdout is not a TTY, `nav` uses raw headless events automatically unless
+you pass `--json-rpc`.
 
 ## Sessions
 
-Every run is persisted to a local SQLite database (default
-`$XDG_DATA_HOME/nav/nav.db`, falling back to `~/.local/share/nav/nav.db`).
-Absolute `--db-path` values are honored; relative values are resolved inside the
-nav data directory.
+Every run is stored in SQLite at `$XDG_DATA_HOME/nav/nav.db`, falling back to
+`~/.local/share/nav/nav.db`. Use `--db-path` to override it. Relative database
+paths are resolved inside the nav data directory.
+
+Common session commands:
 
 ```sh
-nav --list-sessions                 # all sessions, newest first
-nav --list-sessions --cwd "$PWD"    # only sessions started in this directory
-nav --resume <session-id> "follow-up prompt"
+nav --list-sessions
+nav --list-sessions --cwd "$PWD"
+nav --resume <session-id> "Continue from here"
+nav --pick-session
+nav export <session-id> --format md --out transcript.md
 ```
 
-`--resume` rebuilds the Responses transcript from the on-disk event log and
-appends the new prompt as the next turn. Token rollups appear in
-`--list-sessions`; cost is shown only for providers that report it (none do
-today, so the column reads `—`).
+Advanced session workflows:
+
+```sh
+nav sessions fork <session-id> --name "try another approach"
+nav sessions tree <session-id>
+nav sessions label <session-id> bugfix
+nav sessions search "panic" --label bugfix
+```
+
+Token rollups appear in session listings. Cost is shown only when a provider
+reports it.
+
+## Safety Model
+
+`nav` is meant to be useful without being casual about your filesystem.
+
+- `read_file`, `list_files`, `edit_file`, `apply_patch`, and `code_search`
+  reject absolute workspace paths, `..`, and symlink escapes.
+- Writes are workspace-only.
+- Reads of `.env*`, `*.pem`, `*.key`, and SSH keys require approval.
+- Writes under `.git`, `.agents`, and `.nav` are blocked.
+- `bash` defaults to `--sandbox workspace-write`.
+- On macOS, shell commands run through `sandbox-exec`.
+- On Linux and Windows, sandboxing is currently passthrough; command
+  classification and protected-path rules still apply.
+- Dangerous commands can require approval or be refused outright.
+
+The main knobs are:
+
+```sh
+nav --approval-policy untrusted "inspect this repo"
+nav --approval-policy never --json-events "run read-only checks"
+nav --sandbox read-only "look around without writing"
+nav --sandbox danger-full-access "I know this needs full access"
+```
+
+`--dangerously-bypass-approvals-and-sandbox` bypasses prompts and sandboxing,
+but unbypassable dangerous commands and protected-metadata writes are still
+refused.
+
+## Tools
+
+The model can call these tools:
+
+- `read_file`: read a relative file path.
+- `list_files`: list a relative directory.
+- `code_search`: search with ripgrep.
+- `bash`: run a shell command with timeout, approval, and sandbox handling.
+- `edit_file`: create a file or replace one exact string.
+- `apply_patch`: apply a reviewable multi-file patch.
+- `spawn_subagent`: run a focused read-only helper agent for exploration or
+  review.
+
+Large tool output is bounded before it goes back to the model. Shell output can
+spill the full raw result to local storage while the model sees a smaller
+head/tail view.
+
+## Git Checkpoints
+
+For reversible work, `nav` can create stash-backed checkpoints:
+
+```sh
+nav git checkpoint "before refactor"
+nav git stash "pause this work"
+nav git list
+nav git restore
+```
+
+Enable automatic dirty-worktree checkpoints before normal turns:
+
+```sh
+nav --git-checkpoints "make the change"
+```
+
+Or put `"git_checkpoints": true` in settings.
+
+## Project Context And Settings
+
+At startup, `nav` reads context files only from the launch directory:
+
+- `<cwd>/AGENTS.md`
+- `<cwd>/CLAUDE.md`
+- `~/.agents/AGENTS.md`
+- `~/.agents/CLAUDE.md`
+
+It does not walk upward through parent directories.
+
+Settings can live in `<cwd>/.nav/settings.json` or `~/.nav/settings.json`.
+Project settings override user settings. Explicit CLI flags override both.
+
+Example:
+
+```json
+{
+  "model": "gpt-5.5",
+  "transport": "websocket",
+  "bash_timeout_secs": 30,
+  "auto_compact_token_limit": 200000,
+  "auto_compact_fraction": 1.0,
+  "git_checkpoints": true,
+  "theme": "night"
+}
+```
+
+Malformed settings fall back to defaults with an error on stderr. Unknown keys
+are rejected so typos do not silently change behavior.
+
+## Skills And Extensions
+
+Project skills live in `<cwd>/.agents/skills/`. User skills live in
+`~/.agents/skills/`. Project skills shadow user skills with the same parsed
+name. Skills are readable by the agent but not writable by tool calls.
+
+Local extensions live in:
+
+- `<cwd>/.nav/extensions/<name>/extension.json`
+- `~/.nav/extensions/<name>/extension.json`
+
+Today, extensions can register:
+
+- prompt templates, available as `/prompt:<name>` in the TUI
+- simple TUI theme color overrides
+
+`nav extensions list` shows discovered manifests. Manifest sections for custom
+tools, MCP servers, hooks, and packages are parsed for visibility but are not
+executed yet.
 
 ## Desktop UI
 
-`nav-desktop` is the early Electron desktop shell for `nav`. It is intentionally
-small for now: a left sidebar, a main prompt area, and a persisted
-working-directory picker. It launches `nav --json-rpc` from the selected
-workspace, parses the stable headless protocol, and keeps a fallback parser for
-legacy raw `--json-events` output.
+`nav-desktop` is an early Electron shell. It asks for a working directory,
+spawns `nav --json-rpc`, and renders the stable protocol.
 
-Install the UI dependencies once:
+Install dependencies:
 
 ```sh
 bun install
 ```
 
-Start `nav-desktop`:
+Start the desktop UI:
 
 ```sh
 bun run start
 ```
 
-## Tools
+## Active Design Notes
 
-- `read_file`: read a relative file path
-- `list_files`: list a relative directory
-- `bash`: execute a shell command with a timeout
-- `edit_file`: create a file or replace an exact string
-- `apply_patch`: apply a reviewable multi-file patch with add/update/move/delete
-  sections
-- `code_search`: search with `rg`
+- [docs/pre-compaction-token-efficiency-prd.md](docs/pre-compaction-token-efficiency-prd.md)
+  explains the next token-efficiency work: faithful but budgeted replay of
+  tool calls/results, clearer placeholders for old output, and sliced
+  `read_file` reads.
+- [docs/otel-observability-prd.md](docs/otel-observability-prd.md) explains
+  the proposed telemetry shape: local logs stay canonical, while optional OTLP
+  traces make usage, failures, approvals, retries, compactions, and token
+  pressure easier to study.
+- [docs/TODO.md](docs/TODO.md) tracks shipped daily-driver work and remaining
+  follow-ups.
 
-Tool paths are resolved inside the current working directory.
-Absolute paths, parent traversal (`..`), and symbolic-link escapes are rejected.
+## Development Checks
 
-## Extensions
+Useful local checks:
 
-Local extensions live under `<cwd>/.nav/extensions/<name>/extension.json` or
-`~/.nav/extensions/<name>/extension.json`. Project extensions shadow user
-extensions by registered prompt-template or theme name.
-
-```json
-{
-  "name": "team",
-  "description": "Team-local nav helpers",
-  "prompt_templates": [
-    {
-      "name": "review",
-      "description": "Review the current change",
-      "path": "prompts/review.md"
-    }
-  ],
-  "themes": [
-    {
-      "name": "night",
-      "colors": {
-        "composer_bg": "#111827",
-        "popup_bg": "#0f172a"
-      }
-    }
-  ]
-}
+```sh
+cargo fmt --all -- --check
+cargo test -p nav-core -p nav-cli -p nav-tui
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Use `/prompt:review <request>` in the TUI, or set `"theme": "night"` in
-`.nav/settings.json`. `nav extensions list` shows discovered manifests.
-Manifest sections for `custom_tools`, `mcp_servers`, `hooks`, and `packages`
-are counted for visibility but not executed yet.
+Snapshot tests use `insta`. Review pending snapshots before committing.
