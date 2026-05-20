@@ -12,6 +12,7 @@ use crate::guardrails::{
     SessionAllowlist,
 };
 use crate::tool_registry::{SPAWN_SUBAGENT_TOOL, unchecked_permission_context};
+use crate::verify::git_checkpoint::{GitCheckpointAction, GitCheckpointStatus, list_nav_stashes};
 use anyhow::Result;
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -1080,8 +1081,8 @@ async fn run_agent_git_checkpoints_dirty_worktree_before_user_message() {
         matches!(
             event,
             AgentEvent::GitCheckpoint {
-                action: crate::git_checkpoint::GitCheckpointAction::Checkpoint,
-                status: crate::git_checkpoint::GitCheckpointStatus::Created,
+                action: GitCheckpointAction::Checkpoint,
+                status: GitCheckpointStatus::Created,
                 ..
             }
         )
@@ -1094,10 +1095,7 @@ async fn run_agent_git_checkpoints_dirty_worktree_before_user_message() {
         fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
         "dirty\n"
     );
-    assert_eq!(
-        crate::git_checkpoint::list_nav_stashes(&cwd).unwrap().len(),
-        1
-    );
+    assert_eq!(list_nav_stashes(&cwd).unwrap().len(), 1);
 }
 
 #[tokio::test]

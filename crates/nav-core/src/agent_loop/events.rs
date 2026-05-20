@@ -5,8 +5,10 @@ use serde_json::Value;
 
 use crate::agent_loop::control::PendingInputMode;
 use crate::context::compaction::CompactionDetails;
-use crate::git_checkpoint::{GitCheckpointAction, GitCheckpointStatus};
 use crate::guardrails::ReviewDecision;
+use crate::verify::git_checkpoint::{
+    GitCheckpointAction, GitCheckpointOutcome, GitCheckpointStatus,
+};
 use crate::verify::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
 
 /// A non-text input attached to a [`AgentEvent::UserMessage`]. Stored by path
@@ -305,8 +307,8 @@ impl AgentEvent {
     }
 }
 
-impl From<crate::git_checkpoint::GitCheckpointOutcome> for AgentEvent {
-    fn from(outcome: crate::git_checkpoint::GitCheckpointOutcome) -> Self {
+impl From<GitCheckpointOutcome> for AgentEvent {
+    fn from(outcome: GitCheckpointOutcome) -> Self {
         AgentEvent::GitCheckpoint {
             action: outcome.action,
             status: outcome.status,

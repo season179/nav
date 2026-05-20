@@ -13,7 +13,8 @@ use nav_core::{
     PendingInputDraft, PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext,
     SessionId, SessionStore, TurnControls, UserAttachment, build_context_report_with_replay_cwd,
     cli::{Args, sandbox_policy_from_args},
-    git_checkpoint, shorten_home,
+    shorten_home,
+    verify::git_checkpoint,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;

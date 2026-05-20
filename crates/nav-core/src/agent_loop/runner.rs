@@ -14,13 +14,13 @@ use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
 use crate::context::compaction::{estimate_input_tokens, is_compact_command, should_auto_compact};
 use crate::context::{Catalog, ProjectContext, SessionId, SessionStore};
-use crate::git_checkpoint;
 use crate::guardrails::protected::is_protected_read;
 use crate::guardrails::{self, PermissionContext};
 use crate::model::ResponsesTransport;
 use crate::model::responses::{self, ResponseCollector, ResponsesError};
 use crate::tool_registry;
 use crate::tool_registry::truncate::{self, TruncateMode, bound};
+use crate::verify::git_checkpoint;
 use crate::verify::{self, PatchApplyStatus};
 
 /// Optional session-store binding passed to [`run_agent`]; when present,

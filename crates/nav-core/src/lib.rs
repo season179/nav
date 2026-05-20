@@ -7,7 +7,6 @@
 pub mod agent_loop;
 pub mod cli;
 pub mod context;
-pub mod git_checkpoint;
 pub mod guardrails;
 pub mod model;
 pub mod tool_registry;
@@ -68,8 +67,13 @@ pub use context::{
     discover_extensions, load_prompt_template,
 };
 
+// Backward-compatible module alias. The implementation lives under `verify`
+// because it owns working-tree safety evidence, but callers can still use
+// `nav_core::git_checkpoint`.
+pub use verify::git_checkpoint;
+
 // Git checkpoint/stash result types surfaced as durable agent events.
-pub use git_checkpoint::{
+pub use verify::git_checkpoint::{
     GitCheckpointAction, GitCheckpointOutcome, GitCheckpointStatus, GitStashEntry,
 };
 

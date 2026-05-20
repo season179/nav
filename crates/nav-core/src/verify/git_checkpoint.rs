@@ -1,3 +1,11 @@
+//! Git checkpoint helpers.
+//!
+//! In plain terms, this file lets `nav` take a quick safety snapshot of your
+//! current Git worktree before risky work. It stores that snapshot as a
+//! nav-labeled Git stash, can leave your files exactly where they are after
+//! taking the snapshot, and can later restore one of those saved snapshots
+//! without throwing away whatever you were doing in the meantime.
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;

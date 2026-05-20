@@ -13,11 +13,10 @@ use nav_core::{
         Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, SessionsAction,
         sandbox_policy_from_args,
     },
-    discover_extensions, discover_skills, git_checkpoint, layout_session_tree,
-    load_project_context,
+    discover_extensions, discover_skills, layout_session_tree, load_project_context,
     model::{auth, names},
     rebuild_responses_input, run_agent, session_started_notification, shorten_home,
-    verify::doctor,
+    verify::{doctor, git_checkpoint},
 };
 use std::env;
 use std::io::{IsTerminal, Read};

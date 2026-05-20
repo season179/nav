@@ -1,5 +1,5 @@
-//! Verify: mutation summaries, turn diffs, doctor checks, command/test
-//! evidence, and future structured verification output.
+//! Verify: mutation summaries, turn diffs, worktree checkpoints, doctor
+//! checks, command/test evidence, and future structured verification output.
 
 use anyhow::Result;
 use std::path::Path;
@@ -26,5 +26,6 @@ pub fn turn_diff_event(cwd: &Path) -> Result<Option<AgentEvent>> {
 }
 
 pub mod doctor;
+pub mod git_checkpoint;
 pub mod git_diff;
 pub mod mutation;
