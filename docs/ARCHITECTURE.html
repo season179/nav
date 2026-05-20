@@ -830,7 +830,7 @@
         </div>
       </div>
 
-      <p>A tiny binary <code>nav-cli</code> wires those two together. When stdout is a terminal and neither headless flag is set, it launches the TUI. <code>--json-events</code> still emits raw <code>AgentEvent</code> objects for debugging; <code>--json-rpc</code> is the stable protocol for desktop, chat, and other non-TUI frontends.</p>
+      <p>A tiny binary <code>nav-cli</code> wires those two together. When stdout is a terminal and neither headless flag is set, it launches the TUI. <code>--json-events</code> still emits raw <code>AgentEvent</code> objects for debugging; <code>--json-rpc</code> is the stable protocol for scripts, chat bridges, and other future non-TUI experiments.</p>
     </section>
 
     <!-- 02 ─────────────────────────────────────────── -->
@@ -841,11 +841,6 @@
       </header>
 
       <p class="drop">The repo splits into three crates plus a couple of top-level docs. Read the focused files first; the rest are scaffolding.</p>
-
-      <aside class="mnote aside">
-        <span class="label">Aside · desktop</span>
-        <code>nav-desktop/</code> exists at the root but this tour mostly skips it. It's an early Electron shell that spawns <code>cargo run --bin nav -- --json-rpc &lt;prompt&gt;</code>, parses JSON-RPC notifications, and renders messages, tools, file changes, and turn diffs into the page.
-      </aside>
 
       <div class="full tree">
 <span class="root">nav/</span>
@@ -977,7 +972,7 @@
         <code>crates/nav-core/src/agent/events.rs</code> — <code>enum AgentEvent</code>.
       </aside>
 
-      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every frontend reads the same event model through its own adapter: the TUI consumes it in-process, <code>--json-events</code> prints raw events, and <code>--json-rpc</code> wraps them for desktop and chat frontends. The core event families are:</p>
+      <p class="drop">Instead of <code>println!</code>-ing as it goes, the loop emits one <code>AgentEvent</code> per observable step. Every surface reads the same event model through its own adapter: the TUI consumes it in-process, <code>--json-events</code> prints raw events, and <code>--json-rpc</code> wraps them for future non-TUI experiments. The core event families are:</p>
 
       <div class="full flow">
         <div class="row">

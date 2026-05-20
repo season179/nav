@@ -615,7 +615,7 @@ module shape is stable and tests can prove no behavior drift.
 - Do not weaken path safety, approval behavior, sandbox behavior, or protected
   metadata rules.
 - Do not change CalVer or release metadata.
-- Do not rewrite the TUI or desktop UI as part of this refactor.
+- Do not rewrite the TUI as part of this refactor.
 - Do not change the JSON-RPC or `AgentEvent` wire format unless a move proves
   a small compatibility-safe cleanup is necessary.
 

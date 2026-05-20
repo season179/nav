@@ -41,7 +41,7 @@ The default compaction prompt should follow Codex's shape: ask the model to prod
 23. As a daily nav user, I want compaction to avoid storing huge generated summaries repeatedly, so that the local database stays reasonable.
 24. As a daily nav user, I want compacted checkpoints to be inspectable in exported transcripts later, so that I can audit how the session evolved.
 25. As a TUI user, I want compacted checkpoints to render as compact history rows, so that the transcript is readable.
-26. As an NDJSON consumer, I want stable compaction events, so that desktop and chat frontends can show compaction consistently.
+26. As an NDJSON consumer, I want stable compaction events, so that non-TUI frontends can show compaction consistently.
 27. As a future frontend implementer, I want compaction events to be protocol-level events, so that each UI does not infer compaction from text.
 28. As a maintainer, I want compaction logic isolated behind a small interface, so that summary generation, history replacement, and replay can be tested separately.
 29. As a maintainer, I want automatic compaction decisions tested against token accounting, so that threshold behavior does not drift.

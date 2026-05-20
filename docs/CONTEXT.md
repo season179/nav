@@ -1,23 +1,25 @@
 # nav Context
 
-`nav` began as an educational Rust implementation of a coding-agent loop. That
-purpose still matters: the code should remain readable, direct, and useful for
-learning how a Responses-based agent works.
+`nav` is first a learning project: a Rust coding-agent harness for understanding
+how coding agents work by building one. The code should remain readable,
+direct, and useful for studying Responses-based agent loops, tool plumbing,
+approval flow, replay, compaction, and frontend boundaries.
 
-From this point onward, `nav` also has a product goal: become a genuinely usable
-coding agent for real development work.
+`nav` also has a secondary product goal: become useful enough for personal local
+development work without making the harness harder to understand.
 
 ## Product Direction
 
-`nav` should grow from a CLI demo into a dependable coding assistant that can:
+`nav` should grow from a CLI demo into a clear, dependable personal coding
+assistant that can:
 
 - inspect a workspace and explain what it finds;
 - edit files with clear boundaries and reviewable changes;
 - run commands and tests with visible output;
 - stream model messages, tool calls, and tool results as first-class events;
 - preserve enough session state to make longer tasks understandable;
-- be reachable from multiple surfaces: terminal, desktop, and chat
-  (Slack / Discord / Telegram).
+- expose a stable headless protocol for scripts, chat bridges, and other
+  experiments when they teach something useful about harness boundaries.
 
 ## Architecture
 
@@ -37,14 +39,12 @@ the same binary and reads the same event stream:
                     │  --json-rpc: protocol on stdout  │
                     └──────────────┬───────────────────┘
                                    │
-       ┌───────────────────────────┼───────────────────────────┐
-       │                           │                           │
-  terminal user              nav-desktop                  Cloudflare
-                             (Electron)                   Worker
-                             spawns `nav                  spawns sandbox,
-                             --json-rpc`,                 runs `gh clone` +
-                             parses JSON-RPC              `nav --json-rpc`,
-                                                          relays to chat
+       ┌───────────────────────────┴───────────────────────────┐
+       │                                                       │
+  terminal user                                      future experiments
+                                                     scripts, chat bridges,
+                                                     or sandboxed runners
+                                                     using `nav --json-rpc`
 ```
 
 Two seams matter:
@@ -56,13 +56,11 @@ Two seams matter:
   approval responses through stdin. `--json-events` remains as a raw debugging
   stream.
 
-The desktop UI requires a working directory before it can run the agent. The
-chat-bot frontend gets its working directory by cloning the requested repo
-inside a fresh Cloudflare Sandbox container; that container is the session's
-isolation boundary, and credentials (API key, GitHub token) are injected by
-the Worker per-session. The Worker is also responsible for resolving the
-project reference (e.g. "project Y") to an `owner/repo` before invoking nav,
-so `nav-core` itself stays generic.
+Future non-TUI frontends should get their working directory explicitly before
+invoking `nav --json-rpc`. A chat-bot experiment, for example, could clone a
+requested repo inside a fresh sandbox container and use that container as the
+session's isolation boundary. That shape should stay outside `nav-core` unless
+the harness needs a smaller shared seam.
 
 There is no long-lived `nav-server` daemon. If long-lived multi-session state
 later becomes necessary, it can be added without rewriting any of the above.
@@ -135,12 +133,12 @@ extension slice useful without adding an unaudited local command surface.
   read the main loop and understand the agent.
 - Do not hide agent behavior behind magic abstractions. Tool calls, transcript
   state, auth, transport, and filesystem boundaries should stay explicit.
-- Productize the seams that matter: streaming events, tool execution records,
-  command output, file edits, diffs, errors, and session history.
-- Treat workspace safety as a product requirement, not a demo detail. Path
-  restrictions, shell execution, and future approval flows should remain easy
-  to audit. The Cloudflare Sandbox path strengthens this by making each
-  chat-bot session run in its own ephemeral container.
+- Productize only the seams that make the harness clearer or more useful:
+  streaming events, tool execution records, command output, file edits, diffs,
+  errors, and session history.
+- Treat workspace safety as a learning and usability requirement, not a demo
+  detail. Path restrictions, shell execution, and approval flows should remain
+  easy to audit.
 - Prefer small vertical slices over broad rewrites. When adding frontends or
   features, keep the CLI working unless there is a deliberate migration plan.
 
@@ -154,12 +152,8 @@ extension slice useful without adding an unaudited local command surface.
    result, command output, error, turn complete).
 3. Add a `--json-events` flag to `nav-cli` that emits `AgentEvent` as raw
    NDJSON on stdout, then stabilize the frontend contract as `--json-rpc`.
-4. Rewire `nav-desktop` from "spawn `cargo run`, line-parse stdout" to
-   "spawn `nav --json-rpc`, parse versioned notifications." Drop the current
-   string matching in the renderer.
-5. Build the first chat-bot frontend: a Cloudflare Worker that receives
-   Slack events, spawns a Cloudflare Sandbox per session, clones the repo
-   via `gh`, runs `nav --json-rpc`, and relays events into the Slack
-   thread. Auth is API-key, injected by the Worker.
-6. Keep tests focused on safety boundaries, transcript correctness, and tool
+4. Keep `--json-rpc` as the clean headless contract for future frontend or
+   sandbox experiments, without keeping unused frontend code around before it is
+   useful.
+5. Keep tests focused on safety boundaries, transcript correctness, and tool
    execution behavior.

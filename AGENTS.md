@@ -46,7 +46,6 @@ path, so verify the real local checkout before assuming one is absent.
 
 - `rg` must be on `PATH`; `code_search` shells out to it even though
   `Cargo.toml` does not mention it.
-- Desktop UI uses `bun`, not npm: `bun install && bun run start`.
 - `nav update` / `nav upgrade` reinstalls from compile-time
   `CARGO_MANIFEST_DIR`, not from the current working directory.
 - Auth, transport, session storage, settings keys, and CLI defaults are

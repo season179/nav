@@ -11,7 +11,7 @@ through a giant framework.
 The second goal is personal usefulness. As the harness gets clearer, it should
 also become good enough for real work in this checkout and nearby projects: safe
 around the workspace, explicit about what it is doing, resumable after longer
-sessions, and pleasant enough to use from the terminal or desktop.
+sessions, and pleasant enough to use from the terminal.
 
 ## Current Focus
 
@@ -23,7 +23,7 @@ sessions, and pleasant enough to use from the terminal or desktop.
   improve normal pre-compaction turns so old tool output does not bloat context
   or disappear in a confusing way.
 - **Expose clean frontend seams:** keep one Rust agent loop and expose it
-  through the TUI, raw NDJSON, JSON-RPC, desktop, and future experiments.
+  through the TUI, raw NDJSON, JSON-RPC, and future experiments.
 - **Stay local and auditable:** use local SQLite for history, default to
   ChatGPT OAuth or an explicit API key, restrict file writes to the workspace,
   and make shell approval/sandbox behavior visible.
@@ -35,8 +35,7 @@ guided code tour, open [docs/ARCHITECTURE.html](docs/ARCHITECTURE.html).
 
 - A terminal TUI when you run `nav` in a real terminal.
 - Headless raw events with `--json-events`.
-- Versioned JSON-RPC notifications with `--json-rpc` for desktop and other
-  non-TUI frontends.
+- Versioned JSON-RPC notifications with `--json-rpc` for non-TUI experiments.
 - Session persistence, resume, export, fork, labels, transcript search, and
   session trees.
 - Workspace-aware tools: read files, list files, search with ripgrep, run
@@ -45,7 +44,6 @@ guided code tour, open [docs/ARCHITECTURE.html](docs/ARCHITECTURE.html).
   macOS sandbox for shell commands.
 - Manual `/compact`, automatic pre-turn compaction, context reports, and
   bounded tool output.
-- A small Electron desktop shell under `nav-desktop/`.
 
 Learning threads still in progress:
 
@@ -53,7 +51,7 @@ Learning threads still in progress:
 - Native `read_file` slicing with `offset` and `limit`.
 - Observability that helps explain real runs: tokens, tools, retries,
   approvals, compactions, and failures.
-- Frontend experiments beyond the terminal/desktop when they teach something
+- Frontend experiments beyond the terminal when they teach something
   useful about harness boundaries.
 
 ## Requirements
@@ -62,7 +60,6 @@ Learning threads still in progress:
 - `rg` from ripgrep on `PATH`; `code_search` shells out to it.
 - Codex login for the default ChatGPT OAuth flow, or `OPENAI_API_KEY` for raw
   API-key mode.
-- `bun` if you want to run the desktop UI.
 
 ## Setup
 
@@ -142,7 +139,7 @@ Use raw NDJSON when you want one `AgentEvent` per line:
 nav --json-events "list the files" > events.ndjson
 ```
 
-Use JSON-RPC for desktop, chat, or another frontend:
+Use JSON-RPC for a script, chat bridge, or another frontend experiment:
 
 ```sh
 nav --json-rpc "list the files"
@@ -300,23 +297,6 @@ Today, extensions can register:
 `nav extensions list` shows discovered manifests. Manifest sections for custom
 tools, MCP servers, hooks, and packages are parsed for visibility but are not
 executed yet.
-
-## Desktop UI
-
-`nav-desktop` is an early Electron shell. It asks for a working directory,
-spawns `nav --json-rpc`, and renders the stable protocol.
-
-Install dependencies:
-
-```sh
-bun install
-```
-
-Start the desktop UI:
-
-```sh
-bun run start
-```
 
 ## Active Design Notes
 
