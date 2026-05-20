@@ -1,3 +1,9 @@
+//! Keeps track of turn lifecycle and queued user input.
+//!
+//! In plain terms: this file decides when a submitted prompt should start now,
+//! wait as a follow-up, act as live steering for the running turn, or be
+//! cleared/edited/removed from the queue.
+
 use anyhow::Result;
 use nav_core::guardrails::PermissionContext;
 use nav_core::{
@@ -11,10 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+use super::turn_task::{TurnSpawn, spawn_turn};
 use super::{emit_local_event, emit_pending_cleared};
 use crate::ChatWidget;
 use crate::bottom_pane;
-use crate::turn::{TurnSpawn, spawn_turn};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_next_follow_up(

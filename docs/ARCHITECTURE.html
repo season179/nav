@@ -848,7 +848,7 @@
 ├── <span class="focus">crates/nav-core/</span>           <span class="note">the loop, tools, transport, sessions</span>
 │   ├── src/<span class="focus">lib.rs</span>              <span class="note">six reader-facing harness roots</span>
 │   ├── src/agent_loop/   <span class="note">events, protocol, control, and run_agent runner</span>
-│   ├── src/<span class="focus">cli.rs</span>              <span class="note">Args (clap), shared by every frontend</span>
+│   ├── src/cli/           <span class="note">Args (clap), shared by every frontend</span>
 │   ├── src/model/        <span class="note">auth, request building, WebSocket + SSE</span>
 │   ├── src/tool_registry/<span class="note">tool schemas, dispatch, filesystem, shell, patch</span>
 │   ├── src/context/      <span class="note">project context, skills, replay, compaction, sessions</span>
@@ -858,14 +858,12 @@
 <span class="group">— Frontend</span>
 ├── <span class="focus">crates/nav-tui/</span>             <span class="note">terminal chat UI</span>
 │   ├── src/lib.rs         <span class="note">small facade for TUI modules</span>
-│   ├── src/app.rs         <span class="note">event loop: draw, read keys, route events</span>
-│   ├── src/input.rs       <span class="note">keyboard, scroll, slash command handling</span>
-│   ├── src/turn.rs        <span class="note">load history and spawn run_agent turns</span>
+│   ├── src/app/           <span class="note">event loop, rendering, status bar, background turns</span>
+│   ├── src/input/         <span class="note">keyboard, scroll, slash command handling</span>
 │   ├── src/widget.rs      <span class="note">ChatWidget: stack of history cells</span>
-│   ├── src/cells.rs       <span class="note">chat cell types for user, assistant, tools, errors, welcome</span>
+│   ├── src/cells/         <span class="note">chat cell types for user, assistant, tools, errors, welcome</span>
 │   ├── src/streaming.rs   <span class="note">"stable vs tail" helper for live deltas</span>
-│   ├── src/status_bar.rs  <span class="note">model · cwd · branch · Ready/Working Ns</span>
-│   └── src/bottom_pane/   <span class="note">Composer + SlashCommandPopup overlay</span>
+│   └── src/bottom_pane/   <span class="note">Composer plus slash, mention, approval, and session overlays</span>
 │
 <span class="group">— Binary &amp; docs</span>
 ├── <span class="focus">crates/nav-cli/</span>             <span class="note">the binary; ~120 lines, wires core+tui</span>
@@ -890,18 +888,18 @@
       </aside>
 
       <ol>
-        <li><code>crates/nav-core/src/cli.rs</code> — the CLI options. Tiny. Shows what knobs exist.</li>
+        <li><code>crates/nav-core/src/cli/mod.rs</code> — the CLI options. Tiny. Shows what knobs exist.</li>
         <li><code>crates/nav-core/src/agent_loop/runner.rs</code> — start at <code>run_agent</code>. This is the model/tool loop.</li>
         <li><code>crates/nav-core/src/agent_loop/events.rs</code> and <code>context/replay.rs</code> — the event contract and resume transcript builder.</li>
         <li><code>crates/nav-core/src/tool_registry/dispatch.rs</code> — the dispatcher; the model-visible tools enter here.</li>
         <li><code>crates/nav-core/src/tool_registry/fs.rs</code> — workspace file safety. Notice <code>resolve_inside</code>.</li>
         <li><code>crates/nav-core/src/model/responses/request.rs</code>, <code>collector.rs</code>, and <code>parser.rs</code> — request body, stream folding, output parsing.</li>
         <li><code>crates/nav-core/src/context/session/mod.rs</code> — SQLite event log behind <code>--resume</code>.</li>
-        <li><code>crates/nav-tui/src/app.rs</code> — the TUI's <code>run()</code>: <code>tokio::select!</code> over keys + agent events.</li>
-        <li><code>crates/nav-tui/src/input.rs</code> and <code>turn.rs</code> — command classification and background turn spawning.</li>
-        <li><code>crates/nav-tui/src/widget.rs</code> + <code>cells.rs</code> — how each event becomes a row on screen.</li>
+        <li><code>crates/nav-tui/src/app/mod.rs</code> — the TUI's <code>run()</code>: <code>tokio::select!</code> over keys + agent events.</li>
+        <li><code>crates/nav-tui/src/input/mod.rs</code>, <code>app/turn_lifecycle.rs</code>, and <code>app/turn_task.rs</code> — command classification, queued input, and background turn spawning.</li>
+        <li><code>crates/nav-tui/src/widget.rs</code> + <code>cells/mod.rs</code> — how each event becomes a row on screen.</li>
         <li><code>crates/nav-tui/src/streaming.rs</code> — the helper meant to make live streamed text not flicker.</li>
-        <li><code>crates/nav-tui/src/bottom_pane/</code> — composer and slash-command overlay.</li>
+        <li><code>crates/nav-tui/src/bottom_pane/</code> — composer and its slash, mention, approval, and session overlays.</li>
       </ol>
     </section>
 
@@ -1163,7 +1161,7 @@
 
       <aside class="mnote">
         <span class="label">Read this for</span>
-        <code>crates/nav-tui/src/app.rs</code> — function <code>run</code>.
+        <code>crates/nav-tui/src/app/mod.rs</code> — function <code>run</code>.
       </aside>
 
       <p class="drop">The TUI lays out three regions, top to bottom: a scrolling history of cells at the top, a composer in the middle, and a one-line status bar at the bottom.</p>
@@ -1197,13 +1195,13 @@
 
       <ul>
         <li><strong>Scrollback</strong> — <code>ChatWidget</code> in <code>widget.rs</code>. A <code>Vec&lt;Box&lt;dyn HistoryCell&gt;&gt;</code> painted top to bottom.</li>
-        <li><strong>Composer</strong> — <code>BottomPane</code> in <code>bottom_pane/mod.rs</code>. Owns a <code>Composer</code> and an optional overlay (currently just <code>SlashCommandPopup</code>).</li>
-        <li><strong>Status bar</strong> — <code>StatusBar</code> in <code>status_bar.rs</code>. One row: model · cwd · branch · <em>Ready</em> or <em>Working 4s</em>.</li>
+        <li><strong>Composer</strong> — <code>BottomPane</code> in <code>bottom_pane/mod.rs</code>. Owns a <code>Composer</code> and an optional overlay for slash commands, file mentions, approvals, or session picking.</li>
+        <li><strong>Status bar</strong> — <code>StatusBar</code> in <code>app/status_bar.rs</code>. One row: model · cwd · branch · <em>Ready</em> or <em>Working 4s</em>.</li>
       </ul>
 
       <h3>The TUI's main loop</h3>
 
-      <p><code>run</code> in <code>nav-tui/src/app.rs</code> is a single <code>tokio::select!</code> over three sources. <code>input.rs</code> owns key/scroll/slash handling, and <code>turn.rs</code> owns loading session history and spawning <code>run_agent</code>.</p>
+      <p><code>run</code> in <code>nav-tui/src/app/mod.rs</code> is a single <code>tokio::select!</code> over three sources. <code>input/mod.rs</code> owns key/scroll/slash handling, <code>app/turn_lifecycle.rs</code> owns queued input decisions, and <code>app/turn_task.rs</code> owns loading session history and spawning <code>run_agent</code>.</p>
 
       <pre data-lang="rust">tokio::select! {
     Some(ev) = agent_rx.recv() => handle agent event; <span class="cmt">// model said something</span>
@@ -1214,7 +1212,7 @@
     }
 }</pre>
 
-      <p>Every iteration draws the frame, then waits for the next thing to happen. The 80 ms tick advances the spinner and polls the keyboard; the two channels deliver the things that should change what's on screen. When the user hits Enter, <code>turn.rs</code> reloads the persisted session events, rebuilds the Responses input, spawns the agent loop on a background task, and lets its events flow back through <code>agent_rx</code>.</p>
+      <p>Every iteration draws the frame, then waits for the next thing to happen. The 80 ms tick advances the spinner and polls the keyboard; the two channels deliver the things that should change what's on screen. When the user hits Enter, <code>app/turn_lifecycle.rs</code> decides whether the input starts now or queues behind a running turn. When a turn starts, <code>app/turn_task.rs</code> reloads the persisted session events, rebuilds the Responses input, spawns the agent loop on a background task, and lets its events flow back through <code>agent_rx</code>.</p>
 
       <aside class="mnote why">
         <span class="label">Why this matters</span>
@@ -1223,7 +1221,7 @@
 
       <h3>Translating events into cells</h3>
 
-      <p><code>ChatWidget::ingest</code> in <code>widget.rs</code> is a small <code>match</code> that maps each <code>AgentEvent</code> variant to a concrete cell type in <code>cells.rs</code>:</p>
+      <p><code>ChatWidget::ingest</code> in <code>widget.rs</code> is a small <code>match</code> that maps each <code>AgentEvent</code> variant to a concrete cell type in <code>cells/</code>:</p>
 
       <div class="full flow">
         <div class="row"><div class="who">UserMessage</div><div class="what"><code>UserMessageCell</code>, gutter glyph <span style="color:var(--g-user);font-weight:700">›</span>, bold cyan. The live TUI draws the typed prompt immediately and skips the echoed live event; resumed sessions ingest it normally.</div></div>

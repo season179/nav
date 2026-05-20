@@ -1,3 +1,9 @@
+//! Starts one agent turn in the background.
+//!
+//! In plain terms: this file takes the prompt the user just submitted,
+//! gathers the session history and attachments the agent needs, and launches
+//! the real `nav-core` agent work on a Tokio task so the TUI can keep drawing.
+
 use anyhow::{Context, Result};
 use nav_core::guardrails::PermissionContext;
 use nav_core::{

@@ -1,3 +1,9 @@
+//! Transcript cell widgets.
+//!
+//! Each child module owns one family of rows. This root stays as an index and
+//! re-export layer so callers can use stable names like [`AssistantMessageCell`]
+//! without caring which file renders that row.
+
 mod changes;
 mod compaction;
 mod messages;

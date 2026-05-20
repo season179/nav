@@ -1,3 +1,9 @@
+//! User input helpers that sit outside the composer widget itself.
+//!
+//! The bottom pane owns raw text editing. This module handles commands that
+//! affect the whole app, such as `/resume`, `/context`, and transcript
+//! scrollback keys.
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ChatWidget;

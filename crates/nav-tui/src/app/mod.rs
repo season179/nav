@@ -1,3 +1,9 @@
+//! Main TUI application loop.
+//!
+//! This module wires terminal input, agent events, local slash commands, and
+//! rendering together. Child modules hold the lower-level pieces so `run`
+//! reads as the high-level lifecycle.
+
 use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent};
 use nav_core::guardrails::approval::PendingApprovals;
@@ -16,22 +22,26 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 mod permissions;
+mod render;
 mod session;
+mod status_bar;
 mod terminal;
-mod turns;
+mod turn_lifecycle;
+mod turn_task;
 
 use crate::ChatWidget;
 use crate::bottom_pane::{self, PendingApproval};
 use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
-use crate::status_bar::{AgentState, StatusBar};
 use crate::theme::Theme;
 use permissions::build_tui_permissions;
+use render::{TuiStatus, draw_tui};
 use session::{
     export_current_session, open_session_picker, push_context_report, resolve_tree_root,
     resume_session,
 };
+use status_bar::AgentState;
 use terminal::{TerminalGuard, enter_tui, install_panic_teardown_hook};
-use turns::{
+use turn_lifecycle::{
     clear_pending_inputs, pending_draft, pending_input_for_immediate, queue_active_steering,
     remove_active_steering, replace_active_steering, spinner_frame, start_next_follow_up,
     start_pending_turn, turn_is_terminal,
@@ -146,37 +156,18 @@ pub async fn run(
             },
             None => AgentState::Ready,
         };
-        let mut history_viewport = (1, 1);
-        term.terminal.draw(|f| {
-            use ratatui::layout::{Constraint, Layout};
-            let area = f.area();
-            let pane_h = pane
-                .desired_height(area.width)
-                .max(3)
-                .min(area.height.saturating_sub(2));
-            let chunks = Layout::vertical([
-                Constraint::Min(1),
-                Constraint::Length(pane_h),
-                Constraint::Length(1),
-            ])
-            .split(area);
-            history_viewport = (chunks[0].width, chunks[0].height);
-            f.render_widget(&chat, chunks[0]);
-            f.render_widget(&pane, chunks[1]);
-            if let Some((cx, cy)) = pane.cursor_position(chunks[1]) {
-                f.set_cursor_position((cx, cy));
-            }
-            f.render_widget(
-                StatusBar {
-                    model: &args.model,
-                    cwd_short: &cwd_short,
-                    branch: branch.as_deref(),
-                    dirty,
-                    state,
-                },
-                chunks[2],
-            );
-        })?;
+        let history_viewport = draw_tui(
+            &mut term.terminal,
+            &chat,
+            &pane,
+            TuiStatus {
+                model: &args.model,
+                cwd_short: &cwd_short,
+                branch: branch.as_deref(),
+                dirty,
+                state,
+            },
+        )?;
 
         tokio::select! {
             Some(ev) = agent_rx.recv() => {

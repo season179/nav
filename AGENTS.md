@@ -70,6 +70,11 @@ path, so verify the real local checkout before assuming one is absent.
 
 - Versioning is CalVer in `[workspace.package].version`; do not bump it for
   unrelated changes.
+- Directory-backed Rust modules intentionally use the learning-oriented
+  `foo/mod.rs` layout instead of the modern `foo.rs` + `foo/child.rs`
+  convention. This keeps each module root inside its folder while Season is
+  still building Rust fluency; revisit once idiomatic Rust navigation feels
+  natural.
 - Snapshot tests use `insta`; review pending snapshots with
   `cargo insta review` before committing.
 - Commit messages should sound human, with short imperative subjects. Do not
