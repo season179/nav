@@ -2,11 +2,12 @@ use anyhow::Result;
 use std::path::{Component, Path};
 use std::time::Duration;
 
+use crate::guardrails::PermissionContext;
 use crate::sandbox::SandboxRequest;
-use crate::tools::output_accumulator::OutputAccumulator;
-use crate::tools::preflight::PermissionContext;
-use crate::tools::read_filter::{self, ReadOptions};
-use crate::{permissions::bash_parse::parse_command_pipeline, tools::fs};
+use crate::tool_registry::output_accumulator::OutputAccumulator;
+use crate::{permissions::bash_parse::parse_command_pipeline, tool_registry::fs};
+
+use super::read_filter::{self, ReadOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReadRewrite {
@@ -246,7 +247,7 @@ fn render_rewritten_file(cwd: &Path, file: &str, options: ReadOptions) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::unchecked_permission_context;
+    use crate::tool_registry::unchecked_permission_context;
     use std::path::Path;
 
     #[tokio::test]

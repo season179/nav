@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::compaction::CompactionDetails;
-use crate::control::PendingInputMode;
+use crate::agent_loop::control::PendingInputMode;
+use crate::context::compaction::CompactionDetails;
 use crate::git_checkpoint::{GitCheckpointAction, GitCheckpointStatus};
-use crate::mutation::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
 use crate::permissions::ReviewDecision;
+use crate::verify::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
 
 /// A non-text input attached to a [`AgentEvent::UserMessage`]. Stored by path
 /// (workspace-relative) — the bytes are loaded by the transport at request
@@ -322,7 +322,7 @@ impl From<crate::git_checkpoint::GitCheckpointOutcome> for AgentEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::PendingInputMode;
+    use crate::agent_loop::control::PendingInputMode;
     use serde_json::json;
 
     #[test]

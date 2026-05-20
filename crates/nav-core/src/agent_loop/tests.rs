@@ -1,11 +1,15 @@
+use super::control::{PendingInput, PendingInputMode, TurnControls};
+use super::runner::{drop_oldest_tool_pair, emit_stream_events, extract_message_text};
 use super::*;
 use crate::cli::Args;
-use crate::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::context::compaction::{SUMMARIZATION_PROMPT, SUMMARY_PREFIX, summary_message};
+use crate::context::replay::rebuild_responses_input;
+use crate::guardrails::PermissionContext;
 use crate::permissions::approval::{ApprovalGate, ApprovalRequest};
 use crate::permissions::{AskForApproval, ReviewDecision, SandboxPolicy, SessionAllowlist};
 use crate::sandbox::PassthroughRunner;
 use crate::skills::Catalog;
-use crate::tools::PermissionContext;
+use crate::tool_registry::{SPAWN_SUBAGENT_TOOL, unchecked_permission_context};
 use anyhow::Result;
 use futures_util::stream;
 use serde_json::{Value, json};
@@ -28,7 +32,7 @@ use tokio::sync::mpsc;
 /// `Value`s into `StubItem::Event` automatically.
 enum StubItem {
     Event(Value),
-    Err(crate::responses::ResponsesError),
+    Err(crate::model::responses::ResponsesError),
 }
 
 /// Pops one canned event list per `create()` call so each turn of the
@@ -272,7 +276,7 @@ fn trim_for_compaction_falls_back_to_oldest_message_on_text_history() {
         json!({"type": "message", "role": "user", "content": "newest"}),
         // The trailing summarisation prompt that run_compaction_turn
         // appends just before submitting. Must be preserved.
-        json!({"type": "message", "role": "user", "content": super::SUMMARIZATION_PROMPT}),
+        json!({"type": "message", "role": "user", "content": SUMMARIZATION_PROMPT}),
     ];
     let dropped = super::runner::trim_for_compaction(&mut input);
     assert_eq!(dropped, 1);
@@ -282,7 +286,7 @@ fn trim_for_compaction_falls_back_to_oldest_message_on_text_history() {
         .last()
         .and_then(|v| v.get("content"))
         .and_then(Value::as_str);
-    assert_eq!(last_text, Some(super::SUMMARIZATION_PROMPT));
+    assert_eq!(last_text, Some(SUMMARIZATION_PROMPT));
     // "oldest" is gone; "newest" survives.
     let contents: Vec<&str> = input
         .iter()
@@ -296,7 +300,7 @@ fn trim_for_compaction_falls_back_to_oldest_message_on_text_history() {
 fn trim_for_compaction_returns_zero_when_only_prompt_remains() {
     // Nothing eligible to drop — the synthesised prompt is sacred.
     let mut input =
-        vec![json!({"type": "message", "role": "user", "content": super::SUMMARIZATION_PROMPT})];
+        vec![json!({"type": "message", "role": "user", "content": SUMMARIZATION_PROMPT})];
     assert_eq!(super::runner::trim_for_compaction(&mut input), 0);
     assert_eq!(input.len(), 1);
 }
@@ -775,7 +779,7 @@ async fn run_agent_emits_single_error_when_transport_create_fails() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect_err("transport failure should return an error");
@@ -855,7 +859,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await;
     result.expect("run_agent should succeed");
@@ -1008,7 +1012,7 @@ async fn run_agent_git_checkpoints_dirty_worktree_before_user_message() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("run_agent should succeed");
@@ -1050,7 +1054,7 @@ async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
             "item": {
                 "type": "function_call",
                 "call_id": "call_worker",
-                "name": crate::tools::SPAWN_SUBAGENT_TOOL,
+                "name": SPAWN_SUBAGENT_TOOL,
                 "arguments": "{\"task\":\"inspect session code\",\"label\":\"explorer\"}"
             }
         }),
@@ -1096,7 +1100,7 @@ async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("run_agent");
@@ -1110,7 +1114,7 @@ async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
         matches!(
             event,
             AgentEvent::ToolCallStarted { call_id, name, .. }
-                if call_id == "call_worker" && name == crate::tools::SPAWN_SUBAGENT_TOOL
+                if call_id == "call_worker" && name == SPAWN_SUBAGENT_TOOL
         )
     });
     let pos_started = event_position(&events, "SubagentStarted", |event| {
@@ -1179,7 +1183,7 @@ async fn subagent_scope_blocks_hallucinated_mutating_tool() {
             "item": {
                 "type": "function_call",
                 "call_id": "call_worker",
-                "name": crate::tools::SPAWN_SUBAGENT_TOOL,
+                "name": SPAWN_SUBAGENT_TOOL,
                 "arguments": "{\"task\":\"try to edit note.txt\"}"
             }
         }),
@@ -1243,7 +1247,7 @@ async fn subagent_scope_blocks_hallucinated_mutating_tool() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("run_agent");
@@ -1316,7 +1320,7 @@ async fn run_agent_injects_steering_before_dispatching_stale_tool_calls() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
         TurnControls::with_steering_items([steering]),
     )
     .await
@@ -1463,7 +1467,7 @@ async fn run_agent_emits_file_change_and_turn_diff_for_patch_tool() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("run_agent");
@@ -1552,7 +1556,7 @@ async fn run_agent_emits_failed_file_change_for_rejected_patch_tool() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("run_agent continues after tool error");
@@ -1857,7 +1861,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("first run_agent");
@@ -1908,7 +1912,7 @@ async fn resume_replays_transcript_and_appends_new_events() {
         Some(rebuilt),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("resumed run_agent");
@@ -1995,7 +1999,7 @@ async fn user_message_with_image_attachment_is_sent_as_input_image_content() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("run_agent");
@@ -2057,7 +2061,7 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
     ];
     // Turn 2: server says we blew the context window.
     let turn_two = vec![StubItem::Err(
-        crate::responses::ResponsesError::ContextWindowExceeded {
+        crate::model::responses::ResponsesError::ContextWindowExceeded {
             message: "input is too long".into(),
         },
     )];
@@ -2092,7 +2096,7 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("recovery should succeed");
@@ -2156,7 +2160,7 @@ async fn overflow_recovery_does_not_consume_turn_budget() {
         StubItem::Event(json!({"type": "response.completed", "response": {}})),
     ];
     let turn_two_overflow = vec![StubItem::Err(
-        crate::responses::ResponsesError::ContextWindowExceeded {
+        crate::model::responses::ResponsesError::ContextWindowExceeded {
             message: "too long".into(),
         },
     )];
@@ -2191,7 +2195,7 @@ async fn overflow_recovery_does_not_consume_turn_budget() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("recovery on the last allowed turn should still succeed");
@@ -2230,13 +2234,13 @@ async fn overflow_second_failure_surfaces_clean_error() {
     ];
     // First overflow.
     let turn_two = vec![StubItem::Err(
-        crate::responses::ResponsesError::ContextWindowExceeded {
+        crate::model::responses::ResponsesError::ContextWindowExceeded {
             message: "too long".into(),
         },
     )];
     // Second overflow — recovery already consumed, must surface as Error.
     let turn_three = vec![StubItem::Err(
-        crate::responses::ResponsesError::ContextWindowExceeded {
+        crate::model::responses::ResponsesError::ContextWindowExceeded {
             message: "still too long".into(),
         },
     )];
@@ -2260,7 +2264,7 @@ async fn overflow_second_failure_surfaces_clean_error() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect_err("second overflow should fail");
@@ -2328,7 +2332,7 @@ async fn manual_compact_emits_lifecycle_events_and_does_not_steer_prompt() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("compact run");
@@ -2436,7 +2440,7 @@ async fn manual_compact_persists_checkpoint_for_replay() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("first turn");
@@ -2463,7 +2467,7 @@ async fn manual_compact_persists_checkpoint_for_replay() {
         Some(rebuilt),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("compact turn");
@@ -2493,7 +2497,7 @@ async fn manual_compact_persists_checkpoint_for_replay() {
         .get("content")
         .and_then(Value::as_str)
         .expect("synthesized summary is a plain-string user content");
-    assert!(only_user.starts_with(super::SUMMARY_PREFIX));
+    assert!(only_user.starts_with(SUMMARY_PREFIX));
     assert!(only_user.contains("HANDOFF: did first"));
 
     // No leakage of the pre-compaction "first" / "ack" pair.
@@ -2550,7 +2554,7 @@ async fn manual_compact_persists_file_ops_details_for_replay() {
         Some(initial_input),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("compact turn");
@@ -2611,7 +2615,7 @@ async fn consecutive_compactions_use_incremental_smaller_prompt() {
         Some(large_first_input),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("first compact");
@@ -2622,7 +2626,7 @@ async fn consecutive_compactions_use_incremental_smaller_prompt() {
         .expect("first prompt");
 
     let second_input = vec![
-        super::summary_message("## Goal\nfirst"),
+        summary_message("## Goal\nfirst"),
         json!({"type": "message", "role": "user", "content": "small follow-up"}),
     ];
     let second_transport = StubTransport::new(vec![compact_turn_with_text("## Goal\nsecond")]);
@@ -2639,7 +2643,7 @@ async fn consecutive_compactions_use_incremental_smaller_prompt() {
         Some(second_input),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("second compact");
@@ -2660,7 +2664,7 @@ async fn manual_compact_recovers_from_text_only_overflow() {
     // give up. The fallback must instead drop the oldest message and
     // retry — exactly the scenario `/compact` exists to rescue.
     let turn_overflow = vec![StubItem::Err(
-        crate::responses::ResponsesError::ContextWindowExceeded {
+        crate::model::responses::ResponsesError::ContextWindowExceeded {
             message: "input is too long".into(),
         },
     )];
@@ -2701,7 +2705,7 @@ async fn manual_compact_recovers_from_text_only_overflow() {
         Some(initial_input),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("compaction should recover from text-only overflow");
@@ -2757,7 +2761,7 @@ async fn manual_compact_failure_emits_failed_event() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect_err("empty summary should fail");
@@ -2848,7 +2852,7 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
         Some(rebuilt),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("run with auto-compact");
@@ -2942,7 +2946,7 @@ async fn auto_compact_fires_when_estimated_input_crosses_threshold() {
         Some(initial_input),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("run with estimated auto-compact");
@@ -3038,7 +3042,7 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
         Some(rebuilt_one),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("first run");
@@ -3066,7 +3070,7 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
         Some(rebuilt_two),
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect("second run");
@@ -3127,7 +3131,7 @@ async fn create_failure_does_not_emit_retry_event_from_stub() {
         None,
         &Catalog::default(),
         None,
-        crate::tools::unchecked_permission_context(),
+        unchecked_permission_context(),
     )
     .await
     .expect_err("should fail");

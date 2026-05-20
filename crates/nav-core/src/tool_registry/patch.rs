@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::ToolResult;
 use super::fs::{relative_path, resolve_create_path, resolve_delete_path, resolve_inside};
-use crate::mutation::{FileChangeKind, FileChangeSummary, MutationResult, summarize_changes};
+use crate::verify::{FileChangeKind, FileChangeSummary, MutationResult, summarize_changes};
 
 #[derive(Debug)]
 enum PatchOperation {
@@ -375,7 +375,7 @@ fn write_file(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::apply_patch;
-    use crate::mutation::FileChangeKind;
+    use crate::verify::FileChangeKind;
     use std::fs;
     use tempfile::tempdir;
 

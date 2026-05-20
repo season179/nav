@@ -1,21 +1,22 @@
 use anyhow::{Context, Result, bail};
+use nav_core::guardrails::PermissionContext;
 use nav_core::permissions::AskForApproval;
 use nav_core::permissions::approval::{
     ApprovalGate, AutoGate, ChannelGate, PendingApprovals, spawn_response_reader,
 };
 use nav_core::sandbox::select_for_platform;
-use nav_core::tools::PermissionContext;
 use nav_core::{
     AgentEvent, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy,
     SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, agent,
-    agent_event_notification, auth,
+    agent_event_notification,
     cli::{
         Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, SessionsAction,
         sandbox_policy_from_args,
     },
     discover_extensions, discover_skills, doctor, git_checkpoint, layout_session_tree,
-    load_project_context, models, rebuild_responses_input, session_started_notification,
-    shorten_home,
+    load_project_context,
+    model::{auth, names},
+    rebuild_responses_input, session_started_notification, shorten_home,
 };
 use std::env;
 use std::io::{IsTerminal, Read};
@@ -53,10 +54,10 @@ async fn main() -> Result<()> {
         return run_cli_command(&args, &cwd, project.as_ref(), extensions.as_ref(), command);
     }
 
-    if !models::is_known_model_prefix(&args.model) {
+    if !names::is_known_model_prefix(&args.model) {
         // Warn (not error) — a brand-new model the provider supports but
         // nav's prefix list hasn't learned about yet should still work.
-        let hint = models::did_you_mean(&args.model)
+        let hint = names::did_you_mean(&args.model)
             .map(|h| format!(" {h}"))
             .unwrap_or_default();
         eprintln!(
@@ -78,7 +79,7 @@ async fn main() -> Result<()> {
     // disagree if the TUI later moves around.
     let skills = Arc::new(discover_skills(&cwd));
     let store = Arc::new(SessionStore::open(args.db_path.clone())?);
-    nav_core::tools::output_accumulator::sweep_old();
+    nav_core::tool_registry::output_accumulator::sweep_old();
     let (session_id, initial_input, resume_events) = match args.resume.as_deref() {
         Some(id) => {
             let events = store.load_session(id)?;

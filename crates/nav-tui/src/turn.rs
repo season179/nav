@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use nav_core::tools::PermissionContext;
+use nav_core::guardrails::PermissionContext;
 use nav_core::{
     AgentEvent, Catalog, OpenAiTransport, ProjectContext, SessionBinding, SessionId, SessionStore,
     TurnControls, UserAttachment, cli::Args, rebuild_responses_input, run_agent_with_control,

@@ -1,6 +1,6 @@
 //! Pre-flight permission check for tool calls.
 //!
-//! Runs *before* the dispatch in `tools/mod.rs::run_tool` reaches into
+//! Runs *before* the dispatch in `tool_registry::run_tool` reaches into
 //! `fs.rs` or the sandbox. Returns one of three outcomes:
 //! - `Allow`: proceed straight to execution.
 //! - `NeedsApproval`: emit a `ToolCallApprovalRequest`, await the gate.

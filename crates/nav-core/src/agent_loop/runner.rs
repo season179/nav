@@ -1,61 +1,30 @@
 use anyhow::{Result, anyhow};
 use base64::Engine;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::compaction::{
+use super::events::CompactionTrigger;
+use super::{AgentEvent, TurnUsage, UserAttachment};
+use crate::agent_loop::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::cli::Args;
+use crate::context::compaction::{
     append_compaction_details, build_history_summary_prompt, build_replacement_history,
     build_turn_prefix_summary_prompt, estimate_input_tokens, is_compact_command,
     merge_split_turn_summary, prepare_compaction, should_auto_compact,
 };
-use super::events::CompactionTrigger;
-use super::{AgentEvent, TurnUsage, UserAttachment};
-use crate::cli::Args;
-use crate::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::context::{Catalog, ProjectContext, SessionId, SessionStore};
 use crate::git_checkpoint;
-use crate::git_diff;
-use crate::mutation::PatchApplyStatus;
-use crate::permissions::approval::ApprovalRequest;
+use crate::guardrails::{self, PermissionContext};
+use crate::model::ResponsesTransport;
+use crate::model::responses::{self, ResponseCollector, ResponsesError};
 use crate::permissions::protected::is_protected_read;
-use crate::permissions::{
-    ApprovalReason, AskForApproval, ReviewDecision, SandboxPolicy, SessionAllowlist,
-};
-use crate::project::ProjectContext;
-use crate::responses::{self, ResponseCollector, ResponsesError};
-use crate::session::{SessionId, SessionStore};
-use crate::skills::Catalog;
-use crate::tools::truncate::{self, TruncateMode, bound};
-use crate::tools::{self, PermissionContext, preflight};
-
-/// `tool` field surfaced on approval/block events for protected `@file`
-/// attachments. Lets the modal distinguish them from `read_file` calls.
-const ATTACHMENT_READ_TOOL: &str = "attachment_read";
-
-/// Stream of raw `Responses` API events yielded by a transport.
-///
-/// `ResponsesError::ContextWindowExceeded` is the only error variant the agent
-/// loop recovers from; everything else is wrapped in `Other` and surfaces as
-/// an `AgentEvent::Error`.
-pub type EventStream = Pin<Box<dyn Stream<Item = Result<Value, ResponsesError>> + Send>>;
-
-/// Abstraction over the `Responses` API transport so the agent loop can be
-/// driven by either the real WebSocket/SSE client or a test stub.
-///
-/// `events` lets the transport surface durable events (e.g. `ProviderRetry`)
-/// onto the same channel the rest of the agent loop uses, without forcing the
-/// transport to know about session persistence.
-pub trait ResponsesTransport: Send + Sync {
-    fn create<'a>(
-        &'a self,
-        body: Value,
-        events: UnboundedSender<AgentEvent>,
-    ) -> Pin<Box<dyn Future<Output = Result<EventStream>> + Send + 'a>>;
-}
+use crate::permissions::{AskForApproval, SandboxPolicy, SessionAllowlist};
+use crate::tool_registry;
+use crate::tool_registry::truncate::{self, TruncateMode, bound};
+use crate::verify::{self, PatchApplyStatus};
 
 /// Optional session-store binding passed to [`run_agent`]; when present,
 /// every durable [`AgentEvent`] is appended to the store and each turn is
@@ -114,7 +83,7 @@ fn user_message_event(
 /// sees `input_text` alongside `input_image`. Attachments that fail to load
 /// are dropped silently; non-UTF-8 or symlink-to-secret cases surface as
 /// inline text notes so the model knows the path was requested.
-pub(super) fn build_user_content(
+pub(crate) fn build_user_content(
     prompt: &str,
     attachments: &[UserAttachment],
     cwd: &Path,
@@ -229,75 +198,18 @@ fn load_file_attachment(cwd_canonical: Option<&Path>, cwd: &Path, rel: &Path) ->
     ))
 }
 
-/// Gate each `File` attachment whose path matches [`is_protected_read`]
-/// through the same approval flow the `read_file` tool uses. Under
-/// `AskForApproval::Never` the gate is short-circuited to `Denied` so a
-/// secret can't ride along when the operator isn't around to refuse. An
-/// `Abort` decision propagates as the abort reason in the returned tuple;
-/// `run_agent` turns it into a `TurnAborted` event.
-async fn gate_protected_attachments(
+async fn apply_attachment_guardrails(
     attachments: Vec<UserAttachment>,
     permissions: &PermissionContext,
     cwd: &Path,
     events: &UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
 ) -> (Vec<UserAttachment>, Option<&'static str>) {
-    if !attachments
-        .iter()
-        .any(|a| matches!(a, UserAttachment::File { path } if is_protected_read(path)))
-    {
-        return (attachments, None);
+    let outcome = guardrails::gate_protected_attachments(attachments, permissions, cwd).await;
+    for event in outcome.blocked_events {
+        emit(events, session, event);
     }
-
-    let auto_denied = preflight::auto_denies_approvals(permissions.policy);
-    let mut kept = Vec::with_capacity(attachments.len());
-    for attach in attachments {
-        let UserAttachment::File { path } = &attach else {
-            kept.push(attach);
-            continue;
-        };
-        if !is_protected_read(path) {
-            kept.push(attach);
-            continue;
-        }
-        let decision = if auto_denied {
-            ReviewDecision::Denied
-        } else {
-            permissions
-                .gate
-                .request(ApprovalRequest {
-                    call_id: String::new(),
-                    tool: ATTACHMENT_READ_TOOL.to_string(),
-                    command: None,
-                    path: Some(path.display().to_string()),
-                    cwd: cwd.display().to_string(),
-                    reason: ApprovalReason::ProtectedRead.as_str().to_string(),
-                })
-                .await
-        };
-        match decision {
-            ReviewDecision::Approved | ReviewDecision::ApprovedForSession => kept.push(attach),
-            ReviewDecision::Denied => emit(
-                events,
-                session,
-                AgentEvent::ToolCallBlocked {
-                    call_id: String::new(),
-                    tool: ATTACHMENT_READ_TOOL.to_string(),
-                    reason: if auto_denied {
-                        format!(
-                            "attachment {} is protected and approval policy is `never`; dropped",
-                            path.display()
-                        )
-                    } else {
-                        format!("attachment {} denied by user", path.display())
-                    },
-                    rule: ApprovalReason::ProtectedRead.as_str().to_string(),
-                },
-            ),
-            ReviewDecision::Abort => return (Vec::new(), Some("attachment approval abort")),
-        }
-    }
-    (kept, None)
+    (outcome.attachments, outcome.abort_reason)
 }
 
 /// Drives the model/tool loop, emitting one [`AgentEvent`] per observable
@@ -475,7 +387,7 @@ async fn run_agent_inner(
     // Abort before emitting the user-message event so a denied `.env`
     // doesn't show up in the transcript as a turn that almost happened.
     let (attachments, abort_reason) =
-        gate_protected_attachments(attachments, &permissions, cwd, &events, session).await;
+        apply_attachment_guardrails(attachments, &permissions, cwd, &events, session).await;
     if let Some(reason) = abort_reason {
         emit_turn_aborted(&events, session, controls.turn_id.as_deref(), reason);
         return Ok(());
@@ -568,7 +480,7 @@ async fn run_agent_inner(
         let steering = drain_steering(&mut controls, &events, session);
         if !steering.is_empty() {
             for item in steering {
-                let (attachments, abort_reason) = gate_protected_attachments(
+                let (attachments, abort_reason) = apply_attachment_guardrails(
                     item.attachments,
                     &permissions,
                     cwd,
@@ -615,39 +527,40 @@ async fn run_agent_inner(
 
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
-            let result = if tool_name == tools::SPAWN_SUBAGENT_TOOL && options.include_subagents {
-                Ok(run_subagent_tool(
-                    transport,
-                    args,
-                    cwd,
-                    skills,
-                    context,
-                    permissions.clone(),
-                    &events,
-                    session,
-                    &call_id,
-                    &tool_arguments,
-                )
-                .await)
-            } else if !options.allows_tool(&tool_name) {
-                Ok(blocked_tool_outcome(
-                    &tool_name,
-                    "tool is not available in this agent scope",
-                    "agent_tool_scope",
-                ))
-            } else {
-                tools::run_tool(
-                    cwd,
-                    skills,
-                    args.bash_timeout_secs,
-                    &permissions,
-                    &call_id,
-                    &tool_name,
-                    tool_arguments.clone(),
-                    Some(&events),
-                )
-                .await
-            };
+            let result =
+                if tool_name == tool_registry::SPAWN_SUBAGENT_TOOL && options.include_subagents {
+                    Ok(run_subagent_tool(
+                        transport,
+                        args,
+                        cwd,
+                        skills,
+                        context,
+                        permissions.clone(),
+                        &events,
+                        session,
+                        &call_id,
+                        &tool_arguments,
+                    )
+                    .await)
+                } else if !options.allows_tool(&tool_name) {
+                    Ok(blocked_tool_outcome(
+                        &tool_name,
+                        "tool is not available in this agent scope",
+                        "agent_tool_scope",
+                    ))
+                } else {
+                    tool_registry::run_tool(
+                        cwd,
+                        skills,
+                        args.bash_timeout_secs,
+                        &permissions,
+                        &call_id,
+                        &tool_name,
+                        tool_arguments.clone(),
+                        Some(&events),
+                    )
+                    .await
+                };
             let (output_text, is_error, aborted, mutation, failed_mutation_summary) = match result {
                 Ok(outcome) => {
                     if let Some(blocked) = outcome.blocked {
@@ -663,7 +576,7 @@ async fn run_agent_inner(
                         );
                     }
                     let failed = if outcome.is_error && outcome.mutation.is_none() {
-                        tools::failed_mutation_summary(&tool_name, &tool_arguments)
+                        tool_registry::failed_mutation_summary(&tool_name, &tool_arguments)
                             .map(|summary| (summary, outcome.output.clone()))
                     } else {
                         None
@@ -678,8 +591,9 @@ async fn run_agent_inner(
                 }
                 Err(err) => {
                     let error_text = format!("tool error: {err:#}");
-                    let failed = tools::failed_mutation_summary(&tool_name, &tool_arguments)
-                        .map(|summary| (summary, error_text.clone()));
+                    let failed =
+                        tool_registry::failed_mutation_summary(&tool_name, &tool_arguments)
+                            .map(|summary| (summary, error_text.clone()));
                     (error_text, true, false, None, failed)
                 }
             };
@@ -733,7 +647,7 @@ async fn run_agent_inner(
             // the model for another turn.
             if aborted {
                 if turn_had_mutation {
-                    emit_turn_diff(&events, session, cwd);
+                    emit_verification_events(&events, session, cwd);
                 }
                 emit_turn_aborted(
                     &events,
@@ -835,7 +749,7 @@ async fn run_subagent_tool(
     parent_session: Option<&SessionBinding<'_>>,
     call_id: &str,
     input: &Value,
-) -> tools::ToolOutcome {
+) -> tool_registry::ToolOutcome {
     let Some(task) = input.get("task").and_then(Value::as_str).map(str::trim) else {
         return error_tool_outcome("tool error: missing string input field `task`");
     };
@@ -920,8 +834,8 @@ async fn run_subagent_tool(
     }
 }
 
-fn text_tool_outcome(output: impl Into<String>) -> tools::ToolOutcome {
-    tools::ToolOutcome {
+fn text_tool_outcome(output: impl Into<String>) -> tool_registry::ToolOutcome {
+    tool_registry::ToolOutcome {
         output: output.into(),
         is_error: false,
         blocked: None,
@@ -930,8 +844,8 @@ fn text_tool_outcome(output: impl Into<String>) -> tools::ToolOutcome {
     }
 }
 
-fn error_tool_outcome(output: impl Into<String>) -> tools::ToolOutcome {
-    tools::ToolOutcome {
+fn error_tool_outcome(output: impl Into<String>) -> tool_registry::ToolOutcome {
+    tool_registry::ToolOutcome {
         output: output.into(),
         is_error: true,
         blocked: None,
@@ -940,11 +854,11 @@ fn error_tool_outcome(output: impl Into<String>) -> tools::ToolOutcome {
     }
 }
 
-fn blocked_tool_outcome(name: &str, reason: &str, rule: &str) -> tools::ToolOutcome {
-    tools::ToolOutcome {
+fn blocked_tool_outcome(name: &str, reason: &str, rule: &str) -> tool_registry::ToolOutcome {
+    tool_registry::ToolOutcome {
         output: format!("tool {name} blocked: {reason}"),
         is_error: true,
-        blocked: Some(tools::BlockedTool {
+        blocked: Some(tool_registry::BlockedTool {
             rule: rule.to_string(),
             reason: reason.to_string(),
         }),
@@ -1046,7 +960,7 @@ const MAX_COMPACTION_TRIMS: usize = 32;
 /// request — is preserved so the model still knows what we're asking for.
 ///
 /// Returns the number of items removed (`0` if nothing was eligible).
-pub(super) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
+pub(crate) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
     let dropped_pair = drop_oldest_tool_pair(input);
     if dropped_pair > 0 {
         return dropped_pair;
@@ -1071,7 +985,7 @@ pub(super) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
 /// the conversation `input`. Returns the number of pairs removed (`0` or `1`).
 /// Used for one-shot context-overflow recovery: we shed the oldest tool
 /// exchange and re-issue the turn with a shorter transcript.
-pub(super) fn drop_oldest_tool_pair(input: &mut Vec<Value>) -> usize {
+pub(crate) fn drop_oldest_tool_pair(input: &mut Vec<Value>) -> usize {
     let call_pos = input
         .iter()
         .position(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
@@ -1133,7 +1047,7 @@ fn finalize_turn(
     usage: &TurnUsage,
 ) -> Result<()> {
     if turn_had_mutation {
-        emit_turn_diff(events, session, cwd);
+        emit_verification_events(events, session, cwd);
     }
     emit(
         events,
@@ -1150,21 +1064,13 @@ fn finalize_turn(
     Ok(())
 }
 
-fn emit_turn_diff(
+fn emit_verification_events(
     events: &UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
     cwd: &Path,
 ) {
-    match git_diff::working_tree_diff(cwd) {
-        Ok(Some(diff)) => emit(
-            events,
-            session,
-            AgentEvent::TurnDiff {
-                files: diff.files,
-                unified_diff: diff.unified_diff,
-                truncated: diff.truncated,
-            },
-        ),
+    match verify::turn_diff_event(cwd) {
+        Ok(Some(event)) => emit(events, session, event),
         Ok(None) => {}
         Err(err) => eprintln!("nav-core: failed to collect working tree diff: {err:#}"),
     }
@@ -1193,7 +1099,7 @@ fn emit(
 /// the [`ResponseCollector`] folds them into the final envelope. Anything that
 /// is not a message-level concern (function_call items, completion, usage) is
 /// emitted later in [`run_agent`] from the materialized envelope.
-pub(super) fn emit_stream_events(
+pub(crate) fn emit_stream_events(
     event: &Value,
     events: &UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
@@ -1454,7 +1360,7 @@ async fn request_compaction_summary(
     }
 }
 
-pub(super) fn extract_message_text(item: &Value) -> Option<String> {
+pub(crate) fn extract_message_text(item: &Value) -> Option<String> {
     let content = item.get("content")?.as_array()?;
     let mut buffer = String::new();
     for part in content {

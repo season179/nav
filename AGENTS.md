@@ -1,93 +1,77 @@
 # AGENTS.md
 
-Non-obvious context for editing `nav`. Product direction lives in
-[docs/CONTEXT.md](docs/CONTEXT.md); a guided code tour lives in
-[docs/ARCHITECTURE.html](docs/ARCHITECTURE.html).
+Non-obvious guidance for agents editing `nav`. For broader product direction,
+read [docs/CONTEXT.md](docs/CONTEXT.md). For a code tour, read
+[docs/ARCHITECTURE.html](docs/ARCHITECTURE.html). Keep this file short:
+repo-specific gotchas only.
 
-## Reference implementations
+## Core Shape
 
-Sibling coding-agent repos live next to this checkout — consult them before
-inventing a pattern from scratch. They are read-only references; do not edit
-them from a `nav` task.
+When changing `nav-core`, fit new behavior into these six harness parts
+whenever possible:
 
-- `../codex` — upstream Codex CLI; the canonical source for transport, auth,
-  and `AgentEvent` shapes that `nav` mirrors.
-- `../opencode` — alternative TUI/runtime architecture; useful for session
-  persistence and frontend wire-format ideas.
-- `../hermes-agent` — agent loop, tool-call plumbing, and skill execution
-  patterns.
-- `../nanoclaw` — minimal Claude-compatible harness; good for comparing the
-  bare-minimum surface area.
-- `../pi` — adjacent agent project; check for shared conventions before
-  diverging.
+1. **Tool registry**: model-visible tool definitions, tool access policy,
+   dispatch, and concrete tool adapters.
+2. **Model**: provider auth, request submission, streaming transport,
+   response collection/parsing, usage extraction, and model-name handling.
+3. **Context management**: project context, skills, extensions, replay,
+   attachments, compaction, session history, and `/context` measurement.
+4. **Guardrails**: approval policy, protected reads/writes, command
+   classification, sandbox selection, and path-safety rules.
+5. **Agent loop**: prompt intake, model/tool iteration, event emission,
+   steering/abort handling, and turn lifecycle.
+6. **Verify**: mutation summaries, turn diffs, doctor checks, test/command
+   evidence, and future structured verification output.
 
-## Prerequisites
+Prefer locality: put new behavior behind the part that owns it, and keep
+`agent/runner.rs` focused on the loop instead of accumulating cross-cutting
+detail. See [docs/six-part-agent-harness-refactor.md](docs/six-part-agent-harness-refactor.md)
+for the current refactor plan.
 
-- `rg` (ripgrep) on `PATH` — the `code_search` tool shells out to it and
-  nothing in `Cargo.toml` will tell you this.
+## Read-Only References
 
-## Runtime defaults that are easy to miss
+Sibling coding-agent repos are reference implementations only; do not edit them
+from a `nav` task. In temporary worktrees they may not be literally next to this
+path, so verify the real local checkout before assuming one is absent.
 
-- **Auth defaults to ChatGPT OAuth** from `~/.codex/auth.json` (run `codex
-  login` once). For a raw key, pass `--auth api-key` and set `OPENAI_API_KEY`.
-- **Transport defaults to WebSocket** against the Codex Responses backend.
-  `--transport sse` switches to streamed HTTP (kept for learnability).
-- **TUI vs. NDJSON is auto-selected.** TTY stdout + no `--json-events` →
-  interactive TUI. Anything else → one `AgentEvent` per line of NDJSON on
-  stdout — the wire format every non-Rust frontend consumes.
-- **Sessions persist to SQLite** at `$XDG_DATA_HOME/nav/nav.db`, falling back
-  to `~/.local/share/nav/nav.db`. Absolute `--db-path` overrides it; relative
-  values resolve inside the nav data directory.
-- **`nav update` / `nav upgrade`** reinstalls from the compile-time
-  `CARGO_MANIFEST_DIR`, not from `$PWD`. If that checkout moved, the upgrade
-  fails loudly instead of silently using a stale path.
-- **Approval policy defaults to `on-request`.** Classifier-flagged
-  dangerous commands prompt the operator before running; unbypassable
-  patterns (`sudo`, `rm -rf /`, fork bomb, `mkfs*`, etc.) are refused even
-  with `--dangerously-bypass-approvals-and-sandbox`. CLI flags:
-  `--approval-policy {untrusted,on-request,never}` and
-  `--sandbox {read-only,workspace-write,danger-full-access}`.
-- **Sandbox defaults to `workspace-write`.** On macOS this is enforced via
-  `sandbox-exec` with an embedded `.sbpl` profile that allows reads
-  anywhere, writes only under the workspace root, and gates network. On
-  Linux/Windows the sandbox is currently passthrough — the classifier and
-  protected-metadata rules still apply.
-- **`.git`, `.agents`, `.nav` writes are blocked** regardless of approval
-  mode. Reads of `.env*`, `*.pem`, `*.key`, and SSH keys require approval
-  even when the path is in-tree.
-- **NDJSON approval reverse channel.** In `--json-events` mode with a piped
-  stdin, the agent reads JSON lines of the form
-  `{"kind":"approval_response","approval_id":"…","decision":"approved"}`.
-  On a TTY stdin we auto-downgrade to `--approval-policy never` and warn.
+- `../codex`: canonical transport, auth, and `AgentEvent` shapes.
+- `../opencode`: TUI/runtime architecture, persistence, wire-format ideas.
+- `../kimiflare`: custom slash commands, command rendering, remote execution,
+  sandboxing, branch/PR handoff.
+- `../hermes-agent`: agent loop, tool-call plumbing, skill execution patterns.
+- `../nanoclaw`: minimal Claude-compatible harness surface.
+- `../pi`: adjacent agent conventions and shared local-tooling patterns.
 
-## Skills and filesystem boundaries
+## Local Gotchas
 
-- Skill discovery is scoped to **launch cwd only** — no upward walk to
-  ancestors. Project skills (`.agents/skills/`) shadow user skills
-  (`~/.agents/skills/`) by parsed `name`; the shadow is logged with both paths.
-- **Project context (`AGENTS.md`, `CLAUDE.md`) follows the same rule.**
-  Discovery is cwd-only at `<launch_cwd>/{AGENTS.md,CLAUDE.md}` plus a
-  user-scope fallback at `~/.agents/{AGENTS.md,CLAUDE.md}`. Files are deduped
-  by canonical path (so a `CLAUDE.md → AGENTS.md` symlink loads once) and
-  prepended to the Responses API `instructions` field in user-then-project
-  order. Set `disable_context_files: true` in `.nav/settings.json` to skip
-  this entirely.
-- **Project settings live at `<launch_cwd>/.nav/settings.json` and
-  `~/.nav/settings.json`.** Same scoping: no upward walk. Project overrides
-  user; explicit CLI flags beat both. Schema is the subset of CLI flags that
-  make sense as defaults: `model`, `auth`, `transport`, `max_turns`,
-  `bash_timeout_secs`, `disable_context_files`. Unknown keys reject the file
-  with an eprintln; malformed JSON falls back to defaults (startup never
-  blocks on broken settings).
-- **Writes are workspace-only.** `edit_file` rejects absolute paths, `..`, and
-  symlink escapes. Reads under any catalog `skill_dir` are allowed but writes
-  are not — that asymmetry is intentional, not a bug to fix.
+- `rg` must be on `PATH`; `code_search` shells out to it even though
+  `Cargo.toml` does not mention it.
+- `nav update` / `nav upgrade` reinstalls from compile-time
+  `CARGO_MANIFEST_DIR`, not from the current working directory.
+- Auth, transport, session storage, settings keys, and CLI defaults are
+  documented in `README.md`; prefer linking there instead of duplicating them
+  here.
+
+## Scope and Safety Rules
+
+- Skill, context-file, extension, and project-setting discovery are scoped to
+  the launch cwd plus the user-scope fallback. Do not reintroduce an upward walk
+  without updating the documented product rule.
+- `AGENTS.md` and `CLAUDE.md` are deduped by canonical path; in this checkout
+  `CLAUDE.md` is a symlink to `AGENTS.md`.
+- Writes are workspace-only. `edit_file` rejects absolute paths, `..`, and
+  symlink escapes. Reads under catalog `skill_dir`s are allowed; writes there
+  are not.
+- Writes to `.git`, `.agents`, and `.nav` are blocked regardless of approval
+  mode. Reads of `.env*`, `*.pem`, `*.key`, and SSH keys require approval.
+- Keep safety behavior easy to audit. Guardrail changes need focused tests for
+  path containment, protected metadata, approval decisions, and sandbox policy.
 
 ## Conventions
 
-- Versioning is **CalVer** in `[workspace.package].version`. Don't bump it
-  alongside unrelated changes.
-- Snapshot tests use `insta` — review pending snapshots with `cargo insta
-  review` before committing.
-- Commit messages: plain human voice, short imperative subjects (recent style:
-  `Scope skill discovery to launch cwd only`). **No `Co-Authored-By` trailers.**
+- Versioning is CalVer in `[workspace.package].version`; do not bump it for
+  unrelated changes.
+- Snapshot tests use `insta`; review pending snapshots with
+  `cargo insta review` before committing.
+- Commit messages should sound human, with short imperative subjects. Do not
+  include `Co-Authored-By` trailers.

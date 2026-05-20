@@ -942,7 +942,7 @@
     <span class="cmt">// 4. run each tool, append the model's call + our output to `input`</span>
     <span class="kw">for</span> call <span class="kw">in</span> calls {
         emit(<span class="fn">ToolCallStarted</span> { call_id, name, arguments });
-        <span class="kw">let</span> tool_result = tools::run_tool(...).<span class="kw">await</span>;
+        <span class="kw">let</span> tool_result = tool_registry::run_tool(...).<span class="kw">await</span>;
         input.push(function_call_output);
         emit(<span class="fn">ToolCallOutput</span> { call_id, output: tool_result.output, is_error });
         emit(<span class="fn">FileChange</span> { ... });   <span class="cmt">// for mutating tools</span>
@@ -956,7 +956,7 @@
 
       <aside class="mnote why">
         <span class="label">Why this matters</span>
-        The model does not call local code directly. It asks for a tool in JSON; <code>tools::run_tool</code> dispatches by name; and Rust decides what actually runs. The file/search/edit/patch tools enforce workspace path checks. <code>bash</code> is deliberately broader — it runs <code>sh -c</code> in the workspace with a timeout and captured output, but it is <em>not</em> a filesystem sandbox.
+        The model does not call local code directly. It asks for a tool in JSON; <code>tool_registry::run_tool</code> dispatches by name; and Rust decides what actually runs. The file/search/edit/patch tools enforce workspace path checks. <code>bash</code> is deliberately broader — it runs <code>sh -c</code> in the workspace with a timeout and captured output, but it is <em>not</em> a filesystem sandbox.
       </aside>
     </section>
 
