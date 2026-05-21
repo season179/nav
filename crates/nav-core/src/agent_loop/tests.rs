@@ -7,7 +7,7 @@ use crate::context::compaction::{SUMMARIZATION_PROMPT, SUMMARY_PREFIX, summary_m
 use crate::context::replay::{
     CLEARED_TOOL_OUTPUT_PLACEHOLDER, REDUCED_TOOL_OUTPUT_PREFIX, rebuild_responses_input,
 };
-use crate::context::{Catalog, ProjectContext};
+use crate::context::{Catalog, ProjectContext, build_user_content};
 use crate::guardrails::approval::{ApprovalGate, ApprovalRequest};
 use crate::guardrails::{
     AskForApproval, PassthroughRunner, PermissionContext, ReviewDecision, SandboxPolicy,
@@ -807,6 +807,109 @@ fn file_attachment_body_is_truncated_via_tool_output_policy() {
     );
     // Bounded body is well under the unbounded 60 KB original.
     assert!(attached.len() < 60 * 1024);
+}
+
+fn replay_user_text_parts(text: &str, cwd: &Path) -> Vec<String> {
+    let input = rebuild_responses_input(
+        &[AgentEvent::UserMessage {
+            text: text.into(),
+            display_text: None,
+            attachments: Vec::new(),
+        }],
+        cwd,
+    );
+    input[0]
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("@file mentions produce typed parts")
+        .iter()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn find_text_part<'a>(parts: &'a [String], needle: &str) -> &'a str {
+    parts
+        .iter()
+        .map(String::as_str)
+        .find(|text| text.contains(needle))
+        .unwrap_or_else(|| panic!("missing text part containing {needle:?}"))
+}
+
+#[test]
+fn submit_time_file_mention_inlines_existing_file() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("README.md"), "hello\nworld\n").unwrap();
+
+    let parts = replay_user_text_parts("summarise @README.md", dir.path());
+    assert!(parts.iter().any(|text| text == "summarise @README.md"));
+    let attached = find_text_part(&parts, "<attached file: README.md>");
+    assert!(attached.contains("hello\nworld\n"));
+}
+
+#[test]
+fn submit_time_file_mention_notes_invalid_path() {
+    let dir = tempdir().unwrap();
+
+    let parts = replay_user_text_parts("read @missing.rs", dir.path());
+    let note = find_text_part(&parts, "<file mention: @missing.rs>");
+    assert!(note.contains("[not resolved: no such workspace file]"));
+}
+
+#[test]
+fn submit_time_file_mention_notes_protected_read() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join(".env"), "SECRET=1\n").unwrap();
+
+    let parts = replay_user_text_parts("read @.env", dir.path());
+    let note = find_text_part(&parts, "<file mention: @.env>");
+    assert!(note.contains("[refused: protected file reads require explicit approval]"));
+    assert!(!note.contains("SECRET=1"));
+}
+
+#[test]
+fn submit_time_file_mention_notes_ambiguous_basename() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("b")).unwrap();
+    std::fs::write(dir.path().join("a/dup.txt"), "one\n").unwrap();
+    std::fs::write(dir.path().join("b/dup.txt"), "two\n").unwrap();
+
+    let parts = replay_user_text_parts("compare @dup.txt", dir.path());
+    let note = find_text_part(&parts, "<file mention: @dup.txt>");
+    assert!(note.contains("ambiguous: multiple files match this name"));
+    assert!(note.contains("a/dup.txt"));
+    assert!(note.contains("b/dup.txt"));
+}
+
+#[test]
+fn submit_time_file_mention_uses_read_file_line_cap() {
+    let dir = tempdir().unwrap();
+    let body = (0..700).map(|i| format!("line{i}\n")).collect::<String>();
+    std::fs::write(dir.path().join("big.txt"), &body).unwrap();
+
+    let parts = replay_user_text_parts("summarise @big.txt", dir.path());
+    let attached = find_text_part(&parts, "<attached file: big.txt>");
+    assert!(attached.contains("line499\n"));
+    assert!(!attached.contains("line500\n"));
+    assert!(attached.contains("[truncated"));
+}
+
+#[test]
+fn submit_time_mentions_scan_display_prompt_not_wrapped_skill_body() {
+    let dir = tempdir().unwrap();
+
+    let content = build_user_content(
+        "<skill name=\"test\">\nread @missing.rs\n</skill>\n\nActual request",
+        Some("Actual request"),
+        &[],
+        dir.path(),
+    );
+
+    assert_eq!(
+        content,
+        Value::String("<skill name=\"test\">\nread @missing.rs\n</skill>\n\nActual request".into())
+    );
 }
 
 #[test]

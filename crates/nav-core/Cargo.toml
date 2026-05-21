@@ -12,6 +12,7 @@ base64 = "0.22.1"
 clap.workspace = true
 dirs.workspace = true
 futures-util.workspace = true
+ignore = "0.4.25"
 reqwest.workspace = true
 regex = "1"
 rusqlite = { workspace = true, features = ["bundled"] }
