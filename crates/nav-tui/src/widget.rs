@@ -42,7 +42,7 @@ impl CachedCell {
             .layout
             .borrow()
             .as_ref()
-            .map_or(true, |l| l.width != width);
+            .is_none_or(|l| l.width != width);
         if stale {
             let lines = self.inner.display_lines(width);
             *self.layout.borrow_mut() = Some(CellLayout { width, lines });
@@ -575,14 +575,17 @@ impl Widget for &ChatWidget {
         let anchor = stream.as_ref().map(|(a, _)| *a).unwrap_or(self.cells.len());
 
         // `0..=self.cells.len()` is inclusive so the streaming cell can fire
-        // even when its anchor sits past the last finalized cell.
+        // even when its anchor sits past the last finalized cell. The index
+        // gates both the anchor comparison and the cell lookup, so an
+        // iterator-style rewrite hurts more than it helps here.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..=self.cells.len() {
-            if i == anchor {
-                if let Some((_, ref lines)) = stream {
-                    acc = extend_window(acc, lines.len(), start, end, |lstart, lend| {
-                        visible.extend(lines[lstart..lend].iter().cloned());
-                    });
-                }
+            if i == anchor
+                && let Some((_, ref lines)) = stream
+            {
+                acc = extend_window(acc, lines.len(), start, end, |lstart, lend| {
+                    visible.extend(lines[lstart..lend].iter().cloned());
+                });
             }
             if i < self.cells.len() {
                 let cell = &self.cells[i];
@@ -612,4 +615,251 @@ fn parse_skill_prompt(text: &str) -> Option<SkillPrompt> {
     let close_idx = trimmed.rfind(closing)?;
     let request = trimmed[close_idx + closing.len()..].trim().to_string();
     Some(SkillPrompt { name, request })
+}
+
+/// Parsed shape of a model-facing `<skill ...>...</skill>\n\n<request>`
+/// prompt body. Used by /rewind to restore both the model-facing wrapper
+/// (so the resubmitted turn carries the same skill instructions the
+/// original turn had) and the visible request (so the composer shows
+/// what the user wrote, not the wrapper).
+pub(crate) struct RewindSkill {
+    pub name: String,
+    pub wrapped_body: String,
+    pub request: String,
+}
+
+pub(crate) fn parse_rewind_skill_prompt(
+    text: &str,
+    display_text: Option<&str>,
+) -> Option<RewindSkill> {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<skill name=\"") {
+        return parse_wrapper(trimmed, rest, "</skill>", "", None, display_text);
+    }
+    if let Some(rest) = trimmed.strip_prefix("<prompt_template name=\"") {
+        // `/prompt:<name>` invocations are persisted as a separate
+        // `<prompt_template ...>` block. Without this branch /rewind on a
+        // prompt-template turn would lose the template body on resubmit.
+        return parse_wrapper(
+            trimmed,
+            rest,
+            "</prompt_template>",
+            "prompt:",
+            Some("\" extension=\""),
+            display_text,
+        );
+    }
+    None
+}
+
+fn parse_wrapper(
+    trimmed: &str,
+    after_name_attr: &str,
+    closing_tag: &str,
+    name_prefix: &str,
+    middle_attr: Option<&str>,
+    display_text: Option<&str>,
+) -> Option<RewindSkill> {
+    let name_end = after_name_attr.find('"')?;
+    let name = format!("{name_prefix}{}", &after_name_attr[..name_end]);
+    // Verify the next attribute matches what the wrapper actually emits so a
+    // malformed string that just happens to start with the opening tag
+    // doesn't get parsed as a valid wrapper.
+    let after_first_quote = &after_name_attr[name_end..];
+    let after_attrs = match middle_attr {
+        Some(attr) => {
+            let after_middle = after_first_quote.strip_prefix(attr)?;
+            let middle_end = after_middle.find('"')?;
+            after_middle[middle_end..].strip_prefix("\" dir=\"")?
+        }
+        None => after_first_quote.strip_prefix("\" dir=\"")?,
+    };
+    // Walk past the opening tag's closing `">"` so the closing-tag search
+    // below starts in the wrapper body, not the user request.
+    let dir_close = after_attrs.find('"')?;
+    let after_open_tag = after_attrs[dir_close..].strip_prefix("\">")?;
+    let body_offset = trimmed.len() - after_open_tag.len();
+
+    // Prefer the persisted `display_text` to locate the wrapper/request
+    // boundary. The slash-skill code paths set `display_text` to exactly
+    // the visible request and join wrapper + request with `"\n\n"`, so the
+    // wrapped body is everything before that final separator. This is
+    // robust even when the skill body itself contains a literal close tag
+    // (e.g. SKILL.md discussing XML), where a forward `find` would split
+    // inside the body and corrupt the restoration.
+    if let Some(request) = display_text {
+        let suffix = format!("\n\n{request}");
+        if let Some(wrapped_body) = trimmed.strip_suffix(&suffix)
+            && wrapped_body.ends_with(closing_tag)
+            && wrapped_body.len() > body_offset
+        {
+            return Some(RewindSkill {
+                name,
+                wrapped_body: wrapped_body.to_string(),
+                request: request.to_string(),
+            });
+        }
+    }
+
+    // Fallback: no display_text available, or the suffix didn't match the
+    // expected shape. Locate the first close tag inside the wrapper body.
+    // This still misreads bodies that legitimately contain `</skill>` /
+    // `</prompt_template>` but covers older session logs where
+    // display_text wasn't persisted.
+    let close_in_body = after_open_tag.find(closing_tag)?;
+    let close_idx = body_offset + close_in_body;
+    let wrapped_body = trimmed[..close_idx + closing_tag.len()].to_string();
+    let request = trimmed[close_idx + closing_tag.len()..].trim().to_string();
+    Some(RewindSkill {
+        name,
+        wrapped_body,
+        request,
+    })
+}
+
+#[cfg(test)]
+mod skill_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_rewind_skill_prompt_recovers_wrapper_and_request() {
+        // The agent_loop persists the full wrapped text on UserMessage.text.
+        // Rewind must be able to peel the wrapper off so the composer shows
+        // the visible request while restoring the wrapper for resubmit.
+        let wrapped = "<skill name=\"reviewer\" dir=\"/skills/reviewer\">\nBODY\n</skill>\n\ndo the thing";
+        let parsed = parse_rewind_skill_prompt(wrapped, Some("do the thing")).expect("must parse");
+        assert_eq!(parsed.name, "reviewer");
+        assert_eq!(parsed.request, "do the thing");
+        assert!(
+            parsed.wrapped_body.starts_with("<skill name=\"reviewer\""),
+            "wrapped_body must keep the opening tag for re-application"
+        );
+        assert!(
+            parsed.wrapped_body.ends_with("</skill>"),
+            "wrapped_body must include the closing tag"
+        );
+        assert!(
+            !parsed.wrapped_body.contains("do the thing"),
+            "wrapped_body must NOT include the request text — prepend_pending_skill \
+             would otherwise duplicate it on resubmit"
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_returns_none_for_plain_text() {
+        assert!(parse_rewind_skill_prompt("just a plain message", None).is_none());
+        assert!(parse_rewind_skill_prompt("<skill>missing attrs</skill>", None).is_none());
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_recovers_prompt_template_wrapper() {
+        // /prompt:<name> invocations get a different wrapper than /<skill>;
+        // the persisted text starts with <prompt_template>. /rewind on that
+        // turn must still recover the wrapper so resubmit keeps the
+        // template's instructions.
+        let wrapped = "<prompt_template name=\"review\" extension=\"core\" dir=\"/ext/core/prompts\">\nTEMPLATE BODY\n</prompt_template>\n\nplease review this diff";
+        let parsed = parse_rewind_skill_prompt(wrapped, Some("please review this diff"))
+            .expect("must parse prompt_template");
+        assert_eq!(
+            parsed.name, "prompt:review",
+            "name must carry the `prompt:` namespace so PendingSkill matches \
+             the slash-command path that originally emitted the wrapper"
+        );
+        assert_eq!(parsed.request, "please review this diff");
+        assert!(parsed.wrapped_body.starts_with("<prompt_template name=\"review\""));
+        assert!(parsed.wrapped_body.ends_with("</prompt_template>"));
+        assert!(
+            !parsed.wrapped_body.contains("please review this diff"),
+            "wrapped_body must NOT include the request — prepend_pending_skill \
+             would otherwise duplicate it on resubmit"
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_does_not_split_at_close_tag_inside_request() {
+        // Regression: the parser used to use `rfind` to locate the wrapper's
+        // closing tag, which silently absorbs part of the user request when
+        // the request body itself contains `</skill>` (e.g. the user is
+        // reviewing XML or HTML). The composer would then show only a
+        // suffix on resubmit and the wrapper would carry stray content.
+        let wrapped = "<skill name=\"reviewer\" dir=\"/skills/reviewer\">\nBODY\n</skill>\n\nplease audit this snippet: <skill name=\"x\">inner</skill> tail";
+        let parsed = parse_rewind_skill_prompt(
+            wrapped,
+            Some("please audit this snippet: <skill name=\"x\">inner</skill> tail"),
+        )
+        .expect("must parse");
+        assert_eq!(
+            parsed.request,
+            "please audit this snippet: <skill name=\"x\">inner</skill> tail",
+            "request must include the user's full text, including any \
+             literal </skill> tags inside it"
+        );
+        assert!(
+            parsed.wrapped_body.ends_with("BODY\n</skill>"),
+            "wrapped_body must end at the wrapper's own close tag, not at \
+             a later </skill> inside the request body; got:\n{}",
+            parsed.wrapped_body,
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_template_does_not_split_at_close_tag_inside_request() {
+        let wrapped = "<prompt_template name=\"review\" extension=\"core\" dir=\"/ext/core/prompts\">\nTEMPLATE BODY\n</prompt_template>\n\nuse </prompt_template> verbatim";
+        let parsed = parse_rewind_skill_prompt(wrapped, Some("use </prompt_template> verbatim"))
+            .expect("must parse");
+        assert_eq!(parsed.request, "use </prompt_template> verbatim");
+        assert!(
+            parsed.wrapped_body.ends_with("TEMPLATE BODY\n</prompt_template>"),
+            "wrapped_body must close at the wrapper, not at the inner tag; got:\n{}",
+            parsed.wrapped_body,
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_uses_display_text_when_body_contains_close_tag() {
+        // Regression: a SKILL.md body that contains a literal `</skill>` (e.g.
+        // a skill discussing XML or HTML) used to cause a forward `find` to
+        // stop inside the body. The fallback path would then split there,
+        // truncating `wrapped_body` and pushing the remaining skill
+        // instructions into the composer as the user's request. When
+        // `display_text` is persisted (the slash-skill path always sets it),
+        // we anchor the split on the wrapper/request join instead.
+        let wrapped = "<skill name=\"xmlhelper\" dir=\"/skills/xmlhelper\">\nTo nest a snippet, write </skill> inside a code block.\nMore body here.\n</skill>\n\ndo the thing";
+        let parsed = parse_rewind_skill_prompt(wrapped, Some("do the thing"))
+            .expect("display_text path must succeed");
+        assert_eq!(parsed.name, "xmlhelper");
+        assert_eq!(parsed.request, "do the thing");
+        assert!(
+            parsed.wrapped_body.contains("More body here."),
+            "wrapped_body must include the full skill body even when it \
+             contains a literal </skill>; got:\n{}",
+            parsed.wrapped_body,
+        );
+        assert!(
+            parsed.wrapped_body.ends_with("</skill>"),
+            "wrapped_body must end at the wrapper's own close tag"
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_falls_back_to_first_close_without_display_text() {
+        // Legacy session logs (or any flow that didn't persist display_text)
+        // still need *something*. The fallback splits at the first close tag,
+        // which is correct for the common case where the skill body itself
+        // doesn't carry a literal close tag.
+        let wrapped =
+            "<skill name=\"plain\" dir=\"/skills/plain\">\nbody\n</skill>\n\ndo the thing";
+        let parsed = parse_rewind_skill_prompt(wrapped, None).expect("fallback must succeed");
+        assert_eq!(parsed.name, "plain");
+        assert_eq!(parsed.request, "do the thing");
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_rejects_malformed_prompt_template() {
+        // Missing the `extension=` middle attribute the real wrapper always
+        // emits — must not parse, or a hand-crafted look-alike could be
+        // mistaken for a real template wrapper.
+        let bogus = "<prompt_template name=\"x\" dir=\"/whatever\">body</prompt_template>\n\nreq";
+        assert!(parse_rewind_skill_prompt(bogus, Some("req")).is_none());
+    }
 }

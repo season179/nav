@@ -346,30 +346,41 @@ pub fn store_artifact(prefix: &str, body: &[u8]) -> Result<ArtifactRef> {
 /// any id with a path separator, so the resolver always lands inside the
 /// known tool-output dir. Tries the preferred XDG location first, then
 /// the temp-dir fallback used when XDG is not writable.
+///
+/// Both paths are tried before erroring, including when the preferred
+/// path fails for a reason other than "not found" (e.g. the preferred
+/// directory exists as a regular file or is unreadable). The write side
+/// transparently falls back to the temp dir in those cases, so the read
+/// side has to match or the just-written artifact would be unreachable.
 pub fn read_artifact(artifact_id: &str) -> Result<String> {
     if !is_valid_artifact_id(artifact_id) {
         anyhow::bail!("artifact_id is not a valid identifier (expected letters, digits, '_', '-')",);
     }
     let filename = format!("{artifact_id}.log");
-    let preferred = default_log_dir()?.join(&filename);
-    match fs::read_to_string(&preferred) {
-        Ok(content) => return Ok(content),
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to read artifact at {}", preferred.display()));
-        }
-    }
+    let preferred_dir = default_log_dir().ok();
+    let preferred = preferred_dir.map(|dir| dir.join(&filename));
     let fallback = fallback_log_dir().join(&filename);
-    match fs::read_to_string(&fallback) {
-        Ok(content) => Ok(content),
-        Err(err) if err.kind() == ErrorKind::NotFound => anyhow::bail!(
-            "artifact not found; it may have expired (artifacts are swept after 7 days) or never existed",
-        ),
-        Err(err) => {
-            Err(err).with_context(|| format!("failed to read artifact at {}", fallback.display()))
+
+    let mut last_err: Option<(PathBuf, std::io::Error)> = None;
+    for path in preferred.iter().chain(std::iter::once(&fallback)) {
+        match fs::read_to_string(path) {
+            Ok(content) => return Ok(content),
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                // Hold the non-NotFound error but keep checking the other
+                // location; the writer may have fallen back even when the
+                // preferred path is unreadable.
+                last_err = Some((path.clone(), err));
+            }
         }
     }
+    if let Some((path, err)) = last_err {
+        return Err(err)
+            .with_context(|| format!("failed to read artifact at {}", path.display()));
+    }
+    anyhow::bail!(
+        "artifact not found; it may have expired (artifacts are swept after 7 days) or never existed",
+    )
 }
 
 fn default_log_dir() -> Result<PathBuf> {

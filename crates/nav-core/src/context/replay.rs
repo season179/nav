@@ -71,7 +71,25 @@ pub fn rebuild_responses_input(events: &[AgentEvent], cwd: &Path) -> Vec<Value> 
 }
 
 fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path) {
-    let mut current_turn_start: Option<usize> = None;
+    // `user_turn_start` anchors replay back to the most recent UserMessage
+    // and is *not* cleared by per-iteration `TurnComplete` events — a
+    // single user prompt can drive multiple tool-call iterations, each
+    // emitting its own `TurnComplete`, and an abort that lands after a
+    // mid-prompt iteration still needs to drop every continuation and
+    // tool output emitted since the user's last message. Without this,
+    // resume would replay a partial tool-call state the user explicitly
+    // aborted.
+    //
+    // The companion `last_iter_was_terminal` flag distinguishes "mid-turn
+    // abort" (truncate back to UserMessage) from "abort fired *before* a
+    // new turn even emitted its UserMessage" (don't touch the previous
+    // turn). Terminal iters never emit a `ResponseContinuation` (only iters
+    // that produced function_calls do), so a `TurnComplete` that follows
+    // *no* `ResponseContinuation` since the last `UserMessage`/`TurnComplete`
+    // marks the user turn as fully complete.
+    let mut user_turn_start: Option<usize> = None;
+    let mut iter_had_continuation = false;
+    let mut last_iter_was_terminal = false;
     // `function_call` items become valid in the wire input only when the
     // matching reasoning/function_call continuation was captured. We track
     // `call_id`s seen in `ResponseContinuation` so a stray `ToolCallOutput`
@@ -81,11 +99,14 @@ fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path)
     for event in events {
         match event {
             AgentEvent::UserMessage { .. } => {
-                current_turn_start = Some(input.len());
+                user_turn_start = Some(input.len());
                 pending_call_ids.clear();
+                iter_had_continuation = false;
+                last_iter_was_terminal = false;
                 push_replay_event(input, event, cwd);
             }
             AgentEvent::ResponseContinuation { items } => {
+                iter_had_continuation = true;
                 for item in items {
                     if item.get("type").and_then(Value::as_str) == Some("function_call")
                         && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
@@ -106,19 +127,47 @@ fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path)
                     }));
                 }
             }
-            AgentEvent::TurnComplete { .. }
-            | AgentEvent::CompactionCompleted { .. }
+            AgentEvent::CompactionCompleted { .. }
             | AgentEvent::CompactionFailed { .. }
             | AgentEvent::Error { .. } => {
                 push_replay_event(input, event, cwd);
-                current_turn_start = None;
+                user_turn_start = None;
                 pending_call_ids.clear();
+                iter_had_continuation = false;
+                last_iter_was_terminal = false;
+            }
+            AgentEvent::TurnComplete { .. } => {
+                // `TurnComplete` fires *per provider iteration*, not per
+                // user turn — clearing the anchor here would let a later
+                // abort within the same user prompt leave mid-prompt
+                // continuation items in the replayed input. Keep the
+                // anchor; the next `UserMessage` (or terminal event
+                // above) is the right place to drop it.
+                //
+                // We do snapshot terminal-ness here: a `TurnComplete` that
+                // ran with no `ResponseContinuation` this iter came from
+                // the `calls.is_empty()` branch in the runner — the user
+                // turn is fully done. The companion `TurnAborted` handler
+                // uses this to ignore aborts that landed *after* a turn
+                // already completed (e.g. attachment-guard rejection for
+                // the *next* turn before it could emit its own UserMessage).
+                last_iter_was_terminal = !iter_had_continuation;
+                iter_had_continuation = false;
+                push_replay_event(input, event, cwd);
             }
             AgentEvent::TurnAborted { .. } => {
-                if let Some(start) = current_turn_start.take() {
+                if last_iter_was_terminal {
+                    // Abort fired after a fully-completed turn — the prior
+                    // UserMessage is sealed. Leave it (and its tool I/O)
+                    // intact; only disarm so a subsequent abort within a
+                    // fresh active turn truncates correctly.
+                    user_turn_start = None;
+                } else if let Some(start) = user_turn_start.take() {
                     input.truncate(start);
                 }
                 pending_call_ids.clear();
+                iter_had_continuation = false;
+                last_iter_was_terminal = false;
             }
             _ => push_replay_event(input, event, cwd),
         }

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
+use nav_core::UserAttachment;
 
 use super::SlashCommandPopup;
 use super::clipboard::{recognized_image_path, try_save_clipboard_image, workspace_relative_image};
@@ -13,6 +14,20 @@ impl BottomPane {
     /// Replace the editable composer buffer with a generated draft prompt.
     pub fn set_composer_text(&mut self, text: &str) {
         self.composer.set_text(text);
+        self.slash_popup_suppressed = false;
+        self.mention_popup_suppressed = false;
+        self.reconcile_popups();
+    }
+
+    /// Replace the composer buffer and re-queue the given attachments. Used
+    /// by the rewind flow so the resubmitted prompt carries the original
+    /// files/images instead of silently dropping them.
+    pub fn set_composer_text_with_attachments(
+        &mut self,
+        text: &str,
+        attachments: Vec<UserAttachment>,
+    ) {
+        self.composer.set_text_with_attachments(text, attachments);
         self.slash_popup_suppressed = false;
         self.mention_popup_suppressed = false;
         self.reconcile_popups();

@@ -30,10 +30,17 @@ pub const READ_FILE_MAX_BYTES: usize = MAX_BYTES;
 /// Result of a bound: the truncated content plus whether anything was
 /// dropped. Callers use the flag to attach metadata to the durable tool
 /// output event so replay/UI can show why a tool result is short.
+///
+/// `kept_full_lines` counts *complete* lines retained by the bound. A line
+/// retained as a byte-bounded prefix (long minified content) does not count.
+/// Callers that need to compute resume offsets after a byte truncation use
+/// this to rebuild a correct "next offset" hint — relying on the pre-bound
+/// trailer would otherwise overstate progress and silently skip dropped lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundedOutput {
     pub content: String,
     pub truncated: bool,
+    pub kept_full_lines: usize,
 }
 
 impl BoundedOutput {
@@ -83,10 +90,11 @@ pub fn bound_with_limits(
         return BoundedOutput {
             content: output,
             truncated: false,
+            kept_full_lines: total_lines,
         };
     }
 
-    let content = match mode {
+    let (content, kept_full_lines) = match mode {
         TruncateMode::Head => render_head(&lines, max_lines, max_bytes, total_lines, total_bytes),
         TruncateMode::HeadTail { head_lines } => render_head_tail(
             &lines,
@@ -100,6 +108,7 @@ pub fn bound_with_limits(
     BoundedOutput {
         content,
         truncated: true,
+        kept_full_lines,
     }
 }
 
@@ -156,7 +165,7 @@ fn render_head(
     max_bytes: usize,
     total_lines: usize,
     total_bytes: usize,
-) -> String {
+) -> (String, usize) {
     let mut kept_text = String::new();
     let mut kept_lines = 0usize;
     let mut kept_bytes = 0usize;
@@ -169,6 +178,9 @@ fn render_head(
             // Long single line (minified JSON/JS, ripgrep hit on a generated
             // file). Don't drop the whole line — keep a byte-bounded prefix
             // at the nearest UTF-8 boundary so the model sees real content.
+            // This partial line is NOT counted in `kept_lines` — callers
+            // computing a resume offset must point at this line again to
+            // get the rest of it.
             let prefix = byte_prefix(line, remaining);
             kept_text.push_str(prefix);
             kept_bytes += prefix.len();
@@ -184,7 +196,7 @@ fn render_head(
     let mut result = String::with_capacity(kept_bytes + 64);
     result.push_str(&kept_text);
     result.push_str(&marker(dropped_bytes, dropped_lines));
-    result
+    (result, kept_lines)
 }
 
 fn render_head_tail(
@@ -194,7 +206,7 @@ fn render_head_tail(
     max_bytes: usize,
     total_lines: usize,
     total_bytes: usize,
-) -> String {
+) -> (String, usize) {
     let max_lines = max_lines.max(1);
     let head_lines_budget = head_lines_budget.min(max_lines);
     let tail_lines_budget = max_lines - head_lines_budget;
@@ -263,7 +275,7 @@ fn render_head_tail(
     result.push_str(&head_text);
     result.push_str(&marker(dropped_bytes, dropped_lines));
     result.push_str(&tail_text);
-    result
+    (result, kept_lines)
 }
 
 #[cfg(test)]

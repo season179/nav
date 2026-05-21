@@ -39,6 +39,41 @@ pub(crate) const ORPHAN_CALL_OUTPUT_PLACEHOLDER: &str =
 pub(crate) const SHED_IMAGE_PLACEHOLDER: &str =
     "[image omitted: older than keep window]";
 
+/// JSON marker key set on synthetic `role: user` items that nav injects
+/// turn-locally — ambient context and tool-budget steering nudges. Window
+/// counters that walk "user turns" skip these so a single real turn cannot
+/// lose protection because nav added housekeeping messages alongside it.
+/// The marker is stripped from the request body just before send.
+pub(crate) const NAV_SYNTHETIC_MARKER_KEY: &str = "nav_synthetic";
+
+/// True when `item` is a nav-injected synthetic message (ambient context or a
+/// tool-budget nudge) rather than a real user turn. Synthetic messages must
+/// not count against `raw_tool_turns` or `keep_*_turns` windows.
+pub(crate) fn is_synthetic_user_message(item: &Value) -> bool {
+    item.get(NAV_SYNTHETIC_MARKER_KEY).and_then(Value::as_bool) == Some(true)
+}
+
+/// Returns true for a real user-turn boundary: a `message` with `role: user`
+/// that nav itself did not inject. Both the protected-call window and the
+/// trailing reasoning/image window use this so synthetic injections never
+/// shift the boundary.
+fn is_real_user_message(item: &Value) -> bool {
+    item_type(item) == Some("message")
+        && item.get("role").and_then(Value::as_str) == Some("user")
+        && !is_synthetic_user_message(item)
+}
+
+/// Strip the synthetic-message marker from every item in `input`. Called by
+/// the request builder just before send so the marker stays internal and
+/// providers never see an unknown field.
+pub(crate) fn strip_synthetic_markers(input: &mut [Value]) {
+    for item in input.iter_mut() {
+        if let Some(map) = item.as_object_mut() {
+            map.remove(NAV_SYNTHETIC_MARKER_KEY);
+        }
+    }
+}
+
 /// Per-model knobs the history manager respects. Today this is just whether
 /// the resolved model accepts image inputs; new flags should land here so
 /// callers don't sprout ad-hoc model checks.
@@ -210,10 +245,7 @@ fn trailing_user_window_start(input: &[Value], keep_turns: usize) -> Option<usiz
     let user_indices: Vec<usize> = input
         .iter()
         .enumerate()
-        .filter(|(_, item)| {
-            item_type(item) == Some("message")
-                && item.get("role").and_then(Value::as_str) == Some("user")
-        })
+        .filter(|(_, item)| is_real_user_message(item))
         .map(|(idx, _)| idx)
         .collect();
     (user_indices.len() > keep_turns).then(|| user_indices[user_indices.len() - keep_turns])
@@ -284,10 +316,7 @@ pub(crate) fn protected_call_ids(input: &[Value], raw_tool_turns: usize) -> Hash
     let user_indices: Vec<usize> = input
         .iter()
         .enumerate()
-        .filter(|(_, item)| {
-            item_type(item) == Some("message")
-                && item.get("role").and_then(Value::as_str) == Some("user")
-        })
+        .filter(|(_, item)| is_real_user_message(item))
         .map(|(idx, _)| idx)
         .collect();
     if user_indices.is_empty() {
@@ -425,6 +454,15 @@ mod tests {
 
     fn user_msg(text: &str) -> Value {
         json!({"type": "message", "role": "user", "content": text})
+    }
+
+    fn synthetic_user_msg(text: &str) -> Value {
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": text,
+            NAV_SYNTHETIC_MARKER_KEY: true,
+        })
     }
 
     fn user_msg_with_image(text: &str, image_url: &str) -> Value {
@@ -601,6 +639,74 @@ mod tests {
         let protected = protected_call_ids(&input, 1);
         assert!(protected.contains("c2"));
         assert!(!protected.contains("c1"));
+    }
+
+    #[test]
+    fn protected_call_ids_skips_synthetic_user_messages() {
+        // Ambient context and budget-warning messages are injected by nav,
+        // not by the user. They must not push the protected window forward
+        // and drop the immediately previous real turn's tool I/O — that's
+        // the regression codex flagged: with raw_tool_turns=2, a single real
+        // turn plus an ambient injection plus the current prompt would
+        // mis-count as 2 user turns and leave c1 unprotected.
+        let body = "x".repeat(10);
+        let input = vec![
+            user_msg("turn-1"),
+            call("c1"),
+            output("c1", &body),
+            synthetic_user_msg("Ambient context (turn-local; not a user request):"),
+            user_msg("turn-2-current"),
+        ];
+        let protected = protected_call_ids(&input, 2);
+        assert!(
+            protected.contains("c1"),
+            "with one real user turn before the current prompt + one synthetic, \
+             raw_tool_turns=2 must still protect turn-1 (c1); the synthetic must \
+             not count toward the user-turn window"
+        );
+    }
+
+    #[test]
+    fn trailing_user_window_ignores_synthetic_user_messages() {
+        // shed_old_reasoning / shed_old_images share trailing_user_window_start.
+        // Synthetic injections must not be counted as user turns or the
+        // immediate previous real turn could lose its reasoning continuation.
+        let mut input = vec![
+            user_msg("old"),
+            reasoning("rs_old"),
+            user_msg("recent"),
+            reasoning("rs_recent"),
+            synthetic_user_msg("[nav budget check] You have made 3 tool calls"),
+        ];
+        let dropped = shed_old_reasoning(&mut input, 1);
+        // keep_turns=1 with two real user turns must drop only the older one.
+        // Without the synthetic-message filter this would erroneously treat
+        // the budget message as a real turn and drop rs_recent too.
+        assert_eq!(dropped, 1);
+        let surviving: Vec<&str> = input
+            .iter()
+            .filter(|item| item_type(item) == Some("reasoning"))
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(surviving, vec!["rs_recent"]);
+    }
+
+    #[test]
+    fn strip_synthetic_markers_removes_only_marker_field() {
+        let mut input = vec![
+            synthetic_user_msg("ambient"),
+            user_msg("real"),
+            call("c1"),
+        ];
+        strip_synthetic_markers(&mut input);
+        assert!(
+            input[0].get(NAV_SYNTHETIC_MARKER_KEY).is_none(),
+            "marker should be stripped from synthetic message"
+        );
+        assert_eq!(input[0]["role"], "user", "other fields preserved");
+        assert_eq!(input[0]["content"], "ambient");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[2]["type"], "function_call");
     }
 
     #[test]

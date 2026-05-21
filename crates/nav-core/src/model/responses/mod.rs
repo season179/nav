@@ -244,45 +244,78 @@ impl ResponsesTransport for OpenAiTransport {
 
             match transport {
                 Transport::Websocket => {
-                    let baseline_slot = self.ws_baseline.clone();
-                    // Capture the fingerprint and full input *before* we
-                    // possibly rewrite the body into a delta — the baseline
-                    // we record after the response completes is always
-                    // computed against the full historical input the agent
-                    // loop assembled, not against the wire delta.
-                    let (fingerprint, original_input) = delta::split_fingerprint(&body)
-                        .unwrap_or_else(|| (body.clone(), Vec::new()));
-                    let wire_body = {
-                        let guard = baseline_slot.lock().ok();
-                        let cached = guard.as_ref().and_then(|g| g.as_ref());
-                        delta::try_build_incremental(&body, cached).unwrap_or_else(|| body.clone())
-                    };
-                    let result = retry::retry(&policy, on_retry, || async {
-                        websocket::connect_ws(auth.as_ref(), wire_body.clone()).await
-                    })
-                    .await;
-                    match result {
-                        Ok(socket) => {
-                            let baseline_slot_for_tap = baseline_slot.clone();
-                            tokio::spawn(async move {
-                                websocket::drive_ws_with_baseline_observer(
-                                    socket,
-                                    idle_timeout,
-                                    tx,
-                                    baseline_slot_for_tap,
-                                    original_input,
-                                    fingerprint,
-                                )
-                                .await;
-                            });
+                    // The delta path requires a server-stored response to
+                    // diff against. When the caller opted out of storage
+                    // (`store: false`), `try_build_incremental` can never
+                    // produce a delta, so building a baseline would just
+                    // retain a full transcript clone in `ws_baseline` for
+                    // the lifetime of the transport. Skip the observer and
+                    // the `original_input` clone entirely in that case.
+                    let store_disabled =
+                        body.get("store").and_then(Value::as_bool) == Some(false);
+
+                    if store_disabled {
+                        let result = retry::retry(&policy, on_retry, || async {
+                            websocket::connect_ws(auth.as_ref(), body.clone()).await
+                        })
+                        .await;
+                        match result {
+                            Ok(socket) => {
+                                tokio::spawn(async move {
+                                    websocket::drive_ws(socket, idle_timeout, tx).await;
+                                });
+                            }
+                            Err(retry::TransportError::ContextWindowExceeded { message }) => {
+                                let _ = tx.send(Err(
+                                    ResponsesError::ContextWindowExceeded { message },
+                                ));
+                            }
+                            Err(err) => return Err(err.into()),
                         }
-                        Err(retry::TransportError::ContextWindowExceeded { message }) => {
-                            // Surface as a stream-level error so run_agent's
-                            // one-shot recovery handles connect-time and
-                            // stream-time overflows the same way.
-                            let _ = tx.send(Err(ResponsesError::ContextWindowExceeded { message }));
+                    } else {
+                        let baseline_slot = self.ws_baseline.clone();
+                        // Capture the fingerprint and full input *before* we
+                        // possibly rewrite the body into a delta — the baseline
+                        // we record after the response completes is always
+                        // computed against the full historical input the agent
+                        // loop assembled, not against the wire delta.
+                        let (fingerprint, original_input) = delta::split_fingerprint(&body)
+                            .unwrap_or_else(|| (body.clone(), Vec::new()));
+                        let wire_body = {
+                            let guard = baseline_slot.lock().ok();
+                            let cached = guard.as_ref().and_then(|g| g.as_ref());
+                            delta::try_build_incremental(&body, cached)
+                                .unwrap_or_else(|| body.clone())
+                        };
+                        let result = retry::retry(&policy, on_retry, || async {
+                            websocket::connect_ws(auth.as_ref(), wire_body.clone()).await
+                        })
+                        .await;
+                        match result {
+                            Ok(socket) => {
+                                let baseline_slot_for_tap = baseline_slot.clone();
+                                tokio::spawn(async move {
+                                    websocket::drive_ws_with_baseline_observer(
+                                        socket,
+                                        idle_timeout,
+                                        tx,
+                                        baseline_slot_for_tap,
+                                        original_input,
+                                        fingerprint,
+                                    )
+                                    .await;
+                                });
+                            }
+                            Err(retry::TransportError::ContextWindowExceeded { message }) => {
+                                // Surface as a stream-level error so run_agent's
+                                // one-shot recovery handles connect-time and
+                                // stream-time overflows the same way.
+                                let _ = tx.send(Err(
+                                    ResponsesError::ContextWindowExceeded { message },
+                                ));
+                            }
+                            Err(err) => return Err(err.into()),
                         }
-                        Err(err) => return Err(err.into()),
                     }
                 }
                 Transport::Sse => {

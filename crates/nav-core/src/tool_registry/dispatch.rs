@@ -265,24 +265,29 @@ pub async fn run_tool_with_session_store(
     let skill_dirs = skills.skill_dirs();
     let result: Result<ToolResult> = match name {
         "read_file" => parse_read_file_args(&input).and_then(|(path, offset, limit)| {
-            let body = fs::read_file_sliced(cwd, skill_dirs, path, offset, limit)?;
+            let sliced = fs::read_file_sliced(cwd, skill_dirs, path, offset, limit)?;
             // Slice reads already carry their own next-offset hint and stay
             // small by construction. Only full reads (no offset/limit) feed
             // the outline+artifact reducer.
             if offset.is_some() || limit.is_some() {
+                // Bound the body alone so the head-truncation never clips the
+                // trailing "next offset" notice; the caller would otherwise
+                // lose the pagination hint and stop being able to resume.
+                let fs::SlicedRead { body, trailer } = sliced;
                 let bounded = bound_with_limits(
                     body,
                     TruncateMode::Head,
                     READ_FILE_MAX_LINES,
-                    READ_FILE_MAX_BYTES,
+                    READ_FILE_MAX_BYTES.saturating_sub(
+                        trailer.as_deref().map(str::len).unwrap_or(0),
+                    ),
                 );
                 let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
-                return Ok(ToolResult::text_with_truncation(
-                    bounded.content,
-                    truncation,
-                ));
+                let content =
+                    finalize_sliced(bounded, trailer, offset.unwrap_or(1));
+                return Ok(ToolResult::text_with_truncation(content, truncation));
             }
-            let reduced = reduce_read_file(body)?;
+            let reduced = reduce_read_file(sliced.into_combined())?;
             let truncation = reduced.artifact.as_ref().map(|artifact| TruncationMeta {
                 truncated_by: TruncationKind::ReadFileCap,
                 full_output_path: Some(artifact.path.clone()),
@@ -369,19 +374,35 @@ fn parse_read_file_args(input: &Value) -> Result<(&str, Option<usize>, Option<us
     if matches!(offset, Some(0)) {
         bail!("`offset` is 1-indexed; must be >= 1");
     }
-    Ok((path, offset, limit))
+    // When the model resumes a paginated read with `offset=N` (no `limit`)
+    // or a very large `limit`, the slice would otherwise run to EOF and
+    // emit no "next offset" trailer — and the downstream per-tool line
+    // cap would then drop the tail with only a generic truncation marker.
+    // Clamp to READ_FILE_MAX_LINES on the slice path so the trailer stays
+    // accurate and pagination keeps working on long files.
+    let clamped_limit = match offset {
+        Some(_) => Some(limit.unwrap_or(READ_FILE_MAX_LINES).min(READ_FILE_MAX_LINES)),
+        None => limit.map(|n| n.min(READ_FILE_MAX_LINES)),
+    };
+    Ok((path, offset, clamped_limit))
 }
 
 /// Parse the shared `(offset, limit)` line-slice arguments. Defaults the
 /// limit to `READ_FILE_MAX_LINES` so callers paging through artifacts get
-/// the same first-window behavior `read_file` already enforces.
+/// the same first-window behavior `read_file` already enforces, and clamps
+/// any explicit larger limit down to that cap. Without the clamp, a
+/// model-supplied `limit: usize::MAX` (or just a very large number) would
+/// let `expand_artifact` return tens of thousands of lines as long as the
+/// byte ceiling wasn't hit, bypassing the line budget the dispatch path
+/// otherwise enforces.
 fn parse_slice_args(input: &Value) -> Result<(Option<usize>, Option<usize>)> {
     let offset = optional_usize_arg(input, "offset")?;
     let limit = optional_usize_arg(input, "limit")?;
     if matches!(offset, Some(0)) {
         bail!("`offset` is 1-indexed; must be >= 1");
     }
-    Ok((offset, limit.or(Some(READ_FILE_MAX_LINES))))
+    let clamped = Some(limit.unwrap_or(READ_FILE_MAX_LINES).min(READ_FILE_MAX_LINES));
+    Ok((offset, clamped))
 }
 
 fn expand_artifact(input: &Value) -> Result<ToolResult> {
@@ -390,19 +411,86 @@ fn expand_artifact(input: &Value) -> Result<ToolResult> {
     let body = output_accumulator::read_artifact(artifact_id)?;
     // Slice by line so the model sees the same "showed lines X-Y of Z;
     // next offset" trailer `read_file` emits and can resume paging.
-    let sliced = fs::apply_line_slice(&body, offset, limit);
+    let fs::SlicedRead { body: slice_body, trailer } = fs::apply_line_slice(&body, offset, limit);
+    let combined_len = slice_body.len() + trailer.as_deref().map(str::len).unwrap_or(0);
     // Slice already enforced the line budget; only re-bound when bytes
     // exceed the cap (a pathological case of very long lines), otherwise
     // `bound_with_limits` would clip the paging trailer.
-    if sliced.len() <= READ_FILE_MAX_BYTES {
-        return Ok(ToolResult::text(sliced));
+    if combined_len <= READ_FILE_MAX_BYTES {
+        return Ok(ToolResult::text(
+            match trailer {
+                Some(t) => slice_body + &t,
+                None => slice_body,
+            },
+        ));
     }
-    let bounded = bound_with_limits(sliced, TruncateMode::Head, usize::MAX, READ_FILE_MAX_BYTES);
+    let trailer_len = trailer.as_deref().map(str::len).unwrap_or(0);
+    let bounded = bound_with_limits(
+        slice_body,
+        TruncateMode::Head,
+        usize::MAX,
+        READ_FILE_MAX_BYTES.saturating_sub(trailer_len),
+    );
     let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
+    let content = finalize_sliced(bounded, trailer, offset.unwrap_or(1));
     Ok(ToolResult::text_with_truncation(
-        bounded.content,
+        content,
         truncation,
     ))
+}
+
+/// Reattach a slice trailer to a bounded body, rewriting the trailer when
+/// the bound itself dropped lines.
+///
+/// `apply_line_slice` builds its trailer (`showed lines X-Y; next offset Z`)
+/// assuming every requested line survives. When `bound_with_limits` then
+/// drops trailing lines to fit the byte cap, that promise is wrong: the model
+/// would jump to `next offset Z` and silently skip the bytes-truncated lines.
+/// In that case we discard the stale trailer and emit a corrected one keyed
+/// on the bound's reported `kept_full_lines`.
+fn finalize_sliced(
+    bounded: crate::tool_registry::truncate::BoundedOutput,
+    trailer: Option<String>,
+    slice_offset_1indexed: usize,
+) -> String {
+    let mut content = bounded.content;
+    if !bounded.truncated {
+        if let Some(trailer) = trailer {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&trailer);
+        }
+        return content;
+    }
+    // Bound truncated the body itself — the slice's "next offset" hint is
+    // stale. Replace it with one anchored at the actual last kept line so
+    // the model resumes inside the byte-truncated window instead of past it.
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if bounded.kept_full_lines == 0 {
+        // Single line at the requested offset is itself longer than the
+        // byte cap. Telling the model to retry at the same offset with a
+        // smaller `limit` would loop forever — read_file slices by line,
+        // not by bytes, so the next call would re-hit the same line and
+        // the same cap. Advise skipping past the offending line instead.
+        let skip_to = slice_offset_1indexed.saturating_add(1);
+        content.push_str(&format!(
+            "[byte cap hit on a single overlong line at offset {slice_offset_1indexed}; \
+             read_file slices by line, so retrying at this offset will always re-clip \
+             the same line — skip past it with offset {skip_to}, or use code_search \
+             to locate specific content inside the long line]\n",
+        ));
+    } else {
+        let last_shown = slice_offset_1indexed.saturating_add(bounded.kept_full_lines);
+        content.push_str(&format!(
+            "[byte cap hit within slice; full lines shown stop at offset {prev}; \
+             resume with offset {last_shown} and a smaller `limit` to continue]\n",
+            prev = last_shown.saturating_sub(1).max(slice_offset_1indexed),
+        ));
+    }
+    content
 }
 
 fn read_thread(session_store: Option<&SessionStore>, input: &Value) -> Result<ToolResult> {
@@ -622,6 +710,201 @@ mod tests {
                 .contains("[showed lines 2-4 of 8; 4 more lines remain; next offset 5]")
         );
         assert!(!outcome.output.contains("line5\n"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_offset_without_limit_clamps_to_max_lines() {
+        // Regression from pass 7: when the model resumes a paginated read
+        // with just `offset=N` (no `limit`), apply_line_slice would run to
+        // EOF, emit no "next offset" trailer, and the downstream 500-line
+        // cap would drop the tail with only a generic truncation marker —
+        // breaking pagination on long files. Clamping the slice limit
+        // makes the trailer accurate and pagination resumable.
+        use crate::tool_registry::truncate::READ_FILE_MAX_LINES;
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let total = READ_FILE_MAX_LINES * 3;
+        let body = (1..=total).map(|i| format!("row{i}\n")).collect::<String>();
+        fs::write(cwd.join("long.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "long.txt", "offset": 1}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        assert!(
+            outcome.output.contains("next offset"),
+            "offset without limit must clamp + emit pagination trailer; got tail:\n{}",
+            outcome
+                .output
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_slice_preserves_next_offset_trailer_past_line_cap() {
+        // Regression: when the user requests a slice (`offset`/`limit`) that
+        // is large enough to exceed READ_FILE_MAX_LINES, the body gets
+        // head-bounded but the trailer that carries the "next offset" hint
+        // must survive — otherwise long files lose pagination guidance and
+        // can't be resumed.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        // File is 3× the line cap. Asking for a slice that itself exceeds
+        // the cap forces the head-bound path.
+        use crate::tool_registry::truncate::READ_FILE_MAX_LINES;
+        let total = READ_FILE_MAX_LINES * 3;
+        let body = (1..=total).map(|i| format!("ln{i}\n")).collect::<String>();
+        fs::write(cwd.join("big.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "big.txt", "offset": 1, "limit": READ_FILE_MAX_LINES * 2}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        // The "next offset" trailer must survive the head-bound; the user's
+        // limit went well past the cap, so the slice itself reports the
+        // intended boundary.
+        assert!(
+            outcome.output.contains("next offset"),
+            "trailer must survive bound:\n--- tail ---\n{}",
+            outcome.output.lines().rev().take(5).collect::<Vec<_>>().join("\n")
+        );
+        // And the body still starts at the requested offset.
+        assert!(outcome.output.starts_with("ln1\n"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_slice_replaces_stale_next_offset_after_byte_cap() {
+        // Regression: when the sliced body itself exceeds READ_FILE_MAX_BYTES
+        // (e.g. very long lines inside the requested window), `bound_with_limits`
+        // drops trailing lines from the slice body. The original trailer
+        // emitted by `apply_line_slice` still claims those dropped lines were
+        // "shown" and points the model at the wrong next offset, so a follow-up
+        // read would silently skip the byte-truncated lines. We now rebuild a
+        // corrected trailer keyed on the bound's actual `kept_full_lines`.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        use crate::tool_registry::truncate::READ_FILE_MAX_BYTES;
+        // Each line takes ~half the byte cap so only two lines fit per
+        // request even though the requested slice spans far more.
+        let line_len = READ_FILE_MAX_BYTES / 2;
+        let long_line: String = "x".repeat(line_len);
+        let total_lines = 20usize;
+        let body: String = (1..=total_lines)
+            .map(|i| format!("{i:03}-{long_line}\n"))
+            .collect();
+        fs::write(cwd.join("fat.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "fat.txt", "offset": 1, "limit": 10}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        assert!(
+            outcome.output.contains("byte cap hit within slice"),
+            "expected corrected trailer naming the byte cap; got tail:\n{}",
+            outcome
+                .output
+                .lines()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // The stale "next offset 11" hint (which would skip the bytes-truncated
+        // lines) must not appear; the slice asked for lines 1-10 but only
+        // a couple actually survived bytes-wise.
+        assert!(
+            !outcome.output.contains("next offset 11"),
+            "stale next-offset hint must be replaced; got:\n{}",
+            outcome.output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_slice_advises_skipping_past_overlong_single_line() {
+        // Regression: when the line at the requested offset is itself longer
+        // than READ_FILE_MAX_BYTES, `kept_full_lines` is 0 and the previous
+        // "smaller limit" hint sent the model into a loop — read_file slices
+        // by line so retrying at the same offset would always re-clip the
+        // same line. The corrected trailer points the model past the
+        // offending line instead.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        use crate::tool_registry::truncate::READ_FILE_MAX_BYTES;
+        // Single huge line followed by a normal line — the slice will clip
+        // the first line and have no full lines to "keep".
+        let huge: String = "z".repeat(READ_FILE_MAX_BYTES + 4_096);
+        let body = format!("{huge}\nshort follow-up line\n");
+        fs::write(cwd.join("huge.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "huge.txt", "offset": 1, "limit": 5}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        assert!(
+            outcome.output.contains("byte cap hit on a single overlong line"),
+            "expected overlong-line advisory; got tail:\n{}",
+            outcome
+                .output
+                .lines()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // The fix must direct the model past line 1; an offset that lands
+        // back on line 1 would loop forever.
+        assert!(
+            outcome.output.contains("offset 2"),
+            "trailer must point past the overlong line; got:\n{}",
+            outcome.output
+        );
+        // And must NOT re-suggest "retry at offset 1 with smaller limit",
+        // since the same line would just be re-clipped.
+        assert!(
+            !outcome.output.contains("resume with offset 1"),
+            "must not suggest retrying the same offset; got:\n{}",
+            outcome.output
+        );
     }
 
     #[tokio::test]
@@ -852,6 +1135,71 @@ mod tests {
             tail.output
         );
         let _ = std::fs::remove_file(&spill_path);
+    }
+
+    #[tokio::test]
+    async fn expand_artifact_clamps_explicit_limit_to_read_file_max_lines() {
+        // Tool arguments are model-controlled. Without clamping, a
+        // prompt-injected model could pass `limit: 1_000_000` and pull
+        // tens of thousands of short lines out of an artifact in one
+        // call, bypassing the per-tool line budget. The dispatcher must
+        // clamp the limit down to READ_FILE_MAX_LINES regardless of what
+        // the model asked for.
+        use crate::tool_registry::truncate::READ_FILE_MAX_LINES;
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        // Build an artifact with many short lines via bash spillover.
+        // `seq 1 200000` produces well over READ_FILE_MAX_LINES rows.
+        let spill = run_tool(
+            &cwd,
+            &Catalog::default(),
+            30,
+            &permissive_ctx(),
+            "c1",
+            "bash",
+            json!({"command": "seq 1 200000"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let artifact_id = spill
+            .truncation
+            .expect("spill metadata")
+            .artifact_id
+            .clone()
+            .expect("artifact id should be present");
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c2",
+            "expand_artifact",
+            // An adversarial / buggy model asking for a huge slice.
+            json!({"artifact_id": artifact_id, "offset": 1, "limit": 1_000_000}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "expand failed: {}", outcome.output);
+        let body_lines = outcome
+            .output
+            .lines()
+            .filter(|l| !l.starts_with('['))
+            .count();
+        assert!(
+            body_lines <= READ_FILE_MAX_LINES,
+            "expand_artifact returned {body_lines} body lines; must clamp to \
+             READ_FILE_MAX_LINES ({READ_FILE_MAX_LINES}) regardless of input"
+        );
+        // And the paging trailer must still appear so the model can
+        // resume — clamping shouldn't silently hide that more remains.
+        assert!(
+            outcome.output.contains("more lines remain"),
+            "clamped slice must still emit a next-offset trailer: {}",
+            outcome.output
+        );
     }
 
     #[tokio::test]

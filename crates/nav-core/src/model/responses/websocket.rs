@@ -113,6 +113,21 @@ pub(super) async fn drive_ws_with_baseline_observer(
     }
 }
 
+/// Plain websocket driver used when the delta path can't apply (e.g.
+/// `store: false`, where `try_build_incremental` will always return
+/// `None` and the cached baseline would just retain a full transcript
+/// copy for nothing).
+pub(super) async fn drive_ws(
+    socket: WsStream,
+    idle_timeout: Duration,
+    tx: UnboundedSender<Result<Value, ResponsesError>>,
+) {
+    let noop = |_event: &Value| {};
+    if let Err(err) = drive_ws_inner(socket, idle_timeout, &tx, noop).await {
+        let _ = tx.send(Err(ResponsesError::Other(err)));
+    }
+}
+
 async fn drive_ws_inner(
     mut socket: WsStream,
     idle_timeout: Duration,

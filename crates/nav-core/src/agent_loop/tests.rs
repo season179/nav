@@ -696,6 +696,106 @@ fn rebuild_responses_input_continuation_strips_hidden_plaintext_reasoning() {
 }
 
 #[test]
+fn rebuild_responses_input_drops_mid_prompt_continuation_when_aborted_after_iteration() {
+    // Regression: `finalize_turn` (and therefore `TurnComplete`) fires once
+    // per loop iteration, not once per user prompt. If a user prompt runs
+    // a tool call, completes one iteration, then gets aborted on the next
+    // approval/interrupt, the persisted continuation + tool output from
+    // that mid-prompt iteration must be dropped on replay. Without this
+    // anchor surviving the per-iteration TurnComplete, a resumed session
+    // would resend stale partial tool-call state for a prompt the user
+    // explicitly aborted.
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "do something risky".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::ResponseContinuation {
+                items: vec![
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "enc-blob",
+                    }),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"Cargo.toml\"}",
+                    }),
+                ],
+            },
+            AgentEvent::ToolCallOutput {
+                call_id: "call_1".into(),
+                output: "contents".into(),
+                is_error: false,
+                truncation: None,
+            },
+            AgentEvent::TurnComplete {
+                usage: TurnUsage::default(),
+            },
+            AgentEvent::TurnAborted {
+                turn_id: "turn-2".into(),
+                reason: "user denied next tool call".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
+
+    assert!(
+        input.is_empty(),
+        "aborted prompt must leave no continuation/tool-output state in \
+         the replayed input, got: {input:#?}"
+    );
+}
+
+#[test]
+fn rebuild_responses_input_preserves_completed_turn_when_next_turn_aborts_pre_user_message() {
+    // Regression: the attachment guardrail runs *before* the new turn emits
+    // its `UserMessage`. If approval is denied (e.g. the model attempted to
+    // include `.env`), `TurnAborted` fires with no preceding `UserMessage`
+    // for the new turn. The old replay logic blindly truncated back to the
+    // *previous* turn's anchor, deleting the last successful turn from the
+    // model-visible transcript on resume. The fix snapshots terminal-ness
+    // on each `TurnComplete` (a terminal iter never emits a
+    // `ResponseContinuation`) so an abort following a completed turn leaves
+    // that turn intact.
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "first prompt".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "first answer".into(),
+            },
+            AgentEvent::TurnComplete {
+                usage: TurnUsage::default(),
+            },
+            // Attachment-guard rejection for *the next turn* fires before
+            // any `UserMessage` for that turn is persisted. Replay must NOT
+            // drop the prior completed turn.
+            AgentEvent::TurnAborted {
+                turn_id: "turn-2".into(),
+                reason: "attachment denied".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
+
+    assert_eq!(
+        input.len(),
+        2,
+        "completed turn must survive pre-user-message abort: {input:#?}"
+    );
+    assert!(is_input_user_message(&input[0], "first prompt"));
+    assert!(is_input_assistant_message(&input[1], "first answer"));
+}
+
+#[test]
 fn rebuild_responses_input_skips_aborted_turn_partial_answer() {
     let input = rebuild_responses_input(
         &[
