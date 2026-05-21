@@ -5,6 +5,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 pub use crate::agent_loop::UserAttachment;
+pub use ambient::DEFAULT_AMBIENT_CONTEXT_TOKEN_BUDGET;
+pub(crate) use ambient::{build_ambient_context, push_ambient_context};
 pub use compaction::{
     AutoCompactDecision, CheckpointSlice, CompactionDetails, build_replacement_history,
     collect_recent_user_messages, is_summary_message, latest_checkpoint_slice, should_auto_compact,
@@ -185,6 +187,7 @@ pub(crate) fn build_instructions(
         .collect()
 }
 
+pub mod ambient;
 pub mod compaction;
 
 pub mod extensions;

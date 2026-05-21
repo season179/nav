@@ -25,6 +25,7 @@ use clap::{Parser, ValueEnum};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::context::DEFAULT_AMBIENT_CONTEXT_TOKEN_BUDGET;
 use crate::context::compaction::{DEFAULT_AUTO_COMPACT_FRACTION, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT};
 use crate::guardrails::AskForApproval;
 
@@ -158,6 +159,12 @@ pub struct Args {
     )]
     pub auto_compact_fraction: f32,
 
+    /// Estimated token budget for turn-local ambient context such as OS, cwd,
+    /// workspace status, and a shallow current-directory listing. Set to `0`
+    /// to disable ambient context injection.
+    #[arg(default_value_t = DEFAULT_AMBIENT_CONTEXT_TOKEN_BUDGET, long)]
+    pub ambient_context_token_budget: u64,
+
     /// Create a git stash-backed checkpoint before each normal agent turn
     /// that starts from a dirty worktree. The worktree is restored
     /// immediately after the checkpoint is stored.
@@ -209,6 +216,7 @@ impl Args {
             // stub transport that wasn't set up for it.
             auto_compact_token_limit: 0,
             auto_compact_fraction: DEFAULT_AUTO_COMPACT_FRACTION,
+            ambient_context_token_budget: 0,
             git_checkpoints: false,
             no_git_checkpoints: false,
             command: None,

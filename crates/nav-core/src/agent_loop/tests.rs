@@ -917,6 +917,45 @@ fn emit_stream_events_ignores_function_call_items() {
 // ── run_agent end-to-end ──────────────────────────────────────
 
 #[tokio::test]
+async fn run_agent_injects_ambient_context_before_user_prompt_when_budget_allows() {
+    let mut args = Args::test_default();
+    args.ambient_context_token_budget = 256;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    fs::write(cwd.join("Cargo.toml"), "").unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let transport = StubTransport::new(vec![vec![json!({
+        "type": "response.completed",
+        "response": {}
+    })]]);
+
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "hello",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        Some(&ProjectContext::default()),
+        unchecked_permission_context(),
+    )
+    .await
+    .unwrap();
+
+    let bodies = transport.bodies();
+    let input = bodies[0]["input"].as_array().unwrap();
+    assert_eq!(input.len(), 2);
+    let ambient = input[0]["content"].as_str().unwrap();
+    assert!(ambient.starts_with("Ambient context (turn-local; not a user request):"));
+    assert!(ambient.contains("Cargo.toml"));
+    assert!(is_input_user_message(&input[1], "hello"));
+}
+
+#[tokio::test]
 async fn run_agent_emits_single_error_when_transport_create_fails() {
     let args = Args::test_default();
     let cwd_dir = tempdir().unwrap();
