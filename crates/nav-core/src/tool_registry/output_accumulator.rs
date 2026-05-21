@@ -38,9 +38,40 @@ pub struct OutputAccumulator {
     prefix: String,
 }
 
+#[derive(Debug)]
 pub struct AccumulatorOutput {
     pub content: String,
-    pub spill_path: Option<PathBuf>,
+    pub truncation: Option<AccumulatorTruncation>,
+}
+
+/// What the accumulator did to fit a large payload into the model view.
+/// `Bound` means the head+tail bound clipped the rolling buffer; `Spilled`
+/// means the payload exceeded the rolling threshold and the full output is
+/// available at `path`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccumulatorTruncation {
+    Bound,
+    Spilled { path: PathBuf },
+}
+
+impl AccumulatorOutput {
+    /// Render the accumulator's truncation as the shared
+    /// [`crate::tool_registry::TruncationMeta`] used by dispatch and durable
+    /// events. Keeps the "spill vs bound" classification rule next to the
+    /// fields that drive it instead of leaking into `dispatch.rs`.
+    pub fn truncation_meta(&self) -> Option<crate::tool_registry::TruncationMeta> {
+        use crate::tool_registry::{TruncationKind, TruncationMeta};
+        match self.truncation.as_ref()? {
+            AccumulatorTruncation::Bound => Some(TruncationMeta {
+                truncated_by: TruncationKind::BashBound,
+                full_output_path: None,
+            }),
+            AccumulatorTruncation::Spilled { path } => Some(TruncationMeta {
+                truncated_by: TruncationKind::BashSpill,
+                full_output_path: Some(path.clone()),
+            }),
+        }
+    }
 }
 
 impl OutputAccumulator {
@@ -94,8 +125,8 @@ impl OutputAccumulator {
                 },
             );
             return Ok(AccumulatorOutput {
-                content: bounded,
-                spill_path: None,
+                content: bounded.content,
+                truncation: bounded.truncated.then_some(AccumulatorTruncation::Bound),
             });
         }
         if !self.rolling.is_empty() {
@@ -128,10 +159,16 @@ impl OutputAccumulator {
         // so we don't need a canonicalize step. Skipping it also removes a
         // TOCTOU window where the path could be swapped with a symlink
         // between flush and canonicalize.
-        let content = format!("{bounded}\n[Full output: {}]\n", self.spill_path.display());
+        let content = format!(
+            "{}\n[Full output: {}]\n",
+            bounded.content,
+            self.spill_path.display()
+        );
         Ok(AccumulatorOutput {
             content,
-            spill_path: Some(self.spill_path),
+            truncation: Some(AccumulatorTruncation::Spilled {
+                path: self.spill_path,
+            }),
         })
     }
 
@@ -304,7 +341,7 @@ mod tests {
         let payload = "x".repeat(30 * 1024);
         acc.push(payload.as_bytes()).unwrap();
         let out = acc.finish().unwrap();
-        assert!(out.spill_path.is_none(), "30KB should not spill");
+        assert!(out.truncation.is_none(), "30KB should not spill or bound");
         assert_eq!(out.content, payload);
         assert!(!out.content.contains("[Full output:"));
         let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
@@ -326,7 +363,10 @@ mod tests {
             );
         }
         let out = acc.finish().unwrap();
-        let path = out.spill_path.expect("spill path");
+        let path = match out.truncation.as_ref().expect("spill truncation") {
+            AccumulatorTruncation::Spilled { path } => path.clone(),
+            other => panic!("expected Spilled, got {other:?}"),
+        };
         assert!(
             out.content.contains("[Full output:"),
             "missing trailer in: {}",
@@ -349,7 +389,7 @@ mod tests {
         acc.push(&[]).unwrap();
         let out = acc.finish().unwrap();
         assert!(out.content.is_empty());
-        assert!(out.spill_path.is_none());
+        assert!(out.truncation.is_none());
     }
 
     #[test]
@@ -363,7 +403,7 @@ mod tests {
         let payload = "z".repeat(70 * 1024);
         acc.push(payload.as_bytes()).unwrap();
         let out = acc.finish().unwrap();
-        assert!(out.spill_path.is_none(), "70 KB should not spill");
+        assert_eq!(out.truncation, Some(AccumulatorTruncation::Bound));
         assert!(
             out.content.len() <= MAX_BYTES + 256,
             "no-spill content was {} bytes; expected bounded near MAX_BYTES",
@@ -381,10 +421,7 @@ mod tests {
         let payload: String = (0..5000).map(|i| format!("{i}\n")).collect();
         acc.push(payload.as_bytes()).unwrap();
         let out = acc.finish().unwrap();
-        assert!(
-            out.spill_path.is_none(),
-            "5000 short lines should not spill"
-        );
+        assert_eq!(out.truncation, Some(AccumulatorTruncation::Bound));
         assert!(out.content.contains("[truncated"));
         let kept_lines = out.content.lines().count();
         // Head+tail with a marker line in the middle — well under 5000.

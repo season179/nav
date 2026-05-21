@@ -7,6 +7,7 @@ use crate::agent_loop::control::PendingInputMode;
 use crate::context::compaction::CompactionDetails;
 use crate::git_checkpoint::{GitCheckpointAction, GitCheckpointStatus};
 use crate::guardrails::ReviewDecision;
+use crate::tool_registry::TruncationMeta;
 use crate::verify::{FileChangeSummary, FileDiffSummary, PatchApplyStatus};
 
 /// A non-text input attached to a [`AgentEvent::UserMessage`]. Stored by path
@@ -91,6 +92,11 @@ pub enum AgentEvent {
         call_id: String,
         output: String,
         is_error: bool,
+        /// Truncation/spillover metadata. Optional in serialized form so
+        /// older session logs (which never carried this field) round-trip
+        /// unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncation: Option<TruncationMeta>,
     },
     SubagentStarted {
         id: String,
@@ -546,6 +552,63 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_output_truncation_metadata_wire_format() {
+        use crate::tool_registry::{TruncationKind, TruncationMeta};
+
+        // Spillover case: serialized form nests the metadata under
+        // `truncation` so durable events let consumers locate the full
+        // bash output on disk.
+        let event = AgentEvent::ToolCallOutput {
+            call_id: "c1".into(),
+            output: "head...\n[Full output: /tmp/x.log]".into(),
+            is_error: false,
+            truncation: Some(TruncationMeta {
+                truncated_by: TruncationKind::BashSpill,
+                full_output_path: Some("/tmp/x.log".into()),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "tool_call_output",
+                "call_id": "c1",
+                "output": "head...\n[Full output: /tmp/x.log]",
+                "is_error": false,
+                "truncation": {
+                    "truncated_by": "bash_spill",
+                    "full_output_path": "/tmp/x.log",
+                },
+            })
+        );
+
+        // Untruncated case omits the optional field entirely.
+        let plain = AgentEvent::ToolCallOutput {
+            call_id: "c2".into(),
+            output: "ok".into(),
+            is_error: false,
+            truncation: None,
+        };
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("truncation").is_none());
+
+        // Round-trip a legacy payload that omits `truncation`: deserializes
+        // to `None` so existing session logs still replay.
+        let legacy: AgentEvent = serde_json::from_value(json!({
+            "kind": "tool_call_output",
+            "call_id": "c3",
+            "output": "legacy",
+            "is_error": false,
+        }))
+        .unwrap();
+        match legacy {
+            AgentEvent::ToolCallOutput { truncation, .. } => {
+                assert!(truncation.is_none());
+            }
+            other => panic!("expected ToolCallOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn tool_call_blocked_wire_format() {
         let event = AgentEvent::ToolCallBlocked {
             call_id: "c3".into(),
@@ -690,6 +753,7 @@ mod tests {
                     call_id: "c".into(),
                     output: "o".into(),
                     is_error: false,
+                    truncation: None,
                 },
                 "tool_call_output",
             ),

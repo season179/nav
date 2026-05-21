@@ -189,6 +189,7 @@ impl ChatWidget {
                 call_id,
                 output,
                 is_error,
+                ..
             } => {
                 let context = self.tool_calls.remove(&call_id);
                 self.push_work_cell(ToolOutputCell::with_context(output, is_error, context));

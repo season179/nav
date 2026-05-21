@@ -270,6 +270,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
                 call_id,
                 output,
                 is_error,
+                ..
             } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
                 let label = if *is_error {

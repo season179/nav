@@ -1,9 +1,12 @@
 use anyhow::{Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::truncate::{TruncateMode, bound};
+use super::truncate::{
+    READ_FILE_MAX_BYTES, READ_FILE_MAX_LINES, TruncateMode, bound, bound_with_limits,
+};
 #[cfg(test)]
 use super::{SPAWN_SUBAGENT_TOOL, ToolAccess};
 use super::{fs, patch, preflight, shell};
@@ -17,17 +20,55 @@ use crate::verify::MutationResult;
 
 pub use crate::guardrails::preflight::{PermissionContext, PreflightOutcome};
 
+/// Why a tool's model-visible output is shorter than what the tool produced.
+/// Stable, closed set — wire format mirrors the variant name in
+/// `snake_case`, so older session logs deserialize unchanged when this set
+/// grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TruncationKind {
+    /// Stricter per-tool cap on `read_file` output (smaller than the generic
+    /// tool-output cap).
+    ReadFileCap,
+    /// Bash output exceeded the rolling-buffer threshold and was spilled to
+    /// disk; `TruncationMeta::full_output_path` carries the spill path.
+    BashSpill,
+    /// Bash output fit in the rolling buffer but the head+tail bound fired.
+    BashBound,
+    /// Generic tool-output cap fired (currently `code_search`).
+    GlobalCap,
+}
+
+/// Truncation/spillover metadata for a single tool call. Attached to
+/// durable [`AgentEvent::ToolCallOutput`] events so replay and the UI can
+/// link to the full output without re-deriving truncation from a fragile
+/// substring check on the model-visible content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TruncationMeta {
+    pub truncated_by: TruncationKind,
+    /// Set only for [`TruncationKind::BashSpill`]; other variants are
+    /// in-memory truncation with no recoverable artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_output_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
     pub output: String,
     pub mutation: Option<MutationResult>,
+    pub truncation: Option<TruncationMeta>,
 }
 
 impl ToolResult {
     fn text(output: impl Into<String>) -> Self {
+        Self::text_with_truncation(output, None)
+    }
+
+    fn text_with_truncation(output: impl Into<String>, truncation: Option<TruncationMeta>) -> Self {
         Self {
             output: output.into(),
             mutation: None,
+            truncation,
         }
     }
 
@@ -35,6 +76,7 @@ impl ToolResult {
         Self {
             output: output.into(),
             mutation: Some(mutation),
+            truncation: None,
         }
     }
 }
@@ -51,6 +93,7 @@ pub struct ToolOutcome {
     pub blocked: Option<BlockedTool>,
     pub aborted: bool,
     pub mutation: Option<MutationResult>,
+    pub truncation: Option<TruncationMeta>,
 }
 
 /// Why a tool call was refused before execution.
@@ -104,6 +147,7 @@ pub async fn run_tool(
                 }),
                 aborted: false,
                 mutation: None,
+                truncation: None,
             });
         }
         PreflightOutcome::NeedsApproval {
@@ -129,6 +173,7 @@ pub async fn run_tool(
                         blocked: None,
                         aborted: false,
                         mutation: None,
+                        truncation: None,
                     });
                 }
                 let request = ApprovalRequest {
@@ -154,6 +199,7 @@ pub async fn run_tool(
                             blocked: None,
                             aborted: false,
                             mutation: None,
+                            truncation: None,
                         });
                     }
                     ReviewDecision::Abort => {
@@ -167,6 +213,7 @@ pub async fn run_tool(
                             blocked: None,
                             aborted: true,
                             mutation: None,
+                            truncation: None,
                         });
                     }
                 }
@@ -182,8 +229,16 @@ pub async fn run_tool(
     let skill_dirs = skills.skill_dirs();
     let result: Result<ToolResult> = match name {
         "read_file" => parse_read_file_args(&input).and_then(|(path, offset, limit)| {
-            fs::read_file_sliced(cwd, skill_dirs, path, offset, limit)
-                .map(|out| ToolResult::text(bound(out, TruncateMode::Head)))
+            fs::read_file_sliced(cwd, skill_dirs, path, offset, limit).map(|out| {
+                let bounded = bound_with_limits(
+                    out,
+                    TruncateMode::Head,
+                    READ_FILE_MAX_LINES,
+                    READ_FILE_MAX_BYTES,
+                );
+                let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
+                ToolResult::text_with_truncation(bounded.content, truncation)
+            })
         }),
         "list_files" => {
             fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?).map(ToolResult::text)
@@ -195,7 +250,10 @@ pub async fn run_tool(
             string_arg(&input, "command")?,
         )
         .await
-        .map(ToolResult::text),
+        .map(|out| {
+            let truncation = out.truncation_meta();
+            ToolResult::text_with_truncation(out.content, truncation)
+        }),
         "edit_file" => fs::edit_file_with_metadata(
             cwd,
             string_arg(&input, "path")?,
@@ -210,7 +268,11 @@ pub async fn run_tool(
             string_arg(&input, "path")?,
         )
         .await
-        .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
+        .map(|out| {
+            let bounded = bound(out, TruncateMode::Head);
+            let truncation = bounded.truncation_meta(TruncationKind::GlobalCap);
+            ToolResult::text_with_truncation(bounded.content, truncation)
+        }),
         other => Err(anyhow!("unknown tool: {other}")),
     };
 
@@ -221,6 +283,7 @@ pub async fn run_tool(
             blocked: None,
             aborted: false,
             mutation: tool_result.mutation,
+            truncation: tool_result.truncation,
         }),
         Err(err) => Ok(ToolOutcome {
             output: format!("tool error: {err:#}"),
@@ -228,6 +291,7 @@ pub async fn run_tool(
             blocked: None,
             aborted: false,
             mutation: None,
+            truncation: None,
         }),
     }
 }
@@ -494,9 +558,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_bash_output_is_bounded() {
-        // A bash command that emits more than MAX_BYTES should come back
-        // truncated with the marker, so it lands the same way in the prompt
-        // and in the session log.
+        // A bash command between MAX_BYTES and MAX_ROLLING_BYTES bounds
+        // in-memory (no spill) and surfaces `bash_bound` metadata so the
+        // event still records that the model-visible output was clipped.
         let temp = tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
 
@@ -507,7 +571,7 @@ mod tests {
             &permissive_ctx(),
             "c1",
             "bash",
-            json!({"command": "yes hellohello | head -n 20000"}),
+            json!({"command": "yes hellohello | head -n 7000"}),
             None,
         )
         .await
@@ -520,6 +584,131 @@ mod tests {
             outcome.output.len()
         );
         assert!(outcome.mutation.is_none());
+        // Bound fired but the output fit in the rolling buffer, so we
+        // surface the bound marker without a spill path.
+        let truncation = outcome
+            .truncation
+            .expect("bounded bash output should carry truncation metadata");
+        assert_eq!(truncation.truncated_by, TruncationKind::BashBound);
+        assert!(truncation.full_output_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_tool_bash_spillover_surfaces_full_output_path() {
+        // A bash command that emits more than MAX_ROLLING_BYTES should spill
+        // the full output to disk and surface the absolute path through the
+        // truncation metadata so callers (durable events, UI) can link to it.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            30,
+            &permissive_ctx(),
+            "c1",
+            "bash",
+            json!({"command": "seq 1 200000"}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let truncation = outcome
+            .truncation
+            .expect("spillover should attach truncation metadata");
+        assert_eq!(truncation.truncated_by, TruncationKind::BashSpill);
+        let spill_path = truncation
+            .full_output_path
+            .clone()
+            .expect("spill path should be present");
+        assert!(spill_path.is_absolute(), "{}", spill_path.display());
+        // Trailer in the model-visible content names the same path so the
+        // model has a way to retrieve the full output without consulting
+        // the durable event store.
+        assert!(
+            outcome
+                .output
+                .contains(&format!("[Full output: {}]", spill_path.display())),
+            "trailer missing path in: {}",
+            &outcome.output[outcome.output.len().saturating_sub(200)..]
+        );
+        let _ = std::fs::remove_file(&spill_path);
+    }
+
+    #[tokio::test]
+    async fn run_tool_bash_small_output_has_no_truncation_metadata() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "bash",
+            json!({"command": "echo small"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.truncation.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_applies_stricter_cap_than_generic() {
+        // Build a file that fits under the generic 2000-line cap but
+        // exceeds the stricter read_file 500-line cap. Without the
+        // per-tool cap the output would pass through unchanged; with it
+        // we expect the truncation marker plus truncation metadata.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let body = (0..1000).map(|i| format!("line{i}\n")).collect::<String>();
+        std::fs::write(cwd.join("big.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "big.txt"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error);
+        assert!(outcome.output.contains("[truncated"));
+        let truncation = outcome
+            .truncation
+            .expect("read_file should attach truncation metadata when bounded");
+        assert_eq!(truncation.truncated_by, TruncationKind::ReadFileCap);
+        assert!(truncation.full_output_path.is_none());
+        // Keep the first 500 lines and drop the rest.
+        assert!(outcome.output.contains("line0\n"));
+        assert!(outcome.output.contains("line499\n"));
+        assert!(!outcome.output.contains("line500\n"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_small_file_has_no_truncation_metadata() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        std::fs::write(cwd.join("note.txt"), "hello\nworld\n").unwrap();
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "note.txt"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.truncation.is_none());
     }
 
     #[tokio::test]

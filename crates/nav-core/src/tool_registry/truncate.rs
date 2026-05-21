@@ -20,6 +20,38 @@ pub const MAX_BYTES: usize = 50 * 1024;
 /// match line keeps the surrounding matches readable.
 pub const GREP_MAX_LINE_LENGTH: usize = 500;
 
+/// Stricter line cap applied to `read_file` output. File reads are the most
+/// common way to flood context with low-signal bytes (large generated files,
+/// vendored code, lockfiles), so the per-tool cap is a quarter of the
+/// generic `MAX_LINES`. The byte cap stays at `MAX_BYTES`.
+pub const READ_FILE_MAX_LINES: usize = 500;
+pub const READ_FILE_MAX_BYTES: usize = MAX_BYTES;
+
+/// Result of a bound: the truncated content plus whether anything was
+/// dropped. Callers use the flag to attach metadata to the durable tool
+/// output event so replay/UI can show why a tool result is short.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedOutput {
+    pub content: String,
+    pub truncated: bool,
+}
+
+impl BoundedOutput {
+    /// Render the bound's truncation as the shared
+    /// [`crate::tool_registry::TruncationMeta`] used by dispatch and durable
+    /// events. Returns `None` when nothing was dropped so the caller can
+    /// pass the result straight into `ToolResult::truncation`.
+    pub fn truncation_meta(
+        &self,
+        cause: crate::tool_registry::TruncationKind,
+    ) -> Option<crate::tool_registry::TruncationMeta> {
+        self.truncated.then_some(crate::tool_registry::TruncationMeta {
+            truncated_by: cause,
+            full_output_path: None,
+        })
+    }
+}
+
 /// Truncation strategy chosen per tool.
 ///
 /// `Head` keeps the prefix — used for `read_file` and `code_search`, where
@@ -33,24 +65,27 @@ pub enum TruncateMode {
 }
 
 /// Bound `output` using the default `MAX_LINES` / `MAX_BYTES` limits.
-pub fn bound(output: String, mode: TruncateMode) -> String {
+pub fn bound(output: String, mode: TruncateMode) -> BoundedOutput {
     bound_with_limits(output, mode, MAX_LINES, MAX_BYTES)
 }
 
-fn bound_with_limits(
+pub fn bound_with_limits(
     output: String,
     mode: TruncateMode,
     max_lines: usize,
     max_bytes: usize,
-) -> String {
+) -> BoundedOutput {
     let total_bytes = output.len();
     let lines: Vec<&str> = output.split_inclusive('\n').collect();
     let total_lines = lines.len();
     if total_bytes <= max_bytes && total_lines <= max_lines {
-        return output;
+        return BoundedOutput {
+            content: output,
+            truncated: false,
+        };
     }
 
-    match mode {
+    let content = match mode {
         TruncateMode::Head => render_head(&lines, max_lines, max_bytes, total_lines, total_bytes),
         TruncateMode::HeadTail { head_lines } => render_head_tail(
             &lines,
@@ -60,6 +95,10 @@ fn bound_with_limits(
             total_lines,
             total_bytes,
         ),
+    };
+    BoundedOutput {
+        content,
+        truncated: true,
     }
 }
 
@@ -234,7 +273,8 @@ mod tests {
     fn short_output_passes_through_unchanged() {
         let input = "hello\nworld\n".to_string();
         let result = bound(input.clone(), TruncateMode::Head);
-        assert_eq!(result, input);
+        assert_eq!(result.content, input);
+        assert!(!result.truncated);
     }
 
     #[test]
@@ -244,11 +284,12 @@ mod tests {
             input.push_str(&format!("line {i}\n"));
         }
         let result = bound_with_limits(input.clone(), TruncateMode::Head, 10, 1024);
-        assert!(result.starts_with("line 0\n"));
-        assert!(result.contains("[truncated"));
-        assert!(result.contains("40 lines"));
+        assert!(result.truncated);
+        assert!(result.content.starts_with("line 0\n"));
+        assert!(result.content.contains("[truncated"));
+        assert!(result.content.contains("40 lines"));
         // None of the dropped lines should appear.
-        assert!(!result.contains("line 10\n"));
+        assert!(!result.content.contains("line 10\n"));
     }
 
     #[test]
@@ -256,9 +297,10 @@ mod tests {
         let line = "x".repeat(100) + "\n";
         let input = line.repeat(50); // 5050 bytes
         let result = bound_with_limits(input, TruncateMode::Head, 1000, 500);
-        assert!(result.len() < 1024); // 500 cap + marker
-        assert!(result.contains("[truncated"));
-        assert!(result.contains("bytes"));
+        assert!(result.truncated);
+        assert!(result.content.len() < 1024); // 500 cap + marker
+        assert!(result.content.contains("[truncated"));
+        assert!(result.content.contains("bytes"));
     }
 
     #[test]
@@ -269,7 +311,8 @@ mod tests {
         }
         let result = bound_with_limits(input, TruncateMode::Head, 5, 1024);
         // 5 kept, 25 dropped; 5*4=20 kept, 100 dropped.
-        assert!(result.contains("[truncated 100 bytes / 25 lines]"));
+        assert!(result.truncated);
+        assert!(result.content.contains("[truncated 100 bytes / 25 lines]"));
     }
 
     #[test]
@@ -280,13 +323,14 @@ mod tests {
         }
         let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 3 }, 10, 10_000);
         // Head: 0,1,2
-        assert!(result.starts_with("0\n1\n2\n"));
+        assert!(result.truncated);
+        assert!(result.content.starts_with("0\n1\n2\n"));
         // Tail: 93..99 (10 - 3 = 7 tail lines).
-        assert!(result.contains("\n99\n"));
-        assert!(result.contains("\n93\n"));
+        assert!(result.content.contains("\n99\n"));
+        assert!(result.content.contains("\n93\n"));
         // Middle should be gone.
-        assert!(!result.contains("\n50\n"));
-        assert!(result.contains("[truncated"));
+        assert!(!result.content.contains("\n50\n"));
+        assert!(result.content.contains("[truncated"));
     }
 
     #[test]
@@ -295,8 +339,9 @@ mod tests {
         let line = "y".repeat(80) + "\n"; // 81 bytes
         let input = line.repeat(100); // 8100 bytes
         let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 2 }, 50, 500);
-        assert!(result.len() <= 600); // cap + marker headroom
-        assert!(result.contains("[truncated"));
+        assert!(result.truncated);
+        assert!(result.content.len() <= 600); // cap + marker headroom
+        assert!(result.content.contains("[truncated"));
     }
 
     #[test]
@@ -305,13 +350,14 @@ mod tests {
         // appear twice and line 7 must be present.
         let input = (0..8).map(|i| format!("line{i}\n")).collect::<String>();
         let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 3 }, 7, 10_000);
-        let occurrences = result.matches("line3\n").count();
+        let occurrences = result.content.matches("line3\n").count();
         assert!(
             occurrences <= 1,
-            "line3 appeared {occurrences} times: {result}"
+            "line3 appeared {occurrences} times: {}",
+            result.content
         );
-        assert!(result.contains("line0\n"));
-        assert!(result.contains("line7\n"));
+        assert!(result.content.contains("line0\n"));
+        assert!(result.content.contains("line7\n"));
     }
 
     #[test]
@@ -319,8 +365,9 @@ mod tests {
         let input = "a\nb\nc\nd\ne\n".to_string();
         let result = bound_with_limits(input, TruncateMode::Head, 2, 1024);
         // Head-only: marker is the suffix after the kept prefix.
-        assert!(result.starts_with("a\nb\n"));
-        assert!(result.contains("[truncated"));
+        assert!(result.truncated);
+        assert!(result.content.starts_with("a\nb\n"));
+        assert!(result.content.contains("[truncated"));
     }
 
     #[test]
@@ -330,11 +377,12 @@ mod tests {
         // byte-bounded prefix.
         let input = "x".repeat(2000);
         let result = bound_with_limits(input, TruncateMode::Head, 1000, 200);
-        let marker_start = result.find("\n[truncated").expect("marker present");
-        let body = &result[..marker_start];
+        let marker_start = result.content.find("\n[truncated").expect("marker present");
+        let body = &result.content[..marker_start];
         assert_eq!(body.len(), 200);
         assert!(body.chars().all(|c| c == 'x'));
-        assert!(result.contains("1800 bytes"));
+        assert!(result.content.contains("1800 bytes"));
+        assert!(result.truncated);
     }
 
     #[test]
@@ -348,8 +396,9 @@ mod tests {
             input.push_str(&format!("tail{i}\n"));
         }
         let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 2 }, 10, 1000);
-        let marker_start = result.find("\n[truncated").expect("marker present");
-        let head = &result[..marker_start];
+        assert!(result.truncated);
+        let marker_start = result.content.find("\n[truncated").expect("marker present");
+        let head = &result.content[..marker_start];
         assert!(
             head.len() >= 100,
             "head was {} bytes: {:?}",
@@ -358,7 +407,7 @@ mod tests {
         );
         assert!(head.chars().all(|c| c == 'a'));
         // Tail still has the short trailing lines.
-        let tail = &result[marker_start..];
+        let tail = &result.content[marker_start..];
         assert!(tail.contains("tail4\n"));
     }
 
@@ -372,9 +421,10 @@ mod tests {
         }
         input.push_str(&"z".repeat(3000));
         let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 3 }, 10, 500);
-        let marker_start = result.find("\n[truncated").expect("marker present");
-        let head = &result[..marker_start];
-        let tail = &result[marker_start..];
+        assert!(result.truncated);
+        let marker_start = result.content.find("\n[truncated").expect("marker present");
+        let head = &result.content[..marker_start];
+        let tail = &result.content[marker_start..];
         assert!(head.contains("head0\n"));
         let z_count = tail.chars().filter(|c| *c == 'z').count();
         assert!(z_count > 50, "tail kept only {z_count} 'z' chars: {tail:?}");
@@ -434,13 +484,39 @@ mod tests {
     fn head_tail_marker_between_segments() {
         let input = (0..10).map(|i| format!("{i}\n")).collect::<String>();
         let result = bound_with_limits(input, TruncateMode::HeadTail { head_lines: 2 }, 4, 10_000);
-        let head_end = result.find("[truncated").expect("marker present");
-        let head_part = &result[..head_end];
-        let tail_part = &result[head_end..];
+        assert!(result.truncated);
+        let head_end = result.content.find("[truncated").expect("marker present");
+        let head_part = &result.content[..head_end];
+        let tail_part = &result.content[head_end..];
         // Head segment is the prefix; tail segment must come *after* the marker.
         assert!(head_part.contains("0\n"));
         assert!(head_part.contains("1\n"));
         assert!(tail_part.contains("9\n"));
         assert!(tail_part.contains("8\n"));
+    }
+
+    #[test]
+    fn read_file_cap_is_stricter_than_generic() {
+        // The whole point of the dedicated cap: stricter than the generic
+        // tool-output cap so read_file can't dump 2000 lines of context.
+        const _: () = assert!(READ_FILE_MAX_LINES < MAX_LINES);
+        const _: () = assert!(READ_FILE_MAX_BYTES <= MAX_BYTES);
+    }
+
+    #[test]
+    fn read_file_cap_truncates_long_files() {
+        let input = (0..1000).map(|i| format!("line{i}\n")).collect::<String>();
+        let result = bound_with_limits(
+            input,
+            TruncateMode::Head,
+            READ_FILE_MAX_LINES,
+            READ_FILE_MAX_BYTES,
+        );
+        assert!(result.truncated);
+        assert!(result.content.contains("[truncated"));
+        // Kept the first READ_FILE_MAX_LINES lines.
+        assert!(result.content.contains("line0\n"));
+        assert!(result.content.contains("line499\n"));
+        assert!(!result.content.contains("line500\n"));
     }
 }

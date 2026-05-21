@@ -4,8 +4,8 @@
 pub(crate) use definitions::tool_definitions;
 pub use definitions::{SPAWN_SUBAGENT_TOOL, ToolAccess};
 pub use dispatch::{
-    BlockedTool, PermissionContext, PreflightOutcome, ToolOutcome, ToolResult,
-    failed_mutation_summary, run_tool, unchecked_permission_context,
+    BlockedTool, PermissionContext, PreflightOutcome, ToolOutcome, ToolResult, TruncationKind,
+    TruncationMeta, failed_mutation_summary, run_tool, unchecked_permission_context,
 };
 
 pub mod definitions;

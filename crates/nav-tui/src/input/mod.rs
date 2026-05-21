@@ -95,6 +95,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
             is_error: false,
+            truncation: None,
         });
         widget
     }

@@ -90,7 +90,7 @@ pub(crate) async fn run_subagent_tool(request: SubagentToolRequest<'_, '_>) -> T
     match worker_result {
         Ok(()) => {
             if let Some(summary) = final_subagent_summary(&worker_events) {
-                let bounded = bound(summary, TruncateMode::Head);
+                let bounded = bound(summary, TruncateMode::Head).content;
                 emit(
                     request.parent_events,
                     request.parent_session,
@@ -175,6 +175,7 @@ fn text_tool_outcome(output: impl Into<String>) -> ToolOutcome {
         blocked: None,
         aborted: false,
         mutation: None,
+        truncation: None,
     }
 }
 
@@ -185,6 +186,7 @@ fn error_tool_outcome(output: impl Into<String>) -> ToolOutcome {
         blocked: None,
         aborted: false,
         mutation: None,
+        truncation: None,
     }
 }
 
