@@ -578,20 +578,22 @@ pub async fn run(
                         // for a skill that supplied tool-use guidance or
                         // domain-specific rules could change the behaviour
                         // of the rerun without any visible signal.
-                        let (composer_text, restored_skill) =
-                            match parse_rewind_skill_prompt(&outcome.text) {
-                                Some(parsed) => (
-                                    parsed.request,
-                                    Some(PendingSkill {
-                                        name: parsed.name,
-                                        wrapped_body: parsed.wrapped_body,
-                                    }),
-                                ),
-                                None => (
-                                    outcome.display_text.unwrap_or(outcome.text),
-                                    None,
-                                ),
-                            };
+                        let (composer_text, restored_skill) = match parse_rewind_skill_prompt(
+                            &outcome.text,
+                            outcome.display_text.as_deref(),
+                        ) {
+                            Some(parsed) => (
+                                parsed.request,
+                                Some(PendingSkill {
+                                    name: parsed.name,
+                                    wrapped_body: parsed.wrapped_body,
+                                }),
+                            ),
+                            None => (
+                                outcome.display_text.unwrap_or(outcome.text),
+                                None,
+                            ),
+                        };
                         pending_skill = restored_skill;
                         chat = ChatWidget::with_theme(theme);
                         chat.push_welcome(
