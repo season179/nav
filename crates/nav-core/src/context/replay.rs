@@ -6,6 +6,16 @@ use crate::agent_loop::AgentEvent;
 use crate::agent_loop::runner::build_user_content;
 use crate::context::compaction::{latest_checkpoint_slice, summary_message};
 
+/// Exact `function_call_output` text that marks a cleared old tool output.
+/// The string is part of the wire format so inspectors can classify the item
+/// without an out-of-band signal.
+pub const CLEARED_TOOL_OUTPUT_PLACEHOLDER: &str =
+    "[Old tool result content cleared; original output is available in session log]";
+
+/// Prefix of a `function_call_output` whose body has been reduced to a compact
+/// summary instead of fully cleared. Same wire-format contract as above.
+pub const REDUCED_TOOL_OUTPUT_PREFIX: &str = "[Reduced tool output";
+
 /// Reconstructs the Responses API `input` array from a previously persisted
 /// event log so that `--resume` can replay the same conversation state.
 ///
