@@ -506,9 +506,10 @@ mod tests {
         .await
         .unwrap();
         let spill_path = match result.truncation.as_ref().expect("spill truncation") {
-            crate::tool_registry::output_accumulator::AccumulatorTruncation::Spilled { path } => {
-                path.clone()
-            }
+            crate::tool_registry::output_accumulator::AccumulatorTruncation::Spilled {
+                path,
+                ..
+            } => path.clone(),
             other => panic!("expected Spilled, got {other:?}"),
         };
         assert!(

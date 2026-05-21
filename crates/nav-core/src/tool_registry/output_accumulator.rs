@@ -47,11 +47,12 @@ pub struct AccumulatorOutput {
 /// What the accumulator did to fit a large payload into the model view.
 /// `Bound` means the head+tail bound clipped the rolling buffer; `Spilled`
 /// means the payload exceeded the rolling threshold and the full output is
-/// available at `path`.
+/// available on disk; `artifact_id` is the stable handle the model uses
+/// with `expand_artifact` to read the raw bytes back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccumulatorTruncation {
     Bound,
-    Spilled { path: PathBuf },
+    Spilled { path: PathBuf, artifact_id: String },
 }
 
 impl AccumulatorOutput {
@@ -65,10 +66,12 @@ impl AccumulatorOutput {
             AccumulatorTruncation::Bound => Some(TruncationMeta {
                 truncated_by: TruncationKind::BashBound,
                 full_output_path: None,
+                artifact_id: None,
             }),
-            AccumulatorTruncation::Spilled { path } => Some(TruncationMeta {
+            AccumulatorTruncation::Spilled { path, artifact_id } => Some(TruncationMeta {
                 truncated_by: TruncationKind::BashSpill,
                 full_output_path: Some(path.clone()),
+                artifact_id: Some(artifact_id.clone()),
             }),
         }
     }
@@ -159,15 +162,25 @@ impl OutputAccumulator {
         // so we don't need a canonicalize step. Skipping it also removes a
         // TOCTOU window where the path could be swapped with a symlink
         // between flush and canonicalize.
+        // `unique_path` always emits `<prefix>-<ts>-<pid>-<seq>.log` whose
+        // stem is a valid artifact id by construction.
+        let artifact_id = self
+            .spill_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned)
+            .expect("spill path stem is set by unique_path");
         let content = format!(
-            "{}\n[Full output: {}]\n",
-            bounded.content,
-            self.spill_path.display()
+            "{bounded}\n[Full output: {path}]\n[Artifact: {id} — call expand_artifact with artifact_id=\"{id}\" to read the raw output]\n",
+            bounded = bounded.content,
+            path = self.spill_path.display(),
+            id = artifact_id,
         );
         Ok(AccumulatorOutput {
             content,
             truncation: Some(AccumulatorTruncation::Spilled {
                 path: self.spill_path,
+                artifact_id,
             }),
         })
     }
@@ -279,6 +292,50 @@ fn sweep_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Generous enough for `unique_path`'s `<prefix>-<ts>-<pid>-<seq>` scheme.
+const ARTIFACT_ID_MAX_LEN: usize = 128;
+
+/// Reject anything with a slash, dot, or whitespace so the resolver
+/// cannot be coerced into reading outside the tool-output dir.
+fn is_valid_artifact_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > ARTIFACT_ID_MAX_LEN {
+        return false;
+    }
+    id.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Read the raw artifact body. Strictly read-only: the validator rejects
+/// any id with a path separator, so the resolver always lands inside the
+/// known tool-output dir. Tries the preferred XDG location first, then
+/// the temp-dir fallback used when XDG is not writable.
+pub fn read_artifact(artifact_id: &str) -> Result<String> {
+    if !is_valid_artifact_id(artifact_id) {
+        anyhow::bail!(
+            "artifact_id is not a valid identifier (expected letters, digits, '_', '-')",
+        );
+    }
+    let filename = format!("{artifact_id}.log");
+    let preferred = default_log_dir()?.join(&filename);
+    match fs::read_to_string(&preferred) {
+        Ok(content) => return Ok(content),
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read artifact at {}", preferred.display()));
+        }
+    }
+    let fallback = fallback_log_dir().join(&filename);
+    match fs::read_to_string(&fallback) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == ErrorKind::NotFound => anyhow::bail!(
+            "artifact not found; it may have expired (artifacts are swept after 7 days) or never existed",
+        ),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to read artifact at {}", fallback.display())),
+    }
+}
+
 fn default_log_dir() -> Result<PathBuf> {
     let base = crate::context::session::xdg_data_home()
         .context("could not resolve XDG data directory for nav tool-output")?;
@@ -363,8 +420,10 @@ mod tests {
             );
         }
         let out = acc.finish().unwrap();
-        let path = match out.truncation.as_ref().expect("spill truncation") {
-            AccumulatorTruncation::Spilled { path } => path.clone(),
+        let (path, artifact_id) = match out.truncation.as_ref().expect("spill truncation") {
+            AccumulatorTruncation::Spilled { path, artifact_id } => {
+                (path.clone(), artifact_id.clone())
+            }
             other => panic!("expected Spilled, got {other:?}"),
         };
         assert!(
@@ -373,6 +432,16 @@ mod tests {
             &out.content[out.content.len().saturating_sub(200)..]
         );
         assert!(out.content.contains(&path.display().to_string()));
+        assert!(
+            out.content.contains(&format!("[Artifact: {artifact_id}")),
+            "missing artifact id trailer for {artifact_id} in: {}",
+            &out.content[out.content.len().saturating_sub(200)..]
+        );
+        assert_eq!(
+            path.file_stem().and_then(|s| s.to_str()),
+            Some(artifact_id.as_str()),
+            "artifact id should match the spill file stem",
+        );
         assert!(
             out.content.len() <= MAX_BYTES + 512,
             "bounded content was {} bytes",
@@ -429,5 +498,57 @@ mod tests {
             kept_lines < 3000,
             "kept {kept_lines} lines; expected line bound to fire"
         );
+    }
+
+    #[test]
+    fn artifact_id_validator_accepts_canonical_filenames() {
+        // The validator must accept whatever `unique_path` produces so
+        // the read side admits every id the spill side hands out.
+        let path = unique_path(Path::new("/tmp"), "bash");
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap();
+        assert!(
+            is_valid_artifact_id(stem),
+            "generator output `{stem}` rejected by validator",
+        );
+    }
+
+    #[test]
+    fn artifact_id_validator_rejects_path_traversal() {
+        // No slashes, dots, parent-dir hops, or control characters can
+        // make it through; the resolver concatenates the id with `.log`
+        // and joins it under the tool-output dir, so a slash here would
+        // escape the dir.
+        for bad in [
+            "",
+            "../etc",
+            "foo/bar",
+            "foo\\bar",
+            "foo.bar",
+            "with space",
+            "tab\there",
+        ] {
+            assert!(
+                !is_valid_artifact_id(bad),
+                "validator should reject `{bad}`",
+            );
+        }
+    }
+
+    #[test]
+    fn read_artifact_bails_on_path_traversal_id() {
+        // Public read path must refuse a traversal id before touching the
+        // filesystem.
+        let err = read_artifact("../etc/passwd").unwrap_err().to_string();
+        assert!(err.contains("not a valid identifier"), "got: {err}");
+    }
+
+    #[test]
+    fn read_artifact_bails_on_unknown_id() {
+        // Distinguish "swept / never existed" from "bad id" in the error
+        // message so dispatch can surface a clear hint.
+        let err = read_artifact("bash-deadbeef-99999999-0")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not found"), "got: {err}");
     }
 }

@@ -4,6 +4,7 @@
 use serde_json::{Value, json};
 
 pub const SPAWN_SUBAGENT_TOOL: &str = "spawn_subagent";
+pub const EXPAND_ARTIFACT_TOOL: &str = "expand_artifact";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAccess {
@@ -22,9 +23,13 @@ impl ToolAccess {
                     | "edit_file"
                     | "apply_patch"
                     | "code_search"
+                    | EXPAND_ARTIFACT_TOOL
                     | SPAWN_SUBAGENT_TOOL
             ),
-            ToolAccess::ReadOnly => matches!(name, "read_file" | "list_files" | "code_search"),
+            ToolAccess::ReadOnly => matches!(
+                name,
+                "read_file" | "list_files" | "code_search" | EXPAND_ARTIFACT_TOOL
+            ),
         }
     }
 }
@@ -119,6 +124,32 @@ pub(crate) fn tool_definitions(access: ToolAccess, include_subagents: bool) -> V
                     "path": { "type": "string" }
                 },
                 "required": ["pattern", "path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": EXPAND_ARTIFACT_TOOL,
+            "description": "Read the raw bytes of a previously spilled tool-output artifact by its id. Use this when a tool output told you the full result is stored as artifact `<id>`. Returns the raw content sliced by optional 1-indexed `offset` and `limit` (defaults retain the first lines and report how many remain).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "artifact_id": {
+                        "type": "string",
+                        "description": "Artifact id as surfaced by a previous tool output trailer."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-indexed line number to start reading from."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Maximum number of lines to return."
+                    }
+                },
+                "required": ["artifact_id"],
                 "additionalProperties": false
             }
         }),

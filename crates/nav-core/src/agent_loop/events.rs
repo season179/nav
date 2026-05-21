@@ -567,14 +567,15 @@ mod tests {
 
         // Spillover case: serialized form nests the metadata under
         // `truncation` so durable events let consumers locate the full
-        // bash output on disk.
+        // bash output on disk and the model can call `expand_artifact`.
         let event = AgentEvent::ToolCallOutput {
             call_id: "c1".into(),
-            output: "head...\n[Full output: /tmp/x.log]".into(),
+            output: "head...\n[Full output: /tmp/x.log]\n[Artifact: bash-x — call expand_artifact with artifact_id=\"bash-x\" to read the raw output]".into(),
             is_error: false,
             truncation: Some(TruncationMeta {
                 truncated_by: TruncationKind::BashSpill,
                 full_output_path: Some("/tmp/x.log".into()),
+                artifact_id: Some("bash-x".into()),
             }),
         };
         assert_eq!(
@@ -582,11 +583,12 @@ mod tests {
             json!({
                 "kind": "tool_call_output",
                 "call_id": "c1",
-                "output": "head...\n[Full output: /tmp/x.log]",
+                "output": "head...\n[Full output: /tmp/x.log]\n[Artifact: bash-x — call expand_artifact with artifact_id=\"bash-x\" to read the raw output]",
                 "is_error": false,
                 "truncation": {
                     "truncated_by": "bash_spill",
                     "full_output_path": "/tmp/x.log",
+                    "artifact_id": "bash-x",
                 },
             })
         );

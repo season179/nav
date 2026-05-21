@@ -221,7 +221,7 @@ pub(super) fn read_file_sliced(
     Ok(apply_line_slice(&body, offset, limit))
 }
 
-fn apply_line_slice(body: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+pub(super) fn apply_line_slice(body: &str, offset: Option<usize>, limit: Option<usize>) -> String {
     let offset = offset.unwrap_or(1).max(1);
     let lines: Vec<&str> = body.split_inclusive('\n').collect();
     let total = lines.len();

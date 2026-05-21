@@ -1298,7 +1298,10 @@ async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect();
-    assert_eq!(worker_tools, vec!["read_file", "list_files", "code_search"]);
+    assert_eq!(
+        worker_tools,
+        vec!["read_file", "list_files", "code_search", "expand_artifact"]
+    );
     let worker_input = worker_body.get("input").and_then(Value::as_array).unwrap();
     assert!(
         worker_input
