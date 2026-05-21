@@ -1,4 +1,5 @@
 mod collector;
+mod delta;
 mod parser;
 mod request;
 mod retry;
@@ -176,6 +177,10 @@ pub struct OpenAiTransport {
     transport: Transport,
     idle_timeout: Duration,
     retry_policy: RetryPolicy,
+    /// Cached websocket request/response state used to send incremental
+    /// payloads when a turn strictly extends the previous one. `None` on
+    /// the SSE path and any time detection bails out.
+    ws_baseline: Arc<std::sync::Mutex<Option<delta::WsBaseline>>>,
 }
 
 impl OpenAiTransport {
@@ -204,6 +209,7 @@ impl OpenAiTransport {
             transport,
             idle_timeout,
             retry_policy,
+            ws_baseline: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -238,14 +244,36 @@ impl ResponsesTransport for OpenAiTransport {
 
             match transport {
                 Transport::Websocket => {
+                    let baseline_slot = self.ws_baseline.clone();
+                    // Capture the fingerprint and full input *before* we
+                    // possibly rewrite the body into a delta — the baseline
+                    // we record after the response completes is always
+                    // computed against the full historical input the agent
+                    // loop assembled, not against the wire delta.
+                    let (fingerprint, original_input) = delta::split_fingerprint(&body)
+                        .unwrap_or_else(|| (body.clone(), Vec::new()));
+                    let wire_body = {
+                        let guard = baseline_slot.lock().ok();
+                        let cached = guard.as_ref().and_then(|g| g.as_ref());
+                        delta::try_build_incremental(&body, cached).unwrap_or_else(|| body.clone())
+                    };
                     let result = retry::retry(&policy, on_retry, || async {
-                        websocket::connect_ws(auth.as_ref(), body.clone()).await
+                        websocket::connect_ws(auth.as_ref(), wire_body.clone()).await
                     })
                     .await;
                     match result {
                         Ok(socket) => {
+                            let baseline_slot_for_tap = baseline_slot.clone();
                             tokio::spawn(async move {
-                                websocket::drive_ws(socket, idle_timeout, tx).await;
+                                websocket::drive_ws_with_baseline_observer(
+                                    socket,
+                                    idle_timeout,
+                                    tx,
+                                    baseline_slot_for_tap,
+                                    original_input,
+                                    fingerprint,
+                                )
+                                .await;
                             });
                         }
                         Err(retry::TransportError::ContextWindowExceeded { message }) => {

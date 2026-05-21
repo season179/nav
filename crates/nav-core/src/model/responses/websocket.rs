@@ -1,9 +1,11 @@
+use super::delta;
 use super::retry::TransportError;
 use super::{ResponsesError, detect_context_overflow, detect_http_overflow, model_hint_from_body};
 use crate::model::auth::AuthConfig;
 use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedSender;
@@ -85,18 +87,28 @@ fn reclassify_handshake_error(err: tokio_tungstenite::tungstenite::Error) -> Tra
     TransportError::from(err)
 }
 
-/// Read the WebSocket stream, decode text frames as JSON events, forward
-/// them onto `tx`. Stops on the terminal `response.completed` / `error`
-/// events; emits `ResponsesError::ContextWindowExceeded` on overflow.
+/// Read the WebSocket stream, decode text frames as JSON events, and tap
+/// `response.completed` events to refresh the request/response baseline used
+/// for sending incremental payloads on the next turn. Stops on the terminal
+/// `response.completed` / `error` events; emits
+/// `ResponsesError::ContextWindowExceeded` on overflow.
 ///
 /// `idle_timeout` bounds the wait between frames so a half-open socket can't
-/// hang the agent.
-pub(super) async fn drive_ws(
+/// hang the agent. The agent loop sends the full request body here so the
+/// recorded baseline mirrors what the server actually has on file —
+/// `original_input` and `fingerprint` are derived from the pre-delta body.
+pub(super) async fn drive_ws_with_baseline_observer(
     socket: WsStream,
     idle_timeout: Duration,
     tx: UnboundedSender<Result<Value, ResponsesError>>,
+    baseline_slot: Arc<Mutex<Option<delta::WsBaseline>>>,
+    original_input: Vec<Value>,
+    fingerprint: Value,
 ) {
-    if let Err(err) = drive_ws_inner(socket, idle_timeout, &tx).await {
+    let observer = |event: &Value| {
+        delta::update_baseline_from_event(event, &baseline_slot, &original_input, &fingerprint);
+    };
+    if let Err(err) = drive_ws_inner(socket, idle_timeout, &tx, observer).await {
         let _ = tx.send(Err(ResponsesError::Other(err)));
     }
 }
@@ -105,6 +117,7 @@ async fn drive_ws_inner(
     mut socket: WsStream,
     idle_timeout: Duration,
     tx: &UnboundedSender<Result<Value, ResponsesError>>,
+    mut on_event: impl FnMut(&Value),
 ) -> Result<()> {
     loop {
         let next = match timeout(idle_timeout, socket.next()).await {
@@ -129,6 +142,8 @@ async fn drive_ws_inner(
             let _ = tx.send(Err(ResponsesError::ContextWindowExceeded { message }));
             return Ok(());
         }
+
+        on_event(&event);
 
         let is_terminal = matches!(
             event.get("type").and_then(Value::as_str),
