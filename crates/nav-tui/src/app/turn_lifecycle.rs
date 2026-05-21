@@ -14,21 +14,61 @@ use nav_core::{
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use super::turn_task::{TurnSpawn, spawn_turn};
 use super::{emit_local_event, emit_pending_cleared};
 use crate::ChatWidget;
 use crate::bottom_pane;
 
+/// Single source of truth for "a turn is currently active in the TUI."
+///
+/// Before this struct existed, the three fields below lived as separate
+/// `Option<_>` locals in the main loop, set and cleared in lockstep at every
+/// call site — exactly the kind of out-of-sync state that produced the
+/// per-iteration `TurnComplete` bug. Bundling them means cleanup is one
+/// `Option::take()` and the status bar's "Working" state is `Some(_)`,
+/// nothing more.
+pub(super) struct ActiveTurnHandle {
+    task: JoinHandle<()>,
+    steering: PendingSteeringQueue,
+    started_at: Instant,
+}
+
+impl ActiveTurnHandle {
+    fn new(task: JoinHandle<()>, steering: PendingSteeringQueue) -> Self {
+        Self {
+            task,
+            steering,
+            started_at: Instant::now(),
+        }
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    pub(super) fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+
+    pub(super) fn steering(&self) -> &PendingSteeringQueue {
+        &self.steering
+    }
+
+    /// Cancel the underlying task and drop the handle.
+    pub(super) fn abort(self) {
+        self.task.abort();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_next_follow_up(
     next: Option<PendingInput>,
     control: &mut ControlPlane,
-    active_turn_task: &mut Option<tokio::task::JoinHandle<()>>,
-    active_steering_queue: &mut Option<PendingSteeringQueue>,
-    turn_started_at: &mut Option<Instant>,
+    active_turn: &mut Option<ActiveTurnHandle>,
     transport: &Arc<OpenAiTransport>,
     args: &Args,
     cwd: &Path,
@@ -57,9 +97,7 @@ pub(super) fn start_next_follow_up(
     if let Err(err) = start_pending_turn(
         next,
         control,
-        active_turn_task,
-        active_steering_queue,
-        turn_started_at,
+        active_turn,
         transport,
         args,
         cwd,
@@ -77,7 +115,7 @@ pub(super) fn start_next_follow_up(
 
 pub(super) fn clear_pending_inputs(
     control: &mut ControlPlane,
-    active_steering_queue: &Option<PendingSteeringQueue>,
+    active_turn: &Option<ActiveTurnHandle>,
     store: &SessionStore,
     session_id: &SessionId,
     chat: &mut ChatWidget,
@@ -87,7 +125,7 @@ pub(super) fn clear_pending_inputs(
     if cleared.is_empty() {
         return;
     }
-    clear_active_steering(active_steering_queue);
+    clear_active_steering(active_turn);
     emit_pending_cleared(
         cleared.into_iter().map(|item| item.id).collect(),
         store,
@@ -97,44 +135,50 @@ pub(super) fn clear_pending_inputs(
     );
 }
 
-pub(super) fn queue_active_steering(queue: &Option<PendingSteeringQueue>, item: PendingInput) {
+pub(super) fn queue_active_steering(
+    active_turn: &Option<ActiveTurnHandle>,
+    item: PendingInput,
+) {
     if item.mode != PendingInputMode::Steering {
         return;
     }
-    let Some(queue) = queue else {
+    let Some(handle) = active_turn else {
         return;
     };
-    queue.lock().unwrap().push_back(item);
+    handle.steering().lock().unwrap().push_back(item);
 }
 
-pub(super) fn replace_active_steering(queue: &Option<PendingSteeringQueue>, item: &PendingInput) {
+pub(super) fn replace_active_steering(
+    active_turn: &Option<ActiveTurnHandle>,
+    item: &PendingInput,
+) {
     if item.mode != PendingInputMode::Steering {
         return;
     }
-    let Some(queue) = queue else {
+    let Some(handle) = active_turn else {
         return;
     };
-    let mut queued = queue.lock().unwrap();
+    let mut queued = handle.steering().lock().unwrap();
     if let Some(existing) = queued.iter_mut().find(|existing| existing.id == item.id) {
         *existing = item.clone();
     }
 }
 
-pub(super) fn remove_active_steering(queue: &Option<PendingSteeringQueue>, id: &str) {
-    let Some(queue) = queue else {
+pub(super) fn remove_active_steering(active_turn: &Option<ActiveTurnHandle>, id: &str) {
+    let Some(handle) = active_turn else {
         return;
     };
-    let mut queued = queue.lock().unwrap();
+    let mut queued = handle.steering().lock().unwrap();
     if let Some(index) = queued.iter().position(|item| item.id == id) {
         queued.remove(index);
     }
 }
 
-fn clear_active_steering(queue: &Option<PendingSteeringQueue>) {
-    let Some(queue) = queue else {
+fn clear_active_steering(active_turn: &Option<ActiveTurnHandle>) {
+    let Some(handle) = active_turn else {
         return;
     };
-    queue.lock().unwrap().clear();
+    handle.steering().lock().unwrap().clear();
 }
 
 pub(super) fn pending_draft(
@@ -192,9 +236,7 @@ fn model_text(skill: Option<&PendingSkill>, visible_text: &str) -> String {
 pub(super) fn start_pending_turn(
     item: PendingInput,
     control: &mut ControlPlane,
-    active_turn_task: &mut Option<tokio::task::JoinHandle<()>>,
-    active_steering_queue: &mut Option<PendingSteeringQueue>,
-    turn_started_at: &mut Option<Instant>,
+    active_turn: &mut Option<ActiveTurnHandle>,
     transport: &Arc<OpenAiTransport>,
     args: &Args,
     cwd: &Path,
@@ -207,7 +249,7 @@ pub(super) fn start_pending_turn(
     chat: &mut ChatWidget,
 ) -> Result<()> {
     let active = control.start_turn()?;
-    let steering_queue = Arc::new(Mutex::new(VecDeque::new()));
+    let steering_queue: PendingSteeringQueue = Arc::new(Mutex::new(VecDeque::new()));
     let handle = match spawn_turn(TurnSpawn {
         transport: Arc::clone(transport),
         args: args.clone(),
@@ -233,9 +275,7 @@ pub(super) fn start_pending_turn(
         }
     };
 
-    *active_turn_task = Some(handle);
-    *active_steering_queue = Some(steering_queue);
-    *turn_started_at = Some(Instant::now());
+    *active_turn = Some(ActiveTurnHandle::new(handle, steering_queue));
     chat.scroll_to_bottom();
     if let Some(skill) = item.skill.as_ref() {
         chat.push_skill(skill.name.clone(), "applied to this turn");
@@ -249,11 +289,17 @@ pub(super) fn spinner_frame(tick: u64) -> char {
     FRAMES[(tick as usize) % FRAMES.len()]
 }
 
+// `TurnComplete` is deliberately absent: `finalize_turn` in nav-core fires it
+// after every tool-call iteration (it acts as a replay anchor), not just at
+// the end of the user's prompt. Driving status-bar state off it flips the
+// bar to "Ready" after the first tool call. The reaper in the main loop
+// uses the agent task's completion instead, which is the true end-of-turn
+// signal. The events listed here are still authoritatively terminal — each
+// is emitted on a return path out of `run_agent`.
 pub(super) fn turn_is_terminal(ev: &AgentEvent) -> bool {
     matches!(
         ev,
-        AgentEvent::TurnComplete { .. }
-            | AgentEvent::TurnAborted { .. }
+        AgentEvent::TurnAborted { .. }
             | AgentEvent::Error { .. }
             | AgentEvent::CompactionCompleted {
                 trigger: nav_core::CompactionTrigger::Manual,
@@ -273,16 +319,20 @@ mod tests {
     use nav_core::{CompactionTrigger, GitCheckpointAction, GitCheckpointStatus};
 
     #[test]
-    fn turn_is_terminal_for_turn_complete_and_error() {
-        assert!(turn_is_terminal(&AgentEvent::TurnComplete {
-            usage: nav_core::TurnUsage::default()
-        }));
+    fn turn_is_terminal_for_abort_and_error() {
         assert!(turn_is_terminal(&AgentEvent::Error {
             message: "x".into()
         }));
         assert!(turn_is_terminal(&AgentEvent::TurnAborted {
             turn_id: "turn-1".into(),
             reason: "user interrupt".into(),
+        }));
+    }
+
+    #[test]
+    fn turn_is_terminal_excludes_turn_complete() {
+        assert!(!turn_is_terminal(&AgentEvent::TurnComplete {
+            usage: nav_core::TurnUsage::default()
         }));
     }
 

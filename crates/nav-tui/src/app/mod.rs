@@ -9,8 +9,8 @@ use crossterm::event::{self, Event as CtEvent};
 use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
     AgentEvent, Catalog, ControlPlane, ExtensionCatalog, HandoffDraft, OpenAiTransport,
-    PROVIDER_OPENAI_RESPONSES, PendingInputMode, PendingSkill, PendingSteeringQueue,
-    ProjectContext, SessionId, SessionStore, build_handoff_draft,
+    PROVIDER_OPENAI_RESPONSES, PendingInputMode, PendingSkill, ProjectContext, SessionId,
+    SessionStore, build_handoff_draft,
     cli::{Args, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };
@@ -19,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 mod permissions;
@@ -44,9 +44,9 @@ use session::{
 use status_bar::AgentState;
 use terminal::{TerminalGuard, enter_tui, install_panic_teardown_hook};
 use turn_lifecycle::{
-    clear_pending_inputs, pending_draft, pending_input_for_immediate, queue_active_steering,
-    remove_active_steering, replace_active_steering, spinner_frame, start_next_follow_up,
-    start_pending_turn, turn_is_terminal,
+    ActiveTurnHandle, clear_pending_inputs, pending_draft, pending_input_for_immediate,
+    queue_active_steering, remove_active_steering, replace_active_steering, spinner_frame,
+    start_next_follow_up, start_pending_turn, turn_is_terminal,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -112,9 +112,7 @@ pub async fn run(
     // its wrapped body here and prepend it onto the next non-slash prompt.
     let mut pending_skill: Option<PendingSkill> = None;
     let mut control = ControlPlane::new();
-    let mut active_turn_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut active_steering_queue: Option<PendingSteeringQueue> = None;
-    let mut turn_started_at: Option<Instant> = None;
+    let mut active_turn: Option<ActiveTurnHandle> = None;
     let mut spinner_tick: u64 = 0;
     let cwd_short = shorten_home(&cwd);
     let branch = project.workspace.branch.clone();
@@ -150,10 +148,40 @@ pub async fn run(
     }
 
     loop {
+        // Per-iteration `TurnComplete` events aren't a reliable "agent done"
+        // signal (nav-core fires one after each tool round). The agent task
+        // itself ending IS — `run_agent` returns exactly once per user prompt,
+        // after the final `TurnComplete`. Reap a finished task here so the
+        // status bar flips back to Ready only when work is actually over.
+        if active_turn.as_ref().is_some_and(ActiveTurnHandle::is_finished) {
+            let active_id = control.active().map(|active| active.id().to_string());
+            active_turn = None;
+            if let Some(id) = active_id
+                && let Ok(settled) = control.finish_turn(&id)
+            {
+                start_next_follow_up(
+                    settled.next_follow_up,
+                    &mut control,
+                    &mut active_turn,
+                    &transport,
+                    &args,
+                    &cwd,
+                    &store,
+                    &session_id,
+                    &agent_tx,
+                    &skills,
+                    &project,
+                    &permissions,
+                    &mut chat,
+                    &mut pane,
+                );
+            }
+        }
+
         let spinner = spinner_frame(spinner_tick);
-        let state = match turn_started_at {
-            Some(started) => AgentState::Working {
-                elapsed: started.elapsed(),
+        let state = match active_turn.as_ref() {
+            Some(handle) => AgentState::Working {
+                elapsed: handle.elapsed(),
                 spinner,
             },
             None => AgentState::Ready,
@@ -191,18 +219,14 @@ pub async fn run(
                             &mut pane,
                         );
                     }
-                    turn_started_at = None;
-                    active_turn_task = None;
-                    active_steering_queue = None;
+                    active_turn = None;
                     if let Some(id) = active_id
                         && let Ok(settled) = control.finish_turn(&id)
                     {
                         start_next_follow_up(
                             settled.next_follow_up,
                             &mut control,
-                            &mut active_turn_task,
-                            &mut active_steering_queue,
-                            &mut turn_started_at,
+                            &mut active_turn,
                             &transport,
                             &args,
                             &cwd,
@@ -259,7 +283,7 @@ pub async fn run(
                         pending_skill = None;
                         clear_pending_inputs(
                             &mut control,
-                            &active_steering_queue,
+                            &active_turn,
                             store.as_ref(),
                             &session_id,
                             &mut chat,
@@ -271,11 +295,9 @@ pub async fn run(
                             let turn_id = active.id().to_string();
                             let abort = control.abort_turn(&turn_id, "user interrupt").ok();
                             pending_approvals.abort_pending();
-                            if let Some(handle) = active_turn_task.take() {
+                            if let Some(handle) = active_turn.take() {
                                 handle.abort();
                             }
-                            active_steering_queue = None;
-                            turn_started_at = None;
                             if let Some(abort) = abort {
                                 emit_pending_cleared(
                                     abort.cleared_steering_ids,
@@ -299,9 +321,7 @@ pub async fn run(
                                 start_next_follow_up(
                                     settled.next_follow_up,
                                     &mut control,
-                                    &mut active_turn_task,
-                                    &mut active_steering_queue,
-                                    &mut turn_started_at,
+                                    &mut active_turn,
                                     &transport,
                                     &args,
                                     &cwd,
@@ -319,7 +339,7 @@ pub async fn run(
                     }
                     AppEvent::EditPending { id, text } => {
                         if let Some(item) = control.edit_pending(&id, text) {
-                            replace_active_steering(&active_steering_queue, &item);
+                            replace_active_steering(&active_turn, &item);
                             emit_local_event(
                                 AgentEvent::PendingInputEdited {
                                     id: item.id,
@@ -337,7 +357,7 @@ pub async fn run(
                     }
                     AppEvent::RemovePending { id } => {
                         if let Some(item) = control.remove_pending(&id) {
-                            remove_active_steering(&active_steering_queue, &item.id);
+                            remove_active_steering(&active_turn, &item.id);
                             emit_local_event(
                                 AgentEvent::PendingInputRemoved { id: item.id },
                                 store.as_ref(),
@@ -350,7 +370,7 @@ pub async fn run(
                     AppEvent::ClearPending => {
                         clear_pending_inputs(
                             &mut control,
-                            &active_steering_queue,
+                            &active_turn,
                             store.as_ref(),
                             &session_id,
                             &mut chat,
@@ -375,7 +395,7 @@ pub async fn run(
                         }
                     }
                     AppEvent::Resume { query: Some(query) } => {
-                        if turn_started_at.is_some() {
+                        if active_turn.is_some() {
                             chat.ingest(AgentEvent::Error {
                                 message: "cannot resume while a turn is running".to_string(),
                             });
@@ -405,7 +425,7 @@ pub async fn run(
                         }
                     }
                     AppEvent::Resume { query: None } => {
-                        if turn_started_at.is_some() {
+                        if active_turn.is_some() {
                             chat.ingest(AgentEvent::Error {
                                 message: "cannot resume while a turn is running".to_string(),
                             });
@@ -444,7 +464,7 @@ pub async fn run(
                         );
                     }
                     AppEvent::Handoff { goal } => {
-                        if turn_started_at.is_some() {
+                        if active_turn.is_some() {
                             chat.ingest(AgentEvent::Error {
                                 message: "cannot handoff while a turn is running".to_string(),
                             });
@@ -461,7 +481,7 @@ pub async fn run(
                             Ok((new_id, draft)) => {
                                 clear_pending_inputs(
                                     &mut control,
-                                    &active_steering_queue,
+                                    &active_turn,
                                     store.as_ref(),
                                     &source_session_id,
                                     &mut chat,
@@ -478,7 +498,7 @@ pub async fn run(
                                 );
                                 control = ControlPlane::new();
                                 pending_skill = None;
-                                active_steering_queue = None;
+                                active_turn = None;
                                 chat = ChatWidget::with_theme(theme);
                                 chat.push_welcome(
                                     &args.model,
@@ -498,7 +518,7 @@ pub async fn run(
                         }
                     }
                     AppEvent::ForkSession { at } => {
-                        if turn_started_at.is_some() {
+                        if active_turn.is_some() {
                             chat.ingest(AgentEvent::Error {
                                 message: "cannot fork while a turn is running".to_string(),
                             });
@@ -519,7 +539,7 @@ pub async fn run(
                         }
                     }
                     AppEvent::RewindSession { at } => {
-                        if turn_started_at.is_some() {
+                        if active_turn.is_some() {
                             chat.ingest(AgentEvent::Error {
                                 message: "cannot rewind while a turn is running".to_string(),
                             });
@@ -562,7 +582,7 @@ pub async fn run(
                         };
                         clear_pending_inputs(
                             &mut control,
-                            &active_steering_queue,
+                            &active_turn,
                             store.as_ref(),
                             &session_id,
                             &mut chat,
@@ -652,7 +672,7 @@ pub async fn run(
                     AppEvent::GitCheckpoint { label } => {
                         run_idle_git_action(
                             "checkpoint",
-                            turn_started_at.is_some(),
+                            active_turn.is_some(),
                             store.as_ref(),
                             &session_id,
                             &mut chat,
@@ -663,7 +683,7 @@ pub async fn run(
                     AppEvent::GitStash { label } => {
                         run_idle_git_action(
                             "stash",
-                            turn_started_at.is_some(),
+                            active_turn.is_some(),
                             store.as_ref(),
                             &session_id,
                             &mut chat,
@@ -674,7 +694,7 @@ pub async fn run(
                     AppEvent::GitRestore { target } => {
                         run_idle_git_action(
                             "restore",
-                            turn_started_at.is_some(),
+                            active_turn.is_some(),
                             store.as_ref(),
                             &session_id,
                             &mut chat,
@@ -706,7 +726,7 @@ pub async fn run(
                                 PendingInputMode::Steering => control.enqueue_steering(draft),
                             };
                             if item.mode == PendingInputMode::Steering {
-                                queue_active_steering(&active_steering_queue, item.clone());
+                                queue_active_steering(&active_turn, item.clone());
                             }
                             emit_local_event(
                                 AgentEvent::PendingInputQueued {
@@ -734,9 +754,7 @@ pub async fn run(
                         if let Err(err) = start_pending_turn(
                             item,
                             &mut control,
-                            &mut active_turn_task,
-                            &mut active_steering_queue,
-                            &mut turn_started_at,
+                            &mut active_turn,
                             &transport,
                             &args,
                             &cwd,
