@@ -139,8 +139,8 @@ fn subagent_prompt(label: Option<&str>, task: &str) -> String {
          Work independently on the task below. You may inspect files with \
          read_file, list_files, and code_search. You cannot edit files, run \
          shell commands, request approvals, or spawn more agents. Return a \
-         concise final summary with findings, files checked, and remaining \
-         uncertainty.\n\n\
+         concise final summary in plain, layman's terms, with findings, files \
+         checked, and remaining uncertainty.\n\n\
          Task:\n{task}"
     )
 }

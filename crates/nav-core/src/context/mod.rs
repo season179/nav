@@ -63,7 +63,16 @@ fn base_instruction_section(cwd: &Path) -> InstructionSection {
         kind: InstructionSectionKind::Base,
         label: "base instructions".to_string(),
         body: format!(
-            "You are a small coding agent running in {}. Use tools to inspect, edit, search, and verify code. Prefer small, explicit steps. Paths must be relative.",
+            "\
+You are a small coding agent running in {}.
+
+Guidelines:
+- Use tools to inspect, edit, search, and verify code.
+- Prefer small, explicit steps.
+- Keep responses concise.
+- Explain technical details in plain, layman's terms.
+- Show file paths clearly when working with files.
+- Paths must be relative.",
             cwd.display()
         ),
     }

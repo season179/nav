@@ -1223,7 +1223,9 @@ async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
             .and_then(|item| item.get("content"))
             .and_then(Value::as_str)
             .is_some_and(|text| {
-                text.contains("focused nav subagent") && text.contains("inspect session code")
+                text.contains("focused nav subagent")
+                    && text.contains("inspect session code")
+                    && text.contains("plain, layman's terms")
             }),
         "worker prompt missing task: {worker_input:#?}"
     );

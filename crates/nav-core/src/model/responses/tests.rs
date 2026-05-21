@@ -142,6 +142,9 @@ fn response_body_instructions_contain_cwd() {
     let body = response_body(&args, cwd, &[], &Catalog::default(), None);
     let instructions = body["instructions"].as_str().unwrap();
     assert!(instructions.contains("/my/project"));
+    assert!(instructions.contains("Keep responses concise"));
+    assert!(instructions.contains("plain, layman's terms"));
+    assert!(instructions.contains("Show file paths clearly"));
     // No skills => no available-skills section.
     assert!(!instructions.contains("Available skills"));
 }
