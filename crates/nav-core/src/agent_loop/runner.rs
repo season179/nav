@@ -10,6 +10,7 @@ use super::events::CompactionTrigger;
 use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::agent_loop::compaction_turn::{CompactionTurnRequest, run_compaction_turn};
 use crate::agent_loop::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::agent_loop::prune::{ReplayBudget, prune_to_budget};
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
 use crate::context::compaction::{estimate_input_tokens, is_compact_command, should_auto_compact};
@@ -443,12 +444,28 @@ pub(super) async fn run_agent_inner(
     // user message so the model is nudged toward a deliverable.
     let mut tool_calls_this_turn = 0usize;
 
+    let prune_budget = ReplayBudget::default();
+
     'turns: loop {
         if turns_used >= args.max_turns {
             return fail(
                 &events,
                 session,
                 anyhow!("stopped after {} tool turns", args.max_turns),
+            );
+        }
+        // Shed oldest non-protected tool pairs to fit the budget before paying
+        // for a request the provider would likely reject as too long. The
+        // reactive `ContextWindowExceeded` handler below still covers the case
+        // where the provider's token accounting is stricter than ours.
+        let pruned = prune_to_budget(&mut input, &prune_budget);
+        if pruned > 0 {
+            emit(
+                &events,
+                session,
+                AgentEvent::ContextTrimmed {
+                    dropped_pairs: pruned,
+                },
             );
         }
         let body =

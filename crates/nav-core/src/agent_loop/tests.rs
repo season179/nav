@@ -2428,6 +2428,157 @@ async fn overflow_second_failure_surfaces_clean_error() {
     assert_eq!(error_count, 1);
 }
 
+#[tokio::test]
+async fn proactive_prune_sheds_oldest_pair_before_first_request() {
+    // Synthesize a multi-turn `initial_input` whose tool outputs exceed the
+    // default 120KB pre-call budget. With `raw_tool_turns = 2`, the most
+    // recent two user-message boundaries — the second old turn and the new
+    // prompt the runner pushes — protect c2's pair, leaving c1 as the oldest
+    // droppable pair.
+    let big = "x".repeat(70 * 1024);
+    let initial_input = vec![
+        json!({"type": "message", "role": "user", "content": "old turn"}),
+        json!({"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "c1", "output": big.clone()}),
+        json!({"type": "message", "role": "user", "content": "older turn"}),
+        json!({"type": "function_call", "call_id": "c2", "name": "bash", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "c2", "output": big}),
+    ];
+
+    let final_turn = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let transport = StubTransport::with_items(vec![final_turn]);
+
+    let args = Args::test_default();
+    let cwd = tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "fresh prompt",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        Some(initial_input),
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("turn should succeed after pre-call prune");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let trimmed = events
+        .iter()
+        .find(|e| matches!(e, AgentEvent::ContextTrimmed { .. }))
+        .expect("expected ContextTrimmed before the request was sent");
+    assert!(matches!(
+        trimmed,
+        AgentEvent::ContextTrimmed { dropped_pairs } if *dropped_pairs >= 1
+    ));
+
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 1, "exactly one request after pruning");
+    let sent_input = bodies[0]
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("body carries input");
+    let has_c1 = sent_input.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("call_id").and_then(Value::as_str) == Some("c1")
+    });
+    let has_c2 = sent_input.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("call_id").and_then(Value::as_str) == Some("c2")
+    });
+    assert!(!has_c1, "oldest pair c1 should have been pruned");
+    assert!(has_c2, "recent pair c2 must be protected by raw_tool_turns");
+    // Pair preservation: no `function_call_output` without its `function_call`.
+    let output_ids: std::collections::HashSet<&str> = sent_input
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .collect();
+    let call_ids: std::collections::HashSet<&str> = sent_input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        output_ids, call_ids,
+        "every function_call_output must keep its function_call"
+    );
+}
+
+#[tokio::test]
+async fn proactive_prune_no_op_when_under_budget() {
+    // A normal turn with no historical tool pairs must not emit
+    // ContextTrimmed; pre-call pruning is a no-op when the budget is fine.
+    let final_turn = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let transport = StubTransport::with_items(vec![final_turn]);
+
+    let args = Args::test_default();
+    let cwd = tempdir().unwrap();
+    let cwd = cwd.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "hello",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("turn should succeed");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ContextTrimmed { .. })),
+        "no ContextTrimmed expected when input is under budget"
+    );
+}
+
 // ── transport-level retry plumbing ────────────────────────────
 
 // ── tool-call budget backpressure ─────────────────────────────
