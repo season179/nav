@@ -195,6 +195,7 @@ pub mod compaction;
 
 pub mod extensions;
 pub mod handoff;
+pub(crate) mod history;
 pub mod project;
 pub mod replay;
 pub mod replay_policy;

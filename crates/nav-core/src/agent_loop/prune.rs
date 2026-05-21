@@ -3,14 +3,19 @@
 //! Before each Responses request, the runner measures the assembled
 //! model-visible input and sheds the oldest tool call/output pairs to fit a
 //! budget. This avoids paying for a turn the provider would reject with
-//! `context_length_exceeded`. The reactive recovery in [`runner`] still acts
-//! as a one-shot fallback when the pre-call estimate underweights the actual
-//! prompt size.
+//! `context_length_exceeded`. The reactive recovery in [`crate::agent_loop`]
+//! still acts as a one-shot fallback when the pre-call estimate underweights
+//! the actual prompt size.
+//!
+//! Pairing, orphan handling, and output-policy helpers live in
+//! [`crate::context::history`] so this module and the replay path enforce
+//! the same wire-format invariants.
 
 use std::collections::HashSet;
 
 use serde_json::Value;
 
+use crate::context::history::{self, is_error_output};
 use crate::context::replay_policy::ReplayBudget;
 
 /// Drop the oldest non-protected `function_call` + `function_call_output`
@@ -26,13 +31,15 @@ use crate::context::replay_policy::ReplayBudget;
 ///
 /// Call and output are removed together so replay stays structurally valid.
 pub fn prune_to_budget(input: &mut Vec<Value>, budget: &ReplayBudget) -> usize {
-    if input.is_empty() || total_tool_output_bytes(input) <= budget.max_total_tool_output_bytes {
+    if input.is_empty()
+        || history::total_tool_output_bytes(input) <= budget.max_total_tool_output_bytes
+    {
         return 0;
     }
 
-    let protected = protected_call_ids(input, budget.raw_tool_turns);
+    let protected = protected_pair_ids(input, budget.raw_tool_turns);
     let mut dropped = 0usize;
-    while total_tool_output_bytes(input) > budget.max_total_tool_output_bytes {
+    while history::total_tool_output_bytes(input) > budget.max_total_tool_output_bytes {
         let Some(call_id) = oldest_droppable_call_id(input, &protected) else {
             break;
         };
@@ -42,47 +49,16 @@ pub fn prune_to_budget(input: &mut Vec<Value>, budget: &ReplayBudget) -> usize {
     dropped
 }
 
-fn total_tool_output_bytes(input: &[Value]) -> usize {
-    input
-        .iter()
-        .filter(|item| item_type(item) == Some("function_call_output"))
-        .map(|item| {
-            item.get("output")
-                .and_then(Value::as_str)
-                .map(str::len)
-                .unwrap_or(0)
-        })
-        .sum()
-}
-
-fn protected_call_ids(input: &[Value], raw_tool_turns: usize) -> HashSet<String> {
-    let mut protected: HashSet<String> = HashSet::new();
-
-    let user_indices: Vec<usize> = input
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item_type(item) == Some("message") && role(item) == Some("user"))
-        .map(|(idx, _)| idx)
-        .collect();
-    // Pairs after the (raw_tool_turns)-th most-recent user boundary stay
-    // verbatim. With raw_tool_turns == 0 the recent-turn protection is
-    // disabled (errored pairs are still protected below).
-    if raw_tool_turns > 0 && !user_indices.is_empty() {
-        let take = raw_tool_turns.min(user_indices.len());
-        let protect_from = user_indices[user_indices.len() - take];
-        for item in &input[protect_from..] {
-            if item_type(item) == Some("function_call")
-                && let Some(id) = call_id(item)
-            {
-                protected.insert(id.to_string());
-            }
-        }
-    }
-
+fn protected_pair_ids(input: &[Value], raw_tool_turns: usize) -> HashSet<String> {
+    // Shared with replay's budget enforcer so "recent raw turns" means the
+    // same thing in both paths. Drop pruning additionally protects errored
+    // outputs so a failed command's output stays visible after later turns
+    // shift the user-boundary window past it.
+    let mut protected = history::protected_call_ids(input, raw_tool_turns);
     for item in input {
-        if item_type(item) == Some("function_call_output")
+        if history::item_type(item) == Some("function_call_output")
             && is_error_output(item)
-            && let Some(id) = call_id(item)
+            && let Some(id) = history::call_id(item)
         {
             protected.insert(id.to_string());
         }
@@ -90,17 +66,12 @@ fn protected_call_ids(input: &[Value], raw_tool_turns: usize) -> HashSet<String>
     protected
 }
 
-fn is_error_output(item: &Value) -> bool {
-    let text = item.get("output").and_then(Value::as_str).unwrap_or("");
-    text.starts_with("tool error:") || (text.starts_with("tool ") && text.contains(" blocked:"))
-}
-
 fn oldest_droppable_call_id(input: &[Value], protected: &HashSet<String>) -> Option<String> {
     input.iter().find_map(|item| {
-        if item_type(item) != Some("function_call") {
+        if history::item_type(item) != Some("function_call") {
             return None;
         }
-        let id = call_id(item)?;
+        let id = history::call_id(item)?;
         if protected.contains(id) {
             return None;
         }
@@ -112,25 +83,12 @@ fn remove_pair(input: &mut Vec<Value>, call_id_str: &str) {
     // Remove the output first so the call index stays valid for the second
     // removal even if call and output sit next to each other.
     for kind in ["function_call_output", "function_call"] {
-        if let Some(pos) = input
-            .iter()
-            .position(|item| item_type(item) == Some(kind) && call_id(item) == Some(call_id_str))
-        {
+        if let Some(pos) = input.iter().position(|item| {
+            history::item_type(item) == Some(kind) && history::call_id(item) == Some(call_id_str)
+        }) {
             input.remove(pos);
         }
     }
-}
-
-fn item_type(item: &Value) -> Option<&str> {
-    item.get("type").and_then(Value::as_str)
-}
-
-fn role(item: &Value) -> Option<&str> {
-    item.get("role").and_then(Value::as_str)
-}
-
-fn call_id(item: &Value) -> Option<&str> {
-    item.get("call_id").and_then(Value::as_str)
 }
 
 #[cfg(test)]

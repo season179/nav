@@ -127,7 +127,7 @@ pub fn truncate_line(line: &str, max_bytes: usize) -> (String, bool) {
 
 /// Largest UTF-8-safe prefix of `s` not exceeding `max` bytes. Walks back to
 /// the nearest char boundary so the returned slice is always valid UTF-8.
-fn byte_prefix(s: &str, max: usize) -> &str {
+pub(crate) fn byte_prefix(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }

@@ -12,6 +12,7 @@ use crate::agent_loop::prune::prune_to_budget;
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
 use crate::context::compaction::{estimate_input_tokens, is_compact_command, should_auto_compact};
+use crate::context::history::{ModelCapabilities, remove_orphan_outputs, strip_unsupported_images};
 use crate::context::replay_policy::ReplayBudget;
 use crate::context::{
     Catalog, ProjectContext, SessionId, SessionStore, build_user_content, push_ambient_context,
@@ -326,6 +327,7 @@ pub(super) async fn run_agent_inner(
     let mut tool_calls_this_turn = 0usize;
 
     let prune_budget = ReplayBudget::default();
+    let capabilities = ModelCapabilities::for_model(&args.model);
 
     'turns: loop {
         if turns_used >= args.max_turns {
@@ -335,6 +337,8 @@ pub(super) async fn run_agent_inner(
                 anyhow!("stopped after {} tool turns", args.max_turns),
             );
         }
+        remove_orphan_outputs(&mut input);
+        strip_unsupported_images(&mut input, &capabilities);
         // Shed oldest non-protected tool pairs to fit the budget before paying
         // for a request the provider would likely reject as too long. The
         // reactive `ContextWindowExceeded` handler below still covers the case
