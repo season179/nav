@@ -1,5 +1,6 @@
 use crate::cli::Args;
 use crate::context::build_instructions;
+use crate::context::history::strip_synthetic_markers;
 use crate::context::{Catalog, ProjectContext};
 use crate::tool_registry::{SPAWN_SUBAGENT_TOOL, ToolAccess, tool_definitions};
 use serde_json::{Value, json};
@@ -70,10 +71,14 @@ pub(crate) fn response_body_with_options(
     // stable prefix (instructions + tool definitions) lands on the same cache
     // shard across turns and sessions. It is opaque to the provider.
     let cache_key = prompt_cache_key(&args.model, &instructions, &tools);
+    // Synthetic-message markers stay internal: filter the wire copy of input
+    // so providers never see an unknown field on `message` items.
+    let mut wire_input: Vec<Value> = input.to_vec();
+    strip_synthetic_markers(&mut wire_input);
     json!({
         "model": args.model,
         "instructions": instructions,
-        "input": input,
+        "input": wire_input,
         // store=false keeps the demo honest: nav manages the transcript itself,
         // and no server-side stored conversation is needed for the agent loop.
         "store": false,

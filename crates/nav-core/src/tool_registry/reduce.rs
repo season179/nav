@@ -26,7 +26,7 @@ use anyhow::Result;
 use super::output_accumulator::{self, ArtifactRef};
 use super::truncate::{
     BoundedOutput, GREP_MAX_LINE_LENGTH, MAX_BYTES, MAX_LINES, READ_FILE_MAX_BYTES,
-    READ_FILE_MAX_LINES, TruncateMode, bound, truncate_line,
+    READ_FILE_MAX_LINES, TruncateMode, bound, byte_prefix, truncate_line,
 };
 
 /// Result of a `read_file` reduction. When the body fit under the per-tool
@@ -67,8 +67,24 @@ pub fn reduce_read_file(body: String) -> Result<ReducedRead> {
     let mut preview = String::new();
     let mut kept_lines = 0usize;
     let mut kept_bytes = 0usize;
+    let mut first_line_clipped = false;
     for line in lines.iter().take(READ_PREVIEW_LINES) {
         if kept_bytes + line.len() > READ_PREVIEW_BYTES {
+            // Minified / generated files can have a single line that already
+            // exceeds the preview budget. Without this branch the loop breaks
+            // before appending anything and the model sees an empty preview
+            // (outline "lines 1-0"), forcing an expand_artifact round-trip
+            // just to see *any* content. Keep a UTF-8-safe prefix of the
+            // first line in that case so the model has at least a glimpse.
+            if kept_lines == 0 {
+                let room = READ_PREVIEW_BYTES.saturating_sub(kept_bytes);
+                let prefix = byte_prefix(line, room);
+                if !prefix.is_empty() {
+                    preview.push_str(prefix);
+                    kept_lines = 1;
+                    first_line_clipped = prefix.len() < line.len();
+                }
+            }
             break;
         }
         preview.push_str(line);
@@ -78,8 +94,13 @@ pub fn reduce_read_file(body: String) -> Result<ReducedRead> {
     let remaining_lines = total_lines.saturating_sub(kept_lines);
     let next_offset = kept_lines + 1;
 
+    let clipped_note = if first_line_clipped {
+        " (first line clipped to fit byte budget)"
+    } else {
+        ""
+    };
     let header = format!(
-        "[file outline: {total_lines} lines, {total_bytes} bytes; preview showing lines 1-{kept_lines}]\n",
+        "[file outline: {total_lines} lines, {total_bytes} bytes; preview showing lines 1-{kept_lines}{clipped_note}]\n",
     );
     let mut trailer = String::new();
     if !preview.ends_with('\n') {
@@ -371,6 +392,34 @@ mod tests {
             result
                 .content
                 .contains(&format!("next offset {}", preview_lines + 1))
+        );
+        let _ = std::fs::remove_file(&artifact.path);
+    }
+
+    #[test]
+    fn reduce_read_file_keeps_prefix_when_first_line_exceeds_preview_budget() {
+        // Minified bundle: one line, longer than READ_PREVIEW_BYTES. Without
+        // the first-line salvage path the preview would be empty and the
+        // outline would say "lines 1-0", forcing an expand_artifact round-trip
+        // before the model could see any content.
+        let body = "x".repeat(READ_FILE_MAX_BYTES + 4_096);
+        let result = reduce_read_file(body).unwrap();
+        let artifact = result.artifact.as_ref().unwrap();
+        assert!(
+            result.content.contains("first line clipped"),
+            "header must surface that the first line was clipped"
+        );
+        assert!(
+            result.content.contains("lines 1-1"),
+            "outline must report one preview line, not zero — got:\n{}",
+            result.content
+        );
+        // The clipped prefix should fit comfortably under the byte ceiling
+        // but still be substantial (not empty / not a token).
+        let preview_x_count = result.content.matches('x').count();
+        assert!(
+            preview_x_count > 1024,
+            "expected a substantive prefix of the long line, got {preview_x_count} bytes"
         );
         let _ = std::fs::remove_file(&artifact.path);
     }

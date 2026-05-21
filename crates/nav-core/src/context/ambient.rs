@@ -10,6 +10,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::ProjectContext;
+use super::history::NAV_SYNTHETIC_MARKER_KEY;
 
 pub const DEFAULT_AMBIENT_CONTEXT_TOKEN_BUDGET: u64 = 256;
 
@@ -43,6 +44,7 @@ pub(crate) fn push_ambient_context(
         "type": "message",
         "role": "user",
         "content": text,
+        NAV_SYNTHETIC_MARKER_KEY: true,
     }));
     true
 }

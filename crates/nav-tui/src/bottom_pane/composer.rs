@@ -118,6 +118,15 @@ impl Composer {
         self.pending_attachments.clear();
     }
 
+    /// Like [`Composer::set_text`] but re-queues the given attachments so the
+    /// next submit carries them. Used by the rewind flow when a previous user
+    /// message had files/images attached — restoring the visible text without
+    /// these would silently drop them on resubmit.
+    pub fn set_text_with_attachments(&mut self, text: &str, attachments: Vec<UserAttachment>) {
+        self.set_text(text);
+        self.pending_attachments = attachments;
+    }
+
     pub fn history(&self) -> &[String] {
         &self.history
     }
@@ -857,6 +866,70 @@ mod tests {
         };
         assert_eq!(text, "hello world");
         assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn set_text_with_attachments_re_queues_attachments_after_swap() {
+        // /rewind flow: the previous user message may have had files/images.
+        // Restoring just the visible text would silently drop them on resubmit.
+        // The original submit's substring guard (lines 568-570) only kept
+        // attachments whose path appeared in the prompt text, so the
+        // restored text necessarily contains those paths.
+        let mut c = Composer::new();
+        c.push_pending_image(PathBuf::from("stale.png"));
+        c.set_text_with_attachments(
+            "review kept.png and kept.txt",
+            vec![
+                UserAttachment::Image {
+                    path: PathBuf::from("kept.png"),
+                },
+                UserAttachment::File {
+                    path: PathBuf::from("kept.txt"),
+                },
+            ],
+        );
+        assert_eq!(c.text(), "review kept.png and kept.txt");
+
+        let ComposerEvent::Submit { text, attachments } = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(text, "review kept.png and kept.txt");
+        assert_eq!(
+            attachments,
+            vec![
+                UserAttachment::Image {
+                    path: PathBuf::from("kept.png"),
+                },
+                UserAttachment::File {
+                    path: PathBuf::from("kept.txt"),
+                },
+            ],
+            "rewind must restore attachments so resubmit carries them"
+        );
+    }
+
+    #[test]
+    fn set_text_with_attachments_drops_stale_attachment_already_in_buffer() {
+        // Defensive: the prior buffer's stale attachment must be cleared
+        // before the new set is applied. Otherwise a duplicate could ride
+        // along with the rewind-restored set.
+        let mut c = Composer::new();
+        c.push_pending_image(PathBuf::from("stale.png"));
+        c.set_text_with_attachments(
+            "look at kept.png",
+            vec![UserAttachment::Image {
+                path: PathBuf::from("kept.png"),
+            }],
+        );
+        let ComposerEvent::Submit { attachments, .. } = c.handle_key(enter()) else {
+            panic!("expected Submit");
+        };
+        assert_eq!(
+            attachments,
+            vec![UserAttachment::Image {
+                path: PathBuf::from("kept.png"),
+            }]
+        );
     }
 
     #[test]

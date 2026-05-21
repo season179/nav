@@ -41,11 +41,17 @@ pub(super) struct WsBaseline {
 ///
 /// Falls back when:
 /// - `baseline` is absent
+/// - the request opts out of server-side storage (`store: false`); the
+///   provider cannot resolve `previous_response_id` against an unstored
+///   response, so the delta would 404
 /// - non-input fields differ (fingerprint mismatch)
 /// - new `input` does not start with `baseline.known_items` (invalid delta)
 /// - delta would be empty (no new items to ask the model about)
 pub(super) fn try_build_incremental(body: &Value, baseline: Option<&WsBaseline>) -> Option<Value> {
     let baseline = baseline?;
+    if body.get("store").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
     let (fingerprint, new_input) = split_fingerprint(body)?;
     if fingerprint != baseline.fingerprint {
         return None;
@@ -192,6 +198,21 @@ mod tests {
             "model": "m",
             "tools": [],
             "input": [user_item("hi"), assistant_item("hello")],
+        });
+        assert!(try_build_incremental(&body, Some(&baseline)).is_none());
+    }
+
+    #[test]
+    fn try_build_incremental_returns_none_when_store_is_false() {
+        // The provider cannot resolve `previous_response_id` for an unstored
+        // response, so we must fall back to the full input. Otherwise the
+        // follow-up turn 404s mid-tool-loop.
+        let baseline = baseline_with_known(vec![user_item("hi"), assistant_item("hello")]);
+        let body = json!({
+            "model": "m",
+            "tools": [],
+            "store": false,
+            "input": [user_item("hi"), assistant_item("hello"), user_item("more")],
         });
         assert!(try_build_incremental(&body, Some(&baseline)).is_none());
     }

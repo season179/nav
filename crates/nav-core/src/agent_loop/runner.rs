@@ -13,8 +13,8 @@ use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
 use crate::context::compaction::{estimate_input_tokens, is_compact_command, should_auto_compact};
 use crate::context::history::{
-    ModelCapabilities, remove_orphan_outputs, shed_old_images, shed_old_reasoning,
-    strip_unsupported_images,
+    ModelCapabilities, NAV_SYNTHETIC_MARKER_KEY, remove_orphan_outputs, shed_old_images,
+    shed_old_reasoning, strip_unsupported_images,
 };
 use crate::context::replay_policy::ReplayBudget;
 use crate::context::{
@@ -675,6 +675,7 @@ fn maybe_emit_budget_warning(
         "type": "message",
         "role": "user",
         "content": budget_warning_text(tool_calls_after),
+        NAV_SYNTHETIC_MARKER_KEY: true,
     }));
 }
 

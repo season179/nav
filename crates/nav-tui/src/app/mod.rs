@@ -581,7 +581,10 @@ pub async fn run(
                             chat.ingest(event);
                         }
                         let composer_text = outcome.display_text.unwrap_or(outcome.text);
-                        pane.set_composer_text(&composer_text);
+                        pane.set_composer_text_with_attachments(
+                            &composer_text,
+                            outcome.attachments,
+                        );
                     }
                     AppEvent::ShowTree => match resolve_tree_root(&store, &session_id) {
                         Ok(root_id) => match store.walk_tree(&root_id) {
