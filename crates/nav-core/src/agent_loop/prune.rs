@@ -11,32 +11,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
-/// Replay budget shared by pre-call pruning and (in the future) replay
-/// reconstruction. Constants live in one place so the policy stays auditable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReplayBudget {
-    /// Number of trailing user-message boundaries whose tool pairs are kept
-    /// verbatim. The "active turn" — i.e. tool pairs after the latest user
-    /// message — is always included.
-    pub raw_tool_turns: usize,
-    /// Per-output cap for `function_call_output.output`. Reserved for the
-    /// reducer work tracked in the context-management plan; pre-call pruning
-    /// does not consult it.
-    pub max_raw_tool_output_bytes: usize,
-    /// Total `function_call_output.output` byte budget across the assembled
-    /// input. Pre-call pruning fires when total exceeds this.
-    pub max_total_tool_output_bytes: usize,
-}
-
-impl Default for ReplayBudget {
-    fn default() -> Self {
-        Self {
-            raw_tool_turns: 2,
-            max_raw_tool_output_bytes: 50 * 1024,
-            max_total_tool_output_bytes: 120 * 1024,
-        }
-    }
-}
+use crate::context::replay_policy::ReplayBudget;
 
 /// Drop the oldest non-protected `function_call` + `function_call_output`
 /// pairs until total tool output bytes fit under

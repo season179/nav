@@ -4,7 +4,9 @@ use super::runner::{drop_oldest_tool_pair, emit_stream_events, extract_message_t
 use super::*;
 use crate::cli::Args;
 use crate::context::compaction::{SUMMARIZATION_PROMPT, SUMMARY_PREFIX, summary_message};
-use crate::context::replay::rebuild_responses_input;
+use crate::context::replay::{
+    CLEARED_TOOL_OUTPUT_PLACEHOLDER, REDUCED_TOOL_OUTPUT_PREFIX, rebuild_responses_input,
+};
 use crate::context::{Catalog, ProjectContext};
 use crate::guardrails::approval::{ApprovalGate, ApprovalRequest};
 use crate::guardrails::{
@@ -154,6 +156,72 @@ fn is_input_assistant_message(item: &Value, text: &str) -> bool {
             .and_then(|part| part.get("text"))
             .and_then(Value::as_str)
             == Some(text)
+}
+
+fn replay_tool_turn(
+    prompt: &str,
+    call_id: &str,
+    tool_name: &str,
+    output: String,
+    is_error: bool,
+) -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::UserMessage {
+            text: prompt.into(),
+            display_text: None,
+            attachments: Vec::new(),
+        },
+        AgentEvent::ResponseContinuation {
+            items: vec![json!({
+                "type": "function_call",
+                "call_id": call_id,
+                "name": tool_name,
+                "arguments": "{}",
+            })],
+        },
+        AgentEvent::ToolCallStarted {
+            call_id: call_id.into(),
+            name: tool_name.into(),
+            arguments: json!({}),
+        },
+        AgentEvent::ToolCallOutput {
+            call_id: call_id.into(),
+            output,
+            is_error,
+            truncation: None,
+        },
+        AgentEvent::AssistantMessageDone {
+            text: format!("{tool_name} done"),
+        },
+        AgentEvent::TurnComplete {
+            usage: TurnUsage::default(),
+        },
+    ]
+}
+
+fn replay_tool_output<'a>(input: &'a [Value], call_id: &str) -> &'a str {
+    input
+        .iter()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .and_then(|item| item.get("output").and_then(Value::as_str))
+        .unwrap_or_else(|| panic!("expected function_call_output for {call_id}"))
+}
+
+fn assert_replay_outputs_have_calls(input: &[Value]) {
+    let calls: std::collections::HashSet<&str> = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .collect();
+    let orphan = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .find(|call_id| !calls.contains(*call_id));
+    assert!(orphan.is_none(), "orphan tool output: {orphan:?}");
 }
 
 fn git(cwd: &std::path::Path, args: &[&str]) {
@@ -498,6 +566,98 @@ fn rebuild_responses_input_replays_continuation_items_and_tool_outputs() {
         &input[4],
         "Cargo.toml is a Rust manifest."
     ));
+}
+
+#[test]
+fn rebuild_responses_input_reduces_old_tool_outputs_and_keeps_recent_raw() {
+    let mut events = Vec::new();
+    events.extend(replay_tool_turn(
+        "old read",
+        "call_old",
+        "read_file",
+        "old file contents".into(),
+        false,
+    ));
+    events.extend(replay_tool_turn(
+        "middle search",
+        "call_mid",
+        "code_search",
+        "middle search hits".into(),
+        false,
+    ));
+    events.extend(replay_tool_turn(
+        "recent bash",
+        "call_recent",
+        "bash",
+        "tool error: command failed".into(),
+        true,
+    ));
+
+    let input = rebuild_responses_input(&events, Path::new("/tmp"));
+
+    let old = replay_tool_output(&input, "call_old");
+    assert!(
+        old.starts_with(REDUCED_TOOL_OUTPUT_PREFIX),
+        "old successful tool output should be reduced: {old}"
+    );
+    assert!(old.contains("old file contents"));
+    assert_eq!(replay_tool_output(&input, "call_mid"), "middle search hits");
+    assert_eq!(
+        replay_tool_output(&input, "call_recent"),
+        "tool error: command failed"
+    );
+    assert_replay_outputs_have_calls(&input);
+}
+
+#[test]
+fn rebuild_responses_input_clears_oldest_reduced_outputs_over_total_budget() {
+    let large = "x".repeat(70 * 1024);
+    let mut events = Vec::new();
+    for (prompt, call_id) in [
+        ("old one", "call_old_1"),
+        ("old two", "call_old_2"),
+        ("old three", "call_old_3"),
+    ] {
+        events.extend(replay_tool_turn(
+            prompt,
+            call_id,
+            "bash",
+            large.clone(),
+            false,
+        ));
+    }
+    events.extend(replay_tool_turn(
+        "recent one",
+        "call_recent_1",
+        "read_file",
+        "recent file".into(),
+        false,
+    ));
+    events.extend(replay_tool_turn(
+        "recent two",
+        "call_recent_2",
+        "code_search",
+        "recent search".into(),
+        false,
+    ));
+
+    let input = rebuild_responses_input(&events, Path::new("/tmp"));
+
+    assert_eq!(
+        replay_tool_output(&input, "call_old_1"),
+        CLEARED_TOOL_OUTPUT_PLACEHOLDER
+    );
+    assert!(
+        replay_tool_output(&input, "call_old_2").starts_with(REDUCED_TOOL_OUTPUT_PREFIX),
+        "second old output should stay reduced after the oldest is cleared"
+    );
+    assert!(
+        replay_tool_output(&input, "call_old_3").starts_with(REDUCED_TOOL_OUTPUT_PREFIX),
+        "third old output should stay reduced after the oldest is cleared"
+    );
+    assert_eq!(replay_tool_output(&input, "call_recent_1"), "recent file");
+    assert_eq!(replay_tool_output(&input, "call_recent_2"), "recent search");
+    assert_replay_outputs_have_calls(&input);
 }
 
 #[test]
