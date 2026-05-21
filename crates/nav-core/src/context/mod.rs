@@ -2,7 +2,7 @@
 //! attachments, compaction, session history, and `/context` measurement.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use crate::agent_loop::UserAttachment;
 pub use compaction::{
@@ -83,25 +83,38 @@ fn skill_instruction_section(skills: &Catalog) -> Option<InstructionSection> {
         return None;
     }
 
-    let mut body = String::from("\n\nAvailable skills:\n");
+    // Catalog entries are intentionally compact so the static prompt prefix
+    // stays cacheable. Skill bodies and absolute paths are not preloaded;
+    // the model loads a `SKILL.md` only when a request matches a skill.
+    let mut body = String::from("\n\nAvailable skills (load each on demand):\n");
     for skill in skills.iter() {
-        // Absolute paths: the model loads these via the read_file tool,
-        // which now accepts paths under any catalog skill_dir.
         let _ = writeln!(
             body,
-            "- {name} [{scope}]: {description} (SKILL.md: {path}, skill_dir: {dir})",
+            "- {name} [{scope}]: {description}",
             name = skill.name,
             scope = skill.scope.as_str(),
             description = skill.description,
-            path = skill.skill_md_path.display(),
-            dir = skill.skill_dir.display(),
         );
     }
+
     body.push_str(
-        "When a user request matches a skill, read the listed SKILL.md \
-         first to load its instructions before acting. Resolve any \
-         relative resources mentioned in a SKILL.md against that skill's \
-         skill_dir.",
+        "When a user request matches a skill, read its `SKILL.md` first to \
+         load full instructions, then act. Project skills live at \
+         `.agents/skills/<name>/SKILL.md` relative to the working directory \
+         above.",
+    );
+
+    if let Some(user_root) = first_user_skills_root(skills) {
+        let _ = write!(
+            body,
+            " User skills live at `{}/<name>/SKILL.md`.",
+            user_root.display()
+        );
+    }
+
+    body.push_str(
+        " Resolve any relative resources mentioned in a SKILL.md against \
+         that skill's directory.",
     );
 
     Some(InstructionSection {
@@ -109,6 +122,18 @@ fn skill_instruction_section(skills: &Catalog) -> Option<InstructionSection> {
         label: format!("{} skill(s)", skills.len()),
         body,
     })
+}
+
+/// The canonicalized user-skills root, derived from the first user-scoped
+/// catalog entry. `skills.rs` discovery enforces a single user root, so the
+/// first match is the root for every user-scoped skill. Returning the parent
+/// of `skill_dir` (rather than recomputing `~/.agents/skills/`) preserves the
+/// canonicalization the read_file guard expects.
+fn first_user_skills_root(skills: &Catalog) -> Option<PathBuf> {
+    skills
+        .iter()
+        .find(|s| s.scope == SkillScope::User)
+        .and_then(|s| s.skill_dir.parent().map(PathBuf::from))
 }
 
 fn project_context_sections(context: Option<&ProjectContext>) -> Vec<InstructionSection> {
