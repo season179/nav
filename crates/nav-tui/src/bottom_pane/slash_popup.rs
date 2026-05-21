@@ -38,6 +38,9 @@ pub const BUILTIN_SLASH_COMMANDS: &[&str] = &[
     "/queue-clear",
 ];
 
+/// Maximum number of slash command suggestions shown at once.
+const MAX_VISIBLE_SLASH_OPTIONS: usize = 3;
+
 /// One row in the slash popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashEntry {
@@ -93,15 +96,16 @@ pub struct SlashCommandPopup {
 
 impl SlashCommandPopup {
     pub fn new(entries: Arc<[SlashEntry]>, theme: Theme) -> Self {
-        let matches = (0..entries.len()).collect();
-        Self {
+        let mut popup = Self {
             entries,
             theme,
             filter: String::from("/"),
-            matches,
+            matches: Vec::new(),
             selected: 0,
             completed: false,
-        }
+        };
+        popup.refilter();
+        popup
     }
 
     pub fn matches(&self) -> Vec<&SlashEntry> {
@@ -220,15 +224,40 @@ impl SlashCommandPopup {
 
     fn refilter(&mut self) {
         self.matches.clear();
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if entry.command.starts_with(&self.filter) {
-                self.matches.push(idx);
-            }
-        }
+        let mut matching_indices: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| entry.command.starts_with(&self.filter).then_some(idx))
+            .collect();
+
+        matching_indices.sort_by(|&left_idx, &right_idx| {
+            let left = &self.entries[left_idx].command;
+            let right = &self.entries[right_idx].command;
+
+            slash_match_rank(left, &self.filter)
+                .cmp(&slash_match_rank(right, &self.filter))
+                .then_with(|| left.cmp(right))
+        });
+
+        self.matches
+            .extend(matching_indices.into_iter().take(MAX_VISIBLE_SLASH_OPTIONS));
         if self.selected >= self.matches.len() {
             self.selected = 0;
         }
     }
+}
+
+fn slash_match_rank(command: &str, filter: &str) -> (bool, bool, usize) {
+    (
+        command != filter,
+        !is_builtin_slash_command(command),
+        command.len(),
+    )
+}
+
+fn is_builtin_slash_command(command: &str) -> bool {
+    BUILTIN_SLASH_COMMANDS.contains(&command)
 }
 
 /// Build the combined slash entry list shared by every popup instance.
@@ -294,6 +323,10 @@ mod tests {
         )
     }
 
+    fn matching_commands(popup: &SlashCommandPopup) -> Vec<&str> {
+        popup.matches().iter().map(|e| e.command.as_str()).collect()
+    }
+
     #[test]
     fn builtin_entries_are_present() {
         let entries = build_slash_entries(&Catalog::default());
@@ -352,10 +385,8 @@ mod tests {
         let mut popup =
             SlashCommandPopup::new(build_slash_entries(&make_catalog()), Theme::default());
         popup.on_composer_text_changed("/fo");
-        let commands: Vec<&str> = popup.matches().iter().map(|e| e.command.as_str()).collect();
-        // `/fo` matches both the catalog skill `/foo` and the builtin
-        // `/fork`. Both should appear; the exact order is determined by the
-        // popup's stable ordering rather than this assertion.
+        let commands = matching_commands(&popup);
+
         assert!(commands.contains(&"/foo"));
         assert!(commands.contains(&"/fork"));
     }
@@ -365,7 +396,39 @@ mod tests {
         let mut popup =
             SlashCommandPopup::new(build_slash_entries(&Catalog::default()), Theme::default());
         popup.on_composer_text_changed("/he");
-        let commands: Vec<&str> = popup.matches().iter().map(|e| e.command.as_str()).collect();
-        assert_eq!(commands, vec!["/help"]);
+        assert_eq!(matching_commands(&popup), vec!["/help"]);
+    }
+
+    #[test]
+    fn popup_shows_at_most_three_options() {
+        let popup =
+            SlashCommandPopup::new(build_slash_entries(&Catalog::default()), Theme::default());
+        assert_eq!(popup.matches().len(), 3);
+        assert_eq!(popup.desired_height(80), 3);
+    }
+
+    #[test]
+    fn refilter_sorts_exact_then_builtins_then_shorter_then_alphabetical() {
+        let mut popup = SlashCommandPopup::new(
+            Arc::from([
+                SlashEntry {
+                    command: "/foo-extra".into(),
+                    description: None,
+                },
+                SlashEntry {
+                    command: "/foo".into(),
+                    description: None,
+                },
+                SlashEntry::builtin("/fork"),
+                SlashEntry::builtin("/find"),
+            ]),
+            Theme::default(),
+        );
+
+        popup.on_composer_text_changed("/foo");
+        assert_eq!(matching_commands(&popup), vec!["/foo", "/foo-extra"]);
+
+        popup.on_composer_text_changed("/f");
+        assert_eq!(matching_commands(&popup), vec!["/find", "/fork", "/foo"]);
     }
 }
