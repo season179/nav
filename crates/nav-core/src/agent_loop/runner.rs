@@ -183,6 +183,7 @@ pub async fn run_agent(request: AgentTurnRequest<'_>) -> Result<()> {
         request.attachments,
         request.events,
         request.session,
+        request.session.map(|binding| binding.store),
         request.initial_input,
         request.skills,
         request.context,
@@ -203,6 +204,7 @@ pub(super) async fn run_agent_inner(
     attachments: Vec<UserAttachment>,
     events: UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
+    tool_session_store: Option<&SessionStore>,
     initial_input: Option<Vec<Value>>,
     skills: &Catalog,
     context: Option<&ProjectContext>,
@@ -493,7 +495,7 @@ pub(super) async fn run_agent_inner(
                         "agent_tool_scope",
                     ))
                 } else {
-                    tool_registry::run_tool(
+                    tool_registry::run_tool_with_session_store(
                         cwd,
                         skills,
                         args.bash_timeout_secs,
@@ -501,6 +503,7 @@ pub(super) async fn run_agent_inner(
                         &call_id,
                         &tool_name,
                         tool_arguments.clone(),
+                        tool_session_store,
                         Some(&events),
                     )
                     .await

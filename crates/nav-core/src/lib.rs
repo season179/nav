@@ -58,7 +58,7 @@ pub use context::{
 // Session persistence, transcript search/export, and session tree layout.
 pub use context::{
     ExportFormat, PROVIDER_OPENAI_RESPONSES, ReportedCost, ResolveSessionError, SessionId,
-    SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, export_events,
+    SessionStore, SessionSummary, SessionTreeNode, ThreadReadOptions, TranscriptHit, export_events,
     infer_export_format, layout_session_tree, resolved_db_path,
 };
 
