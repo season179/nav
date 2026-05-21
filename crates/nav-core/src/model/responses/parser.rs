@@ -72,6 +72,43 @@ pub fn into_raw_output(response: ResponseEnvelope) -> Vec<Value> {
     response.raw_output
 }
 
+/// Strip provider-returned response items down to the form nav is willing to
+/// persist so the next `store: false` turn can replay the model's tool-call
+/// continuation without resending hidden plaintext reasoning. Assistant
+/// `message` items are dropped here because `AssistantMessageDone` is the
+/// durable record for those.
+///
+/// `reasoning` items keep only `type`, `id`, and `encrypted_content`. The
+/// `summary` and `content` arrays carry the model's plaintext reasoning trace
+/// and are deliberately discarded; an item with no `encrypted_content` has
+/// nothing left worth replaying and is skipped entirely.
+///
+/// All other item kinds (notably `function_call`) pass through verbatim so
+/// the wire shape the API expects on the next turn is preserved.
+pub fn sanitize_continuation_items(items: &[Value]) -> Vec<Value> {
+    items.iter().filter_map(sanitize_continuation_item).collect()
+}
+
+fn sanitize_continuation_item(item: &Value) -> Option<Value> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    match kind {
+        "message" => None,
+        "reasoning" => sanitize_reasoning_item(item),
+        _ => Some(item.clone()),
+    }
+}
+
+fn sanitize_reasoning_item(item: &Value) -> Option<Value> {
+    let encrypted = item.get("encrypted_content")?.clone();
+    let mut out = serde_json::Map::new();
+    out.insert("type".into(), Value::String("reasoning".into()));
+    if let Some(id) = item.get("id") {
+        out.insert("id".into(), id.clone());
+    }
+    out.insert("encrypted_content".into(), encrypted);
+    Some(Value::Object(out))
+}
+
 /// Concatenated text of every assistant `message` item in the collected
 /// envelope. The Responses API does not stamp output messages with
 /// `role: assistant` (they are implicit), so any `type: message` item with

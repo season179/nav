@@ -558,8 +558,22 @@ pub(super) async fn run_agent_inner(
 
         // store=false means the API does not remember the previous function_call.
         // We append the raw items so the next turn carries them alongside the
-        // function_call_output items the agent appends below.
-        input.extend(responses::into_raw_output(envelope));
+        // function_call_output items the agent appends below. The matching
+        // sanitized items are emitted as a durable event so a new `run_agent`
+        // invocation rehydrating from the session log can replay the same
+        // continuation without storing hidden plaintext reasoning.
+        let raw_output = responses::into_raw_output(envelope);
+        let continuation_items = responses::sanitize_continuation_items(&raw_output);
+        if !continuation_items.is_empty() {
+            emit(
+                &events,
+                session,
+                AgentEvent::ResponseContinuation {
+                    items: continuation_items,
+                },
+            );
+        }
+        input.extend(raw_output);
         let mut turn_had_mutation = false;
         let calls_in_this_turn = calls.len();
         for call in calls {

@@ -327,6 +327,10 @@ impl ChatWidget {
                     Some(message),
                 ));
             }
+            AgentEvent::ResponseContinuation { .. } => {
+                // Wire-level continuation handle for the next request — not
+                // user-facing scrollback.
+            }
         }
     }
 

@@ -400,7 +400,12 @@ fn rebuild_responses_input_replays_user_text_not_display_text() {
 }
 
 #[test]
-fn rebuild_responses_input_skips_tool_events() {
+fn rebuild_responses_input_drops_tool_io_without_continuation() {
+    // Sessions written before `ResponseContinuation` was persisted have
+    // `ToolCallStarted` / `ToolCallOutput` but no matching reasoning or
+    // `function_call` items. Replaying a `function_call_output` without
+    // its `function_call` would be rejected by the API, so the old
+    // tool-event-only shape must be skipped on replay.
     let input = rebuild_responses_input(
         &[
             AgentEvent::UserMessage {
@@ -432,6 +437,102 @@ fn rebuild_responses_input_skips_tool_events() {
         &input[1],
         "Cargo.toml is a Rust manifest."
     ));
+}
+
+#[test]
+fn rebuild_responses_input_replays_continuation_items_and_tool_outputs() {
+    // When `ResponseContinuation` carries the reasoning + function_call
+    // items the model emitted, replay must reproduce the same wire shape
+    // the agent loop originally appended in memory: reasoning, function_call,
+    // function_call_output.
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "inspect".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::ResponseContinuation {
+                items: vec![
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "enc-blob",
+                    }),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"Cargo.toml\"}",
+                    }),
+                ],
+            },
+            AgentEvent::ToolCallStarted {
+                call_id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "Cargo.toml"}),
+            },
+            AgentEvent::ToolCallOutput {
+                call_id: "call_1".into(),
+                output: "contents".into(),
+                is_error: false,
+                truncation: None,
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "Cargo.toml is a Rust manifest.".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
+
+    assert_eq!(input.len(), 5, "{input:#?}");
+    assert!(is_input_user_message(&input[0], "inspect"));
+    assert_eq!(input[1]["type"], "reasoning");
+    assert_eq!(input[1]["encrypted_content"], "enc-blob");
+    assert_eq!(input[2]["type"], "function_call");
+    assert_eq!(input[2]["call_id"], "call_1");
+    assert_eq!(input[3]["type"], "function_call_output");
+    assert_eq!(input[3]["call_id"], "call_1");
+    assert_eq!(input[3]["output"], "contents");
+    assert!(is_input_assistant_message(
+        &input[4],
+        "Cargo.toml is a Rust manifest."
+    ));
+}
+
+#[test]
+fn rebuild_responses_input_continuation_strips_hidden_plaintext_reasoning() {
+    // `ResponseContinuation` payloads must already be sanitized when
+    // persisted, but replay should also be robust to historical events
+    // that carry only the encrypted handle. Verify that an item with
+    // just `encrypted_content` round-trips without resurrecting any
+    // `summary` or `content` field on the way back to the wire.
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "hello".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::ResponseContinuation {
+                items: vec![json!({
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "enc-blob",
+                })],
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "hi".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
+
+    let reasoning = &input[1];
+    assert_eq!(reasoning["type"], "reasoning");
+    assert_eq!(reasoning["encrypted_content"], "enc-blob");
+    assert!(reasoning.get("summary").is_none());
+    assert!(reasoning.get("content").is_none());
 }
 
 #[test]
@@ -1028,6 +1129,115 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         events.last().unwrap(),
         AgentEvent::TurnComplete { .. }
     ));
+}
+
+#[tokio::test]
+async fn run_agent_emits_sanitized_response_continuation_with_function_call() {
+    // The model streams a reasoning item (with plaintext summary + content
+    // that must not be persisted) and a function_call item in the same
+    // turn. nav must surface a sanitized `ResponseContinuation` event with
+    // only the encrypted reasoning handle plus the verbatim function_call,
+    // and the second-turn request body must include the same items the
+    // in-memory loop appended via `into_raw_output`.
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "thinking out loud"}],
+                "content": [{"type": "reasoning_text", "text": "raw chain of thought"}],
+                "encrypted_content": "enc-blob",
+            }
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let turn_two = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "done"}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one, turn_two]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 4;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "do the thing",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent should succeed");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let continuation = events
+        .iter()
+        .find(|event| matches!(event, AgentEvent::ResponseContinuation { .. }))
+        .expect("expected ResponseContinuation event");
+    let items = match continuation {
+        AgentEvent::ResponseContinuation { items } => items,
+        _ => unreachable!(),
+    };
+    assert_eq!(items.len(), 2);
+    let reasoning = &items[0];
+    assert_eq!(reasoning["type"], "reasoning");
+    assert_eq!(reasoning["id"], "rs_1");
+    assert_eq!(reasoning["encrypted_content"], "enc-blob");
+    assert!(reasoning.get("summary").is_none());
+    assert!(reasoning.get("content").is_none());
+    let call = &items[1];
+    assert_eq!(call["type"], "function_call");
+    assert_eq!(call["call_id"], "call_1");
+    assert_eq!(call["name"], "bash");
+
+    // The second-turn request body must carry the function_call and the
+    // function_call_output back to the API. Verifies that the continuation
+    // path matches what the in-memory loop appended via `into_raw_output`.
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 2, "expected two stub requests");
+    let second_input = bodies[1]["input"]
+        .as_array()
+        .expect("input must be an array");
+    let pos_call = input_position(second_input, "function_call", |item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("call_id").and_then(Value::as_str) == Some("call_1")
+    });
+    let pos_output = input_position(second_input, "function_call_output", |item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            && item.get("call_id").and_then(Value::as_str) == Some("call_1")
+    });
+    assert!(pos_call < pos_output, "function_call must precede its output");
 }
 
 #[tokio::test]
@@ -2099,6 +2309,191 @@ async fn resume_replays_transcript_and_appends_new_events() {
         .filter(|e| matches!(e, AgentEvent::TurnComplete { .. }))
         .count();
     assert_eq!(turn_completes, 2);
+}
+
+#[tokio::test]
+async fn resume_replays_reasoning_continuation_and_function_call_output() {
+    // The first run ends mid-tool-turn: the model emitted a reasoning item +
+    // function_call, nav fielded the tool result, then the model concluded
+    // with a final assistant message. The persisted session log must let a
+    // fresh `run_agent` invocation rebuild a wire input that still carries
+    // the reasoning continuation handle and the matching function_call /
+    // function_call_output pair — without resurrecting any plaintext
+    // reasoning that should have been stripped at persistence time.
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+
+    let turn_one_tool_call = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "thinking out loud"}],
+                "content": [{"type": "reasoning_text", "text": "raw chain of thought"}],
+                "encrypted_content": "enc-blob",
+            }
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let turn_one_final = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Done."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let turn_two = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Acknowledged."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+
+    let mut args = Args::test_default();
+    args.max_turns = 4;
+
+    let transport_one = StubTransport::new(vec![turn_one_tool_call, turn_one_final]);
+    let binding_one = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport_one,
+        &args,
+        &cwd,
+        "do the thing",
+        None,
+        Vec::new(),
+        tx1,
+        Some(&binding_one),
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("first run_agent");
+    while rx1.recv().await.is_some() {}
+
+    // The persisted log must not contain the plaintext reasoning trace. We
+    // serialize the stored events as JSON and check the raw text for the
+    // hidden plaintext strings.
+    let stored = store.load_session(&session_id).unwrap();
+    let stored_json = serde_json::to_string(&stored).unwrap();
+    assert!(
+        !stored_json.contains("raw chain of thought"),
+        "hidden plaintext reasoning content leaked into session log: {stored_json}"
+    );
+    assert!(
+        !stored_json.contains("thinking out loud"),
+        "reasoning summary leaked into session log: {stored_json}"
+    );
+    assert!(
+        stored_json.contains("enc-blob"),
+        "encrypted reasoning handle should be persisted: {stored_json}"
+    );
+
+    let continuation = stored
+        .iter()
+        .find(|event| matches!(event, AgentEvent::ResponseContinuation { .. }))
+        .expect("expected persisted ResponseContinuation");
+    if let AgentEvent::ResponseContinuation { items } = continuation {
+        let reasoning = items
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .expect("reasoning item");
+        assert!(reasoning.get("summary").is_none());
+        assert!(reasoning.get("content").is_none());
+    }
+
+    // Rebuild for the next TUI turn and verify the wire shape replayed
+    // matches what the in-memory loop appended originally.
+    let rebuilt = rebuild_responses_input(&stored, &cwd);
+    let reasoning_pos = input_position(&rebuilt, "reasoning", |item| {
+        item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && item.get("encrypted_content").and_then(Value::as_str) == Some("enc-blob")
+    });
+    let call_pos = input_position(&rebuilt, "function_call", |item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("call_id").and_then(Value::as_str) == Some("call_1")
+    });
+    let output_pos = input_position(&rebuilt, "function_call_output", |item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            && item.get("call_id").and_then(Value::as_str) == Some("call_1")
+    });
+    assert!(reasoning_pos < call_pos);
+    assert!(call_pos < output_pos);
+
+    // Run the next user turn against the rebuilt input and check that the
+    // request body sent to the provider still includes the continuation
+    // items in the right positions.
+    let transport_two = StubTransport::new(vec![turn_two]);
+    let binding_two = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx2, mut rx2) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport_two,
+        &args,
+        &cwd,
+        "and then?",
+        None,
+        Vec::new(),
+        tx2,
+        Some(&binding_two),
+        Some(rebuilt),
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("second run_agent");
+    while rx2.recv().await.is_some() {}
+
+    let bodies = transport_two.bodies();
+    let body = bodies.first().expect("second turn body");
+    let input = body.get("input").and_then(Value::as_array).expect("input");
+    let reasoning_pos = input_position(input, "reasoning", |item| {
+        item.get("type").and_then(Value::as_str) == Some("reasoning")
+    });
+    let call_pos = input_position(input, "function_call", |item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call")
+    });
+    let output_pos = input_position(input, "function_call_output", |item| {
+        item.get("type").and_then(Value::as_str) == Some("function_call_output")
+    });
+    assert!(reasoning_pos < call_pos);
+    assert!(call_pos < output_pos);
 }
 
 #[tokio::test]

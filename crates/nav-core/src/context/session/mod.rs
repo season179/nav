@@ -304,6 +304,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
                 in_turn = false;
             }
             AgentEvent::AssistantMessageDelta { .. }
+            | AgentEvent::ResponseContinuation { .. }
             | AgentEvent::ProviderRetry { .. }
             | AgentEvent::ContextTrimmed { .. }
             | AgentEvent::ToolBudgetWarning { .. }
