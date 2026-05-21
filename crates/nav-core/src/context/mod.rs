@@ -193,6 +193,7 @@ pub(crate) mod attachments;
 pub mod compaction;
 
 pub mod extensions;
+pub(crate) mod history;
 pub mod project;
 pub mod replay;
 pub mod replay_policy;

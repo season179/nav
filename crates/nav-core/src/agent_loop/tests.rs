@@ -2881,6 +2881,72 @@ async fn user_message_with_image_attachment_is_sent_as_input_image_content() {
     );
 }
 
+#[tokio::test]
+async fn user_message_image_is_stripped_for_text_only_model() {
+    use std::path::PathBuf;
+
+    let turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}],
+            },
+        }),
+        json!({"type": "response.completed", "response": {"usage": {}}}),
+    ];
+    let transport = StubTransport::new(vec![turn]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 1;
+    args.model = "o3-mini".to_string();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\nFAKEBYTES";
+    let rel = PathBuf::from("paste.png");
+    std::fs::write(cwd.join(&rel), png_bytes).unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "describe this",
+        None,
+        vec![UserAttachment::Image { path: rel }],
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent");
+    drop(rx.recv().await);
+    while rx.recv().await.is_some() {}
+
+    let body = transport.bodies().remove(0);
+    let input = body.get("input").and_then(Value::as_array).expect("input");
+    let first = input.first().expect("first input item");
+    let parts = first
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("user message must have array content when attachments are present");
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image")),
+        "text-only model must not receive input_image parts: {parts:?}"
+    );
+    assert!(
+        parts
+            .iter()
+            .any(|part| part.get("type").and_then(Value::as_str) == Some("input_text")),
+        "input_text part must still be present after image stripping: {parts:?}"
+    );
+}
+
 // ── context-overflow recovery ─────────────────────────────────
 
 #[tokio::test]

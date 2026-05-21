@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::agent_loop::{AgentEvent, TurnUsage};
 use crate::cli::Args;
 use crate::context::build_ambient_context;
+use crate::context::history::ORPHAN_CALL_OUTPUT_PLACEHOLDER;
 use crate::context::replay::{CLEARED_TOOL_OUTPUT_PLACEHOLDER, REDUCED_TOOL_OUTPUT_PREFIX};
 use crate::context::{Catalog, ProjectContext};
 use crate::context::{InstructionSectionKind, instruction_sections};
@@ -42,6 +43,7 @@ enum ToolOutputState {
     Raw,
     Reduced,
     Cleared,
+    Orphan,
 }
 
 impl ToolOutputState {
@@ -50,6 +52,7 @@ impl ToolOutputState {
             Self::Raw => "raw",
             Self::Reduced => "reduced",
             Self::Cleared => "cleared",
+            Self::Orphan => "orphan",
         }
     }
 }
@@ -60,6 +63,8 @@ fn classify_function_call_output(item: &Value) -> ToolOutputState {
         ToolOutputState::Cleared
     } else if text.starts_with(REDUCED_TOOL_OUTPUT_PREFIX) {
         ToolOutputState::Reduced
+    } else if text.starts_with(ORPHAN_CALL_OUTPUT_PLACEHOLDER) {
+        ToolOutputState::Orphan
     } else {
         ToolOutputState::Raw
     }
@@ -877,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_state_labels_raw_reduced_and_cleared() {
+    fn tool_output_state_labels_raw_reduced_cleared_and_orphan() {
         let raw = json!({"type": "function_call_output", "call_id": "c1", "output": "ok"});
         let cleared = json!({
             "type": "function_call_output",
@@ -889,6 +894,11 @@ mod tests {
             "call_id": "c3",
             "output": format!("{REDUCED_TOOL_OUTPUT_PREFIX}; 12KB summary]"),
         });
+        let orphan = json!({
+            "type": "function_call_output",
+            "call_id": "c4",
+            "output": ORPHAN_CALL_OUTPUT_PLACEHOLDER,
+        });
 
         assert_eq!(classify_function_call_output(&raw), ToolOutputState::Raw);
         assert_eq!(
@@ -898,6 +908,10 @@ mod tests {
         assert_eq!(
             classify_function_call_output(&reduced),
             ToolOutputState::Reduced
+        );
+        assert_eq!(
+            classify_function_call_output(&orphan),
+            ToolOutputState::Orphan
         );
     }
 
