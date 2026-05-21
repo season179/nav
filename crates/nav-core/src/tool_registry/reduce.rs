@@ -272,6 +272,7 @@ pub fn reduce_bash(output: String, head_lines: usize) -> BoundedOutput {
     BoundedOutput {
         content,
         truncated: true,
+        kept_full_lines: bounded.kept_full_lines,
     }
 }
 

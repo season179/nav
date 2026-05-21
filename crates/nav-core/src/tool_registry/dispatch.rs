@@ -283,13 +283,8 @@ pub async fn run_tool_with_session_store(
                     ),
                 );
                 let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
-                let mut content = bounded.content;
-                if let Some(trailer) = trailer {
-                    if !content.ends_with('\n') {
-                        content.push('\n');
-                    }
-                    content.push_str(&trailer);
-                }
+                let content =
+                    finalize_sliced(bounded, trailer, offset.unwrap_or(1));
                 return Ok(ToolResult::text_with_truncation(content, truncation));
             }
             let reduced = reduce_read_file(sliced.into_combined())?;
@@ -437,17 +432,50 @@ fn expand_artifact(input: &Value) -> Result<ToolResult> {
         READ_FILE_MAX_BYTES.saturating_sub(trailer_len),
     );
     let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
-    let mut content = bounded.content;
-    if let Some(trailer) = trailer {
-        if !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(&trailer);
-    }
+    let content = finalize_sliced(bounded, trailer, offset.unwrap_or(1));
     Ok(ToolResult::text_with_truncation(
         content,
         truncation,
     ))
+}
+
+/// Reattach a slice trailer to a bounded body, rewriting the trailer when
+/// the bound itself dropped lines.
+///
+/// `apply_line_slice` builds its trailer (`showed lines X-Y; next offset Z`)
+/// assuming every requested line survives. When `bound_with_limits` then
+/// drops trailing lines to fit the byte cap, that promise is wrong: the model
+/// would jump to `next offset Z` and silently skip the bytes-truncated lines.
+/// In that case we discard the stale trailer and emit a corrected one keyed
+/// on the bound's reported `kept_full_lines`.
+fn finalize_sliced(
+    bounded: crate::tool_registry::truncate::BoundedOutput,
+    trailer: Option<String>,
+    slice_offset_1indexed: usize,
+) -> String {
+    let mut content = bounded.content;
+    if !bounded.truncated {
+        if let Some(trailer) = trailer {
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str(&trailer);
+        }
+        return content;
+    }
+    // Bound truncated the body itself — the slice's "next offset" hint is
+    // stale. Replace it with one anchored at the actual last kept line so
+    // the model resumes inside the byte-truncated window instead of past it.
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    let last_shown = slice_offset_1indexed.saturating_add(bounded.kept_full_lines);
+    content.push_str(&format!(
+        "[byte cap hit within slice; full lines shown stop at offset {prev}; \
+         resume with offset {last_shown} and a smaller `limit` to continue]\n",
+        prev = last_shown.saturating_sub(1).max(slice_offset_1indexed),
+    ));
+    content
 }
 
 fn read_thread(session_store: Option<&SessionStore>, input: &Value) -> Result<ToolResult> {
@@ -749,6 +777,62 @@ mod tests {
         );
         // And the body still starts at the requested offset.
         assert!(outcome.output.starts_with("ln1\n"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_slice_replaces_stale_next_offset_after_byte_cap() {
+        // Regression: when the sliced body itself exceeds READ_FILE_MAX_BYTES
+        // (e.g. very long lines inside the requested window), `bound_with_limits`
+        // drops trailing lines from the slice body. The original trailer
+        // emitted by `apply_line_slice` still claims those dropped lines were
+        // "shown" and points the model at the wrong next offset, so a follow-up
+        // read would silently skip the byte-truncated lines. We now rebuild a
+        // corrected trailer keyed on the bound's actual `kept_full_lines`.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        use crate::tool_registry::truncate::READ_FILE_MAX_BYTES;
+        // Each line takes ~half the byte cap so only two lines fit per
+        // request even though the requested slice spans far more.
+        let line_len = READ_FILE_MAX_BYTES / 2;
+        let long_line: String = "x".repeat(line_len);
+        let total_lines = 20usize;
+        let body: String = (1..=total_lines)
+            .map(|i| format!("{i:03}-{long_line}\n"))
+            .collect();
+        fs::write(cwd.join("fat.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "fat.txt", "offset": 1, "limit": 10}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        assert!(
+            outcome.output.contains("byte cap hit within slice"),
+            "expected corrected trailer naming the byte cap; got tail:\n{}",
+            outcome
+                .output
+                .lines()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // The stale "next offset 11" hint (which would skip the bytes-truncated
+        // lines) must not appear; the slice asked for lines 1-10 but only
+        // a couple actually survived bytes-wise.
+        assert!(
+            !outcome.output.contains("next offset 11"),
+            "stale next-offset hint must be replaced; got:\n{}",
+            outcome.output
+        );
     }
 
     #[tokio::test]
