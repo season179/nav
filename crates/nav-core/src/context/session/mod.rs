@@ -105,6 +105,8 @@ pub struct TranscriptHit {
     pub summary: SessionSummary,
 }
 
+pub use reference::ThreadReadOptions;
+
 /// One node in the parent → child tree returned by [`SessionStore::walk_tree`].
 /// `depth` is the distance from the root passed in (root itself is depth 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1373,5 +1375,6 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+mod reference;
 #[cfg(test)]
 mod tests;

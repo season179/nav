@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 pub const SPAWN_SUBAGENT_TOOL: &str = "spawn_subagent";
 pub const EXPAND_ARTIFACT_TOOL: &str = "expand_artifact";
+pub const READ_THREAD_TOOL: &str = "read_thread";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAccess {
@@ -23,12 +24,17 @@ impl ToolAccess {
                     | "edit_file"
                     | "apply_patch"
                     | "code_search"
+                    | READ_THREAD_TOOL
                     | EXPAND_ARTIFACT_TOOL
                     | SPAWN_SUBAGENT_TOOL
             ),
             ToolAccess::ReadOnly => matches!(
                 name,
-                "read_file" | "list_files" | "code_search" | EXPAND_ARTIFACT_TOOL
+                "read_file"
+                    | "list_files"
+                    | "code_search"
+                    | READ_THREAD_TOOL
+                    | EXPAND_ARTIFACT_TOOL
             ),
         }
     }
@@ -124,6 +130,37 @@ pub(crate) fn tool_definitions(access: ToolAccess, include_subagents: bool) -> V
                     "path": { "type": "string" }
                 },
                 "required": ["pattern", "path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": READ_THREAD_TOOL,
+            "description": "Read focused, budgeted excerpts from another stored nav session by full/partial id or URL. Use `query` or `around_seq` to narrow context; the tool never returns the full transcript by default.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Session ULID, unique prefix, or URL whose final path segment or session/session_id/id query parameter is the session id."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional case-insensitive text to search for before returning nearby events."
+                    },
+                    "around_seq": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Optional event sequence number to center the excerpt around."
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "minimum": 64,
+                        "maximum": 4096,
+                        "description": "Approximate output token budget; defaults to 800."
+                    }
+                },
+                "required": ["session"],
                 "additionalProperties": false
             }
         }),
