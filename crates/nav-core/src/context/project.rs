@@ -161,6 +161,8 @@ pub struct Settings {
     /// Fraction of `auto_compact_token_limit` at which automatic compaction
     /// fires. Defaults to [`crate::context::compaction::DEFAULT_AUTO_COMPACT_FRACTION`].
     pub auto_compact_fraction: Option<f32>,
+    /// Per-turn budget for ephemeral ambient context. `0` disables injection.
+    pub ambient_context_token_budget: Option<u64>,
     /// When true, create a git stash-backed checkpoint before each normal
     /// agent turn that starts from a dirty worktree.
     pub git_checkpoints: Option<bool>,
@@ -184,6 +186,9 @@ impl Settings {
             .auto_compact_token_limit
             .or(self.auto_compact_token_limit);
         self.auto_compact_fraction = other.auto_compact_fraction.or(self.auto_compact_fraction);
+        self.ambient_context_token_budget = other
+            .ambient_context_token_budget
+            .or(self.ambient_context_token_budget);
         self.git_checkpoints = other.git_checkpoints.or(self.git_checkpoints);
         self.theme = other.theme.or(self.theme.take());
     }

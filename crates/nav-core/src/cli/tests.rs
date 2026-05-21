@@ -13,6 +13,7 @@ fn defaults_are_correct() {
     assert_eq!(args.max_turns, 100);
     assert_eq!(args.tool_call_soft_budget, 25);
     assert_eq!(args.bash_timeout_secs, 20);
+    assert_eq!(args.ambient_context_token_budget, 256);
     assert_eq!(args.prompt, vec!["hello"]);
     assert!(args.codex_home.is_none());
     assert!(!args.json_rpc);
@@ -188,15 +189,28 @@ fn settings_fill_in_defaulted_args() {
         model: Some("custom-model".into()),
         max_turns: Some(20),
         tool_call_soft_budget: Some(7),
+        ambient_context_token_budget: Some(99),
         ..Settings::default()
     };
     args.apply_settings(&settings, &provided);
     assert_eq!(args.model, "custom-model");
     assert_eq!(args.max_turns, 20);
     assert_eq!(args.tool_call_soft_budget, 7);
+    assert_eq!(args.ambient_context_token_budget, 99);
     // Untouched fields stay at clap defaults.
     assert_eq!(args.bash_timeout_secs, 20);
     assert!(!args.git_checkpoints);
+}
+
+#[test]
+fn explicit_ambient_context_budget_flag_beats_settings() {
+    let (mut args, provided) = matches(&["nav", "--ambient-context-token-budget", "0", "hi"]);
+    let settings = Settings {
+        ambient_context_token_budget: Some(99),
+        ..Settings::default()
+    };
+    args.apply_settings(&settings, &provided);
+    assert_eq!(args.ambient_context_token_budget, 0);
 }
 
 #[test]

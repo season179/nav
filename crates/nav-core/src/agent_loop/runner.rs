@@ -14,7 +14,7 @@ use crate::agent_loop::prune::{ReplayBudget, prune_to_budget};
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
 use crate::context::compaction::{estimate_input_tokens, is_compact_command, should_auto_compact};
-use crate::context::{Catalog, ProjectContext, SessionId, SessionStore};
+use crate::context::{Catalog, ProjectContext, SessionId, SessionStore, push_ambient_context};
 use crate::git_checkpoint;
 use crate::guardrails::protected::is_protected_read;
 use crate::guardrails::{self, PermissionContext};
@@ -426,6 +426,7 @@ pub(super) async fn run_agent_inner(
         session,
         user_message_event(prompt, display_prompt, attachments),
     );
+    push_ambient_context(&mut input, cwd, context, args.ambient_context_token_budget);
     input.push(json!({
         "type": "message",
         "role": "user",

@@ -270,6 +270,7 @@ Example:
   "bash_timeout_secs": 30,
   "auto_compact_token_limit": 200000,
   "auto_compact_fraction": 1.0,
+  "ambient_context_token_budget": 256,
   "git_checkpoints": true,
   "theme": "night"
 }

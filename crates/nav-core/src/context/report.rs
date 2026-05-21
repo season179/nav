@@ -15,6 +15,7 @@ use crate::cli::Args;
 use crate::context::replay::{CLEARED_TOOL_OUTPUT_PLACEHOLDER, REDUCED_TOOL_OUTPUT_PREFIX};
 use crate::context::{Catalog, ProjectContext};
 use crate::context::{InstructionSectionKind, instruction_sections};
+use crate::context::build_ambient_context;
 use crate::context::{is_summary_message, rebuild_responses_input, should_auto_compact};
 use crate::tool_registry::{ToolAccess, tool_definitions};
 
@@ -24,6 +25,7 @@ const IMAGE_TOKEN_ESTIMATE: u64 = 1_000;
 // request shape the next normal turn will ship.
 pub const CATEGORY_INSTRUCTIONS: &str = "Instructions";
 pub const CATEGORY_TOOLS: &str = "Tools";
+pub const CATEGORY_AMBIENT: &str = "Ambient context";
 pub const CATEGORY_HISTORY: &str = "History";
 pub const CATEGORY_TOOL_OUTPUTS: &str = "Tool outputs";
 pub const CATEGORY_REASONING: &str = "Reasoning continuation";
@@ -31,7 +33,7 @@ pub const CATEGORY_REASONING: &str = "Reasoning continuation";
 fn is_request_body_bucket(label: &str) -> bool {
     matches!(
         label,
-        CATEGORY_HISTORY | CATEGORY_TOOL_OUTPUTS | CATEGORY_REASONING
+        CATEGORY_AMBIENT | CATEGORY_HISTORY | CATEGORY_TOOL_OUTPUTS | CATEGORY_REASONING
     )
 }
 
@@ -228,9 +230,14 @@ pub fn build_context_report_with_replay_cwd(
     skills: &Catalog,
     project: Option<&ProjectContext>,
 ) -> ContextReport {
-    let mut categories = Vec::with_capacity(5);
+    let mut categories = Vec::with_capacity(6);
     categories.push(instructions_category(cwd, skills, project));
     categories.push(tool_category());
+    categories.push(ambient_category(
+        cwd,
+        project,
+        args.ambient_context_token_budget,
+    ));
     let RequestBlocks {
         history,
         tool_outputs,
@@ -299,6 +306,40 @@ fn tool_category() -> ContextCategory {
         let body = serde_json::to_string(&tool).unwrap_or_default();
         category.add_text_item(label, &body);
     }
+    category
+}
+
+fn ambient_category(
+    cwd: &Path,
+    project: Option<&ProjectContext>,
+    token_budget: u64,
+) -> ContextCategory {
+    let mut category = ContextCategory::new(
+        CATEGORY_AMBIENT,
+        Some(if token_budget == 0 {
+            "disabled".to_string()
+        } else {
+            format!("budget {} tokens", format_u64(token_budget))
+        }),
+    );
+
+    if token_budget == 0 {
+        return category;
+    }
+
+    if let Some(ambient) = build_ambient_context(cwd, project, token_budget) {
+        category.add_text_item("turn-local snapshot", &ambient);
+        category.detail = Some(format!(
+            "included, budget {} tokens",
+            format_u64(token_budget)
+        ));
+    } else {
+        category.detail = Some(format!(
+            "omitted, over {}-token budget",
+            format_u64(token_budget)
+        ));
+    }
+
     category
 }
 
@@ -568,6 +609,7 @@ mod tests {
 
     use super::*;
     use crate::agent_loop::UserAttachment;
+    use crate::context::push_ambient_context;
     use crate::context::{Catalog, ContextFile, ContextScope, ProjectContext, Skill, SkillScope};
 
     #[test]
@@ -729,19 +771,74 @@ mod tests {
             vec![
                 CATEGORY_INSTRUCTIONS,
                 CATEGORY_TOOLS,
+                CATEGORY_AMBIENT,
                 CATEGORY_HISTORY,
                 CATEGORY_TOOL_OUTPUTS,
                 CATEGORY_REASONING,
             ],
-            "report must expose the five canonical buckets in the documented order"
+            "report must expose the canonical buckets in the documented order"
         );
         assert!(category_tokens(&report, CATEGORY_INSTRUCTIONS) > 0);
         assert!(category_tokens(&report, CATEGORY_TOOLS) > 0);
+        assert_eq!(category_tokens(&report, CATEGORY_AMBIENT), 0);
         // Empty replay still exposes the bucket so growth is attributable once
         // the bucket starts to fill.
         assert_eq!(category_tokens(&report, CATEGORY_HISTORY), 0);
         assert_eq!(category_tokens(&report, CATEGORY_TOOL_OUTPUTS), 0);
         assert_eq!(category_tokens(&report, CATEGORY_REASONING), 0);
+    }
+
+    #[test]
+    fn report_counts_ambient_context_as_own_bucket_when_under_budget() {
+        let mut args = Args::test_default();
+        args.ambient_context_token_budget = 256;
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+
+        let report = build_context_report(
+            &args,
+            tmp.path(),
+            &[],
+            &Catalog::default(),
+            Some(&ProjectContext::default()),
+        );
+        let ambient = report
+            .categories
+            .iter()
+            .find(|category| category.label == CATEGORY_AMBIENT)
+            .expect("ambient bucket present");
+
+        assert!(ambient.measure.tokens > 0);
+        assert_eq!(ambient.items[0].label, "turn-local snapshot");
+        assert!(ambient.items[0].measure.tokens <= 256);
+        assert!(report.render_text(true).contains("Ambient context"));
+    }
+
+    #[test]
+    fn report_omits_ambient_context_when_over_budget() {
+        let mut args = Args::test_default();
+        args.ambient_context_token_budget = 1;
+        let tmp = TempDir::new().unwrap();
+
+        let report = build_context_report(
+            &args,
+            tmp.path(),
+            &[],
+            &Catalog::default(),
+            Some(&ProjectContext::default()),
+        );
+        let ambient = report
+            .categories
+            .iter()
+            .find(|category| category.label == CATEGORY_AMBIENT)
+            .expect("ambient bucket present");
+
+        assert_eq!(ambient.measure.tokens, 0);
+        assert!(ambient.items.is_empty());
+        assert_eq!(
+            ambient.detail.as_deref(),
+            Some("omitted, over 1-token budget")
+        );
     }
 
     #[test]
@@ -842,7 +939,8 @@ mod tests {
 
     #[test]
     fn report_buckets_match_assembled_request_input() {
-        let args = Args::test_default();
+        let mut args = Args::test_default();
+        args.ambient_context_token_budget = 256;
         let cwd = Path::new("/tmp/nav");
         let events = vec![
             AgentEvent::UserMessage {
@@ -871,11 +969,17 @@ mod tests {
             Some(&ProjectContext::default()),
         );
 
-        let input = rebuild_responses_input(&events, cwd);
+        let mut input = rebuild_responses_input(&events, cwd);
+        push_ambient_context(
+            &mut input,
+            cwd,
+            Some(&ProjectContext::default()),
+            args.ambient_context_token_budget,
+        );
         assert_eq!(
             report.replay_items,
-            input.len(),
-            "replay_items reflects the assembled request input"
+            rebuild_responses_input(&events, cwd).len(),
+            "replay_items reflects replay history before turn-local ambient context"
         );
         let bucket_items: usize = report
             .categories
