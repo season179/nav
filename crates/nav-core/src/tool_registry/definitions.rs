@@ -38,10 +38,22 @@ pub(crate) fn tool_definitions(access: ToolAccess, include_subagents: bool) -> V
         json!({
             "type": "function",
             "name": "read_file",
-            "description": "Read the contents of a relative file path. Do not use this with directories.",
+            "description": "Read the contents of a relative file path. Do not use this with directories. Pass `offset` (1-indexed line number) and/or `limit` (line count) to read a slice instead of the whole file; truncated reads end with a notice that names the next offset and remaining-line count.",
             "parameters": {
                 "type": "object",
-                "properties": { "path": { "type": "string" } },
+                "properties": {
+                    "path": { "type": "string" },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-indexed line number to start reading from."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Maximum number of lines to return."
+                    }
+                },
                 "required": ["path"],
                 "additionalProperties": false
             }

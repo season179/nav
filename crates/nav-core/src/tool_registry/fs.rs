@@ -207,6 +207,65 @@ pub(super) fn read_file(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Resul
     fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
 }
 
+pub(super) fn read_file_sliced(
+    cwd: &Path,
+    skill_dirs: &[PathBuf],
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<String> {
+    let body = read_file(cwd, skill_dirs, path)?;
+    if offset.is_none() && limit.is_none() {
+        return Ok(body);
+    }
+    Ok(apply_line_slice(&body, offset, limit))
+}
+
+fn apply_line_slice(body: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    let offset = offset.unwrap_or(1).max(1);
+    let lines: Vec<&str> = body.split_inclusive('\n').collect();
+    let total = lines.len();
+    let start = offset - 1;
+
+    if start >= total {
+        return format!("[file has {total} lines; offset {offset} is past end]\n");
+    }
+
+    let end = match limit {
+        Some(n) => (start + n).min(total),
+        None => total,
+    };
+    let kept = end - start;
+    if kept == 0 {
+        let remaining = total - start;
+        return format!(
+            "[file has {total} lines; limit 0 returned no lines; {remaining} lines remain from offset {offset}]\n"
+        );
+    }
+
+    let mut out = String::with_capacity(body.len());
+    for line in &lines[start..end] {
+        out.push_str(line);
+    }
+    let truncated_head = start > 0;
+    let truncated_tail = end < total;
+    if truncated_head || truncated_tail {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if truncated_tail {
+            let remaining = total - end;
+            let next_offset = end + 1;
+            out.push_str(&format!(
+                "[showed lines {offset}-{end} of {total}; {remaining} more lines remain; next offset {next_offset}]\n"
+            ));
+        } else {
+            out.push_str(&format!("[showed lines {offset}-{end} of {total}]\n"));
+        }
+    }
+    out
+}
+
 pub(super) fn list_files(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Result<String> {
     let path = resolve_under(cwd, skill_dirs, path)?;
     let mut entries = fs::read_dir(&path)
@@ -394,7 +453,7 @@ fn apply_code_search_caps(stdout: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_file_with_metadata, read_file};
+    use super::{edit_file_with_metadata, read_file, read_file_sliced};
     use std::fs;
     use tempfile::tempdir;
 
@@ -650,6 +709,140 @@ mod tests {
         let entries: Vec<String> = (0..10).map(|i| format!("entry-{i}")).collect();
         let result = super::apply_list_files_cap(entries).unwrap();
         assert!(!result.contains("[truncated"));
+    }
+
+    #[test]
+    fn read_file_sliced_returns_window_with_next_offset_notice() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let body = (1..=10)
+            .map(|i| format!("line{i}\n"))
+            .collect::<String>();
+        fs::write(workspace.join("file.txt"), &body).unwrap();
+
+        let out =
+            read_file_sliced(&workspace, &[], "file.txt", Some(3), Some(4)).unwrap();
+
+        assert!(out.starts_with("line3\nline4\nline5\nline6\n"));
+        assert!(out.contains("[showed lines 3-6 of 10; 4 more lines remain; next offset 7]"));
+        assert!(!out.contains("line7\n"));
+        assert!(!out.contains("line2\n"));
+    }
+
+    #[test]
+    fn read_file_sliced_offset_only_skips_prefix() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let body = (1..=5).map(|i| format!("line{i}\n")).collect::<String>();
+        fs::write(workspace.join("file.txt"), &body).unwrap();
+
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(3), None).unwrap();
+
+        assert!(out.starts_with("line3\nline4\nline5\n"));
+        assert!(out.contains("[showed lines 3-5 of 5]"));
+        assert!(!out.contains("more lines remain"));
+    }
+
+    #[test]
+    fn read_file_sliced_limit_only_starts_at_one() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let body = (1..=5).map(|i| format!("line{i}\n")).collect::<String>();
+        fs::write(workspace.join("file.txt"), &body).unwrap();
+
+        let out = read_file_sliced(&workspace, &[], "file.txt", None, Some(2)).unwrap();
+
+        assert!(out.starts_with("line1\nline2\n"));
+        assert!(out.contains("[showed lines 1-2 of 5; 3 more lines remain; next offset 3]"));
+    }
+
+    #[test]
+    fn read_file_sliced_full_window_omits_trailer() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let body = "line1\nline2\nline3\n".to_string();
+        fs::write(workspace.join("file.txt"), &body).unwrap();
+
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(1), Some(10)).unwrap();
+
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn read_file_sliced_no_args_returns_whole_file() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        let body = "alpha\nbeta\n".to_string();
+        fs::write(workspace.join("file.txt"), &body).unwrap();
+
+        let out = read_file_sliced(&workspace, &[], "file.txt", None, None).unwrap();
+
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn read_file_sliced_offset_past_end_returns_notice() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        fs::write(workspace.join("file.txt"), "only\nthree\nlines\n").unwrap();
+
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(99), Some(5)).unwrap();
+
+        assert_eq!(out, "[file has 3 lines; offset 99 is past end]\n");
+    }
+
+    #[test]
+    fn read_file_sliced_zero_limit_returns_notice_with_remaining() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        fs::write(workspace.join("file.txt"), "a\nb\nc\nd\n").unwrap();
+
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(2), Some(0)).unwrap();
+
+        assert_eq!(
+            out,
+            "[file has 4 lines; limit 0 returned no lines; 3 lines remain from offset 2]\n"
+        );
+    }
+
+    #[test]
+    fn read_file_sliced_handles_file_without_trailing_newline() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        fs::write(workspace.join("file.txt"), "one\ntwo\nthree").unwrap();
+
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(2), Some(1)).unwrap();
+
+        assert!(out.starts_with("two\n"));
+        assert!(out.contains("[showed lines 2-2 of 3; 1 more lines remain; next offset 3]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_sliced_rejects_symlink_to_dotenv() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        fs::write(workspace.join(".env"), "SECRET=1\n").unwrap();
+        std::os::unix::fs::symlink(workspace.join(".env"), workspace.join("cfg")).unwrap();
+
+        let err = read_file_sliced(&workspace, &[], "cfg", Some(1), Some(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("protected secret"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_file_sliced_rejects_parent_traversal() {
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+
+        let err = read_file_sliced(&workspace, &[], "../escape.txt", Some(1), Some(1))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("parent directory traversal is not allowed")
+        );
     }
 
     #[test]

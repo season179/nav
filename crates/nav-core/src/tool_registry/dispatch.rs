@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -181,8 +181,10 @@ pub async fn run_tool(
 
     let skill_dirs = skills.skill_dirs();
     let result: Result<ToolResult> = match name {
-        "read_file" => fs::read_file(cwd, skill_dirs, string_arg(&input, "path")?)
-            .map(|out| ToolResult::text(bound(out, TruncateMode::Head))),
+        "read_file" => parse_read_file_args(&input).and_then(|(path, offset, limit)| {
+            fs::read_file_sliced(cwd, skill_dirs, path, offset, limit)
+                .map(|out| ToolResult::text(bound(out, TruncateMode::Head)))
+        }),
         "list_files" => {
             fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?).map(ToolResult::text)
         }
@@ -235,6 +237,30 @@ fn string_arg<'a>(input: &'a Value, key: &str) -> Result<&'a str> {
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing string input field `{key}`"))
+}
+
+fn parse_read_file_args(input: &Value) -> Result<(&str, Option<usize>, Option<usize>)> {
+    let path = string_arg(input, "path")?;
+    let offset = optional_usize_arg(input, "offset")?;
+    let limit = optional_usize_arg(input, "limit")?;
+    if matches!(offset, Some(0)) {
+        bail!("`offset` is 1-indexed; must be >= 1");
+    }
+    Ok((path, offset, limit))
+}
+
+fn optional_usize_arg(input: &Value, key: &str) -> Result<Option<usize>> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let n = value
+                .as_u64()
+                .ok_or_else(|| anyhow!("field `{key}` must be a non-negative integer"))?;
+            usize::try_from(n)
+                .map(Some)
+                .map_err(|_| anyhow!("field `{key}` is too large"))
+        }
+    }
 }
 
 pub fn failed_mutation_summary(name: &str, input: &Value) -> Option<String> {
@@ -366,6 +392,79 @@ mod tests {
         assert_eq!(outcome.output, "world");
         assert!(!outcome.is_error);
         assert!(outcome.mutation.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_applies_offset_and_limit() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let body = (1..=8).map(|i| format!("line{i}\n")).collect::<String>();
+        fs::write(cwd.join("slice.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "slice.txt", "offset": 2, "limit": 3}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        assert!(outcome.output.starts_with("line2\nline3\nline4\n"));
+        assert!(
+            outcome
+                .output
+                .contains("[showed lines 2-4 of 8; 4 more lines remain; next offset 5]")
+        );
+        assert!(!outcome.output.contains("line5\n"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_rejects_zero_offset() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::write(cwd.join("file.txt"), "hi\n").unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "file.txt", "offset": 0}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.output.contains("1-indexed"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_rejects_non_integer_offset() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        fs::write(cwd.join("file.txt"), "hi\n").unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "file.txt", "offset": "two"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.output.contains("non-negative integer"));
     }
 
     #[tokio::test]
