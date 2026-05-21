@@ -106,6 +106,7 @@ fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
         | AgentEvent::TurnAborted { .. }
         | AgentEvent::ProviderRetry { .. }
         | AgentEvent::ContextTrimmed { .. }
+        | AgentEvent::ToolBudgetWarning { .. }
         | AgentEvent::CompactionStarted { .. }
         | AgentEvent::CompactionCompleted { .. }
         | AgentEvent::CompactionFailed { .. }

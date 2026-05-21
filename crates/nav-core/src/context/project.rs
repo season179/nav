@@ -148,6 +148,9 @@ pub struct Settings {
     pub auth: Option<AuthMode>,
     pub transport: Option<Transport>,
     pub max_turns: Option<usize>,
+    /// Soft per-turn tool-call budget. After every N tool calls in a single
+    /// user turn nav injects a backpressure steering nudge. `0` disables.
+    pub tool_call_soft_budget: Option<usize>,
     pub bash_timeout_secs: Option<u64>,
     /// When `true`, skip context-file discovery entirely. Useful for repos
     /// that intentionally do not want their `AGENTS.md` shipped to the model.
@@ -174,6 +177,7 @@ impl Settings {
         self.auth = other.auth.or(self.auth);
         self.transport = other.transport.or(self.transport);
         self.max_turns = other.max_turns.or(self.max_turns);
+        self.tool_call_soft_budget = other.tool_call_soft_budget.or(self.tool_call_soft_budget);
         self.bash_timeout_secs = other.bash_timeout_secs.or(self.bash_timeout_secs);
         self.disable_context_files = other.disable_context_files.or(self.disable_context_files);
         self.auto_compact_token_limit = other
@@ -563,15 +567,17 @@ mod tests {
         let tmp_cwd = TempDir::new().unwrap();
         write(
             &tmp_home.path().join(".nav").join("settings.json"),
-            r#"{"model":"u","max_turns":99,"theme":"night"}"#,
+            r#"{"model":"u","max_turns":99,"tool_call_soft_budget":10,"theme":"night"}"#,
         );
         write(
             &tmp_cwd.path().join(".nav").join("settings.json"),
-            r#"{"model":"p"}"#,
+            r#"{"model":"p","tool_call_soft_budget":0}"#,
         );
         let ctx = load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
         assert_eq!(ctx.settings.model.as_deref(), Some("p"));
         assert_eq!(ctx.settings.max_turns, Some(99));
+        // Project setting wins for tool_call_soft_budget; `0` means disabled.
+        assert_eq!(ctx.settings.tool_call_soft_budget, Some(0));
         assert_eq!(ctx.settings.theme.as_deref(), Some("night"));
         assert_eq!(ctx.settings_sources.len(), 2);
     }

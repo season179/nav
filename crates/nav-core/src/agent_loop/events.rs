@@ -217,6 +217,15 @@ pub enum AgentEvent {
     ContextTrimmed {
         dropped_pairs: usize,
     },
+    /// Emitted when the tool-call count within a single user turn crosses a
+    /// multiple of `soft_budget`. nav also injects a model-visible steering
+    /// message so the agent is nudged to produce a deliverable or justify
+    /// continued exploration. `tool_calls` is the running count for the
+    /// current user turn; `soft_budget` is the configured threshold.
+    ToolBudgetWarning {
+        tool_calls: usize,
+        soft_budget: usize,
+    },
     /// A compaction turn is about to start. `tokens_before` is the lifetime
     /// cumulative `tokens_input` recorded against this session at the
     /// moment of compaction; `0` if no session totals were available. Auto
@@ -286,6 +295,7 @@ impl AgentEvent {
             AgentEvent::TurnAborted { .. } => "turn_aborted",
             AgentEvent::ProviderRetry { .. } => "provider_retry",
             AgentEvent::ContextTrimmed { .. } => "context_trimmed",
+            AgentEvent::ToolBudgetWarning { .. } => "tool_budget_warning",
             AgentEvent::CompactionStarted { .. } => "compaction_started",
             AgentEvent::CompactionCompleted { .. } => "compaction_completed",
             AgentEvent::CompactionFailed { .. } => "compaction_failed",
@@ -564,6 +574,24 @@ mod tests {
             })
         );
         assert_eq!(event.kind(), "tool_call_blocked");
+        assert!(event.is_durable());
+    }
+
+    #[test]
+    fn tool_budget_warning_wire_format() {
+        let event = AgentEvent::ToolBudgetWarning {
+            tool_calls: 25,
+            soft_budget: 25,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "tool_budget_warning",
+                "tool_calls": 25,
+                "soft_budget": 25,
+            })
+        );
+        assert_eq!(event.kind(), "tool_budget_warning");
         assert!(event.is_durable());
     }
 

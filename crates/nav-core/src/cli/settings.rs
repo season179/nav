@@ -69,6 +69,11 @@ impl Args {
         {
             self.max_turns = max_turns;
         }
+        if let Some(budget) = settings.tool_call_soft_budget
+            && !provided.was_provided("tool_call_soft_budget")
+        {
+            self.tool_call_soft_budget = budget;
+        }
         if let Some(secs) = settings.bash_timeout_secs
             && !provided.was_provided("bash_timeout_secs")
         {

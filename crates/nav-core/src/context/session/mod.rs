@@ -305,6 +305,7 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             AgentEvent::AssistantMessageDelta { .. }
             | AgentEvent::ProviderRetry { .. }
             | AgentEvent::ContextTrimmed { .. }
+            | AgentEvent::ToolBudgetWarning { .. }
             | AgentEvent::ToolCallApprovalRequest { .. }
             | AgentEvent::ToolCallApprovalDecision { .. }
             | AgentEvent::ToolCallBlocked { .. }
