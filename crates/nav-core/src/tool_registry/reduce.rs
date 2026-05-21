@@ -65,7 +65,7 @@ pub fn reduce_read_file(body: String) -> Result<ReducedRead> {
     let artifact = output_accumulator::store_artifact("read", body.as_bytes())?;
 
     let mut preview = String::new();
-    let mut kept_lines = 0usize;
+    let mut kept_full_lines = 0usize;
     let mut kept_bytes = 0usize;
     let mut first_line_clipped = false;
     for line in lines.iter().take(READ_PREVIEW_LINES) {
@@ -76,12 +76,17 @@ pub fn reduce_read_file(body: String) -> Result<ReducedRead> {
             // (outline "lines 1-0"), forcing an expand_artifact round-trip
             // just to see *any* content. Keep a UTF-8-safe prefix of the
             // first line in that case so the model has at least a glimpse.
-            if kept_lines == 0 {
+            //
+            // Crucially we do *not* advance `kept_full_lines` for a clipped
+            // prefix — the model still needs to resume *at* line 1 to read
+            // the rest of it. If we counted the partial line as kept, the
+            // trailer would say "next offset 2" and a follow-up read would
+            // silently skip the unshown bytes of line 1.
+            if kept_full_lines == 0 {
                 let room = READ_PREVIEW_BYTES.saturating_sub(kept_bytes);
                 let prefix = byte_prefix(line, room);
                 if !prefix.is_empty() {
                     preview.push_str(prefix);
-                    kept_lines = 1;
                     first_line_clipped = prefix.len() < line.len();
                 }
             }
@@ -89,26 +94,39 @@ pub fn reduce_read_file(body: String) -> Result<ReducedRead> {
         }
         preview.push_str(line);
         kept_bytes += line.len();
-        kept_lines += 1;
+        kept_full_lines += 1;
     }
-    let remaining_lines = total_lines.saturating_sub(kept_lines);
-    let next_offset = kept_lines + 1;
-
-    let clipped_note = if first_line_clipped {
-        " (first line clipped to fit byte budget)"
+    let next_offset = if first_line_clipped {
+        // Partial line 1 was shown but not consumed — resume at 1 to read
+        // the rest of it.
+        1
     } else {
-        ""
+        kept_full_lines + 1
     };
-    let header = format!(
-        "[file outline: {total_lines} lines, {total_bytes} bytes; preview showing lines 1-{kept_lines}{clipped_note}]\n",
-    );
+    let remaining_lines = total_lines.saturating_sub(kept_full_lines);
+
+    let header = if first_line_clipped {
+        format!(
+            "[file outline: {total_lines} lines, {total_bytes} bytes; preview showing a clipped prefix of line 1]\n",
+        )
+    } else {
+        format!(
+            "[file outline: {total_lines} lines, {total_bytes} bytes; preview showing lines 1-{kept_full_lines}]\n",
+        )
+    };
     let mut trailer = String::new();
     if !preview.ends_with('\n') {
         trailer.push('\n');
     }
-    trailer.push_str(&format!(
-        "[showed lines 1-{kept_lines} of {total_lines}; {remaining_lines} more lines remain; next offset {next_offset}]\n",
-    ));
+    if first_line_clipped {
+        trailer.push_str(&format!(
+            "[showed prefix of line 1 only ({total_lines} lines total); resume at offset 1 to read the rest of line 1]\n",
+        ));
+    } else {
+        trailer.push_str(&format!(
+            "[showed lines 1-{kept_full_lines} of {total_lines}; {remaining_lines} more lines remain; next offset {next_offset}]\n",
+        ));
+    }
     trailer.push_str(&format!(
         "[Artifact: {id} — call expand_artifact with artifact_id=\"{id}\" or read_file with offset={next_offset} to see the rest]\n",
         id = artifact.id,
@@ -430,17 +448,26 @@ mod tests {
         // Minified bundle: one line, longer than READ_PREVIEW_BYTES. Without
         // the first-line salvage path the preview would be empty and the
         // outline would say "lines 1-0", forcing an expand_artifact round-trip
-        // before the model could see any content.
+        // before the model could see any content. The salvage must NOT
+        // advance the line offset — the trailer must still resume at offset 1
+        // so the model re-reads the unshown bytes of line 1 instead of
+        // skipping past them.
         let body = "x".repeat(READ_FILE_MAX_BYTES + 4_096);
         let result = reduce_read_file(body).unwrap();
         let artifact = result.artifact.as_ref().unwrap();
         assert!(
-            result.content.contains("first line clipped"),
-            "header must surface that the first line was clipped"
+            result.content.contains("clipped prefix of line 1"),
+            "header must surface that the first line was clipped — got:\n{}",
+            result.content
         );
         assert!(
-            result.content.contains("lines 1-1"),
-            "outline must report one preview line, not zero — got:\n{}",
+            !result.content.contains("next offset 2"),
+            "next offset must NOT advance past the partially-shown line 1; got:\n{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("resume at offset 1"),
+            "trailer must direct the model to re-read line 1; got:\n{}",
             result.content
         );
         // The clipped prefix should fit comfortably under the byte ceiling
