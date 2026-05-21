@@ -195,6 +195,7 @@ pub mod compaction;
 pub mod extensions;
 pub mod project;
 pub mod replay;
+pub mod replay_policy;
 pub mod report;
 pub mod session;
 pub mod skills;

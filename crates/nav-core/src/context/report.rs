@@ -12,10 +12,10 @@ use serde_json::Value;
 
 use crate::agent_loop::{AgentEvent, TurnUsage};
 use crate::cli::Args;
+use crate::context::build_ambient_context;
 use crate::context::replay::{CLEARED_TOOL_OUTPUT_PLACEHOLDER, REDUCED_TOOL_OUTPUT_PREFIX};
 use crate::context::{Catalog, ProjectContext};
 use crate::context::{InstructionSectionKind, instruction_sections};
-use crate::context::build_ambient_context;
 use crate::context::{is_summary_message, rebuild_responses_input, should_auto_compact};
 use crate::tool_registry::{ToolAccess, tool_definitions};
 
@@ -612,6 +612,41 @@ mod tests {
     use crate::context::push_ambient_context;
     use crate::context::{Catalog, ContextFile, ContextScope, ProjectContext, Skill, SkillScope};
 
+    fn tool_turn(prompt: &str, call_id: &str, tool: &str, output: String) -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::UserMessage {
+                text: prompt.into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::ResponseContinuation {
+                items: vec![json!({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": tool,
+                    "arguments": "{}",
+                })],
+            },
+            AgentEvent::ToolCallStarted {
+                call_id: call_id.into(),
+                name: tool.into(),
+                arguments: json!({}),
+            },
+            AgentEvent::ToolCallOutput {
+                call_id: call_id.into(),
+                output,
+                is_error: false,
+                truncation: None,
+            },
+            AgentEvent::AssistantMessageDone {
+                text: format!("{tool} done"),
+            },
+            AgentEvent::TurnComplete {
+                usage: TurnUsage::default(),
+            },
+        ]
+    }
+
     #[test]
     fn report_splits_startup_context_from_conversation() {
         let mut args = Args::test_default();
@@ -868,8 +903,6 @@ mod tests {
 
     #[test]
     fn request_block_categories_classify_tool_outputs_and_reasoning() {
-        // Replay does not yet emit function_call / function_call_output /
-        // reasoning items, so drive the helper with a synthetic input array.
         let mut call_n = 0usize;
         let mut output_n = 0usize;
         let mut reasoning_n = 0usize;
@@ -935,6 +968,50 @@ mod tests {
         assert_eq!(reasoning.items[0].label, "reasoning continuation 1");
         assert!(tool_outputs.measure.tokens > 0);
         assert!(reasoning.measure.tokens > 0);
+    }
+
+    #[test]
+    fn report_labels_budgeted_replay_tool_outputs() {
+        let large = "x".repeat(70 * 1024);
+        let mut events = Vec::new();
+        events.extend(tool_turn("old one", "c1", "bash", large.clone()));
+        events.extend(tool_turn("old two", "c2", "bash", large.clone()));
+        events.extend(tool_turn("old three", "c3", "bash", large));
+        events.extend(tool_turn(
+            "recent one",
+            "c4",
+            "read_file",
+            "recent read".into(),
+        ));
+        events.extend(tool_turn(
+            "recent two",
+            "c5",
+            "code_search",
+            "recent hits".into(),
+        ));
+
+        let report = build_context_report(
+            &Args::test_default(),
+            Path::new("/tmp/nav"),
+            &events,
+            &Catalog::default(),
+            Some(&ProjectContext::default()),
+        );
+        let tool_outputs = report
+            .categories
+            .iter()
+            .find(|category| category.label == CATEGORY_TOOL_OUTPUTS)
+            .expect("tool output bucket");
+        let labels: Vec<_> = tool_outputs
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+
+        assert!(labels.contains(&"tool output 1 (cleared)"));
+        assert!(labels.contains(&"tool output 2 (reduced)"));
+        assert!(labels.contains(&"tool output 5 (raw)"));
+        assert!(report.render_text(true).contains("tool output 1 (cleared)"));
     }
 
     #[test]
