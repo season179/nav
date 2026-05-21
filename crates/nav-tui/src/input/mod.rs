@@ -28,7 +28,7 @@ pub(crate) fn handle_scrollback_key(
     (history_w, history_h): (u16, u16),
     allow_line_scroll: bool,
 ) -> bool {
-    const LINE_SCROLL_ROWS: u16 = 3;
+    const LINE_SCROLL_ROWS: u16 = 1;
 
     let page_rows = history_h.saturating_sub(1).max(1);
     match key.code {
@@ -320,6 +320,15 @@ mod tests {
         ));
         let newest = render_widget(&widget, 40, 6);
         assert!(newest.contains("line 19"), "{newest}");
+
+        assert!(handle_scrollback_key(
+            &mut widget,
+            &KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            (40, 6),
+            true,
+        ));
+        let one_row_older = render_widget(&widget, 40, 6);
+        assert!(one_row_older.contains("line 18"), "{one_row_older}");
 
         assert!(handle_scrollback_key(
             &mut widget,
