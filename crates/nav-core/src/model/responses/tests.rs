@@ -208,12 +208,11 @@ fn response_body_lists_skills_when_present() {
     let instructions = body["instructions"].as_str().unwrap();
     assert!(instructions.contains("Available skills"));
     assert!(instructions.contains("- demo [project]: demo skill"));
-    // The compact catalog must not bake skill_md / skill_dir absolute paths
-    // into every turn — those bloat the prompt and break prefix caching.
-    assert!(!instructions.contains("/abs/skills/demo/SKILL.md"));
-    assert!(!instructions.contains("skill_dir:"));
-    assert!(instructions.contains("`.agents/skills/<name>/SKILL.md`"));
-    assert!(instructions.contains("read its `SKILL.md` first"));
+    // Each skill entry advertises its discovered `skill_md_path` because
+    // frontmatter `name` may differ from the directory basename; without
+    // this the model would `read_file` a path that does not exist on disk.
+    assert!(instructions.contains("(read: /abs/skills/demo/SKILL.md)"));
+    assert!(instructions.contains("read its `SKILL.md`"));
 }
 
 #[test]
@@ -246,30 +245,38 @@ fn response_body_skill_section_lists_user_root_once_when_user_skills_present() {
     ]);
     let body = response_body(&args, cwd, &[], &catalog, None);
     let instructions = body["instructions"].as_str().unwrap();
-    // User root mentioned once, not per-skill.
-    let mentions = instructions.matches("/home/me/.agents/skills").count();
-    assert_eq!(
-        mentions, 1,
-        "user-skill root should be listed exactly once, got {mentions} mentions in:\n{instructions}"
-    );
-    assert!(instructions.contains("`/home/me/.agents/skills/<name>/SKILL.md`"));
+    // Each user-scoped skill now advertises its own SKILL.md path so
+    // a discovered name that differs from the directory basename
+    // still resolves; that means one mention per user skill, not one
+    // collapsed root line.
+    assert!(instructions.contains("(read: /home/me/.agents/skills/u1/SKILL.md)"));
+    assert!(instructions.contains("(read: /home/me/.agents/skills/u2/SKILL.md)"));
 }
 
 #[test]
-fn response_body_skill_section_omits_user_root_when_only_project_skills_present() {
+fn response_body_skill_section_advertises_per_skill_path() {
+    // When frontmatter `name` differs from the directory basename,
+    // discovery still keeps that skill, and the catalog must tell the
+    // model where SKILL.md actually lives — not a derived
+    // `.agents/skills/<frontmatter-name>/SKILL.md` that does not exist.
     use crate::context::{Skill, SkillScope};
     let args = Args::test_default();
     let cwd = std::path::Path::new("/tmp");
     let catalog = Catalog::new(vec![Skill {
-        name: "demo".into(),
+        // Frontmatter name (what the model invokes).
+        name: "renamed".into(),
         description: "demo".into(),
-        skill_md_path: "/work/.agents/skills/demo/SKILL.md".into(),
-        skill_dir: "/work/.agents/skills/demo".into(),
+        // Directory uses the legacy folder name.
+        skill_md_path: "/work/.agents/skills/legacy-dir/SKILL.md".into(),
+        skill_dir: "/work/.agents/skills/legacy-dir".into(),
         scope: SkillScope::Project,
     }]);
     let body = response_body(&args, cwd, &[], &catalog, None);
     let instructions = body["instructions"].as_str().unwrap();
-    assert!(!instructions.contains("User skills live at"));
+    assert!(instructions.contains("(read: /work/.agents/skills/legacy-dir/SKILL.md)"));
+    // The wrapper must not hard-code `.agents/skills/<name>/SKILL.md` —
+    // that pattern fails the moment name != dir.
+    assert!(!instructions.contains("`.agents/skills/<name>/SKILL.md`"));
 }
 
 #[test]
@@ -307,9 +314,9 @@ fn response_body_instructions_snapshot_with_skills() {
     - Paths must be relative.
 
     Available skills (load each on demand):
-    - review [project]: Review a pull request
-    - verify [user]: Verify changes by running the app
-    When a user request matches a skill, read its `SKILL.md` first to load full instructions, then act. Project skills live at `.agents/skills/<name>/SKILL.md` relative to the working directory above. User skills live at `/home/me/.agents/skills/<name>/SKILL.md`. Resolve any relative resources mentioned in a SKILL.md against that skill's directory.
+    - review [project]: Review a pull request (read: /work/.agents/skills/review/SKILL.md)
+    - verify [user]: Verify changes by running the app (read: /home/me/.agents/skills/verify/SKILL.md)
+    When a user request matches a skill, read its `SKILL.md` (the `read:` path on the line above) first to load full instructions, then act. Resolve any relative resources mentioned in a SKILL.md against that skill's directory.
     ");
 }
 

@@ -379,7 +379,17 @@ fn parse_read_file_args(input: &Value) -> Result<(&str, Option<usize>, Option<us
     if matches!(offset, Some(0)) {
         bail!("`offset` is 1-indexed; must be >= 1");
     }
-    Ok((path, offset, limit))
+    // When the model resumes a paginated read with `offset=N` (no `limit`)
+    // or a very large `limit`, the slice would otherwise run to EOF and
+    // emit no "next offset" trailer — and the downstream per-tool line
+    // cap would then drop the tail with only a generic truncation marker.
+    // Clamp to READ_FILE_MAX_LINES on the slice path so the trailer stays
+    // accurate and pagination keeps working on long files.
+    let clamped_limit = match offset {
+        Some(_) => Some(limit.unwrap_or(READ_FILE_MAX_LINES).min(READ_FILE_MAX_LINES)),
+        None => limit.map(|n| n.min(READ_FILE_MAX_LINES)),
+    };
+    Ok((path, offset, clamped_limit))
 }
 
 /// Parse the shared `(offset, limit)` line-slice arguments. Defaults the
@@ -657,6 +667,47 @@ mod tests {
                 .contains("[showed lines 2-4 of 8; 4 more lines remain; next offset 5]")
         );
         assert!(!outcome.output.contains("line5\n"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_offset_without_limit_clamps_to_max_lines() {
+        // Regression from pass 7: when the model resumes a paginated read
+        // with just `offset=N` (no `limit`), apply_line_slice would run to
+        // EOF, emit no "next offset" trailer, and the downstream 500-line
+        // cap would drop the tail with only a generic truncation marker —
+        // breaking pagination on long files. Clamping the slice limit
+        // makes the trailer accurate and pagination resumable.
+        use crate::tool_registry::truncate::READ_FILE_MAX_LINES;
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let total = READ_FILE_MAX_LINES * 3;
+        let body = (1..=total).map(|i| format!("row{i}\n")).collect::<String>();
+        fs::write(cwd.join("long.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "long.txt", "offset": 1}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        assert!(
+            outcome.output.contains("next offset"),
+            "offset without limit must clamp + emit pagination trailer; got tail:\n{}",
+            outcome
+                .output
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     #[tokio::test]
