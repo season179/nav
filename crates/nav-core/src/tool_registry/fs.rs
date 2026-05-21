@@ -6,16 +6,11 @@ use std::{
 use tokio::process::Command;
 
 use super::ToolResult;
-use super::truncate::{GREP_MAX_LINE_LENGTH, MAX_BYTES, truncate_line};
+use super::truncate::MAX_BYTES;
 use crate::guardrails::protected::{
     PROTECTED_READ_GLOBS, is_protected_metadata_write, is_protected_read,
 };
 use crate::verify::{FileChangeKind, FileChangeSummary, MutationResult, summarize_changes};
-
-/// Max grep matches returned to the model. Larger searches surface a
-/// trailer noting the dropped count so the model can refine the query
-/// rather than scrolling through pages of hits.
-const CODE_SEARCH_MAX_MATCHES: usize = 100;
 
 /// Max directory entries returned by `list_files`. Mirrors pi's `ls` cap.
 const LIST_FILES_MAX_ENTRIES: usize = 500;
@@ -409,46 +404,10 @@ pub(super) async fn code_search(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() || output.status.code() == Some(1) {
-        Ok(apply_code_search_caps(&stdout))
+        Ok(stdout.into_owned())
     } else {
         Ok(format!("rg failed: {stderr}"))
     }
-}
-
-/// Clip each match line and cap the result at `CODE_SEARCH_MAX_MATCHES`
-/// AND at `MAX_BYTES` so the per-tool trailer survives the global head
-/// bound applied in `run_tool`. Empty stdout (no matches) passes through.
-fn apply_code_search_caps(stdout: &str) -> String {
-    // 100 clipped lines can exceed MAX_BYTES (100 * 515b + newlines > 50 KB).
-    // Reserve a small headroom so the PRD-specified `[truncated N of TOTAL
-    // matches]` trailer always fits before the global head bound trims it.
-    const TRAILER_RESERVE: usize = 64;
-    let line_budget = MAX_BYTES.saturating_sub(TRAILER_RESERVE);
-
-    let mut all = stdout.lines();
-    let mut out = String::new();
-    let mut kept = 0usize;
-    let mut byte_budget_hit = false;
-
-    for line in all.by_ref().take(CODE_SEARCH_MAX_MATCHES) {
-        let (clipped, _) = truncate_line(line, GREP_MAX_LINE_LENGTH);
-        if out.len() + clipped.len() + 1 > line_budget {
-            byte_budget_hit = true;
-            break;
-        }
-        out.push_str(&clipped);
-        out.push('\n');
-        kept += 1;
-    }
-    // `all.count()` is the source-iterator remainder after `take(N)` consumed
-    // its quota or we broke out early. When we broke for budget, the
-    // already-consumed-but-rejected line isn't in that remainder, so add 1.
-    let dropped = all.count() + if byte_budget_hit { 1 } else { 0 };
-    if dropped > 0 {
-        let total = kept + dropped;
-        out.push_str(&format!("[truncated {dropped} of {total} matches]\n"));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -648,47 +607,6 @@ mod tests {
     }
 
     #[test]
-    fn code_search_caps_to_one_hundred_matches() {
-        let mut stdout = String::new();
-        for i in 0..200 {
-            stdout.push_str(&format!("file.rs:{}:hit-{i}\n", i + 1));
-        }
-        let result = super::apply_code_search_caps(&stdout);
-        let match_lines = result.lines().filter(|l| l.starts_with("file.rs:")).count();
-        assert_eq!(match_lines, 100);
-        assert!(
-            result.contains("[truncated 100 of 200 matches]"),
-            "missing trailer in: {result}"
-        );
-        // The earliest matches are the ones we keep.
-        assert!(result.contains("file.rs:1:hit-0\n"));
-        assert!(!result.contains("file.rs:101:hit-100\n"));
-    }
-
-    #[test]
-    fn code_search_no_truncation_when_under_cap() {
-        let mut stdout = String::new();
-        for i in 0..5 {
-            stdout.push_str(&format!("file.rs:{}:hit-{i}\n", i + 1));
-        }
-        let result = super::apply_code_search_caps(&stdout);
-        assert_eq!(result, stdout);
-        assert!(!result.contains("[truncated"));
-    }
-
-    #[test]
-    fn code_search_truncates_overlong_lines() {
-        let mut stdout = String::new();
-        // Single match with a huge line — should be clipped to GREP_MAX_LINE_LENGTH.
-        let payload = "x".repeat(2000);
-        stdout.push_str(&format!("file.rs:1:{payload}\n"));
-        let result = super::apply_code_search_caps(&stdout);
-        assert!(result.contains("... [truncated]"));
-        // No matches-trailer (only one match total).
-        assert!(!result.contains("of 1 matches"));
-    }
-
-    #[test]
     fn list_files_caps_to_five_hundred_entries() {
         let entries: Vec<String> = (0..700).map(|i| format!("entry-{i:03}")).collect();
         let result = super::apply_list_files_cap(entries).unwrap();
@@ -715,13 +633,10 @@ mod tests {
     fn read_file_sliced_returns_window_with_next_offset_notice() {
         let temp = tempdir().unwrap();
         let workspace = temp.path().canonicalize().unwrap();
-        let body = (1..=10)
-            .map(|i| format!("line{i}\n"))
-            .collect::<String>();
+        let body = (1..=10).map(|i| format!("line{i}\n")).collect::<String>();
         fs::write(workspace.join("file.txt"), &body).unwrap();
 
-        let out =
-            read_file_sliced(&workspace, &[], "file.txt", Some(3), Some(4)).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(3), Some(4)).unwrap();
 
         assert!(out.starts_with("line3\nline4\nline5\nline6\n"));
         assert!(out.contains("[showed lines 3-6 of 10; 4 more lines remain; next offset 7]"));
@@ -837,8 +752,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let workspace = temp.path().canonicalize().unwrap();
 
-        let err = read_file_sliced(&workspace, &[], "../escape.txt", Some(1), Some(1))
-            .unwrap_err();
+        let err = read_file_sliced(&workspace, &[], "../escape.txt", Some(1), Some(1)).unwrap_err();
         assert!(
             err.to_string()
                 .contains("parent directory traversal is not allowed")
