@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::BASH_HEAD_LINES;
-use super::truncate::{MAX_BYTES, TruncateMode, bound};
+use super::reduce::reduce_bash;
+use super::truncate::MAX_BYTES;
 
 /// Once cumulative output passes `MAX_ROLLING_BYTES`, the oldest portion of
 /// the rolling buffer is drained to disk and only the trailing window stays
@@ -121,12 +122,7 @@ impl OutputAccumulator {
     pub fn finish(mut self) -> Result<AccumulatorOutput> {
         if self.spill.is_none() {
             let content = String::from_utf8_lossy(&self.rolling).into_owned();
-            let bounded = bound(
-                content,
-                TruncateMode::HeadTail {
-                    head_lines: BASH_HEAD_LINES,
-                },
-            );
+            let bounded = reduce_bash(content, BASH_HEAD_LINES);
             return Ok(AccumulatorOutput {
                 content: bounded.content,
                 truncation: bounded.truncated.then_some(AccumulatorTruncation::Bound),
@@ -152,12 +148,7 @@ impl OutputAccumulator {
         let mut full = String::new();
         file.read_to_string(&mut full)
             .with_context(|| format!("failed to read back {}", self.spill_path.display()))?;
-        let bounded = bound(
-            full,
-            TruncateMode::HeadTail {
-                head_lines: BASH_HEAD_LINES,
-            },
-        );
+        let bounded = reduce_bash(full, BASH_HEAD_LINES);
         // `spill_path` is already absolute under the selected log directory,
         // so we don't need a canonicalize step. Skipping it also removes a
         // TOCTOU window where the path could be swapped with a symlink
@@ -305,15 +296,59 @@ fn is_valid_artifact_id(id: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 
+/// Stable id+path pair for a one-shot artifact written via [`store_artifact`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRef {
+    pub path: PathBuf,
+    pub id: String,
+}
+
+/// Write `body` to a fresh artifact file under the tool-output dir and
+/// return its stable id + absolute path. The id reuses the same
+/// `<prefix>-<ts>-<pid>-<seq>` naming the bash spill path uses, so
+/// `read_artifact` and the validator accept it without changes.
+///
+/// Use this for non-streaming tool outputs (full `read_file` body, future
+/// reducers) that need an artifact-backed recovery handle but never grow
+/// past a single `push`-equivalent write.
+pub fn store_artifact(prefix: &str, body: &[u8]) -> Result<ArtifactRef> {
+    let dir = writable_log_dir(default_log_dir()?)?;
+    let mut path = unique_path(&dir, prefix);
+    for _ in 0..3 {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(body)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                file.flush()
+                    .with_context(|| format!("failed to flush {}", path.display()))?;
+                let id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_owned)
+                    .expect("unique_path always produces a non-empty stem");
+                return Ok(ArtifactRef { path, id });
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                path = unique_path(&dir, prefix);
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to create {}", path.display()));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "failed to allocate a unique artifact file in {} after 3 attempts",
+        dir.display()
+    ))
+}
+
 /// Read the raw artifact body. Strictly read-only: the validator rejects
 /// any id with a path separator, so the resolver always lands inside the
 /// known tool-output dir. Tries the preferred XDG location first, then
 /// the temp-dir fallback used when XDG is not writable.
 pub fn read_artifact(artifact_id: &str) -> Result<String> {
     if !is_valid_artifact_id(artifact_id) {
-        anyhow::bail!(
-            "artifact_id is not a valid identifier (expected letters, digits, '_', '-')",
-        );
+        anyhow::bail!("artifact_id is not a valid identifier (expected letters, digits, '_', '-')",);
     }
     let filename = format!("{artifact_id}.log");
     let preferred = default_log_dir()?.join(&filename);
@@ -331,8 +366,9 @@ pub fn read_artifact(artifact_id: &str) -> Result<String> {
         Err(err) if err.kind() == ErrorKind::NotFound => anyhow::bail!(
             "artifact not found; it may have expired (artifacts are swept after 7 days) or never existed",
         ),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to read artifact at {}", fallback.display())),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read artifact at {}", fallback.display()))
+        }
     }
 }
 

@@ -19,6 +19,7 @@ pub mod preflight {
     pub use crate::guardrails::preflight::*;
 }
 mod read_filter;
+pub mod reduce;
 mod shell;
 pub mod truncate;
 
