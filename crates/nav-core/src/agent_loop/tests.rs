@@ -696,6 +696,62 @@ fn rebuild_responses_input_continuation_strips_hidden_plaintext_reasoning() {
 }
 
 #[test]
+fn rebuild_responses_input_drops_mid_prompt_continuation_when_aborted_after_iteration() {
+    // Regression: `finalize_turn` (and therefore `TurnComplete`) fires once
+    // per loop iteration, not once per user prompt. If a user prompt runs
+    // a tool call, completes one iteration, then gets aborted on the next
+    // approval/interrupt, the persisted continuation + tool output from
+    // that mid-prompt iteration must be dropped on replay. Without this
+    // anchor surviving the per-iteration TurnComplete, a resumed session
+    // would resend stale partial tool-call state for a prompt the user
+    // explicitly aborted.
+    let input = rebuild_responses_input(
+        &[
+            AgentEvent::UserMessage {
+                text: "do something risky".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::ResponseContinuation {
+                items: vec![
+                    json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "enc-blob",
+                    }),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"Cargo.toml\"}",
+                    }),
+                ],
+            },
+            AgentEvent::ToolCallOutput {
+                call_id: "call_1".into(),
+                output: "contents".into(),
+                is_error: false,
+                truncation: None,
+            },
+            AgentEvent::TurnComplete {
+                usage: TurnUsage::default(),
+            },
+            AgentEvent::TurnAborted {
+                turn_id: "turn-2".into(),
+                reason: "user denied next tool call".into(),
+            },
+        ],
+        Path::new("/tmp"),
+    );
+
+    assert!(
+        input.is_empty(),
+        "aborted prompt must leave no continuation/tool-output state in \
+         the replayed input, got: {input:#?}"
+    );
+}
+
+#[test]
 fn rebuild_responses_input_skips_aborted_turn_partial_answer() {
     let input = rebuild_responses_input(
         &[

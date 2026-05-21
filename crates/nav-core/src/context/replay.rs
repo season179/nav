@@ -71,7 +71,15 @@ pub fn rebuild_responses_input(events: &[AgentEvent], cwd: &Path) -> Vec<Value> 
 }
 
 fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path) {
-    let mut current_turn_start: Option<usize> = None;
+    // `user_turn_start` anchors replay back to the most recent UserMessage
+    // and is *not* cleared by per-iteration `TurnComplete` events — a
+    // single user prompt can drive multiple tool-call iterations, each
+    // emitting its own `TurnComplete`, and an abort that lands after a
+    // mid-prompt iteration still needs to drop every continuation and
+    // tool output emitted since the user's last message. Without this,
+    // resume would replay a partial tool-call state the user explicitly
+    // aborted.
+    let mut user_turn_start: Option<usize> = None;
     // `function_call` items become valid in the wire input only when the
     // matching reasoning/function_call continuation was captured. We track
     // `call_id`s seen in `ResponseContinuation` so a stray `ToolCallOutput`
@@ -81,7 +89,7 @@ fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path)
     for event in events {
         match event {
             AgentEvent::UserMessage { .. } => {
-                current_turn_start = Some(input.len());
+                user_turn_start = Some(input.len());
                 pending_call_ids.clear();
                 push_replay_event(input, event, cwd);
             }
@@ -106,16 +114,24 @@ fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path)
                     }));
                 }
             }
-            AgentEvent::TurnComplete { .. }
-            | AgentEvent::CompactionCompleted { .. }
+            AgentEvent::CompactionCompleted { .. }
             | AgentEvent::CompactionFailed { .. }
             | AgentEvent::Error { .. } => {
                 push_replay_event(input, event, cwd);
-                current_turn_start = None;
+                user_turn_start = None;
                 pending_call_ids.clear();
             }
+            AgentEvent::TurnComplete { .. } => {
+                // `TurnComplete` fires *per provider iteration*, not per
+                // user turn — clearing the anchor here would let a later
+                // abort within the same user prompt leave mid-prompt
+                // continuation items in the replayed input. Keep the
+                // anchor; the next `UserMessage` (or terminal event
+                // above) is the right place to drop it.
+                push_replay_event(input, event, cwd);
+            }
             AgentEvent::TurnAborted { .. } => {
-                if let Some(start) = current_turn_start.take() {
+                if let Some(start) = user_turn_start.take() {
                     input.truncate(start);
                 }
                 pending_call_ids.clear();
