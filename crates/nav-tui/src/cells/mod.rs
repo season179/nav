@@ -18,7 +18,7 @@ mod welcome;
 mod wrapping;
 
 pub(crate) use tools::ToolCallContext;
-pub(crate) use wrapping::render_body;
+pub(crate) use wrapping::{count_wrapped_body_lines, render_body};
 
 pub use changes::{FileChangeCell, GitCheckpointCell, TurnDiffCell};
 pub use compaction::{CompactionCell, CompactionPhase};

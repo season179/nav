@@ -43,3 +43,33 @@ fn append_wrapped_line(raw_line: &str, body_width: usize, out: &mut Vec<Line<'st
 fn body_line(text: &str) -> Line<'static> {
     Line::from(format!("  {text}"))
 }
+
+/// Count the wrapped lines `render_body` would produce, without allocating.
+/// Mirrors the wrapping rules in [`render_body`] / [`append_wrapped_line`]:
+/// empty input → 0; otherwise each `\n`-delimited segment contributes
+/// `ceil(chars / body_width)` rows (minimum 1, even for empty segments and for
+/// `body_width == 0`).
+pub(crate) fn count_wrapped_body_lines(text: &str, width: u16) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let body_width = width.saturating_sub(2) as usize;
+    let trimmed = text.strip_suffix('\n').unwrap_or(text);
+    let mut total = 0;
+    for raw_line in trimmed.split('\n') {
+        total += count_wrapped_segment(raw_line, body_width);
+    }
+    total
+}
+
+fn count_wrapped_segment(raw_line: &str, body_width: usize) -> usize {
+    if body_width == 0 {
+        return 1;
+    }
+    let chars = raw_line.chars().count();
+    if chars == 0 {
+        1
+    } else {
+        chars.div_ceil(body_width)
+    }
+}

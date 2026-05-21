@@ -110,6 +110,20 @@ impl HistoryCell for AssistantMessageCell {
         out.extend(tail);
         finish_row_lines(TranscriptRowKind::AssistantMessage, style.label(), out)
     }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        // Streaming cell isn't cached at the widget level (it mutates on each
+        // delta), so the height of an in-flight assistant message gets queried
+        // on the scroll hot path. Skip the `Vec<Line>` materialization that
+        // `display_lines` does and just count rows. The +1 covers the trailing
+        // blank that `finish_row_lines` always appends; an empty body adds a
+        // single placeholder row before the blank.
+        let style = TranscriptRowKind::AssistantMessage.style();
+        let render_width = style.body_width(width, style.label());
+        let body = self.controller.partitioned_line_count(render_width);
+        let chrome = if body == 0 { 2 } else { 1 };
+        u16::try_from(body + chrome).unwrap_or(u16::MAX)
+    }
 }
 
 pub struct SkillInvocationCell {
@@ -180,6 +194,43 @@ mod tests {
           |---|---|
 
         ");
+    }
+
+    #[test]
+    fn assistant_desired_height_matches_display_lines_len() {
+        // `desired_height` skips the `Vec<Line>` allocation on the scroll hot
+        // path. Its result must stay in lockstep with `display_lines().len()`
+        // — drift would let the scroll-clamp math diverge from what gets
+        // painted, hiding rows or letting the viewport scroll past the end.
+        let cases: &[(&str, bool)] = &[
+            ("", true),
+            ("short line", true),
+            ("two lines\nhere", true),
+            ("Quick summary:\n| a | b |\n|---|---|\n", false), // unterminated table -> tail
+            ("```rust\nfn main() {}\n```\nafter\n", true),
+            ("```rust\nfn main() {\n", false), // unterminated fence -> tail
+            (
+                "a fairly long line that will definitely wrap several times across a narrow viewport width to test wrapping",
+                true,
+            ),
+        ];
+
+        for (text, finalize) in cases {
+            for width in [12u16, 24, 40, 80, 120] {
+                let mut cell = AssistantMessageCell::streaming();
+                cell.push_delta(text);
+                if *finalize {
+                    cell.finalize();
+                }
+                let display = cell.display_lines(width).len();
+                let desired = cell.desired_height(width) as usize;
+                assert_eq!(
+                    desired, display,
+                    "desired_height drift: text={text:?} width={width} finalize={finalize} \
+                     (desired={desired}, display={display})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use ratatui::text::Line;
 
-use crate::cells::render_body;
+use crate::cells::{count_wrapped_body_lines, render_body};
 
 #[derive(Default)]
 pub struct StreamController {
@@ -56,6 +56,16 @@ impl StreamController {
             render_body(&self.buffer[..end], width),
             render_body(&self.buffer[end..], width),
         )
+    }
+
+    /// Count the wrapped body lines without allocating any. Equivalent to
+    /// `partitioned_lines(width).0.len() + ...1.len()` but skips the
+    /// `Vec<Line>` materialization, which is the dominant cost when the
+    /// streaming buffer is large.
+    pub fn partitioned_line_count(&self, width: u16) -> usize {
+        let end = self.partition_offset();
+        count_wrapped_body_lines(&self.buffer[..end], width)
+            + count_wrapped_body_lines(&self.buffer[end..], width)
     }
 
     fn partition_offset(&self) -> usize {
