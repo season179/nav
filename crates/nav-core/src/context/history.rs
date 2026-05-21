@@ -36,8 +36,7 @@ pub(crate) const ORPHAN_CALL_OUTPUT_PLACEHOLDER: &str =
 /// message that owned it falls outside the configured image keep window.
 /// Stable so inspectors can classify the substitution without an
 /// out-of-band signal.
-pub(crate) const SHED_IMAGE_PLACEHOLDER: &str =
-    "[image omitted: older than keep window]";
+pub(crate) const SHED_IMAGE_PLACEHOLDER: &str = "[image omitted: older than keep window]";
 
 /// JSON marker key set on synthetic `role: user` items that nav injects
 /// turn-locally — ambient context and tool-budget steering nudges. Window
@@ -608,10 +607,7 @@ mod tests {
             .filter_map(call_id)
             .collect();
         assert!(outputs.contains(&"c1"), "real output kept: {outputs:?}");
-        assert!(
-            outputs.contains(&"c2"),
-            "orphan call repaired: {outputs:?}"
-        );
+        assert!(outputs.contains(&"c2"), "orphan call repaired: {outputs:?}");
         assert!(
             !outputs.contains(&"c-orphan"),
             "stray output removed: {outputs:?}"
@@ -693,11 +689,7 @@ mod tests {
 
     #[test]
     fn strip_synthetic_markers_removes_only_marker_field() {
-        let mut input = vec![
-            synthetic_user_msg("ambient"),
-            user_msg("real"),
-            call("c1"),
-        ];
+        let mut input = vec![synthetic_user_msg("ambient"), user_msg("real"), call("c1")];
         strip_synthetic_markers(&mut input);
         assert!(
             input[0].get(NAV_SYNTHETIC_MARKER_KEY).is_none(),
@@ -741,7 +733,12 @@ mod tests {
 
     #[test]
     fn shed_old_reasoning_noop_when_fewer_user_turns_than_keep_window() {
-        let mut input = vec![user_msg("only"), reasoning("rs_1"), call("c1"), output("c1", "ok")];
+        let mut input = vec![
+            user_msg("only"),
+            reasoning("rs_1"),
+            call("c1"),
+            output("c1", "ok"),
+        ];
         let before = input.clone();
         let dropped = shed_old_reasoning(&mut input, 2);
         assert_eq!(dropped, 0);
@@ -792,9 +789,9 @@ mod tests {
             "old image must be replaced: {old_parts:?}",
         );
         assert!(
-            old_parts
-                .iter()
-                .any(|part| part.get("text").and_then(Value::as_str) == Some(SHED_IMAGE_PLACEHOLDER)),
+            old_parts.iter().any(
+                |part| part.get("text").and_then(Value::as_str) == Some(SHED_IMAGE_PLACEHOLDER)
+            ),
             "placeholder text part expected in old message: {old_parts:?}",
         );
 

@@ -18,6 +18,13 @@ pub struct StatusBar<'a> {
     /// uncommitted changes. False when not in a repo.
     pub dirty: bool,
     pub state: AgentState,
+    /// Most recent `tokens_input` reported by the provider. For `store: false`
+    /// transports this is also the current context occupancy, since every turn
+    /// resends the full history. `0` before the first `TurnComplete`.
+    pub tokens_input: u64,
+    /// Effective context window used to compute the percentage. `0` hides the
+    /// gauge entirely.
+    pub context_window: u64,
 }
 
 pub enum AgentState {
@@ -73,6 +80,18 @@ impl<'a> Widget for StatusBar<'a> {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+        }
+        if let Some(pct) = self
+            .tokens_input
+            .saturating_mul(100)
+            .checked_div(self.context_window)
+        {
+            let denom_k = (self.context_window + 500) / 1000;
+            spans.push(Span::styled("  ·  ", dim));
+            spans.push(Span::styled(
+                format!("{}/{denom_k}k {pct}%", self.tokens_input),
+                dim,
+            ));
         }
         Paragraph::new(Line::from(spans)).render(area, buf);
     }

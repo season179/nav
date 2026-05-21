@@ -251,8 +251,7 @@ impl ResponsesTransport for OpenAiTransport {
                     // retain a full transcript clone in `ws_baseline` for
                     // the lifetime of the transport. Skip the observer and
                     // the `original_input` clone entirely in that case.
-                    let store_disabled =
-                        body.get("store").and_then(Value::as_bool) == Some(false);
+                    let store_disabled = body.get("store").and_then(Value::as_bool) == Some(false);
 
                     if store_disabled {
                         let result = retry::retry(&policy, on_retry, || async {
@@ -266,9 +265,8 @@ impl ResponsesTransport for OpenAiTransport {
                                 });
                             }
                             Err(retry::TransportError::ContextWindowExceeded { message }) => {
-                                let _ = tx.send(Err(
-                                    ResponsesError::ContextWindowExceeded { message },
-                                ));
+                                let _ =
+                                    tx.send(Err(ResponsesError::ContextWindowExceeded { message }));
                             }
                             Err(err) => return Err(err.into()),
                         }
@@ -310,9 +308,8 @@ impl ResponsesTransport for OpenAiTransport {
                                 // Surface as a stream-level error so run_agent's
                                 // one-shot recovery handles connect-time and
                                 // stream-time overflows the same way.
-                                let _ = tx.send(Err(
-                                    ResponsesError::ContextWindowExceeded { message },
-                                ));
+                                let _ =
+                                    tx.send(Err(ResponsesError::ContextWindowExceeded { message }));
                             }
                             Err(err) => return Err(err.into()),
                         }

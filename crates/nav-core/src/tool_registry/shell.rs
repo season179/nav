@@ -562,9 +562,7 @@ mod tests {
         );
         assert_eq!(
             result.truncation,
-            Some(
-                crate::tool_registry::output_accumulator::AccumulatorTruncation::Bound
-            ),
+            Some(crate::tool_registry::output_accumulator::AccumulatorTruncation::Bound),
             "rewrite path should bound in-memory, not spill"
         );
         assert!(

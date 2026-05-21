@@ -17,6 +17,8 @@ pub(super) struct TuiStatus<'a> {
     pub branch: Option<&'a str>,
     pub dirty: bool,
     pub state: AgentState,
+    pub tokens_input: u64,
+    pub context_window: u64,
 }
 
 pub(super) fn draw_tui(
@@ -51,6 +53,8 @@ pub(super) fn draw_tui(
                 branch: status.branch,
                 dirty: status.dirty,
                 state: status.state,
+                tokens_input: status.tokens_input,
+                context_window: status.context_window,
             },
             chunks[2],
         );

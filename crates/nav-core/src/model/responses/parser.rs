@@ -86,7 +86,10 @@ pub fn into_raw_output(response: ResponseEnvelope) -> Vec<Value> {
 /// All other item kinds (notably `function_call`) pass through verbatim so
 /// the wire shape the API expects on the next turn is preserved.
 pub fn sanitize_continuation_items(items: &[Value]) -> Vec<Value> {
-    items.iter().filter_map(sanitize_continuation_item).collect()
+    items
+        .iter()
+        .filter_map(sanitize_continuation_item)
+        .collect()
 }
 
 fn sanitize_continuation_item(item: &Value) -> Option<Value> {

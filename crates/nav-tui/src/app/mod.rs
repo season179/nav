@@ -114,6 +114,11 @@ pub async fn run(
     let mut control = ControlPlane::new();
     let mut active_turn: Option<ActiveTurnHandle> = None;
     let mut spinner_tick: u64 = 0;
+    // Latest provider-reported `tokens_input`. For `store: false` transports
+    // this is also the current context occupancy, since every turn resends the
+    // full history. Updated on `TurnComplete`; pre-first-turn value of `0`
+    // renders as `0/200k 0%`.
+    let mut last_tokens_input: u64 = 0;
     let cwd_short = shorten_home(&cwd);
     let branch = project.workspace.branch.clone();
     let dirty = project.workspace.dirty;
@@ -134,6 +139,8 @@ pub async fn run(
         pending_approvals.clone(),
         &sandbox_policy,
     );
+    let mut needs_draw = true;
+    let mut history_viewport = (1, 1);
 
     if let Some(prompt) = initial_prompt {
         app_tx
@@ -153,7 +160,11 @@ pub async fn run(
         // itself ending IS — `run_agent` returns exactly once per user prompt,
         // after the final `TurnComplete`. Reap a finished task here so the
         // status bar flips back to Ready only when work is actually over.
-        if active_turn.as_ref().is_some_and(ActiveTurnHandle::is_finished) {
+        if active_turn
+            .as_ref()
+            .is_some_and(ActiveTurnHandle::is_finished)
+        {
+            needs_draw = true;
             let active_id = control.active().map(|active| active.id().to_string());
             active_turn = None;
             if let Some(id) = active_id
@@ -178,32 +189,43 @@ pub async fn run(
             }
         }
 
-        let spinner = spinner_frame(spinner_tick);
-        let state = match active_turn.as_ref() {
-            Some(handle) => AgentState::Working {
-                elapsed: handle.elapsed(),
-                spinner,
-            },
-            None => AgentState::Ready,
-        };
-        let history_viewport = draw_tui(
-            &mut term.terminal,
-            &chat,
-            &pane,
-            TuiStatus {
-                model: &args.model,
-                cwd_short: &cwd_short,
-                branch: branch.as_deref(),
-                dirty,
-                state,
-            },
-        )?;
+        if needs_draw {
+            let spinner = spinner_frame(spinner_tick);
+            let state = match active_turn.as_ref() {
+                Some(handle) => AgentState::Working {
+                    elapsed: handle.elapsed(),
+                    spinner,
+                },
+                None => AgentState::Ready,
+            };
+            history_viewport = draw_tui(
+                &mut term.terminal,
+                &chat,
+                &pane,
+                TuiStatus {
+                    model: &args.model,
+                    cwd_short: &cwd_short,
+                    branch: branch.as_deref(),
+                    dirty,
+                    state,
+                    tokens_input: last_tokens_input,
+                    context_window: args.auto_compact_token_limit,
+                },
+            )?;
+            needs_draw = false;
+        }
 
         tokio::select! {
             Some(ev) = agent_rx.recv() => {
+                needs_draw = true;
                 pane.apply_agent_event(&ev);
                 if let AgentEvent::PendingInputDequeued { id, .. } = &ev {
                     control.remove_pending(id);
+                }
+                if let AgentEvent::TurnComplete { usage } = &ev
+                    && usage.tokens_input > 0
+                {
+                    last_tokens_input = usage.tokens_input;
                 }
                 if turn_is_terminal(&ev) {
                     let active_id = control.active().map(|active| active.id().to_string());
@@ -268,6 +290,7 @@ pub async fn run(
                 chat.ingest(ev);
             }
             Some(app) = app_rx.recv() => {
+                needs_draw = true;
                 match app {
                     AppEvent::Quit => break,
                     AppEvent::Clear => {
@@ -773,13 +796,19 @@ pub async fn run(
             }
             _ = tokio::time::sleep(Duration::from_millis(80)) => {
                 // 80 ms = ~12 Hz: fast enough that the braille spinner reads as
-                // motion, slow enough that an idle TUI doesn't peg a CPU core.
-                // The poll(0) below pulls *all* buffered keys per tick so a fast
-                // typist never lags a redraw behind their keystrokes.
-                spinner_tick = spinner_tick.wrapping_add(1);
+                // motion while a turn is active. When idle we still wake up to
+                // poll crossterm, but avoid repainting unchanged frames so
+                // native terminal text selection is not cleared by redraws.
+                // The poll(0) below pulls *all* buffered keys per tick so a
+                // fast typist never lags a redraw behind their keystrokes.
+                if active_turn.is_some() {
+                    spinner_tick = spinner_tick.wrapping_add(1);
+                    needs_draw = true;
+                }
                 while event::poll(Duration::from_millis(0))? {
                     match event::read()? {
                         CtEvent::Key(key) => {
+                            needs_draw = true;
                             if is_ctrl_c(&key) {
                                 if control.active().is_some() {
                                     ctrl_c_count = 0;
@@ -816,10 +845,14 @@ pub async fn run(
                             }
                         }
                         CtEvent::Paste(text) => {
+                            needs_draw = true;
                             // Bracketed paste was enabled at TUI entry
                             // (see write_tui_enter_sequences); without this
                             // arm the payload would be silently dropped.
                             pane.on_paste(&text);
+                        }
+                        CtEvent::Resize(_, _) => {
+                            needs_draw = true;
                         }
                         _ => {}
                     }

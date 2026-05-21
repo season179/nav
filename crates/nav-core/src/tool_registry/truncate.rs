@@ -52,11 +52,12 @@ impl BoundedOutput {
         &self,
         cause: crate::tool_registry::TruncationKind,
     ) -> Option<crate::tool_registry::TruncationMeta> {
-        self.truncated.then_some(crate::tool_registry::TruncationMeta {
-            truncated_by: cause,
-            full_output_path: None,
-            artifact_id: None,
-        })
+        self.truncated
+            .then_some(crate::tool_registry::TruncationMeta {
+                truncated_by: cause,
+                full_output_path: None,
+                artifact_id: None,
+            })
     }
 }
 

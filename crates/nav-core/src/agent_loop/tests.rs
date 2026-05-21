@@ -681,9 +681,7 @@ fn rebuild_responses_input_continuation_strips_hidden_plaintext_reasoning() {
                     "encrypted_content": "enc-blob",
                 })],
             },
-            AgentEvent::AssistantMessageDone {
-                text: "hi".into(),
-            },
+            AgentEvent::AssistantMessageDone { text: "hi".into() },
         ],
         Path::new("/tmp"),
     );
@@ -1639,7 +1637,10 @@ async fn run_agent_emits_sanitized_response_continuation_with_function_call() {
         item.get("type").and_then(Value::as_str) == Some("function_call_output")
             && item.get("call_id").and_then(Value::as_str) == Some("call_1")
     });
-    assert!(pos_call < pos_output, "function_call must precede its output");
+    assert!(
+        pos_call < pos_output,
+        "function_call must precede its output"
+    );
 }
 
 #[tokio::test]
@@ -3385,9 +3386,7 @@ async fn proactive_prune_sheds_oldest_pair_before_first_request() {
     // Pair preservation: no `function_call_output` without its `function_call`.
     let output_ids: std::collections::HashSet<&str> = sent_input
         .iter()
-        .filter(|item| {
-            item.get("type").and_then(Value::as_str) == Some("function_call_output")
-        })
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
         .filter_map(|item| item.get("call_id").and_then(Value::as_str))
         .collect();
     let call_ids: std::collections::HashSet<&str> = sent_input
@@ -3537,7 +3536,10 @@ async fn tool_call_soft_budget_emits_warning_and_injects_steering() {
     );
     assert!(matches!(
         warnings[0],
-        AgentEvent::ToolBudgetWarning { tool_calls: 2, soft_budget: 2 }
+        AgentEvent::ToolBudgetWarning {
+            tool_calls: 2,
+            soft_budget: 2
+        }
     ));
 
     // After the warning fires, the next request (turn index 2, the third

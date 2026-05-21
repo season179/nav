@@ -1290,9 +1290,7 @@ impl SessionStore {
         let escaped_prefix = escape_like_pattern(prefix);
         let conn = self.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT id FROM session WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id ASC LIMIT 3",
-            )
+            .prepare("SELECT id FROM session WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id ASC LIMIT 3")
             .map_err(|_| not_found())?;
         let rows = stmt
             .query_map(params![format!("{escaped_prefix}%")], |row| {

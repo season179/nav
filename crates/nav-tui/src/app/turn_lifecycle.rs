@@ -135,10 +135,7 @@ pub(super) fn clear_pending_inputs(
     );
 }
 
-pub(super) fn queue_active_steering(
-    active_turn: &Option<ActiveTurnHandle>,
-    item: PendingInput,
-) {
+pub(super) fn queue_active_steering(active_turn: &Option<ActiveTurnHandle>, item: PendingInput) {
     if item.mode != PendingInputMode::Steering {
         return;
     }
@@ -148,10 +145,7 @@ pub(super) fn queue_active_steering(
     handle.steering().lock().unwrap().push_back(item);
 }
 
-pub(super) fn replace_active_steering(
-    active_turn: &Option<ActiveTurnHandle>,
-    item: &PendingInput,
-) {
+pub(super) fn replace_active_steering(active_turn: &Option<ActiveTurnHandle>, item: &PendingInput) {
     if item.mode != PendingInputMode::Steering {
         return;
     }

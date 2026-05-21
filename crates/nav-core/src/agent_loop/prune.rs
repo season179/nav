@@ -190,9 +190,7 @@ mod tests {
             .collect();
         let mut outputs: Vec<&str> = input
             .iter()
-            .filter(|item| {
-                item.get("type").and_then(Value::as_str) == Some("function_call_output")
-            })
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
             .filter_map(|item| item.get("call_id").and_then(Value::as_str))
             .collect();
         calls.sort();

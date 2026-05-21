@@ -375,8 +375,7 @@ pub fn read_artifact(artifact_id: &str) -> Result<String> {
         }
     }
     if let Some((path, err)) = last_err {
-        return Err(err)
-            .with_context(|| format!("failed to read artifact at {}", path.display()));
+        return Err(err).with_context(|| format!("failed to read artifact at {}", path.display()));
     }
     anyhow::bail!(
         "artifact not found; it may have expired (artifacts are swept after 7 days) or never existed",

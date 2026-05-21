@@ -726,7 +726,8 @@ mod skill_parse_tests {
         // The agent_loop persists the full wrapped text on UserMessage.text.
         // Rewind must be able to peel the wrapper off so the composer shows
         // the visible request while restoring the wrapper for resubmit.
-        let wrapped = "<skill name=\"reviewer\" dir=\"/skills/reviewer\">\nBODY\n</skill>\n\ndo the thing";
+        let wrapped =
+            "<skill name=\"reviewer\" dir=\"/skills/reviewer\">\nBODY\n</skill>\n\ndo the thing";
         let parsed = parse_rewind_skill_prompt(wrapped, Some("do the thing")).expect("must parse");
         assert_eq!(parsed.name, "reviewer");
         assert_eq!(parsed.request, "do the thing");
@@ -766,7 +767,11 @@ mod skill_parse_tests {
              the slash-command path that originally emitted the wrapper"
         );
         assert_eq!(parsed.request, "please review this diff");
-        assert!(parsed.wrapped_body.starts_with("<prompt_template name=\"review\""));
+        assert!(
+            parsed
+                .wrapped_body
+                .starts_with("<prompt_template name=\"review\"")
+        );
         assert!(parsed.wrapped_body.ends_with("</prompt_template>"));
         assert!(
             !parsed.wrapped_body.contains("please review this diff"),
@@ -789,8 +794,7 @@ mod skill_parse_tests {
         )
         .expect("must parse");
         assert_eq!(
-            parsed.request,
-            "please audit this snippet: <skill name=\"x\">inner</skill> tail",
+            parsed.request, "please audit this snippet: <skill name=\"x\">inner</skill> tail",
             "request must include the user's full text, including any \
              literal </skill> tags inside it"
         );
@@ -809,7 +813,9 @@ mod skill_parse_tests {
             .expect("must parse");
         assert_eq!(parsed.request, "use </prompt_template> verbatim");
         assert!(
-            parsed.wrapped_body.ends_with("TEMPLATE BODY\n</prompt_template>"),
+            parsed
+                .wrapped_body
+                .ends_with("TEMPLATE BODY\n</prompt_template>"),
             "wrapped_body must close at the wrapper, not at the inner tag; got:\n{}",
             parsed.wrapped_body,
         );

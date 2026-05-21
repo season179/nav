@@ -13,11 +13,9 @@ pub use crate::permissions::classifier::{
 pub use crate::permissions::{
     ApprovalReason, AskForApproval, BlockRule, ReviewDecision, SandboxPolicy, SessionAllowlist,
 };
-pub use crate::sandbox::{
-    PassthroughRunner, SandboxRequest, SandboxRunner, select_for_platform,
-};
 #[cfg(target_os = "macos")]
 pub use crate::sandbox::SeatbeltRunner;
+pub use crate::sandbox::{PassthroughRunner, SandboxRequest, SandboxRunner, select_for_platform};
 pub use preflight::{PermissionContext, PreflightOutcome};
 
 /// `tool` field surfaced on approval/block events for protected `@file`

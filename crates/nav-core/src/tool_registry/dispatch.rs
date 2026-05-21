@@ -278,13 +278,11 @@ pub async fn run_tool_with_session_store(
                     body,
                     TruncateMode::Head,
                     READ_FILE_MAX_LINES,
-                    READ_FILE_MAX_BYTES.saturating_sub(
-                        trailer.as_deref().map(str::len).unwrap_or(0),
-                    ),
+                    READ_FILE_MAX_BYTES
+                        .saturating_sub(trailer.as_deref().map(str::len).unwrap_or(0)),
                 );
                 let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
-                let content =
-                    finalize_sliced(bounded, trailer, offset.unwrap_or(1));
+                let content = finalize_sliced(bounded, trailer, offset.unwrap_or(1));
                 return Ok(ToolResult::text_with_truncation(content, truncation));
             }
             let reduced = reduce_read_file(sliced.into_combined())?;
@@ -381,7 +379,11 @@ fn parse_read_file_args(input: &Value) -> Result<(&str, Option<usize>, Option<us
     // Clamp to READ_FILE_MAX_LINES on the slice path so the trailer stays
     // accurate and pagination keeps working on long files.
     let clamped_limit = match offset {
-        Some(_) => Some(limit.unwrap_or(READ_FILE_MAX_LINES).min(READ_FILE_MAX_LINES)),
+        Some(_) => Some(
+            limit
+                .unwrap_or(READ_FILE_MAX_LINES)
+                .min(READ_FILE_MAX_LINES),
+        ),
         None => limit.map(|n| n.min(READ_FILE_MAX_LINES)),
     };
     Ok((path, offset, clamped_limit))
@@ -401,7 +403,11 @@ fn parse_slice_args(input: &Value) -> Result<(Option<usize>, Option<usize>)> {
     if matches!(offset, Some(0)) {
         bail!("`offset` is 1-indexed; must be >= 1");
     }
-    let clamped = Some(limit.unwrap_or(READ_FILE_MAX_LINES).min(READ_FILE_MAX_LINES));
+    let clamped = Some(
+        limit
+            .unwrap_or(READ_FILE_MAX_LINES)
+            .min(READ_FILE_MAX_LINES),
+    );
     Ok((offset, clamped))
 }
 
@@ -411,18 +417,19 @@ fn expand_artifact(input: &Value) -> Result<ToolResult> {
     let body = output_accumulator::read_artifact(artifact_id)?;
     // Slice by line so the model sees the same "showed lines X-Y of Z;
     // next offset" trailer `read_file` emits and can resume paging.
-    let fs::SlicedRead { body: slice_body, trailer } = fs::apply_line_slice(&body, offset, limit);
+    let fs::SlicedRead {
+        body: slice_body,
+        trailer,
+    } = fs::apply_line_slice(&body, offset, limit);
     let combined_len = slice_body.len() + trailer.as_deref().map(str::len).unwrap_or(0);
     // Slice already enforced the line budget; only re-bound when bytes
     // exceed the cap (a pathological case of very long lines), otherwise
     // `bound_with_limits` would clip the paging trailer.
     if combined_len <= READ_FILE_MAX_BYTES {
-        return Ok(ToolResult::text(
-            match trailer {
-                Some(t) => slice_body + &t,
-                None => slice_body,
-            },
-        ));
+        return Ok(ToolResult::text(match trailer {
+            Some(t) => slice_body + &t,
+            None => slice_body,
+        }));
     }
     let trailer_len = trailer.as_deref().map(str::len).unwrap_or(0);
     let bounded = bound_with_limits(
@@ -433,10 +440,7 @@ fn expand_artifact(input: &Value) -> Result<ToolResult> {
     );
     let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
     let content = finalize_sliced(bounded, trailer, offset.unwrap_or(1));
-    Ok(ToolResult::text_with_truncation(
-        content,
-        truncation,
-    ))
+    Ok(ToolResult::text_with_truncation(content, truncation))
 }
 
 /// Reattach a slice trailer to a bounded body, rewriting the trailer when
@@ -788,7 +792,13 @@ mod tests {
         assert!(
             outcome.output.contains("next offset"),
             "trailer must survive bound:\n--- tail ---\n{}",
-            outcome.output.lines().rev().take(5).collect::<Vec<_>>().join("\n")
+            outcome
+                .output
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         // And the body still starts at the requested offset.
         assert!(outcome.output.starts_with("ln1\n"));
@@ -881,7 +891,9 @@ mod tests {
         .unwrap();
         assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
         assert!(
-            outcome.output.contains("byte cap hit on a single overlong line"),
+            outcome
+                .output
+                .contains("byte cap hit on a single overlong line"),
             "expected overlong-line advisory; got tail:\n{}",
             outcome
                 .output

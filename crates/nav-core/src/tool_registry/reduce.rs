@@ -564,10 +564,7 @@ mod tests {
             MAX_BYTES
         );
         // Byte cap must trigger before the row cap when paths are huge.
-        let summary_section = result
-            .split("\n\n")
-            .next()
-            .unwrap_or_default();
+        let summary_section = result.split("\n\n").next().unwrap_or_default();
         assert!(
             summary_section.len() <= CODE_SEARCH_SUMMARY_MAX_BYTES + 2_048,
             "summary section ({} bytes) must stay near the byte cap ({} bytes)",
