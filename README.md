@@ -300,10 +300,10 @@ executed yet.
 
 ## Active Design Notes
 
-- [docs/pre-compaction-token-efficiency-prd.md](docs/pre-compaction-token-efficiency-prd.md)
-  explains the next token-efficiency work: faithful but budgeted replay of
-  tool calls/results, clearer placeholders for old output, and sliced
-  `read_file` reads.
+- [docs/context-management-plan.md](docs/context-management-plan.md)
+  ranks the next token-efficiency work: lazy skills section, prompt caching,
+  proactive pruning, budgeted tool-call replay with placeholders, and sliced
+  `read_file` reads, plus Tier 2 UX (edit/restore, handoff, `@file`).
 - [docs/otel-observability-prd.md](docs/otel-observability-prd.md) explains
   the proposed telemetry shape: local logs stay canonical, while optional OTLP
   traces make usage, failures, approvals, retries, compactions, and token
