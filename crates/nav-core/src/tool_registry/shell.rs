@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::guardrails::PermissionContext;
 use crate::guardrails::SandboxRequest;
-use crate::tool_registry::output_accumulator::OutputAccumulator;
+use crate::tool_registry::output_accumulator::{AccumulatorOutput, OutputAccumulator};
 use crate::{permissions::bash_parse::parse_command_pipeline, tool_registry::fs};
 
 use super::read_filter::{self, ReadOptions};
@@ -30,7 +30,7 @@ pub(super) async fn bash(
     cwd: &Path,
     timeout_secs: u64,
     command: &str,
-) -> Result<String> {
+) -> Result<AccumulatorOutput> {
     // Both the read-rewrite shortcut and the native sandbox path produce a
     // single combined string; feed it through the accumulator so the
     // model-visible output is uniformly bounded and an oversize result
@@ -56,7 +56,7 @@ pub(super) async fn bash(
     };
     let mut acc = OutputAccumulator::new("bash")?;
     acc.push(combined.as_bytes())?;
-    Ok(acc.finish()?.content)
+    acc.finish()
 }
 
 fn read_rewrite(command: &str) -> Option<ReadRewrite> {
@@ -260,8 +260,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.contains("hello"));
-        assert!(result.contains("status:"));
+        assert!(result.content.contains("hello"));
+        assert!(result.content.contains("status:"));
+        assert!(result.truncation.is_none());
     }
 
     #[tokio::test]
@@ -274,7 +275,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.contains("stderr:\noops"));
+        assert!(result.content.contains("stderr:\noops"));
     }
 
     #[tokio::test]
@@ -287,7 +288,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.contains("status: exit status: 42"));
+        assert!(result.content.contains("status: exit status: 42"));
     }
 
     #[tokio::test]
@@ -300,7 +301,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.contains("status: exit status: 0"));
+        assert!(result.content.contains("status: exit status: 0"));
     }
 
     #[tokio::test]
@@ -313,7 +314,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, "alpha\nbravo");
+        assert_eq!(result.content, "alpha\nbravo");
     }
 
     #[tokio::test]
@@ -326,7 +327,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, "1 │ alpha\n2 │ bravo\n");
+        assert_eq!(result.content, "1 │ alpha\n2 │ bravo\n");
     }
 
     #[tokio::test]
@@ -343,7 +344,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, "fn main() {\n    println!(\"hi\");\n}");
+        assert_eq!(result.content, "fn main() {\n    println!(\"hi\");\n}");
     }
 
     #[tokio::test]
@@ -357,9 +358,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.contains("alpha\n"));
-        assert!(result.contains("bravo\n"));
-        assert!(!result.contains("failed to canonicalize"));
+        assert!(result.content.contains("alpha\n"));
+        assert!(result.content.contains("bravo\n"));
+        assert!(!result.content.contains("failed to canonicalize"));
     }
 
     #[tokio::test]
@@ -372,8 +373,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, "one\n[2 more lines]");
-        assert!(!result.contains("three"));
+        assert_eq!(result.content, "one\n[2 more lines]");
+        assert!(!result.content.contains("three"));
     }
 
     #[tokio::test]
@@ -391,8 +392,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, "[3 more lines]");
-        assert!(!result.contains("two"));
+        assert_eq!(result.content, "[3 more lines]");
+        assert!(!result.content.contains("two"));
     }
 
     #[tokio::test]
@@ -405,7 +406,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, "");
+        assert_eq!(result.content, "");
     }
 
     #[tokio::test]
@@ -418,7 +419,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, "one\ntwo\nthree");
+        assert_eq!(result.content, "one\ntwo\nthree");
     }
 
     #[tokio::test]
@@ -437,8 +438,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(result.contains("==> a.txt <=="));
-        assert!(result.contains("==> b.txt <=="));
+        assert!(result.content.contains("==> a.txt <=="));
+        assert!(result.content.contains("==> b.txt <=="));
     }
 
     #[tokio::test]
@@ -476,8 +477,8 @@ mod tests {
         .unwrap();
 
         for result in [numeric, split, long_eq, long_space] {
-            assert_eq!(result, "two\nthree");
-            assert!(!result.contains("one"));
+            assert_eq!(result.content, "two\nthree");
+            assert!(!result.content.contains("one"));
         }
     }
 
@@ -504,16 +505,27 @@ mod tests {
         )
         .await
         .unwrap();
+        let spill_path = match result.truncation.as_ref().expect("spill truncation") {
+            crate::tool_registry::output_accumulator::AccumulatorTruncation::Spilled { path } => {
+                path.clone()
+            }
+            other => panic!("expected Spilled, got {other:?}"),
+        };
+        assert!(
+            spill_path.is_absolute(),
+            "spill path should be absolute: {}",
+            spill_path.display()
+        );
         let trailer_marker = "[Full output: ";
         let trailer_at = result
+            .content
             .rfind(trailer_marker)
             .expect("trailer present in bash output");
-        let trailer_tail = &result[trailer_at + trailer_marker.len()..];
+        let trailer_tail = &result.content[trailer_at + trailer_marker.len()..];
         let path_end = trailer_tail.find(']').expect("closing bracket on trailer");
         let path_str = &trailer_tail[..path_end];
-        let path = Path::new(path_str);
-        assert!(path.is_absolute(), "trailer path was relative: {path_str}");
-        let on_disk = std::fs::read_to_string(path).expect("spill file readable");
+        assert_eq!(Path::new(path_str), spill_path);
+        let on_disk = std::fs::read_to_string(&spill_path).expect("spill file readable");
         assert!(
             on_disk.contains("\n200000\n") || on_disk.ends_with("200000\n"),
             "spill file is missing line 200000 (last 80 chars: {:?})",
@@ -522,7 +534,7 @@ mod tests {
         // The real nav data dir isn't hermetic here; clean up this run's
         // spill so successive `cargo test` invocations don't accumulate
         // files until the 7-day sweep catches them.
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&spill_path);
     }
 
     #[tokio::test]
@@ -543,18 +555,25 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            result.contains("[truncated"),
+            result.content.contains("[truncated"),
             "rewrite-path large output should be bounded: {}",
-            &result[..result.len().min(120)]
+            &result.content[..result.content.len().min(120)]
+        );
+        assert_eq!(
+            result.truncation,
+            Some(
+                crate::tool_registry::output_accumulator::AccumulatorTruncation::Bound
+            ),
+            "rewrite path should bound in-memory, not spill"
         );
         assert!(
-            !result.contains("[Full output:"),
+            !result.content.contains("[Full output:"),
             "rewrite path should not spill"
         );
         assert!(
-            result.len() < 80 * 1024,
+            result.content.len() < 80 * 1024,
             "bounded rewrite output was {} bytes",
-            result.len()
+            result.content.len()
         );
     }
 
@@ -565,6 +584,10 @@ mod tests {
         let result = bash(&unchecked_permission_context(), &cwd, 5, "pwd")
             .await
             .unwrap();
-        assert!(result.contains(&format!("stdout:\n{}", cwd.display())));
+        assert!(
+            result
+                .content
+                .contains(&format!("stdout:\n{}", cwd.display()))
+        );
     }
 }

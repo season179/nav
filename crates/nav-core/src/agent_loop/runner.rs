@@ -267,7 +267,7 @@ fn load_file_attachment(cwd_canonical: Option<&Path>, cwd: &Path, rel: &Path) ->
             ));
         }
     };
-    let bounded = bound(body, TruncateMode::Head);
+    let bounded = bound(body, TruncateMode::Head).content;
     Some(format!(
         "<attached file: {rel_display}>\n{bounded}\n</attached>",
     ))
@@ -593,42 +593,44 @@ pub(super) async fn run_agent_inner(
                     )
                     .await
                 };
-            let (output_text, is_error, aborted, mutation, failed_mutation_summary) = match result {
-                Ok(outcome) => {
-                    if let Some(blocked) = outcome.blocked {
-                        emit(
-                            &events,
-                            session,
-                            AgentEvent::ToolCallBlocked {
-                                call_id: call_id.clone(),
-                                tool: tool_name.clone(),
-                                reason: blocked.reason,
-                                rule: blocked.rule,
-                            },
-                        );
+            let (output_text, is_error, aborted, mutation, truncation, failed_mutation_summary) =
+                match result {
+                    Ok(outcome) => {
+                        if let Some(blocked) = outcome.blocked {
+                            emit(
+                                &events,
+                                session,
+                                AgentEvent::ToolCallBlocked {
+                                    call_id: call_id.clone(),
+                                    tool: tool_name.clone(),
+                                    reason: blocked.reason,
+                                    rule: blocked.rule,
+                                },
+                            );
+                        }
+                        let failed = if outcome.is_error && outcome.mutation.is_none() {
+                            tool_registry::failed_mutation_summary(&tool_name, &tool_arguments)
+                                .map(|summary| (summary, outcome.output.clone()))
+                        } else {
+                            None
+                        };
+                        (
+                            outcome.output,
+                            outcome.is_error,
+                            outcome.aborted,
+                            outcome.mutation,
+                            outcome.truncation,
+                            failed,
+                        )
                     }
-                    let failed = if outcome.is_error && outcome.mutation.is_none() {
-                        tool_registry::failed_mutation_summary(&tool_name, &tool_arguments)
-                            .map(|summary| (summary, outcome.output.clone()))
-                    } else {
-                        None
-                    };
-                    (
-                        outcome.output,
-                        outcome.is_error,
-                        outcome.aborted,
-                        outcome.mutation,
-                        failed,
-                    )
-                }
-                Err(err) => {
-                    let error_text = format!("tool error: {err:#}");
-                    let failed =
-                        tool_registry::failed_mutation_summary(&tool_name, &tool_arguments)
-                            .map(|summary| (summary, error_text.clone()));
-                    (error_text, true, false, None, failed)
-                }
-            };
+                    Err(err) => {
+                        let error_text = format!("tool error: {err:#}");
+                        let failed =
+                            tool_registry::failed_mutation_summary(&tool_name, &tool_arguments)
+                                .map(|summary| (summary, error_text.clone()));
+                        (error_text, true, false, None, None, failed)
+                    }
+                };
 
             input.push(json!({
                 "type": "function_call_output",
@@ -642,6 +644,7 @@ pub(super) async fn run_agent_inner(
                     call_id: call_id.clone(),
                     output: output_text.clone(),
                     is_error,
+                    truncation,
                 },
             );
             if let Some(mutation) = mutation {
@@ -831,6 +834,7 @@ fn blocked_tool_outcome(name: &str, reason: &str, rule: &str) -> tool_registry::
         }),
         aborted: false,
         mutation: None,
+        truncation: None,
     }
 }
 

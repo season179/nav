@@ -191,6 +191,7 @@ fn round_trip_create_append_load() {
             call_id: "c1".into(),
             output: "hi\n".into(),
             is_error: false,
+            truncation: None,
         },
         AgentEvent::TurnComplete {
             usage: TurnUsage {
@@ -812,6 +813,7 @@ fn markdown_export_groups_turns_and_collapses_tool_calls() {
             call_id: "call-1".into(),
             output: " M src/main.rs\n".into(),
             is_error: false,
+            truncation: None,
         },
         AgentEvent::AssistantMessageDone {
             text: "The tree is dirty.".into(),

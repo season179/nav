@@ -417,6 +417,7 @@ fn rebuild_responses_input_skips_tool_events() {
                 call_id: "call_1".into(),
                 output: "contents".into(),
                 is_error: false,
+                truncation: None,
             },
             AgentEvent::AssistantMessageDone {
                 text: "Cargo.toml is a Rust manifest.".into(),
@@ -959,6 +960,7 @@ async fn run_agent_emits_expected_sequence_with_usage() {
             call_id,
             output,
             is_error,
+            ..
         } => {
             assert_eq!(call_id, "call_1");
             assert!(!*is_error);
@@ -1026,6 +1028,87 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         events.last().unwrap(),
         AgentEvent::TurnComplete { .. }
     ));
+}
+
+#[tokio::test]
+async fn run_agent_emits_truncation_metadata_when_bash_spills() {
+    // Model asks for a bash command whose output is large enough to spill
+    // to disk. The emitted ToolCallOutput must surface `truncated`,
+    // `truncated_by`, and `full_output_path` so durable events let
+    // operators (and replay) link to the full output.
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_spill",
+                "name": "bash",
+                "arguments": "{\"command\":\"seq 1 200000\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let turn_two = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one, turn_two]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 4;
+    args.bash_timeout_secs = 30;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "spill",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let tool_output = events
+        .iter()
+        .find(|e| matches!(e, AgentEvent::ToolCallOutput { .. }))
+        .expect("ToolCallOutput should be emitted");
+    match tool_output {
+        AgentEvent::ToolCallOutput { truncation, .. } => {
+            let meta = truncation.as_ref().expect("spill truncation");
+            assert_eq!(
+                meta.truncated_by,
+                crate::tool_registry::TruncationKind::BashSpill
+            );
+            let path = meta
+                .full_output_path
+                .as_ref()
+                .expect("spill path should be set");
+            assert!(path.is_absolute(), "{}", path.display());
+            let _ = std::fs::remove_file(path);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1190,7 +1273,7 @@ async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
     let pos_output = event_position(&events, "ToolCallOutput", |event| {
         matches!(
             event,
-            AgentEvent::ToolCallOutput { call_id, output, is_error }
+            AgentEvent::ToolCallOutput { call_id, output, is_error, .. }
                 if call_id == "call_worker"
                     && !*is_error
                     && output.contains("Checked session/mod.rs")

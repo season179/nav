@@ -45,6 +45,7 @@ fn widget_with_numbered_output(line_count: usize) -> ChatWidget {
             .collect::<Vec<_>>()
             .join("\n"),
         is_error: false,
+        truncation: None,
     });
     widget
 }
@@ -195,6 +196,7 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
             .collect::<Vec<_>>()
             .join("\n"),
         is_error: false,
+        truncation: None,
     });
 
     let rendered = render_widget(&widget, 90, 20);
@@ -581,6 +583,7 @@ fn renders_full_turn_transcript() {
         call_id: "call_1".to_string(),
         output: "Cargo.toml\nsrc".to_string(),
         is_error: false,
+        truncation: None,
     });
     widget.ingest(AgentEvent::AssistantMessageDone {
         text: "Two entries: Cargo.toml and src.".to_string(),
@@ -704,6 +707,7 @@ fn scrolled_viewport_stays_stable_when_new_output_arrives() {
         call_id: "call_2".to_string(),
         output: "new line".to_string(),
         is_error: false,
+        truncation: None,
     });
     let after = render_widget(&widget, 40, 6);
 
@@ -724,6 +728,7 @@ fn scrolling_before_overflow_keeps_following_new_output() {
             .collect::<Vec<_>>()
             .join("\n"),
         is_error: false,
+        truncation: None,
     });
     let rendered = render_widget(&widget, 40, 6);
 
