@@ -1,7 +1,9 @@
 use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::cells::{
@@ -14,10 +16,79 @@ use crate::cells::{
 use crate::history::HistoryCell;
 use crate::theme::Theme;
 
+/// Wraps a history cell with a per-width layout cache. Wrapping text into
+/// styled lines is the dominant cost in scrollback rendering; caching it
+/// makes PgUp/PgDown O(viewport) instead of O(transcript) per keystroke.
+struct CachedCell {
+    inner: Box<dyn HistoryCell>,
+    layout: RefCell<Option<CellLayout>>,
+}
+
+struct CellLayout {
+    width: u16,
+    lines: Vec<Line<'static>>,
+}
+
+impl CachedCell {
+    fn new(inner: Box<dyn HistoryCell>) -> Self {
+        Self {
+            inner,
+            layout: RefCell::new(None),
+        }
+    }
+
+    fn ensure(&self, width: u16) {
+        let stale = self
+            .layout
+            .borrow()
+            .as_ref()
+            .map_or(true, |l| l.width != width);
+        if stale {
+            let lines = self.inner.display_lines(width);
+            *self.layout.borrow_mut() = Some(CellLayout { width, lines });
+        }
+    }
+
+    fn height(&self, width: u16) -> usize {
+        self.ensure(width);
+        self.layout.borrow().as_ref().map_or(0, |l| l.lines.len())
+    }
+
+    /// Append the slice `[start, end)` of this cell's cached lines (relative
+    /// to the cell, in line coordinates) into `out`. Caller is responsible
+    /// for clamping `start..end` to `0..height(width)`.
+    fn append_window(&self, width: u16, start: usize, end: usize, out: &mut Vec<Line<'static>>) {
+        self.ensure(width);
+        if let Some(layout) = self.layout.borrow().as_ref() {
+            out.extend(layout.lines[start..end].iter().cloned());
+        }
+    }
+}
+
+/// Common viewport-overlap accumulator: given the next segment's `lines` and
+/// the absolute byte position `acc` of its top edge, emit the slice that
+/// overlaps the visible window `[start, end)` into `out` and return the new
+/// `acc` (top edge of the next segment).
+fn extend_window(
+    acc: usize,
+    lines_len: usize,
+    start: usize,
+    end: usize,
+    mut copy: impl FnMut(usize, usize),
+) -> usize {
+    let seg_bottom = acc + lines_len;
+    if seg_bottom > start && acc < end {
+        let lstart = start.saturating_sub(acc);
+        let lend = (end - acc).min(lines_len);
+        copy(lstart, lend);
+    }
+    seg_bottom
+}
+
 /// Flat scrollback widget. Holds the full history as a vector of cells and
 /// renders a viewport over their flattened lines.
 pub struct ChatWidget {
-    cells: Vec<Box<dyn HistoryCell>>,
+    cells: Vec<CachedCell>,
     theme: Theme,
     tool_calls: HashMap<String, ToolCallContext>,
     subagent_labels: HashMap<String, String>,
@@ -79,12 +150,15 @@ impl ChatWidget {
     }
 
     pub fn push_session_tree(&mut self, nodes: Vec<SessionTreeNode>) {
-        self.cells.push(Box::new(SessionTreeCell::new(nodes)));
+        self.cells
+            .push(CachedCell::new(Box::new(SessionTreeCell::new(nodes))));
     }
 
     pub fn push_transcript_hits(&mut self, query: String, hits: Vec<TranscriptHit>) {
         self.cells
-            .push(Box::new(TranscriptHitsCell::new(query, hits)));
+            .push(CachedCell::new(Box::new(TranscriptHitsCell::new(
+                query, hits,
+            ))));
     }
 
     /// Prepend a welcome cell that orients the user (model, cwd, session id).
@@ -142,7 +216,9 @@ impl ChatWidget {
             AgentEvent::AssistantMessageDone { text } => {
                 if let Some((idx, mut cell)) = self.streaming_assistant.take() {
                     cell.finalize_with(&text);
-                    self.cells.insert(idx, Box::new(cell));
+                    let insert_at = idx.min(self.cells.len());
+                    self.cells
+                        .insert(insert_at, CachedCell::new(Box::new(cell)));
                 } else {
                     self.push_cell(AssistantMessageCell::new(text));
                 }
@@ -351,18 +427,16 @@ impl ChatWidget {
     }
 
     pub fn scroll_up(&mut self, rows: u16, width: u16, viewport_height: u16) {
-        let max_top = self.max_top(width, viewport_height);
+        let (max_top, current) = self.scroll_anchor(width, viewport_height);
         if max_top == 0 {
             self.scroll_top = None;
             return;
         }
-        let current = self.current_top(width, viewport_height);
         self.scroll_top = Some(current.saturating_sub(rows as usize));
     }
 
     pub fn scroll_down(&mut self, rows: u16, width: u16, viewport_height: u16) {
-        let max_top = self.max_top(width, viewport_height);
-        let current = self.current_top(width, viewport_height);
+        let (max_top, current) = self.scroll_anchor(width, viewport_height);
         let next = current.saturating_add(rows as usize);
         if next >= max_top {
             self.scroll_top = None;
@@ -372,7 +446,8 @@ impl ChatWidget {
     }
 
     pub fn scroll_to_top(&mut self, width: u16, viewport_height: u16) {
-        if self.max_top(width, viewport_height) == 0 {
+        let (max_top, _) = self.scroll_anchor(width, viewport_height);
+        if max_top == 0 {
             self.scroll_top = None;
         } else {
             self.scroll_top = Some(0);
@@ -383,43 +458,25 @@ impl ChatWidget {
         self.scroll_top = None;
     }
 
-    fn max_top(&self, width: u16, viewport_height: u16) -> usize {
-        self.rendered_height(width)
-            .saturating_sub(viewport_height as usize)
-    }
-
-    fn current_top(&self, width: u16, viewport_height: u16) -> usize {
-        let max_top = self.max_top(width, viewport_height);
-        self.scroll_top.unwrap_or(max_top).min(max_top)
+    /// Single-walk scroll math used by every key gesture. `max_top` is the
+    /// largest valid `scroll_top`; `current` is the effective top of the
+    /// viewport today, clamped to `max_top`. Folding both into one call keeps
+    /// PgUp/PgDown from walking the cell heights twice per keystroke (via
+    /// `max_top` + `current_top` previously).
+    fn scroll_anchor(&self, width: u16, viewport_height: u16) -> (usize, usize) {
+        let max_top = self
+            .rendered_height(width)
+            .saturating_sub(viewport_height as usize);
+        let current = self.scroll_top.unwrap_or(max_top).min(max_top);
+        (max_top, current)
     }
 
     fn rendered_height(&self, width: u16) -> usize {
-        self.iter_cells()
-            .map(|cell| cell.display_lines(width).len())
-            .sum()
-    }
-
-    fn render_lines(&self, width: u16) -> Vec<ratatui::text::Line<'static>> {
-        self.iter_cells()
-            .flat_map(|cell| cell.display_lines(width))
-            .collect()
-    }
-
-    fn iter_cells(&self) -> impl Iterator<Item = &dyn HistoryCell> {
-        let split = self
-            .streaming_assistant
-            .as_ref()
-            .map(|(idx, _)| (*idx).min(self.cells.len()))
-            .unwrap_or(self.cells.len());
-        let (head, tail) = self.cells.split_at(split);
-        head.iter()
-            .map(|cell| cell.as_ref())
-            .chain(
-                self.streaming_assistant
-                    .as_ref()
-                    .map(|(_, cell)| cell as &dyn HistoryCell),
-            )
-            .chain(tail.iter().map(|cell| cell.as_ref()))
+        let mut total: usize = self.cells.iter().map(|c| c.height(width)).sum();
+        if let Some((_, cell)) = &self.streaming_assistant {
+            total += cell.desired_height(width) as usize;
+        }
+        total
     }
 
     /// Push a cell that ends the in-flight assistant message. Closes the
@@ -427,7 +484,7 @@ impl ChatWidget {
     /// position before this cell appends after it.
     fn push_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
         self.close_streaming_assistant();
-        self.cells.push(Box::new(cell));
+        self.cells.push(CachedCell::new(Box::new(cell)));
     }
 
     fn push_work_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
@@ -441,14 +498,15 @@ impl ChatWidget {
     /// without finalizing it — `AssistantMessageDone` then splices the
     /// single assistant cell into its anchored position.
     fn push_local_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
-        self.cells.push(Box::new(cell));
+        self.cells.push(CachedCell::new(Box::new(cell)));
     }
 
     fn close_streaming_assistant(&mut self) {
         if let Some((idx, mut cell)) = self.streaming_assistant.take() {
             cell.finalize();
             let insert_at = idx.min(self.cells.len());
-            self.cells.insert(insert_at, Box::new(cell));
+            self.cells
+                .insert(insert_at, CachedCell::new(Box::new(cell)));
         }
     }
 
@@ -493,16 +551,48 @@ impl Widget for &ChatWidget {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let lines = self.render_lines(area.width);
-        let total = lines.len();
+        let width = area.width;
         let viewport_height = area.height as usize;
+
+        // Streaming assistant cell mutates on each delta, so it is not cached
+        // alongside the finalized cells. Materialize it once per frame and
+        // pair it with its anchor index.
+        let stream: Option<(usize, Vec<Line<'static>>)> = self
+            .streaming_assistant
+            .as_ref()
+            .map(|(idx, cell)| ((*idx).min(self.cells.len()), cell.display_lines(width)));
+
+        let cell_heights: Vec<usize> = self.cells.iter().map(|c| c.height(width)).collect();
+        let total: usize =
+            cell_heights.iter().sum::<usize>() + stream.as_ref().map_or(0, |(_, l)| l.len());
+
         let max_scroll = total.saturating_sub(viewport_height);
         let start = self.scroll_top.unwrap_or(max_scroll).min(max_scroll);
-        let visible: Vec<_> = lines
-            .into_iter()
-            .skip(start)
-            .take(viewport_height)
-            .collect();
+        let end = (start + viewport_height).min(total);
+
+        let mut visible: Vec<Line<'static>> = Vec::with_capacity(viewport_height);
+        let mut acc: usize = 0;
+        let anchor = stream.as_ref().map(|(a, _)| *a).unwrap_or(self.cells.len());
+
+        // `0..=self.cells.len()` is inclusive so the streaming cell can fire
+        // even when its anchor sits past the last finalized cell.
+        for i in 0..=self.cells.len() {
+            if i == anchor {
+                if let Some((_, ref lines)) = stream {
+                    acc = extend_window(acc, lines.len(), start, end, |lstart, lend| {
+                        visible.extend(lines[lstart..lend].iter().cloned());
+                    });
+                }
+            }
+            if i < self.cells.len() {
+                let cell = &self.cells[i];
+                let len = cell_heights[i];
+                acc = extend_window(acc, len, start, end, |lstart, lend| {
+                    cell.append_window(width, lstart, lend, &mut visible);
+                });
+            }
+        }
+
         Paragraph::new(visible).render(area, buf);
     }
 }
