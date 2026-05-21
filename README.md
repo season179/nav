@@ -125,6 +125,7 @@ Useful keys and commands:
 - `/context` estimates what the next model request will contain.
 - `/context all` expands the context report into item-level rows.
 - `/compact` summarizes older history and continues from the checkpoint.
+- `/handoff <goal>` starts a fresh session with an editable focused prompt.
 - `/sessions` lists stored sessions.
 - `/resume` opens the session picker.
 - `/quit` exits. Press `Ctrl+C` twice to exit cleanly.

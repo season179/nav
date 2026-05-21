@@ -8,15 +8,16 @@ use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent};
 use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
-    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, OpenAiTransport, PendingInputMode,
-    PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
+    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, HandoffDraft, OpenAiTransport,
+    PROVIDER_OPENAI_RESPONSES, PendingInputMode, PendingSkill, PendingSteeringQueue,
+    ProjectContext, SessionId, SessionStore, build_handoff_draft,
     cli::{Args, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -441,6 +442,60 @@ pub async fn run(
                             &mut chat,
                         );
                     }
+                    AppEvent::Handoff { goal } => {
+                        if turn_started_at.is_some() {
+                            chat.ingest(AgentEvent::Error {
+                                message: "cannot handoff while a turn is running".to_string(),
+                            });
+                            continue;
+                        }
+                        let source_session_id = session_id.clone();
+                        match create_handoff_session(
+                            store.as_ref(),
+                            &source_session_id,
+                            &cwd,
+                            &args.model,
+                            &goal,
+                        ) {
+                            Ok((new_id, draft)) => {
+                                clear_pending_inputs(
+                                    &mut control,
+                                    &active_steering_queue,
+                                    store.as_ref(),
+                                    &source_session_id,
+                                    &mut chat,
+                                    &mut pane,
+                                );
+                                session_id = new_id;
+                                permissions = build_tui_permissions(
+                                    &args,
+                                    Arc::clone(&store),
+                                    &session_id,
+                                    agent_tx.clone(),
+                                    pending_approvals.clone(),
+                                    &sandbox_policy,
+                                );
+                                control = ControlPlane::new();
+                                pending_skill = None;
+                                active_steering_queue = None;
+                                chat = ChatWidget::with_theme(theme);
+                                chat.push_welcome(
+                                    &args.model,
+                                    cwd.display().to_string(),
+                                    &session_id,
+                                    branch_summary.clone(),
+                                    context_summary.clone(),
+                                    settings_summary.clone(),
+                                );
+                                pane.set_composer_text(&draft.text);
+                                chat.push_session_notice(
+                                    "handoff",
+                                    handoff_notice(&session_id, &draft),
+                                );
+                            }
+                            Err(err) => chat.push_err(err),
+                        }
+                    }
                     AppEvent::ForkSession { at } => {
                         if turn_started_at.is_some() {
                             chat.ingest(AgentEvent::Error {
@@ -713,6 +768,51 @@ fn emit_pending_cleared(
         chat,
         pane,
     );
+}
+
+fn handoff_session_name(goal: &str) -> String {
+    let trimmed = goal.trim();
+    if trimmed.is_empty() {
+        return "handoff".to_string();
+    }
+    let mut name = format!("handoff: {trimmed}");
+    if name.chars().count() > 80 {
+        name = name.chars().take(77).collect::<String>();
+        name.push_str("...");
+    }
+    name
+}
+
+fn create_handoff_session(
+    store: &SessionStore,
+    source_session_id: &SessionId,
+    cwd: &Path,
+    model: &str,
+    goal: &str,
+) -> Result<(SessionId, HandoffDraft)> {
+    let events = store.load_session(source_session_id)?;
+    let draft = build_handoff_draft(goal, &events);
+    let session_name = handoff_session_name(goal);
+    let new_id = store.create_session_named(
+        cwd,
+        PROVIDER_OPENAI_RESPONSES,
+        model,
+        None,
+        Some(&session_name),
+    )?;
+    Ok((new_id, draft))
+}
+
+fn handoff_notice(session_id: &SessionId, draft: &HandoffDraft) -> String {
+    if draft.found_relevant_context {
+        return format!(
+            "Started fresh session {session_id} with editable handoff draft ({} context item(s))",
+            draft.included_entries
+        );
+    }
+    format!(
+        "Started fresh session {session_id} with editable handoff draft (no matching prior context)"
+    )
 }
 
 fn run_idle_git_action(

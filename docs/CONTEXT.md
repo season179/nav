@@ -89,8 +89,9 @@ The discovered [`Catalog`] is shared by three seams:
   paths the system prompt advertises are actually resolvable. Writes
   (`edit_file`) remain workspace-only.
 - The TUI slash popup is sourced from the same catalog: built-in commands
-  (`/help`, `/clear`, `/quit`, `/resume`, `/sessions`) plus one entry per
-  skill. Submitting `/<skill-name> <request>` wraps the SKILL.md body in a
+  (including `/help`, `/context`, `/compact`, `/handoff`, and session
+  management commands) plus one entry per skill. Submitting
+  `/<skill-name> <request>` wraps the SKILL.md body in a
   `<skill name=… dir=…>` block and inlines `<request>` for the next turn.
   Submitting `/<skill-name>` alone queues the wrapped body in TUI state and
   prepends it to the next non-slash prompt; each `run_agent` call is

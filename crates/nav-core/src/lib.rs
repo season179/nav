@@ -49,6 +49,9 @@ pub use context::{
     build_context_report_with_replay_cwd, rebuild_responses_input,
 };
 
+// Focused prompt draft extraction for `/handoff <goal>`.
+pub use context::{HANDOFF_SLASH, HandoffBudget, HandoffDraft, build_handoff_draft};
+
 // Project context and settings loaded from the launch workspace.
 pub use context::{
     ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,

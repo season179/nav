@@ -444,5 +444,24 @@ mod tests {
             rx.try_recv().unwrap(),
             AppEvent::ShowContext { include_all: true }
         ));
+
+        dispatch("/handoff finish issue 54", &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::Handoff { goal } if goal == "finish issue 54"
+        ));
+    }
+
+    #[test]
+    fn dispatch_submit_reports_missing_handoff_goal() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+
+        dispatch("/handoff", &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::SlashError { message } if message.contains("/handoff")
+        ));
     }
 }
