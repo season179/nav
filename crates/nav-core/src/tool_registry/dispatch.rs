@@ -469,12 +469,27 @@ fn finalize_sliced(
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    let last_shown = slice_offset_1indexed.saturating_add(bounded.kept_full_lines);
-    content.push_str(&format!(
-        "[byte cap hit within slice; full lines shown stop at offset {prev}; \
-         resume with offset {last_shown} and a smaller `limit` to continue]\n",
-        prev = last_shown.saturating_sub(1).max(slice_offset_1indexed),
-    ));
+    if bounded.kept_full_lines == 0 {
+        // Single line at the requested offset is itself longer than the
+        // byte cap. Telling the model to retry at the same offset with a
+        // smaller `limit` would loop forever — read_file slices by line,
+        // not by bytes, so the next call would re-hit the same line and
+        // the same cap. Advise skipping past the offending line instead.
+        let skip_to = slice_offset_1indexed.saturating_add(1);
+        content.push_str(&format!(
+            "[byte cap hit on a single overlong line at offset {slice_offset_1indexed}; \
+             read_file slices by line, so retrying at this offset will always re-clip \
+             the same line — skip past it with offset {skip_to}, or use code_search \
+             to locate specific content inside the long line]\n",
+        ));
+    } else {
+        let last_shown = slice_offset_1indexed.saturating_add(bounded.kept_full_lines);
+        content.push_str(&format!(
+            "[byte cap hit within slice; full lines shown stop at offset {prev}; \
+             resume with offset {last_shown} and a smaller `limit` to continue]\n",
+            prev = last_shown.saturating_sub(1).max(slice_offset_1indexed),
+        ));
+    }
     content
 }
 
@@ -831,6 +846,63 @@ mod tests {
         assert!(
             !outcome.output.contains("next offset 11"),
             "stale next-offset hint must be replaced; got:\n{}",
+            outcome.output
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_slice_advises_skipping_past_overlong_single_line() {
+        // Regression: when the line at the requested offset is itself longer
+        // than READ_FILE_MAX_BYTES, `kept_full_lines` is 0 and the previous
+        // "smaller limit" hint sent the model into a loop — read_file slices
+        // by line so retrying at the same offset would always re-clip the
+        // same line. The corrected trailer points the model past the
+        // offending line instead.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        use crate::tool_registry::truncate::READ_FILE_MAX_BYTES;
+        // Single huge line followed by a normal line — the slice will clip
+        // the first line and have no full lines to "keep".
+        let huge: String = "z".repeat(READ_FILE_MAX_BYTES + 4_096);
+        let body = format!("{huge}\nshort follow-up line\n");
+        fs::write(cwd.join("huge.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "huge.txt", "offset": 1, "limit": 5}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        assert!(
+            outcome.output.contains("byte cap hit on a single overlong line"),
+            "expected overlong-line advisory; got tail:\n{}",
+            outcome
+                .output
+                .lines()
+                .rev()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // The fix must direct the model past line 1; an offset that lands
+        // back on line 1 would loop forever.
+        assert!(
+            outcome.output.contains("offset 2"),
+            "trailer must point past the overlong line; got:\n{}",
+            outcome.output
+        );
+        // And must NOT re-suggest "retry at offset 1 with smaller limit",
+        // since the same line would just be re-clipped.
+        assert!(
+            !outcome.output.contains("resume with offset 1"),
+            "must not suggest retrying the same offset; got:\n{}",
             outcome.output
         );
     }
