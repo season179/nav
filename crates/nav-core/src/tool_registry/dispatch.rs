@@ -4,11 +4,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::output_accumulator;
-use super::truncate::{
-    READ_FILE_MAX_BYTES, READ_FILE_MAX_LINES, TruncateMode, bound, bound_with_limits,
-};
 use super::EXPAND_ARTIFACT_TOOL;
+use super::output_accumulator;
+use super::reduce::{reduce_code_search, reduce_read_file};
+use super::truncate::{READ_FILE_MAX_BYTES, READ_FILE_MAX_LINES, TruncateMode, bound_with_limits};
 #[cfg(test)]
 use super::{SPAWN_SUBAGENT_TOOL, ToolAccess};
 use super::{fs, patch, preflight, shell};
@@ -237,16 +236,33 @@ pub async fn run_tool(
     let skill_dirs = skills.skill_dirs();
     let result: Result<ToolResult> = match name {
         "read_file" => parse_read_file_args(&input).and_then(|(path, offset, limit)| {
-            fs::read_file_sliced(cwd, skill_dirs, path, offset, limit).map(|out| {
+            let body = fs::read_file_sliced(cwd, skill_dirs, path, offset, limit)?;
+            // Slice reads already carry their own next-offset hint and stay
+            // small by construction. Only full reads (no offset/limit) feed
+            // the outline+artifact reducer.
+            if offset.is_some() || limit.is_some() {
                 let bounded = bound_with_limits(
-                    out,
+                    body,
                     TruncateMode::Head,
                     READ_FILE_MAX_LINES,
                     READ_FILE_MAX_BYTES,
                 );
                 let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
-                ToolResult::text_with_truncation(bounded.content, truncation)
-            })
+                return Ok(ToolResult::text_with_truncation(
+                    bounded.content,
+                    truncation,
+                ));
+            }
+            let reduced = reduce_read_file(body)?;
+            let truncation = reduced.artifact.as_ref().map(|artifact| TruncationMeta {
+                truncated_by: TruncationKind::ReadFileCap,
+                full_output_path: Some(artifact.path.clone()),
+                artifact_id: Some(artifact.id.clone()),
+            });
+            Ok(ToolResult::text_with_truncation(
+                reduced.content,
+                truncation,
+            ))
         }),
         "list_files" => {
             fs::list_files(cwd, skill_dirs, string_arg(&input, "path")?).map(ToolResult::text)
@@ -277,9 +293,13 @@ pub async fn run_tool(
         )
         .await
         .map(|out| {
-            let bounded = bound(out, TruncateMode::Head);
-            let truncation = bounded.truncation_meta(TruncationKind::GlobalCap);
-            ToolResult::text_with_truncation(bounded.content, truncation)
+            let reduced = reduce_code_search(&out);
+            let truncation = reduced.contains("[truncated ").then_some(TruncationMeta {
+                truncated_by: TruncationKind::GlobalCap,
+                full_output_path: None,
+                artifact_id: None,
+            });
+            ToolResult::text_with_truncation(reduced, truncation)
         }),
         EXPAND_ARTIFACT_TOOL => expand_artifact(&input),
         other => Err(anyhow!("unknown tool: {other}")),
@@ -347,14 +367,12 @@ fn expand_artifact(input: &Value) -> Result<ToolResult> {
     if sliced.len() <= READ_FILE_MAX_BYTES {
         return Ok(ToolResult::text(sliced));
     }
-    let bounded = bound_with_limits(
-        sliced,
-        TruncateMode::Head,
-        usize::MAX,
-        READ_FILE_MAX_BYTES,
-    );
+    let bounded = bound_with_limits(sliced, TruncateMode::Head, usize::MAX, READ_FILE_MAX_BYTES);
     let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
-    Ok(ToolResult::text_with_truncation(bounded.content, truncation))
+    Ok(ToolResult::text_with_truncation(
+        bounded.content,
+        truncation,
+    ))
 }
 
 fn optional_usize_arg(input: &Value, key: &str) -> Result<Option<usize>> {
@@ -866,11 +884,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_read_file_applies_stricter_cap_than_generic() {
+    async fn run_tool_read_file_full_read_reduces_to_outline_with_artifact() {
         // Build a file that fits under the generic 2000-line cap but
-        // exceeds the stricter read_file 500-line cap. Without the
-        // per-tool cap the output would pass through unchanged; with it
-        // we expect the truncation marker plus truncation metadata.
+        // exceeds the stricter read_file 500-line cap. Full reads above the
+        // cap go through the semantic reducer instead of plain head-trim:
+        // outline + preview + next-offset hint + artifact id for recovery.
         let temp = tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
         let body = (0..1000).map(|i| format!("line{i}\n")).collect::<String>();
@@ -889,16 +907,38 @@ mod tests {
         .await
         .unwrap();
         assert!(!outcome.is_error);
-        assert!(outcome.output.contains("[truncated"));
+        assert!(
+            outcome.output.starts_with("[file outline: 1000 lines,"),
+            "missing outline header: {}",
+            &outcome.output[..outcome.output.len().min(120)]
+        );
+        assert!(outcome.output.contains("call expand_artifact"));
+        assert!(outcome.output.contains("read_file with offset"));
+        // The preview keeps the first lines; the rest is recoverable via the
+        // artifact and not in the model view.
+        assert!(outcome.output.contains("line0\n"));
+        assert!(!outcome.output.contains("line999\n"));
+
         let truncation = outcome
             .truncation
-            .expect("read_file should attach truncation metadata when bounded");
+            .expect("oversize full read should attach truncation metadata");
         assert_eq!(truncation.truncated_by, TruncationKind::ReadFileCap);
-        assert!(truncation.full_output_path.is_none());
-        // Keep the first 500 lines and drop the rest.
-        assert!(outcome.output.contains("line0\n"));
-        assert!(outcome.output.contains("line499\n"));
-        assert!(!outcome.output.contains("line500\n"));
+        let artifact_id = truncation
+            .artifact_id
+            .clone()
+            .expect("artifact id should be present for reduced reads");
+        let spill_path = truncation
+            .full_output_path
+            .clone()
+            .expect("full output path should be present for reduced reads");
+        assert!(spill_path.is_absolute(), "{}", spill_path.display());
+        // The trailer text the model sees must name the same artifact id.
+        assert!(outcome.output.contains(&artifact_id));
+        // Round-trip via expand_artifact recovers the original body.
+        let back = output_accumulator::read_artifact(&artifact_id).unwrap();
+        let _ = std::fs::remove_file(&spill_path);
+        assert_eq!(back.lines().count(), 1000);
+        assert!(back.starts_with("line0\n"));
     }
 
     #[tokio::test]

@@ -89,6 +89,11 @@ impl Args {
         {
             self.auto_compact_fraction = fraction;
         }
+        if let Some(budget) = settings.ambient_context_token_budget
+            && !provided.was_provided("ambient_context_token_budget")
+        {
+            self.ambient_context_token_budget = budget;
+        }
         if provided.was_provided("no_git_checkpoints") {
             self.git_checkpoints = false;
         } else if let Some(enabled) = settings.git_checkpoints
