@@ -42,7 +42,7 @@ impl CachedCell {
             .layout
             .borrow()
             .as_ref()
-            .map_or(true, |l| l.width != width);
+            .is_none_or(|l| l.width != width);
         if stale {
             let lines = self.inner.display_lines(width);
             *self.layout.borrow_mut() = Some(CellLayout { width, lines });
@@ -575,14 +575,17 @@ impl Widget for &ChatWidget {
         let anchor = stream.as_ref().map(|(a, _)| *a).unwrap_or(self.cells.len());
 
         // `0..=self.cells.len()` is inclusive so the streaming cell can fire
-        // even when its anchor sits past the last finalized cell.
+        // even when its anchor sits past the last finalized cell. The index
+        // gates both the anchor comparison and the cell lookup, so an
+        // iterator-style rewrite hurts more than it helps here.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..=self.cells.len() {
-            if i == anchor {
-                if let Some((_, ref lines)) = stream {
-                    acc = extend_window(acc, lines.len(), start, end, |lstart, lend| {
-                        visible.extend(lines[lstart..lend].iter().cloned());
-                    });
-                }
+            if i == anchor
+                && let Some((_, ref lines)) = stream
+            {
+                acc = extend_window(acc, lines.len(), start, end, |lstart, lend| {
+                    visible.extend(lines[lstart..lend].iter().cloned());
+                });
             }
             if i < self.cells.len() {
                 let cell = &self.cells[i];
