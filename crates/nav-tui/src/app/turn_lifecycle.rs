@@ -146,8 +146,16 @@ pub(super) fn pending_draft(
     pending_skill: &mut Option<PendingSkill>,
 ) -> PendingInputDraft {
     let skill = if mode == PendingInputMode::FollowUp {
-        skill.or_else(|| pending_skill.take())
+        // Always consume the queued slot on a follow-up submit. The
+        // explicit slash (if any) wins, but the queue must not survive
+        // — otherwise a queued skill (or a /rewind-restored wrapper)
+        // can silently prepend itself to a *later* unrelated prompt
+        // when the user submits an explicit `/other ...` first.
+        let queued = pending_skill.take();
+        skill.or(queued)
     } else {
+        // Steering injects mid-turn and intentionally leaves any queued
+        // skill in place for the next follow-up submit.
         skill
     };
     PendingInputDraft {
@@ -310,6 +318,63 @@ mod tests {
             trigger: CompactionTrigger::Auto,
             message: "x".into(),
         }));
+    }
+
+    #[test]
+    fn pending_draft_consumes_queued_skill_even_when_explicit_skill_present() {
+        // Regression: a /rewind that restored a skill wrapper stashes it in
+        // `pending_skill`. If the user then submits an *explicit* slash
+        // (`/other ...`) instead of resubmitting the restored plain text,
+        // the queued slot must still be consumed — otherwise the rewound
+        // wrapper silently prepends itself to the next ordinary prompt.
+        let mut pending = Some(PendingSkill {
+            name: "rewound".into(),
+            wrapped_body: "<skill name=\"rewound\" dir=\"/r\">x</skill>".into(),
+        });
+        let explicit = Some(PendingSkill {
+            name: "other".into(),
+            wrapped_body: "<skill name=\"other\" dir=\"/o\">y</skill>".into(),
+        });
+        let draft = pending_draft(
+            "do thing".into(),
+            None,
+            Vec::new(),
+            PendingInputMode::FollowUp,
+            explicit,
+            &mut pending,
+        );
+        assert_eq!(
+            draft.skill.as_ref().map(|s| s.name.as_str()),
+            Some("other"),
+            "explicit slash must win over queued"
+        );
+        assert!(
+            pending.is_none(),
+            "queued slot must be consumed even when explicit skill won"
+        );
+    }
+
+    #[test]
+    fn pending_draft_keeps_queued_skill_when_steering() {
+        // Steering injections happen mid-turn and intentionally don't
+        // disturb the follow-up queue. The queued slot must survive a
+        // steering submit so the next follow-up still picks it up.
+        let mut pending = Some(PendingSkill {
+            name: "queued".into(),
+            wrapped_body: "<skill name=\"queued\" dir=\"/q\">x</skill>".into(),
+        });
+        let _ = pending_draft(
+            "steer text".into(),
+            None,
+            Vec::new(),
+            PendingInputMode::Steering,
+            None,
+            &mut pending,
+        );
+        assert!(
+            pending.is_some(),
+            "steering submit must not consume the follow-up queue"
+        );
     }
 
     #[test]

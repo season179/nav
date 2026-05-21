@@ -656,19 +656,30 @@ fn parse_wrapper(
     let name = format!("{name_prefix}{}", &after_name_attr[..name_end]);
     // Verify the next attribute matches what the wrapper actually emits so a
     // malformed string that just happens to start with the opening tag
-    // doesn't get parsed as a valid wrapper.
+    // doesn't get parsed as a valid wrapper. We also walk past the opening
+    // tag's final `">"` so the closing-tag search below starts in the
+    // wrapper body, not the user request — `rfind` from position 0 would
+    // pick a stray `</skill>` pasted inside the user's request (e.g. while
+    // reviewing XML) and silently absorb part of that request into
+    // `wrapped_body`.
     let after_first_quote = &after_name_attr[name_end..];
-    match middle_attr {
+    let after_attrs = match middle_attr {
         Some(attr) => {
             let after_middle = after_first_quote.strip_prefix(attr)?;
             let middle_end = after_middle.find('"')?;
-            after_middle[middle_end..].strip_prefix("\" dir=\"")?;
+            after_middle[middle_end..].strip_prefix("\" dir=\"")?
         }
-        None => {
-            after_first_quote.strip_prefix("\" dir=\"")?;
-        }
-    }
-    let close_idx = trimmed.rfind(closing_tag)?;
+        None => after_first_quote.strip_prefix("\" dir=\"")?,
+    };
+    // Skip the `dir` value and the opening tag's closing `">"`. After this
+    // `after_open_tag` points at the wrapper body — the first occurrence of
+    // `closing_tag` from here is unambiguously the wrapper's close, even
+    // when the trailing user request contains the same literal tag.
+    let dir_close = after_attrs.find('"')?;
+    let after_open_tag = after_attrs[dir_close..].strip_prefix("\">")?;
+    let body_offset = trimmed.len() - after_open_tag.len();
+    let close_in_body = after_open_tag.find(closing_tag)?;
+    let close_idx = body_offset + close_in_body;
     let wrapped_body = trimmed[..close_idx + closing_tag.len()].to_string();
     let request = trimmed[close_idx + closing_tag.len()..].trim().to_string();
     Some(RewindSkill {
@@ -732,6 +743,41 @@ mod skill_parse_tests {
             !parsed.wrapped_body.contains("please review this diff"),
             "wrapped_body must NOT include the request — prepend_pending_skill \
              would otherwise duplicate it on resubmit"
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_does_not_split_at_close_tag_inside_request() {
+        // Regression: the parser used to use `rfind` to locate the wrapper's
+        // closing tag, which silently absorbs part of the user request when
+        // the request body itself contains `</skill>` (e.g. the user is
+        // reviewing XML or HTML). The composer would then show only a
+        // suffix on resubmit and the wrapper would carry stray content.
+        let wrapped = "<skill name=\"reviewer\" dir=\"/skills/reviewer\">\nBODY\n</skill>\n\nplease audit this snippet: <skill name=\"x\">inner</skill> tail";
+        let parsed = parse_rewind_skill_prompt(wrapped).expect("must parse");
+        assert_eq!(
+            parsed.request,
+            "please audit this snippet: <skill name=\"x\">inner</skill> tail",
+            "request must include the user's full text, including any \
+             literal </skill> tags inside it"
+        );
+        assert!(
+            parsed.wrapped_body.ends_with("BODY\n</skill>"),
+            "wrapped_body must end at the wrapper's own close tag, not at \
+             a later </skill> inside the request body; got:\n{}",
+            parsed.wrapped_body,
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_template_does_not_split_at_close_tag_inside_request() {
+        let wrapped = "<prompt_template name=\"review\" extension=\"core\" dir=\"/ext/core/prompts\">\nTEMPLATE BODY\n</prompt_template>\n\nuse </prompt_template> verbatim";
+        let parsed = parse_rewind_skill_prompt(wrapped).expect("must parse");
+        assert_eq!(parsed.request, "use </prompt_template> verbatim");
+        assert!(
+            parsed.wrapped_body.ends_with("TEMPLATE BODY\n</prompt_template>"),
+            "wrapped_body must close at the wrapper, not at the inner tag; got:\n{}",
+            parsed.wrapped_body,
         );
     }
 
