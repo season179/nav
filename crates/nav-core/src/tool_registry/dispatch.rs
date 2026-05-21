@@ -4,9 +4,11 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::output_accumulator;
 use super::truncate::{
     READ_FILE_MAX_BYTES, READ_FILE_MAX_LINES, TruncateMode, bound, bound_with_limits,
 };
+use super::EXPAND_ARTIFACT_TOOL;
 #[cfg(test)]
 use super::{SPAWN_SUBAGENT_TOOL, ToolAccess};
 use super::{fs, patch, preflight, shell};
@@ -50,6 +52,12 @@ pub struct TruncationMeta {
     /// in-memory truncation with no recoverable artifact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<PathBuf>,
+    /// Stable handle the model passes to `expand_artifact` to read the
+    /// raw bytes. Populated alongside `full_output_path` for
+    /// [`TruncationKind::BashSpill`]. Optional in serialized form so
+    /// older session logs (which never carried this field) replay cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +281,7 @@ pub async fn run_tool(
             let truncation = bounded.truncation_meta(TruncationKind::GlobalCap);
             ToolResult::text_with_truncation(bounded.content, truncation)
         }),
+        EXPAND_ARTIFACT_TOOL => expand_artifact(&input),
         other => Err(anyhow!("unknown tool: {other}")),
     };
 
@@ -311,6 +320,41 @@ fn parse_read_file_args(input: &Value) -> Result<(&str, Option<usize>, Option<us
         bail!("`offset` is 1-indexed; must be >= 1");
     }
     Ok((path, offset, limit))
+}
+
+/// Parse the shared `(offset, limit)` line-slice arguments. Defaults the
+/// limit to `READ_FILE_MAX_LINES` so callers paging through artifacts get
+/// the same first-window behavior `read_file` already enforces.
+fn parse_slice_args(input: &Value) -> Result<(Option<usize>, Option<usize>)> {
+    let offset = optional_usize_arg(input, "offset")?;
+    let limit = optional_usize_arg(input, "limit")?;
+    if matches!(offset, Some(0)) {
+        bail!("`offset` is 1-indexed; must be >= 1");
+    }
+    Ok((offset, limit.or(Some(READ_FILE_MAX_LINES))))
+}
+
+fn expand_artifact(input: &Value) -> Result<ToolResult> {
+    let artifact_id = string_arg(input, "artifact_id")?;
+    let (offset, limit) = parse_slice_args(input)?;
+    let body = output_accumulator::read_artifact(artifact_id)?;
+    // Slice by line so the model sees the same "showed lines X-Y of Z;
+    // next offset" trailer `read_file` emits and can resume paging.
+    let sliced = fs::apply_line_slice(&body, offset, limit);
+    // Slice already enforced the line budget; only re-bound when bytes
+    // exceed the cap (a pathological case of very long lines), otherwise
+    // `bound_with_limits` would clip the paging trailer.
+    if sliced.len() <= READ_FILE_MAX_BYTES {
+        return Ok(ToolResult::text(sliced));
+    }
+    let bounded = bound_with_limits(
+        sliced,
+        TruncateMode::Head,
+        usize::MAX,
+        READ_FILE_MAX_BYTES,
+    );
+    let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
+    Ok(ToolResult::text_with_truncation(bounded.content, truncation))
 }
 
 fn optional_usize_arg(input: &Value, key: &str) -> Result<Option<usize>> {
@@ -363,7 +407,7 @@ mod tests {
     #[test]
     fn tool_definitions_returns_full_toolset() {
         let defs = tool_definitions(ToolAccess::Full, true);
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 8);
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.get("name").and_then(Value::as_str))
@@ -375,6 +419,7 @@ mod tests {
             "edit_file",
             "apply_patch",
             "code_search",
+            "expand_artifact",
             SPAWN_SUBAGENT_TOOL,
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
@@ -396,7 +441,13 @@ mod tests {
             .iter()
             .filter_map(|d| d.get("name").and_then(Value::as_str))
             .collect();
-        assert_eq!(worker_names, vec!["read_file", "list_files", "code_search"]);
+        // Subagents share the artifact ids surfaced by their parent, so the
+        // read-only worker scope keeps `expand_artifact` alongside the
+        // other read-only tools.
+        assert_eq!(
+            worker_names,
+            vec!["read_file", "list_files", "code_search", "expand_artifact"]
+        );
     }
 
     #[test]
@@ -623,9 +674,12 @@ mod tests {
             .clone()
             .expect("spill path should be present");
         assert!(spill_path.is_absolute(), "{}", spill_path.display());
-        // Trailer in the model-visible content names the same path so the
-        // model has a way to retrieve the full output without consulting
-        // the durable event store.
+        let artifact_id = truncation
+            .artifact_id
+            .clone()
+            .expect("spill artifact id should be present");
+        // Trailer carries both the path (for operator `cat`) and the id
+        // (so the model can call `expand_artifact`).
         assert!(
             outcome
                 .output
@@ -633,7 +687,163 @@ mod tests {
             "trailer missing path in: {}",
             &outcome.output[outcome.output.len().saturating_sub(200)..]
         );
+        assert!(
+            outcome.output.contains(&artifact_id),
+            "trailer missing artifact id in: {}",
+            &outcome.output[outcome.output.len().saturating_sub(200)..]
+        );
         let _ = std::fs::remove_file(&spill_path);
+    }
+
+    #[tokio::test]
+    async fn expand_artifact_round_trips_with_bash_spill() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let spill = run_tool(
+            &cwd,
+            &Catalog::default(),
+            30,
+            &permissive_ctx(),
+            "c1",
+            "bash",
+            json!({"command": "seq 1 200000"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let truncation = spill.truncation.expect("spill metadata");
+        let artifact_id = truncation
+            .artifact_id
+            .clone()
+            .expect("artifact id should be present");
+        let spill_path = truncation
+            .full_output_path
+            .clone()
+            .expect("spill path should be present");
+
+        let head = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c2",
+            "expand_artifact",
+            json!({"artifact_id": artifact_id}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!head.is_error, "expand failed: {}", head.output);
+        assert!(
+            head.output.contains("more lines remain"),
+            "expected paging hint: {}",
+            head.output
+        );
+
+        // The bash wrapper prepends a `status:`/`stdout:` header to the
+        // raw output, so absolute line numbers shift; we just confirm the
+        // tail slice reaches the final seq line. Exact recovery is the
+        // whole point.
+        let on_disk = std::fs::read_to_string(&spill_path).expect("spill readable");
+        let total_lines = on_disk.lines().count();
+        let near_end_offset = total_lines.saturating_sub(20).max(1);
+        let tail = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c3",
+            "expand_artifact",
+            json!({"artifact_id": artifact_id, "offset": near_end_offset, "limit": 25}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!tail.is_error, "expand failed: {}", tail.output);
+        assert!(
+            tail.output.contains("200000"),
+            "expected `200000` (final seq line) in tail slice: {}",
+            tail.output
+        );
+        let _ = std::fs::remove_file(&spill_path);
+    }
+
+    #[tokio::test]
+    async fn expand_artifact_rejects_missing_id() {
+        // A well-formed but unknown id (e.g. one that has aged out of the
+        // 7-day sweep) must surface "not found" instead of erroring.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "expand_artifact",
+            json!({"artifact_id": "bash-0-0-99999999"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error, "expected error for unknown artifact");
+        assert!(
+            outcome.output.contains("not found"),
+            "expected `not found` in error: {}",
+            outcome.output
+        );
+    }
+
+    #[tokio::test]
+    async fn expand_artifact_rejects_id_with_path_traversal() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        for bad in ["../etc/passwd", "foo/bar", "../../secret", "with space"] {
+            let outcome = run_tool(
+                &cwd,
+                &Catalog::default(),
+                5,
+                &permissive_ctx(),
+                "c1",
+                "expand_artifact",
+                json!({"artifact_id": bad}),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(outcome.is_error, "expected error for id `{bad}`");
+            assert!(
+                outcome.output.contains("not a valid identifier")
+                    || outcome.output.contains("not found"),
+                "unexpected error for id `{bad}`: {}",
+                outcome.output
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_meta_with_artifact_id_round_trips_through_json() {
+        // Durable session logs replay these meta records, so adding
+        // `artifact_id` must round-trip cleanly and stay backwards
+        // compatible with logs written before the field existed.
+        let meta = TruncationMeta {
+            truncated_by: TruncationKind::BashSpill,
+            full_output_path: Some("/tmp/x.log".into()),
+            artifact_id: Some("bash-1-2-3".into()),
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["artifact_id"], "bash-1-2-3");
+        let back: TruncationMeta = serde_json::from_value(json).unwrap();
+        assert_eq!(back, meta);
+
+        // Legacy payload without `artifact_id` deserializes with the field
+        // defaulted to None — existing session logs still replay.
+        let legacy: TruncationMeta = serde_json::from_value(json!({
+            "truncated_by": "bash_spill",
+            "full_output_path": "/tmp/old.log"
+        }))
+        .unwrap();
+        assert!(legacy.artifact_id.is_none());
     }
 
     #[tokio::test]
