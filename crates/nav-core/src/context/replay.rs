@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -36,10 +37,14 @@ pub const REDUCED_TOOL_OUTPUT_PREFIX: &str = "[Reduced tool output";
 /// silently dropped, same as the live agent loop — a missing attachment
 /// can't block resume.
 ///
-/// Tool-call events stay in the persisted log for scrollback, but replay skips
-/// them. Stateless Responses tool turns require the matching reasoning items,
-/// and nav only keeps those encrypted reasoning blobs inside the active
-/// `run_agent` loop, not in the long-term session log.
+/// Tool-call replay is unlocked by `ResponseContinuation` events: each one
+/// carries the sanitized `function_call` (and encrypted reasoning) items the
+/// model emitted in a single response, so the next turn can resend the same
+/// wire shape `store: false` needs. Matching `ToolCallOutput` events are then
+/// translated back into `function_call_output` items. Older sessions without
+/// `ResponseContinuation` events drop tool I/O during replay (their reasoning
+/// continuation was never persisted, and a `function_call_output` without its
+/// `function_call` would be rejected on submit).
 pub fn rebuild_responses_input(events: &[AgentEvent], cwd: &Path) -> Vec<Value> {
     if let Some(slice) = latest_checkpoint_slice(events) {
         let mut input = Vec::with_capacity(slice.following.len() + 1);
@@ -54,11 +59,39 @@ pub fn rebuild_responses_input(events: &[AgentEvent], cwd: &Path) -> Vec<Value> 
 
 fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path) {
     let mut current_turn_start: Option<usize> = None;
+    // `function_call` items become valid in the wire input only when the
+    // matching reasoning/function_call continuation was captured. We track
+    // `call_id`s seen in `ResponseContinuation` so a stray `ToolCallOutput`
+    // from a session that predates continuation persistence doesn't surface
+    // as an orphaned `function_call_output`.
+    let mut pending_call_ids: HashSet<String> = HashSet::new();
     for event in events {
         match event {
             AgentEvent::UserMessage { .. } => {
                 current_turn_start = Some(input.len());
+                pending_call_ids.clear();
                 push_replay_event(input, event, cwd);
+            }
+            AgentEvent::ResponseContinuation { items } => {
+                for item in items {
+                    if item.get("type").and_then(Value::as_str) == Some("function_call")
+                        && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
+                    {
+                        pending_call_ids.insert(call_id.to_string());
+                    }
+                    input.push(item.clone());
+                }
+            }
+            AgentEvent::ToolCallOutput {
+                call_id, output, ..
+            } => {
+                if pending_call_ids.remove(call_id) {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    }));
+                }
             }
             AgentEvent::TurnComplete { .. }
             | AgentEvent::CompactionCompleted { .. }
@@ -66,11 +99,13 @@ fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path)
             | AgentEvent::Error { .. } => {
                 push_replay_event(input, event, cwd);
                 current_turn_start = None;
+                pending_call_ids.clear();
             }
             AgentEvent::TurnAborted { .. } => {
                 if let Some(start) = current_turn_start.take() {
                     input.truncate(start);
                 }
+                pending_call_ids.clear();
             }
             _ => push_replay_event(input, event, cwd),
         }
@@ -96,6 +131,7 @@ fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
             }));
         }
         AgentEvent::AssistantMessageDelta { .. }
+        | AgentEvent::ResponseContinuation { .. }
         | AgentEvent::ToolCallStarted { .. }
         | AgentEvent::ToolCallOutput { .. }
         | AgentEvent::SubagentStarted { .. }

@@ -83,6 +83,16 @@ pub enum AgentEvent {
     AssistantMessageDone {
         text: String,
     },
+    /// Provider response items nav needs to replay a `store: false` tool turn
+    /// across separate `run_agent` invocations. Carries the model's
+    /// `function_call` items verbatim, plus any reasoning items reduced to the
+    /// `id` + `encrypted_content` continuation handle. Hidden plaintext
+    /// reasoning (`summary`, `content`) and assistant `message` items are
+    /// excluded here; the durable assistant message lives in
+    /// `AssistantMessageDone`.
+    ResponseContinuation {
+        items: Vec<Value>,
+    },
     ToolCallStarted {
         call_id: String,
         name: String,
@@ -281,6 +291,7 @@ impl AgentEvent {
             AgentEvent::UserMessage { .. } => "user_message",
             AgentEvent::AssistantMessageDelta { .. } => "assistant_message_delta",
             AgentEvent::AssistantMessageDone { .. } => "assistant_message_done",
+            AgentEvent::ResponseContinuation { .. } => "response_continuation",
             AgentEvent::ToolCallStarted { .. } => "tool_call_started",
             AgentEvent::ToolCallOutput { .. } => "tool_call_output",
             AgentEvent::SubagentStarted { .. } => "subagent_started",

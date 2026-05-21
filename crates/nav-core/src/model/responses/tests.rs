@@ -532,6 +532,79 @@ fn into_raw_output_returns_raw_items() {
     assert_eq!(raw[0]["call_id"], "c1");
 }
 
+// ── sanitize_continuation_items ───────────────────────────────
+
+#[test]
+fn sanitize_continuation_items_strips_hidden_plaintext_reasoning() {
+    let raw = vec![
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{"type": "summary_text", "text": "thinking out loud"}],
+            "content": [{"type": "reasoning_text", "text": "raw chain of thought"}],
+            "encrypted_content": "enc-blob",
+        }),
+        json!({
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"x\"}",
+        }),
+    ];
+    let sanitized = sanitize_continuation_items(&raw);
+
+    assert_eq!(sanitized.len(), 2);
+    let reasoning = &sanitized[0];
+    assert_eq!(reasoning["type"], "reasoning");
+    assert_eq!(reasoning["id"], "rs_1");
+    assert_eq!(reasoning["encrypted_content"], "enc-blob");
+    assert!(reasoning.get("summary").is_none());
+    assert!(reasoning.get("content").is_none());
+
+    // function_call items pass through verbatim so the wire shape is intact.
+    let call = &sanitized[1];
+    assert_eq!(call["type"], "function_call");
+    assert_eq!(call["call_id"], "call_1");
+    assert_eq!(call["name"], "read_file");
+}
+
+#[test]
+fn sanitize_continuation_items_drops_message_items() {
+    // Assistant messages are persisted via `AssistantMessageDone`; keeping
+    // them here too would replay the same message twice.
+    let raw = vec![
+        json!({
+            "type": "message",
+            "content": [{"type": "output_text", "text": "hi"}],
+        }),
+        json!({
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "noop",
+            "arguments": "{}",
+        }),
+    ];
+    let sanitized = sanitize_continuation_items(&raw);
+
+    assert_eq!(sanitized.len(), 1);
+    assert_eq!(sanitized[0]["type"], "function_call");
+}
+
+#[test]
+fn sanitize_continuation_items_drops_reasoning_without_encrypted_content() {
+    // A reasoning item with no encrypted continuation handle has nothing
+    // left to replay once the plaintext is stripped — drop it entirely so
+    // the persisted event doesn't carry a useless structural shell.
+    let raw = vec![json!({
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "thinking"}],
+    })];
+    let sanitized = sanitize_continuation_items(&raw);
+    assert!(sanitized.is_empty());
+}
+
 // ── decode_completed_response ─────────────────────────────────
 
 #[test]
