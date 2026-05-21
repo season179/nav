@@ -133,6 +133,35 @@ fn response_body_includes_model_and_store_false() {
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert!(body["input"].is_array());
     assert!(body["tools"].is_array());
+    assert!(
+        body["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("nav-"))
+    );
+}
+
+#[test]
+fn response_body_cache_key_partitions_by_stable_prefix() {
+    let args = Args::test_default();
+    let cwd_a = std::path::Path::new("/tmp/a");
+    let cwd_b = std::path::Path::new("/tmp/b");
+    let full_a = response_body(&args, cwd_a, &[], &Catalog::default(), None);
+    let full_a_again = response_body(&args, cwd_a, &[], &Catalog::default(), None);
+    let full_b = response_body(&args, cwd_b, &[], &Catalog::default(), None);
+    let read_only_a = response_body_with_options(
+        &args,
+        cwd_a,
+        &[],
+        &Catalog::default(),
+        None,
+        ResponseBodyOptions::read_only(),
+    );
+    // Same inputs => same key (so routing groups identical-prefix requests).
+    assert_eq!(full_a["prompt_cache_key"], full_a_again["prompt_cache_key"]);
+    // Different instructions (cwd flows into instructions) => different key.
+    assert_ne!(full_a["prompt_cache_key"], full_b["prompt_cache_key"]);
+    // Different tool set => different key.
+    assert_ne!(full_a["prompt_cache_key"], read_only_a["prompt_cache_key"]);
 }
 
 #[test]
@@ -178,11 +207,136 @@ fn response_body_lists_skills_when_present() {
     let body = response_body(&args, cwd, &[], &catalog, None);
     let instructions = body["instructions"].as_str().unwrap();
     assert!(instructions.contains("Available skills"));
-    assert!(instructions.contains("demo"));
-    assert!(instructions.contains("demo skill"));
-    assert!(instructions.contains("/abs/skills/demo/SKILL.md"));
-    assert!(instructions.contains("/abs/skills/demo"));
-    assert!(instructions.contains("read the listed SKILL.md"));
+    assert!(instructions.contains("- demo [project]: demo skill"));
+    // The compact catalog must not bake skill_md / skill_dir absolute paths
+    // into every turn — those bloat the prompt and break prefix caching.
+    assert!(!instructions.contains("/abs/skills/demo/SKILL.md"));
+    assert!(!instructions.contains("skill_dir:"));
+    assert!(instructions.contains("`.agents/skills/<name>/SKILL.md`"));
+    assert!(instructions.contains("read its `SKILL.md` first"));
+}
+
+#[test]
+fn response_body_skill_section_lists_user_root_once_when_user_skills_present() {
+    use crate::context::{Skill, SkillScope};
+    let args = Args::test_default();
+    let cwd = std::path::Path::new("/tmp");
+    let catalog = Catalog::new(vec![
+        Skill {
+            name: "proj".into(),
+            description: "project skill".into(),
+            skill_md_path: "/work/.agents/skills/proj/SKILL.md".into(),
+            skill_dir: "/work/.agents/skills/proj".into(),
+            scope: SkillScope::Project,
+        },
+        Skill {
+            name: "u1".into(),
+            description: "user skill one".into(),
+            skill_md_path: "/home/me/.agents/skills/u1/SKILL.md".into(),
+            skill_dir: "/home/me/.agents/skills/u1".into(),
+            scope: SkillScope::User,
+        },
+        Skill {
+            name: "u2".into(),
+            description: "user skill two".into(),
+            skill_md_path: "/home/me/.agents/skills/u2/SKILL.md".into(),
+            skill_dir: "/home/me/.agents/skills/u2".into(),
+            scope: SkillScope::User,
+        },
+    ]);
+    let body = response_body(&args, cwd, &[], &catalog, None);
+    let instructions = body["instructions"].as_str().unwrap();
+    // User root mentioned once, not per-skill.
+    let mentions = instructions.matches("/home/me/.agents/skills").count();
+    assert_eq!(
+        mentions, 1,
+        "user-skill root should be listed exactly once, got {mentions} mentions in:\n{instructions}"
+    );
+    assert!(instructions.contains("`/home/me/.agents/skills/<name>/SKILL.md`"));
+}
+
+#[test]
+fn response_body_skill_section_omits_user_root_when_only_project_skills_present() {
+    use crate::context::{Skill, SkillScope};
+    let args = Args::test_default();
+    let cwd = std::path::Path::new("/tmp");
+    let catalog = Catalog::new(vec![Skill {
+        name: "demo".into(),
+        description: "demo".into(),
+        skill_md_path: "/work/.agents/skills/demo/SKILL.md".into(),
+        skill_dir: "/work/.agents/skills/demo".into(),
+        scope: SkillScope::Project,
+    }]);
+    let body = response_body(&args, cwd, &[], &catalog, None);
+    let instructions = body["instructions"].as_str().unwrap();
+    assert!(!instructions.contains("User skills live at"));
+}
+
+#[test]
+fn response_body_instructions_snapshot_with_skills() {
+    use crate::context::{Skill, SkillScope};
+    let args = Args::test_default();
+    let cwd = std::path::Path::new("/work");
+    let catalog = Catalog::new(vec![
+        Skill {
+            name: "review".into(),
+            description: "Review a pull request".into(),
+            skill_md_path: "/work/.agents/skills/review/SKILL.md".into(),
+            skill_dir: "/work/.agents/skills/review".into(),
+            scope: SkillScope::Project,
+        },
+        Skill {
+            name: "verify".into(),
+            description: "Verify changes by running the app".into(),
+            skill_md_path: "/home/me/.agents/skills/verify/SKILL.md".into(),
+            skill_dir: "/home/me/.agents/skills/verify".into(),
+            scope: SkillScope::User,
+        },
+    ]);
+    let body = response_body(&args, cwd, &[], &catalog, None);
+    let instructions = body["instructions"].as_str().unwrap();
+    insta::assert_snapshot!(instructions, @r"
+    You are a small coding agent running in /work.
+
+    Guidelines:
+    - Use tools to inspect, edit, search, and verify code.
+    - Prefer small, explicit steps.
+    - Keep responses concise.
+    - Explain technical details in plain, layman's terms.
+    - Show file paths clearly when working with files.
+    - Paths must be relative.
+
+    Available skills (load each on demand):
+    - review [project]: Review a pull request
+    - verify [user]: Verify changes by running the app
+    When a user request matches a skill, read its `SKILL.md` first to load full instructions, then act. Project skills live at `.agents/skills/<name>/SKILL.md` relative to the working directory above. User skills live at `/home/me/.agents/skills/<name>/SKILL.md`. Resolve any relative resources mentioned in a SKILL.md against that skill's directory.
+    ");
+}
+
+#[test]
+fn response_body_shape_snapshot_marks_stable_blocks_cacheable() {
+    let args = Args::test_default();
+    let cwd = std::path::Path::new("/work");
+    let input = vec![json!({"type": "message", "role": "user", "content": "hi"})];
+    let body = response_body(&args, cwd, &input, &Catalog::default(), None);
+    // Sort keys so the snapshot pins the cache-marker placement next to the
+    // stable prefix (instructions, tools, model).
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    insta::assert_snapshot!(keys.join("\n"), @r"
+    include
+    input
+    instructions
+    model
+    prompt_cache_key
+    store
+    tools
+    ");
 }
 
 #[test]
