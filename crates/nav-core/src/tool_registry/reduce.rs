@@ -131,6 +131,10 @@ const CODE_SEARCH_MAX_MATCHES: usize = 100;
 /// Threshold for emitting the by-file grouping header. Below this the raw
 /// output is short enough to read directly without a summary.
 const CODE_SEARCH_GROUP_MIN_MATCHES: usize = 10;
+/// Cap on per-file summary rows. A grep over a vendored tree could hit
+/// thousands of files and turn the "summary" itself into a context flood;
+/// the top-N highest-count files cover almost all signal.
+const CODE_SEARCH_SUMMARY_MAX_FILES: usize = 50;
 
 /// Reduce `rg`-style stdout to a model-friendly view. When matches span
 /// multiple files (or there are many of them), a `[grouped by file: ...]`
@@ -163,9 +167,19 @@ pub fn reduce_code_search(stdout: &str) -> String {
         // Sort by descending count, then by file path for determinism.
         let mut by_count: Vec<(&str, usize)> = counts.into_iter().collect();
         by_count.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        for (file, count) in &by_count {
+        // Cap the summary section: a grep over a large vendored tree could
+        // otherwise produce thousands of rows, flooding the next prompt and
+        // saturating the raw-budget calculation below.
+        let summarized = by_count.len().min(CODE_SEARCH_SUMMARY_MAX_FILES);
+        for (file, count) in by_count.iter().take(summarized) {
             let label = if *count == 1 { "match" } else { "matches" };
             out.push_str(&format!("  {file}: {count} {label}\n"));
+        }
+        let omitted_files = by_count.len().saturating_sub(summarized);
+        if omitted_files > 0 {
+            out.push_str(&format!(
+                "  [+{omitted_files} more files omitted from summary]\n",
+            ));
         }
         out.push('\n');
     }
@@ -486,6 +500,51 @@ mod tests {
         let stdout = format!("file.rs:1:{payload}\n");
         let result = reduce_code_search(&stdout);
         assert!(result.contains("... [truncated]"));
+    }
+
+    #[test]
+    fn reduce_code_search_caps_summary_when_many_files_match() {
+        // A grep over a large tree could hit thousands of files. Without a
+        // summary cap, the per-file summary section would balloon, saturate
+        // `raw_byte_budget` to zero, and ship an oversized output back to
+        // the model — regressing the MAX_BYTES guard.
+        let mut stdout = String::new();
+        let file_count = 2_000usize;
+        for i in 0..file_count {
+            stdout.push_str(&format!("path/to/file_{i:04}.rs:1:alpha\n"));
+        }
+        let result = reduce_code_search(&stdout);
+        // Header reports the true file count.
+        assert!(result.contains(&format!("[grouped by file: {file_count} files")));
+        // But the summary itself caps the rows. Per-file rows start with
+        // two spaces and end with " match" / " matches"; the header and
+        // truncation trailer are bracketed so they don't match this shape.
+        let summary_rows = result
+            .lines()
+            .filter(|l| {
+                l.starts_with("  ")
+                    && !l.starts_with("  [")
+                    && (l.ends_with(" match") || l.ends_with(" matches"))
+            })
+            .count();
+        assert!(
+            summary_rows <= CODE_SEARCH_SUMMARY_MAX_FILES,
+            "summary should be capped at {CODE_SEARCH_SUMMARY_MAX_FILES} rows, got {summary_rows}"
+        );
+        // And the trailing notice surfaces the omission so the model can
+        // request a narrower search.
+        assert!(
+            result.contains("more files omitted from summary"),
+            "summary cap must surface the omitted-file count"
+        );
+        // Final output stays under the global MAX_BYTES ceiling so it
+        // cannot flood the next prompt.
+        assert!(
+            result.len() <= MAX_BYTES,
+            "reducer output {} bytes exceeds MAX_BYTES {}",
+            result.len(),
+            MAX_BYTES
+        );
     }
 
     // ── bash reducer ───────────────────────────────────────────────

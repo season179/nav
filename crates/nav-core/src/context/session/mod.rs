@@ -1008,15 +1008,53 @@ impl SessionStore {
             params![session_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
+
+        // Trim the `turn` table and recompute session-level turn rollups so
+        // `/sessions`, tree summaries, and future `turn_index` calculations
+        // stop counting the rewound-past turns. The surviving turn rows are
+        // the first N where N equals the count of surviving `turn_complete`
+        // events — turn rows are created 1:1 with that event in
+        // `complete_turn`, in insertion (i.e. seq) order.
+        let surviving_turn_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM event WHERE session_id = ?1 AND kind = 'turn_complete'",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "DELETE FROM turn WHERE session_id = ?1 AND turn_index >= ?2",
+            params![session_id, surviving_turn_count],
+        )?;
+        let (reported_cost_sum, reported_cost_count): (i64, i64) = tx.query_row(
+            "SELECT
+                 COALESCE(SUM(cost_micros), 0),
+                 COALESCE(SUM(CASE WHEN cost_source = ?1 THEN 1 ELSE 0 END), 0)
+             FROM turn
+             WHERE session_id = ?2 AND cost_source = ?1",
+            params![COST_SOURCE_REPORTED, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         tx.execute(
             "UPDATE session
              SET tokens_input = ?1,
                  tokens_output = ?2,
                  tokens_input_cached = ?3,
                  tokens_reasoning = ?4,
-                 updated_at = ?5
-             WHERE id = ?6",
-            params![sum_in, sum_out, sum_in_cached, sum_reason, now, session_id],
+                 turns_total = ?5,
+                 turns_with_reported_cost = ?6,
+                 cost_micros_reported = ?7,
+                 updated_at = ?8
+             WHERE id = ?9",
+            params![
+                sum_in,
+                sum_out,
+                sum_in_cached,
+                sum_reason,
+                surviving_turn_count,
+                reported_cost_count,
+                reported_cost_sum,
+                now,
+                session_id,
+            ],
         )?;
 
         tx.commit()?;
@@ -1243,12 +1281,23 @@ impl SessionStore {
         let not_found = || ResolveSessionError::NotFound {
             query: prefix.to_string(),
         };
+        // Escape SQLite LIKE wildcards (`%`, `_`) and the escape character
+        // itself in the user/model-supplied prefix. Session IDs are ULIDs
+        // (Crockford base32) which never contain these characters, so this
+        // is a no-op for valid prefixes — but it defangs a prompt-injected
+        // call into `read_thread` that would otherwise pass `%` and match
+        // arbitrary stored sessions.
+        let escaped_prefix = escape_like_pattern(prefix);
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT id FROM session WHERE id LIKE ?1 ORDER BY id ASC LIMIT 3")
+            .prepare(
+                "SELECT id FROM session WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id ASC LIMIT 3",
+            )
             .map_err(|_| not_found())?;
         let rows = stmt
-            .query_map(params![format!("{prefix}%")], |row| row.get::<_, String>(0))
+            .query_map(params![format!("{escaped_prefix}%")], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|_| not_found())?;
         let mut matches: Vec<String> = rows
             .collect::<rusqlite::Result<_>>()
@@ -1487,6 +1536,21 @@ fn preview_for_audit(text: &str) -> String {
     }
     let mut out: String = first_line.chars().take(REWIND_PREVIEW_MAX_CHARS).collect();
     out.push('…');
+    out
+}
+
+/// Escape SQLite `LIKE` metacharacters in `prefix` using `\` as the escape
+/// character. Use together with `ESCAPE '\\'` on the LIKE clause so a
+/// caller-supplied prefix containing `%` or `_` matches literally rather
+/// than as a wildcard.
+fn escape_like_pattern(prefix: &str) -> String {
+    let mut out = String::with_capacity(prefix.len());
+    for ch in prefix.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
     out
 }
 

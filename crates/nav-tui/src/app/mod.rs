@@ -34,6 +34,7 @@ use crate::ChatWidget;
 use crate::bottom_pane::{self, PendingApproval};
 use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
 use crate::theme::Theme;
+use crate::widget::parse_rewind_skill_prompt;
 use permissions::build_tui_permissions;
 use render::{TuiStatus, draw_tui};
 use session::{
@@ -567,7 +568,31 @@ pub async fn run(
                             &mut chat,
                             &mut pane,
                         );
-                        pending_skill = None;
+                        // If the rewound message was wrapped by an inline
+                        // /skill invocation, restore both the model-facing
+                        // wrapper (so the resubmit carries the same skill
+                        // instructions the original turn had) and the visible
+                        // request (so the composer shows what the user
+                        // typed, not the wrapper). Otherwise the resubmit
+                        // would silently lose the skill's context — which
+                        // for a skill that supplied tool-use guidance or
+                        // domain-specific rules could change the behaviour
+                        // of the rerun without any visible signal.
+                        let (composer_text, restored_skill) =
+                            match parse_rewind_skill_prompt(&outcome.text) {
+                                Some(parsed) => (
+                                    parsed.request,
+                                    Some(PendingSkill {
+                                        name: parsed.name,
+                                        wrapped_body: parsed.wrapped_body,
+                                    }),
+                                ),
+                                None => (
+                                    outcome.display_text.unwrap_or(outcome.text),
+                                    None,
+                                ),
+                            };
+                        pending_skill = restored_skill;
                         chat = ChatWidget::with_theme(theme);
                         chat.push_welcome(
                             &args.model,
@@ -580,7 +605,6 @@ pub async fn run(
                         for event in truncated_events {
                             chat.ingest(event);
                         }
-                        let composer_text = outcome.display_text.unwrap_or(outcome.text);
                         pane.set_composer_text_with_attachments(
                             &composer_text,
                             outcome.attachments,

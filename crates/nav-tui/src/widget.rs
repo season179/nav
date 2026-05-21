@@ -613,3 +613,66 @@ fn parse_skill_prompt(text: &str) -> Option<SkillPrompt> {
     let request = trimmed[close_idx + closing.len()..].trim().to_string();
     Some(SkillPrompt { name, request })
 }
+
+/// Parsed shape of a model-facing `<skill ...>...</skill>\n\n<request>`
+/// prompt body. Used by /rewind to restore both the model-facing wrapper
+/// (so the resubmitted turn carries the same skill instructions the
+/// original turn had) and the visible request (so the composer shows
+/// what the user wrote, not the wrapper).
+pub(crate) struct RewindSkill {
+    pub name: String,
+    pub wrapped_body: String,
+    pub request: String,
+}
+
+pub(crate) fn parse_rewind_skill_prompt(text: &str) -> Option<RewindSkill> {
+    let trimmed = text.trim_start();
+    let name_start = trimmed.strip_prefix("<skill name=\"")?;
+    let name_end = name_start.find('"')?;
+    let name = name_start[..name_end].to_string();
+    name_start[name_end..].strip_prefix("\" dir=\"")?;
+    let closing = "</skill>";
+    let close_idx = trimmed.rfind(closing)?;
+    let wrapped_body = trimmed[..close_idx + closing.len()].to_string();
+    let request = trimmed[close_idx + closing.len()..].trim().to_string();
+    Some(RewindSkill {
+        name,
+        wrapped_body,
+        request,
+    })
+}
+
+#[cfg(test)]
+mod skill_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_rewind_skill_prompt_recovers_wrapper_and_request() {
+        // The agent_loop persists the full wrapped text on UserMessage.text.
+        // Rewind must be able to peel the wrapper off so the composer shows
+        // the visible request while restoring the wrapper for resubmit.
+        let wrapped = "<skill name=\"reviewer\" dir=\"/skills/reviewer\">\nBODY\n</skill>\n\ndo the thing";
+        let parsed = parse_rewind_skill_prompt(wrapped).expect("must parse");
+        assert_eq!(parsed.name, "reviewer");
+        assert_eq!(parsed.request, "do the thing");
+        assert!(
+            parsed.wrapped_body.starts_with("<skill name=\"reviewer\""),
+            "wrapped_body must keep the opening tag for re-application"
+        );
+        assert!(
+            parsed.wrapped_body.ends_with("</skill>"),
+            "wrapped_body must include the closing tag"
+        );
+        assert!(
+            !parsed.wrapped_body.contains("do the thing"),
+            "wrapped_body must NOT include the request text — prepend_pending_skill \
+             would otherwise duplicate it on resubmit"
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_returns_none_for_plain_text() {
+        assert!(parse_rewind_skill_prompt("just a plain message").is_none());
+        assert!(parse_rewind_skill_prompt("<skill>missing attrs</skill>").is_none());
+    }
+}

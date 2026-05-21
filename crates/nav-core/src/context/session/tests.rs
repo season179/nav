@@ -777,6 +777,52 @@ fn resolve_session_id_accepts_unique_prefix_and_rejects_ambiguous_prefix() {
 }
 
 #[test]
+fn resolve_session_id_escapes_sqlite_like_wildcards() {
+    // A prompt-injected model could call `read_thread` with `%` or `_` and,
+    // because the resolver uses LIKE under the hood, match arbitrary stored
+    // sessions or learn IDs through the ambiguous-prefix error. With LIKE
+    // wildcards escaped, the wildcards are treated as literals so no
+    // sessions match.
+    let (_dir, store) = open_temp_store();
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO session (id, cwd, provider, model, created_at, updated_at)
+             VALUES (?1, '/repo', ?2, 'gpt', 1, 1)",
+            params!["01AAAA00000000000000000000", PROVIDER_OPENAI_RESPONSES],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, cwd, provider, model, created_at, updated_at)
+             VALUES (?1, '/repo', ?2, 'gpt', 1, 1)",
+            params!["01AAAB00000000000000000000", PROVIDER_OPENAI_RESPONSES],
+        )
+        .unwrap();
+    }
+
+    // `%` alone would otherwise match every session (LIMIT 3 + ambiguous).
+    assert!(matches!(
+        store.resolve_session_id("%"),
+        Err(ResolveSessionError::NotFound { .. })
+    ));
+    // `_` is the single-char LIKE wildcard — also rejected.
+    assert!(matches!(
+        store.resolve_session_id("01AAA_"),
+        Err(ResolveSessionError::NotFound { .. })
+    ));
+    // A targeted wildcard pattern must not exfiltrate a specific id either.
+    assert!(matches!(
+        store.resolve_session_id("01AAAA%"),
+        Err(ResolveSessionError::NotFound { .. })
+    ));
+    // Legitimate prefixes still resolve.
+    assert_eq!(
+        store.resolve_session_id("01AAAA").unwrap(),
+        "01AAAA00000000000000000000"
+    );
+}
+
+#[test]
 fn read_thread_resolves_url_and_returns_focused_excerpt() {
     let (_dir, store) = open_temp_store();
     let id = store
@@ -1347,6 +1393,158 @@ fn rewind_recomputes_rolling_totals_against_surviving_turns() {
     assert_eq!(summary.tokens_output, 0);
     assert_eq!(summary.tokens_input_cached, 0);
     assert_eq!(summary.tokens_reasoning, 0);
+}
+
+#[test]
+fn rewind_trims_turn_rollups_so_future_turn_index_stays_aligned() {
+    // `seed_two_turn_session` only appends events; the live agent loop also
+    // calls `complete_turn`, which writes a row into `turn` and updates
+    // session-level rollups (`turns_total`, `cost_micros_reported`,
+    // `turns_with_reported_cost`). Without recomputing those on rewind,
+    // /sessions, /tree, read_thread, and the next turn's `turn_index` would
+    // all keep counting the rewound-past turns.
+    let (_dir, store) = open_temp_store();
+    let session = store
+        .create_session(
+            Path::new("/proj"),
+            PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+        )
+        .unwrap();
+
+    // Turn 1: user + assistant + complete (with reported cost).
+    store
+        .append_event(
+            &session,
+            &AgentEvent::UserMessage {
+                text: "first".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .append_event(
+            &session,
+            &AgentEvent::AssistantMessageDone {
+                text: "first reply".into(),
+            },
+        )
+        .unwrap();
+    let usage_one = TurnUsage {
+        tokens_input: 10,
+        tokens_output: 5,
+        tokens_input_cached: 0,
+        tokens_reasoning: 0,
+    };
+    store
+        .append_event(
+            &session,
+            &AgentEvent::TurnComplete {
+                usage: usage_one.clone(),
+            },
+        )
+        .unwrap();
+    store
+        .complete_turn(
+            &session,
+            "gpt-test",
+            &usage_one,
+            Some(ReportedCost {
+                micros: 4_200,
+                currency: "USD".into(),
+            }),
+        )
+        .unwrap();
+
+    // Turn 2: same shape, also with reported cost.
+    store
+        .append_event(
+            &session,
+            &AgentEvent::UserMessage {
+                text: "second".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .append_event(
+            &session,
+            &AgentEvent::AssistantMessageDone {
+                text: "second reply".into(),
+            },
+        )
+        .unwrap();
+    let usage_two = TurnUsage {
+        tokens_input: 7,
+        tokens_output: 3,
+        tokens_input_cached: 0,
+        tokens_reasoning: 0,
+    };
+    store
+        .append_event(
+            &session,
+            &AgentEvent::TurnComplete {
+                usage: usage_two.clone(),
+            },
+        )
+        .unwrap();
+    store
+        .complete_turn(
+            &session,
+            "gpt-test",
+            &usage_two,
+            Some(ReportedCost {
+                micros: 7_800,
+                currency: "USD".into(),
+            }),
+        )
+        .unwrap();
+
+    let pre = store.session_summary(&session).unwrap().unwrap();
+    assert_eq!(pre.turn_count, 2);
+
+    // Rewind to the second user message — turn 2 must disappear from every
+    // rollup; turn 1's totals must be preserved.
+    store.rewind_to_user_message(&session, 3).unwrap();
+    let post = store.session_summary(&session).unwrap().unwrap();
+    assert_eq!(
+        post.turn_count, 1,
+        "turns_total must reflect only the surviving turn"
+    );
+    assert_eq!(post.tokens_input, usage_one.tokens_input);
+    assert_eq!(post.tokens_output, usage_one.tokens_output);
+
+    // The next `complete_turn` call must land at turn_index = 1 (i.e. just
+    // after the surviving turn), not turn_index = 2 (which would happen if
+    // the old turn-2 row had been left in place).
+    store
+        .complete_turn(
+            &session,
+            "gpt-test",
+            &TurnUsage {
+                tokens_input: 1,
+                tokens_output: 1,
+                tokens_input_cached: 0,
+                tokens_reasoning: 0,
+            },
+            None,
+        )
+        .unwrap();
+    let conn = store.conn.lock().unwrap();
+    let max_index: i64 = conn
+        .query_row(
+            "SELECT MAX(turn_index) FROM turn WHERE session_id = ?1",
+            params![&session],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        max_index, 1,
+        "new turn must take the freed index, not a stale gap"
+    );
 }
 
 #[test]
