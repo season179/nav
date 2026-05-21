@@ -627,14 +627,50 @@ pub(crate) struct RewindSkill {
 
 pub(crate) fn parse_rewind_skill_prompt(text: &str) -> Option<RewindSkill> {
     let trimmed = text.trim_start();
-    let name_start = trimmed.strip_prefix("<skill name=\"")?;
-    let name_end = name_start.find('"')?;
-    let name = name_start[..name_end].to_string();
-    name_start[name_end..].strip_prefix("\" dir=\"")?;
-    let closing = "</skill>";
-    let close_idx = trimmed.rfind(closing)?;
-    let wrapped_body = trimmed[..close_idx + closing.len()].to_string();
-    let request = trimmed[close_idx + closing.len()..].trim().to_string();
+    if let Some(rest) = trimmed.strip_prefix("<skill name=\"") {
+        return parse_wrapper(trimmed, rest, "</skill>", "", None);
+    }
+    if let Some(rest) = trimmed.strip_prefix("<prompt_template name=\"") {
+        // `/prompt:<name>` invocations are persisted as a separate
+        // `<prompt_template ...>` block. Without this branch /rewind on a
+        // prompt-template turn would lose the template body on resubmit.
+        return parse_wrapper(
+            trimmed,
+            rest,
+            "</prompt_template>",
+            "prompt:",
+            Some("\" extension=\""),
+        );
+    }
+    None
+}
+
+fn parse_wrapper(
+    trimmed: &str,
+    after_name_attr: &str,
+    closing_tag: &str,
+    name_prefix: &str,
+    middle_attr: Option<&str>,
+) -> Option<RewindSkill> {
+    let name_end = after_name_attr.find('"')?;
+    let name = format!("{name_prefix}{}", &after_name_attr[..name_end]);
+    // Verify the next attribute matches what the wrapper actually emits so a
+    // malformed string that just happens to start with the opening tag
+    // doesn't get parsed as a valid wrapper.
+    let after_first_quote = &after_name_attr[name_end..];
+    match middle_attr {
+        Some(attr) => {
+            let after_middle = after_first_quote.strip_prefix(attr)?;
+            let middle_end = after_middle.find('"')?;
+            after_middle[middle_end..].strip_prefix("\" dir=\"")?;
+        }
+        None => {
+            after_first_quote.strip_prefix("\" dir=\"")?;
+        }
+    }
+    let close_idx = trimmed.rfind(closing_tag)?;
+    let wrapped_body = trimmed[..close_idx + closing_tag.len()].to_string();
+    let request = trimmed[close_idx + closing_tag.len()..].trim().to_string();
     Some(RewindSkill {
         name,
         wrapped_body,
@@ -674,5 +710,37 @@ mod skill_parse_tests {
     fn parse_rewind_skill_prompt_returns_none_for_plain_text() {
         assert!(parse_rewind_skill_prompt("just a plain message").is_none());
         assert!(parse_rewind_skill_prompt("<skill>missing attrs</skill>").is_none());
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_recovers_prompt_template_wrapper() {
+        // /prompt:<name> invocations get a different wrapper than /<skill>;
+        // the persisted text starts with <prompt_template>. /rewind on that
+        // turn must still recover the wrapper so resubmit keeps the
+        // template's instructions.
+        let wrapped = "<prompt_template name=\"review\" extension=\"core\" dir=\"/ext/core/prompts\">\nTEMPLATE BODY\n</prompt_template>\n\nplease review this diff";
+        let parsed = parse_rewind_skill_prompt(wrapped).expect("must parse prompt_template");
+        assert_eq!(
+            parsed.name, "prompt:review",
+            "name must carry the `prompt:` namespace so PendingSkill matches \
+             the slash-command path that originally emitted the wrapper"
+        );
+        assert_eq!(parsed.request, "please review this diff");
+        assert!(parsed.wrapped_body.starts_with("<prompt_template name=\"review\""));
+        assert!(parsed.wrapped_body.ends_with("</prompt_template>"));
+        assert!(
+            !parsed.wrapped_body.contains("please review this diff"),
+            "wrapped_body must NOT include the request — prepend_pending_skill \
+             would otherwise duplicate it on resubmit"
+        );
+    }
+
+    #[test]
+    fn parse_rewind_skill_prompt_rejects_malformed_prompt_template() {
+        // Missing the `extension=` middle attribute the real wrapper always
+        // emits — must not parse, or a hand-crafted look-alike could be
+        // mistaken for a real template wrapper.
+        let bogus = "<prompt_template name=\"x\" dir=\"/whatever\">body</prompt_template>\n\nreq";
+        assert!(parse_rewind_skill_prompt(bogus).is_none());
     }
 }

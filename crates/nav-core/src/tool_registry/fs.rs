@@ -260,7 +260,11 @@ pub(super) fn apply_line_slice(
     }
 
     let end = match limit {
-        Some(n) => (start + n).min(total),
+        // `limit` is model-supplied; a value like `usize::MAX` would
+        // overflow `start + n` and panic in debug builds (and silently
+        // wrap into a bogus range in release). Saturating before the
+        // clamp keeps the slice range sane regardless of input.
+        Some(n) => start.saturating_add(n).min(total),
         None => total,
     };
     let kept = end - start;
@@ -776,6 +780,25 @@ mod tests {
             out,
             "[file has 4 lines; limit 0 returned no lines; 3 lines remain from offset 2]\n"
         );
+    }
+
+    #[test]
+    fn read_file_sliced_saturates_overflowing_limit_without_panicking() {
+        // Tool arguments are model-controlled. A prompt-injected or buggy
+        // model could ship `limit: usize::MAX` alongside an in-range
+        // `offset`; the naive `start + n` would overflow and panic in
+        // debug builds. The saturating add must clamp the slice end to
+        // the file size instead.
+        let temp = tempdir().unwrap();
+        let workspace = temp.path().canonicalize().unwrap();
+        fs::write(workspace.join("file.txt"), "a\nb\nc\nd\n").unwrap();
+
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(2), Some(usize::MAX))
+            .unwrap()
+            .into_combined();
+
+        assert!(out.starts_with("b\nc\nd\n"), "slice must succeed: {out:?}");
+        assert!(out.contains("[showed lines 2-4 of 4]"));
     }
 
     #[test]
