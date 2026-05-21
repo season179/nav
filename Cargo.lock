@@ -1695,6 +1695,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "ignore",
  "insta",
  "regex",
  "reqwest",

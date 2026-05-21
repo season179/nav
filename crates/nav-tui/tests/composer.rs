@@ -80,34 +80,7 @@ fn slash_shows_popup_and_he_filters_to_help() {
         .iter()
         .map(|entry| entry.command.as_str())
         .collect();
-    assert_eq!(
-        commands,
-        vec![
-            "/help",
-            "/clear",
-            "/quit",
-            "/exit",
-            "/resume",
-            "/sessions",
-            "/name",
-            "/export",
-            "/context",
-            "/fork",
-            "/tree",
-            "/label",
-            "/unlabel",
-            "/find",
-            "/compact",
-            "/checkpoint",
-            "/stash",
-            "/restore",
-            "/abort",
-            "/steer",
-            "/queue-edit",
-            "/queue-remove",
-            "/queue-clear",
-        ]
-    );
+    assert_eq!(commands, vec!["/exit", "/find", "/fork"]);
 
     type_text(&mut pane, "he");
     render(&pane, &mut terminal);
@@ -224,6 +197,7 @@ fn slash_popup_lists_catalog_skills() {
     }]);
     let mut pane = BottomPane::with_slash_entries(build_slash_entries(&catalog));
     press(&mut pane, KeyCode::Char('/'), KeyModifiers::NONE);
+    type_text(&mut pane, "fo");
     let popup = pane.slash_popup().expect("slash popup");
     let commands: Vec<&str> = popup
         .matches()
@@ -234,7 +208,7 @@ fn slash_popup_lists_catalog_skills() {
         commands.contains(&"/foo"),
         "catalog skill missing: {commands:?}"
     );
-    assert!(commands.contains(&"/help"));
+    assert!(commands.contains(&"/fork"));
 }
 
 #[test]

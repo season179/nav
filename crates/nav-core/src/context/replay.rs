@@ -4,7 +4,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::agent_loop::AgentEvent;
-use crate::agent_loop::runner::build_user_content;
+use crate::context::build_user_content;
 use crate::context::compaction::{latest_checkpoint_slice, summary_message};
 
 /// Exact `function_call_output` text that marks a cleared old tool output.
@@ -115,12 +115,14 @@ fn push_replay_events(input: &mut Vec<Value>, events: &[AgentEvent], cwd: &Path)
 fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
     match event {
         AgentEvent::UserMessage {
-            text, attachments, ..
+            text,
+            display_text,
+            attachments,
         } => {
             input.push(json!({
                 "type": "message",
                 "role": "user",
-                "content": build_user_content(text, attachments, cwd),
+                "content": build_user_content(text, display_text.as_deref(), attachments, cwd),
             }));
         }
         AgentEvent::AssistantMessageDone { text } => {
