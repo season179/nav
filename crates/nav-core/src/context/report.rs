@@ -12,12 +12,56 @@ use serde_json::Value;
 
 use crate::agent_loop::{AgentEvent, TurnUsage};
 use crate::cli::Args;
+use crate::context::replay::{CLEARED_TOOL_OUTPUT_PLACEHOLDER, REDUCED_TOOL_OUTPUT_PREFIX};
 use crate::context::{Catalog, ProjectContext};
 use crate::context::{InstructionSectionKind, instruction_sections};
 use crate::context::{is_summary_message, rebuild_responses_input, should_auto_compact};
 use crate::tool_registry::{ToolAccess, tool_definitions};
 
 const IMAGE_TOKEN_ESTIMATE: u64 = 1_000;
+
+// Canonical category labels for the `/context` report. The buckets mirror the
+// request shape the next normal turn will ship.
+pub const CATEGORY_INSTRUCTIONS: &str = "Instructions";
+pub const CATEGORY_TOOLS: &str = "Tools";
+pub const CATEGORY_HISTORY: &str = "History";
+pub const CATEGORY_TOOL_OUTPUTS: &str = "Tool outputs";
+pub const CATEGORY_REASONING: &str = "Reasoning continuation";
+
+fn is_request_body_bucket(label: &str) -> bool {
+    matches!(
+        label,
+        CATEGORY_HISTORY | CATEGORY_TOOL_OUTPUTS | CATEGORY_REASONING
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolOutputState {
+    Raw,
+    Reduced,
+    Cleared,
+}
+
+impl ToolOutputState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Reduced => "reduced",
+            Self::Cleared => "cleared",
+        }
+    }
+}
+
+fn classify_function_call_output(item: &Value) -> ToolOutputState {
+    let text = item.get("output").and_then(Value::as_str).unwrap_or("");
+    if text.starts_with(CLEARED_TOOL_OUTPUT_PLACEHOLDER) {
+        ToolOutputState::Cleared
+    } else if text.starts_with(REDUCED_TOOL_OUTPUT_PREFIX) {
+        ToolOutputState::Reduced
+    } else {
+        ToolOutputState::Raw
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContextMeasure {
@@ -184,10 +228,18 @@ pub fn build_context_report_with_replay_cwd(
     skills: &Catalog,
     project: Option<&ProjectContext>,
 ) -> ContextReport {
-    let mut categories = instruction_categories(cwd, skills, project);
+    let mut categories = Vec::with_capacity(5);
+    categories.push(instructions_category(cwd, skills, project));
     categories.push(tool_category());
-    let (conversation, replay_items) = conversation_category(events, replay_cwd);
-    categories.push(conversation);
+    let RequestBlocks {
+        history,
+        tool_outputs,
+        reasoning,
+        replay_items,
+    } = request_block_categories(events, replay_cwd);
+    categories.push(history);
+    categories.push(tool_outputs);
+    categories.push(reasoning);
 
     let mut total = ContextMeasure::default();
     for category in &categories {
@@ -211,42 +263,33 @@ pub fn build_context_report_with_replay_cwd(
     }
 }
 
-fn instruction_categories(
+fn instructions_category(
     cwd: &Path,
     skills: &Catalog,
     project: Option<&ProjectContext>,
-) -> Vec<ContextCategory> {
-    let mut system = ContextCategory::new("System prompt", None);
-    let mut skill_catalog =
-        ContextCategory::new("Skills", Some(format!("{} available", skills.len())));
-    let mut project_context = ContextCategory::new("Project context", None);
-
+) -> ContextCategory {
+    let detail = Some(if skills.is_empty() {
+        "base + project context".to_string()
+    } else {
+        format!("base + {} skill(s) + project context", skills.len())
+    });
+    let mut category = ContextCategory::new(CATEGORY_INSTRUCTIONS, detail);
     for section in instruction_sections(cwd, skills, project) {
-        match section.kind {
-            InstructionSectionKind::Base => system.add_text_item(section.label, &section.body),
-            InstructionSectionKind::Skills => {
-                skill_catalog.add_text_item(section.label, &section.body);
-            }
-            InstructionSectionKind::ProjectContextIntro
-            | InstructionSectionKind::ProjectContextFile => {
-                project_context.add_text_item(section.label, &section.body);
-            }
-        }
+        let prefix = match section.kind {
+            InstructionSectionKind::Base => "base",
+            InstructionSectionKind::Skills => "skills",
+            InstructionSectionKind::ProjectContextIntro => "project context",
+            InstructionSectionKind::ProjectContextFile => "project file",
+        };
+        category.add_text_item(format!("{prefix}: {}", section.label), &section.body);
     }
-
-    let mut categories = vec![system];
-    if !skill_catalog.items.is_empty() {
-        categories.push(skill_catalog);
-    }
-    if !project_context.items.is_empty() {
-        categories.push(project_context);
-    }
-    categories
+    category
 }
 
 fn tool_category() -> ContextCategory {
     let tools = tool_definitions(ToolAccess::Full, true);
-    let mut category = ContextCategory::new("Tools", Some(format!("{} definitions", tools.len())));
+    let mut category =
+        ContextCategory::new(CATEGORY_TOOLS, Some(format!("{} definitions", tools.len())));
     for tool in tools {
         let label = tool
             .get("name")
@@ -259,13 +302,26 @@ fn tool_category() -> ContextCategory {
     category
 }
 
-fn conversation_category(events: &[AgentEvent], cwd: &Path) -> (ContextCategory, usize) {
+struct RequestBlocks {
+    history: ContextCategory,
+    tool_outputs: ContextCategory,
+    reasoning: ContextCategory,
+    replay_items: usize,
+}
+
+fn request_block_categories(events: &[AgentEvent], cwd: &Path) -> RequestBlocks {
+    // Walk the same assembled input the next normal turn will send so bucket
+    // totals match the request body, not a separate estimate.
     let input = rebuild_responses_input(events, cwd);
-    let mut category = ContextCategory::new("Conversation", Some(format!("{} items", input.len())));
+    let mut history = ContextCategory::new(CATEGORY_HISTORY, None);
+    let mut tool_outputs = ContextCategory::new(CATEGORY_TOOL_OUTPUTS, None);
+    let mut reasoning = ContextCategory::new(CATEGORY_REASONING, None);
+
     let mut user = 0usize;
     let mut assistant = 0usize;
     let mut tool_call = 0usize;
     let mut tool_output = 0usize;
+    let mut reasoning_n = 0usize;
     let mut other = 0usize;
 
     for item in &input {
@@ -281,35 +337,62 @@ fn conversation_category(events: &[AgentEvent], cwd: &Path) -> (ContextCategory,
                     } else {
                         format!("user message {user}")
                     };
-                    category.add_item(label, measure_message_item(item));
+                    history.add_item(label, measure_message_item(item));
                 }
                 Some("assistant") => {
                     assistant += 1;
-                    category.add_item(
+                    history.add_item(
                         format!("assistant message {assistant}"),
                         measure_message_item(item),
                     );
                 }
                 _ => {
                     other += 1;
-                    category.add_item(format!("message {other}"), measure_value(item));
+                    history.add_item(format!("message {other}"), measure_value(item));
                 }
             },
             Some("function_call") => {
                 tool_call += 1;
-                category.add_item(format!("tool call {tool_call}"), measure_value(item));
+                tool_outputs.add_item(format!("tool call {tool_call}"), measure_value(item));
             }
             Some("function_call_output") => {
                 tool_output += 1;
-                category.add_item(format!("tool output {tool_output}"), measure_value(item));
+                let state = classify_function_call_output(item);
+                tool_outputs.add_item(
+                    format!("tool output {tool_output} ({})", state.label()),
+                    measure_value(item),
+                );
+            }
+            Some("reasoning") => {
+                reasoning_n += 1;
+                reasoning.add_item(
+                    format!("reasoning continuation {reasoning_n}"),
+                    measure_value(item),
+                );
             }
             _ => {
                 other += 1;
-                category.add_item(format!("item {other}"), measure_value(item));
+                history.add_item(format!("item {other}"), measure_value(item));
             }
         }
     }
-    (category, input.len())
+
+    let other_suffix = if other > 0 {
+        format!(", {other} other")
+    } else {
+        String::new()
+    };
+    history.detail = Some(format!("{user} user, {assistant} assistant{other_suffix}"));
+    tool_outputs.detail = Some(format!("{tool_call} call(s), {tool_output} output(s)"));
+    reasoning.detail = Some(format!("{reasoning_n} item(s)"));
+
+    let replay_items = input.len();
+    RequestBlocks {
+        history,
+        tool_outputs,
+        reasoning,
+        replay_items,
+    }
 }
 
 fn measure_message_item(item: &Value) -> ContextMeasure {
@@ -423,12 +506,14 @@ fn report_notes(
             ));
         }
     }
-    let conversation_dominates = categories.iter().any(|category| {
-        category.label == "Conversation" && category.measure.tokens > total.tokens / 2
-    });
-    if conversation_dominates {
+    let request_body_tokens: u64 = categories
+        .iter()
+        .filter(|category| is_request_body_bucket(&category.label))
+        .map(|category| category.measure.tokens)
+        .sum();
+    if request_body_tokens > total.tokens / 2 {
         notes.push(
-            "Conversation history dominates; /compact trims old turns while keeping this session."
+            "Replay history dominates; /compact trims old turns while keeping this session."
                 .to_string(),
         );
     }
@@ -530,11 +615,16 @@ mod tests {
         assert_eq!(report.auto_compact_threshold, 8_500);
         assert_eq!(report.recorded_usage.tokens_input, 123);
         assert_eq!(report.replay_items, 2);
+        let instructions = report
+            .categories
+            .iter()
+            .find(|category| category.label == CATEGORY_INSTRUCTIONS)
+            .expect("instructions bucket present");
         assert!(
-            report
-                .categories
+            instructions
+                .items
                 .iter()
-                .any(|category| category.label == "Project context")
+                .any(|item| item.label.contains("AGENTS.md (project)"))
         );
         assert!(report.render_text(true).contains("AGENTS.md (project)"));
     }
@@ -560,13 +650,13 @@ mod tests {
             &Catalog::default(),
             Some(&ProjectContext::default()),
         );
-        let conversation = report
+        let history = report
             .categories
             .iter()
-            .find(|category| category.label == "Conversation")
+            .find(|category| category.label == CATEGORY_HISTORY)
             .unwrap();
 
-        assert!(conversation.measure.tokens >= 3);
+        assert!(history.measure.tokens >= 3);
         assert_eq!(report.replay_items, 1);
     }
 
@@ -604,16 +694,199 @@ mod tests {
             Some(&ProjectContext::default()),
         );
 
-        let current_conversation = category_tokens(&current_only, "Conversation");
-        let split_conversation = category_tokens(&split, "Conversation");
+        let current_history = category_tokens(&current_only, CATEGORY_HISTORY);
+        let split_history = category_tokens(&split, CATEGORY_HISTORY);
         assert!(
-            split_conversation > current_conversation,
+            split_history > current_history,
             "replay cwd should resolve stored attachments"
         );
         assert_eq!(
-            category_tokens(&split, "System prompt"),
-            category_tokens(&current_only, "System prompt"),
+            category_tokens(&split, CATEGORY_INSTRUCTIONS),
+            category_tokens(&current_only, CATEGORY_INSTRUCTIONS),
             "instruction cwd should remain the current launch cwd"
+        );
+    }
+
+    #[test]
+    fn report_groups_request_blocks_into_canonical_buckets() {
+        let args = Args::test_default();
+        let cwd = Path::new("/tmp/nav");
+        let report = build_context_report(
+            &args,
+            cwd,
+            &[],
+            &Catalog::default(),
+            Some(&ProjectContext::default()),
+        );
+
+        let labels: Vec<_> = report
+            .categories
+            .iter()
+            .map(|category| category.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                CATEGORY_INSTRUCTIONS,
+                CATEGORY_TOOLS,
+                CATEGORY_HISTORY,
+                CATEGORY_TOOL_OUTPUTS,
+                CATEGORY_REASONING,
+            ],
+            "report must expose the five canonical buckets in the documented order"
+        );
+        assert!(category_tokens(&report, CATEGORY_INSTRUCTIONS) > 0);
+        assert!(category_tokens(&report, CATEGORY_TOOLS) > 0);
+        // Empty replay still exposes the bucket so growth is attributable once
+        // the bucket starts to fill.
+        assert_eq!(category_tokens(&report, CATEGORY_HISTORY), 0);
+        assert_eq!(category_tokens(&report, CATEGORY_TOOL_OUTPUTS), 0);
+        assert_eq!(category_tokens(&report, CATEGORY_REASONING), 0);
+    }
+
+    #[test]
+    fn tool_output_state_labels_raw_reduced_and_cleared() {
+        let raw = json!({"type": "function_call_output", "call_id": "c1", "output": "ok"});
+        let cleared = json!({
+            "type": "function_call_output",
+            "call_id": "c2",
+            "output": CLEARED_TOOL_OUTPUT_PLACEHOLDER,
+        });
+        let reduced = json!({
+            "type": "function_call_output",
+            "call_id": "c3",
+            "output": format!("{REDUCED_TOOL_OUTPUT_PREFIX}; 12KB summary]"),
+        });
+
+        assert_eq!(classify_function_call_output(&raw), ToolOutputState::Raw);
+        assert_eq!(
+            classify_function_call_output(&cleared),
+            ToolOutputState::Cleared
+        );
+        assert_eq!(
+            classify_function_call_output(&reduced),
+            ToolOutputState::Reduced
+        );
+    }
+
+    #[test]
+    fn request_block_categories_classify_tool_outputs_and_reasoning() {
+        // Replay does not yet emit function_call / function_call_output /
+        // reasoning items, so drive the helper with a synthetic input array.
+        let mut call_n = 0usize;
+        let mut output_n = 0usize;
+        let mut reasoning_n = 0usize;
+        let mut tool_outputs = ContextCategory::new(CATEGORY_TOOL_OUTPUTS, None);
+        let mut reasoning = ContextCategory::new(CATEGORY_REASONING, None);
+
+        let inputs = vec![
+            json!({"type": "function_call", "call_id": "c1", "name": "read_file", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "file contents"}),
+            json!({
+                "type": "function_call_output",
+                "call_id": "c2",
+                "output": CLEARED_TOOL_OUTPUT_PLACEHOLDER,
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "c3",
+                "output": format!("{REDUCED_TOOL_OUTPUT_PREFIX}; 4KB summary]"),
+            }),
+            json!({"type": "reasoning", "summary": "thinking", "encrypted_content": "abc"}),
+        ];
+
+        for item in &inputs {
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    call_n += 1;
+                    tool_outputs.add_item(format!("tool call {call_n}"), measure_value(item));
+                }
+                Some("function_call_output") => {
+                    output_n += 1;
+                    let state = classify_function_call_output(item);
+                    tool_outputs.add_item(
+                        format!("tool output {output_n} ({})", state.label()),
+                        measure_value(item),
+                    );
+                }
+                Some("reasoning") => {
+                    reasoning_n += 1;
+                    reasoning.add_item(
+                        format!("reasoning continuation {reasoning_n}"),
+                        measure_value(item),
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let labels: Vec<_> = tool_outputs
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "tool call 1",
+                "tool output 1 (raw)",
+                "tool output 2 (cleared)",
+                "tool output 3 (reduced)",
+            ]
+        );
+        assert_eq!(reasoning.items.len(), 1);
+        assert_eq!(reasoning.items[0].label, "reasoning continuation 1");
+        assert!(tool_outputs.measure.tokens > 0);
+        assert!(reasoning.measure.tokens > 0);
+    }
+
+    #[test]
+    fn report_buckets_match_assembled_request_input() {
+        let args = Args::test_default();
+        let cwd = Path::new("/tmp/nav");
+        let events = vec![
+            AgentEvent::UserMessage {
+                text: "hello".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+            AgentEvent::AssistantMessageDone {
+                text: "hi there".into(),
+            },
+            AgentEvent::TurnComplete {
+                usage: TurnUsage::default(),
+            },
+            AgentEvent::UserMessage {
+                text: "follow up".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        ];
+
+        let report = build_context_report(
+            &args,
+            cwd,
+            &events,
+            &Catalog::default(),
+            Some(&ProjectContext::default()),
+        );
+
+        let input = rebuild_responses_input(&events, cwd);
+        assert_eq!(
+            report.replay_items,
+            input.len(),
+            "replay_items reflects the assembled request input"
+        );
+        let bucket_items: usize = report
+            .categories
+            .iter()
+            .filter(|category| is_request_body_bucket(&category.label))
+            .map(|category| category.items.len())
+            .sum();
+        assert_eq!(
+            bucket_items,
+            input.len(),
+            "every assembled input item must land in exactly one request-body bucket"
         );
     }
 
