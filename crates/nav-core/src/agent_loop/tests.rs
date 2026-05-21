@@ -2762,8 +2762,10 @@ async fn resume_replays_reasoning_continuation_and_function_call_output() {
     assert!(call_pos < output_pos);
 
     // Run the next user turn against the rebuilt input and check that the
-    // request body sent to the provider still includes the continuation
-    // items in the right positions.
+    // request body sent to the provider still pairs the prior function_call
+    // with its output — but the prior reasoning has been shed, because the
+    // new user message pushes it outside the "recent continuation" window
+    // (`keep_reasoning_turns = 1` by default; issue #51).
     let transport_two = StubTransport::new(vec![turn_two]);
     let binding_two = SessionBinding {
         store: &store,
@@ -2791,17 +2793,19 @@ async fn resume_replays_reasoning_continuation_and_function_call_output() {
     let bodies = transport_two.bodies();
     let body = bodies.first().expect("second turn body");
     let input = body.get("input").and_then(Value::as_array).expect("input");
-    let reasoning_pos = input_position(input, "reasoning", |item| {
-        item.get("type").and_then(Value::as_str) == Some("reasoning")
-    });
     let call_pos = input_position(input, "function_call", |item| {
         item.get("type").and_then(Value::as_str) == Some("function_call")
     });
     let output_pos = input_position(input, "function_call_output", |item| {
         item.get("type").and_then(Value::as_str) == Some("function_call_output")
     });
-    assert!(reasoning_pos < call_pos);
     assert!(call_pos < output_pos);
+    assert!(
+        !input
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("reasoning")),
+        "prior turn reasoning must be shed once a new user message arrives: {input:?}",
+    );
 }
 
 #[tokio::test]
