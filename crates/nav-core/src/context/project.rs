@@ -335,7 +335,11 @@ fn collect_context_in_dir(
     }
 }
 
-fn probe_workspace(cwd: &Path) -> WorkspaceStatus {
+/// Fresh git status for `cwd`. The startup `ProjectContext` snapshot can
+/// go stale across turns (the user commits, switches branches, or edits
+/// files between turns) — callers that surface workspace state to the
+/// model on every turn should call this rather than reusing the snapshot.
+pub(crate) fn probe_workspace(cwd: &Path) -> WorkspaceStatus {
     let (is_repo, branch) = git_repo_info(cwd);
     let dirty = if is_repo { git_dirty(cwd) } else { false };
     WorkspaceStatus {
