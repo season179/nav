@@ -1,8 +1,10 @@
 # Context Management Plan
 
-Combines two investigations and one prior PRD into a single ranked roadmap:
+Combines sibling-agent comparisons, the Amp guide, and one prior PRD into a
+single ranked roadmap:
 
-- **pi comparison** — what `../pi` does turn-by-turn that nav lacks.
+- **Sibling-agent comparisons** — what `../pi`, `../opencode`, `../codex`, and
+  `../kimiflare` do turn-by-turn that nav lacks.
 - **Amp comparison** — Amp Context Management guide (https://ampcode.com/guides/context-management) vs. nav.
 - **Prior PRD** — the pre-compaction replay-fidelity work, now folded in as the detailed design for the highest-leverage Tier 1 items.
 
@@ -32,14 +34,40 @@ A specific replay bug compounds the budget problem: in TUI mode every new turn r
 - Compaction uses `keepRecentTokens` to retain a token budget of recent work.
 
 ### opencode
+- Tool truncation writes the full output to a truncation directory, returns a
+  preview, and records an `outputPath`.
+- `read` supports `offset` / `limit` for both files and directories, with
+  continuation hints.
 - Completed tool parts can be marked compacted.
 - Replay renders compacted old outputs as `[Old tool result content cleared]`.
 - Recent/protected context kept; stale large outputs cleared before they inflate future turns.
+- Overflow checks reserve output/headroom tokens before deciding the usable input budget.
+
+### codex
+- A `ContextManager` owns model-visible history instead of letting the loop
+  append raw JSON forever.
+- History normalization enforces call/output pairing, removes orphan outputs,
+  and strips image content when the target model does not support images.
+- Function/custom tool outputs are truncated by `TruncationPolicy` at record
+  time, including token-based budgets.
+- Token accounting separates the last API response total from estimated
+  model-visible bytes/tokens added since the last successful response.
+- Websocket transport can send incremental input deltas when a request strictly
+  extends the previous one, avoiding repeated shipment of unchanged history.
+- Environment, permissions, realtime, model, and personality context are emitted
+  as diffs when they change instead of blindly re-injecting everything.
 
 ### kimiflare
 - Reduced outputs include an artifact id.
 - `expand_artifact` retrieves the full raw output when needed.
 - read/grep/bash/web fetch tools are designed around reduced summaries plus targeted expansion.
+- `read` supports `offset` / `limit`; full-file reads reduce to a compact
+  outline by default.
+- Historical assistant reasoning can be stripped while preserving the latest
+  assistant reasoning.
+- Older user images can be removed from the API message array.
+- Tool-call budget reminders push the model to stop broad exploration before a
+  turn balloons.
 
 ### Amp
 - Submit-time `@<filename>` scanning resolves and inlines files at message send.
@@ -52,8 +80,10 @@ A specific replay bug compounds the budget problem: in TUI mode every new turn r
 The useful lessons:
 
 - **From pi**: ordinary tool use should lead the model toward smaller follow-up reads; per-event exclusion is cheaper than re-summarizing.
-- **From opencode**: old tool results should become explicit placeholders, not disappear and not stay raw forever.
-- **From kimiflare**: the model can act on a compact view if the full output remains recoverable through an explicit path.
+- **From opencode**: old tool results should become explicit placeholders, not disappear and not stay raw forever; saved full outputs make truncation recoverable.
+- **From codex**: model-visible history needs a manager with normalization,
+  modality-aware stripping, token-policy truncation, and request-delta support.
+- **From kimiflare**: the model can act on a compact view if the full output remains recoverable through an explicit path; semantic reducers are stronger than generic truncation.
 - **From Amp**: caching + lazy ambient + thread-level rewinds reduce both per-turn bytes and "let me re-read that" round-trips.
 
 ## Goals
@@ -67,6 +97,10 @@ The useful lessons:
 7. Preserve local-first, `store: false` Responses behavior.
 8. Keep scrollback and exports truthful: UI history can show full durable events even when model replay is budgeted.
 9. Make `/context` report the same budgeted replay shape the next normal turn will actually send.
+10. Strip or replace low-value historical modalities (old images, old reasoning
+    continuation/narration) before they become compaction pressure.
+11. Add loop-level backpressure so one broad tool-using turn cannot consume the
+    next two turns' context budget.
 
 ## Non-Goals
 
@@ -121,33 +155,114 @@ Tier 1 directly attacks the 2-turn blowup. Tier 2 is UX work that does not move 
 - **Fix**: add `offset` (1-indexed) and `limit` parameters; append next-offset notices on truncation. See [Detailed design: native read slicing](#detailed-design-native-read-slicing).
 - **Risk**: low.
 
+#### 7. Artifact-backed full-output retrieval
+- **Where**: `ToolCallOutput` event metadata, a new in-session artifact store,
+  and a read-only `expand_artifact` / `read_tool_output` tool.
+- **Problem**: truncation is currently lossy from the model's point of view. If
+  nav keeps less output inline, the model needs a precise way to retrieve the
+  full result without repeating broad reads or commands.
+- **Fix**: store raw oversized tool output outside normal replay, keep a compact
+  summary plus artifact id in context, and expose a retrieval tool that can read
+  exact ranges or the full raw artifact. Prefer persisted session artifacts over
+  temp files for TUI resume fidelity.
+- **Risk**: medium. Must keep artifact reads workspace/session-scoped and avoid
+  turning large expansion into the new default.
+
+#### 8. Semantic output reducers
+- **Where**: new reducer layer between `tool_registry::run_tool` and
+  `function_call_output` assembly.
+- **Problem**: generic head/head-tail truncation preserves bytes, not intent. A
+  `grep` result, a file read, a bash log, and LSP output each need different
+  summaries and follow-up hints.
+- **Fix**: add per-tool reducers:
+  - `read_file`: outline/imports/signatures/preview for full reads above the
+    budget, with artifact id and next slice hint.
+  - `code_search`: grouped file summaries and match counts before raw matches.
+  - `bash`: status, command, first failure-looking lines, and tail.
+  - future web/LSP tools: summaries tuned to their result shapes.
+- **Risk**: medium. Summaries must remain deterministic and testable; do not use
+  an LLM reducer in the hot path.
+
+#### 9. Context manager for normalized prompt history
+- **Where**: new `context/history.rs` or `agent_loop/history.rs`, used by both
+  live turns and `rebuild_responses_input`.
+- **Problem**: the active loop appends raw Responses JSON, replay skips tools,
+  and overflow recovery drops one pair reactively. There is no single owner for
+  model-visible history invariants.
+- **Fix**: introduce a history manager that:
+  - records only API-suitable items,
+  - enforces call/output pairing,
+  - removes orphan outputs,
+  - applies truncation/reducer policy at record time,
+  - strips unsupported or old images,
+  - reports model-visible bytes/tokens by category.
+- **Risk**: high. This is the correct long-term shape, but should follow the
+  smaller output and replay changes unless a refactor becomes unavoidable.
+
+#### 10. Historical reasoning and image shedding
+- **Where**: replay policy plus active-turn request assembly.
+- **Problem**: old reasoning continuations, short assistant narration around
+  tool calls, and image payloads can remain expensive long after they stop
+  helping the next turn.
+- **Fix**:
+  - Preserve provider continuation items required for the most recent
+    `store: false` tool flow.
+  - Replace older reasoning/narration with explicit placeholders once no longer
+    needed for continuation.
+  - Drop or placeholder images older than a small number of user turns, and
+    strip images entirely when the resolved model does not accept image input.
+- **Risk**: medium-high. Must not break Responses continuation semantics.
+
+#### 11. Incremental request payloads
+- **Where**: `crates/nav-core/src/model/responses/websocket.rs` and request
+  state near the transport client.
+- **Problem**: with `store: false`, nav sends the full `input` array every turn.
+  Even when provider billing still counts the full prompt, this increases
+  serialization, transport cost, and makes prompt-cache boundaries harder to
+  reason about.
+- **Fix**: when the current request is a strict extension of the previous
+  request and non-input fields are unchanged, send only the delta with the
+  previous response id if the transport/provider supports it. Fall back to the
+  current full request path otherwise.
+- **Risk**: medium. Treat as an optimization after replay/history correctness.
+
+#### 12. Tool-loop budget backpressure
+- **Where**: `run_agent_inner` loop and possibly base instructions.
+- **Problem**: a single turn can run many tools before the user sees the result,
+  making the next normal turn huge even if total user turns are few.
+- **Fix**: lower the default loop cap and inject deterministic budget-check
+  messages after N tool calls ("produce a deliverable unless a specific gap
+  changes the answer"). Keep an escape hatch for deliberate deep research.
+- **Risk**: low-medium. Needs UX tuning so productive coding loops are not cut
+  off too early.
+
 ### Tier 2 — UX wins (do not move compaction much)
 
-#### 7. Edit / restore previous submitted messages
+#### 13. Edit / restore previous submitted messages
 - **Where**: `crates/nav-tui/src/bottom_pane/slash_popup.rs:14,70`, session event log.
 - **Problem**: Amp lets users navigate to an earlier user message, edit it, truncate everything after, and rerun. nav's `/restore` is a git checkpoint restore; `/fork [seq]` creates a new session copy. Neither rewrites the current session.
 - **Fix**: event-log truncation at a selected user turn + re-emit. First-class operation, not a fork.
 - **Risk**: medium. Persistence semantics + UI.
 
-#### 8. Handoff command
+#### 14. Handoff command
 - **Where**: new command alongside `/compact`.
 - **Problem**: when the user pivots goals, `/compact` keeps history; a fresh thread loses everything. Amp's handoff uses a second model to extract the relevant messages, tool calls, and files into an editable draft.
 - **Fix**: `/handoff <goal>` runs a second-model extraction pass and opens a draft prompt in a fresh session.
 - **Risk**: low-medium. Builds on existing session-fork plumbing.
 
-#### 9. Submit-time `@file` scanning
+#### 15. Submit-time `@file` scanning
 - **Where**: `crates/nav-tui/src/bottom_pane/mention_popup.rs:32`.
 - **Problem**: today `@` opens a mention popup that creates a pending attachment. Plain typed `@path` in a message is not resolved on submit (Amp does this).
 - **Fix**: scan submitted message text for `@<path>` tokens, resolve + inline under the same truncation policy as #5.
 - **Risk**: low.
 
-#### 10. `read_thread` tool
+#### 16. `read_thread` tool
 - **Where**: new tool in `crates/nav-core/src/tool_registry/definitions.rs:17`.
 - **Problem**: model cannot reference other sessions by ID/URL. Amp does this via `read_thread` + second-model extraction.
 - **Fix**: add tool that pulls excerpts from a session by ID with a budget.
 - **Risk**: low. Useful but niche until multi-thread workflows are common.
 
-#### 11. Ambient context additions
+#### 17. Ambient context additions
 - **Where**: instruction assembly in `crates/nav-core/src/context/mod.rs:48`.
 - **Problem**: Amp injects OS, cwd listing, open file, selected text. nav injects only cwd + skills + project context files.
 - **Fix**: add minimal ambient context (open file path, selected text, shallow `ls` of cwd) **gated behind a per-turn size budget**.
@@ -155,10 +270,12 @@ Tier 1 directly attacks the 2-turn blowup. Tier 2 is UX work that does not move 
 
 ### Execution order
 
-- **Sprint 1 — fix the symptom**: #1 → #2 → #3 → #5. Each independently shippable. #1 alone may resolve the 2-turn issue.
-- **Sprint 2 — durability**: #4 → #6.
-- **Sprint 3 — UX**: #7 → #8 → #9.
-- **Later**: #10, #11.
+- **Sprint 1 — fix the symptom**: #1 → #2 → #5 → #6 → #3. Each independently shippable.
+- **Sprint 2 — make truncation recoverable**: #7 → #8 → #4.
+- **Sprint 3 — history correctness and modality pressure**: #9 → #10 → #12.
+- **Sprint 4 — transport optimization**: #11.
+- **Sprint 5 — UX**: #13 → #14 → #15.
+- **Later**: #16, #17.
 
 ## Detailed Design: Replay Budget
 
@@ -271,7 +388,11 @@ Combined with the tighter caps in Tier 1 #5, this gives the model a safe way to 
 9. NDJSON event log remains truthful even when model replay is pruned.
 10. Replay budgeting is testable independently from live model calls.
 11. The system prompt does not balloon as the skills catalog grows (Tier 1 #1).
-12. I can edit an earlier user message and rerun from that point (Tier 2 #7).
+12. Oversized output is recoverable by artifact id instead of by re-running the
+    broad command/read.
+13. Old images and old reasoning/narration stop inflating later turns once they
+    are no longer needed for continuation.
+14. I can edit an earlier user message and rerun from that point (Tier 2 #13).
 
 ## Implementation Plan
 
@@ -281,26 +402,38 @@ Combined with the tighter caps in Tier 1 #5, this gives the model a safe way to 
 2. **Tier 1 #1 — lazy skills section**. Edit `skill_instruction_section` to emit name + 1-line summary; update wrapper text to tell the model how to load SKILL.md.
 3. **Tier 1 #2 — caching**. Mark the instructions block and tool-definitions block as cacheable in the Responses request.
 4. **Tier 1 #5 — caps + bash spillover**. Update `truncate.rs` to specialize `read_file` caps; add disk spillover for large bash output with `full_output_path` metadata on the event.
-5. **Tier 1 #3 — proactive pruning**. Add a pre-call size check in the agent loop; shed oldest tool pairs to fit budget. Snapshot test the pruning decisions.
+5. **Tier 1 #6 — native `read_file` slicing**. Add `offset`/`limit` to the tool, parse args, propagate to `fs::read_file_slice`. Update truncation notices.
+6. **Tier 1 #3 — proactive pruning**. Add a pre-call size check in the agent loop; shed oldest tool pairs to fit budget. Snapshot test the pruning decisions.
 
-### Sprint 2 — durability
+### Sprint 2 — make truncation recoverable
 
-6. **Tier 1 #6 — native `read_file` slicing**. Add `offset`/`limit` to the tool, parse args, propagate to `fs::read_file_slice`. Update truncation notices.
-7. **Tier 1 #4 — replay policy module**. Create `crates/nav-core/src/agent_loop/replay_policy.rs` (or near replay). Define `ReplayBudget`. Move policy decisions out of `replay.rs`.
-8. **Persist replayable provider output**. Extend `ResponseItem` for reasoning items; capture them from `response.output_item.done`; persist as a durable event before tool execution emits `ToolCallStarted` / `ToolCallOutput`.
-9. **Replay tool calls under budget**. Update `rebuild_responses_input` to emit `function_call` + (raw or placeholder) `function_call_output`, plus provider continuation items. Retain the aborted-turn truncation behavior.
-10. **Extend `/context` reporting**. Label entries `tool output 3 (raw)`, `tool output 4 (cleared)`, `reasoning continuation`. PR auditable without live API calls.
+7. **Tier 1 #7 — artifact-backed full-output retrieval**. Persist raw oversized outputs outside normal replay, emit artifact ids, and add a read-only expansion tool.
+8. **Tier 1 #8 — semantic output reducers**. Add deterministic reducers for `read_file`, `code_search`, and `bash` before old outputs enter history.
+9. **Tier 1 #4 — replay policy module**. Create `crates/nav-core/src/agent_loop/replay_policy.rs` (or near replay). Define `ReplayBudget`. Move policy decisions out of `replay.rs`.
+10. **Persist replayable provider output**. Extend `ResponseItem` for reasoning items; capture them from `response.output_item.done`; persist as a durable event before tool execution emits `ToolCallStarted` / `ToolCallOutput`.
+11. **Replay tool calls under budget**. Update `rebuild_responses_input` to emit `function_call` + (raw, reduced, or placeholder) `function_call_output`, plus provider continuation items. Retain the aborted-turn truncation behavior.
+12. **Extend `/context` reporting**. Label entries `tool output 3 (raw)`, `tool output 4 (reduced)`, `tool output 5 (cleared)`, `reasoning continuation`. PR auditable without live API calls.
 
-### Sprint 3 — UX
+### Sprint 3 — history correctness and modality pressure
 
-11. **Tier 2 #7** — edit/restore previous submitted messages (event-log truncation + re-emit).
-12. **Tier 2 #8** — `/handoff <goal>`.
-13. **Tier 2 #9** — submit-time `@file` scanning that reuses #5's truncation policy.
+13. **Tier 1 #9 — normalized prompt history manager**. Centralize model-visible history recording, pairing, modality stripping, and token-policy truncation.
+14. **Tier 1 #10 — historical reasoning and image shedding**. Strip older reasoning/narration and old image payloads without breaking recent `store: false` continuation.
+15. **Tier 1 #12 — tool-loop budget backpressure**. Lower/default caps and inject budget-check messages after repeated tool calls.
+
+### Sprint 4 — transport optimization
+
+16. **Tier 1 #11 — incremental request payloads**. Send websocket deltas for strict extensions when supported; retain full-request fallback.
+
+### Sprint 5 — UX
+
+17. **Tier 2 #13** — edit/restore previous submitted messages (event-log truncation + re-emit).
+18. **Tier 2 #14** — `/handoff <goal>`.
+19. **Tier 2 #15** — submit-time `@file` scanning that reuses #5's truncation policy.
 
 ### Later
 
-14. **Tier 2 #10** — `read_thread` tool.
-15. **Tier 2 #11** — ambient context additions, gated by size budget.
+20. **Tier 2 #16** — `read_thread` tool.
+21. **Tier 2 #17** — ambient context additions, gated by size budget.
 
 ## Testing Decisions
 
@@ -319,6 +452,14 @@ Focused tests before broad integration:
 - `skill_instruction_section_emits_only_name_and_summary`
 - `agent_loop_proactively_drops_oldest_pair_at_budget`
 - `bash_output_above_threshold_spills_to_disk_with_pointer`
+- `artifact_store_round_trips_truncated_tool_output`
+- `read_file_full_read_reduces_to_outline_with_artifact_id`
+- `code_search_reducer_groups_matches_by_file`
+- `history_manager_removes_orphan_tool_outputs`
+- `history_manager_strips_images_when_model_lacks_image_input`
+- `replay_strips_old_reasoning_but_keeps_recent_continuation`
+- `agent_loop_injects_budget_check_after_repeated_tool_calls`
+- `websocket_request_uses_incremental_delta_for_strict_extension`
 
 Snapshot tests (`insta`) for system-prompt assembly so #1 and #2 do not silently change wording.
 
@@ -350,6 +491,19 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Instructions + tool definitions blocks hit the provider prompt cache after turn 1.
 - Pre-call pruning drops oldest tool pairs to a budget instead of waiting for `ContextWindowExceeded`.
 - Bash outputs above the spillover threshold are stored to disk with a `full_output_path` pointer on the event.
+- Oversized read/search/bash outputs have a recoverable artifact id, and the
+  expansion tool can retrieve the exact raw result without re-running the
+  original tool.
+- Reducers produce deterministic compact output for full-file reads, code
+  search, and bash logs.
+- Model-visible history is normalized: no orphan tool outputs, no outputs
+  without calls, no unsupported image payloads.
+- Old images and old reasoning/narration are stripped or replaced without
+  dropping recent provider continuation items needed by `store: false`.
+- Tool-loop budget checks fire before a runaway tool-heavy turn consumes the
+  next turn's context budget.
+- Incremental websocket requests are used only for strict request extensions and
+  safely fall back to full requests.
 - Existing compacted-session replay still starts from the latest checkpoint, but post-checkpoint normal turns use the same pre-compaction replay policy.
 - No compaction prompt, summary format, or threshold behavior changes.
 
@@ -360,9 +514,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 - Should mutation outputs be replayed raw, or should `FileChange` summaries become the model-visible source of truth for mutations?
 - Should `read_file` default to a smaller line window than the global 50KB / 2000-line cap once `offset`/`limit` exists?
 - Should the lazy skills block include a one-line "how to discover the full list" hint, or rely on a static section in base instructions?
+- Should raw tool artifacts be persisted in SQLite, sidecar files under `.nav`,
+  or ephemeral memory with only same-process expansion?
+- Should artifact expansion support ranges from day one, or should range support
+  wait until reducer output proves the need?
+- What is the right default keep window for historical reasoning and old images:
+  last assistant message, last user turn, or last two user turns?
+- Should incremental request deltas be websocket-only, or should the SSE path
+  learn the same previous-response-id optimization if the provider supports it?
 
 ## Sources
 
 - Amp Context Management guide — https://ampcode.com/guides/context-management
-- Sibling reference repos (read-only): `../pi`, `../opencode`, `../kimiflare`.
+- Sibling reference repos (read-only): `../pi`, `../opencode`, `../codex`, `../kimiflare`.
 - Related: [long-session-compaction-prd.md](long-session-compaction-prd.md) (the *post*-compaction work this plan deliberately does not touch).
