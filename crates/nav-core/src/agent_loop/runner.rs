@@ -11,7 +11,7 @@ use crate::agent_loop::control::{PendingInput, PendingInputMode, TurnControls};
 use crate::agent_loop::prune::prune_to_budget;
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
-use crate::context::compaction::{estimate_input_tokens, is_compact_command, should_auto_compact};
+use crate::context::compaction::{is_compact_command, should_auto_compact};
 use crate::context::history::{
     ModelCapabilities, NAV_SYNTHETIC_MARKER_KEY, remove_orphan_outputs, shed_old_images,
     shed_old_reasoning, strip_unsupported_images,
@@ -114,10 +114,9 @@ impl<'a> AgentTurnRequest<'a> {
 }
 
 impl<'a> SessionBinding<'a> {
-    /// Lifetime cumulative `tokens_input` across all completed turns. Cached
-    /// tokens are a discounted subset of `tokens_input` in the Responses API
-    /// usage shape, so they are not added here — adding them would inflate
-    /// the auto-compaction signal by counting the same prompt twice.
+    /// Lifetime cumulative `tokens_input` across all completed turns.
+    /// Persisted onto `CompactionCompleted` as `tokens_before`; not the
+    /// auto-compaction signal (see [`Self::current_context_tokens`]).
     fn rolling_input_tokens(&self) -> u64 {
         self.store
             .session_token_totals(&self.session_id)
@@ -125,19 +124,15 @@ impl<'a> SessionBinding<'a> {
             .unwrap_or(0)
     }
 
-    /// Tokens spent since the latest `CompactionCompleted` checkpoint. Auto
-    /// compaction must decide against this, not the lifetime total, otherwise
-    /// once a session crosses the threshold every subsequent prompt would
-    /// re-compact because the lifetime counter never decreases.
-    fn post_checkpoint_input_tokens(&self) -> u64 {
-        let rolling = self.rolling_input_tokens();
-        let baseline = self
-            .store
-            .latest_checkpoint_tokens_before(&self.session_id)
+    /// Latest `TurnComplete.tokens_input`. Under `store: false` this equals
+    /// current context occupancy, so it's the right auto-compaction signal —
+    /// the cumulative rollup would double-count history across iterations.
+    fn current_context_tokens(&self) -> u64 {
+        self.store
+            .latest_input_tokens(&self.session_id)
             .ok()
             .flatten()
-            .unwrap_or(0);
-        rolling.saturating_sub(baseline)
+            .unwrap_or(0)
     }
 }
 
@@ -246,18 +241,17 @@ pub(super) async fn run_agent_inner(
         .map(|_| ());
     }
 
-    // Automatic threshold compaction: if recorded or estimated input tokens
-    // cross the configured threshold, compact before submitting so the
-    // incoming prompt isn't sacrificed to an overflow. Recorded usage is
-    // post-checkpoint (rolling minus the lifetime baseline stored at the last
-    // `CompactionCompleted`) so we don't re-compact every turn once the
-    // cumulative counter passes the threshold.
+    // Auto-compact before submitting if current context occupancy crosses
+    // the threshold. After compaction the replacement `input` is shorter, so
+    // the next turn's `tokens_input` drops naturally — no baseline
+    // subtraction needed. A brand-new session with no `TurnComplete` events
+    // reads as 0 here and will not pre-emptively compact even if
+    // `initial_input` is large; that case is rare and the model's own
+    // overflow handler covers it.
     if let Some(binding) = session
         && args.auto_compact_token_limit > 0
     {
-        let tokens_in_use = binding
-            .post_checkpoint_input_tokens()
-            .max(estimate_input_tokens(&input));
+        let tokens_in_use = binding.current_context_tokens();
         let decision = should_auto_compact(
             tokens_in_use,
             args.auto_compact_token_limit,

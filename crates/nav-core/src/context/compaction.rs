@@ -383,10 +383,6 @@ pub fn serialize_for_compaction(input: &[Value]) -> String {
     parts.join("\n\n")
 }
 
-pub fn estimate_input_tokens(input: &[Value]) -> u64 {
-    input.iter().map(estimate_item_tokens).sum()
-}
-
 pub fn select_recent_context(input: &[Value], keep_recent_tokens: u64) -> RecentContextSelection {
     if input.is_empty() {
         return RecentContextSelection {
@@ -1220,20 +1216,4 @@ mod tests {
         assert_eq!(details.modified_files, vec!["b.rs", "c.rs", "d.rs", "e.rs"]);
     }
 
-    #[test]
-    fn estimate_input_tokens_counts_text_blocks_and_images() {
-        let input = vec![
-            json!({"type": "message", "role": "user", "content": "abcd"}),
-            json!({
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "abcdefgh"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,abc"}
-                ]
-            }),
-        ];
-
-        assert_eq!(estimate_input_tokens(&input), 1 + 2 + 1_200);
-    }
 }

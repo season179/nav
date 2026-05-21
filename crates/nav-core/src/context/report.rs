@@ -125,6 +125,8 @@ pub struct ContextReport {
     pub model: String,
     pub token_limit: u64,
     pub auto_compact_threshold: u64,
+    /// Latest `TurnComplete.tokens_input`; `None` until one completes.
+    pub current_context_tokens: Option<u64>,
     pub total: ContextMeasure,
     pub categories: Vec<ContextCategory>,
     pub recorded_usage: TurnUsage,
@@ -137,33 +139,40 @@ impl ContextReport {
         let mut out = String::new();
         let total_tokens = self.total.tokens.max(1);
         let _ = writeln!(out, "model: {}", self.model);
+        let headline_tokens = self.current_context_tokens.unwrap_or(0);
+        let pending = if self.current_context_tokens.is_none() {
+            " (no turns completed yet)"
+        } else {
+            ""
+        };
         if self.token_limit > 0 {
             let _ = writeln!(
                 out,
-                "estimated context: {} / {} tokens ({:.1}%)",
-                format_u64(self.total.tokens),
+                "current context: {} / {} tokens ({:.1}%){pending}",
+                format_u64(headline_tokens),
                 format_u64(self.token_limit),
-                percent(self.total.tokens, self.token_limit)
+                percent(headline_tokens, self.token_limit)
             );
             let _ = writeln!(
                 out,
-                "auto-compact trigger: {} recorded input tokens",
+                "auto-compact trigger: {} tokens (current context size)",
                 format_u64(self.auto_compact_threshold)
             );
             let _ = writeln!(
                 out,
                 "[{}]",
-                usage_bar(self.total.tokens, self.token_limit, 28)
+                usage_bar(headline_tokens, self.token_limit, 28)
             );
         } else {
             let _ = writeln!(
                 out,
-                "estimated context: {} tokens",
-                format_u64(self.total.tokens)
+                "current context: {} tokens{pending}",
+                format_u64(headline_tokens)
             );
             out.push_str("auto-compact trigger: disabled\n");
         }
         out.push('\n');
+        out.push_str("Breakdown (estimated; provider tokenizers will differ slightly)\n");
         out.push_str("Category                 Tokens   Share\n");
         out.push_str("----------------------  -------  ------\n");
         for category in &self.categories {
@@ -203,7 +212,8 @@ impl ContextReport {
                 format_u64(self.recorded_usage.tokens_reasoning)
             );
             out.push_str(
-                "recorded usage is lifetime spend; the estimate above is current replay size.\n",
+                "recorded usage is lifetime spend across all turns; auto-compact fires on \
+                 current context size (headline above), not on this rollup.\n",
             );
         }
         if !self.notes.is_empty() {
@@ -261,12 +271,14 @@ pub fn build_context_report_with_replay_cwd(
     let auto_compact_threshold =
         should_auto_compact(0, args.auto_compact_token_limit, args.auto_compact_fraction).threshold;
     let recorded_usage = recorded_usage(events);
+    let current_context_tokens = latest_turn_input_tokens(events);
     let notes = report_notes(&categories, total, args.auto_compact_token_limit);
 
     ContextReport {
         model: args.model.clone(),
         token_limit: args.auto_compact_token_limit,
         auto_compact_threshold,
+        current_context_tokens,
         total,
         categories,
         recorded_usage,
@@ -510,6 +522,13 @@ fn measure_text(text: &str) -> ContextMeasure {
         chars,
         tokens: char_estimate.max(word_floor).max(1),
     }
+}
+
+fn latest_turn_input_tokens(events: &[AgentEvent]) -> Option<u64> {
+    events.iter().rev().find_map(|event| match event {
+        AgentEvent::TurnComplete { usage } if usage.tokens_input > 0 => Some(usage.tokens_input),
+        _ => None,
+    })
 }
 
 fn recorded_usage(events: &[AgentEvent]) -> TurnUsage {

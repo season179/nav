@@ -18,13 +18,26 @@ pub struct StatusBar<'a> {
     /// uncommitted changes. False when not in a repo.
     pub dirty: bool,
     pub state: AgentState,
-    /// Most recent `tokens_input` reported by the provider. For `store: false`
-    /// transports this is also the current context occupancy, since every turn
-    /// resends the full history. `0` before the first `TurnComplete`.
+    /// Current context-window occupancy: the latest provider-reported
+    /// `tokens_input`. `0` before the first `TurnComplete`.
     pub tokens_input: u64,
     /// Effective context window used to compute the percentage. `0` hides the
     /// gauge entirely.
     pub context_window: u64,
+}
+
+/// Format `tokens` as `<n.n>k` (one decimal). Caller must gate on
+/// `>= 1_000`; below that the gauge is hidden entirely.
+fn format_tokens_k(tokens: u64) -> String {
+    debug_assert!(tokens >= 1_000);
+    let tenths = (tokens + 50) / 100;
+    let whole = tenths / 10;
+    let frac = tenths % 10;
+    if frac == 0 {
+        format!("{whole}k")
+    } else {
+        format!("{whole}.{frac}k")
+    }
 }
 
 pub enum AgentState {
@@ -85,11 +98,15 @@ impl<'a> Widget for StatusBar<'a> {
             .tokens_input
             .saturating_mul(100)
             .checked_div(self.context_window)
+            && self.tokens_input >= 1_000
         {
-            let denom_k = (self.context_window + 500) / 1000;
+            let denom_k = (self.context_window + 500) / 1_000;
             spans.push(Span::styled("  ·  ", dim));
             spans.push(Span::styled(
-                format!("{}/{denom_k}k {pct}%", self.tokens_input),
+                format!(
+                    "{}/{denom_k}k {pct}%",
+                    format_tokens_k(self.tokens_input)
+                ),
                 dim,
             ));
         }

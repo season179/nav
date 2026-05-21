@@ -3682,6 +3682,21 @@ async fn tool_call_soft_budget_zero_disables_backpressure() {
 /// given text and a `response.completed` envelope. Used by the compaction
 /// tests as the stand-in for "the model wrote a summary."
 fn compact_turn_with_text(text: &str) -> Vec<Value> {
+    compact_turn_with_text_and_input_tokens(text, 0)
+}
+
+/// Same as [`compact_turn_with_text`] but reports an explicit `input_tokens`
+/// usage value on the `response.completed` envelope, so callers can assert
+/// against a non-zero post-turn `tokens_input` reading.
+fn compact_turn_with_text_and_input_tokens(text: &str, input_tokens: u64) -> Vec<Value> {
+    let completed = if input_tokens == 0 {
+        json!({"type": "response.completed", "response": {}})
+    } else {
+        json!({
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": input_tokens}},
+        })
+    };
     vec![
         json!({
             "type": "response.output_item.done",
@@ -3690,7 +3705,7 @@ fn compact_turn_with_text(text: &str) -> Vec<Value> {
                 "content": [{"type": "output_text", "text": text}]
             }
         }),
-        json!({"type": "response.completed", "response": {}}),
+        completed,
     ]
 }
 
@@ -4289,82 +4304,15 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
 }
 
 #[tokio::test]
-async fn auto_compact_fires_when_estimated_input_crosses_threshold() {
-    let db_dir = tempdir().unwrap();
-    let store =
-        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
-    let cwd_dir = tempdir().unwrap();
-    let cwd = cwd_dir.path().canonicalize().unwrap();
-    let session_id = store
-        .create_session(
-            &cwd,
-            crate::context::PROVIDER_OPENAI_RESPONSES,
-            "test-model",
-            None,
-        )
-        .unwrap();
-    let binding = SessionBinding {
-        store: &store,
-        session_id,
-    };
-
-    let mut args = Args::test_default();
-    args.auto_compact_token_limit = 500;
-    args.auto_compact_fraction = 1.0;
-
-    let initial_input = vec![json!({
-        "type": "message",
-        "role": "user",
-        "content": "large replay ".repeat(500),
-    })];
-    let summarise_turn = compact_turn_with_text("HANDOFF: estimated pressure");
-    let user_turn = compact_turn_with_text("ack after estimate");
-    let transport = StubTransport::new(vec![summarise_turn, user_turn]);
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-
-    run_agent_for_test(
-        &transport,
-        &args,
-        &cwd,
-        "regular prompt",
-        None,
-        Vec::new(),
-        tx,
-        Some(&binding),
-        Some(initial_input),
-        &Catalog::default(),
-        None,
-        unchecked_permission_context(),
-    )
-    .await
-    .expect("run with estimated auto-compact");
-
-    let mut events = Vec::new();
-    while let Some(event) = rx.recv().await {
-        events.push(event);
-    }
-
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AgentEvent::CompactionStarted {
-                trigger: super::CompactionTrigger::Auto,
-                ..
-            }
-        )),
-        "auto-compaction should have fired from estimated replay tokens"
-    );
-    assert_eq!(transport.bodies().len(), 2, "auto-compact + user turn");
-}
-
-#[tokio::test]
 async fn auto_compact_does_not_re_fire_after_checkpoint() {
-    // Regression for codex review B-3: rolling token totals are lifetime
-    // cumulative, so naive threshold checks would re-compact every turn
-    // after the first crossing. The runner must instead key off
-    // `rolling - latest_checkpoint.tokens_before` so a second prompt
-    // submitted shortly after a successful auto-compaction does NOT
-    // trigger compaction again.
+    // After auto-compaction the next provider response reports a *smaller*
+    // `tokens_input` because the replacement history is shorter — so the
+    // latest reading naturally drops below the threshold and a subsequent
+    // prompt does not re-trigger. Stubs report a concrete non-zero
+    // `input_tokens` for both post-compaction turns so the no-re-fire
+    // outcome is driven by the threshold comparison, not by the stub
+    // returning empty usage (which would let the test pass on a zero
+    // reading and hide a regression where lifetime rollup was still in use).
     let db_dir = tempdir().unwrap();
     let store =
         crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
@@ -4406,10 +4354,12 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
     args.auto_compact_token_limit = 100_000;
     args.auto_compact_fraction = 0.85;
 
-    // First run: auto-compact + user turn.
+    // First run: auto-compact + user turn. Both stub responses carry a
+    // concrete `input_tokens` reading so the test asserts threshold behavior
+    // against a real number, not a zero side-effect of the empty-usage stub.
     let transport_one = StubTransport::new(vec![
-        compact_turn_with_text("HANDOFF: ongoing"),
-        compact_turn_with_text("ack"),
+        compact_turn_with_text_and_input_tokens("HANDOFF: ongoing", 50_000),
+        compact_turn_with_text_and_input_tokens("ack", 5_000),
     ]);
     let binding_one = SessionBinding {
         store: &store,

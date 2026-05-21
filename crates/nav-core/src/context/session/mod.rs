@@ -699,36 +699,30 @@ impl SessionStore {
         Ok(events)
     }
 
-    /// Returns the `tokens_before` field from the most recent
-    /// `compaction_completed` event recorded for `session_id`, or `None` if
-    /// the session has never been compacted. Used as the baseline against
-    /// which post-checkpoint usage is measured for automatic compaction —
-    /// without it, once lifetime rolling tokens cross the threshold, every
-    /// later prompt would re-compact.
-    pub(crate) fn latest_checkpoint_tokens_before(&self, session_id: &str) -> Result<Option<u64>> {
+    /// Latest `TurnComplete.tokens_input` for `session_id`, or `None` if no
+    /// turn has completed yet. Under `store: false` this equals current
+    /// context-window occupancy (each iteration resends the full history), so
+    /// it's the right auto-compaction signal — unlike the cumulative rollup
+    /// in `session.tokens_input`, which double-counts the same context.
+    pub(crate) fn latest_input_tokens(&self, session_id: &str) -> Result<Option<u64>> {
         let conn = self.lock();
-        let row: Option<String> = conn
+        let row: Option<i64> = conn
             .query_row(
-                "SELECT data FROM event
-                 WHERE session_id = ?1 AND kind = 'compaction_completed'
+                "SELECT CAST(json_extract(data, '$.usage.tokens_input') AS INTEGER)
+                 FROM event
+                 WHERE session_id = ?1 AND kind = 'turn_complete'
                  ORDER BY seq DESC LIMIT 1",
                 params![session_id],
                 |row| row.get(0),
             )
             .optional()?;
-        let Some(data) = row else {
-            return Ok(None);
-        };
-        let value: serde_json::Value = serde_json::from_str(&data)
-            .context("failed to parse stored compaction_completed event")?;
-        Ok(value
-            .get("tokens_before")
-            .and_then(serde_json::Value::as_u64))
+        Ok(row.map(|n| n.max(0) as u64))
     }
 
-    /// Returns the rolling token totals recorded against `session_id`. Used
-    /// by the compaction module to decide whether automatic compaction
-    /// should fire before submitting the next turn.
+    /// Returns the rolling token totals recorded against `session_id`. The
+    /// rolling rollup is for lifetime-spend reporting; auto-compaction uses
+    /// [`Self::latest_input_tokens`] instead so the threshold tracks current
+    /// context-window occupancy rather than cumulative spend.
     pub(crate) fn session_token_totals(&self, session_id: &str) -> Result<SessionTokenTotals> {
         let conn = self.lock();
         let row = conn
