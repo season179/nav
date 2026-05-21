@@ -331,6 +331,22 @@ impl ChatWidget {
                 // Wire-level continuation handle for the next request — not
                 // user-facing scrollback.
             }
+            AgentEvent::SessionRewound {
+                target_seq,
+                removed_events,
+                preview,
+            } => {
+                self.close_streaming_assistant();
+                self.turn_has_work = false;
+                let detail = if preview.is_empty() {
+                    format!("rewound to seq {target_seq}, removed {removed_events} event(s)")
+                } else {
+                    format!(
+                        "rewound to seq {target_seq}, removed {removed_events} event(s) — {preview}"
+                    )
+                };
+                self.push_cell(SessionNoticeCell::new("rewind", detail));
+            }
         }
     }
 

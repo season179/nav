@@ -305,6 +305,14 @@ fn event_label_and_body(event: &AgentEvent) -> (&'static str, String) {
         AgentEvent::TurnAborted { turn_id, reason } => {
             ("turn aborted", format!("{turn_id}: {reason}"))
         }
+        AgentEvent::SessionRewound {
+            target_seq,
+            removed_events,
+            preview,
+        } => (
+            "session rewound",
+            format!("to seq {target_seq}, removed {removed_events} event(s): {preview}"),
+        ),
         AgentEvent::ContextTrimmed { dropped_pairs } => (
             "context trimmed",
             format!("dropped {dropped_pairs} tool-call pair(s)"),

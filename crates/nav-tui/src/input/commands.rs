@@ -51,6 +51,13 @@ pub(crate) enum AppEvent {
     ForkSession {
         at: Option<u64>,
     },
+    /// Rewind the current session to an earlier user_message. `at = None`
+    /// defaults to the latest submitted prompt — i.e. "edit the message I
+    /// just sent". The original text is returned via the store so the
+    /// composer can be repopulated for editing before the next turn.
+    RewindSession {
+        at: Option<u64>,
+    },
     ShowTree,
     AddLabel {
         label: String,
@@ -201,6 +208,21 @@ pub(super) fn parse_builtin_command(text: &str) -> Option<AppEvent> {
             }
         };
         return Some(AppEvent::ForkSession { at });
+    }
+    if let Some(rest) = slash_rest(trimmed, "/rewind") {
+        let at = if rest.is_empty() {
+            None
+        } else {
+            match rest.parse::<u64>() {
+                Ok(seq) => Some(seq),
+                Err(_) => {
+                    return Some(AppEvent::SlashError {
+                        message: format!("usage: /rewind [seq]  (got {rest:?})"),
+                    });
+                }
+            }
+        };
+        return Some(AppEvent::RewindSession { at });
     }
     if trimmed == "/tree" {
         return Some(AppEvent::ShowTree);

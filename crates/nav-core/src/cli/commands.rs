@@ -65,6 +65,17 @@ pub enum SessionsAction {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Rewind a session to an earlier `user_message` seq. Removes that
+    /// message and every later event from the session's own log, leaving
+    /// an audit row in place. The next prompt continues the same session.
+    Rewind {
+        /// Full session ULID or unique prefix.
+        session_id: String,
+        /// Event seq of the `user_message` to rewind to. Defaults to the
+        /// most recently submitted user message.
+        #[arg(long)]
+        at: Option<u64>,
+    },
     /// Show the parent -> child tree rooted at this session.
     Tree {
         /// Full session ULID or unique prefix.
