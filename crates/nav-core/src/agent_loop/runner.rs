@@ -1,9 +1,7 @@
 use anyhow::{Result, anyhow};
-use base64::Engine;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::events::CompactionTrigger;
@@ -14,14 +12,12 @@ use crate::agent_loop::prune::{ReplayBudget, prune_to_budget};
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
 use crate::context::compaction::{estimate_input_tokens, is_compact_command, should_auto_compact};
-use crate::context::{Catalog, ProjectContext, SessionId, SessionStore};
+use crate::context::{Catalog, ProjectContext, SessionId, SessionStore, build_user_content};
 use crate::git_checkpoint;
-use crate::guardrails::protected::is_protected_read;
 use crate::guardrails::{self, PermissionContext};
 use crate::model::ResponsesTransport;
 use crate::model::responses::{self, ResponseCollector, ResponsesError};
 use crate::tool_registry;
-use crate::tool_registry::truncate::{self, TruncateMode, bound};
 use crate::verify::{self, PatchApplyStatus};
 
 /// Optional session-store binding passed to [`run_agent`]; when present,
@@ -151,127 +147,6 @@ fn user_message_event(
         display_text,
         attachments,
     }
-}
-
-/// Build the `content` part of a Responses API user message. Plain text turns
-/// stay as a single string (the historical shape); when attachments are
-/// present, return an array of typed content parts so the Responses API
-/// sees `input_text` alongside `input_image`. Attachments that fail to load
-/// are dropped silently; non-UTF-8 or symlink-to-secret cases surface as
-/// inline text notes so the model knows the path was requested.
-pub(crate) fn build_user_content(
-    prompt: &str,
-    attachments: &[UserAttachment],
-    cwd: &Path,
-) -> Value {
-    if attachments.is_empty() {
-        return Value::String(prompt.to_string());
-    }
-    // Canonicalize cwd once; resolve_workspace_path used to do this per
-    // attachment, which on a turn with N files meant N stat-walks of the
-    // workspace root.
-    let cwd_canonical = cwd.canonicalize().ok();
-    let mut parts: Vec<Value> = Vec::with_capacity(1 + attachments.len());
-    parts.push(json!({ "type": "input_text", "text": prompt }));
-    for attach in attachments {
-        match attach {
-            UserAttachment::Image { path } => {
-                if let Some(canonical) = resolve_workspace_path(cwd_canonical.as_deref(), cwd, path)
-                    && let Some(data_uri) = encode_image_data_uri(&canonical)
-                {
-                    parts.push(json!({
-                        "type": "input_image",
-                        "image_url": data_uri,
-                    }));
-                }
-            }
-            UserAttachment::File { path } => {
-                if let Some(text) = load_file_attachment(cwd_canonical.as_deref(), cwd, path) {
-                    parts.push(json!({
-                        "type": "input_text",
-                        "text": text,
-                    }));
-                }
-            }
-        }
-    }
-    Value::Array(parts)
-}
-
-/// Canonicalize `rel` against `cwd` and require workspace containment. A
-/// `..`-laden path or a symlink that escapes would otherwise let us
-/// silently include arbitrary files (e.g. `~/.ssh/id_rsa`) in the request.
-/// `cwd_canonical` is the pre-canonicalized cwd from the caller — passing
-/// `None` falls back to canonicalizing per call, used by code paths that
-/// don't have the canonical form handy.
-fn resolve_workspace_path(cwd_canonical: Option<&Path>, cwd: &Path, rel: &Path) -> Option<PathBuf> {
-    let abs = if rel.is_absolute() {
-        rel.to_path_buf()
-    } else {
-        cwd.join(rel)
-    };
-    let canonical = abs.canonicalize().ok()?;
-    let cwd_canonical = match cwd_canonical {
-        Some(p) => p.to_path_buf(),
-        None => cwd.canonicalize().ok()?,
-    };
-    canonical.starts_with(&cwd_canonical).then_some(canonical)
-}
-
-fn encode_image_data_uri(canonical: &Path) -> Option<String> {
-    let bytes = std::fs::read(canonical).ok()?;
-    let ext = canonical
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_else(|| "png".to_string());
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        _ => "image/png",
-    };
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Some(format!("data:{mime};base64,{encoded}"))
-}
-
-/// Cap on how many bytes a single file attachment may pull off disk before
-/// truncation. `MAX_BYTES + 1` so a file at exactly the cap still has the
-/// next byte sampled — the marker would otherwise lie about whether
-/// anything was dropped.
-const FILE_ATTACHMENT_READ_CAP: u64 = (truncate::MAX_BYTES as u64) + 1;
-
-/// Render a `File` attachment as a fenced block. UTF-8 only; binary bodies
-/// fall back to a note. We read at most `FILE_ATTACHMENT_READ_CAP` bytes so
-/// a 1 GB attachment doesn't pull 1 GB into memory just to discard the
-/// tail. Symlink reaches into protected paths are refused inline even
-/// after gate approval — matches `read_file`'s symlink-bypass check.
-fn load_file_attachment(cwd_canonical: Option<&Path>, cwd: &Path, rel: &Path) -> Option<String> {
-    let rel_display = rel.display().to_string();
-    let canonical = resolve_workspace_path(cwd_canonical, cwd, rel)?;
-    if is_protected_read(&canonical) && !is_protected_read(rel) {
-        return Some(format!(
-            "<attached file: {rel_display}>\n[refused: path resolves via symlink to a protected secret]\n</attached>",
-        ));
-    }
-    let file = std::fs::File::open(&canonical).ok()?;
-    let mut bytes = Vec::new();
-    file.take(FILE_ATTACHMENT_READ_CAP)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    let body = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(err) => {
-            return Some(format!(
-                "<attached file: {rel_display}>\n[skipped: file is not valid UTF-8 ({} bytes read)]\n</attached>",
-                err.into_bytes().len()
-            ));
-        }
-    };
-    let bounded = bound(body, TruncateMode::Head).content;
-    Some(format!(
-        "<attached file: {rel_display}>\n{bounded}\n</attached>",
-    ))
 }
 
 async fn apply_attachment_guardrails(
@@ -420,7 +295,7 @@ pub(super) async fn run_agent_inner(
         return Ok(());
     }
 
-    let content = build_user_content(prompt, &attachments, cwd);
+    let content = build_user_content(prompt, display_prompt, &attachments, cwd);
     emit(
         &events,
         session,
@@ -540,10 +415,12 @@ pub(super) async fn run_agent_inner(
                     emit_turn_aborted(&events, session, controls.turn_id.as_deref(), reason);
                     return Ok(());
                 }
+                let content =
+                    build_user_content(&item.text, item.display_text.as_deref(), &attachments, cwd);
                 input.push(json!({
                     "type": "message",
                     "role": "user",
-                    "content": build_user_content(&item.text, &attachments, cwd),
+                    "content": content,
                 }));
             }
             continue 'turns;

@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 pub use crate::agent_loop::UserAttachment;
+pub(crate) use attachments::build_user_content;
 pub use compaction::{
     AutoCompactDecision, CheckpointSlice, CompactionDetails, build_replacement_history,
     collect_recent_user_messages, is_summary_message, latest_checkpoint_slice, should_auto_compact,
@@ -185,6 +186,7 @@ pub(crate) fn build_instructions(
         .collect()
 }
 
+pub(crate) mod attachments;
 pub mod compaction;
 
 pub mod extensions;
