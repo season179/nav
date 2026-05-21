@@ -437,6 +437,11 @@ pub(super) async fn run_agent_inner(
     // Tracked manually so an overflow trim+retry doesn't consume the user's
     // turn budget — the server rejected our request before any work happened.
     let mut turns_used = 0usize;
+    // Total tool calls fielded for this user prompt. Each time the running
+    // count crosses a new multiple of `args.tool_call_soft_budget` (when > 0),
+    // nav emits a `ToolBudgetWarning` and injects a budget-check steering
+    // user message so the model is nudged toward a deliverable.
+    let mut tool_calls_this_turn = 0usize;
 
     'turns: loop {
         if turns_used >= args.max_turns {
@@ -539,6 +544,7 @@ pub(super) async fn run_agent_inner(
         // function_call_output items the agent appends below.
         input.extend(responses::into_raw_output(envelope));
         let mut turn_had_mutation = false;
+        let calls_in_this_turn = calls.len();
         for call in calls {
             let call_id = call.call_id.clone();
             emit(
@@ -685,6 +691,17 @@ pub(super) async fn run_agent_inner(
             }
         }
 
+        let tool_calls_before = tool_calls_this_turn;
+        tool_calls_this_turn = tool_calls_this_turn.saturating_add(calls_in_this_turn);
+        maybe_emit_budget_warning(
+            args.tool_call_soft_budget,
+            tool_calls_before,
+            tool_calls_this_turn,
+            &mut input,
+            &events,
+            session,
+        );
+
         if let Err(err) = finalize_turn(
             &events,
             session,
@@ -697,6 +714,49 @@ pub(super) async fn run_agent_inner(
         }
         turns_used += 1;
     }
+}
+
+/// Inject a "budget check" steering user message and emit
+/// [`AgentEvent::ToolBudgetWarning`] when this turn iteration's tool calls
+/// pushed the running total across a new multiple of `soft_budget`. Even when
+/// a single iteration crosses several multiples at once, nav fires once per
+/// iteration so the model isn't drowned in stacked nudges. `soft_budget == 0`
+/// is the explicit escape hatch for deep-research sessions.
+fn maybe_emit_budget_warning(
+    soft_budget: usize,
+    tool_calls_before: usize,
+    tool_calls_after: usize,
+    input: &mut Vec<Value>,
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+) {
+    if soft_budget == 0 {
+        return;
+    }
+    if tool_calls_after / soft_budget <= tool_calls_before / soft_budget {
+        return;
+    }
+    emit(
+        events,
+        session,
+        AgentEvent::ToolBudgetWarning {
+            tool_calls: tool_calls_after,
+            soft_budget,
+        },
+    );
+    input.push(json!({
+        "type": "message",
+        "role": "user",
+        "content": budget_warning_text(tool_calls_after),
+    }));
+}
+
+fn budget_warning_text(tool_calls: usize) -> String {
+    format!(
+        "[nav budget check] You have made {tool_calls} tool calls in this turn. \
+         If you can produce a deliverable now with what you have gathered, do so. \
+         Otherwise, briefly justify why continued tool use is necessary before making more calls."
+    )
 }
 
 fn checkpoint_dirty_worktree(

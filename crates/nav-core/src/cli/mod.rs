@@ -57,9 +57,19 @@ pub struct Args {
     #[arg(long)]
     pub codex_home: Option<PathBuf>,
 
-    /// Maximum model/tool loop iterations.
-    #[arg(default_value_t = 10000, long)]
+    /// Maximum model/tool loop iterations within a single user turn. Bounds
+    /// runaway turns so one user prompt cannot consume an unlimited number of
+    /// round trips. Pair with `--tool-call-soft-budget` for an earlier nudge.
+    #[arg(default_value_t = 100, long)]
     pub max_turns: usize,
+
+    /// Soft tool-call budget within a single user turn. After every N tool
+    /// calls, nav injects a budget-check steering message asking the model to
+    /// produce a deliverable or briefly justify continued exploration. `0`
+    /// disables the nudge — the escape hatch for deliberate deep-research
+    /// sessions, where the hard `--max-turns` cap is the only bound.
+    #[arg(default_value_t = 25, long)]
+    pub tool_call_soft_budget: usize,
 
     /// Timeout for shell commands run by the bash tool.
     #[arg(default_value_t = 20, long)]
@@ -177,6 +187,10 @@ impl Args {
             // reading the developer's real ~/.codex/auth.json.
             codex_home: Some(PathBuf::from("/nonexistent/test/codex/home")),
             max_turns: 4,
+            // Disable the soft tool-call budget in tests by default so unit
+            // tests don't see surprise steering injections; tests that
+            // exercise the budget set it explicitly.
+            tool_call_soft_budget: 0,
             bash_timeout_secs: 10,
             idle_timeout_secs: 30,
             resume: None,

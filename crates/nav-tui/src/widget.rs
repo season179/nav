@@ -176,6 +176,14 @@ impl ChatWidget {
                     "context window exceeded — trimmed {dropped_pairs} oldest tool pair(s) and retried"
                 )));
             }
+            AgentEvent::ToolBudgetWarning {
+                tool_calls,
+                soft_budget,
+            } => {
+                self.push_cell(NoticeCell::warning(format!(
+                    "tool-call budget check — {tool_calls} calls this turn (soft budget {soft_budget}); nav nudged the model"
+                )));
+            }
             AgentEvent::ToolCallStarted {
                 call_id,
                 name,

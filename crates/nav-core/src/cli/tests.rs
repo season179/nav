@@ -10,7 +10,8 @@ fn defaults_are_correct() {
     assert_eq!(args.model, "gpt-5.5");
     assert!(matches!(args.auth, AuthMode::Chatgpt));
     assert!(matches!(args.transport, Transport::Websocket));
-    assert_eq!(args.max_turns, 10000);
+    assert_eq!(args.max_turns, 100);
+    assert_eq!(args.tool_call_soft_budget, 25);
     assert_eq!(args.bash_timeout_secs, 20);
     assert_eq!(args.prompt, vec!["hello"]);
     assert!(args.codex_home.is_none());
@@ -186,14 +187,30 @@ fn settings_fill_in_defaulted_args() {
     let settings = Settings {
         model: Some("custom-model".into()),
         max_turns: Some(20),
+        tool_call_soft_budget: Some(7),
         ..Settings::default()
     };
     args.apply_settings(&settings, &provided);
     assert_eq!(args.model, "custom-model");
     assert_eq!(args.max_turns, 20);
+    assert_eq!(args.tool_call_soft_budget, 7);
     // Untouched fields stay at clap defaults.
     assert_eq!(args.bash_timeout_secs, 20);
     assert!(!args.git_checkpoints);
+}
+
+#[test]
+fn explicit_tool_call_soft_budget_flag_beats_settings() {
+    let (mut args, provided) = matches(&["nav", "--tool-call-soft-budget", "0", "hi"]);
+    let settings = Settings {
+        tool_call_soft_budget: Some(50),
+        ..Settings::default()
+    };
+    args.apply_settings(&settings, &provided);
+    assert_eq!(
+        args.tool_call_soft_budget, 0,
+        "explicit `0` (deep-research escape hatch) wins over settings"
+    );
 }
 
 #[test]

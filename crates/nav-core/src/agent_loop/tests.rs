@@ -2344,6 +2344,226 @@ async fn overflow_second_failure_surfaces_clean_error() {
 
 // ── transport-level retry plumbing ────────────────────────────
 
+// ── tool-call budget backpressure ─────────────────────────────
+
+fn tool_call_turn(call_id: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "list_files",
+                "arguments": "{\"path\":\".\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ]
+}
+
+fn final_message_turn(text: &str) -> Vec<Value> {
+    vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": text}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ]
+}
+
+#[tokio::test]
+async fn tool_call_soft_budget_emits_warning_and_injects_steering() {
+    // Three tool-call turns followed by a final message. With
+    // tool_call_soft_budget=2, the warning should fire exactly once — after
+    // the second tool call (cumulative count reaches the budget), and the
+    // subsequent request should include the injected steering message.
+    let transport = StubTransport::new(vec![
+        tool_call_turn("call_1"),
+        tool_call_turn("call_2"),
+        tool_call_turn("call_3"),
+        final_message_turn("done"),
+    ]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 10;
+    args.tool_call_soft_budget = 2;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "explore",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let warnings: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolBudgetWarning { .. }))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "single threshold crossing emits one warning: {events:#?}"
+    );
+    assert!(matches!(
+        warnings[0],
+        AgentEvent::ToolBudgetWarning { tool_calls: 2, soft_budget: 2 }
+    ));
+
+    // After the warning fires, the next request (turn index 2, the third
+    // model call) should carry the injected budget-check user message.
+    let bodies = transport.bodies();
+    assert!(bodies.len() >= 3, "expected at least 3 transport calls");
+    let third_input = bodies[2].get("input").and_then(Value::as_array).unwrap();
+    let nudge_present = third_input.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("user")
+            && item
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.starts_with("[nav budget check]"))
+    });
+    assert!(
+        nudge_present,
+        "budget-check steering not injected into next request: {third_input:#?}"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_soft_budget_fires_repeatedly_for_long_turns() {
+    // budget=1 means every tool call crosses a new multiple. Four tool-call
+    // turns should produce four warnings before the final message arrives.
+    let transport = StubTransport::new(vec![
+        tool_call_turn("call_1"),
+        tool_call_turn("call_2"),
+        tool_call_turn("call_3"),
+        tool_call_turn("call_4"),
+        final_message_turn("done"),
+    ]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 10;
+    args.tool_call_soft_budget = 1;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "explore",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    let warning_counts: Vec<usize> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolBudgetWarning { tool_calls, .. } => Some(*tool_calls),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        warning_counts,
+        vec![1, 2, 3, 4],
+        "expected one warning per crossing, got {warning_counts:?}"
+    );
+}
+
+#[tokio::test]
+async fn tool_call_soft_budget_zero_disables_backpressure() {
+    // soft_budget=0 is the deep-research escape hatch — no warning should
+    // ever fire even after many tool calls.
+    let transport = StubTransport::new(vec![
+        tool_call_turn("call_1"),
+        tool_call_turn("call_2"),
+        tool_call_turn("call_3"),
+        final_message_turn("done"),
+    ]);
+
+    let mut args = Args::test_default();
+    args.max_turns = 10;
+    args.tool_call_soft_budget = 0;
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "explore",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run_agent");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ToolBudgetWarning { .. })),
+        "soft_budget=0 must not emit ToolBudgetWarning: {events:#?}"
+    );
+    // And no injected nudge should appear in any request body either.
+    for body in transport.bodies() {
+        let input = body.get("input").and_then(Value::as_array).unwrap();
+        for item in input {
+            if let Some(text) = item.get("content").and_then(Value::as_str) {
+                assert!(
+                    !text.starts_with("[nav budget check]"),
+                    "unexpected nudge in body: {input:#?}"
+                );
+            }
+        }
+    }
+}
+
 // ── compaction integration ────────────────────────────────────
 
 /// Build a single-turn stub that returns one assistant message with the
