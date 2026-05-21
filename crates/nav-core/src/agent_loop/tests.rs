@@ -1812,7 +1812,13 @@ async fn run_agent_spawn_subagent_returns_worker_summary_to_parent() {
         .collect();
     assert_eq!(
         worker_tools,
-        vec!["read_file", "list_files", "code_search", "expand_artifact"]
+        vec![
+            "read_file",
+            "list_files",
+            "code_search",
+            "read_thread",
+            "expand_artifact"
+        ]
     );
     let worker_input = worker_body.get("input").and_then(Value::as_array).unwrap();
     assert!(

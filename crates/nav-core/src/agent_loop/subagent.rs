@@ -73,6 +73,7 @@ pub(crate) async fn run_subagent_tool(request: SubagentToolRequest<'_, '_>) -> T
         Vec::new(),
         worker_tx,
         None,
+        request.parent_session.map(|binding| binding.store),
         None,
         request.skills,
         request.context,

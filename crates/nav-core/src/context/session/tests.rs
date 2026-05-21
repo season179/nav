@@ -777,6 +777,125 @@ fn resolve_session_id_accepts_unique_prefix_and_rejects_ambiguous_prefix() {
 }
 
 #[test]
+fn read_thread_resolves_url_and_returns_focused_excerpt() {
+    let (_dir, store) = open_temp_store();
+    let id = store
+        .create_session_named(
+            Path::new("/proj/thread"),
+            PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+            Some("reference source"),
+        )
+        .unwrap();
+    for event in [
+        AgentEvent::UserMessage {
+            text: "start with broad setup".into(),
+            display_text: None,
+            attachments: Vec::new(),
+        },
+        AgentEvent::AssistantMessageDone {
+            text: "ordinary setup notes".into(),
+        },
+        AgentEvent::UserMessage {
+            text: "focus on the needle detail".into(),
+            display_text: None,
+            attachments: Vec::new(),
+        },
+        AgentEvent::AssistantMessageDone {
+            text: "needle detail lives here".into(),
+        },
+        AgentEvent::TurnComplete {
+            usage: TurnUsage::default(),
+        },
+    ] {
+        store.append_event(&id, &event).unwrap();
+    }
+
+    let output = store
+        .read_thread(
+            &format!("nav://session/{id}"),
+            ThreadReadOptions {
+                query: Some("needle".into()),
+                around_seq: None,
+                max_tokens: Some(512),
+            },
+        )
+        .unwrap();
+
+    assert!(output.contains(&id));
+    assert!(output.contains("reference source"));
+    assert!(output.contains("query \"needle\""));
+    assert!(output.contains("[seq 2] user"));
+    assert!(output.contains("[seq 3] assistant"));
+    assert!(output.contains("needle detail lives here"));
+    assert!(output.contains("[omitted"));
+}
+
+#[test]
+fn read_thread_errors_when_session_is_missing() {
+    let (_dir, store) = open_temp_store();
+    let err = store
+        .read_thread(
+            "nav://session/01MISSING00000000000000000",
+            ThreadReadOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("session not found"), "{err}");
+}
+
+#[test]
+fn read_thread_enforces_max_token_budget() {
+    let (_dir, store) = open_temp_store();
+    let id = store
+        .create_session(
+            Path::new("/proj/thread"),
+            PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+        )
+        .unwrap();
+    store
+        .append_event(
+            &id,
+            &AgentEvent::UserMessage {
+                text: "budget check".into(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .append_event(
+            &id,
+            &AgentEvent::AssistantMessageDone {
+                text: "x ".repeat(2_000),
+            },
+        )
+        .unwrap();
+
+    let output = store
+        .read_thread(
+            &format!("https://example.test/nav/thread?utm&x=1&id={id}"),
+            ThreadReadOptions {
+                query: None,
+                around_seq: None,
+                max_tokens: Some(64),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        output.chars().count() <= 64 * 4,
+        "output exceeded budget: {} chars\n{output}",
+        output.chars().count()
+    );
+    assert!(output.contains("truncated to budget"));
+    assert!(output.contains("read_thread"));
+}
+
+#[test]
 fn infer_export_format_defaults_to_markdown_and_honors_json_extension() {
     assert_eq!(infer_export_format(None, None), ExportFormat::Markdown);
     assert_eq!(

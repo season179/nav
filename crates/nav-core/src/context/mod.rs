@@ -17,6 +17,7 @@ pub use extensions::{
     Extension, ExtensionCatalog, ExtensionScope, ExtensionTheme, PromptTemplate, ThemeColors,
     discover_extensions, load_prompt_template,
 };
+pub use handoff::{HANDOFF_SLASH, HandoffBudget, HandoffDraft, build_handoff_draft};
 pub use project::{
     ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,
     shorten_home,
@@ -28,7 +29,7 @@ pub use report::{
 };
 pub use session::{
     ExportFormat, PROVIDER_OPENAI_RESPONSES, ReportedCost, ResolveSessionError, SessionId,
-    SessionStore, SessionSummary, SessionTreeNode, TranscriptHit, export_events,
+    SessionStore, SessionSummary, SessionTreeNode, ThreadReadOptions, TranscriptHit, export_events,
     infer_export_format, layout_session_tree, resolved_db_path,
 };
 pub use skills::{Catalog, Skill, SkillScope, discover_skills};
@@ -193,6 +194,7 @@ pub(crate) mod attachments;
 pub mod compaction;
 
 pub mod extensions;
+pub mod handoff;
 pub(crate) mod history;
 pub mod project;
 pub mod replay;

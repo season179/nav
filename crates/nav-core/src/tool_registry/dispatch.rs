@@ -4,15 +4,15 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::EXPAND_ARTIFACT_TOOL;
 use super::output_accumulator;
 use super::reduce::{reduce_code_search, reduce_read_file};
 use super::truncate::{READ_FILE_MAX_BYTES, READ_FILE_MAX_LINES, TruncateMode, bound_with_limits};
+use super::{EXPAND_ARTIFACT_TOOL, READ_THREAD_TOOL};
 #[cfg(test)]
 use super::{SPAWN_SUBAGENT_TOOL, ToolAccess};
 use super::{fs, patch, preflight, shell};
 use crate::agent_loop::AgentEvent;
-use crate::context::Catalog;
+use crate::context::{Catalog, SessionStore, ThreadReadOptions};
 use crate::guardrails::approval::{ApprovalRequest, AutoGate};
 use crate::guardrails::{
     AskForApproval, PassthroughRunner, ReviewDecision, SandboxPolicy, SessionAllowlist,
@@ -135,6 +135,35 @@ pub async fn run_tool(
     call_id: &str,
     name: &str,
     input: Value,
+    events: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
+) -> Result<ToolOutcome> {
+    run_tool_with_session_store(
+        cwd,
+        skills,
+        timeout_secs,
+        permissions,
+        call_id,
+        name,
+        input,
+        None,
+        events,
+    )
+    .await
+}
+
+/// Dispatch a tool call with access to the current session store. Most tools
+/// do not need it, but session-reference tools read from the same SQLite
+/// database the active conversation is being persisted into.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tool_with_session_store(
+    cwd: &Path,
+    skills: &Catalog,
+    timeout_secs: u64,
+    permissions: &PermissionContext,
+    call_id: &str,
+    name: &str,
+    input: Value,
+    session_store: Option<&SessionStore>,
     events: Option<&tokio::sync::mpsc::UnboundedSender<AgentEvent>>,
 ) -> Result<ToolOutcome> {
     // central dispatch keeps the trust boundary obvious. The model asks;
@@ -301,6 +330,7 @@ pub async fn run_tool(
             });
             ToolResult::text_with_truncation(reduced, truncation)
         }),
+        READ_THREAD_TOOL => read_thread(session_store, &input),
         EXPAND_ARTIFACT_TOOL => expand_artifact(&input),
         other => Err(anyhow!("unknown tool: {other}")),
     };
@@ -375,6 +405,22 @@ fn expand_artifact(input: &Value) -> Result<ToolResult> {
     ))
 }
 
+fn read_thread(session_store: Option<&SessionStore>, input: &Value) -> Result<ToolResult> {
+    let store = session_store.ok_or_else(|| anyhow!("read_thread requires a session store"))?;
+    let session = string_arg(input, "session")?;
+    let options = ThreadReadOptions {
+        query: input
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        around_seq: optional_i64_arg(input, "around_seq")?,
+        max_tokens: optional_usize_arg(input, "max_tokens")?,
+    };
+    store.read_thread(session, options).map(ToolResult::text)
+}
+
 fn optional_usize_arg(input: &Value, key: &str) -> Result<Option<usize>> {
     match input.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -385,6 +431,21 @@ fn optional_usize_arg(input: &Value, key: &str) -> Result<Option<usize>> {
             usize::try_from(n)
                 .map(Some)
                 .map_err(|_| anyhow!("field `{key}` is too large"))
+        }
+    }
+}
+
+fn optional_i64_arg(input: &Value, key: &str) -> Result<Option<i64>> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let n = value
+                .as_i64()
+                .ok_or_else(|| anyhow!("field `{key}` must be an integer"))?;
+            if n < 0 {
+                bail!("field `{key}` must be non-negative");
+            }
+            Ok(Some(n))
         }
     }
 }
@@ -425,7 +486,7 @@ mod tests {
     #[test]
     fn tool_definitions_returns_full_toolset() {
         let defs = tool_definitions(ToolAccess::Full, true);
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 9);
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|d| d.get("name").and_then(Value::as_str))
@@ -437,6 +498,7 @@ mod tests {
             "edit_file",
             "apply_patch",
             "code_search",
+            "read_thread",
             "expand_artifact",
             SPAWN_SUBAGENT_TOOL,
         ] {
@@ -460,11 +522,17 @@ mod tests {
             .filter_map(|d| d.get("name").and_then(Value::as_str))
             .collect();
         // Subagents share the artifact ids surfaced by their parent, so the
-        // read-only worker scope keeps `expand_artifact` alongside the
-        // other read-only tools.
+        // read-only worker scope keeps cross-session readers and
+        // `expand_artifact` alongside the other read-only tools.
         assert_eq!(
             worker_names,
-            vec!["read_file", "list_files", "code_search", "expand_artifact"]
+            vec![
+                "read_file",
+                "list_files",
+                "code_search",
+                "read_thread",
+                "expand_artifact"
+            ]
         );
     }
 
@@ -837,6 +905,69 @@ mod tests {
                 outcome.output
             );
         }
+    }
+
+    #[tokio::test]
+    async fn read_thread_requires_session_store() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_thread",
+            json!({"session": "01ABC"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.output.contains("requires a session store"));
+    }
+
+    #[tokio::test]
+    async fn read_thread_dispatches_with_budget() {
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let store = SessionStore::open(Some(temp.path().join("nav.db"))).unwrap();
+        let session_id = store
+            .create_session(
+                &cwd,
+                crate::context::PROVIDER_OPENAI_RESPONSES,
+                "gpt-test",
+                None,
+            )
+            .unwrap();
+        store
+            .append_event(
+                &session_id,
+                &AgentEvent::UserMessage {
+                    text: "find dispatch needle".into(),
+                    display_text: None,
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let outcome = run_tool_with_session_store(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_thread",
+            json!({"session": session_id, "query": "needle", "max_tokens": 128}),
+            Some(&store),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        assert!(outcome.output.contains("dispatch needle"));
+        assert!(outcome.output.chars().count() <= 128 * 4);
     }
 
     #[test]

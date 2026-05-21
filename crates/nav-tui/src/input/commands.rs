@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use nav_core::{Catalog, ExtensionCatalog, PendingInputMode, PendingSkill, UserAttachment};
+use nav_core::{
+    Catalog, ExtensionCatalog, HANDOFF_SLASH, PendingInputMode, PendingSkill, UserAttachment,
+};
 use tokio::sync::mpsc;
 
 use super::slash::{ControlCommand, SlashAction, classify_slash_with_extensions};
@@ -42,6 +44,9 @@ pub(crate) enum AppEvent {
     },
     ShowContext {
         include_all: bool,
+    },
+    Handoff {
+        goal: String,
     },
     ForkSession {
         at: Option<u64>,
@@ -171,6 +176,16 @@ pub(super) fn parse_builtin_command(text: &str) -> Option<AppEvent> {
                 message: "usage: /context [all]".to_string(),
             }),
         };
+    }
+    if let Some(rest) = slash_rest(trimmed, HANDOFF_SLASH) {
+        if rest.is_empty() {
+            return Some(AppEvent::SlashError {
+                message: "usage: /handoff <goal>".to_string(),
+            });
+        }
+        return Some(AppEvent::Handoff {
+            goal: rest.to_string(),
+        });
     }
     if let Some(rest) = slash_rest(trimmed, "/fork") {
         let at = if rest.is_empty() {
