@@ -384,14 +384,20 @@ fn parse_read_file_args(input: &Value) -> Result<(&str, Option<usize>, Option<us
 
 /// Parse the shared `(offset, limit)` line-slice arguments. Defaults the
 /// limit to `READ_FILE_MAX_LINES` so callers paging through artifacts get
-/// the same first-window behavior `read_file` already enforces.
+/// the same first-window behavior `read_file` already enforces, and clamps
+/// any explicit larger limit down to that cap. Without the clamp, a
+/// model-supplied `limit: usize::MAX` (or just a very large number) would
+/// let `expand_artifact` return tens of thousands of lines as long as the
+/// byte ceiling wasn't hit, bypassing the line budget the dispatch path
+/// otherwise enforces.
 fn parse_slice_args(input: &Value) -> Result<(Option<usize>, Option<usize>)> {
     let offset = optional_usize_arg(input, "offset")?;
     let limit = optional_usize_arg(input, "limit")?;
     if matches!(offset, Some(0)) {
         bail!("`offset` is 1-indexed; must be >= 1");
     }
-    Ok((offset, limit.or(Some(READ_FILE_MAX_LINES))))
+    let clamped = Some(limit.unwrap_or(READ_FILE_MAX_LINES).min(READ_FILE_MAX_LINES));
+    Ok((offset, clamped))
 }
 
 fn expand_artifact(input: &Value) -> Result<ToolResult> {
@@ -922,6 +928,71 @@ mod tests {
             tail.output
         );
         let _ = std::fs::remove_file(&spill_path);
+    }
+
+    #[tokio::test]
+    async fn expand_artifact_clamps_explicit_limit_to_read_file_max_lines() {
+        // Tool arguments are model-controlled. Without clamping, a
+        // prompt-injected model could pass `limit: 1_000_000` and pull
+        // tens of thousands of short lines out of an artifact in one
+        // call, bypassing the per-tool line budget. The dispatcher must
+        // clamp the limit down to READ_FILE_MAX_LINES regardless of what
+        // the model asked for.
+        use crate::tool_registry::truncate::READ_FILE_MAX_LINES;
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        // Build an artifact with many short lines via bash spillover.
+        // `seq 1 200000` produces well over READ_FILE_MAX_LINES rows.
+        let spill = run_tool(
+            &cwd,
+            &Catalog::default(),
+            30,
+            &permissive_ctx(),
+            "c1",
+            "bash",
+            json!({"command": "seq 1 200000"}),
+            None,
+        )
+        .await
+        .unwrap();
+        let artifact_id = spill
+            .truncation
+            .expect("spill metadata")
+            .artifact_id
+            .clone()
+            .expect("artifact id should be present");
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c2",
+            "expand_artifact",
+            // An adversarial / buggy model asking for a huge slice.
+            json!({"artifact_id": artifact_id, "offset": 1, "limit": 1_000_000}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "expand failed: {}", outcome.output);
+        let body_lines = outcome
+            .output
+            .lines()
+            .filter(|l| !l.starts_with('['))
+            .count();
+        assert!(
+            body_lines <= READ_FILE_MAX_LINES,
+            "expand_artifact returned {body_lines} body lines; must clamp to \
+             READ_FILE_MAX_LINES ({READ_FILE_MAX_LINES}) regardless of input"
+        );
+        // And the paging trailer must still appear so the model can
+        // resume — clamping shouldn't silently hide that more remains.
+        assert!(
+            outcome.output.contains("more lines remain"),
+            "clamped slice must still emit a next-offset trailer: {}",
+            outcome.output
+        );
     }
 
     #[tokio::test]
