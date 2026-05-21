@@ -113,6 +113,8 @@ mod tests {
             raw_tool_turns: raw_turns,
             max_raw_tool_output_bytes: 50 * 1024,
             max_total_tool_output_bytes: max_bytes,
+            keep_reasoning_turns: 1,
+            keep_image_turns: 2,
         }
     }
 

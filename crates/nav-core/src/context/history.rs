@@ -32,6 +32,13 @@ use crate::tool_registry::truncate::byte_prefix;
 pub(crate) const ORPHAN_CALL_OUTPUT_PLACEHOLDER: &str =
     "[Tool result missing; original output was not recorded]";
 
+/// Marker text inserted in place of an `input_image` part once the user
+/// message that owned it falls outside the configured image keep window.
+/// Stable so inspectors can classify the substitution without an
+/// out-of-band signal.
+pub(crate) const SHED_IMAGE_PLACEHOLDER: &str =
+    "[image omitted: older than keep window]";
+
 /// Per-model knobs the history manager respects. Today this is just whether
 /// the resolved model accepts image inputs; new flags should land here so
 /// callers don't sprout ad-hoc model checks.
@@ -139,6 +146,79 @@ pub(crate) fn strip_unsupported_images(
     stripped
 }
 
+/// Drop standalone `reasoning` continuation items that belong to user-message
+/// windows older than `keep_reasoning_turns`. Encrypted reasoning continuation
+/// is load-bearing only for the next provider response — once a fresh user
+/// message arrives, the prior reasoning is no longer driving any chain and is
+/// just paying for tokens. Sanitization upstream already ensured these items
+/// carry no plaintext, so dropping them does not leak hidden reasoning either
+/// way. Returns the number of items removed.
+pub(crate) fn shed_old_reasoning(input: &mut Vec<Value>, keep_reasoning_turns: usize) -> usize {
+    let Some(cutoff) = trailing_user_window_start(input, keep_reasoning_turns) else {
+        return 0;
+    };
+    let before = input.len();
+    let mut idx = 0;
+    input.retain(|item| {
+        let keep = idx >= cutoff || item_type(item) != Some("reasoning");
+        idx += 1;
+        keep
+    });
+    before - input.len()
+}
+
+/// Replace `input_image` parts in user messages older than `keep_image_turns`
+/// with a single text placeholder. Recent images stay intact so the model can
+/// still see screenshots the user is currently working from; older images are
+/// near-pure token cost (~1500 tokens each) once the conversation has moved on.
+/// The placeholder is a stable string so `/context` and replay inspectors can
+/// classify the substitution. Returns the number of image parts replaced.
+pub(crate) fn shed_old_images(input: &mut [Value], keep_image_turns: usize) -> usize {
+    let Some(cutoff) = trailing_user_window_start(input, keep_image_turns) else {
+        return 0;
+    };
+    let mut replaced = 0;
+    for item in input.iter_mut().take(cutoff) {
+        if item_type(item) != Some("message")
+            || item.get("role").and_then(Value::as_str) != Some("user")
+        {
+            continue;
+        }
+        let Some(Value::Array(parts)) = item.get_mut("content") else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                *part = json!({
+                    "type": "input_text",
+                    "text": SHED_IMAGE_PLACEHOLDER,
+                });
+                replaced += 1;
+            }
+        }
+    }
+    replaced
+}
+
+/// Index where the trailing `keep_turns` user-message window starts. `None`
+/// means "keep everything" — either `keep_turns` is zero or there are fewer
+/// user messages than the window asks for, so nothing is "older."
+fn trailing_user_window_start(input: &[Value], keep_turns: usize) -> Option<usize> {
+    if keep_turns == 0 {
+        return None;
+    }
+    let user_indices: Vec<usize> = input
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item_type(item) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    (user_indices.len() > keep_turns).then(|| user_indices[user_indices.len() - keep_turns])
+}
+
 /// Apply the deterministic replay output policy: reduce eligible tool outputs
 /// to a compact header + preview, then clear oldest unprotected outputs once
 /// total bytes still exceed the global budget. Live and replay share this so
@@ -185,6 +265,8 @@ pub(crate) fn normalize_for_request(
 ) {
     remove_orphan_outputs(input);
     repair_orphan_calls(input);
+    shed_old_reasoning(input, budget.keep_reasoning_turns);
+    shed_old_images(input, budget.keep_image_turns);
     apply_replay_budget(input, budget);
     strip_unsupported_images(input, capabilities);
 }
@@ -372,6 +454,14 @@ mod tests {
         json!({"type": "function_call_output", "call_id": id, "output": body})
     }
 
+    fn reasoning(id: &str) -> Value {
+        json!({
+            "type": "reasoning",
+            "id": id,
+            "encrypted_content": "enc-blob",
+        })
+    }
+
     #[test]
     fn capabilities_for_known_text_only_families() {
         assert!(!ModelCapabilities::for_model("o1-mini").supports_images);
@@ -511,6 +601,191 @@ mod tests {
         let protected = protected_call_ids(&input, 1);
         assert!(protected.contains("c2"));
         assert!(!protected.contains("c1"));
+    }
+
+    #[test]
+    fn shed_old_reasoning_keeps_recent_window() {
+        let mut input = vec![
+            user_msg("old"),
+            reasoning("rs_old"),
+            call("c1"),
+            output("c1", "ok"),
+            user_msg("recent"),
+            reasoning("rs_recent"),
+            call("c2"),
+            output("c2", "ok"),
+        ];
+        let dropped = shed_old_reasoning(&mut input, 1);
+        assert_eq!(dropped, 1, "exactly one old reasoning item dropped");
+        let surviving_reasoning_ids: Vec<&str> = input
+            .iter()
+            .filter(|item| item_type(item) == Some("reasoning"))
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(surviving_reasoning_ids, vec!["rs_recent"]);
+        // Tool call/output pairing must survive — the function_call ids the
+        // reasoning was interleaved with stay where they were.
+        let call_ids: Vec<&str> = input
+            .iter()
+            .filter(|item| item_type(item) == Some("function_call"))
+            .filter_map(call_id)
+            .collect();
+        assert_eq!(call_ids, vec!["c1", "c2"]);
+    }
+
+    #[test]
+    fn shed_old_reasoning_noop_when_fewer_user_turns_than_keep_window() {
+        let mut input = vec![user_msg("only"), reasoning("rs_1"), call("c1"), output("c1", "ok")];
+        let before = input.clone();
+        let dropped = shed_old_reasoning(&mut input, 2);
+        assert_eq!(dropped, 0);
+        assert_eq!(input, before);
+    }
+
+    #[test]
+    fn shed_old_reasoning_does_not_persist_plaintext() {
+        // shed_old_reasoning only ever drops items; it never writes any
+        // placeholder body, so there is no path through which it could
+        // surface hidden plaintext reasoning into the request.
+        let mut input = vec![
+            user_msg("old"),
+            json!({
+                "type": "reasoning",
+                "id": "rs_old",
+                "encrypted_content": "enc-blob",
+                // Even if a malformed event smuggled plaintext into the
+                // wire input, dropping the whole item removes it wholesale.
+                "content": [{"type": "reasoning_text", "text": "secret thought"}],
+            }),
+            user_msg("recent"),
+            reasoning("rs_recent"),
+        ];
+        shed_old_reasoning(&mut input, 1);
+        let plaintext = serde_json::to_string(&input).unwrap();
+        assert!(
+            !plaintext.contains("secret thought"),
+            "old plaintext reasoning leaked into input: {plaintext}",
+        );
+    }
+
+    #[test]
+    fn shed_old_images_replaces_old_input_image_parts_with_placeholder() {
+        let mut input = vec![
+            user_msg_with_image("old look", "data:image/png;base64,old"),
+            assistant_msg("ack"),
+            user_msg_with_image("recent look", "data:image/png;base64,recent"),
+        ];
+        let replaced = shed_old_images(&mut input, 1);
+        assert_eq!(replaced, 1);
+
+        let old_parts = input[0].get("content").and_then(Value::as_array).unwrap();
+        assert!(
+            old_parts
+                .iter()
+                .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image")),
+            "old image must be replaced: {old_parts:?}",
+        );
+        assert!(
+            old_parts
+                .iter()
+                .any(|part| part.get("text").and_then(Value::as_str) == Some(SHED_IMAGE_PLACEHOLDER)),
+            "placeholder text part expected in old message: {old_parts:?}",
+        );
+
+        let recent_parts = input[2].get("content").and_then(Value::as_array).unwrap();
+        assert!(
+            recent_parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("input_image")),
+            "recent image must be preserved: {recent_parts:?}",
+        );
+    }
+
+    #[test]
+    fn shed_old_images_noop_when_fewer_user_turns_than_keep_window() {
+        let mut input = vec![user_msg_with_image("see this", "data:image/png;base64,abc")];
+        let before = input.clone();
+        let replaced = shed_old_images(&mut input, 2);
+        assert_eq!(replaced, 0);
+        assert_eq!(input, before);
+    }
+
+    #[test]
+    fn normalize_for_request_sheds_old_modalities_and_keeps_recent() {
+        let mut input = vec![
+            user_msg_with_image("old look", "data:image/png;base64,old"),
+            reasoning("rs_old"),
+            call("c1"),
+            output("c1", "ok"),
+            user_msg_with_image("recent look", "data:image/png;base64,recent"),
+            reasoning("rs_recent"),
+            call("c2"),
+            output("c2", "ok"),
+        ];
+        let budget = ReplayBudget {
+            keep_reasoning_turns: 1,
+            keep_image_turns: 1,
+            ..ReplayBudget::default()
+        };
+        normalize_for_request(&mut input, &ModelCapabilities::permissive(), &budget);
+
+        let reasoning_ids: Vec<&str> = input
+            .iter()
+            .filter(|item| item_type(item) == Some("reasoning"))
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(reasoning_ids, vec!["rs_recent"], "old reasoning dropped");
+
+        let part_types_at = |idx: usize| -> Vec<&str> {
+            input[idx]
+                .get("content")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(|part| part.get("type").and_then(Value::as_str))
+                .collect()
+        };
+        // Item layout after shedding reasoning: [user_old, c1, out_c1, user_recent, rs_recent, c2, out_c2].
+        let old_user_idx = 0;
+        let recent_user_idx = input
+            .iter()
+            .position(|item| {
+                item_type(item) == Some("message")
+                    && item.get("role").and_then(Value::as_str) == Some("user")
+                    && item != &input[old_user_idx]
+            })
+            .expect("recent user message");
+
+        assert!(
+            !part_types_at(old_user_idx).contains(&"input_image"),
+            "old user image must be shed"
+        );
+        assert!(
+            part_types_at(recent_user_idx).contains(&"input_image"),
+            "recent image must remain on a permissive model"
+        );
+    }
+
+    #[test]
+    fn normalize_for_request_strips_all_images_on_text_only_model() {
+        let mut input = vec![
+            user_msg_with_image("old", "data:image/png;base64,old"),
+            user_msg_with_image("recent", "data:image/png;base64,recent"),
+        ];
+        let capabilities = ModelCapabilities {
+            supports_images: false,
+        };
+        normalize_for_request(&mut input, &capabilities, &ReplayBudget::default());
+
+        for item in &input {
+            let parts = item.get("content").and_then(Value::as_array).unwrap();
+            assert!(
+                parts
+                    .iter()
+                    .all(|part| part.get("type").and_then(Value::as_str) != Some("input_image")),
+                "every image must be stripped when model is text-only: {parts:?}",
+            );
+        }
     }
 
     #[test]
