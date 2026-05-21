@@ -17,6 +17,7 @@ pub use extensions::{
     Extension, ExtensionCatalog, ExtensionScope, ExtensionTheme, PromptTemplate, ThemeColors,
     discover_extensions, load_prompt_template,
 };
+pub use handoff::{HANDOFF_SLASH, HandoffBudget, HandoffDraft, build_handoff_draft};
 pub use project::{
     ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,
     shorten_home,
@@ -193,6 +194,7 @@ pub(crate) mod attachments;
 pub mod compaction;
 
 pub mod extensions;
+pub mod handoff;
 pub mod project;
 pub mod replay;
 pub mod replay_policy;

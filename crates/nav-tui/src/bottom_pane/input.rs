@@ -10,6 +10,14 @@ use super::clipboard::{recognized_image_path, try_save_clipboard_image, workspac
 use super::{BottomPane, BottomPaneView, ComposerEvent, FileMentionPopup, InputResult};
 
 impl BottomPane {
+    /// Replace the editable composer buffer with a generated draft prompt.
+    pub fn set_composer_text(&mut self, text: &str) {
+        self.composer.set_text(text);
+        self.slash_popup_suppressed = false;
+        self.mention_popup_suppressed = false;
+        self.reconcile_popups();
+    }
+
     /// Route a bracketed paste payload from the terminal into the composer.
     /// Bypasses overlay routing: a popup can be open but a paste should always
     /// land in the buffer; the popup will reconcile on the next keystroke.
