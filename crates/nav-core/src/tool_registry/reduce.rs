@@ -135,6 +135,12 @@ const CODE_SEARCH_GROUP_MIN_MATCHES: usize = 10;
 /// thousands of files and turn the "summary" itself into a context flood;
 /// the top-N highest-count files cover almost all signal.
 const CODE_SEARCH_SUMMARY_MAX_FILES: usize = 50;
+/// Byte ceiling for the summary section itself. Even with the row cap
+/// above, 50 rows of very long monorepo paths could still rival
+/// `MAX_BYTES` and saturate the raw-budget calculation below. Once the
+/// summary hits this ceiling, remaining rows collapse into the
+/// "[+N more files omitted]" trailer.
+const CODE_SEARCH_SUMMARY_MAX_BYTES: usize = MAX_BYTES / 4;
 
 /// Reduce `rg`-style stdout to a model-friendly view. When matches span
 /// multiple files (or there are many of them), a `[grouped by file: ...]`
@@ -167,13 +173,21 @@ pub fn reduce_code_search(stdout: &str) -> String {
         // Sort by descending count, then by file path for determinism.
         let mut by_count: Vec<(&str, usize)> = counts.into_iter().collect();
         by_count.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-        // Cap the summary section: a grep over a large vendored tree could
-        // otherwise produce thousands of rows, flooding the next prompt and
-        // saturating the raw-budget calculation below.
-        let summarized = by_count.len().min(CODE_SEARCH_SUMMARY_MAX_FILES);
-        for (file, count) in by_count.iter().take(summarized) {
+        // Cap the summary section by both row count *and* byte size: a
+        // grep over a large vendored tree could otherwise produce thousands
+        // of rows (or, with the row cap alone, ~50 rows of very long
+        // monorepo paths) and saturate the raw-budget calculation below.
+        let summary_start = out.len();
+        let row_cap = by_count.len().min(CODE_SEARCH_SUMMARY_MAX_FILES);
+        let mut summarized = 0usize;
+        for (file, count) in by_count.iter().take(row_cap) {
             let label = if *count == 1 { "match" } else { "matches" };
-            out.push_str(&format!("  {file}: {count} {label}\n"));
+            let row = format!("  {file}: {count} {label}\n");
+            if (out.len() - summary_start) + row.len() > CODE_SEARCH_SUMMARY_MAX_BYTES {
+                break;
+            }
+            out.push_str(&row);
+            summarized += 1;
         }
         let omitted_files = by_count.len().saturating_sub(summarized);
         if omitted_files > 0 {
@@ -500,6 +514,42 @@ mod tests {
         let stdout = format!("file.rs:1:{payload}\n");
         let result = reduce_code_search(&stdout);
         assert!(result.contains("... [truncated]"));
+    }
+
+    #[test]
+    fn reduce_code_search_summary_caps_by_bytes_with_long_paths() {
+        // A monorepo with deep paths can blow past the row cap on bytes
+        // even when only a handful of files match. Without the byte ceiling
+        // the summary alone could rival MAX_BYTES.
+        let long_path = format!("very/{}", "deep/".repeat(120));
+        let mut stdout = String::new();
+        // 60 files all with long paths — more than the row cap of 50, so
+        // we exercise both caps interacting.
+        for i in 0..60 {
+            stdout.push_str(&format!("{long_path}file_{i:03}.rs:1:hit\n"));
+        }
+        let result = reduce_code_search(&stdout);
+        assert!(
+            result.len() <= MAX_BYTES,
+            "reducer output {} bytes exceeds MAX_BYTES {}",
+            result.len(),
+            MAX_BYTES
+        );
+        // Byte cap must trigger before the row cap when paths are huge.
+        let summary_section = result
+            .split("\n\n")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            summary_section.len() <= CODE_SEARCH_SUMMARY_MAX_BYTES + 2_048,
+            "summary section ({} bytes) must stay near the byte cap ({} bytes)",
+            summary_section.len(),
+            CODE_SEARCH_SUMMARY_MAX_BYTES
+        );
+        assert!(
+            result.contains("more files omitted from summary"),
+            "byte-cap path must still surface the omission notice"
+        );
     }
 
     #[test]

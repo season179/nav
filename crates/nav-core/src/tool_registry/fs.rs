@@ -202,28 +202,61 @@ pub(super) fn read_file(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Resul
     fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
 }
 
+/// A sliced read result split into the body slice and an optional trailing
+/// notice. The dispatch path bounds the body to per-tool caps but keeps the
+/// trailer intact so the model never loses the "next offset" pagination
+/// hint to a generic head truncation.
+#[derive(Debug)]
+pub(super) struct SlicedRead {
+    pub body: String,
+    pub trailer: Option<String>,
+}
+
+impl SlicedRead {
+    /// Combine body and trailer into a single string. Used by call sites that
+    /// don't need to bound the body separately.
+    pub fn into_combined(self) -> String {
+        match self.trailer {
+            Some(t) => self.body + &t,
+            None => self.body,
+        }
+    }
+}
+
 pub(super) fn read_file_sliced(
     cwd: &Path,
     skill_dirs: &[PathBuf],
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
-) -> Result<String> {
+) -> Result<SlicedRead> {
     let body = read_file(cwd, skill_dirs, path)?;
     if offset.is_none() && limit.is_none() {
-        return Ok(body);
+        return Ok(SlicedRead {
+            body,
+            trailer: None,
+        });
     }
     Ok(apply_line_slice(&body, offset, limit))
 }
 
-pub(super) fn apply_line_slice(body: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+pub(super) fn apply_line_slice(
+    body: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> SlicedRead {
     let offset = offset.unwrap_or(1).max(1);
     let lines: Vec<&str> = body.split_inclusive('\n').collect();
     let total = lines.len();
     let start = offset - 1;
 
     if start >= total {
-        return format!("[file has {total} lines; offset {offset} is past end]\n");
+        return SlicedRead {
+            body: String::new(),
+            trailer: Some(format!(
+                "[file has {total} lines; offset {offset} is past end]\n"
+            )),
+        };
     }
 
     let end = match limit {
@@ -233,9 +266,12 @@ pub(super) fn apply_line_slice(body: &str, offset: Option<usize>, limit: Option<
     let kept = end - start;
     if kept == 0 {
         let remaining = total - start;
-        return format!(
-            "[file has {total} lines; limit 0 returned no lines; {remaining} lines remain from offset {offset}]\n"
-        );
+        return SlicedRead {
+            body: String::new(),
+            trailer: Some(format!(
+                "[file has {total} lines; limit 0 returned no lines; {remaining} lines remain from offset {offset}]\n"
+            )),
+        };
     }
 
     let mut out = String::with_capacity(body.len());
@@ -248,17 +284,25 @@ pub(super) fn apply_line_slice(body: &str, offset: Option<usize>, limit: Option<
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        if truncated_tail {
+        let trailer = if truncated_tail {
             let remaining = total - end;
             let next_offset = end + 1;
-            out.push_str(&format!(
+            format!(
                 "[showed lines {offset}-{end} of {total}; {remaining} more lines remain; next offset {next_offset}]\n"
-            ));
+            )
         } else {
-            out.push_str(&format!("[showed lines {offset}-{end} of {total}]\n"));
+            format!("[showed lines {offset}-{end} of {total}]\n")
+        };
+        SlicedRead {
+            body: out,
+            trailer: Some(trailer),
+        }
+    } else {
+        SlicedRead {
+            body: out,
+            trailer: None,
         }
     }
-    out
 }
 
 pub(super) fn list_files(cwd: &Path, skill_dirs: &[PathBuf], path: &str) -> Result<String> {
@@ -636,7 +680,9 @@ mod tests {
         let body = (1..=10).map(|i| format!("line{i}\n")).collect::<String>();
         fs::write(workspace.join("file.txt"), &body).unwrap();
 
-        let out = read_file_sliced(&workspace, &[], "file.txt", Some(3), Some(4)).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(3), Some(4))
+            .unwrap()
+            .into_combined();
 
         assert!(out.starts_with("line3\nline4\nline5\nline6\n"));
         assert!(out.contains("[showed lines 3-6 of 10; 4 more lines remain; next offset 7]"));
@@ -651,7 +697,9 @@ mod tests {
         let body = (1..=5).map(|i| format!("line{i}\n")).collect::<String>();
         fs::write(workspace.join("file.txt"), &body).unwrap();
 
-        let out = read_file_sliced(&workspace, &[], "file.txt", Some(3), None).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(3), None)
+            .unwrap()
+            .into_combined();
 
         assert!(out.starts_with("line3\nline4\nline5\n"));
         assert!(out.contains("[showed lines 3-5 of 5]"));
@@ -665,7 +713,9 @@ mod tests {
         let body = (1..=5).map(|i| format!("line{i}\n")).collect::<String>();
         fs::write(workspace.join("file.txt"), &body).unwrap();
 
-        let out = read_file_sliced(&workspace, &[], "file.txt", None, Some(2)).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", None, Some(2))
+            .unwrap()
+            .into_combined();
 
         assert!(out.starts_with("line1\nline2\n"));
         assert!(out.contains("[showed lines 1-2 of 5; 3 more lines remain; next offset 3]"));
@@ -678,7 +728,9 @@ mod tests {
         let body = "line1\nline2\nline3\n".to_string();
         fs::write(workspace.join("file.txt"), &body).unwrap();
 
-        let out = read_file_sliced(&workspace, &[], "file.txt", Some(1), Some(10)).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(1), Some(10))
+            .unwrap()
+            .into_combined();
 
         assert_eq!(out, body);
     }
@@ -690,7 +742,9 @@ mod tests {
         let body = "alpha\nbeta\n".to_string();
         fs::write(workspace.join("file.txt"), &body).unwrap();
 
-        let out = read_file_sliced(&workspace, &[], "file.txt", None, None).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", None, None)
+            .unwrap()
+            .into_combined();
 
         assert_eq!(out, body);
     }
@@ -701,7 +755,9 @@ mod tests {
         let workspace = temp.path().canonicalize().unwrap();
         fs::write(workspace.join("file.txt"), "only\nthree\nlines\n").unwrap();
 
-        let out = read_file_sliced(&workspace, &[], "file.txt", Some(99), Some(5)).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(99), Some(5))
+            .unwrap()
+            .into_combined();
 
         assert_eq!(out, "[file has 3 lines; offset 99 is past end]\n");
     }
@@ -712,7 +768,9 @@ mod tests {
         let workspace = temp.path().canonicalize().unwrap();
         fs::write(workspace.join("file.txt"), "a\nb\nc\nd\n").unwrap();
 
-        let out = read_file_sliced(&workspace, &[], "file.txt", Some(2), Some(0)).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(2), Some(0))
+            .unwrap()
+            .into_combined();
 
         assert_eq!(
             out,
@@ -726,7 +784,9 @@ mod tests {
         let workspace = temp.path().canonicalize().unwrap();
         fs::write(workspace.join("file.txt"), "one\ntwo\nthree").unwrap();
 
-        let out = read_file_sliced(&workspace, &[], "file.txt", Some(2), Some(1)).unwrap();
+        let out = read_file_sliced(&workspace, &[], "file.txt", Some(2), Some(1))
+            .unwrap()
+            .into_combined();
 
         assert!(out.starts_with("two\n"));
         assert!(out.contains("[showed lines 2-2 of 3; 1 more lines remain; next offset 3]"));

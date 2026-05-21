@@ -265,24 +265,34 @@ pub async fn run_tool_with_session_store(
     let skill_dirs = skills.skill_dirs();
     let result: Result<ToolResult> = match name {
         "read_file" => parse_read_file_args(&input).and_then(|(path, offset, limit)| {
-            let body = fs::read_file_sliced(cwd, skill_dirs, path, offset, limit)?;
+            let sliced = fs::read_file_sliced(cwd, skill_dirs, path, offset, limit)?;
             // Slice reads already carry their own next-offset hint and stay
             // small by construction. Only full reads (no offset/limit) feed
             // the outline+artifact reducer.
             if offset.is_some() || limit.is_some() {
+                // Bound the body alone so the head-truncation never clips the
+                // trailing "next offset" notice; the caller would otherwise
+                // lose the pagination hint and stop being able to resume.
+                let fs::SlicedRead { body, trailer } = sliced;
                 let bounded = bound_with_limits(
                     body,
                     TruncateMode::Head,
                     READ_FILE_MAX_LINES,
-                    READ_FILE_MAX_BYTES,
+                    READ_FILE_MAX_BYTES.saturating_sub(
+                        trailer.as_deref().map(str::len).unwrap_or(0),
+                    ),
                 );
                 let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
-                return Ok(ToolResult::text_with_truncation(
-                    bounded.content,
-                    truncation,
-                ));
+                let mut content = bounded.content;
+                if let Some(trailer) = trailer {
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                    content.push_str(&trailer);
+                }
+                return Ok(ToolResult::text_with_truncation(content, truncation));
             }
-            let reduced = reduce_read_file(body)?;
+            let reduced = reduce_read_file(sliced.into_combined())?;
             let truncation = reduced.artifact.as_ref().map(|artifact| TruncationMeta {
                 truncated_by: TruncationKind::ReadFileCap,
                 full_output_path: Some(artifact.path.clone()),
@@ -390,17 +400,36 @@ fn expand_artifact(input: &Value) -> Result<ToolResult> {
     let body = output_accumulator::read_artifact(artifact_id)?;
     // Slice by line so the model sees the same "showed lines X-Y of Z;
     // next offset" trailer `read_file` emits and can resume paging.
-    let sliced = fs::apply_line_slice(&body, offset, limit);
+    let fs::SlicedRead { body: slice_body, trailer } = fs::apply_line_slice(&body, offset, limit);
+    let combined_len = slice_body.len() + trailer.as_deref().map(str::len).unwrap_or(0);
     // Slice already enforced the line budget; only re-bound when bytes
     // exceed the cap (a pathological case of very long lines), otherwise
     // `bound_with_limits` would clip the paging trailer.
-    if sliced.len() <= READ_FILE_MAX_BYTES {
-        return Ok(ToolResult::text(sliced));
+    if combined_len <= READ_FILE_MAX_BYTES {
+        return Ok(ToolResult::text(
+            match trailer {
+                Some(t) => slice_body + &t,
+                None => slice_body,
+            },
+        ));
     }
-    let bounded = bound_with_limits(sliced, TruncateMode::Head, usize::MAX, READ_FILE_MAX_BYTES);
+    let trailer_len = trailer.as_deref().map(str::len).unwrap_or(0);
+    let bounded = bound_with_limits(
+        slice_body,
+        TruncateMode::Head,
+        usize::MAX,
+        READ_FILE_MAX_BYTES.saturating_sub(trailer_len),
+    );
     let truncation = bounded.truncation_meta(TruncationKind::ReadFileCap);
+    let mut content = bounded.content;
+    if let Some(trailer) = trailer {
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&trailer);
+    }
     Ok(ToolResult::text_with_truncation(
-        bounded.content,
+        content,
         truncation,
     ))
 }
@@ -622,6 +651,47 @@ mod tests {
                 .contains("[showed lines 2-4 of 8; 4 more lines remain; next offset 5]")
         );
         assert!(!outcome.output.contains("line5\n"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_read_file_slice_preserves_next_offset_trailer_past_line_cap() {
+        // Regression: when the user requests a slice (`offset`/`limit`) that
+        // is large enough to exceed READ_FILE_MAX_LINES, the body gets
+        // head-bounded but the trailer that carries the "next offset" hint
+        // must survive — otherwise long files lose pagination guidance and
+        // can't be resumed.
+        let temp = tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        // File is 3× the line cap. Asking for a slice that itself exceeds
+        // the cap forces the head-bound path.
+        use crate::tool_registry::truncate::READ_FILE_MAX_LINES;
+        let total = READ_FILE_MAX_LINES * 3;
+        let body = (1..=total).map(|i| format!("ln{i}\n")).collect::<String>();
+        fs::write(cwd.join("big.txt"), &body).unwrap();
+
+        let outcome = run_tool(
+            &cwd,
+            &Catalog::default(),
+            5,
+            &permissive_ctx(),
+            "c1",
+            "read_file",
+            json!({"path": "big.txt", "offset": 1, "limit": READ_FILE_MAX_LINES * 2}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.output);
+        // The "next offset" trailer must survive the head-bound; the user's
+        // limit went well past the cap, so the slice itself reports the
+        // intended boundary.
+        assert!(
+            outcome.output.contains("next offset"),
+            "trailer must survive bound:\n--- tail ---\n{}",
+            outcome.output.lines().rev().take(5).collect::<Vec<_>>().join("\n")
+        );
+        // And the body still starts at the requested offset.
+        assert!(outcome.output.starts_with("ln1\n"));
     }
 
     #[tokio::test]
