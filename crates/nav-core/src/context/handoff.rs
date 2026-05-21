@@ -298,7 +298,8 @@ fn candidates_from_events(
             | AgentEvent::ContextTrimmed { .. }
             | AgentEvent::ToolBudgetWarning { .. }
             | AgentEvent::CompactionStarted { .. }
-            | AgentEvent::CompactionFailed { .. } => {}
+            | AgentEvent::CompactionFailed { .. }
+            | AgentEvent::SessionRewound { .. } => {}
         }
     }
 

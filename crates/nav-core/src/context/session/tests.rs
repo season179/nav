@@ -1241,3 +1241,184 @@ fn search_transcript_finds_phrase_across_sessions() {
         .unwrap();
     assert!(empty.is_empty());
 }
+
+fn seed_two_turn_session(store: &SessionStore) -> SessionId {
+    let session = store
+        .create_session(
+            Path::new("/proj"),
+            PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+        )
+        .unwrap();
+    let events = vec![
+        AgentEvent::UserMessage {
+            text: "first".into(),
+            display_text: None,
+            attachments: Vec::new(),
+        },
+        AgentEvent::AssistantMessageDone {
+            text: "first reply".into(),
+        },
+        AgentEvent::TurnComplete {
+            usage: TurnUsage {
+                tokens_input: 10,
+                tokens_output: 5,
+                tokens_input_cached: 0,
+                tokens_reasoning: 0,
+            },
+        },
+        AgentEvent::UserMessage {
+            text: "second".into(),
+            display_text: Some("display second".into()),
+            attachments: Vec::new(),
+        },
+        AgentEvent::AssistantMessageDone {
+            text: "second reply".into(),
+        },
+        AgentEvent::TurnComplete {
+            usage: TurnUsage {
+                tokens_input: 7,
+                tokens_output: 3,
+                tokens_input_cached: 0,
+                tokens_reasoning: 0,
+            },
+        },
+    ];
+    for event in &events {
+        store.append_event(&session, event).unwrap();
+    }
+    session
+}
+
+#[test]
+fn rewind_to_user_message_drops_target_and_later_events() {
+    let (_dir, store) = open_temp_store();
+    let session = seed_two_turn_session(&store);
+
+    // The second user_message is at seq 3 (0=user, 1=assistant, 2=turn,
+    // 3=user, 4=assistant, 5=turn).
+    let outcome = store.rewind_to_user_message(&session, 3).unwrap();
+    assert_eq!(outcome.target_seq, 3);
+    assert_eq!(outcome.removed_events, 3);
+    assert_eq!(outcome.text, "second");
+    assert_eq!(outcome.display_text.as_deref(), Some("display second"));
+    assert!(outcome.attachments.is_empty());
+
+    // The trimmed log keeps the first turn intact and ends with the audit
+    // row at the same seq the original user_message lived at — downstream
+    // cursors that referenced the anchor still resolve to a known event.
+    let trimmed = store.load_session(&session).unwrap();
+    assert_eq!(trimmed.len(), 4);
+    assert!(matches!(trimmed[0], AgentEvent::UserMessage { ref text, .. } if text == "first"));
+    assert!(matches!(
+        trimmed[1],
+        AgentEvent::AssistantMessageDone { .. }
+    ));
+    assert!(matches!(trimmed[2], AgentEvent::TurnComplete { .. }));
+    let last = trimmed.last().unwrap();
+    assert!(matches!(
+        last,
+        AgentEvent::SessionRewound {
+            target_seq: 3,
+            removed_events: 3,
+            ..
+        }
+    ));
+
+    // Token totals match a fresh roll-up of the surviving TurnComplete.
+    let summary = store.session_summary(&session).unwrap().unwrap();
+    assert_eq!(summary.tokens_input, 10);
+    assert_eq!(summary.tokens_output, 5);
+}
+
+#[test]
+fn rewind_recomputes_rolling_totals_against_surviving_turns() {
+    let (_dir, store) = open_temp_store();
+    let session = seed_two_turn_session(&store);
+
+    // Rewinding to the very first user_message clears every turn — every
+    // surviving cumulative rollup must come from zero TurnComplete events.
+    let outcome = store.rewind_to_user_message(&session, 0).unwrap();
+    assert_eq!(outcome.removed_events, 6);
+
+    let summary = store.session_summary(&session).unwrap().unwrap();
+    assert_eq!(summary.tokens_input, 0);
+    assert_eq!(summary.tokens_output, 0);
+    assert_eq!(summary.tokens_input_cached, 0);
+    assert_eq!(summary.tokens_reasoning, 0);
+}
+
+#[test]
+fn rewind_errors_when_seq_missing_or_wrong_kind() {
+    let (_dir, store) = open_temp_store();
+    let session = seed_two_turn_session(&store);
+
+    let err = store.rewind_to_user_message(&session, 999).unwrap_err();
+    assert!(
+        err.to_string().contains("no event at seq 999"),
+        "missing seq must error clearly: {err}"
+    );
+
+    // seq 1 is the assistant message of the first turn — not a user
+    // message, so rewinding there must refuse rather than silently
+    // truncate at a non-user-turn boundary.
+    let err = store.rewind_to_user_message(&session, 1).unwrap_err();
+    assert!(
+        err.to_string().contains("not user_message"),
+        "wrong kind must error clearly: {err}"
+    );
+}
+
+#[test]
+fn rewind_preserves_unrelated_session_metadata() {
+    let (_dir, store) = open_temp_store();
+    let session = seed_two_turn_session(&store);
+    store.set_session_name(&session, "keeper").unwrap();
+    store.add_label(&session, "keep").unwrap();
+
+    store.rewind_to_user_message(&session, 3).unwrap();
+
+    let summary = store.session_summary(&session).unwrap().unwrap();
+    assert_eq!(summary.name.as_deref(), Some("keeper"));
+    assert_eq!(summary.cwd, "/proj");
+    assert_eq!(summary.model, "gpt-test");
+    assert_eq!(summary.labels, vec!["keep".to_string()]);
+    assert_eq!(summary.parent_id, None);
+}
+
+#[test]
+fn latest_user_message_seq_picks_the_most_recent() {
+    let (_dir, store) = open_temp_store();
+    let empty = store
+        .create_session(
+            Path::new("/proj"),
+            PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+        )
+        .unwrap();
+    assert_eq!(store.latest_user_message_seq(&empty).unwrap(), None);
+
+    let session = seed_two_turn_session(&store);
+    assert_eq!(store.latest_user_message_seq(&session).unwrap(), Some(3));
+}
+
+#[test]
+fn replay_after_rewind_matches_truncated_transcript() {
+    use crate::context::rebuild_responses_input;
+
+    let (_dir, store) = open_temp_store();
+    let session = seed_two_turn_session(&store);
+    store.rewind_to_user_message(&session, 3).unwrap();
+
+    let trimmed_events = store.load_session(&session).unwrap();
+    let input = rebuild_responses_input(&trimmed_events, Path::new("/proj"));
+
+    // Replay sees the first user/assistant exchange and silently drops the
+    // SessionRewound audit row — no model-visible item per durable event.
+    assert_eq!(input.len(), 2);
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[1]["role"], "assistant");
+    assert_eq!(input[1]["content"][0]["text"], "first reply");
+}

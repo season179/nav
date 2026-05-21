@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 use ulid::Ulid;
 
-use crate::agent_loop::{AgentEvent, TurnUsage};
+use crate::agent_loop::{AgentEvent, TurnUsage, UserAttachment};
 
 /// The schema embedded into the binary; applied once on first open.
 pub const INIT_SQL: &str = include_str!("init.sql");
@@ -106,6 +106,20 @@ pub struct TranscriptHit {
 }
 
 pub use reference::ThreadReadOptions;
+
+/// What [`SessionStore::rewind_to_user_message`] returns to the caller after
+/// trimming the event log. The message fields are the original
+/// `user_message` contents at the rewound seq so the next prompt can be
+/// pre-filled in the composer — `display_text` mirrors the optional
+/// renderer-only override stored on [`AgentEvent::UserMessage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindOutcome {
+    pub target_seq: u64,
+    pub removed_events: usize,
+    pub text: String,
+    pub display_text: Option<String>,
+    pub attachments: Vec<UserAttachment>,
+}
 
 /// One node in the parent → child tree returned by [`SessionStore::walk_tree`].
 /// `depth` is the distance from the root passed in (root itself is depth 0).
@@ -325,7 +339,8 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             | AgentEvent::TurnDiff { .. }
             | AgentEvent::GitCheckpoint { .. }
             | AgentEvent::CompactionStarted { .. }
-            | AgentEvent::CompactionFailed { .. } => {
+            | AgentEvent::CompactionFailed { .. }
+            | AgentEvent::SessionRewound { .. } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
                 push_json_details(&mut out, &format!("Event: {}", event.kind()), event)?;
             }
@@ -905,6 +920,133 @@ impl SessionStore {
         Ok(new_id)
     }
 
+    /// In-session counterpart to [`Self::fork_session`]. Removes the
+    /// `user_message` at `target_seq` and every later event from the session's
+    /// own log, appends a [`AgentEvent::SessionRewound`] audit row in their
+    /// place, and recomputes the rolling token totals from the surviving
+    /// `TurnComplete` events. The returned [`RewindOutcome`] carries the
+    /// original message fields so callers (the TUI composer, the headless
+    /// CLI) can repopulate the prompt for editing before the next turn.
+    ///
+    /// Errors when the row at `(session_id, target_seq)` is missing or is
+    /// not a `user_message` — both signal a stale UI seq or an invalid CLI
+    /// argument, and silently choosing a different anchor would corrupt the
+    /// transcript.
+    pub fn rewind_to_user_message(
+        &self,
+        session_id: &str,
+        target_seq: u64,
+    ) -> Result<RewindOutcome> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+
+        let target_signed = target_seq as i64;
+        let target_row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT kind, data FROM event WHERE session_id = ?1 AND seq = ?2",
+                params![session_id, target_signed],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let (kind, data) = target_row.ok_or_else(|| {
+            anyhow::anyhow!("session {session_id} has no event at seq {target_seq}")
+        })?;
+        anyhow::ensure!(
+            kind == "user_message",
+            "event at seq {target_seq} is kind {kind:?}, not user_message"
+        );
+
+        let event: AgentEvent = serde_json::from_str(&data)
+            .with_context(|| format!("failed to parse user_message at seq {target_seq}"))?;
+        let AgentEvent::UserMessage {
+            text,
+            display_text,
+            attachments,
+        } = event
+        else {
+            anyhow::bail!("event at seq {target_seq} deserialized to a non-user_message variant");
+        };
+
+        let removed_events = tx.execute(
+            "DELETE FROM event WHERE session_id = ?1 AND seq >= ?2",
+            params![session_id, target_signed],
+        )?;
+
+        let audit_event = AgentEvent::SessionRewound {
+            target_seq,
+            removed_events,
+            preview: preview_for_audit(display_text.as_deref().unwrap_or(&text)),
+        };
+        let audit_data =
+            serde_json::to_string(&audit_event).context("failed to serialize rewind event")?;
+        let now = now_secs();
+        // The previous DELETE freed `target_seq`, so the next-seq seed lands
+        // exactly there. Keeping the audit row at the same seq the original
+        // user_message occupied means downstream cursors that referenced the
+        // anchor still resolve to a recognisable position.
+        tx.execute(
+            "INSERT INTO event (session_id, seq, created_at, kind, data)
+             VALUES (
+                 ?1,
+                 COALESCE((SELECT MAX(seq) FROM event WHERE session_id = ?1), -1) + 1,
+                 ?2, ?3, ?4
+             )",
+            params![session_id, now, audit_event.kind(), audit_data],
+        )?;
+
+        // Recompute rolling token totals from the surviving `TurnComplete`
+        // events so the next auto-compaction decision uses the trimmed
+        // baseline instead of the pre-rewind one.
+        let (sum_in, sum_out, sum_in_cached, sum_reason): (i64, i64, i64, i64) = tx.query_row(
+            "SELECT
+                 COALESCE(SUM(CAST(json_extract(data, '$.usage.tokens_input') AS INTEGER)), 0),
+                 COALESCE(SUM(CAST(json_extract(data, '$.usage.tokens_output') AS INTEGER)), 0),
+                 COALESCE(SUM(CAST(json_extract(data, '$.usage.tokens_input_cached') AS INTEGER)), 0),
+                 COALESCE(SUM(CAST(json_extract(data, '$.usage.tokens_reasoning') AS INTEGER)), 0)
+             FROM event
+             WHERE session_id = ?1 AND kind = 'turn_complete'",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        tx.execute(
+            "UPDATE session
+             SET tokens_input = ?1,
+                 tokens_output = ?2,
+                 tokens_input_cached = ?3,
+                 tokens_reasoning = ?4,
+                 updated_at = ?5
+             WHERE id = ?6",
+            params![sum_in, sum_out, sum_in_cached, sum_reason, now, session_id],
+        )?;
+
+        tx.commit()?;
+        Ok(RewindOutcome {
+            target_seq,
+            removed_events,
+            text,
+            display_text,
+            attachments,
+        })
+    }
+
+    /// Returns the highest `user_message` seq recorded for `session_id`, or
+    /// `None` when the session has not yet captured one. Used by the TUI's
+    /// `/rewind` (no-arg form) to default to "edit the most recent submitted
+    /// prompt" without forcing the user to look up a seq.
+    pub fn latest_user_message_seq(&self, session_id: &str) -> Result<Option<u64>> {
+        let conn = self.lock();
+        let row: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(seq) FROM event
+                 WHERE session_id = ?1 AND kind = 'user_message'",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(row.map(|seq| seq as u64))
+    }
+
     /// Direct children of `parent_id`, ordered by creation time ascending.
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<SessionSummary>> {
         let conn = self.lock();
@@ -1330,6 +1472,22 @@ fn first_user_prompt_from_event_json(data: Option<String>) -> Option<String> {
         } => display_text.or(Some(text)),
         _ => None,
     }
+}
+
+/// First line of `text`, truncated to a short audit-friendly slice. The
+/// preview is stored on [`AgentEvent::SessionRewound`] so the durable log
+/// records which message was rewound past without copying the full body —
+/// the original event is gone from the log by then, and a tiny excerpt is
+/// usually enough to reconstruct intent during review.
+const REWIND_PREVIEW_MAX_CHARS: usize = 120;
+fn preview_for_audit(text: &str) -> String {
+    let first_line = text.lines().next().unwrap_or("").trim();
+    if first_line.chars().count() <= REWIND_PREVIEW_MAX_CHARS {
+        return first_line.to_string();
+    }
+    let mut out: String = first_line.chars().take(REWIND_PREVIEW_MAX_CHARS).collect();
+    out.push('…');
+    out
 }
 
 /// [`DurableEventSink`] adaptor that writes through a [`SessionStore`].

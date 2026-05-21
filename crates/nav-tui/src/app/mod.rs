@@ -517,6 +517,72 @@ pub async fn run(
                             Err(err) => chat.push_err(err),
                         }
                     }
+                    AppEvent::RewindSession { at } => {
+                        if turn_started_at.is_some() {
+                            chat.ingest(AgentEvent::Error {
+                                message: "cannot rewind while a turn is running".to_string(),
+                            });
+                            continue;
+                        }
+                        let target_seq = if let Some(seq) = at {
+                            seq
+                        } else {
+                            match store.latest_user_message_seq(&session_id) {
+                                Ok(Some(seq)) => seq,
+                                Ok(None) => {
+                                    chat.ingest(AgentEvent::Error {
+                                        message: "no user message in this session to rewind to"
+                                            .to_string(),
+                                    });
+                                    continue;
+                                }
+                                Err(err) => {
+                                    chat.push_err(err);
+                                    continue;
+                                }
+                            }
+                        };
+                        let outcome = match store.rewind_to_user_message(&session_id, target_seq) {
+                            Ok(outcome) => outcome,
+                            Err(err) => {
+                                chat.push_err(err);
+                                continue;
+                            }
+                        };
+                        // Rebuild the visible transcript from the trimmed
+                        // event log so scrollback matches what the next turn
+                        // will replay through `rebuild_responses_input`.
+                        let truncated_events = match store.load_session(&session_id) {
+                            Ok(events) => events,
+                            Err(err) => {
+                                chat.push_err(err);
+                                continue;
+                            }
+                        };
+                        clear_pending_inputs(
+                            &mut control,
+                            &active_steering_queue,
+                            store.as_ref(),
+                            &session_id,
+                            &mut chat,
+                            &mut pane,
+                        );
+                        pending_skill = None;
+                        chat = ChatWidget::with_theme(theme);
+                        chat.push_welcome(
+                            &args.model,
+                            cwd.display().to_string(),
+                            &session_id,
+                            branch_summary.clone(),
+                            context_summary.clone(),
+                            settings_summary.clone(),
+                        );
+                        for event in truncated_events {
+                            chat.ingest(event);
+                        }
+                        let composer_text = outcome.display_text.unwrap_or(outcome.text);
+                        pane.set_composer_text(&composer_text);
+                    }
                     AppEvent::ShowTree => match resolve_tree_root(&store, &session_id) {
                         Ok(root_id) => match store.walk_tree(&root_id) {
                             Ok(nodes) => {

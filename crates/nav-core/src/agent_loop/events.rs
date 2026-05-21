@@ -217,6 +217,17 @@ pub enum AgentEvent {
         turn_id: String,
         reason: String,
     },
+    /// Recorded after the user rewinds the session to an earlier
+    /// `user_message`. The original message at `target_seq` and every event
+    /// that followed it have been removed from the event log; this audit
+    /// row takes their place so the durable transcript still shows where
+    /// the rewind happened. Replay drops the event — it carries no
+    /// model-visible content.
+    SessionRewound {
+        target_seq: u64,
+        removed_events: usize,
+        preview: String,
+    },
     /// Emitted before sleeping during a retry of the streaming provider call.
     /// Surfaces transient failures so the TUI / session log can show that a
     /// hiccup was recovered from, not papered over.
@@ -310,6 +321,7 @@ impl AgentEvent {
             AgentEvent::PendingInputDequeued { .. } => "pending_input_dequeued",
             AgentEvent::TurnComplete { .. } => "turn_complete",
             AgentEvent::TurnAborted { .. } => "turn_aborted",
+            AgentEvent::SessionRewound { .. } => "session_rewound",
             AgentEvent::ProviderRetry { .. } => "provider_retry",
             AgentEvent::ContextTrimmed { .. } => "context_trimmed",
             AgentEvent::ToolBudgetWarning { .. } => "tool_budget_warning",

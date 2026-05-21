@@ -338,6 +338,20 @@ fn sessions_command(args: &Args, action: SessionsAction) -> Result<()> {
             let new_id = store.fork_session(&resolved, at, name.as_deref())?;
             println!("forked {resolved} -> {new_id}");
         }
+        SessionsAction::Rewind { session_id, at } => {
+            let resolved = store.resolve_session_id(&session_id)?;
+            let target = match at {
+                Some(seq) => seq,
+                None => store.latest_user_message_seq(&resolved)?.ok_or_else(|| {
+                    anyhow::anyhow!("session {resolved} has no user_message events to rewind to")
+                })?,
+            };
+            let outcome = store.rewind_to_user_message(&resolved, target)?;
+            println!(
+                "rewound {resolved} to seq {} (removed {} event(s))",
+                outcome.target_seq, outcome.removed_events
+            );
+        }
         SessionsAction::Tree { session_id } => {
             let resolved = store.resolve_session_id(&session_id)?;
             let nodes = store.walk_tree(&resolved)?;
