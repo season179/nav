@@ -7,6 +7,9 @@
 //! bottom of the screen.
 
 use anyhow::Result;
+use crossterm::cursor::MoveTo;
+use crossterm::queue;
+use crossterm::terminal::{Clear, ClearType};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Paragraph;
@@ -62,6 +65,23 @@ pub(super) fn draw_tui(
     let viewport_h = streaming_h + composer_h + STATUS_ROWS;
     let viewport_y = screen_h.saturating_sub(viewport_h);
     let viewport_area = Rect::new(0, viewport_y, screen_w, viewport_h);
+
+    // When the streaming cell finalizes (or shrinks), the viewport's top
+    // moves down. ratatui only paints inside the new (smaller) area, so the
+    // rows the viewport just vacated keep their stale streaming text on
+    // screen. The next `insert_history_lines` call sets the scroll region
+    // to `1..new_area.top()` — which now includes those abandoned rows —
+    // and scrolls them up into the terminal's native scrollback as orphan
+    // fragments. Clear the freed rows now so they enter scrollback blank
+    // instead of as leftovers from a mid-stream paint.
+    let old_area = terminal.viewport_area;
+    if old_area.width > 0 && viewport_area.top() > old_area.top() {
+        let backend = terminal.backend_mut();
+        for row in old_area.top()..viewport_area.top() {
+            let _ = queue!(backend, MoveTo(0, row), Clear(ClearType::CurrentLine));
+        }
+    }
+
     terminal.set_viewport_area(viewport_area);
 
     terminal.draw(|f| {
