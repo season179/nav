@@ -10,8 +10,8 @@ use nav_core::{
     RetryPolicy, SessionBinding, SessionStore, SessionSummary, SessionTreeNode, StartupNotices,
     TranscriptHit, agent_event_notification,
     cli::{
-        Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, SessionsAction,
-        sandbox_policy_from_args,
+        Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, ModelsAction,
+        ProvidersAction, SessionsAction, list_models, list_providers, sandbox_policy_from_args,
     },
     discover_extensions, discover_skills, git_checkpoint, layout_session_tree,
     load_project_context,
@@ -240,6 +240,8 @@ fn run_cli_command(
         CliCommand::Sessions { action } => sessions_command(args, action),
         CliCommand::Git { action } => git_command(cwd, action),
         CliCommand::Extensions { action } => extensions_command(extensions, action),
+        CliCommand::Models { action } => models_command(project, action),
+        CliCommand::Providers { action } => providers_command(project, action),
     }
 }
 
@@ -276,6 +278,83 @@ fn git_command(cwd: &Path, action: GitAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn models_command(project: &ProjectContext, action: ModelsAction) -> Result<()> {
+    match action {
+        ModelsAction::List { json } => {
+            let lines = list_models(project.settings.providers.as_ref());
+            if json {
+                emit_line(&serde_json::to_string(&lines).expect("models list serializes"));
+                return Ok(());
+            }
+            if lines.is_empty() {
+                emit_line("(no models configured)");
+                return Ok(());
+            }
+            for line in &lines {
+                let mut out = format!("{}  {}", line.selector, line.provider_display_name);
+                if let Some(wire_name) = line.model_id.as_deref() {
+                    out.push_str(&format!("  model_id={wire_name}"));
+                }
+                if let Some(effort) = line.reasoning_effort {
+                    out.push_str(&format!("  reasoning={effort}"));
+                }
+                emit_line(&out);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn providers_command(project: &ProjectContext, action: ProvidersAction) -> Result<()> {
+    match action {
+        ProvidersAction::List { json } => {
+            let lines = list_providers(project.settings.providers.as_ref());
+            if json {
+                emit_line(&serde_json::to_string(&lines).expect("providers list serializes"));
+                return Ok(());
+            }
+            if lines.is_empty() {
+                emit_line("(no providers configured)");
+                return Ok(());
+            }
+            for line in &lines {
+                let base_url = line.base_url.as_deref().unwrap_or("-");
+                let credential = if !line.credential_configured {
+                    "credential resolvable: n/a"
+                } else if line.credential_resolvable {
+                    "credential resolvable: yes"
+                } else {
+                    "credential resolvable: no"
+                };
+                emit_line(&format!(
+                    "{}  {}  {}  {}",
+                    line.id, line.display_name, base_url, credential
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a line to stdout, treating `BrokenPipe` as a clean exit so callers
+/// like `nav models list | head -1` do not panic. Other I/O errors aren't
+/// expected on stdout; we surface them on stderr without aborting since the
+/// surrounding command flow has nothing useful to do with them either.
+fn emit_line(line: &str) {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    match writeln!(handle, "{line}") {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {
+            std::process::exit(0);
+        }
+        Err(err) => {
+            eprintln!("nav: write to stdout failed: {err}");
+        }
+    }
 }
 
 fn extensions_command(

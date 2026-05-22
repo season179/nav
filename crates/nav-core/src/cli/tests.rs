@@ -165,6 +165,44 @@ fn parses_extensions_list_subcommand() {
 }
 
 #[test]
+fn parses_models_list_subcommand() {
+    let args = Args::try_parse_from(["nav", "models", "list"]).unwrap();
+    assert_eq!(
+        args.command,
+        Some(CliCommand::Models {
+            action: ModelsAction::List { json: false },
+        })
+    );
+
+    let args = Args::try_parse_from(["nav", "models", "list", "--json"]).unwrap();
+    assert_eq!(
+        args.command,
+        Some(CliCommand::Models {
+            action: ModelsAction::List { json: true },
+        })
+    );
+}
+
+#[test]
+fn parses_providers_list_subcommand() {
+    let args = Args::try_parse_from(["nav", "providers", "list"]).unwrap();
+    assert_eq!(
+        args.command,
+        Some(CliCommand::Providers {
+            action: ProvidersAction::List { json: false },
+        })
+    );
+
+    let args = Args::try_parse_from(["nav", "providers", "list", "--json"]).unwrap();
+    assert_eq!(
+        args.command,
+        Some(CliCommand::Providers {
+            action: ProvidersAction::List { json: true },
+        })
+    );
+}
+
+#[test]
 fn allows_empty_prompt() {
     // clap Vec<String> accepts zero args; main.rs checks for emptiness.
     let args = Args::try_parse_from(["nav"]).unwrap();
