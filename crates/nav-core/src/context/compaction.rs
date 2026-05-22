@@ -23,6 +23,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::history::{NAV_SYNTHETIC_MARKER_KEY, is_synthetic_user_message};
 use super::{Catalog, ProjectContext};
 use crate::agent_loop::AgentEvent;
 
@@ -336,12 +337,18 @@ fn extract_user_text(item: &Value) -> Option<String> {
 }
 
 /// Returns the text of a real, non-summary user message — or [`None`] if the
-/// item is not a user message, has no text, or is a prior summary.
+/// item is not a user message, has no text, is a prior summary, or is one of
+/// nav's synthetic injections (ambient context, tool-budget nudge, or a
+/// previously spliced initial-context block from mid-turn compaction). The
+/// synthetic filter prevents accumulation across compactions.
 fn real_user_text(item: &Value) -> Option<String> {
     if item.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }
     if item.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    if is_synthetic_user_message(item) {
         return None;
     }
     let text = extract_user_text(item)?;
@@ -360,13 +367,12 @@ fn real_user_text(item: &Value) -> Option<String> {
 ///
 /// The model has been fine-tuned to see the compaction summary as the last
 /// item in history. Mid-turn (in-loop) compaction therefore re-injects
-/// initial context *before* the last real user message; manual and pre-turn
-/// compaction drop it because the next regular turn re-assembles it.
+/// initial context *before* the last real user message; manual `/compact`
+/// drops it because the next regular turn re-assembles initial context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitialContextInjection {
-    /// Manual and pre-turn compaction: replace history with summary and
-    /// clear reference context. The next regular turn re-injects initial
-    /// context.
+    /// Manual `/compact`: replace history with summary and clear reference
+    /// context. The next regular turn re-injects initial context.
     DoNotInject,
 
     /// Mid-turn (in-loop) compaction: re-inject initial context just above
@@ -460,24 +466,22 @@ fn insert_initial_context_before_last_user_message(
 /// turn — so there is a single source of truth for "the initial context
 /// block." Returns an empty vec when there is nothing to inject.
 ///
-/// The first live consumer is the mid-turn auto-compact path (tracked
-/// separately); until that lands, this helper is invoked only from tests,
-/// which is why the dead_code allowance is intentional.
+/// The wrapped item is marked synthetic ([`NAV_SYNTHETIC_MARKER_KEY`]) so a
+/// follow-up mid-turn compaction in the same session does not re-collect
+/// the injected initial context into the carry-forward — without this,
+/// N compactions would splice N copies of the initial context block.
+/// The marker is stripped from the request body just before send.
 ///
-/// Open questions for the live consumer:
-/// - **Accumulation across compactions.** The wrapped item is `role=user`
-///   with a non-summary body, so [`select_recent_user_messages`] will pick
-///   it up on the *next* compaction and a fresh copy will be spliced again
-///   — N compactions ⇒ N copies. The consumer must either filter injected
-///   items out of the carry-forward (sentinel prefix, structural marker, or
-///   a parallel "this is initial context, drop on next compaction" channel)
-///   or accept the duplication.
-/// - **Channel choice.** `build_instructions` produces system-flavoured text
-///   ("You are a small coding agent …"); delivering it over `role=user`
-///   may compete with the trailing summary for the model's attention. The
-///   consumer may want a developer/system-role item if the transport
-///   supports it.
-#[allow(dead_code)]
+/// Wire-cost note: post-compaction request bodies now ship the preamble
+/// twice — once in the top-level `instructions` field assembled by the
+/// request builder, once inline as this synthetic user message. The
+/// codex compaction shape (which the model is trained against per §5 of
+/// `docs/codex-compaction-learnings.md`) expects the initial context
+/// above the trailing summary, so the inline copy is load-bearing for
+/// continuity even though `instructions` is sent in parallel. If
+/// telemetry later shows the double-send is a meaningful cost, the cure
+/// is to suppress `instructions` on post-compaction iterations, not to
+/// drop the inline copy.
 pub(crate) fn build_initial_context_items(
     cwd: &Path,
     skills: &Catalog,
@@ -491,6 +495,7 @@ pub(crate) fn build_initial_context_items(
         "type": "message",
         "role": "user",
         "content": [{ "type": "input_text", "text": body }],
+        NAV_SYNTHETIC_MARKER_KEY: true,
     })]
 }
 

@@ -14,7 +14,8 @@ use super::runner::{SessionBinding, drop_oldest_tool_pair};
 use crate::cli::Args;
 use crate::context::compaction::{
     InitialContextInjection, append_compaction_details, build_history_summary_prompt,
-    build_replacement_history, estimate_input_tokens, prepare_compaction,
+    build_initial_context_items, build_replacement_history, estimate_input_tokens,
+    prepare_compaction,
 };
 use crate::context::{Catalog, ProjectContext};
 use crate::model::ResponsesTransport;
@@ -32,6 +33,13 @@ pub(crate) struct CompactionTurnRequest<'a, 's> {
     pub events: &'a UnboundedSender<AgentEvent>,
     pub skills: &'a Catalog,
     pub context: Option<&'a ProjectContext>,
+    /// Whether the replacement history re-injects the canonical initial
+    /// context block above the last real user message. Mid-turn auto-compact
+    /// uses [`InitialContextInjection::BeforeLastUserMessage`] because the
+    /// model is trained to see the summary at the tail; manual `/compact`
+    /// uses [`InitialContextInjection::DoNotInject`] and lets the next
+    /// regular turn re-assemble initial context.
+    pub initial_context_injection: InitialContextInjection,
 }
 
 /// Run a single compaction turn. Mutates `input` in place: on success it is
@@ -140,7 +148,14 @@ pub(crate) async fn run_compaction_turn(
         });
         return Err(anyhow!(message));
     }
-    *input = build_replacement_history(&summary, input, &[], InitialContextInjection::DoNotInject);
+    let injection = request.initial_context_injection;
+    let initial_context = match injection {
+        InitialContextInjection::DoNotInject => Vec::new(),
+        InitialContextInjection::BeforeLastUserMessage => {
+            build_initial_context_items(request.cwd, request.skills, request.context)
+        }
+    };
+    *input = build_replacement_history(&summary, input, &initial_context, injection);
     let _ = request.events.send(completed);
 
     emit_compaction_analytics(CompactionAnalyticsEvent {
