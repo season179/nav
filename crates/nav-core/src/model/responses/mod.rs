@@ -2,7 +2,7 @@ mod collector;
 mod delta;
 mod parser;
 mod request;
-mod retry;
+pub(crate) mod retry;
 mod sse;
 pub mod types;
 mod websocket;
