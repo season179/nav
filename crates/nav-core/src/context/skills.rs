@@ -145,8 +145,9 @@ fn user_skills_root() -> Option<PathBuf> {
 /// onto `notices` naming both paths.
 ///
 /// Skills that fail to parse (missing description, unreadable frontmatter)
-/// are skipped with a diagnostic. Cosmetic problems such as a
-/// `name`/directory mismatch are warned about but still loaded.
+/// are skipped with a diagnostic. A directory name that doesn't match the
+/// frontmatter `name` is fine — many installers (gstack, factory, …) pick
+/// a different folder name and address the skill by its frontmatter slug.
 pub fn discover_skills(launch_cwd: &Path, notices: &mut StartupNotices) -> Catalog {
     discover_skills_with_roots(launch_cwd, user_skills_root().as_deref(), notices)
 }
@@ -212,7 +213,7 @@ fn scan_directory(root: &Path, scope: SkillScope, notices: &mut StartupNotices) 
         if !skill_md_path.is_file() {
             continue;
         }
-        match load_skill(&path, &skill_md_path, scope, notices) {
+        match load_skill(&path, &skill_md_path, scope) {
             Ok(skill) => out.push(skill),
             Err(err) => {
                 notices.warning(format!("skipping skill at {}: {err}", path.display()));
@@ -233,7 +234,6 @@ fn load_skill(
     skill_dir: &Path,
     skill_md_path: &Path,
     scope: SkillScope,
-    notices: &mut StartupNotices,
 ) -> Result<Skill, String> {
     let contents = fs::read_to_string(skill_md_path)
         .map_err(|err| format!("failed to read SKILL.md: {err}"))?;
@@ -252,14 +252,6 @@ fn load_skill(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "SKILL.md frontmatter is missing `description`".to_string())?;
-
-    if let Some(dir_name) = skill_dir.file_name().and_then(|n| n.to_str())
-        && dir_name != name
-    {
-        notices.warning(format!(
-            "skill `{name}` directory name `{dir_name}` does not match frontmatter `name`"
-        ));
-    }
 
     // Canonicalize so downstream fs guards still accept these paths when
     // `$HOME` or another ancestor is a symlink.
@@ -447,8 +439,16 @@ mod tests {
         )
         .unwrap();
 
-        let catalog = discover_skills_with_roots(&cwd, None, &mut StartupNotices::new());
+        let mut notices = StartupNotices::new();
+        let catalog = discover_skills_with_roots(&cwd, None, &mut notices);
         assert_eq!(catalog.len(), 1);
         assert!(catalog.get("right").is_some());
+        assert!(
+            notices.is_empty(),
+            "dir-name vs frontmatter-name mismatch must not warn — many \
+             installers (gstack, factory, …) use a different directory name; \
+             got notices: {:?}",
+            notices
+        );
     }
 }
