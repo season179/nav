@@ -39,7 +39,7 @@ struct CodexTokens {
     access_token: String,
 }
 
-pub fn load_auth(args: &Args) -> Result<AuthConfig> {
+pub fn load_auth(args: &Args, settings: &Settings) -> Result<AuthConfig> {
     match args.auth {
         AuthMode::ApiKey => {
             // API-key mode uses the public OpenAI API endpoint.
@@ -59,6 +59,9 @@ pub fn load_auth(args: &Args) -> Result<AuthConfig> {
             // ChatGPT subscription auth is not the same as OPENAI_API_KEY.
             // Codex stores an OAuth access token locally; the Codex backend
             // accepts that token at chatgpt.com/backend-api/codex.
+            //
+            // When the Codex auth file is missing or in the wrong mode, fall
+            // through to the provider catalog (G2) instead of hard-failing.
             let codex_home = args
                 .codex_home
                 .clone()
@@ -69,48 +72,85 @@ pub fn load_auth(args: &Args) -> Result<AuthConfig> {
                      Set HOME, set CODEX_HOME explicitly, or pass --codex-home <path>.",
                 )?;
             let auth_path = codex_home.join("auth.json");
-            let raw = fs::read_to_string(&auth_path).map_err(|err| {
-                anyhow::anyhow!(
-                    "could not read {}: {err}. Run `codex login` to create it, \
-                     or pass `--auth api-key` and set OPENAI_API_KEY.",
-                    auth_path.display()
-                )
-            })?;
-            let auth_file: CodexAuthFile = serde_json::from_str(&raw).map_err(|err| {
-                anyhow::anyhow!(
-                    "could not parse {} as Codex auth.json: {err}. \
-                     Re-run `codex login` to rewrite the file.",
-                    auth_path.display()
-                )
-            })?;
-            if auth_file.auth_mode.as_deref() != Some("chatgpt") {
-                bail!(
-                    "{} is not in ChatGPT auth mode. Run `codex login` and choose \
-                     Sign in with ChatGPT, or pass `--auth api-key` and set OPENAI_API_KEY.",
-                    auth_path.display()
-                );
+
+            // Try to load and validate the Codex auth file. If any step
+            // fails, attempt fallback to the provider catalog.
+            let codex_result: Result<CodexAuthFile> = (|| {
+                let raw = fs::read_to_string(&auth_path).map_err(|err| {
+                    anyhow::anyhow!("could not read {}: {err}", auth_path.display())
+                })?;
+                let auth_file: CodexAuthFile = serde_json::from_str(&raw).map_err(|err| {
+                    anyhow::anyhow!(
+                        "could not parse {} as Codex auth.json: {err}",
+                        auth_path.display()
+                    )
+                })?;
+                if auth_file.auth_mode.as_deref() != Some("chatgpt") {
+                    bail!("{} is not in ChatGPT auth mode", auth_path.display());
+                }
+                Ok(auth_file)
+            })();
+
+            match codex_result {
+                Ok(auth_file) => {
+                    let bearer = auth_file.tokens.map(|t| t.access_token).context(
+                        "Codex auth.json does not contain an access token. \
+                         Re-run `codex login` and choose Sign in with ChatGPT.",
+                    )?;
+                    Ok(AuthConfig {
+                        http_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                        websocket_url: "wss://chatgpt.com/backend-api/codex/responses".to_string(),
+                        bearer,
+                    })
+                }
+                Err(codex_err) => {
+                    // Codex auth failed — try the provider catalog.
+                    match resolve_provider(Some(args.model.as_str()), settings) {
+                        Ok(resolved) => {
+                            eprintln!(
+                                "nav: Codex auth unavailable; falling back to {}",
+                                resolved.display_name
+                            );
+                            let bearer = resolved.bearer.ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "provider `{}` has no API key configured. \
+                                     Set `api_key` in `.nav/settings.json` or export OPENAI_API_KEY.",
+                                    resolved.display_name
+                                )
+                            })?;
+                            let ws_base = if resolved.base_url.starts_with("https://") {
+                                resolved.base_url.replacen("https://", "wss://", 1)
+                            } else {
+                                resolved.base_url.replacen("http://", "ws://", 1)
+                            };
+                            Ok(AuthConfig {
+                                http_base_url: format!("{}/responses", resolved.base_url),
+                                websocket_url: format!("{ws_base}/responses"),
+                                bearer,
+                            })
+                        }
+                        Err(resolve_err) => {
+                            // Nothing resolvable — emit the original Codex
+                            // error enriched with what we tried.
+                            Err(anyhow::anyhow!(
+                                "{codex_err}\n\nFailed to resolve provider: {resolve_err}\n\
+                                 Run `nav providers list` to see configured providers, \
+                                 or set OPENAI_API_KEY and configure a provider in .nav/settings.json."
+                            ))
+                        }
+                    }
+                }
             }
-            let bearer = auth_file.tokens.map(|tokens| tokens.access_token).context(
-                "Codex auth.json does not contain an access token. \
-                     Re-run `codex login` and choose Sign in with ChatGPT.",
-            )?;
-            Ok(AuthConfig {
-                http_base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-                websocket_url: "wss://chatgpt.com/backend-api/codex/responses".to_string(),
-                bearer,
-            })
         }
     }
 }
 
 /// A provider + model entry resolved from the merged providers catalog.
 ///
-/// Produced by [`resolve_provider`] for the api-key auth path. Today nothing
-/// outside the resolver and its tests consumes this type — G9 will migrate
-/// [`load_auth`]'s api-key branch to consult the catalog through
-/// [`resolve_provider`] and replace `AuthConfig`'s api-key half. The
-/// Codex/ChatGPT login flow in [`load_auth`] does not, and will not, go
-/// through the catalog.
+/// Produced by [`resolve_provider`]. The Codex/ChatGPT login flow in
+/// [`load_auth`] reads `~/.codex/auth.json` directly; when that fails,
+/// G9 falls back to [`resolve_provider`] and converts the result into an
+/// [`AuthConfig`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedProvider {
     /// OpenAI-compatible API base URL (e.g. `https://api.z.ai/v1`).
@@ -381,7 +421,7 @@ mod tests {
         let auth_json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"tok_abc"}}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let auth = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap();
+        let auth = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap();
         assert_eq!(auth.bearer, "tok_abc");
         assert!(auth.http_base_url.contains("chatgpt.com"));
         assert!(auth.websocket_url.contains("chatgpt.com"));
@@ -393,11 +433,10 @@ mod tests {
         let auth_json = r#"{"auth_mode":"api_key","tokens":{"access_token":"tok"}}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not in ChatGPT auth mode"));
-        // The new message also points users at the alternative.
-        assert!(msg.contains("--auth api-key"));
+        assert!(msg.contains("Failed to resolve provider"));
     }
 
     #[test]
@@ -406,7 +445,7 @@ mod tests {
         let auth_json = r#"{"auth_mode":"chatgpt"}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
         assert!(err.to_string().contains("access token"));
     }
 
@@ -417,7 +456,7 @@ mod tests {
         let auth_json = r#"{"auth_mode":"chatgpt","tokens":{}}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
         assert!(err.to_string().contains("parse"));
     }
 
@@ -425,12 +464,12 @@ mod tests {
     fn chatgpt_rejects_missing_auth_file() {
         let temp = tempdir().unwrap();
         let args = chatgpt_args(temp.path().join("nonexistent").to_path_buf());
-        let err = load_auth(&args).unwrap_err();
+        // With empty settings (no providers catalog), the fallback can't
+        // resolve a provider either, so we still get a hard error.
+        let err = load_auth(&args, &Settings::default()).unwrap_err();
         let msg = err.to_string();
-        // Path included and an action ("codex login" or "--auth api-key").
         assert!(msg.contains("could not read"));
-        assert!(msg.contains("codex login"));
-        assert!(msg.contains("--auth api-key"));
+        assert!(msg.contains("Failed to resolve provider"));
     }
 
     #[test]
@@ -438,12 +477,12 @@ mod tests {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("auth.json"), "not json").unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
         let msg = err.to_string();
         // Path included and a concrete action.
         assert!(msg.contains("parse"));
         assert!(msg.contains("auth.json"));
-        assert!(msg.contains("codex login"));
+        assert!(msg.contains("Failed to resolve provider"));
     }
 
     #[test]
@@ -452,7 +491,7 @@ mod tests {
         let auth_json = r#"{"auth_mode":null,"tokens":{"access_token":"tok"}}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf())).unwrap_err();
+        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
         assert!(err.to_string().contains("not in ChatGPT auth mode"));
     }
 
@@ -462,6 +501,62 @@ mod tests {
     // in Rust 2024 and the tests race under parallel execution. The code path
     // is trivial (env::var -> construct AuthConfig); the ChatGPT file-based
     // tests above provide meaningful coverage of the auth loading structure.
+
+    // ── G9: auth auto-detect with config awareness ───────────────
+
+    /// Missing Codex file + resolvable provider → falls back silently.
+    #[test]
+    fn chatgpt_fallback_to_resolved_provider_when_codex_missing() {
+        let temp = tempdir().unwrap();
+        // No auth.json written — file is missing.
+        let args = chatgpt_args(temp.path().to_path_buf());
+
+        // Settings with a provider whose api_key resolves to a literal.
+        let settings = settings_with_catalog();
+        // args.model is "test-model" (from test_default), which doesn't
+        // match any catalog entry. Override with a qualified selector.
+        let mut args = args;
+        args.model = "z.ai/glm-5.1".to_string();
+
+        let auth = load_auth(&args, &settings).unwrap();
+        assert_eq!(auth.bearer, "sk-zai-literal");
+        assert!(auth.http_base_url.contains("/responses"));
+        assert!(auth.http_base_url.starts_with("https://api.z.ai/v1"));
+        assert!(auth.websocket_url.starts_with("wss://"));
+    }
+
+    /// Missing Codex file + no resolvable provider → hard error listing what
+    /// was tried.
+    #[test]
+    fn chatgpt_errors_when_nothing_resolvable() {
+        let temp = tempdir().unwrap();
+        let args = chatgpt_args(temp.path().to_path_buf());
+
+        let err = load_auth(&args, &Settings::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("could not read"), "original Codex error: {msg}");
+        assert!(msg.contains("Failed to resolve provider"), "fallback note: {msg}");
+        assert!(msg.contains("nav providers list"), "hint: {msg}");
+    }
+
+    /// --auth api-key never falls back to Codex (decision tree rule 4).
+    #[test]
+    fn api_key_mode_never_falls_back_to_codex() {
+        let temp = tempdir().unwrap();
+        // Write a valid Codex auth file — but we're in api-key mode, so it
+        // should be ignored entirely.
+        let auth_json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"codex_tok"}}"#;
+        fs::write(temp.path().join("auth.json"), auth_json).unwrap();
+
+        let mut args = Args::test_default();
+        args.auth = AuthMode::ApiKey;
+        args.codex_home = Some(temp.path().to_path_buf());
+
+        // No OPENAI_API_KEY set → should error about the env var, NOT about
+        // Codex auth.
+        let err = load_auth(&args, &Settings::default()).unwrap_err();
+        assert!(err.to_string().contains("OPENAI_API_KEY"));
+    }
 
     // ── AuthConfig debug ──────────────────────────────────────────
 
@@ -670,18 +765,11 @@ mod tests {
         assert_eq!(resolved.headers["X-Computed"], "computed-header");
     }
 
-    /// Codex auth mode bypasses the providers catalog because [`load_auth`]
-    /// takes no `Settings` parameter at all — the signature itself is the
-    /// invariant. The actual ChatGPT-auth.json reading is covered by the
-    /// `chatgpt_*` tests above; here we just confirm that the new resolver
-    /// did not change `load_auth`'s shape.
+    /// load_auth now takes `&Settings` so it can fall back to the provider
+    /// catalog (G9) when Codex auth is missing.
     #[test]
-    fn codex_auth_mode_signature_is_settings_free() {
-        // Compile-time check: load_auth's only argument is `&Args`. If a
-        // future refactor adds a `&Settings` parameter, this binding stops
-        // compiling and the reviewer has to decide whether to wire Codex
-        // auth through the catalog (which the issue explicitly forbids).
-        let _: fn(&Args) -> Result<AuthConfig> = load_auth;
+    fn codex_auth_mode_signature_uses_settings() {
+        let _: fn(&Args, &Settings) -> Result<AuthConfig> = load_auth;
     }
 
     // ── api_key resolution: configured-but-empty is a hard error ─

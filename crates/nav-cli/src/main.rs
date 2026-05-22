@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let auth_config = auth::load_auth(&args)?;
+    let auth_config = auth::load_auth(&args, &project.settings)?;
     // No global `.timeout()` — a streaming turn legitimately runs for minutes.
     // The SSE/WS idle timeout below is what catches stuck streams.
     let client = reqwest::Client::builder()
