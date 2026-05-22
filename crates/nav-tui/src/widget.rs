@@ -479,7 +479,6 @@ impl Default for ChatWidget {
     }
 }
 
-
 struct SkillPrompt {
     name: String,
     request: String,

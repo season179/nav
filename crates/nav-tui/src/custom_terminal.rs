@@ -127,7 +127,6 @@ impl Frame<'_> {
     pub fn set_cursor_position<P: Into<Position>>(&mut self, position: P) {
         self.cursor_position = Some(position.into());
     }
-
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
@@ -584,5 +583,3 @@ where
 
     Ok(())
 }
-
-

@@ -664,4 +664,3 @@ fn renders_session_management_cells() {
     let rendered = render_widget(&mut widget, 96, 20);
     insta::assert_snapshot!("session_management_cells", rendered);
 }
-

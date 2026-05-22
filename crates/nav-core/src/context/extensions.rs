@@ -314,8 +314,9 @@ fn load_extension(
     for template in &manifest.prompt_templates {
         match load_prompt_template_manifest(template, &name, &extension_dir, scope) {
             Ok(template) => prompt_templates.push(template),
-            Err(err) => notices
-                .warning(format!("skipping prompt template in extension `{name}`: {err}")),
+            Err(err) => notices.warning(format!(
+                "skipping prompt template in extension `{name}`: {err}"
+            )),
         }
     }
 
@@ -504,8 +505,7 @@ mod tests {
             &extension_json("demo", "review", "night"),
         );
 
-        let catalog =
-            discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
+        let catalog = discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
 
         assert_eq!(catalog.extensions().len(), 1);
         assert_eq!(catalog.prompt_templates().len(), 1);
@@ -577,8 +577,7 @@ mod tests {
             }"#,
         );
 
-        let catalog =
-            discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
+        let catalog = discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
         assert!(catalog.prompt_templates().is_empty());
     }
 
@@ -597,8 +596,7 @@ mod tests {
             }"#,
         );
 
-        let catalog =
-            discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
+        let catalog = discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
         assert!(catalog.prompt_templates().is_empty());
         assert_eq!(catalog.extensions().len(), 1);
         assert_eq!(catalog.extensions()[0].prompt_template_count, 0);

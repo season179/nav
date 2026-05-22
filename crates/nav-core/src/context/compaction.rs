@@ -182,12 +182,11 @@ pub fn prepare_compaction(input: &[Value]) -> CompactionPreparation {
     }
 
     let selection = select_recent_context(input, KEEP_RECENT_TOKENS);
-    let summary_source =
-        if selection.summary_source.is_empty() && !input.is_empty() {
-            input.to_vec()
-        } else {
-            selection.summary_source
-        };
+    let summary_source = if selection.summary_source.is_empty() && !input.is_empty() {
+        input.to_vec()
+    } else {
+        selection.summary_source
+    };
 
     file_ops.extract_from_input(&summary_source);
     let details = file_ops.into_details();
@@ -1152,8 +1151,14 @@ mod tests {
 
         // Only two user messages + summary.
         assert_eq!(new_history.len(), 3);
-        assert_eq!(extract_user_text(&new_history[0]), Some("hello".to_string()));
-        assert_eq!(extract_user_text(&new_history[1]), Some("follow up".to_string()));
+        assert_eq!(
+            extract_user_text(&new_history[0]),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            extract_user_text(&new_history[1]),
+            Some("follow up".to_string())
+        );
         let summary_content = extract_user_text(&new_history[2]).unwrap();
         assert!(summary_content.starts_with(SUMMARY_PREFIX));
         assert!(summary_content.contains("summary text"));
@@ -1175,7 +1180,10 @@ mod tests {
 
         // Only the real user message + new summary; prior summary is dropped.
         assert_eq!(new_history.len(), 2);
-        assert_eq!(extract_user_text(&new_history[0]), Some("real question".to_string()));
+        assert_eq!(
+            extract_user_text(&new_history[0]),
+            Some("real question".to_string())
+        );
         let summary_content = extract_user_text(&new_history[1]).unwrap();
         assert!(summary_content.contains("new summary"));
     }
@@ -1183,17 +1191,17 @@ mod tests {
     #[test]
     fn build_replacement_history_truncates_oversized_boundary_message() {
         // A huge user message that exceeds KEEP_RECENT_TOKENS.
-        let huge_text = "x".chars().cycle().take(KEEP_RECENT_TOKENS as usize * 8).collect::<String>();
+        let huge_text = "x"
+            .chars()
+            .cycle()
+            .take(KEEP_RECENT_TOKENS as usize * 8)
+            .collect::<String>();
         let input = vec![
             json!({"type": "message", "role": "user", "content": "small msg"}),
             json!({"type": "message", "role": "user", "content": huge_text}),
         ];
-        let new_history = build_replacement_history(
-            "sum",
-            &input,
-            &[],
-            InitialContextInjection::DoNotInject,
-        );
+        let new_history =
+            build_replacement_history("sum", &input, &[], InitialContextInjection::DoNotInject);
 
         // Summary is last.
         let last_text = extract_user_text(new_history.last().unwrap()).unwrap();
@@ -1232,9 +1240,8 @@ mod tests {
             json!({"type": "message", "role": "user", "content": "first"}),
             json!({"type": "message", "role": "user", "content": "second"}),
         ];
-        let initial = vec![
-            json!({"type": "message", "role": "user", "content": "should-not-appear"}),
-        ];
+        let initial =
+            vec![json!({"type": "message", "role": "user", "content": "should-not-appear"})];
 
         let history = build_replacement_history(
             "summary",
