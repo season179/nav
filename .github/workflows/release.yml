@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release -p nav-cli
+
+      - name: Package
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p dist
+          cp target/release/nav dist/
+          tar -czf "nav-${VERSION}-aarch64-apple-darwin.tar.gz" -C dist nav
+          shasum -a 256 "nav-${VERSION}-aarch64-apple-darwin.tar.gz" | cut -d" " -f1 \
+            > "nav-${VERSION}-aarch64-apple-darwin.tar.gz.sha256"
+
+      - name: Publish release
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          gh release create "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "nav-${VERSION}-aarch64-apple-darwin.tar.gz" \
+            "nav-${VERSION}-aarch64-apple-darwin.tar.gz.sha256"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
