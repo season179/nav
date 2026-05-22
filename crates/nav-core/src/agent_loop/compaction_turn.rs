@@ -53,16 +53,6 @@ pub(crate) async fn run_compaction_turn(
     let phase = request.phase;
     let tokens_before = request.tokens_before;
 
-    let event_for = |status| CompactionAnalyticsEvent {
-        trigger,
-        reason,
-        phase,
-        status,
-        tokens_before,
-        tokens_after: 0,
-        duration_ms: started_at.elapsed().as_millis() as u64,
-    };
-
     emit(
         request.events,
         request.session,
@@ -110,7 +100,15 @@ pub(crate) async fn run_compaction_turn(
                     message: message.clone(),
                 },
             );
-            emit_compaction_analytics(event_for(CompactionStatus::Failed));
+            emit_compaction_analytics(CompactionAnalyticsEvent {
+                trigger,
+                reason,
+                phase,
+                status: CompactionStatus::Failed,
+                tokens_before,
+                tokens_after: 0,
+                duration_ms: started_at.elapsed().as_millis() as u64,
+            });
             return Err(anyhow!(message));
         }
     };
@@ -124,7 +122,15 @@ pub(crate) async fn run_compaction_turn(
                 message: message.clone(),
             },
         );
-        emit_compaction_analytics(event_for(CompactionStatus::Failed));
+        emit_compaction_analytics(CompactionAnalyticsEvent {
+            trigger,
+            reason,
+            phase,
+            status: CompactionStatus::Failed,
+            tokens_before,
+            tokens_after: 0,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        });
         return Err(anyhow!(message));
     }
 
@@ -147,7 +153,15 @@ pub(crate) async fn run_compaction_turn(
                 message: message.clone(),
             },
         );
-        emit_compaction_analytics(event_for(CompactionStatus::Failed));
+        emit_compaction_analytics(CompactionAnalyticsEvent {
+            trigger,
+            reason,
+            phase,
+            status: CompactionStatus::Failed,
+            tokens_before,
+            tokens_after: 0,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+        });
         return Err(anyhow!(message));
     }
     *input = build_replacement_history(&summary, &preparation.recent_context);
