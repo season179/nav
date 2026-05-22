@@ -48,7 +48,11 @@ fn run_nav(args: &[&str], cwd: &std::path::Path, home: &std::path::Path) -> std:
 fn models_list_text_output_includes_provider_display_and_reasoning() {
     let (workspace, home) = write_fixture();
     let out = run_nav(&["models", "list"], workspace.path(), home.path());
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     // BTreeMap orders providers lexicographically: ollama before z.ai.
     let lines: Vec<&str> = stdout.lines().collect();
@@ -57,7 +61,11 @@ fn models_list_text_output_includes_provider_display_and_reasoning() {
     // exact column shape so a regression that collapses the display column
     // to an empty string can't pass.
     assert_eq!(lines[0], "ollama/llama3  ollama");
-    assert!(lines[1].starts_with("z.ai/glm-5.1  Z.AI"), "got: {}", lines[1]);
+    assert!(
+        lines[1].starts_with("z.ai/glm-5.1  Z.AI"),
+        "got: {}",
+        lines[1]
+    );
     assert!(lines[1].contains("reasoning=high"));
 }
 
@@ -65,7 +73,11 @@ fn models_list_text_output_includes_provider_display_and_reasoning() {
 fn models_list_json_output_is_array() {
     let (workspace, home) = write_fixture();
     let out = run_nav(&["models", "list", "--json"], workspace.path(), home.path());
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let arr = parsed.as_array().expect("array");
@@ -75,7 +87,11 @@ fn models_list_json_output_is_array() {
     assert_eq!(arr[1]["reasoning_effort"], "high");
     // None fields skip-serialize so consumers can use `has(...)` to
     // discriminate unset from set.
-    assert!(arr[0].get("reasoning_effort").is_none(), "expected reasoning_effort absent for ollama, got {:?}", arr[0]);
+    assert!(
+        arr[0].get("reasoning_effort").is_none(),
+        "expected reasoning_effort absent for ollama, got {:?}",
+        arr[0]
+    );
     assert!(arr[0].get("model_id").is_none());
 }
 
@@ -83,7 +99,11 @@ fn models_list_json_output_is_array() {
 fn providers_list_text_output_reports_credential_state() {
     let (workspace, home) = write_fixture();
     let out = run_nav(&["providers", "list"], workspace.path(), home.path());
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 2, "stdout: {stdout}");
@@ -104,8 +124,16 @@ fn providers_list_text_output_reports_credential_state() {
 #[test]
 fn providers_list_json_output_is_array() {
     let (workspace, home) = write_fixture();
-    let out = run_nav(&["providers", "list", "--json"], workspace.path(), home.path());
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = run_nav(
+        &["providers", "list", "--json"],
+        workspace.path(),
+        home.path(),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8(out.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let arr = parsed.as_array().expect("array");
@@ -150,10 +178,16 @@ fn empty_catalog_prints_placeholder() {
     let out = run_nav(&["models", "list"], workspace.path(), home.path());
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("(no models configured)"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("(no models configured)"),
+        "stdout: {stdout}"
+    );
 
     let out = run_nav(&["providers", "list"], workspace.path(), home.path());
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("(no providers configured)"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("(no providers configured)"),
+        "stdout: {stdout}"
+    );
 }

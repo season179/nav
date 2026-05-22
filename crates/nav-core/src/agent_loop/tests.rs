@@ -3097,12 +3097,8 @@ async fn overflow_one_shot_recovery_compacts_and_continues() {
         })),
         StubItem::Event(json!({"type": "response.completed", "response": {}})),
     ];
-    let transport = StubTransport::with_items(vec![
-        turn_one,
-        turn_two,
-        turn_three_summary,
-        turn_four,
-    ]);
+    let transport =
+        StubTransport::with_items(vec![turn_one, turn_two, turn_three_summary, turn_four]);
 
     let mut args = Args::test_default();
     args.max_turns = 6;
@@ -3165,7 +3161,10 @@ async fn overflow_one_shot_recovery_compacts_and_continues() {
         item.get("type").and_then(Value::as_str) == Some("function_call")
             && item.get("call_id").and_then(Value::as_str) == Some("call_1")
     });
-    assert!(!has_call_1, "call_1 should be gone from the compacted retry");
+    assert!(
+        !has_call_1,
+        "call_1 should be gone from the compacted retry"
+    );
 
     // Recovery is one-shot; the flag is consumed. The retry's assistant
     // message bubbles all the way back up to the user.
@@ -4674,10 +4673,8 @@ async fn auto_compact_does_not_re_fire_mid_loop_after_checkpoint() {
     // `latest_input_tokens` is 5k from the previous final answer. With the
     // first tool sampling reporting input_tokens=10k, the mid-turn check
     // sees 10k < 85k and does NOT fire.
-    let transport_two = StubTransport::new(vec![
-        tool_call_turn(10_000),
-        final_turn("done two", 12_000),
-    ]);
+    let transport_two =
+        StubTransport::new(vec![tool_call_turn(10_000), final_turn("done two", 12_000)]);
     let binding_two = SessionBinding {
         store: &store,
         session_id: session_id.clone(),

@@ -50,10 +50,7 @@ pub fn list_models(catalog: Option<&ProviderCatalog>) -> Vec<ModelLine> {
     };
     let mut lines = Vec::new();
     for (provider_id, provider) in catalog {
-        let display = provider
-            .name
-            .clone()
-            .unwrap_or_else(|| provider_id.clone());
+        let display = provider.name.clone().unwrap_or_else(|| provider_id.clone());
         for (model_key, model) in &provider.models {
             lines.push(ModelLine {
                 selector: format!("{provider_id}/{model_key}"),

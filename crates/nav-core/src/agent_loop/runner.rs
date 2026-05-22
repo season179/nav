@@ -358,8 +358,9 @@ pub(super) async fn run_agent_inner(
                     if !overflow_recovery_attempted =>
                 {
                     overflow_recovery_attempted = true;
-                    let tokens_before =
-                        session.map(|binding| binding.rolling_input_tokens()).unwrap_or(0);
+                    let tokens_before = session
+                        .map(|binding| binding.rolling_input_tokens())
+                        .unwrap_or(0);
                     let outcome = run_compaction_turn(
                         CompactionTurnRequest {
                             transport,
@@ -706,8 +707,7 @@ pub(super) async fn run_agent_inner(
                         events: &events,
                         skills,
                         context,
-                        initial_context_injection:
-                            InitialContextInjection::BeforeLastUserMessage,
+                        initial_context_injection: InitialContextInjection::BeforeLastUserMessage,
                     },
                     &mut input,
                 )

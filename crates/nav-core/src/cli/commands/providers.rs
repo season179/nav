@@ -121,7 +121,11 @@ mod tests {
         }
     }
 
-    fn provider(name: Option<&str>, base_url: Option<&str>, api_key: Option<&str>) -> ProviderConfig {
+    fn provider(
+        name: Option<&str>,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+    ) -> ProviderConfig {
         ProviderConfig {
             name: name.map(str::to_owned),
             base_url: base_url.map(str::to_owned),
@@ -139,7 +143,10 @@ mod tests {
     #[test]
     fn ordered_by_provider_id() {
         let mut catalog = ProviderCatalog::new();
-        catalog.insert("z.ai".into(), provider(Some("Z.AI"), Some("https://z"), None));
+        catalog.insert(
+            "z.ai".into(),
+            provider(Some("Z.AI"), Some("https://z"), None),
+        );
         catalog.insert("ollama".into(), provider(None, Some("http://local"), None));
         let lines = list_providers(Some(&catalog));
         assert_eq!(lines[0].id, "ollama");
@@ -170,7 +177,10 @@ mod tests {
             "secret",
         );
         let mut catalog = ProviderCatalog::new();
-        catalog.insert("z.ai".into(), provider(Some("Z.AI"), Some("https://z"), Some(guard.key())));
+        catalog.insert(
+            "z.ai".into(),
+            provider(Some("Z.AI"), Some("https://z"), Some(guard.key())),
+        );
         let lines = list_providers(Some(&catalog));
         assert!(lines[0].credential_configured);
         assert!(lines[0].credential_resolvable);
@@ -184,7 +194,11 @@ mod tests {
         let unique_literal = format!("sk-literal-{}", std::process::id());
         catalog.insert(
             "openai".into(),
-            provider(Some("OpenAI"), Some("https://api.openai.com/v1"), Some(&unique_literal)),
+            provider(
+                Some("OpenAI"),
+                Some("https://api.openai.com/v1"),
+                Some(&unique_literal),
+            ),
         );
         let lines = list_providers(Some(&catalog));
         assert!(lines[0].credential_configured);

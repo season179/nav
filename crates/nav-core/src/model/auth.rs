@@ -140,10 +140,7 @@ impl fmt::Debug for ResolvedProvider {
         formatter
             .debug_struct("ResolvedProvider")
             .field("base_url", &self.base_url)
-            .field(
-                "bearer",
-                &self.bearer.as_ref().map(|_| "Bearer[REDACTED]"),
-            )
+            .field("bearer", &self.bearer.as_ref().map(|_| "Bearer[REDACTED]"))
             .field("headers", &self.headers)
             .field("model_id", &self.model_id)
             .field("reasoning_effort", &self.reasoning_effort)
@@ -174,10 +171,7 @@ impl fmt::Debug for ResolvedProvider {
 /// resolver itself cannot distinguish "user typed `gpt-5.5`" from "user
 /// omitted `--model`". The wiring layer that runs `apply_settings` is the
 /// natural place to make that call.
-pub fn resolve_provider(
-    selector: Option<&str>,
-    settings: &Settings,
-) -> Result<ResolvedProvider> {
+pub fn resolve_provider(selector: Option<&str>, settings: &Settings) -> Result<ResolvedProvider> {
     let selector = selector.or(settings.default_model.as_deref()).context(
         "no model specified and no `default_model` in settings.json. Pass `--model <provider>/<model>` \
          or set `default_model` in `.nav/settings.json`. Run `nav providers list` to see the catalog.",
@@ -283,9 +277,9 @@ pub fn resolve_provider(
             })?;
             let value = match resolved {
                 Some(v) if !v.is_empty() => v,
-                _ => bail!(
-                    "header `{name}` for provider `{provider_id}` resolved to an empty value"
-                ),
+                _ => {
+                    bail!("header `{name}` for provider `{provider_id}` resolved to an empty value")
+                }
             };
             headers.insert(name.clone(), value);
         }
@@ -519,10 +513,7 @@ mod tests {
         };
 
         let mut acme_models = BTreeMap::new();
-        acme_models.insert(
-            "glm-5.1".to_string(),
-            ModelConfig::default(),
-        );
+        acme_models.insert("glm-5.1".to_string(), ModelConfig::default());
         acme_models.insert("only-here".to_string(), ModelConfig::default());
         let acme_provider = ProviderConfig {
             name: None,
@@ -591,7 +582,10 @@ mod tests {
         let settings = settings_with_catalog();
         let err = resolve_provider(Some("z.ai/no-such-model"), &settings).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("`no-such-model`"), "model name in error: {msg}");
+        assert!(
+            msg.contains("`no-such-model`"),
+            "model name in error: {msg}"
+        );
         assert!(msg.contains("`z.ai`"), "provider name in error: {msg}");
     }
 
@@ -856,7 +850,10 @@ mod tests {
             display_name: "ollama/llama3".to_string(),
         };
         let dbg = format!("{resolved:?}");
-        assert!(dbg.contains("None"), "expected None for absent bearer: {dbg}");
+        assert!(
+            dbg.contains("None"),
+            "expected None for absent bearer: {dbg}"
+        );
         assert!(!dbg.contains("REDACTED"));
     }
 }
