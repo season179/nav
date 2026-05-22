@@ -79,6 +79,44 @@ fn detect_http_overflow_ignores_non_json_body() {
     assert!(detect_http_overflow("").is_none());
 }
 
+#[test]
+fn detect_http_overflow_matches_message_substring_openai() {
+    // OpenAI / DeepSeek sometimes omit the code field and only include
+    // the message. The substring "maximum context length" should match.
+    let body = r#"{"error":{"message":"This model's maximum context length is 8192 tokens.","type":"invalid_request_error","param":null}}"#;
+    let msg = detect_http_overflow(body).expect("should match on message substring");
+    assert!(msg.contains("8192 tokens"));
+}
+
+#[test]
+fn detect_http_overflow_matches_message_substring_context_length() {
+    // Together / Groq variant with "context length" in the message.
+    let body = r#"{"error":{"message":"Requested context length exceeds maximum.","type":"invalid_request_error"}}"#;
+    let msg = detect_http_overflow(body).expect("should match on context length");
+    assert!(msg.contains("exceeds maximum"));
+}
+
+#[test]
+fn detect_http_overflow_matches_message_input_too_long() {
+    // Anthropic OpenAI-compat shim: "input is too long" without the code field.
+    let body = r#"{"error":{"message":"input is too long: max_tokens + prompt > model context window","type":"invalid_request_error"}}"#;
+    let msg = detect_http_overflow(body).expect("should match on input too long");
+    assert!(msg.contains("max_tokens"));
+}
+
+#[test]
+fn detect_http_overflow_message_match_is_case_insensitive() {
+    let body = r#"{"error":{"message":"MAXIMUM CONTEXT LENGTH exceeded."}}"#;
+    assert!(detect_http_overflow(body).is_some());
+}
+
+#[test]
+fn detect_http_overflow_message_match_is_conservative() {
+    // A message about "context" but not about overflow — should NOT match.
+    let body = r#"{"error":{"message":"Invalid context parameter.","type":"invalid_request_error"}}"#;
+    assert!(detect_http_overflow(body).is_none());
+}
+
 // ── model_hint_from_body ──────────────────────────────────────
 
 #[test]

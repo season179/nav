@@ -12,7 +12,7 @@
 use anyhow::anyhow;
 use serde_json::{Map, Value, json};
 
-use crate::model::responses::ResponsesError;
+use crate::model::responses::{ResponsesError, is_overflow_code, is_overflow_message};
 
 const MAX_STREAMING_TOOL_CALLS: usize = 128;
 
@@ -247,14 +247,7 @@ fn chat_error_detail(err: &Value) -> (Option<&str>, String) {
 }
 
 fn is_context_overflow_error(code: Option<&str>, message: &str) -> bool {
-    if matches!(
-        code,
-        Some("context_length_exceeded") | Some("context_window_exceeded")
-    ) {
-        return true;
-    }
-    let lower = message.to_ascii_lowercase();
-    lower.contains("context") && (lower.contains("exceed") || lower.contains("too long"))
+    is_overflow_code(code) || is_overflow_message(message)
 }
 
 /// Map Chat Completions `prompt_tokens` / `completion_tokens` (with their

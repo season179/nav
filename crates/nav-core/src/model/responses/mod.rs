@@ -142,29 +142,50 @@ fn extract_quoted_model(message: &str) -> Option<String> {
 /// Returns the error message if an HTTP error response body indicates a
 /// context-window overflow. Used by the SSE and WebSocket connect paths so a
 /// 400 / handshake rejection routes through the same recovery as stream-time
-/// overflows. Expected body shape:
-/// `{"error": {"code": "context_length_exceeded", "message": "..."}}`.
+/// overflows.
+///
+/// Matches when `error.code` is a known overflow code (see [`is_overflow_code`])
+/// **or** when `error.message` contains a known overflow substring (see
+/// [`is_overflow_message`]). When in doubt, returns `None` so the error
+/// surfaces normally instead of triggering compaction recovery on a false
+/// positive.
 pub(crate) fn detect_http_overflow(body: &str) -> Option<String> {
     let json: Value = serde_json::from_str(body).ok()?;
     let err = json.get("error")?;
     let code = err.get("code").and_then(Value::as_str);
-    if is_overflow_code(code) {
-        Some(
-            err.get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        )
+    let message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if is_overflow_code(code) || is_overflow_message(&message) {
+        Some(message)
     } else {
         None
     }
 }
 
-fn is_overflow_code(code: Option<&str>) -> bool {
+/// Machine-readable `error.code` check. Shared by the HTTP path
+/// ([`detect_http_overflow`]) and the stream-event path in both the Responses
+/// and Chat Completions transports.
+pub(crate) fn is_overflow_code(code: Option<&str>) -> bool {
     matches!(
         code,
         Some("context_length_exceeded") | Some("context_window_exceeded")
     )
+}
+
+/// Conservative message-substring check for providers that don't set a
+/// machine-readable `error.code` but include a human-readable hint.
+/// Covers:
+/// - OpenAI / DeepSeek: `"...maximum context length..."`
+/// - Anthropic OpenAI shim: `"...input is too long..."`
+/// - Together / Groq: same as OpenAI or `"...context length..."`
+pub(crate) fn is_overflow_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("maximum context length")
+        || lower.contains("context length")
+        || lower.contains("input is too long")
 }
 
 /// Real `Responses` transport backed by the existing WebSocket and SSE code.
