@@ -11,6 +11,7 @@ All citations are from `~/Personal/codex/codex-rs/` at the `main` branch checkou
 - The auto-compaction check fires **after every sampling response**, never *before* the first sampling of a freshly submitted user turn. Concretely: when a user types a prompt, codex sends it as-is without any pre-flight token check — the new prompt is appended to history and shipped. Only once that sampling completes does codex check `needs_follow_up && token_limit_reached`; if true, it compacts before the next sampling iteration. So there is **no "before I send your new prompt, let me compact first" path** — an oversized fresh prompt has to rely on the in-compaction overflow fallback or the provider's overflow error. (This is the key gap vs PRD story #17.)
 - Pre-turn/manual compaction throws away the initial context block (because the next regular turn re-injects it). Mid-turn compaction re-injects the initial context immediately before the last user message, because the model is trained to see the summary as the last item.
 - Persistence is rollout-based, not SQLite-table-based: a `RolloutItem::Compacted { message, replacement_history }` row is appended. On resume, the rollout is replayed sequentially, so the compaction row naturally shadows everything before it.
+- The **visible transcript** (what the user saw scroll by) and the **model-visible history** (what gets sent next turn) are distinct surfaces. Compaction only rewrites the latter — codex preserves the former in the rollout file; nav inherits it from the terminal's native scrollback, which is unforgeable.
 - The compaction turn is **non-steerable** — input submitted during compaction is rejected with `SteerInputError::ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind::Compact }`. Pending input is queued and drained after compaction completes.
 - Tool calls/results from before compaction are **dropped**. Only user messages are carried forward. Encrypted reasoning / `previous_response_id` are not preserved across the boundary.
 
@@ -204,6 +205,10 @@ For `InitialContextInjection::BeforeLastUserMessage`, the canonical initial cont
 
 This is a load-bearing distinction — the model has been fine-tuned to expect the summary at the tail.
 
+### Visible vs. model-visible separation
+
+A property worth naming explicitly: codex never tries to retroactively edit what the user saw. The rollout file keeps every item ever produced; compaction only rewrites the *model-visible* slice that gets sent next turn. In codex this is a convention enforced by which code paths read which store. nav has the same property but for a stronger reason — see §10.11.
+
 ---
 
 ## 6. Non-steerable execution & queueing
@@ -236,6 +241,8 @@ Three event-level signals:
 - `EventMsg::Warning` — posted immediately after success (`compact.rs:289-292`): *"Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted."*
 - `CodexCompactionEvent` analytics (compact.rs:308-358) — `trigger` (Manual/Auto), `reason` (UserRequested/ContextLimit/ModelDownshift), `phase` (StandaloneTurn/PreTurn/MidTurn), `status` (Completed/Interrupted/Failed), `active_context_tokens_before`/`after`, duration. Not on the user event bus — analytics-only.
 
+**Failure-path gap.** Codex emits `ItemStartedEvent` on entry and `ItemCompletedEvent` on success; the analytics event captures `status: Failed`, but there is no dedicated user-visible failure event on the protocol bus. The TUI infers failure from the absence of completion plus the normal error rail. nav's PRD #13 wants explicit failure surfacing — this likely means adding a `ContextCompactionFailed` protocol event rather than copying codex 1:1.
+
 ### Persistence
 
 History replacement is atomic in `session/mod.rs:2609-2632`:
@@ -267,6 +274,8 @@ pub struct CompactedItem {
     pub replacement_history: Option<Vec<ResponseItem>>,  // post-compaction history
 }
 ```
+
+**Storage hygiene caveat.** `replacement_history` is persisted in full per compaction event. A session with N compactions stores N replacement-history blobs in the rollout, each carrying the surviving user messages and summary. This is acceptable for codex's append-only rollout (resume only consumes the latest), but for a queryable SQLite store nav should either null out earlier `replacement_history` columns once a newer compaction shadows them, or accept the linear growth and treat the redundancy as an audit trail. PRD #23 is exactly this concern.
 
 ### Resume
 
@@ -308,11 +317,14 @@ Mapping the codex design onto the nav PRD:
 2. **Replicate the three-trigger model.** Manual, in-loop (post-sampling) auto, in-compaction overflow fallback. A "before-first-sampling" check on freshly submitted user prompts is *not* part of codex's design — it relies on the in-compaction fallback or a provider overflow error to recover. Don't add a pre-flight check just because PRD story #17 asks for it; re-examine that story first.
 3. **Replicate the `InitialContextInjection` distinction.** This is subtle but load-bearing. Manual (and any hypothetical pre-flight) = `DoNotInject` and clear reference context, because the next regular turn will reinject canonical initial context. In-loop auto = `BeforeLastUserMessage`, because the model has been trained to see the summary as the last item in history.
 4. **Carry forward `[recent user messages, capped at ~20k tokens] + [SUMMARY_PREFIX + summary]`.** Drop everything else. Filter prior summaries out of the "user messages" pool.
-5. **Don't persist a separate compaction table.** Reuse the rollout/event log; let a `RolloutItem::Compacted` (or nav-equivalent) entry naturally shadow earlier items on replay. This satisfies PRD stories 8, 9, 10, 21, 24, 26, 27 in one stroke.
+5. **Don't persist a separate compaction table.** Reuse the rollout/event log; let a `RolloutItem::Compacted` (or nav-equivalent) entry naturally shadow earlier items on replay. This satisfies PRD stories 8, 9, 10, 21, 24, 26, 27 in one stroke. Translation to nav's SQLite store: write a `compaction` row into the same ordered events table as user/assistant/tool rows, and have replay logic skip everything before the most recent compaction row. Do **not** introduce a separate `compactions` table — that fragments the source of truth and breaks the single-pass replay property that makes codex's resume so simple.
 6. **Make compaction turns non-steerable**, with queued input draining post-compaction (PRD #14, #15).
 7. **Threshold scope = `Total` for v1.** `BodyAfterPrefix` is sophisticated but only matters once you've done compaction more than once in a session and the summary itself is large. Ship `Total` first; revisit when telemetry shows pathological multi-compact sessions.
 8. **Emit one analytics event with `trigger × reason × phase × status` axes** — codex's structure is the right shape.
 9. **Keep nav's existing tool-call-pair overflow trim as the *in-compaction* retry**, not the primary recovery. Same role as `compact.rs:223-232`.
 10. **Test priorities**: (a) ItemStarted/ItemCompleted protocol round-trip, (b) replay sends checkpoint + post-checkpoint only, (c) summary-message filter prevents re-summarization, (d) non-steerable behavior, (e) mid-turn vs pre-turn injection golden.
+11. **Trust nav's substrate to enforce the visible/model-visible split.** Codex maintains this split by convention — the rollout file is full, the model-visible history is the rewritten one. nav has a stronger property: the inline-viewport TUI writes finalized cells into the terminal's native scrollback (see CLAUDE.md), which the app literally cannot edit. Compaction rewriting model-visible history therefore *cannot* accidentally also rewrite what the user saw. Lean into this — it satisfies PRD #9 for free, and there is no need to invent a separate "visible transcript store."
+12. **Decide explicitly whether to preserve provider continuation artifacts** (PRD #22). Codex drops encrypted reasoning blobs and `previous_response_id` at the compaction boundary; the summary is plain text. For v1 against the OpenAI Responses flow this is a non-question — drop them, the summary is the handoff. Revisit only if a provider later requires reasoning continuity to keep an in-flight tool call valid across the boundary, and treat that as a provider-specific exception rather than a general policy.
+13. **Add a `ContextCompactionFailed` protocol event.** Codex's user-bus emits Started + Completed only; failure is visible only in analytics and via the generic error rail. PRD #13 wants explicit failure surfacing, so nav should diverge here — emit a dedicated failure event with enough metadata (trigger, reason, error class) for the TUI and NDJSON consumers to render it as a first-class row.
 
 The cleanest single design choice in the codex implementation is treating compaction as **just another turn that happens to rewrite history**, persisted via the same rollout log. That's the property the PRD is gesturing at when it says "compaction should be a normal session lifecycle event, not an emergency truncation."
