@@ -37,5 +37,8 @@ rustc-ice-*.txt
 # without it git anchors the rule to repo root only.
 **/.nav/clipboard/
 
+# Python bytecode cache
+__pycache__/
+
 # Claude Code agent worktrees
 .claude/worktrees/
