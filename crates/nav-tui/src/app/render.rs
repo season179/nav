@@ -29,6 +29,20 @@ const MAX_STREAMING_ROWS: u16 = 16;
 /// Bottom-anchored status bar height.
 const STATUS_ROWS: u16 = 1;
 
+/// Composer minimum height — keeps at least one input row plus padding.
+const MIN_COMPOSER_ROWS: u16 = 3;
+
+/// Reserve this many rows above the inline viewport for native scrollback
+/// insertion. `insert_history_lines` defines its upper scroll region as
+/// `SetScrollRegion(1..area.top())`, which is only a valid DECSTBM when
+/// `area.top() >= 2` (top < bottom, 1-based). Without this clamp, a
+/// streaming preview tall enough to fill the screen drives `area.y` to 0
+/// via the overflow branch below, and the next history flush emits
+/// `\x1b[1;0r`; several terminals fall back to a full-screen region on
+/// that invalid range and the history rows then overpaint the inline
+/// frame.
+const SCROLLBACK_RESERVE: u16 = 2;
+
 pub(super) struct TuiStatus<'a> {
     pub model: &'a str,
     pub cwd_short: &'a str,
@@ -49,26 +63,42 @@ pub(super) fn draw_tui(
 ) -> Result<()> {
     let screen_h = screen_h.max(2);
 
+    // Inline frame fits in `max_inline` rows so that at least
+    // `SCROLLBACK_RESERVE` rows always remain above the viewport for
+    // native scrollback insertion (see the constant's doc comment).
+    let max_inline = screen_h.saturating_sub(SCROLLBACK_RESERVE).max(1);
+
     // Materialize the live inline cells once: streaming assistant followed
     // by any `Exploring`/`Running` tool-call placeholders. `inline_lines_capped`
     // already caps the row count at `MAX_STREAMING_ROWS` and prioritizes
     // placeholders over streaming-assistant tokens — without that, a long
     // streaming reply would push `Exploring`/`Running` rows past the cap
-    // and they'd be invisibly clipped by ratatui's `Paragraph`.
-    let streaming_lines = chat.inline_lines_capped(screen_w, MAX_STREAMING_ROWS);
+    // and they'd be invisibly clipped by ratatui's `Paragraph`. Tighten the
+    // cap further on small terminals so composer + status still fit inside
+    // `max_inline`.
+    let streaming_cap = MAX_STREAMING_ROWS
+        .min(max_inline.saturating_sub(STATUS_ROWS + MIN_COMPOSER_ROWS));
+    let streaming_lines = chat.inline_lines_capped(screen_w, streaming_cap);
     let streaming_h = streaming_lines.len() as u16;
-    let max_composer = screen_h.saturating_sub(STATUS_ROWS + streaming_h).max(1);
-    let composer_h = pane.desired_height(screen_w).max(3).min(max_composer);
+    let max_composer = max_inline.saturating_sub(STATUS_ROWS + streaming_h).max(1);
+    let composer_h = pane
+        .desired_height(screen_w)
+        .max(MIN_COMPOSER_ROWS)
+        .min(max_composer);
 
     // Sticky-top viewport: preserve `viewport_area.top()` so the inline frame
     // doesn't slam against the bottom of the screen on every frame. On the
     // first frame this anchors the viewport just below the cursor's startup
     // row (where the shell prompt was), avoiding the "empty rows below the
-    // viewport snapshotted into scrollback" leak. The viewport slides DOWN
-    // naturally as `insert_history_lines` pushes content above it, and
-    // bottom-anchors permanently once it reaches the screen floor.
+    // viewport snapshotted into scrollback" leak.
+    //
+    // When the viewport shrinks (e.g. a streaming assistant cell finalizes),
+    // area.y stays put and the height drops at the bottom. The caller pairs
+    // this resize with a follow-up `insert_history_lines` that slides the
+    // now-smaller viewport DOWN by the freed rows below it — re-anchoring
+    // the composer at the screen floor without leaving a blank band above.
     let old_area = terminal.viewport_area;
-    let viewport_h = (streaming_h + composer_h + STATUS_ROWS).min(screen_h).max(1);
+    let viewport_h = (streaming_h + composer_h + STATUS_ROWS).min(max_inline).max(1);
     let mut viewport_area = Rect::new(0, old_area.y, screen_w, viewport_h);
 
     // Expansion-overflow: if growing the viewport would push it past the
@@ -89,14 +119,18 @@ pub(super) fn draw_tui(
         viewport_area.y = screen_h - viewport_area.height;
     }
 
-    // Blank rows the viewport is about to vacate (streaming cell finalized
-    // or shrunk) before the next `insert_history_lines` scrolls them into
-    // native scrollback as orphan fragments of a mid-stream paint.
-    if old_area.width > 0 /* skip the pre-first-frame zero-sized area */
-        && viewport_area.top() > old_area.top()
-    {
+    // Blank rows the new viewport vacates at the bottom (e.g. streaming
+    // cell finalized and the inline frame collapsed back to composer +
+    // status with `area.y` preserved). Without this clear, the stale
+    // streaming text painted into those rows on the previous frame stays
+    // on screen below the new composer, looking like the message got
+    // duplicated. `old_area.width == 0` only on the pre-first-frame
+    // zero-sized area — skip then.
+    if old_area.width > 0 && viewport_area.bottom() < old_area.bottom() {
         let backend = terminal.backend_mut();
-        for row in old_area.top()..viewport_area.top() {
+        let start = viewport_area.bottom().max(old_area.top());
+        let end = old_area.bottom().min(screen_h);
+        for row in start..end {
             queue!(backend, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
         }
     }

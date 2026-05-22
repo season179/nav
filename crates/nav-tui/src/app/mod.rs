@@ -213,31 +213,22 @@ pub async fn run(
                 screen_w
             };
 
-            // Flush newly-finalized cells into the terminal's native
-            // scrollback above the inline viewport. Use the current
-            // viewport width so each cell renders against the same width
-            // it would have at draw time.
+            // Pull newly-finalized cells out of the chat ahead of the
+            // viewport resize so the resize sees the in-flight cells
+            // (streaming, tool placeholders) only — and the flush below
+            // pushes the finalized scrollback rows into the now-smaller
+            // viewport's slide room.
             let pending = chat.drain_pending(scroll_width);
 
-            // Bracket the scrollback insertion + viewport redraw in a
+            // Bracket the viewport redraw + scrollback insertion in a
             // synchronized update so terminals that support it commit
             // both operations atomically — no tearing between the
-            // history rows landing above the viewport and the inline
-            // viewport repaint. The Begin/End pair is best-effort:
-            // terminals without DECSET 2026 support silently ignore it,
-            // so a failure here is not actionable.
+            // inline viewport repaint and the history rows landing
+            // above it. The Begin/End pair is best-effort: terminals
+            // without DECSET 2026 support silently ignore it, so a
+            // failure here is not actionable.
             use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
             let _ = crossterm::queue!(term.terminal.backend_mut(), BeginSynchronizedUpdate);
-
-            if !pending.is_empty()
-                && let Err(err) = crate::insert_history::insert_history_lines(
-                    &mut term.terminal,
-                    pending,
-                    scroll_width,
-                )
-            {
-                eprintln!("nav-tui: failed to insert pending history rows: {err:#}");
-            }
 
             let spinner = spinner_frame(spinner_tick);
             let state = match active_turn.as_ref() {
@@ -263,6 +254,23 @@ pub async fn run(
                 screen_w,
                 screen_h,
             )?;
+
+            // Flush finalized rows into native scrollback AFTER the resize.
+            // When the viewport just shrank (e.g. a streaming cell
+            // finalized), `insert_history_lines` finds slide room equal to
+            // the shrinkage and slides the smaller viewport DOWN — the
+            // composer re-anchors at the screen floor without a blank
+            // band above. This mirrors codex's draw flow (resize first,
+            // then flush_pending_history_lines).
+            if !pending.is_empty()
+                && let Err(err) = crate::insert_history::insert_history_lines(
+                    &mut term.terminal,
+                    pending,
+                    scroll_width,
+                )
+            {
+                eprintln!("nav-tui: failed to insert pending history rows: {err:#}");
+            }
 
             // Close the synchronized update; pair this with the Begin
             // above. Use execute! so the terminal commits the queued
