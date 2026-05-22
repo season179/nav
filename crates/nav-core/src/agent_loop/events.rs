@@ -45,6 +45,90 @@ impl CompactionTrigger {
     }
 }
 
+/// Why compaction was initiated. Mirrors codex's `CompactionReason` so
+/// analytics consumers share a common vocabulary across harnesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionReason {
+    /// User typed `/compact` (or a skill triggered an explicit compact).
+    UserRequested,
+    /// Token usage crossed the auto-compaction threshold before a turn.
+    ContextLimit,
+    /// A future path: downshifted to a smaller model with a shorter window.
+    ModelDownshift,
+}
+
+impl CompactionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactionReason::UserRequested => "user_requested",
+            CompactionReason::ContextLimit => "context_limit",
+            CompactionReason::ModelDownshift => "model_downshift",
+        }
+    }
+}
+
+/// When compaction ran relative to the surrounding turn lifecycle. Named
+/// `CompactionAnalyticsPhase` (not `CompactionPhase`) to avoid colliding
+/// with the TUI's rendering-phase enum in `nav-tui::cells::compaction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionAnalyticsPhase {
+    /// Compaction ran as its own isolated turn (manual `/compact` or
+    /// pre-turn auto-compact before the first sampling iteration).
+    StandaloneTurn,
+    /// Compaction ran between sampling iterations inside an ongoing user
+    /// turn (not yet exercised in nav, but reserved per codex learnings §7).
+    MidTurn,
+}
+
+impl CompactionAnalyticsPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactionAnalyticsPhase::StandaloneTurn => "standalone_turn",
+            CompactionAnalyticsPhase::MidTurn => "mid_turn",
+        }
+    }
+}
+
+/// Outcome of a compaction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStatus {
+    Completed,
+    /// Reserved for future use: compaction aborted mid-flight by a
+    /// pre-emption signal (e.g. user cancels the turn while compacting).
+    Interrupted,
+    Failed,
+}
+
+impl CompactionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactionStatus::Completed => "completed",
+            CompactionStatus::Interrupted => "interrupted",
+            CompactionStatus::Failed => "failed",
+        }
+    }
+}
+
+/// Structured analytics event emitted exactly once per compaction attempt.
+/// Routed to `tracing::info!(target: "nav.compaction", …)` — this is a
+/// telemetry-only event and must NOT appear on the user-facing
+/// [`AgentEvent`] stream. nav does not currently have a dedicated telemetry
+/// sink, so structured tracing is the lightest-weight option that avoids
+/// coupling the analytics surface to the protocol event bus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionAnalyticsEvent {
+    pub trigger: CompactionTrigger,
+    pub reason: CompactionReason,
+    pub phase: CompactionAnalyticsPhase,
+    pub status: CompactionStatus,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub duration_ms: u64,
+}
+
 /// Normalized usage counters emitted at the end of each model turn.
 ///
 /// Each field counts tokens for a single response; providers that do not

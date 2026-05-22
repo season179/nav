@@ -543,6 +543,12 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     )
 }
 
+/// Sum the per-item token estimates for every entry in `input`. Used by
+/// compaction analytics to report post-compaction context size.
+pub fn estimate_input_tokens(input: &[Value]) -> u64 {
+    input.iter().map(estimate_item_tokens).sum()
+}
+
 fn estimate_item_tokens(item: &Value) -> u64 {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => estimate_message_tokens(item),

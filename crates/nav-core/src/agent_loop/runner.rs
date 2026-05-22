@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::events::CompactionTrigger;
+use super::events::{CompactionAnalyticsPhase, CompactionReason, CompactionTrigger};
 use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::agent_loop::compaction_turn::{CompactionTurnRequest, run_compaction_turn};
 use crate::agent_loop::control::{PendingInput, PendingInputMode, TurnControls};
@@ -229,6 +229,8 @@ pub(super) async fn run_agent_inner(
                 args,
                 cwd,
                 trigger: CompactionTrigger::Manual,
+                reason: CompactionReason::UserRequested,
+                phase: CompactionAnalyticsPhase::StandaloneTurn,
                 tokens_before,
                 session,
                 events: &events,
@@ -273,6 +275,8 @@ pub(super) async fn run_agent_inner(
                     args,
                     cwd,
                     trigger: CompactionTrigger::Auto,
+                    reason: CompactionReason::ContextLimit,
+                    phase: CompactionAnalyticsPhase::StandaloneTurn,
                     tokens_before,
                     session,
                     events: &events,
