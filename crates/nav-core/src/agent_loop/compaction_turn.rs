@@ -50,11 +50,8 @@ pub(crate) async fn run_compaction_turn(
     );
 
     let preparation = prepare_compaction(input);
-    let summary_result = request_compaction_summary(
-        &request,
-        preparation.summary_source.clone(),
-    )
-    .await;
+    let summary_result =
+        request_compaction_summary(&request, preparation.summary_source.clone()).await;
     let summary = match summary_result {
         Ok(summary) => append_compaction_details(&summary, &preparation.details),
         Err(err) => {

@@ -36,8 +36,6 @@ Include:\n\
 \n\
 Be concise, structured, and focused on helping the next LLM seamlessly continue the work.";
 
-
-
 /// Prepended to the persisted summary so the next assistant turn knows it is
 /// reading a handoff produced by an earlier session, not a fresh user
 /// instruction. Mirrors Codex's `templates/compact/summary_prefix.md`.
@@ -164,33 +162,38 @@ pub struct RecentContextSelection {
 /// responsible for sending model requests and persisting the checkpoint.
 ///
 /// Every compaction re-summarises from scratch using [`SUMMARIZATION_PROMPT`],
-/// matching Codex's single-prompt compaction path. Previous summaries are
-/// filtered from the source so they are never re-summarised.
+/// matching Codex's single-prompt compaction path. The previous summary (if
+/// any) stays in `summary_source` so its narrative is visible to the model;
+/// its `<read-files>` / `<modified-files>` blocks are also lifted into
+/// [`CompactionDetails`] so they survive even if the model trims them.
+///
+/// If `select_recent_context` would keep everything verbatim (the whole input
+/// fits the recent-context budget), the full input is promoted into
+/// `summary_source` and `recent_context` is cleared. That preserves the
+/// manual `/compact` contract — a user-requested checkpoint always rolls the
+/// session into a single summary message rather than duplicating items into
+/// both sides.
 pub fn prepare_compaction(input: &[Value]) -> CompactionPreparation {
-    let previous_summary = latest_summary_from_input(input);
     let mut file_ops = FileOps::default();
-    if let Some(summary) = previous_summary.as_deref() {
-        file_ops.merge_details(parse_file_ops_from_summary(summary));
+    if let Some(summary) = latest_summary_from_input(input) {
+        file_ops.merge_details(parse_file_ops_from_summary(&summary));
     }
 
-    let source = input
-        .iter()
-        .filter(|item| !is_summary_input_item(item))
-        .cloned()
-        .collect::<Vec<_>>();
-    let selection = select_recent_context(&source, KEEP_RECENT_TOKENS);
-    let summary_source = if selection.summary_source.is_empty() {
-        source
-    } else {
-        selection.summary_source
-    };
+    let selection = select_recent_context(input, KEEP_RECENT_TOKENS);
+    let (summary_source, recent_context) =
+        if selection.summary_source.is_empty() && !input.is_empty() {
+            (input.to_vec(), Vec::new())
+        } else {
+            (selection.summary_source, selection.recent_context)
+        };
+
     file_ops.extract_from_input(&summary_source);
     let details = file_ops.into_details();
-    let replaced_events = input.len().saturating_sub(selection.recent_context.len());
+    let replaced_events = summary_source.len();
 
     CompactionPreparation {
         summary_source,
-        recent_context: selection.recent_context,
+        recent_context,
         replaced_events,
         details,
     }
@@ -211,8 +214,6 @@ pub fn build_history_summary_prompt(source: &[Value]) -> String {
     )
 }
 
-
-
 pub fn append_compaction_details(summary: &str, details: &CompactionDetails) -> String {
     let mut out = strip_xml_blocks(summary, &["read-files", "modified-files"])
         .trim()
@@ -221,8 +222,6 @@ pub fn append_compaction_details(summary: &str, details: &CompactionDetails) -> 
     append_xml_lines(&mut out, "modified-files", &details.modified_files);
     out
 }
-
-
 
 /// Serialize model-visible Responses input into a single summarization string.
 /// Only `function_call_output` text is truncated.
@@ -276,9 +275,10 @@ pub fn serialize_for_compaction(input: &[Value]) -> String {
 }
 
 /// Partition `input` into a summary-to-generate prefix and a recent-context
-/// suffix to retain verbatim. The cut always lands on a message boundary;
-/// there is no split-turn sub-range because compaction always summarises the
-/// full pre-checkpoint range with a single prompt.
+/// suffix to retain verbatim. The cut lands on a message boundary (user or
+/// assistant role); if no valid cut exists in `input[target..]`, everything
+/// is treated as summary_source so the recent-context side either starts at
+/// a real message or is empty.
 pub fn select_recent_context(input: &[Value], keep_recent_tokens: u64) -> RecentContextSelection {
     if input.is_empty() {
         return RecentContextSelection {
@@ -300,7 +300,7 @@ pub fn select_recent_context(input: &[Value], keep_recent_tokens: u64) -> Recent
 
     let cut_index = (target..input.len())
         .find(|idx| is_valid_cut_point(&input[*idx]))
-        .unwrap_or(0);
+        .unwrap_or(input.len());
 
     RecentContextSelection {
         summary_source: input[..cut_index].to_vec(),
@@ -400,10 +400,6 @@ pub fn latest_checkpoint_slice(events: &[AgentEvent]) -> Option<CheckpointSlice<
 
 fn latest_summary_from_input(input: &[Value]) -> Option<String> {
     input.iter().rev().find_map(extract_summary_text)
-}
-
-fn is_summary_input_item(item: &Value) -> bool {
-    extract_summary_text(item).is_some()
 }
 
 fn extract_summary_text(item: &Value) -> Option<String> {
@@ -618,8 +614,6 @@ fn is_valid_cut_point(item: &Value) -> bool {
         Some("user" | "assistant")
     )
 }
-
-
 
 #[derive(Debug, Default)]
 struct FileOps {
@@ -878,8 +872,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn build_history_summary_prompt_always_uses_single_prompt() {
         let prior = "## Goal\nold goal\n\n<read-files>\nold.rs\n</read-files>";
@@ -891,10 +883,13 @@ mod tests {
         let prepared = prepare_compaction(&input);
         let prompt = build_history_summary_prompt(&prepared.summary_source);
 
-        // Always uses SUMMARIZATION_PROMPT — no <previous-summary> block.
+        // Always uses SUMMARIZATION_PROMPT — no <previous-summary> wrapper.
         assert!(prompt.contains(SUMMARIZATION_PROMPT));
         assert!(!prompt.contains("<previous-summary>"));
         assert!(prompt.contains("[User]: new work"));
+        // Codex parity: prior summary text stays in source so the model can
+        // see the narrative it is meant to carry forward.
+        assert!(prompt.contains("old goal"));
     }
 
     #[test]
@@ -908,7 +903,12 @@ mod tests {
         let prepared = prepare_compaction(&input);
 
         assert!(prepared.details.read_files.contains(&"old.rs".to_string()));
-        assert!(prepared.details.modified_files.contains(&"edit.rs".to_string()));
+        assert!(
+            prepared
+                .details
+                .modified_files
+                .contains(&"edit.rs".to_string())
+        );
     }
 
     #[test]
@@ -1026,14 +1026,20 @@ mod tests {
         assert_eq!(selected.first_kept_index, 2);
         assert_eq!(selected.summary_source.len(), 2);
 
+        // No valid cut point exists in input[target..] (the tail is a bare
+        // function_call without its output). Falling back to cut_index=0
+        // would leave the orphan call at the head of recent_context — the
+        // Responses API rejects that shape. Instead we promote everything
+        // into summary_source so the recent-context side stays empty.
         let unmatched_call = vec![
             json!({"type": "message", "role": "user", "content": "do it"}),
             json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "running"}]}),
             json!({"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{\"command\":\"test\"}"}),
         ];
         let selected = select_recent_context(&unmatched_call, 1);
-        assert_eq!(selected.first_kept_index, 0);
-        assert_eq!(selected.recent_context, unmatched_call);
+        assert_eq!(selected.first_kept_index, unmatched_call.len());
+        assert_eq!(selected.summary_source, unmatched_call);
+        assert!(selected.recent_context.is_empty());
 
         // Even when the cut lands mid-turn, summary_source includes
         // everything before the cut (no split-turn sub-range).
@@ -1046,14 +1052,18 @@ mod tests {
         assert_eq!(selected.first_kept_index, 2);
         assert_eq!(selected.summary_source.len(), 2);
 
+        // Tail is a function_call + output pair with no later message — no
+        // valid cut point above target, so everything ends up in
+        // summary_source rather than dangling in recent_context.
         let long_single_turn = vec![
             json!({"type": "message", "role": "user", "content": "one turn"}),
             json!({"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{\"command\":\"cat big\"}"}),
             json!({"type": "function_call_output", "call_id": "c1", "output": "x".repeat(400)}),
         ];
         let selected = select_recent_context(&long_single_turn, 5);
-        assert_eq!(selected.first_kept_index, 0);
-        assert_eq!(selected.recent_context, long_single_turn);
+        assert_eq!(selected.first_kept_index, long_single_turn.len());
+        assert_eq!(selected.summary_source, long_single_turn);
+        assert!(selected.recent_context.is_empty());
     }
 
     #[test]
@@ -1072,5 +1082,4 @@ mod tests {
         assert_eq!(details.read_files, vec!["a.rs"]);
         assert_eq!(details.modified_files, vec!["b.rs", "c.rs", "d.rs", "e.rs"]);
     }
-
 }

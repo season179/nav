@@ -4056,16 +4056,15 @@ async fn consecutive_compactions_re_summarize_from_scratch() {
         .as_str()
         .expect("second prompt");
 
-    // Both compactions use SUMMARIZATION_PROMPT — no <previous-summary> block.
+    // Both compactions use SUMMARIZATION_PROMPT — no <previous-summary> block,
+    // no incremental/turn-prefix variants.
     assert!(first_prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
     assert!(second_prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
     assert!(!second_prompt.contains("<previous-summary>"));
-    // The previous summary is filtered from the source so it is not
-    // re-summarised as a user message.
-    assert!(!second_prompt.contains("## Goal\nfirst"));
-    // The second prompt is still smaller because the summary replaces the
-    // large original input.
-    assert!(second_prompt.len() < first_prompt.len());
+    // Codex parity: the prior summary stays in the source so the model can
+    // carry its narrative (goals, decisions, next steps) into the new summary
+    // rather than seeing only the new turns since the last checkpoint.
+    assert!(second_prompt.contains("## Goal\nfirst"));
 }
 
 #[tokio::test]
