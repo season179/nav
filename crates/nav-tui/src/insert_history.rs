@@ -41,7 +41,18 @@ use crate::custom_terminal::Terminal;
 
 /// Insert `lines` above the inline viewport, pushing them into the
 /// terminal's native scrollback. Cursor position is left where it was.
-pub fn insert_history_lines<B>(terminal: &mut Terminal<B>, lines: Vec<Line<'static>>) -> io::Result<()>
+///
+/// `wrap_width` is the column width the caller used to render the lines —
+/// must match the actual terminal width, since that's what natural terminal
+/// wrap respects when the printed cells scroll up into scrollback. On the
+/// first frame `terminal.viewport_area.width` is still `0` (set later by
+/// `set_viewport_area` inside `draw_tui`), so callers must source the width
+/// from `Backend::size()` rather than the viewport.
+pub fn insert_history_lines<B>(
+    terminal: &mut Terminal<B>,
+    lines: Vec<Line<'static>>,
+    wrap_width: u16,
+) -> io::Result<()>
 where
     B: Backend<Error = io::Error> + Write,
 {
@@ -51,7 +62,7 @@ where
     let last_cursor_pos = terminal.last_known_cursor_pos;
     let writer = terminal.backend_mut();
 
-    let wrap_width = area.width.max(1) as usize;
+    let wrap_width = wrap_width.max(1) as usize;
     let wrapped: Vec<Line<'static>> = lines
         .into_iter()
         .flat_map(|line| simple_wrap_line(line, wrap_width))

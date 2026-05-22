@@ -244,6 +244,7 @@ pub async fn run(
                 && let Err(err) = crate::insert_history::insert_history_lines(
                     &mut term.terminal,
                     reflow_lines,
+                    scroll_width,
                 )
             {
                 eprintln!("nav-tui: failed to insert reflowed history rows: {err:#}");
@@ -253,6 +254,7 @@ pub async fn run(
                 && let Err(err) = crate::insert_history::insert_history_lines(
                     &mut term.terminal,
                     pending,
+                    scroll_width,
                 )
             {
                 eprintln!("nav-tui: failed to insert pending history rows: {err:#}");
