@@ -1164,7 +1164,7 @@
         <code>crates/nav-tui/src/app/mod.rs</code> — function <code>run</code>.
       </aside>
 
-      <p class="drop">The TUI lays out three regions, top to bottom: a scrolling history of cells at the top, a composer in the middle, and a one-line status bar at the bottom.</p>
+      <p class="drop">The TUI runs against an <em>inline viewport</em>, not the alternate screen. Finalized chat history is written into the terminal's native scrollback above the viewport; the ratatui frame only paints the active streaming cell, the composer, and a one-line status bar. Wheel / PgUp / PgDn are handled by the terminal, not the app, so text selection and OS clipboard copy work the way they do in any other shell session.</p>
 
       <div class="full tui">
         <div class="tui-bar">
@@ -1176,7 +1176,7 @@
 <div class="row"><span class="muted">  Type a prompt to begin. Slash commands:</span></div>
 <div class="row"><span class="muted">    /quit, /exit      exit</span></div>
 <div class="row"><span class="muted">    /clear     start a new transcript</span></div>
-<div class="row"><span class="muted">    /sessions  shown in popup, not wired yet</span></div>
+<div class="row"><span class="muted">    /sessions, /resume  list and resume prior sessions</span></div>
 <div class="row"> </div>
 <div class="row"><span class="glyph-user">›</span> what does this repo do?</div>
 <div class="row"> </div>
@@ -1191,10 +1191,11 @@
         </div>
       </div>
 
-      <p>The three regions, in code terms:</p>
+      <p>The pieces, in code terms:</p>
 
       <ul>
-        <li><strong>Scrollback</strong> — <code>ChatWidget</code> in <code>widget.rs</code>. A <code>Vec&lt;Box&lt;dyn HistoryCell&gt;&gt;</code> painted top to bottom.</li>
+        <li><strong>Scrollback</strong> — owned by the terminal. <code>ChatWidget</code> in <code>widget.rs</code> keeps a ledger of finalized cells (<code>Vec&lt;Box&lt;dyn HistoryCell&gt;&gt;</code>) so a resize can re-render the tail at a new width; the main loop drains new cells each tick and pushes their rendered lines into native scrollback via <code>insert_history::insert_history_lines</code> (DECSTBM scroll region + reverse linefeed).</li>
+        <li><strong>Streaming row</strong> — an in-flight <code>AssistantMessageCell</code> lives inside the ratatui frame so deltas paint immediately; when <code>AssistantMessageDone</code> arrives it joins the ledger and gets pushed to scrollback like everything else.</li>
         <li><strong>Composer</strong> — <code>BottomPane</code> in <code>bottom_pane/mod.rs</code>. Owns a <code>Composer</code> and an optional overlay for slash commands, file mentions, approvals, or session picking.</li>
         <li><strong>Status bar</strong> — <code>StatusBar</code> in <code>app/status_bar.rs</code>. One row: model · cwd · branch · <em>Ready</em> or <em>Working 4s</em>.</li>
       </ul>
@@ -1229,7 +1230,8 @@
         <div class="row"><div class="who">ToolCallStarted</div><div class="what"><code>ToolCallCell</code>, gutter glyph <span style="color:var(--g-tool);font-weight:700">•</span>, yellow. Shows <code>name {json args}</code>.</div></div>
         <div class="row"><div class="who">ToolCallOutput</div><div class="what"><code>ToolOutputCell</code>, gutter glyph <code>└</code>, dim grey (red if <code>is_error</code>).</div></div>
         <div class="row"><div class="who">Error</div><div class="what"><code>ErrorCell</code>, red.</div></div>
-        <div class="row"><div class="who">AssistantMessageDelta / TurnComplete</div><div class="what">Ignored by the widget today. The final assistant text appears on <code>AssistantMessageDone</code>; <code>TurnComplete</code> flips the status bar.</div></div>
+        <div class="row"><div class="who">AssistantMessageDelta</div><div class="what">Appended to the in-flight <code>AssistantMessageCell</code> in the viewport so the user sees text grow as it streams. <code>AssistantMessageDone</code> finalizes the cell and pushes it to scrollback.</div></div>
+        <div class="row"><div class="who">TurnComplete</div><div class="what">Flips the status bar back to <em>Ready</em> and (if the turn produced any work) appends a <code>TurnSeparatorCell</code> with token usage.</div></div>
       </div>
     </section>
 
@@ -1245,9 +1247,9 @@
         <code>crates/nav-tui/src/streaming.rs</code>.
       </aside>
 
-      <p class="drop">Models stream text. Important current-state note: <code>ChatWidget</code> currently ignores <code>AssistantMessageDelta</code>, so the TUI shows the final assistant message when <code>AssistantMessageDone</code> arrives. <code>StreamController</code> is the helper that keeps live text stable once those deltas are wired into a live assistant cell.</p>
+      <p class="drop">Models stream text. <code>ChatWidget</code> opens an <code>AssistantMessageCell::streaming()</code> on the first <code>AssistantMessageDelta</code> and keeps appending; the cell is painted inside the inline viewport so the user watches the reply grow in place. <code>AssistantMessageDone</code> finalizes the cell and pushes it to scrollback.</p>
 
-      <p>If a frontend feeds deltas into <code>AssistantMessageCell::streaming()</code>, simply appending every delta and re-rendering the whole thing each frame would be readable but jumpy: a half-written table row reflows as cells widen, code fences appear before their closing backticks, and so on.</p>
+      <p>Just appending every delta and re-rendering would be readable but jumpy: a half-written table row reflows as cells widen, code fences appear before their closing backticks, and so on. <code>StreamController</code> is the helper that keeps the live text stable.</p>
 
       <p><code>StreamController</code> solves that with one rule:</p>
 
@@ -1286,7 +1288,7 @@
 
       <h3>Overlays: who sees the key first</h3>
 
-      <p>The <code>BottomPane</code> can host an overlay on top of the composer. Today there's exactly one (<code>SlashCommandPopup</code>), but the routing is general:</p>
+      <p>The <code>BottomPane</code> can host one overlay on top of the composer. Today the routing serves several: <code>SlashCommandPopup</code> (built-in commands, skills, prompt templates), <code>MentionPopup</code> (workspace file fuzzy-match on <code>@</code>), <code>SessionPicker</code> (from <code>/resume</code> with no args), and approval prompts (from tool-call <code>RequestApproval</code> events):</p>
 
       <pre data-lang="rust"><span class="kw">fn</span> <span class="fn">handle_key</span>(&<span class="kw">mut self</span>, key) {
     <span class="kw">if let</span> Some(view) = <span class="kw">self</span>.view.as_mut() {
@@ -1298,7 +1300,7 @@
     <span class="kw">self</span>.composer.handle_key(key)
 }</pre>
 
-      <p>The popup auto-opens when the buffer starts with <code>/</code> and has one line, and auto-closes when that's no longer true. Today <code>/quit</code> (and its alias <code>/exit</code>) and <code>/clear</code> are the commands wired up in <code>run()</code>. The popup also lists <code>/help</code>, <code>/resume</code>, and <code>/sessions</code> as placeholders; <kbd>Tab</kbd> only completes the selected command, while <kbd>Enter</kbd> completes the selected command and submits it in the same keypress. <code>slash_popup_suppressed</code> remembers "the user just hit Esc to dismiss me; don't pop back open on the next keystroke."</p>
+      <p>The popup auto-opens when the buffer starts with <code>/</code> and has one line, and auto-closes when that's no longer true. The built-in entries (<code>/help</code>, <code>/clear</code>, <code>/quit</code> + alias <code>/exit</code>, <code>/resume</code>, <code>/sessions</code>, plus session-tree, label, export, context, fork, rewind, handoff, and git-checkpoint commands) come from <code>BUILTIN_SLASH_COMMANDS</code> in <code>slash_popup.rs</code>; <code>build_slash_entries_with_extensions</code> appends discovered skills and prompt templates. <kbd>Tab</kbd> only completes the selected command, while <kbd>Enter</kbd> completes the selected command and submits it in the same keypress. <code>slash_popup_suppressed</code> remembers "the user just hit Esc to dismiss me; don't pop back open on the next keystroke."</p>
     </section>
 
     <!-- 12 ─────────────────────────────────────────── -->

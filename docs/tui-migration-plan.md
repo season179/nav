@@ -14,7 +14,7 @@ Codex reference paths below are anchored at
 |---|---|---|
 | 1 — Foundation: inline viewport + scrollback insertion | **done** | Modules landed; wiring complete; tests green |
 | 2 — Synchronized updates | **done** | BeginSynchronizedUpdate / EndSynchronizedUpdate brackets the drain + draw block |
-| 3 — Resize reflow + re-insert | **done (basic)** | Re-emit-everything on resize; codex's debounce + row cap NOT ported |
+| 3 — Resize reflow + re-insert | **done** | Width-change-guarded coalescing (drag-resize collapses to one reflow per draw cycle) + tail cap at `screen_h` via `reflow_tail_lines`; SIGWINCH debounce not adopted |
 | 4 — Streaming pipeline | **n/a** | Nav already streams into viewport, not scrollback — codex's commit-tick / table-holdback machinery doesn't apply |
 | 5 — Composer / textarea | **deferred** | Independent project; nav's composer works on new substrate; would lose recent word-wrap improvements |
 | 6 — Diff render + palette | **deferred** | codex's diff_render.rs is 92KB; orthogonal polish, not architectural |
@@ -42,8 +42,10 @@ Concrete code in tree:
   screen.
 - `crates/nav-tui/src/widget.rs` — finalized cells live in a ledger
   (`finalized: Vec<Box<dyn HistoryCell>>`); `drain_pending` returns lines
-  to push into scrollback; `reflow_all_lines` re-renders everything on
-  resize; viewport `render` only paints the in-flight streaming cell.
+  to push into scrollback; `reflow_tail_lines` re-renders the most recent
+  cells (capped at `screen_h`) on resize, since older rows already sit in
+  the terminal's scrollback at the previous width and we can't reach in;
+  viewport `render` only paints the in-flight streaming cell.
 - `crates/nav-tui/src/input/mod.rs` — `handle_scrollback_key` deleted;
   scrollback navigation is owned by the terminal.
 - `crates/nav-tui/src/app/mod.rs` — main loop drains pending lines into

@@ -51,6 +51,20 @@ path, so verify the real local checkout before assuming one is absent.
   [docs/tui-architecture-migration.md](docs/tui-architecture-migration.md)
   and [docs/tui-migration-plan.md](docs/tui-migration-plan.md) for the
   decision record and what's still deferred.
+- TUI substrate gotchas worth knowing before editing the viewport plumbing:
+  - `terminal.viewport_area` is zero-sized until `draw_tui` calls
+    `set_viewport_area` for the first time. Anything that needs the column
+    width *before* the first frame (`insert_history_lines`, scrollback
+    wrap) must source it from `Backend::size()`, not the viewport.
+  - Resize reflow is bounded: `reflow_tail_lines` re-emits at most one
+    screen-height worth of recent cells. Older content already lives in
+    the terminal's scrollback at the previous width — the terminal owns
+    that buffer and we can't reach in, so a visible width seam at the
+    resize point is by design.
+  - Drag-resize fires `Event::Resize` per row. `app/mod.rs` collapses runs
+    with a width-change guard (`last_reflow_width` + `pending_reflow_width`);
+    same-width events are no-ops so a vertical drag never re-emits the
+    transcript.
 - `rg` must be on `PATH`; `code_search` shells out to it even though
   `Cargo.toml` does not mention it.
 - `nav update` / `nav upgrade` reinstalls from compile-time
