@@ -42,7 +42,10 @@ use crate::guardrails::AskForApproval;
     version
 )]
 pub struct Args {
-    /// Model to use.
+    /// Model to use. Accepts either a bare name (`gpt-5.5`) or a fully
+    /// qualified `<provider>/<model>` selector (`z.ai/glm-5.1`). The provider
+    /// resolver matches bare names against the merged providers catalog;
+    /// ambiguous bare names error out and ask for a qualified selector.
     #[arg(default_value = "gpt-5.5", long)]
     pub model: String,
 

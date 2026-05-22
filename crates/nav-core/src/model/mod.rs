@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent_loop::AgentEvent;
 
-pub use auth::{AuthConfig, load_auth};
+pub use auth::{AuthConfig, ResolvedProvider, load_auth, resolve_provider};
 pub use names::did_you_mean;
 pub use responses::types::ResponseEnvelope;
 pub use responses::{

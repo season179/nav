@@ -1,7 +1,10 @@
 use crate::cli::{Args, AuthMode};
-use anyhow::{Context, Result, bail};
+use crate::context::{ReasoningEffort, Settings};
+use crate::model::resolve_value::resolve_value;
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::{env, fmt, fs, path::PathBuf};
 
 // the rest of the code only needs two facts after auth is resolved:
@@ -98,6 +101,224 @@ pub fn load_auth(args: &Args) -> Result<AuthConfig> {
             })
         }
     }
+}
+
+/// A provider + model entry resolved from the merged providers catalog.
+///
+/// Produced by [`resolve_provider`] for the api-key auth path. Today nothing
+/// outside the resolver and its tests consumes this type — G9 will migrate
+/// [`load_auth`]'s api-key branch to consult the catalog through
+/// [`resolve_provider`] and replace `AuthConfig`'s api-key half. The
+/// Codex/ChatGPT login flow in [`load_auth`] does not, and will not, go
+/// through the catalog.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedProvider {
+    /// OpenAI-compatible API base URL (e.g. `https://api.z.ai/v1`).
+    pub base_url: String,
+    /// Bearer token resolved from `api_key`. `None` only when `api_key` was
+    /// omitted from the provider config entirely (e.g. a local Ollama).
+    /// A configured-but-empty resolution is rejected by [`resolve_provider`].
+    pub bearer: Option<String>,
+    /// Extra HTTP headers from the provider config, each value already
+    /// resolved through [`resolve_value`].
+    pub headers: BTreeMap<String, String>,
+    /// Wire model name sent to the provider. Defaults to the model key when
+    /// `model_id` is omitted in the config.
+    pub model_id: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub max_output_tokens: Option<u32>,
+    /// Human-readable label of the form `"<provider_name>/<model_key>"`
+    /// (e.g. `Z.AI/glm-5.1`), used for `/model` display.
+    pub display_name: String,
+}
+
+// Manual Debug mirrors [`AuthConfig`]: redact the bearer so a stray
+// `tracing::debug!` or an `assert_eq!` panic message in a future test does
+// not dump the API key into logs or CI artifacts.
+impl fmt::Debug for ResolvedProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedProvider")
+            .field("base_url", &self.base_url)
+            .field(
+                "bearer",
+                &self.bearer.as_ref().map(|_| "Bearer[REDACTED]"),
+            )
+            .field("headers", &self.headers)
+            .field("model_id", &self.model_id)
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("display_name", &self.display_name)
+            .finish()
+    }
+}
+
+/// Resolve a model selector against the providers catalog in `settings`.
+///
+/// The selector follows these rules in order:
+///
+/// 1. If `selector` is `None`, fall back to `settings.default_model`.
+/// 2. If the selector contains `/`, it is treated as a fully qualified
+///    `<provider>/<model>` and looked up exactly. Both halves must be
+///    non-empty; model keys may themselves contain further `/`s (e.g.
+///    `openrouter/anthropic/claude-3-5-sonnet`) — only the first `/` splits.
+/// 3. Otherwise the selector is matched against every model key in the
+///    catalog; exactly one match wins, multiple matches return an error
+///    listing the candidates, zero matches is an error.
+///
+/// The Codex/ChatGPT auth mode does not use this resolver — [`load_auth`]
+/// handles it directly and bypasses the catalog.
+///
+/// Note for G9: `--model` has a clap default of `"gpt-5.5"`, so callers must
+/// decide explicitly whether to pass `Some(&args.model)` or `None` — the
+/// resolver itself cannot distinguish "user typed `gpt-5.5`" from "user
+/// omitted `--model`". The wiring layer that runs `apply_settings` is the
+/// natural place to make that call.
+pub fn resolve_provider(
+    selector: Option<&str>,
+    settings: &Settings,
+) -> Result<ResolvedProvider> {
+    let selector = selector.or(settings.default_model.as_deref()).context(
+        "no model specified and no `default_model` in settings.json. Pass `--model <provider>/<model>` \
+         or set `default_model` in `.nav/settings.json`. Run `nav providers list` to see the catalog.",
+    )?;
+
+    let catalog = settings.providers.as_ref().ok_or_else(|| {
+        anyhow!(
+            "no `providers` catalog configured. Add one to `.nav/settings.json` or run \
+             `nav providers list` for guidance."
+        )
+    })?;
+
+    let (provider_id, model_key) = if let Some((p, m)) = selector.split_once('/') {
+        // Reject empty halves so `"foo/"`, `"/bar"`, `"/"` produce a clear
+        // syntax error instead of `provider `` not found` with empty backticks.
+        if p.is_empty() || m.is_empty() {
+            bail!(
+                "model selector `{selector}` is malformed — expected `<provider>/<model>` with non-empty halves."
+            );
+        }
+        let provider = catalog.get(p).ok_or_else(|| {
+            anyhow!(
+                "provider `{p}` not found in catalog. Run `nav providers list` to see configured providers."
+            )
+        })?;
+        if !provider.models.contains_key(m) {
+            bail!(
+                "model `{m}` not found under provider `{p}`. Run `nav providers list` to see configured providers."
+            );
+        }
+        (p.to_string(), m.to_string())
+    } else {
+        let mut matches: Vec<(String, String)> = Vec::new();
+        for (provider_id, provider) in catalog {
+            if provider.models.contains_key(selector) {
+                matches.push((provider_id.clone(), selector.to_string()));
+            }
+        }
+        match matches.len() {
+            0 => bail!(
+                "model `{selector}` not found in any provider. Pass a fully qualified \
+                 `<provider>/<model>` selector or run `nav providers list` to see configured providers."
+            ),
+            1 => matches.into_iter().next().expect("len==1 has one element"),
+            _ => {
+                let candidates = matches
+                    .iter()
+                    .map(|(p, m)| format!("{p}/{m}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "model `{selector}` is ambiguous — matches: {candidates}. \
+                     Pass a fully qualified `<provider>/<model>` selector to disambiguate."
+                );
+            }
+        }
+    };
+
+    let provider = catalog
+        .get(&provider_id)
+        .expect("provider_id was validated above");
+    let model = provider
+        .models
+        .get(&model_key)
+        .expect("model_key was validated above");
+
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!(
+                "provider `{provider_id}` has no `base_url`. Built-in providers ship in a later \
+                 release; set `base_url` explicitly in `.nav/settings.json` for now."
+            )
+        })?
+        .to_string();
+
+    // api_key resolution: a configured key that resolves empty is a hard
+    // error, not a silent fallback to "no auth". This keeps misconfiguration
+    // (unset env var, blank literal) audible at startup instead of producing
+    // a 401 with no breadcrumb.
+    let bearer = match provider.api_key.as_deref() {
+        Some(api_key) => {
+            let resolved = resolve_value(api_key).with_context(|| {
+                format!("failed to resolve `api_key` for provider `{provider_id}`")
+            })?;
+            match resolved {
+                Some(value) if !value.is_empty() => Some(value),
+                _ => bail!(
+                    "`api_key` for provider `{provider_id}` resolved to an empty value — \
+                     check the env var or literal in `.nav/settings.json`."
+                ),
+            }
+        }
+        None => None,
+    };
+
+    let mut headers = BTreeMap::new();
+    if let Some(provider_headers) = provider.headers.as_ref() {
+        for (name, value) in provider_headers {
+            let resolved = resolve_value(value).with_context(|| {
+                format!("failed to resolve header `{name}` for provider `{provider_id}`")
+            })?;
+            let value = match resolved {
+                Some(v) if !v.is_empty() => v,
+                _ => bail!(
+                    "header `{name}` for provider `{provider_id}` resolved to an empty value"
+                ),
+            };
+            headers.insert(name.clone(), value);
+        }
+    }
+
+    let model_id = model.model_id.clone().unwrap_or_else(|| model_key.clone());
+
+    let provider_name = provider.name.as_deref().unwrap_or(&provider_id);
+    let display_name = format!("{provider_name}/{model_key}");
+
+    // u64 → u32: bail on overflow so a settings.json typo
+    // (`max_output_tokens: 50000000000`) surfaces at startup instead of being
+    // silently clamped to ~4.29B and reaching the provider as a bogus value.
+    let max_output_tokens = match model.max_output_tokens {
+        Some(n) => Some(u32::try_from(n).map_err(|_| {
+            anyhow!(
+                "`max_output_tokens` for `{provider_id}/{model_key}` is {n}, which exceeds the \
+                 32-bit limit ({}); use a smaller value.",
+                u32::MAX
+            )
+        })?),
+        None => None,
+    };
+
+    Ok(ResolvedProvider {
+        base_url,
+        bearer,
+        headers,
+        model_id,
+        reasoning_effort: model.reasoning_effort,
+        max_output_tokens,
+        display_name,
+    })
 }
 
 pub fn default_headers(auth: &AuthConfig) -> Result<HeaderMap> {
@@ -262,5 +483,380 @@ mod tests {
         assert!(debug.contains("wss://x.com"));
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("super-secret"));
+    }
+
+    // ── resolve_provider ──────────────────────────────────────────
+
+    use crate::context::{ModelConfig, ProviderConfig, ReasoningEffort, Settings};
+
+    /// Build a minimal settings catalog with two providers, used across the
+    /// resolver tests. `glm-5.1` lives under both `z.ai` and `acme` to give
+    /// the bare-name disambiguation test a real ambiguity.
+    fn settings_with_catalog() -> Settings {
+        let mut z_models = BTreeMap::new();
+        z_models.insert(
+            "glm-5.1".to_string(),
+            ModelConfig {
+                model_id: Some("glm-5.1".to_string()),
+                reasoning_effort: Some(ReasoningEffort::High),
+                max_output_tokens: Some(16384),
+            },
+        );
+        z_models.insert(
+            "glm-4-air".to_string(),
+            ModelConfig {
+                model_id: None,
+                reasoning_effort: None,
+                max_output_tokens: None,
+            },
+        );
+        let z_provider = ProviderConfig {
+            name: Some("Z.AI".to_string()),
+            base_url: Some("https://api.z.ai/v1".to_string()),
+            api_key: Some("sk-zai-literal".to_string()),
+            headers: None,
+            models: z_models,
+        };
+
+        let mut acme_models = BTreeMap::new();
+        acme_models.insert(
+            "glm-5.1".to_string(),
+            ModelConfig::default(),
+        );
+        acme_models.insert("only-here".to_string(), ModelConfig::default());
+        let acme_provider = ProviderConfig {
+            name: None,
+            base_url: Some("https://api.acme.example/v1".to_string()),
+            api_key: None,
+            headers: None,
+            models: acme_models,
+        };
+
+        let mut catalog = BTreeMap::new();
+        catalog.insert("z.ai".to_string(), z_provider);
+        catalog.insert("acme".to_string(), acme_provider);
+
+        Settings {
+            providers: Some(catalog),
+            default_model: Some("z.ai/glm-5.1".to_string()),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn qualified_selector_resolves_provider_and_model() {
+        let settings = settings_with_catalog();
+        let resolved = resolve_provider(Some("z.ai/glm-5.1"), &settings).unwrap();
+        assert_eq!(resolved.base_url, "https://api.z.ai/v1");
+        assert_eq!(resolved.bearer.as_deref(), Some("sk-zai-literal"));
+        assert_eq!(resolved.model_id, "glm-5.1");
+        assert_eq!(resolved.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(resolved.max_output_tokens, Some(16384));
+        assert_eq!(resolved.display_name, "Z.AI/glm-5.1");
+        assert!(resolved.headers.is_empty());
+    }
+
+    #[test]
+    fn bare_selector_resolves_when_unambiguous() {
+        let settings = settings_with_catalog();
+        let resolved = resolve_provider(Some("only-here"), &settings).unwrap();
+        assert_eq!(resolved.model_id, "only-here");
+        // `acme` has no `name` so display falls back to the provider id.
+        assert_eq!(resolved.display_name, "acme/only-here");
+        // `acme` has no api_key so bearer is None.
+        assert_eq!(resolved.bearer, None);
+    }
+
+    #[test]
+    fn bare_selector_errors_when_ambiguous_and_lists_candidates() {
+        let settings = settings_with_catalog();
+        let err = resolve_provider(Some("glm-5.1"), &settings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ambiguous"), "expected ambiguity error: {msg}");
+        assert!(msg.contains("z.ai/glm-5.1"), "candidate missing: {msg}");
+        assert!(msg.contains("acme/glm-5.1"), "candidate missing: {msg}");
+    }
+
+    #[test]
+    fn missing_provider_returns_actionable_error() {
+        let settings = settings_with_catalog();
+        let err = resolve_provider(Some("nonesuch/anything"), &settings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`nonesuch`"), "provider id in error: {msg}");
+        assert!(msg.contains("nav providers list"), "pointer to G7: {msg}");
+    }
+
+    #[test]
+    fn missing_model_under_known_provider_errors() {
+        let settings = settings_with_catalog();
+        let err = resolve_provider(Some("z.ai/no-such-model"), &settings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`no-such-model`"), "model name in error: {msg}");
+        assert!(msg.contains("`z.ai`"), "provider name in error: {msg}");
+    }
+
+    #[test]
+    fn unknown_bare_model_returns_error() {
+        let settings = settings_with_catalog();
+        let err = resolve_provider(Some("not-a-model"), &settings).unwrap_err();
+        assert!(err.to_string().contains("not-a-model"));
+    }
+
+    #[test]
+    fn omitted_selector_falls_back_to_default_model() {
+        let settings = settings_with_catalog();
+        let resolved = resolve_provider(None, &settings).unwrap();
+        // default_model is "z.ai/glm-5.1" in the fixture.
+        assert_eq!(resolved.display_name, "Z.AI/glm-5.1");
+        assert_eq!(resolved.model_id, "glm-5.1");
+    }
+
+    #[test]
+    fn no_selector_and_no_default_errors() {
+        let mut settings = settings_with_catalog();
+        settings.default_model = None;
+        let err = resolve_provider(None, &settings).unwrap_err();
+        assert!(err.to_string().contains("default_model"));
+    }
+
+    #[test]
+    fn empty_catalog_errors_with_pointer_to_providers_list() {
+        let settings = Settings::default();
+        let err = resolve_provider(Some("z.ai/glm-5.1"), &settings).unwrap_err();
+        assert!(err.to_string().contains("providers"));
+    }
+
+    #[test]
+    fn model_id_defaults_to_key_when_omitted() {
+        let settings = settings_with_catalog();
+        // `glm-4-air` has no explicit `model_id`.
+        let resolved = resolve_provider(Some("z.ai/glm-4-air"), &settings).unwrap();
+        assert_eq!(resolved.model_id, "glm-4-air");
+        // No reasoning_effort / max_output_tokens configured.
+        assert_eq!(resolved.reasoning_effort, None);
+        assert_eq!(resolved.max_output_tokens, None);
+    }
+
+    #[test]
+    fn missing_base_url_errors() {
+        let mut settings = settings_with_catalog();
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .get_mut("z.ai")
+            .unwrap()
+            .base_url = None;
+        let err = resolve_provider(Some("z.ai/glm-5.1"), &settings).unwrap_err();
+        assert!(err.to_string().contains("base_url"));
+    }
+
+    #[test]
+    fn provider_headers_resolve_via_resolve_value() {
+        let mut settings = settings_with_catalog();
+        let mut headers = BTreeMap::new();
+        // A literal header that round-trips unchanged through resolve_value.
+        headers.insert("X-Custom".to_string(), "static-value".to_string());
+        // A shell-command header — `!echo …` is deterministic enough for a
+        // single-process test and exercises the G3 path end-to-end.
+        headers.insert(
+            "X-Computed".to_string(),
+            "!echo computed-header".to_string(),
+        );
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .get_mut("z.ai")
+            .unwrap()
+            .headers = Some(headers);
+
+        let resolved = resolve_provider(Some("z.ai/glm-5.1"), &settings).unwrap();
+        assert_eq!(resolved.headers["X-Custom"], "static-value");
+        assert_eq!(resolved.headers["X-Computed"], "computed-header");
+    }
+
+    /// Codex auth mode bypasses the providers catalog because [`load_auth`]
+    /// takes no `Settings` parameter at all — the signature itself is the
+    /// invariant. The actual ChatGPT-auth.json reading is covered by the
+    /// `chatgpt_*` tests above; here we just confirm that the new resolver
+    /// did not change `load_auth`'s shape.
+    #[test]
+    fn codex_auth_mode_signature_is_settings_free() {
+        // Compile-time check: load_auth's only argument is `&Args`. If a
+        // future refactor adds a `&Settings` parameter, this binding stops
+        // compiling and the reviewer has to decide whether to wire Codex
+        // auth through the catalog (which the issue explicitly forbids).
+        let _: fn(&Args) -> Result<AuthConfig> = load_auth;
+    }
+
+    // ── api_key resolution: configured-but-empty is a hard error ─
+
+    #[test]
+    fn empty_literal_api_key_errors_instead_of_silently_anonymous() {
+        let mut settings = settings_with_catalog();
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .get_mut("z.ai")
+            .unwrap()
+            .api_key = Some(String::new());
+        let err = resolve_provider(Some("z.ai/glm-5.1"), &settings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`api_key`"), "msg: {msg}");
+        assert!(msg.contains("empty"), "msg: {msg}");
+    }
+
+    #[test]
+    fn omitted_api_key_yields_none_bearer() {
+        // `acme` has api_key: None — bearer should be None, NOT an error.
+        let settings = settings_with_catalog();
+        let resolved = resolve_provider(Some("acme/only-here"), &settings).unwrap();
+        assert_eq!(resolved.bearer, None);
+    }
+
+    // ── headers: empty literal is also rejected ──────────────────
+
+    #[test]
+    fn empty_literal_header_value_errors() {
+        let mut settings = settings_with_catalog();
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Org".to_string(), String::new());
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .get_mut("z.ai")
+            .unwrap()
+            .headers = Some(headers);
+        let err = resolve_provider(Some("z.ai/glm-5.1"), &settings).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`X-Org`"), "header name in error: {msg}");
+        assert!(msg.contains("empty"), "empty marker in error: {msg}");
+    }
+
+    // ── max_output_tokens overflow is loud, not silent ───────────
+
+    #[test]
+    fn max_output_tokens_overflowing_u32_errors() {
+        let mut settings = settings_with_catalog();
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .get_mut("z.ai")
+            .unwrap()
+            .models
+            .get_mut("glm-5.1")
+            .unwrap()
+            .max_output_tokens = Some(u64::from(u32::MAX) + 1);
+        let err = resolve_provider(Some("z.ai/glm-5.1"), &settings).unwrap_err();
+        assert!(err.to_string().contains("max_output_tokens"));
+    }
+
+    // ── selector syntax: empty halves rejected, multi-slash allowed ──
+
+    #[test]
+    fn empty_provider_half_errors() {
+        let settings = settings_with_catalog();
+        let err = resolve_provider(Some("/glm-5.1"), &settings).unwrap_err();
+        assert!(err.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn empty_model_half_errors() {
+        let settings = settings_with_catalog();
+        let err = resolve_provider(Some("z.ai/"), &settings).unwrap_err();
+        assert!(err.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn solo_slash_errors() {
+        let settings = settings_with_catalog();
+        let err = resolve_provider(Some("/"), &settings).unwrap_err();
+        assert!(err.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn multi_slash_model_key_is_allowed_for_openrouter_style_ids() {
+        // Real-world providers (OpenRouter, etc.) use `<vendor>/<model>` as
+        // the wire model id. The catalog can store that as the model key
+        // under a single provider, so `openrouter/anthropic/claude-3-5`
+        // splits on the FIRST `/` only.
+        let mut models = BTreeMap::new();
+        models.insert("anthropic/claude-3-5".to_string(), ModelConfig::default());
+        let provider = ProviderConfig {
+            name: None,
+            base_url: Some("https://openrouter.ai/api/v1".to_string()),
+            api_key: Some("sk-or-literal".to_string()),
+            headers: None,
+            models,
+        };
+        let mut catalog = BTreeMap::new();
+        catalog.insert("openrouter".to_string(), provider);
+        let settings = Settings {
+            providers: Some(catalog),
+            ..Settings::default()
+        };
+        let resolved =
+            resolve_provider(Some("openrouter/anthropic/claude-3-5"), &settings).unwrap();
+        assert_eq!(resolved.model_id, "anthropic/claude-3-5");
+    }
+
+    // ── error propagation: resolve_value failures carry provider context ──
+
+    #[test]
+    fn shell_command_failure_in_api_key_propagates_provider_context() {
+        let mut settings = settings_with_catalog();
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .get_mut("z.ai")
+            .unwrap()
+            .api_key = Some("!false".to_string());
+        let err = resolve_provider(Some("z.ai/glm-5.1"), &settings).unwrap_err();
+        // The `with_context` wrapping must mention which provider failed.
+        let chain = format!("{err:#}");
+        assert!(chain.contains("`z.ai`"), "chain: {chain}");
+        assert!(chain.contains("api_key"), "chain: {chain}");
+    }
+
+    // ── Debug redaction ──────────────────────────────────────────
+
+    #[test]
+    fn resolved_provider_debug_redacts_bearer() {
+        let resolved = ResolvedProvider {
+            base_url: "https://api.z.ai/v1".to_string(),
+            bearer: Some("super-secret-token".to_string()),
+            headers: BTreeMap::new(),
+            model_id: "glm-5.1".to_string(),
+            reasoning_effort: None,
+            max_output_tokens: None,
+            display_name: "Z.AI/glm-5.1".to_string(),
+        };
+        let dbg = format!("{resolved:?}");
+        assert!(!dbg.contains("super-secret-token"), "bearer leaked: {dbg}");
+        assert!(dbg.contains("REDACTED"), "redaction marker missing: {dbg}");
+        // Non-secret fields should still render.
+        assert!(dbg.contains("https://api.z.ai/v1"));
+        assert!(dbg.contains("glm-5.1"));
+    }
+
+    #[test]
+    fn resolved_provider_debug_with_no_bearer_shows_none() {
+        let resolved = ResolvedProvider {
+            base_url: "http://localhost:11434/v1".to_string(),
+            bearer: None,
+            headers: BTreeMap::new(),
+            model_id: "llama3".to_string(),
+            reasoning_effort: None,
+            max_output_tokens: None,
+            display_name: "ollama/llama3".to_string(),
+        };
+        let dbg = format!("{resolved:?}");
+        assert!(dbg.contains("None"), "expected None for absent bearer: {dbg}");
+        assert!(!dbg.contains("REDACTED"));
     }
 }

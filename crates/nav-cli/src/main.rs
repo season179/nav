@@ -60,7 +60,12 @@ async fn main() -> Result<()> {
         return run_cli_command(&args, &cwd, project.as_ref(), extensions.as_ref(), command);
     }
 
-    if !names::is_known_model_prefix(&args.model) {
+    // The known-family-prefix check is scoped to bare OpenAI-style names;
+    // a `<provider>/<model>` selector is opaque to it (e.g. `z.ai/glm-5.1`
+    // doesn't start with any OpenAI prefix and would always warn). Skip the
+    // check for qualified selectors so the new providers catalog flow is
+    // quiet by default.
+    if !args.model.contains('/') && !names::is_known_model_prefix(&args.model) {
         // Warn (not error) — a brand-new model the provider supports but
         // nav's prefix list hasn't learned about yet should still work.
         let hint = names::did_you_mean(&args.model)
