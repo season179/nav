@@ -1,0 +1,18 @@
+---
+source: crates/nav-core/src/model/chat_completions/request.rs
+expression: snap_body(&body)
+---
+{
+  "messages": [
+    {
+      "content": "You are a small coding agent running in /tmp/project.\n\nGuidelines:\n- Use tools to inspect, edit, search, and verify code.\n- Prefer small, explicit steps.\n- Keep responses concise.\n- Explain technical details in plain, layman's terms.\n- Show file paths clearly when working with files.\n- Paths must be relative.",
+      "role": "system"
+    },
+    {
+      "content": "hello",
+      "role": "user"
+    }
+  ],
+  "model": "glm-5.1",
+  "stream": true
+}
