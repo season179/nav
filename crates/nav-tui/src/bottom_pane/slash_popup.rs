@@ -22,6 +22,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[&str] = &[
     "/name",
     "/export",
     "/context",
+    "/model",
     "/fork",
     "/tree",
     "/label",
@@ -78,6 +79,7 @@ fn builtin_description(command: &str) -> Option<&'static str> {
         "/checkpoint" => Some("save reversible git checkpoint"),
         "/stash" => Some("stash current git changes"),
         "/restore" => Some("restore a nav git checkpoint"),
+        "/model" => Some("list or set model (restart to apply)"),
         _ => None,
     }
 }

@@ -98,6 +98,16 @@ async fn main() -> Result<()> {
             // input array — relative attachment paths in stored events were
             // workspace-relative to *that* cwd, not the resumed process's.
             let session_cwd = store.session_cwd(id)?;
+
+            // If the user didn't explicitly pass --model, pick up the
+            // session's stored model so `/model` changes persist across
+            // restarts when resuming.
+            if !provided.was_provided("model") {
+                if let Some(summary) = store.session_summary(id)? {
+                    args.model = summary.model;
+                }
+            }
+
             (
                 id.to_string(),
                 Some(rebuild_responses_input(&events, &session_cwd)),

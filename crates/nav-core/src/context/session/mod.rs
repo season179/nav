@@ -472,6 +472,22 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Updates the model selector stored on this session. The model takes
+    /// effect the next time the session is resumed (i.e. after restart).
+    pub fn set_session_model(&self, session_id: &str, model: &str) -> Result<()> {
+        let trimmed = model.trim();
+        anyhow::ensure!(!trimmed.is_empty(), "model selector cannot be empty");
+        let conn = self.lock();
+        let updated = conn.execute(
+            "UPDATE session SET model = ?1, updated_at = ?2 WHERE id = ?3",
+            params![trimmed, now_secs(), session_id],
+        )?;
+        if updated == 0 {
+            anyhow::bail!("session not found: {session_id}");
+        }
+        Ok(())
+    }
+
     /// Persists a durable event to the session log and bumps `updated_at`.
     /// `AssistantMessageDelta` is intentionally dropped — it is a stream-only
     /// concern. When the event is a `TurnComplete`, the session's

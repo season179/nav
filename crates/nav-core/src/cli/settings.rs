@@ -18,7 +18,7 @@ use super::Args;
 pub struct ProvidedArgs(HashSet<String>);
 
 impl ProvidedArgs {
-    fn was_provided(&self, name: &str) -> bool {
+    pub fn was_provided(&self, name: &str) -> bool {
         self.0.contains(name)
     }
 }
