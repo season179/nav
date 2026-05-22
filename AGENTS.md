@@ -56,15 +56,20 @@ path, so verify the real local checkout before assuming one is absent.
     `set_viewport_area` for the first time. Anything that needs the column
     width *before* the first frame (`insert_history_lines`, scrollback
     wrap) must source it from `Backend::size()`, not the viewport.
-  - Resize reflow is bounded: `reflow_tail_lines` re-emits at most one
-    screen-height worth of recent cells. Older content already lives in
-    the terminal's scrollback at the previous width — the terminal owns
-    that buffer and we can't reach in, so a visible width seam at the
-    resize point is by design.
-  - Drag-resize fires `Event::Resize` per row. `app/mod.rs` collapses runs
-    with a width-change guard (`last_reflow_width` + `pending_reflow_width`);
-    same-width events are no-ops so a vertical drag never re-emits the
-    transcript.
+  - The viewport is sticky-top, not bottom-anchored. `draw_tui` preserves
+    `viewport_area.top()` so the first frame anchors at the shell-prompt
+    row instead of slamming to the bottom of the screen and snapshotting
+    the empty rows below into scrollback. When the viewport grows and would
+    overflow the screen floor, the rows directly above it are pushed into
+    native scrollback first (via
+    `insert_history::scroll_region_above_into_scrollback`) — without that,
+    streaming-expansion overwrites the user-prompt row.
+  - On resize, nav does NOT re-emit cells into scrollback. The terminal
+    handles re-wrapping its own scrollback at the new width. The previous
+    `reflow_tail_lines` mechanism produced a duplicate transcript because
+    re-emitted rows landed above identical old-width copies the terminal
+    had already kept. A visible width seam at the resize point is by
+    design.
 - `rg` must be on `PATH`; `code_search` shells out to it even though
   `Cargo.toml` does not mention it.
 - `nav update` / `nav upgrade` downloads the latest tarball from GitHub

@@ -246,6 +246,33 @@ where
     Ok(())
 }
 
+/// Push `rows` rows of the region `0..top` (0-based) into native scrollback.
+/// Used by `draw_tui` when the inline viewport expands upward — the rows that
+/// would otherwise be overwritten by the inline frame need to survive in the
+/// terminal's scrollback first.
+pub fn scroll_region_above_into_scrollback<B>(
+    terminal: &mut Terminal<B>,
+    top: u16,
+    rows: u16,
+) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + Write,
+{
+    if top == 0 || rows == 0 {
+        return Ok(());
+    }
+    let last_cursor_pos = terminal.last_known_cursor_pos;
+    let writer = terminal.backend_mut();
+    queue!(writer, SetScrollRegion(1..top))?;
+    queue!(writer, MoveTo(0, top.saturating_sub(1)))?;
+    for _ in 0..rows {
+        queue!(writer, Print("\r\n"))?;
+    }
+    queue!(writer, ResetScrollRegion)?;
+    queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SetScrollRegion(std::ops::Range<u16>);
 

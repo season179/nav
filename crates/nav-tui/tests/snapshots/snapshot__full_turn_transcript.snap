@@ -6,8 +6,6 @@ expression: rendered
 › list files in the repo
 
 
-• Running  shell {"command":["ls"]}
-
 • Ran  shell {"command":["ls"]}
   └ 2 lines, 14 chars
     Cargo.toml
