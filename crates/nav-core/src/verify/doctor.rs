@@ -316,7 +316,11 @@ fn credential_source(api_key: &str) -> (String, bool) {
 
 fn check_config(b: &mut DoctorBuilder, args: &Args, settings: &Settings) {
     let Some(ref catalog) = settings.providers else {
-        b.warn(DoctorGroup::Config, "providers", "no providers catalog configured");
+        b.warn(
+            DoctorGroup::Config,
+            "providers",
+            "no providers catalog configured",
+        );
         check_active_path(b, args, settings);
         return;
     };
@@ -960,20 +964,16 @@ mod tests {
     #[test]
     fn config_literal_api_key_shows_length() {
         let mut settings = settings_with_providers();
-        settings
-            .providers
-            .as_mut()
-            .unwrap()
-            .insert(
-                "custom".to_string(),
-                ProviderConfig {
-                    name: Some("Custom".to_string()),
-                    base_url: Some("https://api.custom.example/v1".to_string()),
-                    api_key: Some("sk-1234567890".to_string()),
-                    headers: None,
-                    models: BTreeMap::new(),
-                },
-            );
+        settings.providers.as_mut().unwrap().insert(
+            "custom".to_string(),
+            ProviderConfig {
+                name: Some("Custom".to_string()),
+                base_url: Some("https://api.custom.example/v1".to_string()),
+                api_key: Some("sk-1234567890".to_string()),
+                headers: None,
+                models: BTreeMap::new(),
+            },
+        );
         let mut b = DoctorBuilder::new();
         let args = Args::test_default();
         check_config(&mut b, &args, &settings);
@@ -993,20 +993,16 @@ mod tests {
     #[test]
     fn config_warns_on_unresolvable_shell_command() {
         let mut settings = settings_with_providers();
-        settings
-            .providers
-            .as_mut()
-            .unwrap()
-            .insert(
-                "shellprov".to_string(),
-                ProviderConfig {
-                    name: Some("ShellProv".to_string()),
-                    base_url: Some("https://api.shell.example/v1".to_string()),
-                    api_key: Some("!false".to_string()),
-                    headers: None,
-                    models: BTreeMap::new(),
-                },
-            );
+        settings.providers.as_mut().unwrap().insert(
+            "shellprov".to_string(),
+            ProviderConfig {
+                name: Some("ShellProv".to_string()),
+                base_url: Some("https://api.shell.example/v1".to_string()),
+                api_key: Some("!false".to_string()),
+                headers: None,
+                models: BTreeMap::new(),
+            },
+        );
         let mut b = DoctorBuilder::new();
         let args = Args::test_default();
         check_config(&mut b, &args, &settings);
@@ -1042,24 +1038,20 @@ mod tests {
     fn config_default_model_fail_when_provider_unresolvable() {
         let mut settings = settings_with_providers();
         // Point default_model at a provider with a failing shell command.
-        settings
-            .providers
-            .as_mut()
-            .unwrap()
-            .insert(
-                "broken".to_string(),
-                ProviderConfig {
-                    name: Some("Broken".to_string()),
-                    base_url: Some("https://api.broken.example/v1".to_string()),
-                    api_key: Some("!false".to_string()),
-                    headers: None,
-                    models: {
-                        let mut m = BTreeMap::new();
-                        m.insert("m1".to_string(), ModelConfig::default());
-                        m
-                    },
+        settings.providers.as_mut().unwrap().insert(
+            "broken".to_string(),
+            ProviderConfig {
+                name: Some("Broken".to_string()),
+                base_url: Some("https://api.broken.example/v1".to_string()),
+                api_key: Some("!false".to_string()),
+                headers: None,
+                models: {
+                    let mut m = BTreeMap::new();
+                    m.insert("m1".to_string(), ModelConfig::default());
+                    m
                 },
-            );
+            },
+        );
         settings.default_model = Some("broken/m1".to_string());
         let mut b = DoctorBuilder::new();
         let args = Args::test_default();
@@ -1099,11 +1091,7 @@ mod tests {
         let mut args = Args::test_default();
         args.auth = AuthMode::Chatgpt;
         check_config(&mut b, &args, &settings);
-        let path_row = b
-            .checks
-            .iter()
-            .find(|c| c.label == "active path")
-            .unwrap();
+        let path_row = b.checks.iter().find(|c| c.label == "active path").unwrap();
         assert!(matches!(path_row.status, DoctorStatus::Ok));
         assert!(path_row.detail.contains("ChatGPT"));
     }
@@ -1116,14 +1104,14 @@ mod tests {
         args.auth = AuthMode::ApiKey;
         args.model = "ollama/llama3".to_string();
         check_config(&mut b, &args, &settings);
-        let path_row = b
-            .checks
-            .iter()
-            .find(|c| c.label == "active path")
-            .unwrap();
+        let path_row = b.checks.iter().find(|c| c.label == "active path").unwrap();
         assert!(matches!(path_row.status, DoctorStatus::Ok));
         // Display name uses the provider's `name` field: "Ollama (local)".
-        assert!(path_row.detail.contains("Ollama"), "got: {}", path_row.detail);
+        assert!(
+            path_row.detail.contains("Ollama"),
+            "got: {}",
+            path_row.detail
+        );
     }
 
     #[test]
