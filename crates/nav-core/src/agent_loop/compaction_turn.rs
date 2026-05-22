@@ -2,15 +2,20 @@ use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::path::Path;
+use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::AgentEvent;
-use super::events::CompactionTrigger;
+use super::events::{
+    CompactionAnalyticsEvent, CompactionAnalyticsPhase, CompactionReason, CompactionStatus,
+    CompactionTrigger,
+};
 use super::runner::{SessionBinding, drop_oldest_tool_pair};
 use crate::cli::Args;
 use crate::context::compaction::{
     append_compaction_details, build_history_summary_prompt, build_replacement_history,
-    build_turn_prefix_summary_prompt, merge_split_turn_summary, prepare_compaction,
+    build_turn_prefix_summary_prompt, estimate_input_tokens, merge_split_turn_summary,
+    prepare_compaction,
 };
 use crate::context::{Catalog, ProjectContext};
 use crate::model::ResponsesTransport;
@@ -21,6 +26,8 @@ pub(crate) struct CompactionTurnRequest<'a, 's> {
     pub args: &'a Args,
     pub cwd: &'a Path,
     pub trigger: CompactionTrigger,
+    pub reason: CompactionReason,
+    pub phase: CompactionAnalyticsPhase,
     pub tokens_before: u64,
     pub session: Option<&'a SessionBinding<'s>>,
     pub events: &'a UnboundedSender<AgentEvent>,
@@ -40,12 +47,28 @@ pub(crate) async fn run_compaction_turn(
     request: CompactionTurnRequest<'_, '_>,
     input: &mut Vec<Value>,
 ) -> Result<String> {
+    let started_at = Instant::now();
+    let trigger = request.trigger;
+    let reason = request.reason;
+    let phase = request.phase;
+    let tokens_before = request.tokens_before;
+
+    let event_for = |status| CompactionAnalyticsEvent {
+        trigger,
+        reason,
+        phase,
+        status,
+        tokens_before,
+        tokens_after: 0,
+        duration_ms: started_at.elapsed().as_millis() as u64,
+    };
+
     emit(
         request.events,
         request.session,
         AgentEvent::CompactionStarted {
-            trigger: request.trigger,
-            tokens_before: request.tokens_before,
+            trigger,
+            tokens_before,
         },
     );
 
@@ -83,10 +106,11 @@ pub(crate) async fn run_compaction_turn(
                 request.events,
                 request.session,
                 AgentEvent::CompactionFailed {
-                    trigger: request.trigger,
+                    trigger,
                     message: message.clone(),
                 },
             );
+            emit_compaction_analytics(event_for(CompactionStatus::Failed));
             return Err(anyhow!(message));
         }
     };
@@ -96,18 +120,19 @@ pub(crate) async fn run_compaction_turn(
             request.events,
             request.session,
             AgentEvent::CompactionFailed {
-                trigger: request.trigger,
+                trigger,
                 message: message.clone(),
             },
         );
+        emit_compaction_analytics(event_for(CompactionStatus::Failed));
         return Err(anyhow!(message));
     }
 
     let completed = AgentEvent::CompactionCompleted {
-        trigger: request.trigger,
+        trigger,
         summary: summary.clone(),
         replaced_events: preparation.replaced_events,
-        tokens_before: request.tokens_before,
+        tokens_before,
         details: (!preparation.details.is_empty()).then_some(preparation.details.clone()),
     };
     if let Some(binding) = request.session
@@ -118,14 +143,26 @@ pub(crate) async fn run_compaction_turn(
             request.events,
             request.session,
             AgentEvent::CompactionFailed {
-                trigger: request.trigger,
+                trigger,
                 message: message.clone(),
             },
         );
+        emit_compaction_analytics(event_for(CompactionStatus::Failed));
         return Err(anyhow!(message));
     }
     *input = build_replacement_history(&summary, &preparation.recent_context);
     let _ = request.events.send(completed);
+
+    emit_compaction_analytics(CompactionAnalyticsEvent {
+        trigger,
+        reason,
+        phase,
+        status: CompactionStatus::Completed,
+        tokens_before,
+        tokens_after: estimate_input_tokens(input),
+        duration_ms: started_at.elapsed().as_millis() as u64,
+    });
+
     Ok(summary)
 }
 
@@ -238,6 +275,25 @@ pub(crate) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
         }
     }
     0
+}
+
+/// Emit a structured analytics event via `tracing::info!`. This is
+/// telemetry-only — it does NOT go on the user-facing [`AgentEvent`] stream.
+/// nav has no dedicated telemetry sink yet, so structured tracing is the
+/// lightest-weight option. When a real sink is added later, swap this
+/// function's body.
+fn emit_compaction_analytics(event: CompactionAnalyticsEvent) {
+    tracing::info!(
+        target: "nav.compaction",
+        trigger = event.trigger.as_str(),
+        reason = event.reason.as_str(),
+        phase = event.phase.as_str(),
+        status = event.status.as_str(),
+        tokens_before = event.tokens_before,
+        tokens_after = event.tokens_after,
+        duration_ms = event.duration_ms,
+        "compaction analytics event"
+    );
 }
 
 fn emit(
