@@ -549,7 +549,18 @@ pub fn estimate_input_tokens(input: &[Value]) -> u64 {
     input.iter().map(estimate_item_tokens).sum()
 }
 
-fn estimate_item_tokens(item: &Value) -> u64 {
+/// Combined token count for the auto-compaction decision. Sums the last
+/// server-reported `tokens_input` with a per-item estimate for any items
+/// added to the transcript since that response. When no items have been
+/// added (steady state), this equals the server reading.
+///
+/// Callers can cache `last_server_tokens` and pass only the delta items,
+/// avoiding repeated session-store reads on the hot path.
+pub fn current_context_tokens(last_server_tokens: u64, pending_items: &[Value]) -> u64 {
+    last_server_tokens.saturating_add(estimate_input_tokens(pending_items))
+}
+
+pub(crate) fn estimate_item_tokens(item: &Value) -> u64 {
     match item.get("type").and_then(Value::as_str) {
         Some("message") => estimate_message_tokens(item),
         Some("function_call") => {
@@ -1087,5 +1098,34 @@ mod tests {
 
         assert_eq!(details.read_files, vec!["a.rs"]);
         assert_eq!(details.modified_files, vec!["b.rs", "c.rs", "d.rs", "e.rs"]);
+    }
+
+    #[test]
+    fn current_context_tokens_steady_state_equals_server_reading() {
+        let server_tokens = 42_000u64;
+        assert_eq!(current_context_tokens(server_tokens, &[]), server_tokens);
+    }
+
+    #[test]
+    fn current_context_tokens_adds_pending_estimate() {
+        let server_tokens = 10_000u64;
+        let pending = vec![
+            json!({"type": "message", "role": "user", "content": "hello world"}),
+            json!({"type": "function_call", "name": "read_file", "arguments": "{\"path\":\"src/main.rs\"}"}),
+            json!({"type": "function_call_output", "output": "fn main() { println!(\"hi\"); }"}),
+        ];
+        let estimate = estimate_input_tokens(&pending);
+        assert!(estimate > 0, "pending items must contribute tokens");
+        assert_eq!(
+            current_context_tokens(server_tokens, &pending),
+            server_tokens + estimate,
+        );
+    }
+
+    #[test]
+    fn current_context_tokens_saturates_on_overflow() {
+        let server_tokens = u64::MAX;
+        let pending = vec![json!({"type": "message", "role": "user", "content": "x"})];
+        assert_eq!(current_context_tokens(server_tokens, &pending), u64::MAX);
     }
 }
