@@ -4189,10 +4189,14 @@ async fn manual_compact_failure_emits_failed_event() {
 }
 
 #[tokio::test]
-async fn auto_compact_fires_when_session_tokens_cross_threshold() {
-    // Pre-populate a session whose recorded `tokens_input` is above the
-    // auto-compact threshold, then submit a normal prompt. The runner
-    // should run compaction first, then proceed with the user's turn.
+async fn auto_compact_fires_mid_loop_after_tool_turn_crosses_threshold() {
+    // Mid-turn auto-compact: the first sampling iteration in a fresh turn
+    // returns a tool call AND reports `input_tokens=95_000` on the
+    // `response.completed` envelope. After `finalize_turn` records that
+    // reading, the post-turn check inside `'turns: loop` sees the
+    // threshold crossed and runs compaction before the next sampling
+    // iteration. A pre-turn check is intentionally absent — fresh user
+    // prompts are always sent first.
     let db_dir = tempdir().unwrap();
     let store =
         crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
@@ -4206,19 +4210,150 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
             None,
         )
         .unwrap();
-    // Seed the rolling token total by pretending an earlier turn consumed
-    // 95k input tokens. Append a TurnComplete event so append_event runs
-    // the rollup UPDATE.
-    store
-        .append_event(
-            &session_id,
-            &AgentEvent::UserMessage {
-                text: "huge".into(),
-                display_text: None,
-                attachments: Vec::new(),
-            },
+
+    // Threshold = 100k * 0.85 = 85k. The tool turn reports 95k → crosses.
+    let mut args = Args::test_default();
+    args.auto_compact_token_limit = 100_000;
+    args.auto_compact_fraction = 0.85;
+    args.max_turns = 4;
+
+    // Three turns to the transport:
+    //   1. Tool-call sampling that reports input_tokens=95k.
+    //   2. Compaction summarisation (fires inside the loop).
+    //   3. Continuation sampling — final answer post-compaction.
+    let tool_call_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 95_000}},
+        }),
+    ];
+    let summarise_turn = compact_turn_with_text("HANDOFF: did the thing");
+    let final_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "All done."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {"usage": {"input_tokens": 5_000}}}),
+    ];
+    let transport = StubTransport::new(vec![tool_call_turn, summarise_turn, final_turn]);
+    let binding = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "do the thing",
+        None,
+        Vec::new(),
+        tx,
+        Some(&binding),
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run with mid-loop auto-compact");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    // Sequence: a tool call ran *before* compaction fired. The mid-turn
+    // check is gated on a follow-up iteration being needed.
+    let tool_pos = event_position(&events, "ToolCallOutput", |e| {
+        matches!(e, AgentEvent::ToolCallOutput { .. })
+    });
+    let auto_started_pos = event_position(&events, "CompactionStarted", |e| {
+        matches!(
+            e,
+            AgentEvent::CompactionStarted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    assert!(
+        tool_pos < auto_started_pos,
+        "auto-compaction should fire AFTER a tool call, not before any sampling"
+    );
+
+    let auto_completed_pos = event_position(&events, "CompactionCompleted", |e| {
+        matches!(
+            e,
+            AgentEvent::CompactionCompleted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    assert!(auto_started_pos < auto_completed_pos);
+
+    // The post-compaction continuation sampling saw the replacement
+    // history: the prior assistant/tool items are gone and the trailing
+    // user item is the summary (carry-forward `[user_msgs, initial_ctx,
+    // summary]` with `BeforeLastUserMessage` injection).
+    let bodies = transport.bodies();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "tool sampling + compaction summarisation + continuation"
+    );
+    let continuation_input = bodies[2].get("input").and_then(Value::as_array).unwrap();
+    let function_outputs: Vec<&Value> = continuation_input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .collect();
+    assert!(
+        function_outputs.is_empty(),
+        "compaction should drop tool outputs: {function_outputs:?}"
+    );
+    let last_text = continuation_input
+        .last()
+        .and_then(|item| item.get("content"))
+        .and_then(Value::as_str)
+        .expect("continuation input ends with a user message carrying the summary");
+    assert!(
+        last_text.starts_with(SUMMARY_PREFIX),
+        "trailing item is the compaction summary: {last_text}"
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_does_not_fire_on_fresh_user_prompt_without_tool_loop() {
+    // A brand-new user prompt is always sent first — even if the session
+    // is already at the threshold, the model gets a chance to answer in
+    // one sampling iteration. If it returns a final assistant message,
+    // no tool follow-up is needed and the mid-turn check never runs.
+    // This locks in the codex design: the smallest blast radius of an
+    // auto-compaction is a tool-call follow-up, not a brand-new prompt.
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
         )
         .unwrap();
+    // Seed `latest_input_tokens` past the threshold via a prior
+    // TurnComplete event. A pre-turn check would have fired on this seed.
     store
         .append_event(
             &session_id,
@@ -4233,16 +4368,15 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
         )
         .unwrap();
 
-    // Threshold = 100k * 0.85 = 85k. 95k crosses.
     let mut args = Args::test_default();
     args.auto_compact_token_limit = 100_000;
     args.auto_compact_fraction = 0.85;
+    args.max_turns = 4;
 
-    // Two turns to the transport: first is the compaction summarisation,
-    // second is the user's actual prompt response.
-    let summarise_turn = compact_turn_with_text("HANDOFF: ongoing");
-    let user_turn = compact_turn_with_text("ack second");
-    let transport = StubTransport::new(vec![summarise_turn, user_turn]);
+    // Single transport call: the model returns a final answer
+    // immediately, with no tool calls.
+    let final_turn = compact_turn_with_text("answer");
+    let transport = StubTransport::new(vec![final_turn]);
     let binding = SessionBinding {
         store: &store,
         session_id: session_id.clone(),
@@ -4254,7 +4388,7 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
         &transport,
         &args,
         &cwd,
-        "regular prompt",
+        "fresh prompt",
         None,
         Vec::new(),
         tx,
@@ -4265,61 +4399,37 @@ async fn auto_compact_fires_when_session_tokens_cross_threshold() {
         unchecked_permission_context(),
     )
     .await
-    .expect("run with auto-compact");
+    .expect("run a fresh-prompt turn");
 
     let mut events = Vec::new();
     while let Some(event) = rx.recv().await {
         events.push(event);
     }
-    let auto_started = events.iter().find(|e| {
+    let fired = events.iter().any(|e| {
         matches!(
             e,
             AgentEvent::CompactionStarted { trigger, .. }
                 if matches!(trigger, super::CompactionTrigger::Auto)
         )
     });
-    assert!(auto_started.is_some(), "auto-compaction should have fired");
-    let auto_completed = events.iter().find(|e| {
-        matches!(
-            e,
-            AgentEvent::CompactionCompleted { trigger, .. }
-                if matches!(trigger, super::CompactionTrigger::Auto)
-        )
-    });
-    assert!(auto_completed.is_some());
-
-    // The user's actual prompt followed, and the second transport call
-    // saw the replacement history (summary + recent context) plus the new
-    // user prompt — not the raw 95k-token transcript.
-    let bodies = transport.bodies();
-    assert_eq!(bodies.len(), 2, "auto-compact + user turn");
-    let final_input = bodies[1].get("input").and_then(Value::as_array).unwrap();
-    let assistants: Vec<&Value> = final_input
-        .iter()
-        .filter(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
-        .collect();
     assert!(
-        assistants.is_empty(),
-        "compaction should drop assistant items: {assistants:?}"
+        !fired,
+        "fresh user prompt with no tool loop must not pre-emptively compact: {events:?}"
     );
-    // The new user prompt is the last item in `input`.
-    let last = final_input.last().unwrap();
-    assert_eq!(
-        last.get("content").and_then(Value::as_str),
-        Some("regular prompt")
-    );
+    // Exactly one transport call — no compaction summarisation body.
+    assert_eq!(transport.bodies().len(), 1);
 }
 
 #[tokio::test]
-async fn auto_compact_does_not_re_fire_after_checkpoint() {
-    // After auto-compaction the next provider response reports a *smaller*
-    // `tokens_input` because the replacement history is shorter — so the
-    // latest reading naturally drops below the threshold and a subsequent
-    // prompt does not re-trigger. Stubs report a concrete non-zero
-    // `input_tokens` for both post-compaction turns so the no-re-fire
-    // outcome is driven by the threshold comparison, not by the stub
-    // returning empty usage (which would let the test pass on a zero
-    // reading and hide a regression where lifetime rollup was still in use).
+async fn auto_compact_does_not_re_fire_mid_loop_after_checkpoint() {
+    // After mid-loop auto-compaction the next continuation sampling reports
+    // a *smaller* `input_tokens` because the replacement history is
+    // shorter. A subsequent tool-loop turn on the same session reads the
+    // post-checkpoint `latest_input_tokens` (not the lifetime cumulative)
+    // and stays below the threshold, so the mid-turn check does not
+    // re-fire. The cumulative rollup, by contrast, would still cross the
+    // threshold — this test fails if anyone ever rewires the decision to
+    // read it.
     let db_dir = tempdir().unwrap();
     let store =
         crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
@@ -4333,47 +4443,56 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
             None,
         )
         .unwrap();
-    store
-        .append_event(
-            &session_id,
-            &AgentEvent::UserMessage {
-                text: "huge".into(),
-                display_text: None,
-                attachments: Vec::new(),
-            },
-        )
-        .unwrap();
-    store
-        .append_event(
-            &session_id,
-            &AgentEvent::TurnComplete {
-                usage: TurnUsage {
-                    tokens_input: 95_000,
-                    tokens_output: 0,
-                    tokens_input_cached: 0,
-                    tokens_reasoning: 0,
-                },
-            },
-        )
-        .unwrap();
 
     let mut args = Args::test_default();
     args.auto_compact_token_limit = 100_000;
     args.auto_compact_fraction = 0.85;
+    args.max_turns = 6;
 
-    // First run: auto-compact + user turn. Both stub responses carry a
-    // concrete `input_tokens` reading so the test asserts threshold behavior
-    // against a real number, not a zero side-effect of the empty-usage stub.
+    // Run 1: tool call reports input_tokens=95k → mid-turn check fires →
+    // compaction → continuation reports input_tokens=5k → final answer.
+    let tool_call_turn = |input_tokens: u64| {
+        vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "arguments": "{\"command\":\"echo hi\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": input_tokens}},
+            }),
+        ]
+    };
+    let final_turn = |text: &str, input_tokens: u64| {
+        vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": text}]
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": input_tokens}},
+            }),
+        ]
+    };
+
     let transport_one = StubTransport::new(vec![
+        tool_call_turn(95_000),
         compact_turn_with_text_and_input_tokens("HANDOFF: ongoing", 50_000),
-        compact_turn_with_text_and_input_tokens("ack", 5_000),
+        final_turn("done one", 5_000),
     ]);
     let binding_one = SessionBinding {
         store: &store,
         session_id: session_id.clone(),
     };
-    let prior_one = store.load_session(&session_id).unwrap();
-    let rebuilt_one = rebuild_responses_input(&prior_one, &cwd);
     let (tx1, mut rx1) = mpsc::unbounded_channel::<AgentEvent>();
     run_agent_for_test(
         &transport_one,
@@ -4384,7 +4503,7 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
         Vec::new(),
         tx1,
         Some(&binding_one),
-        Some(rebuilt_one),
+        None,
         &Catalog::default(),
         None,
         unchecked_permission_context(),
@@ -4393,9 +4512,15 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
     .expect("first run");
     while rx1.recv().await.is_some() {}
 
-    // Second run: with the lifetime rolling counter still ≥ threshold, a
-    // naive implementation would compact again. We assert it does NOT.
-    let transport_two = StubTransport::new(vec![compact_turn_with_text("ack two")]);
+    // Run 2: another tool loop on the same session. The lifetime cumulative
+    // counter has been climbing (95k + 50k + 5k = 150k so far), but
+    // `latest_input_tokens` is 5k from the previous final answer. With the
+    // first tool sampling reporting input_tokens=10k, the mid-turn check
+    // sees 10k < 85k and does NOT fire.
+    let transport_two = StubTransport::new(vec![
+        tool_call_turn(10_000),
+        final_turn("done two", 12_000),
+    ]);
     let binding_two = SessionBinding {
         store: &store,
         session_id: session_id.clone(),
@@ -4448,10 +4573,389 @@ async fn auto_compact_does_not_re_fire_after_checkpoint() {
         "exactly one auto-compaction should have run"
     );
 
-    // Only one transport call this run (the user turn) — no extra
-    // summarisation body.
+    // Only two transport calls this run (tool sampling + final answer) —
+    // no extra summarisation body.
     let bodies = transport_two.bodies();
-    assert_eq!(bodies.len(), 1, "expected single user turn, no compaction");
+    assert_eq!(
+        bodies.len(),
+        2,
+        "expected tool turn + final answer, no compaction"
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_mid_loop_injects_initial_context_before_last_user_message() {
+    // Mid-turn compaction must use InitialContextInjection::BeforeLastUserMessage
+    // — the model is trained to see the summary at the tail in this path,
+    // so the canonical initial-context block is spliced just above the
+    // last real user message. The post-compaction continuation body is
+    // the assertion surface: its `input` ends with the summary, and the
+    // item immediately before the trailing user prompt carries the
+    // initial-context block.
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+
+    let mut args = Args::test_default();
+    args.auto_compact_token_limit = 100_000;
+    args.auto_compact_fraction = 0.85;
+    args.max_turns = 4;
+
+    let tool_call_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 95_000}},
+        }),
+    ];
+    let summarise_turn = compact_turn_with_text("HANDOFF: prepared for handoff");
+    let final_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "All done."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {"usage": {"input_tokens": 5_000}}}),
+    ];
+    let transport = StubTransport::new(vec![tool_call_turn, summarise_turn, final_turn]);
+    let binding = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "do the thing",
+        None,
+        Vec::new(),
+        tx,
+        Some(&binding),
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run with mid-loop auto-compact");
+    while rx.recv().await.is_some() {}
+
+    // Post-compaction continuation body (3rd transport call) is the
+    // replacement history fed back to the model.
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 3);
+    let continuation_input = bodies[2].get("input").and_then(Value::as_array).unwrap();
+
+    // Trailing item is the summary, prefixed with SUMMARY_PREFIX.
+    let last_text = continuation_input
+        .last()
+        .and_then(|item| item.get("content"))
+        .and_then(Value::as_str)
+        .expect("continuation input ends with a string-content user message");
+    assert!(
+        last_text.starts_with(SUMMARY_PREFIX),
+        "trailing item is the compaction summary: {last_text}"
+    );
+
+    // The initial-context block sits immediately before the last real
+    // user message (which here is the one carrying "do the thing").
+    // `build_instructions` always includes `cwd` in the small-coding-agent
+    // preamble — we assert on a stable substring of that preamble.
+    let user_items: Vec<&Value> = continuation_input
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+        .collect();
+    assert!(
+        user_items.len() >= 3,
+        "expected [initial_context, user_prompt, summary] shape: {user_items:?}"
+    );
+    let initial_text = user_items
+        .iter()
+        .rev()
+        .skip(2) // skip summary + last user prompt
+        .find_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.first())
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str)
+        })
+        .expect("initial-context user item spliced into history");
+    assert!(
+        initial_text.contains("small coding agent"),
+        "spliced item carries the base instructions preamble: {initial_text}"
+    );
+
+    // The strip_synthetic_markers pass runs just before send, so the
+    // continuation body must not leak the internal `nav_synthetic` field.
+    let any_marker = continuation_input
+        .iter()
+        .any(|item| item.get("nav_synthetic").is_some());
+    assert!(
+        !any_marker,
+        "synthetic marker must be stripped before send: {continuation_input:?}"
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_mid_loop_does_not_re_fire_after_failure_in_same_turn() {
+    // If the mid-turn compaction summarisation fails (empty summary), the
+    // CompactionFailed event surfaces and `input` is left untouched. The
+    // post-finalize check must NOT re-attempt compaction on subsequent
+    // iterations of the same user turn — otherwise a transient transport
+    // hiccup would burn one failing compaction per tool-loop iteration
+    // until `max_turns`.
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+
+    let mut args = Args::test_default();
+    args.auto_compact_token_limit = 100_000;
+    args.auto_compact_fraction = 0.85;
+    args.max_turns = 6;
+
+    // Sequence:
+    //  1. Tool sampling reports 95k input_tokens (threshold crossed).
+    //  2. Compaction summarisation returns ONLY response.completed —
+    //     no assistant text → run_compaction_turn returns Err with
+    //     "compaction summary was empty" and emits CompactionFailed.
+    //  3. Tool sampling again reports 95k. If the latch is missing, the
+    //     post-finalize check fires another (failing) compaction here.
+    //  4. Final answer ends the loop.
+    let tool_turn = |input_tokens: u64| {
+        vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_n",
+                    "name": "bash",
+                    "arguments": "{\"command\":\"echo hi\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {"usage": {"input_tokens": input_tokens}},
+            }),
+        ]
+    };
+    let empty_compaction_turn = vec![json!({"type": "response.completed", "response": {}})];
+    let final_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "All done."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {"usage": {"input_tokens": 95_000}}}),
+    ];
+    let transport = StubTransport::new(vec![
+        tool_turn(95_000),
+        empty_compaction_turn,
+        tool_turn(95_000),
+        final_turn,
+    ]);
+    let binding = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "do the thing",
+        None,
+        Vec::new(),
+        tx,
+        Some(&binding),
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run with failing mid-loop compaction");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    // Exactly one CompactionStarted (from iteration 1) and one
+    // CompactionFailed; no successful CompactionCompleted in this run.
+    let started = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::CompactionStarted { trigger, .. }
+                    if matches!(trigger, super::CompactionTrigger::Auto)
+            )
+        })
+        .count();
+    let failed = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionFailed { .. }))
+        .count();
+    let completed = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::CompactionCompleted { .. }))
+        .count();
+    assert_eq!(
+        started, 1,
+        "compaction must not re-fire after a failure in the same turn: {events:?}"
+    );
+    assert_eq!(failed, 1);
+    assert_eq!(completed, 0);
+
+    // The transport saw 4 calls (tool, compaction, tool, final). If the
+    // latch were missing, the second tool iteration would have inserted
+    // another compaction call, pushing the count to 5+.
+    assert_eq!(
+        transport.bodies().len(),
+        4,
+        "extra compaction body would indicate the latch is not working",
+    );
+}
+
+#[tokio::test]
+async fn auto_compact_mid_loop_repushes_ambient_context_after_success() {
+    // push_ambient_context fires once at the top of run_agent_inner, and
+    // mid-turn compaction's carry-forward filter drops synthetic items.
+    // Without an explicit re-push after a successful compaction, the rest
+    // of the user turn runs without ambient context. This test pins the
+    // re-push: the post-compaction continuation body must contain the
+    // ambient-context user message.
+    let db_dir = tempdir().unwrap();
+    let store =
+        crate::context::SessionStore::open(Some(db_dir.path().join("nav.db"))).expect("open store");
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let session_id = store
+        .create_session(
+            &cwd,
+            crate::context::PROVIDER_OPENAI_RESPONSES,
+            "test-model",
+            None,
+        )
+        .unwrap();
+
+    // Default Args sets ambient_context_token_budget=0 (disabled); raise
+    // it so push_ambient_context actually appends an item.
+    let mut args = Args::test_default();
+    args.ambient_context_token_budget = 256;
+    args.auto_compact_token_limit = 100_000;
+    args.auto_compact_fraction = 0.85;
+    args.max_turns = 4;
+
+    let tool_call_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {"usage": {"input_tokens": 95_000}}}),
+    ];
+    let summarise_turn = compact_turn_with_text("HANDOFF: ongoing");
+    let final_turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "All done."}]
+            }
+        }),
+        json!({"type": "response.completed", "response": {"usage": {"input_tokens": 5_000}}}),
+    ];
+    let transport = StubTransport::new(vec![tool_call_turn, summarise_turn, final_turn]);
+    let binding = SessionBinding {
+        store: &store,
+        session_id: session_id.clone(),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "do the thing",
+        None,
+        Vec::new(),
+        tx,
+        Some(&binding),
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("run with ambient context");
+    while rx.recv().await.is_some() {}
+
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 3);
+
+    fn body_contains_ambient(body: &Value) -> bool {
+        body.get("input")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.iter().any(|item| {
+                    item.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.contains("Ambient context (turn-local"))
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    assert!(
+        body_contains_ambient(&bodies[0]),
+        "first sampling body should carry the initial ambient context",
+    );
+    assert!(
+        body_contains_ambient(&bodies[2]),
+        "post-compaction continuation body must re-carry ambient context: {:?}",
+        bodies[2],
+    );
 }
 
 #[tokio::test]

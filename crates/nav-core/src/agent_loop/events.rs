@@ -52,7 +52,8 @@ impl CompactionTrigger {
 pub enum CompactionReason {
     /// User typed `/compact` (or a skill triggered an explicit compact).
     UserRequested,
-    /// Token usage crossed the auto-compaction threshold before a turn.
+    /// Token usage crossed the auto-compaction threshold between sampling
+    /// iterations inside an ongoing turn.
     ContextLimit,
     /// A future path: downshifted to a smaller model with a shorter window.
     ModelDownshift,
@@ -74,11 +75,11 @@ impl CompactionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionAnalyticsPhase {
-    /// Compaction ran as its own isolated turn (manual `/compact` or
-    /// pre-turn auto-compact before the first sampling iteration).
+    /// Compaction ran as its own isolated turn (manual `/compact`).
     StandaloneTurn,
     /// Compaction ran between sampling iterations inside an ongoing user
-    /// turn (not yet exercised in nav, but reserved per codex learnings §7).
+    /// turn — codex's "mid-turn" path, gated on a tool-call follow-up
+    /// being needed when the token threshold is crossed.
     MidTurn,
 }
 

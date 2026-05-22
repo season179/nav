@@ -12,7 +12,8 @@ use crate::agent_loop::prune::prune_to_budget;
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
 use crate::context::compaction::{
-    current_context_tokens as estimate_context_tokens, is_compact_command, should_auto_compact,
+    InitialContextInjection, current_context_tokens as estimate_context_tokens, is_compact_command,
+    should_auto_compact,
 };
 use crate::context::history::{
     ModelCapabilities, NAV_SYNTHETIC_MARKER_KEY, remove_orphan_outputs, shed_old_images,
@@ -248,6 +249,10 @@ pub(super) async fn run_agent_inner(
                 events: &events,
                 skills,
                 context,
+                // Manual compaction's replacement history clears reference
+                // context; the next regular turn re-assembles initial
+                // context from scratch.
+                initial_context_injection: InitialContextInjection::DoNotInject,
             },
             &mut input,
         )
@@ -255,51 +260,11 @@ pub(super) async fn run_agent_inner(
         .map(|_| ());
     }
 
-    // Auto-compact before submitting if current context occupancy crosses
-    // the threshold. After compaction the replacement `input` is shorter, so
-    // the next turn's `tokens_input` drops naturally — no baseline
-    // subtraction needed. A brand-new session with no `TurnComplete` events
-    // reads as 0 here and will not pre-emptively compact even if
-    // `initial_input` is large; that case is rare and the model's own
-    // overflow handler covers it.
-    if let Some(binding) = session
-        && args.auto_compact_token_limit > 0
-    {
-        let tokens_in_use = binding.current_context_tokens();
-        let decision = should_auto_compact(
-            tokens_in_use,
-            args.auto_compact_token_limit,
-            args.auto_compact_fraction,
-        );
-        if decision.should_compact && !input.is_empty() {
-            // `tokens_before` is the lifetime cumulative `tokens_input` at
-            // the moment of compaction — persisted onto `CompactionCompleted`
-            // and read back as the next baseline. Subtracting it from a
-            // future rolling total yields post-checkpoint pressure.
-            let tokens_before = binding.rolling_input_tokens();
-            // Don't fail the user's turn if compaction itself fails — we
-            // still want to take their next prompt from the pre-compact
-            // transcript. The CompactionFailed event already surfaces the
-            // failure to frontends.
-            let _ = run_compaction_turn(
-                CompactionTurnRequest {
-                    transport,
-                    args,
-                    cwd,
-                    trigger: CompactionTrigger::Auto,
-                    reason: CompactionReason::ContextLimit,
-                    phase: CompactionAnalyticsPhase::StandaloneTurn,
-                    tokens_before,
-                    session,
-                    events: &events,
-                    skills,
-                    context,
-                },
-                &mut input,
-            )
-            .await;
-        }
-    }
+    // Auto-compaction is decided inside the agent loop, after a sampling
+    // response completes and before the next iteration — see the post-
+    // `finalize_turn` block below. A fresh user prompt is always sent first,
+    // matching codex's design: the smallest blast radius of an auto-compact
+    // is a tool-call follow-up, never a brand-new user prompt.
 
     if args.git_checkpoints {
         checkpoint_dirty_worktree(cwd, session, &events);
@@ -333,6 +298,14 @@ pub(super) async fn run_agent_inner(
     // Tracked manually so an overflow trim+retry doesn't consume the user's
     // turn budget — the server rejected our request before any work happened.
     let mut turns_used = 0usize;
+    // Latches once a mid-turn compaction fails so the post-finalize check
+    // does not re-fire every subsequent iteration. A failing summarisation
+    // does not mutate `input`, and the next iteration's `finalize_turn`
+    // records the same above-threshold reading, so without this flag the
+    // loop would burn one failing compaction request per iteration until
+    // `max_turns`. The overflow recovery path remains available as the
+    // separate fallback called out by issue #86.
+    let mut compaction_failed_this_turn = false;
     // Total tool calls fielded for this user prompt. Each time the running
     // count crosses a new multiple of `args.tool_call_soft_budget` (when > 0),
     // nav emits a `ToolBudgetWarning` and injects a budget-check steering
@@ -649,6 +622,83 @@ pub(super) async fn run_agent_inner(
         ) {
             return fail(&events, session, err);
         }
+
+        // Mid-turn auto-compact: the model still has tool calls to follow
+        // up on (`calls` was non-empty above; the no-tools branch already
+        // returned), so this fires between two sampling iterations within
+        // the same user turn — codex's "MidTurn" phase. If compaction
+        // succeeds, `input` is replaced with `[user_msgs, initial_context,
+        // summary]` and the next iteration sees the shorter shape. If it
+        // fails, the CompactionFailed event surfaces the error, the
+        // `compaction_failed_this_turn` latch suppresses retries for the
+        // rest of this user turn, and the loop continues with the
+        // pre-compaction input — a later iteration may still hit the
+        // overflow recovery path.
+        //
+        // Notes for future tuning (see review on #86):
+        // - The mid-turn check is not consulted on the steering-drain
+        //   `continue 'turns;` branch above; that path is pre-existing
+        //   behavior and skips `finalize_turn` for the same reason.
+        // - There is no abort drain between `finalize_turn` and the
+        //   compaction call. A user abort issued during a slow
+        //   summarisation is observed only after the compaction finishes.
+        if !compaction_failed_this_turn
+            && let Some(binding) = session
+            && args.auto_compact_token_limit > 0
+        {
+            let tokens_in_use = binding.current_context_tokens();
+            let decision = should_auto_compact(
+                tokens_in_use,
+                args.auto_compact_token_limit,
+                args.auto_compact_fraction,
+            );
+            if decision.should_compact {
+                let tokens_before = binding.rolling_input_tokens();
+                let outcome = run_compaction_turn(
+                    CompactionTurnRequest {
+                        transport,
+                        args,
+                        cwd,
+                        trigger: CompactionTrigger::Auto,
+                        reason: CompactionReason::ContextLimit,
+                        phase: CompactionAnalyticsPhase::MidTurn,
+                        tokens_before,
+                        session,
+                        events: &events,
+                        skills,
+                        context,
+                        initial_context_injection:
+                            InitialContextInjection::BeforeLastUserMessage,
+                    },
+                    &mut input,
+                )
+                .await;
+                match outcome {
+                    Ok(_) => {
+                        // Ambient context is pushed once at the top of
+                        // `run_agent_inner`; compaction's carry-forward
+                        // filter drops synthetic items, so without this
+                        // re-push the rest of the user turn would run
+                        // without ambient context (cwd / git status /
+                        // dirty-state nudge). Tool-budget steering nudges
+                        // are intentionally not re-injected — the running
+                        // `tool_calls_this_turn` counter still drives
+                        // future nudges if the loop crosses another
+                        // multiple of `soft_budget`.
+                        push_ambient_context(
+                            &mut input,
+                            cwd,
+                            context,
+                            args.ambient_context_token_budget,
+                        );
+                    }
+                    Err(_) => {
+                        compaction_failed_this_turn = true;
+                    }
+                }
+            }
+        }
+
         turns_used += 1;
     }
 }
