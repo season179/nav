@@ -10,6 +10,7 @@ pub mod context;
 pub mod git_checkpoint;
 pub mod guardrails;
 pub mod model;
+pub mod startup_notices;
 pub mod tool_registry;
 pub mod verify;
 
@@ -86,3 +87,8 @@ pub use model::{OpenAiTransport, RetryPolicy};
 pub use verify::{
     FileChangeKind, FileChangeSummary, FileDiffSummary, MutationResult, PatchApplyStatus, TurnDiff,
 };
+
+// Startup-time message accumulator used by skill/extension discovery and
+// the session store so frontends can render warnings without leaking
+// stderr above the TUI viewport.
+pub use startup_notices::{NoticeLevel, StartupNotice, StartupNotices};

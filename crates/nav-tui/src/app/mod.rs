@@ -8,9 +8,9 @@ use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent};
 use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
-    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, HandoffDraft, OpenAiTransport,
+    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, HandoffDraft, NoticeLevel, OpenAiTransport,
     PROVIDER_OPENAI_RESPONSES, PendingInputMode, PendingSkill, ProjectContext, SessionId,
-    SessionStore, build_handoff_draft,
+    SessionStore, StartupNotices, build_handoff_draft,
     cli::{Args, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };
@@ -62,6 +62,7 @@ pub async fn run(
     skills: Arc<Catalog>,
     extensions: Arc<ExtensionCatalog>,
     project: Arc<ProjectContext>,
+    startup_notices: StartupNotices,
 ) -> Result<()> {
     let slash_entries =
         bottom_pane::build_slash_entries_with_extensions(skills.as_ref(), extensions.as_ref());
@@ -97,6 +98,15 @@ pub async fn run(
             context_summary.clone(),
             settings_summary.clone(),
         );
+    }
+    // Replay startup-time warnings as styled cells so skill/extension
+    // discovery messages live in scrollback like the rest of the
+    // transcript, instead of stderr leaking above the inline viewport.
+    for notice in startup_notices.iter() {
+        match notice.level {
+            NoticeLevel::Warning => chat.push_warning(notice.message.clone()),
+            NoticeLevel::Error => chat.push_error_notice(notice.message.clone()),
+        }
     }
     // Rehydrate the visible scrollback at startup. Each submitted turn below
     // rebuilds model-facing history fresh from the session store because

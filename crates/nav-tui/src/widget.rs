@@ -67,6 +67,19 @@ impl ChatWidget {
         self.push_cell(SkillInvocationCell::new(name, detail));
     }
 
+    /// Surface a startup-time warning (skill/extension discovery) as a styled
+    /// notice cell so it lives in scrollback alongside the rest of the
+    /// transcript, instead of leaking onto stderr above the inline viewport.
+    pub fn push_warning(&mut self, message: impl Into<String>) {
+        self.push_cell(NoticeCell::warning(message));
+    }
+
+    /// Same as [`push_warning`] but renders with the error severity styling.
+    /// Reserved for fatal-but-non-aborting startup conditions.
+    pub fn push_error_notice(&mut self, message: impl Into<String>) {
+        self.push_cell(NoticeCell::error(message));
+    }
+
     pub fn push_session_list(&mut self, sessions: Vec<SessionSummary>) {
         self.push_cell(SessionListCell::new(sessions));
     }

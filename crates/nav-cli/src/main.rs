@@ -7,8 +7,8 @@ use nav_core::guardrails::{
 };
 use nav_core::{
     AgentEvent, AgentTurnRequest, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext,
-    RetryPolicy, SessionBinding, SessionStore, SessionSummary, SessionTreeNode, TranscriptHit,
-    agent_event_notification,
+    RetryPolicy, SessionBinding, SessionStore, SessionSummary, SessionTreeNode, StartupNotices,
+    TranscriptHit, agent_event_notification,
     cli::{
         Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, SessionsAction,
         sandbox_policy_from_args,
@@ -46,7 +46,12 @@ async fn main() -> Result<()> {
     // from settings, but a settings file can fill defaults.
     let project = Arc::new(load_project_context(&cwd));
     args.apply_settings(&project.settings, &provided);
-    let extensions = Arc::new(discover_extensions(&cwd));
+
+    // Capture warnings emitted by skill/extension discovery so the TUI can
+    // render them as styled cells (and headless modes can keep printing
+    // them on stderr) instead of leaking above the inline viewport.
+    let mut startup_notices = StartupNotices::new();
+    let extensions = Arc::new(discover_extensions(&cwd, &mut startup_notices));
 
     // Subcommands run with the same merged args + project context the agent
     // loop would see, so `nav doctor` and `nav export` reflect a configured
@@ -78,7 +83,7 @@ async fn main() -> Result<()> {
 
     // Locked to launch cwd so the system prompt and slash popup never
     // disagree if the TUI later moves around.
-    let skills = Arc::new(discover_skills(&cwd));
+    let skills = Arc::new(discover_skills(&cwd, &mut startup_notices));
     let store = Arc::new(SessionStore::open(args.db_path.clone())?);
     nav_core::tool_registry::output_accumulator::sweep_old();
     let (session_id, initial_input, resume_events) = match args.resume.as_deref() {
@@ -152,9 +157,15 @@ async fn main() -> Result<()> {
             skills,
             extensions,
             project,
+            startup_notices,
         )
         .await;
     }
+
+    // Headless mode: discovery warnings now go straight to stderr so the
+    // banner stays clean. The notices vector replaced the old
+    // `eprintln!` calls inside nav-core itself.
+    startup_notices.write_to_stderr();
 
     let Some(prompt) = combined_prompt else {
         bail!("provide a prompt for non-interactive mode, e.g. nav \"list the files\"");

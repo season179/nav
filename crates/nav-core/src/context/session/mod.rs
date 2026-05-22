@@ -386,8 +386,11 @@ impl SessionStore {
     /// Opens the session database. When `path` is `None` the XDG data
     /// directory — `$XDG_DATA_HOME/nav/nav.db`, falling back to
     /// `~/.local/share/nav/nav.db` — is used. Relative overrides are resolved
-    /// inside that same nav data directory. Echoes the resolved pragma values
-    /// to stderr so misconfiguration is visible at startup.
+    /// inside that same nav data directory.
+    ///
+    /// If SQLite refuses any of the pragmas we set (e.g. WAL is not available
+    /// on the underlying filesystem), the mismatch is echoed to stderr so a
+    /// misconfiguration is visible at startup. The happy path is silent.
     pub fn open(path: Option<PathBuf>) -> Result<Self> {
         let path = resolve_db_path(path)?;
         if let Some(parent) = path.parent() {
@@ -406,10 +409,12 @@ impl SessionStore {
         let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
         conn.execute_batch("PRAGMA foreign_keys = ON")?;
         let foreign_keys: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
-        eprintln!(
-            "nav-core: opened {} (journal_mode={journal_mode}, synchronous={synchronous}, foreign_keys={foreign_keys})",
-            path.display()
-        );
+        if !journal_mode.eq_ignore_ascii_case("wal") || synchronous != 1 || foreign_keys != 1 {
+            eprintln!(
+                "nav-core: opened {} with unexpected pragmas (journal_mode={journal_mode}, synchronous={synchronous}, foreign_keys={foreign_keys})",
+                path.display()
+            );
+        }
 
         apply_schema(&conn)?;
         Ok(SessionStore {

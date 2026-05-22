@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::startup_notices::StartupNotices;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionCatalog {
     extensions: Vec<Extension>,
@@ -164,21 +166,22 @@ struct LoadedExtension {
     themes: Vec<ExtensionTheme>,
 }
 
-pub fn discover_extensions(launch_cwd: &Path) -> ExtensionCatalog {
-    discover_extensions_with_roots(launch_cwd, user_extensions_root().as_deref())
+pub fn discover_extensions(launch_cwd: &Path, notices: &mut StartupNotices) -> ExtensionCatalog {
+    discover_extensions_with_roots(launch_cwd, user_extensions_root().as_deref(), notices)
 }
 
 pub fn discover_extensions_with_roots(
     launch_cwd: &Path,
     user_root: Option<&Path>,
+    notices: &mut StartupNotices,
 ) -> ExtensionCatalog {
     let mut collected = ExtensionAccumulator::default();
 
     let project_root = launch_cwd.join(".nav").join("extensions");
-    collected.collect_from_root(&project_root, ExtensionScope::Project);
+    collected.collect_from_root(&project_root, ExtensionScope::Project, notices);
 
     if let Some(user_root) = user_root {
-        collected.collect_from_root(user_root, ExtensionScope::User);
+        collected.collect_from_root(user_root, ExtensionScope::User, notices);
     }
 
     collected.into_catalog()
@@ -210,17 +213,22 @@ struct ExtensionAccumulator {
 }
 
 impl ExtensionAccumulator {
-    fn collect_from_root(&mut self, root: &Path, scope: ExtensionScope) {
+    fn collect_from_root(
+        &mut self,
+        root: &Path,
+        scope: ExtensionScope,
+        notices: &mut StartupNotices,
+    ) {
         if !root.is_dir() {
             return;
         }
         let entries = match fs::read_dir(root) {
             Ok(entries) => entries,
             Err(err) => {
-                eprintln!(
-                    "nav-core: failed to read extensions root {}: {err}",
+                notices.warning(format!(
+                    "failed to read extensions root {}: {err}",
                     root.display()
-                );
+                ));
                 return;
             }
         };
@@ -236,30 +244,30 @@ impl ExtensionAccumulator {
             if !manifest_path.is_file() {
                 continue;
             }
-            match load_extension(&dir, &manifest_path, scope) {
-                Ok(loaded) => self.add_loaded(loaded),
+            match load_extension(&dir, &manifest_path, scope, notices) {
+                Ok(loaded) => self.add_loaded(loaded, notices),
                 Err(err) => {
-                    eprintln!(
-                        "nav-core: skipping extension at {}: {err}",
+                    notices.warning(format!(
+                        "skipping extension at {}: {err}",
                         manifest_path.display()
-                    );
+                    ));
                 }
             }
         }
     }
 
-    fn add_loaded(&mut self, mut loaded: LoadedExtension) {
+    fn add_loaded(&mut self, mut loaded: LoadedExtension, notices: &mut StartupNotices) {
         let mut prompt_template_count = 0;
         for template in loaded.prompt_templates {
             if self.seen_prompts.insert(template.name.clone()) {
                 self.prompt_templates.push(template);
                 prompt_template_count += 1;
             } else {
-                eprintln!(
-                    "nav-core: prompt template `{}` from {} ignored; name already registered",
+                notices.warning(format!(
+                    "prompt template `{}` from {} ignored; name already registered",
                     template.name,
                     template.body_path.display()
-                );
+                ));
             }
         }
         let mut theme_count = 0;
@@ -268,10 +276,10 @@ impl ExtensionAccumulator {
                 self.themes.push(theme);
                 theme_count += 1;
             } else {
-                eprintln!(
-                    "nav-core: theme `{}` from extension `{}` ignored; name already registered",
+                notices.warning(format!(
+                    "theme `{}` from extension `{}` ignored; name already registered",
                     theme.name, theme.extension_name
-                );
+                ));
             }
         }
         loaded.extension.prompt_template_count = prompt_template_count;
@@ -288,6 +296,7 @@ fn load_extension(
     extension_dir: &Path,
     manifest_path: &Path,
     scope: ExtensionScope,
+    notices: &mut StartupNotices,
 ) -> Result<LoadedExtension, String> {
     let manifest_text = fs::read_to_string(manifest_path)
         .map_err(|err| format!("failed to read extension.json: {err}"))?;
@@ -305,9 +314,8 @@ fn load_extension(
     for template in &manifest.prompt_templates {
         match load_prompt_template_manifest(template, &name, &extension_dir, scope) {
             Ok(template) => prompt_templates.push(template),
-            Err(err) => {
-                eprintln!("nav-core: skipping prompt template in extension `{name}`: {err}")
-            }
+            Err(err) => notices
+                .warning(format!("skipping prompt template in extension `{name}`: {err}")),
         }
     }
 
@@ -315,7 +323,7 @@ fn load_extension(
     for theme in &manifest.themes {
         match load_theme_manifest(theme, &name, scope) {
             Ok(theme) => themes.push(theme),
-            Err(err) => eprintln!("nav-core: skipping theme in extension `{name}`: {err}"),
+            Err(err) => notices.warning(format!("skipping theme in extension `{name}`: {err}")),
         }
     }
     let prompt_template_count = prompt_templates.len();
@@ -496,7 +504,8 @@ mod tests {
             &extension_json("demo", "review", "night"),
         );
 
-        let catalog = discover_extensions_with_roots(cwd.path(), None);
+        let catalog =
+            discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
 
         assert_eq!(catalog.extensions().len(), 1);
         assert_eq!(catalog.prompt_templates().len(), 1);
@@ -535,7 +544,11 @@ mod tests {
             &extension_json("user", "review", "user-theme"),
         );
 
-        let catalog = discover_extensions_with_roots(cwd.path(), Some(user.path()));
+        let catalog = discover_extensions_with_roots(
+            cwd.path(),
+            Some(user.path()),
+            &mut StartupNotices::new(),
+        );
         assert_eq!(catalog.prompt_templates().len(), 1);
         let template = catalog.get_prompt_template("review").unwrap();
         assert_eq!(template.scope, ExtensionScope::Project);
@@ -564,7 +577,8 @@ mod tests {
             }"#,
         );
 
-        let catalog = discover_extensions_with_roots(cwd.path(), None);
+        let catalog =
+            discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
         assert!(catalog.prompt_templates().is_empty());
     }
 
@@ -583,7 +597,8 @@ mod tests {
             }"#,
         );
 
-        let catalog = discover_extensions_with_roots(cwd.path(), None);
+        let catalog =
+            discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
         assert!(catalog.prompt_templates().is_empty());
         assert_eq!(catalog.extensions().len(), 1);
         assert_eq!(catalog.extensions()[0].prompt_template_count, 0);

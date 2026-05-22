@@ -16,6 +16,8 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::startup_notices::StartupNotices;
+
 /// A single discovered skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -139,25 +141,29 @@ fn user_skills_root() -> Option<PathBuf> {
 /// up an ancestor's project skills.
 ///
 /// Project skills are discovered first, then user skills. When two skills
-/// share a parsed `name`, the project entry wins and a warning is logged via
-/// `eprintln!` naming both paths.
+/// share a parsed `name`, the project entry wins and a warning is pushed
+/// onto `notices` naming both paths.
 ///
 /// Skills that fail to parse (missing description, unreadable frontmatter)
 /// are skipped with a diagnostic. Cosmetic problems such as a
 /// `name`/directory mismatch are warned about but still loaded.
-pub fn discover_skills(launch_cwd: &Path) -> Catalog {
-    discover_skills_with_roots(launch_cwd, user_skills_root().as_deref())
+pub fn discover_skills(launch_cwd: &Path, notices: &mut StartupNotices) -> Catalog {
+    discover_skills_with_roots(launch_cwd, user_skills_root().as_deref(), notices)
 }
 
 /// Variant of [`discover_skills`] that accepts an explicit user-skills root.
 /// Exposed for tests so they can isolate from the developer's real
 /// `~/.agents/skills/`.
-pub fn discover_skills_with_roots(launch_cwd: &Path, user_root: Option<&Path>) -> Catalog {
+pub fn discover_skills_with_roots(
+    launch_cwd: &Path,
+    user_root: Option<&Path>,
+    notices: &mut StartupNotices,
+) -> Catalog {
     let mut skills: Vec<Skill> = Vec::new();
     let mut seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
 
     if let Some(project_root) = find_project_skills_root_in_cwd(launch_cwd, user_root) {
-        for skill in scan_directory(&project_root, SkillScope::Project) {
+        for skill in scan_directory(&project_root, SkillScope::Project, notices) {
             seen.insert(skill.name.clone(), skill.skill_md_path.clone());
             skills.push(skill);
         }
@@ -166,14 +172,14 @@ pub fn discover_skills_with_roots(launch_cwd: &Path, user_root: Option<&Path>) -
     if let Some(user_root) = user_root
         && user_root.is_dir()
     {
-        for skill in scan_directory(user_root, SkillScope::User) {
+        for skill in scan_directory(user_root, SkillScope::User, notices) {
             if let Some(project_path) = seen.get(&skill.name) {
-                eprintln!(
-                    "nav-core: project skill `{}` at {} shadows user skill at {}",
+                notices.warning(format!(
+                    "project skill `{}` at {} shadows user skill at {}",
                     skill.name,
                     project_path.display(),
                     skill.skill_md_path.display()
-                );
+                ));
                 continue;
             }
             seen.insert(skill.name.clone(), skill.skill_md_path.clone());
@@ -184,14 +190,14 @@ pub fn discover_skills_with_roots(launch_cwd: &Path, user_root: Option<&Path>) -
     Catalog::new(skills)
 }
 
-fn scan_directory(root: &Path, scope: SkillScope) -> Vec<Skill> {
+fn scan_directory(root: &Path, scope: SkillScope, notices: &mut StartupNotices) -> Vec<Skill> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(err) => {
-            eprintln!(
-                "nav-core: failed to read skills root {}: {err}",
+            notices.warning(format!(
+                "failed to read skills root {}: {err}",
                 root.display()
-            );
+            ));
             return Vec::new();
         }
     };
@@ -206,10 +212,10 @@ fn scan_directory(root: &Path, scope: SkillScope) -> Vec<Skill> {
         if !skill_md_path.is_file() {
             continue;
         }
-        match load_skill(&path, &skill_md_path, scope) {
+        match load_skill(&path, &skill_md_path, scope, notices) {
             Ok(skill) => out.push(skill),
             Err(err) => {
-                eprintln!("nav-core: skipping skill at {}: {err}", path.display());
+                notices.warning(format!("skipping skill at {}: {err}", path.display()));
             }
         }
     }
@@ -223,7 +229,12 @@ struct Frontmatter {
     description: Option<String>,
 }
 
-fn load_skill(skill_dir: &Path, skill_md_path: &Path, scope: SkillScope) -> Result<Skill, String> {
+fn load_skill(
+    skill_dir: &Path,
+    skill_md_path: &Path,
+    scope: SkillScope,
+    notices: &mut StartupNotices,
+) -> Result<Skill, String> {
     let contents = fs::read_to_string(skill_md_path)
         .map_err(|err| format!("failed to read SKILL.md: {err}"))?;
     let frontmatter_str = extract_frontmatter(&contents)
@@ -245,10 +256,9 @@ fn load_skill(skill_dir: &Path, skill_md_path: &Path, scope: SkillScope) -> Resu
     if let Some(dir_name) = skill_dir.file_name().and_then(|n| n.to_str())
         && dir_name != name
     {
-        eprintln!(
-            "nav-core: skill `{}` directory name `{}` does not match frontmatter `name`",
-            name, dir_name
-        );
+        notices.warning(format!(
+            "skill `{name}` directory name `{dir_name}` does not match frontmatter `name`"
+        ));
     }
 
     // Canonicalize so downstream fs guards still accept these paths when
@@ -317,7 +327,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         write_skill(&root, "alpha", "first skill", "instructions");
 
-        let catalog = discover_skills_with_roots(&cwd, None);
+        let catalog = discover_skills_with_roots(&cwd, None, &mut StartupNotices::new());
         assert_eq!(catalog.len(), 1);
         let alpha = catalog.get("alpha").expect("alpha skill");
         assert_eq!(alpha.description, "first skill");
@@ -335,7 +345,7 @@ mod tests {
 
         let nested = root.join("a/b/c");
         fs::create_dir_all(&nested).unwrap();
-        let catalog = discover_skills_with_roots(&nested, None);
+        let catalog = discover_skills_with_roots(&nested, None, &mut StartupNotices::new());
         assert!(
             catalog.is_empty(),
             "project skills in an ancestor dir must not be picked up"
@@ -347,7 +357,8 @@ mod tests {
         let temp = tempdir().unwrap();
         let cwd = temp.path().canonicalize().unwrap();
         let empty_user = tempdir().unwrap();
-        let catalog = discover_skills_with_roots(&cwd, Some(empty_user.path()));
+        let catalog =
+            discover_skills_with_roots(&cwd, Some(empty_user.path()), &mut StartupNotices::new());
         assert!(catalog.is_empty());
     }
 
@@ -369,7 +380,7 @@ mod tests {
         fs::create_dir_all(&no_fm).unwrap();
         fs::write(no_fm.join("SKILL.md"), "no fences here").unwrap();
 
-        let catalog = discover_skills_with_roots(&cwd, None);
+        let catalog = discover_skills_with_roots(&cwd, None, &mut StartupNotices::new());
         assert_eq!(catalog.len(), 1);
         assert!(catalog.get("good").is_some());
     }
@@ -388,7 +399,8 @@ mod tests {
         write_skill(&user_root, "shared", "user version", "body-u");
         write_skill(&user_root, "user-only", "user only", "body-uo");
 
-        let catalog = discover_skills_with_roots(&cwd, Some(&user_root));
+        let catalog =
+            discover_skills_with_roots(&cwd, Some(&user_root), &mut StartupNotices::new());
         let shared = catalog.get("shared").expect("shared skill");
         assert_eq!(shared.scope, SkillScope::Project);
         assert_eq!(shared.description, "project version");
@@ -409,7 +421,8 @@ mod tests {
         fs::create_dir_all(&user_root).unwrap();
         write_skill(&user_root, "global", "user skill", "body-u");
 
-        let catalog = discover_skills_with_roots(&home_path, Some(&user_root));
+        let catalog =
+            discover_skills_with_roots(&home_path, Some(&user_root), &mut StartupNotices::new());
         let global = catalog.get("global").expect("global skill");
         assert_eq!(
             global.scope,
@@ -434,7 +447,7 @@ mod tests {
         )
         .unwrap();
 
-        let catalog = discover_skills_with_roots(&cwd, None);
+        let catalog = discover_skills_with_roots(&cwd, None, &mut StartupNotices::new());
         assert_eq!(catalog.len(), 1);
         assert!(catalog.get("right").is_some());
     }
