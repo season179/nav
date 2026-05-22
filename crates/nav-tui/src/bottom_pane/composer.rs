@@ -355,17 +355,19 @@ impl Composer {
         let mut row_offset: u16 = 0;
         for (i, line) in self.lines.iter().enumerate() {
             if i == self.row {
-                let col_chars = line[..self.col].chars().count();
-                // Cursor exactly at end of a line whose length is a multiple of
-                // the wrap width: park it at the right edge of the last visible
-                // wrapped row instead of column 0 of a phantom next row.
-                if self.col == line.len() && col_chars > 0 && col_chars % w == 0 {
-                    let last_row = (col_chars / w - 1) as u16;
-                    return (w as u16, row_offset + last_row);
+                for (seg_row, (start, end)) in wrap_ranges(line, w).into_iter().enumerate() {
+                    if self.col < start {
+                        return (0, row_offset + seg_row as u16);
+                    }
+                    if self.col <= end {
+                        let seg_col = line[start..self.col].chars().count() as u16;
+                        return (seg_col, row_offset + seg_row as u16);
+                    }
                 }
-                let seg_row = (col_chars / w) as u16;
-                let seg_col = (col_chars % w) as u16;
-                return (seg_col, row_offset + seg_row);
+                let ranges = wrap_ranges(line, w);
+                let (start, end) = ranges.last().copied().unwrap_or((0, 0));
+                let seg_col = line[start..end].chars().count() as u16;
+                return (seg_col, row_offset + ranges.len().saturating_sub(1) as u16);
             }
             row_offset = row_offset.saturating_add(wrapped_row_count(line, w) as u16);
         }
@@ -598,52 +600,104 @@ impl Default for Composer {
 }
 
 fn wrapped_row_count(line: &str, width: usize) -> usize {
-    let chars = line.chars().count();
-    if chars == 0 {
-        1
-    } else {
-        (chars - 1) / width + 1
-    }
+    wrap_ranges(line, width).len()
 }
 
 /// Yield successive `&str` slices of `line`, each at most `width` chars long.
+/// Wrapping prefers whitespace so words move to the next visual row instead of
+/// being split in the middle. Words longer than the available width still hard
+/// wrap because there is no whitespace boundary that can fit them.
+///
 /// An empty input yields a single empty slice so the row still renders.
 fn wrap_slices(line: &str, width: usize) -> WrapSlices<'_> {
     WrapSlices {
-        rest: line,
-        width: width.max(1),
-        emitted: false,
+        line,
+        ranges: wrap_ranges(line, width),
+        next: 0,
     }
 }
 
 struct WrapSlices<'a> {
-    rest: &'a str,
-    width: usize,
-    emitted: bool,
+    line: &'a str,
+    ranges: Vec<(usize, usize)>,
+    next: usize,
 }
 
 impl<'a> Iterator for WrapSlices<'a> {
     type Item = &'a str;
     fn next(&mut self) -> Option<&'a str> {
-        if self.rest.is_empty() {
-            if self.emitted {
-                return None;
-            }
-            self.emitted = true;
-            return Some("");
-        }
-        self.emitted = true;
-        let mut end = self.rest.len();
-        for (i, (byte_idx, _)) in self.rest.char_indices().enumerate() {
-            if i == self.width {
-                end = byte_idx;
+        let (start, end) = *self.ranges.get(self.next)?;
+        self.next += 1;
+        Some(&self.line[start..end])
+    }
+}
+
+fn wrap_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    if line.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut at_soft_line_start = false;
+    while start < line.len() {
+        if at_soft_line_start {
+            start = skip_leading_whitespace(line, start);
+            if start >= line.len() {
                 break;
             }
         }
-        let (seg, rest) = self.rest.split_at(end);
-        self.rest = rest;
-        Some(seg)
+
+        let Some(limit) = byte_after_chars(line, start, width) else {
+            ranges.push((start, line.len()));
+            break;
+        };
+
+        let end = if line[limit..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+        {
+            limit
+        } else if let Some((rel_idx, _)) = line[start..limit]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+        {
+            let boundary = start + rel_idx;
+            if boundary > start { boundary } else { limit }
+        } else {
+            limit
+        };
+
+        ranges.push((start, end));
+        start = end;
+        at_soft_line_start = true;
     }
+
+    if ranges.is_empty() {
+        ranges.push((line.len(), line.len()));
+    }
+    ranges
+}
+
+fn skip_leading_whitespace(line: &str, mut start: usize) -> usize {
+    while start < line.len() {
+        let ch = line[start..].chars().next().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        start += ch.len_utf8();
+    }
+    start
+}
+
+fn byte_after_chars(line: &str, start: usize, width: usize) -> Option<usize> {
+    line[start..]
+        .char_indices()
+        .nth(width)
+        .map(|(idx, _)| start + idx)
 }
 
 fn prev_char_boundary(s: &str, byte: usize) -> usize {
@@ -946,6 +1000,34 @@ mod tests {
             c.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()));
         }
         c
+    }
+
+    #[test]
+    fn wrap_slices_move_whole_words_to_next_row() {
+        let slices: Vec<&str> = wrap_slices("hello world from nav", 8).collect();
+
+        assert_eq!(slices, vec!["hello", "world", "from nav"]);
+    }
+
+    #[test]
+    fn wrap_slices_hard_wrap_words_that_are_too_long() {
+        let slices: Vec<&str> = wrap_slices("supercalifragilistic", 8).collect();
+
+        assert_eq!(slices, vec!["supercal", "ifragili", "stic"]);
+    }
+
+    #[test]
+    fn desired_height_uses_word_wrapping() {
+        let c = typed("hello world from nav");
+
+        assert_eq!(c.desired_height(8), 3);
+    }
+
+    #[test]
+    fn visual_position_uses_word_wrapping() {
+        let c = typed("hello world");
+
+        assert_eq!(c.visual_position(8), (5, 1));
     }
 
     #[test]
