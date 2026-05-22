@@ -72,6 +72,16 @@ path, so verify the real local checkout before assuming one is absent.
 - Auth, transport, session storage, settings keys, and CLI defaults are
   documented in `README.md`; prefer linking there instead of duplicating them
   here.
+- Three pair-shedding mechanisms coexist in the agent loop; compaction is
+  the primary long-session strategy and pair-drop survives only as the
+  in-compaction fallback. Order, with per-function doc comments that
+  cross-reference each other:
+  1. `prune::prune_to_budget` — proactive, before every sampling request.
+  2. Normal-turn `ContextWindowExceeded` recovery in `runner.rs` — fires a
+     full compaction and retries the turn once.
+  3. `compaction_turn::trim_for_compaction` (and its primitive
+     `drop_oldest_tool_pair`) — fallback inside a compaction turn that
+     itself overflowed.
 
 ## Scope and Safety Rules
 

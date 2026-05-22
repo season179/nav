@@ -248,9 +248,21 @@ async fn request_compaction_summary(
 }
 
 /// Trim one item from a compaction request that overflowed. Prefers dropping
-/// the oldest `function_call` + `function_call_output` pair; falls back to
-/// dropping the oldest message item when no tool pair remains. The trailing
-/// summarisation prompt is preserved.
+/// the oldest `function_call` + `function_call_output` pair (via
+/// [`drop_oldest_tool_pair`]); falls back to dropping the oldest message item
+/// when no tool pair remains. The trailing summarisation prompt is preserved
+/// so the compaction request stays structurally valid on retry.
+///
+/// **Role: fallback, in-compaction only.** This is the third and last of
+/// nav's pair-shedding mechanisms — the proactive
+/// [`super::prune::prune_to_budget`] and the normal-turn compaction recovery
+/// run before this is ever reached. Trimming from the beginning preserves
+/// prefix-cache reuse on the retry (per
+/// `docs/codex-compaction-learnings.md` §3c).
+///
+/// See also:
+/// - [`super::prune::prune_to_budget`] — primary, proactive pre-call pruner.
+/// - [`drop_oldest_tool_pair`] — the pair-removal primitive this calls.
 pub(crate) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
     let dropped_pair = drop_oldest_tool_pair(input);
     if dropped_pair > 0 {
@@ -271,9 +283,18 @@ pub(crate) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
 
 /// Drop the oldest `function_call` + matching `function_call_output` pair from
 /// the conversation `input`. Returns the number of pairs removed (`0` or `1`).
-/// Used as the in-compaction overflow fallback inside [`trim_for_compaction`];
-/// after #87, the normal-turn overflow path goes through a full compaction
-/// instead of calling this directly.
+///
+/// **Role: low-level primitive, fallback path only.** Used exclusively by
+/// [`trim_for_compaction`] inside a compaction turn that overflowed. After
+/// #87 the normal-turn overflow path runs a full compaction instead of
+/// calling this directly, so this is *not* part of the primary long-session
+/// strategy — it survives as the last-resort trim that keeps a compaction
+/// retry structurally valid.
+///
+/// See also:
+/// - [`super::prune::prune_to_budget`] — primary, proactive pre-call pruner.
+/// - [`trim_for_compaction`] — the only caller; wraps this with a
+///   fall-through to message-item drop.
 pub(crate) fn drop_oldest_tool_pair(input: &mut Vec<Value>) -> usize {
     let call_pos = input
         .iter()
