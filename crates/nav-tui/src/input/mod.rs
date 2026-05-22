@@ -12,7 +12,7 @@ mod slash;
 
 #[cfg(test)]
 use commands::parse_builtin_command;
-pub(crate) use commands::{AppEvent, dispatch_submit};
+pub(crate) use commands::{AppEvent, ModelMatch, dispatch_submit, match_model_selector};
 #[cfg(test)]
 use slash::classify_slash_with_extensions;
 pub use slash::{SlashAction, classify_slash, prepend_pending_skill};
@@ -329,6 +329,42 @@ mod tests {
         assert!(matches!(
             rx.try_recv().unwrap(),
             AppEvent::SlashError { message } if message.contains("/handoff")
+        ));
+    }
+
+    #[test]
+    fn dispatch_submit_routes_model_list() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+
+        dispatch("/model", &catalog, &tx);
+        assert!(matches!(rx.try_recv().unwrap(), AppEvent::ListModels));
+    }
+
+    #[test]
+    fn dispatch_submit_routes_model_set() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+
+        dispatch("/model openai/gpt-5.5", &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::SetModel { selector } if selector == "openai/gpt-5.5"
+        ));
+    }
+
+    #[test]
+    fn dispatch_submit_routes_model_set_bare_name() {
+        let dir = tempdir().unwrap();
+        let catalog = catalog_with_skill(dir.path());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+
+        dispatch("/model gpt-5.5", &catalog, &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AppEvent::SetModel { selector } if selector == "gpt-5.5"
         ));
     }
 }

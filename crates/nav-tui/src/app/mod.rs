@@ -11,7 +11,7 @@ use nav_core::{
     AgentEvent, Catalog, ControlPlane, ExtensionCatalog, HandoffDraft, NoticeLevel,
     OpenAiTransport, PROVIDER_OPENAI_RESPONSES, PendingInputMode, PendingSkill, ProjectContext,
     SessionId, SessionStore, StartupNotices, build_handoff_draft,
-    cli::{Args, sandbox_policy_from_args},
+    cli::{Args, list_models, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };
 use ratatui::backend::CrosstermBackend;
@@ -33,7 +33,7 @@ mod turn_task;
 
 use crate::ChatWidget;
 use crate::bottom_pane::{self, PendingApproval};
-use crate::input::{AppEvent, dispatch_submit, is_ctrl_c};
+use crate::input::{AppEvent, ModelMatch, dispatch_submit, is_ctrl_c, match_model_selector};
 use crate::theme::Theme;
 use crate::widget::parse_rewind_skill_prompt;
 use permissions::build_tui_permissions;
@@ -550,6 +550,48 @@ pub async fn run(
                             include_all,
                             &mut chat,
                         );
+                    }
+                    AppEvent::ListModels => {
+                        let lines = list_models(project.settings.providers.as_ref());
+                        chat.push_model_list(
+                            lines,
+                            args.model.clone(),
+                            project.settings.default_model.clone(),
+                        );
+                    }
+                    AppEvent::SetModel { selector } => {
+                        let catalog = project.settings.providers.as_ref();
+                        let Some(catalog) = catalog else {
+                            chat.push_model_set(
+                                "no providers configured — add providers.models to .nav/settings.json",
+                            );
+                            continue;
+                        };
+                        match match_model_selector(&selector, catalog) {
+                            ModelMatch::Exact(sel) | ModelMatch::BareUnique(sel) => {
+                                match store.set_session_model(&session_id, &sel) {
+                                    Ok(()) => {
+                                        chat.push_model_set(format!(
+                                            "Set next session model to \"{sel}\".\n\
+                                            Restart nav (Ctrl+C, rerun) for the change to take effect."
+                                        ));
+                                    }
+                                    Err(err) => chat.push_err(err),
+                                }
+                            }
+                            ModelMatch::Ambiguous(sels) => {
+                                let list = sels.join("\n  ");
+                                chat.push_model_set(format!(
+                                    "\"{selector}\" is ambiguous — matches:\n  {list}\n\
+                                    Use a qualified <provider>/<model> selector."
+                                ));
+                            }
+                            ModelMatch::NotFound => {
+                                chat.push_model_set(format!(
+                                    "No model matches \"{selector}\". Run /model to list."
+                                ));
+                            }
+                        }
                     }
                     AppEvent::Handoff { goal } => {
                         if active_turn.is_some() {
