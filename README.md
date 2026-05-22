@@ -390,6 +390,28 @@ The id can be anything — just use the same `provider/model` form in
 }
 ```
 
+### Auth and the Provider Catalog
+
+`nav` has two auth paths:
+
+- **ChatGPT subscription (default).** When no `default_model` is set,
+  `--auth chatgpt` reads `~/.codex/auth.json` (created by `codex login`)
+  and calls OpenAI's **Responses API**.
+
+- **API key / third-party provider.** Set the provider's env var
+  (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, etc.) and either pass
+  `--model <provider>/<model>` on the command line or set `default_model` in
+  `settings.json`. These providers use the **Chat Completions API**.
+
+The provider catalog is consulted only when `default_model` or `--model`
+points at a provider entry; otherwise `nav` falls back to the Codex/ChatGPT
+OAuth flow.
+
+**Switching models mid-session.** `/model` swaps to any model in your provider
+catalog. Switching from the default ChatGPT path to a Chat Completions provider
+works; switching back mid-session is not supported — start a new session
+instead.
+
 ## Skills And Extensions
 
 Project skills live in `<cwd>/.agents/skills/`. User skills live in
