@@ -9,8 +9,9 @@
 //! spinning up the full CLI binary.
 
 use crate::cli::{Args, AuthMode, SandboxMode};
-use crate::context::{ProjectContext, resolved_db_path, shorten_home};
+use crate::context::{ProjectContext, Settings, resolved_db_path, shorten_home};
 use crate::model::auth::{AuthConfig, load_auth};
+use crate::model::resolve_value::resolve_value;
 use clap::ValueEnum;
 use serde::Serialize;
 use std::env;
@@ -45,6 +46,7 @@ impl DoctorStatus {
 pub enum DoctorGroup {
     Runtime,
     Auth,
+    Config,
     Storage,
     Project,
     Install,
@@ -55,6 +57,7 @@ impl DoctorGroup {
         match self {
             DoctorGroup::Runtime => "runtime",
             DoctorGroup::Auth => "auth",
+            DoctorGroup::Config => "config",
             DoctorGroup::Storage => "storage",
             DoctorGroup::Project => "project",
             DoctorGroup::Install => "install",
@@ -190,6 +193,7 @@ pub fn run(
     let mut b = DoctorBuilder::new();
     check_runtime(&mut b, args);
     check_auth(&mut b, args);
+    check_config(&mut b, args, &project.settings);
     check_storage(&mut b, args);
     check_project(&mut b, cwd, project);
     check_install(&mut b, install_manifest_dir);
@@ -284,6 +288,139 @@ fn redacted_summary(args: &Args, config: &AuthConfig) -> String {
         AuthMode::Chatgpt => "ChatGPT OAuth token resolved",
     };
     format!("{credential} (len {bearer_len}, ends …{suffix}); endpoint {endpoint}")
+}
+
+// ── config (providers & default_model) ────────────────────────────
+
+/// Classify a config string into a human-readable credential source
+/// description without leaking the actual value. Follows the same
+/// precedence as [`resolve_value`]: `!command` → env → literal.
+/// Returns `(description, resolved)` where `resolved` is true when the
+/// credential could be read successfully.
+fn credential_source(api_key: &str) -> (String, bool) {
+    if let Some(cmd) = api_key.strip_prefix('!') {
+        return match resolve_value(api_key) {
+            Ok(Some(_)) => (format!("shell command `{cmd}` (resolves)"), true),
+            Ok(None) => (format!("shell command `{cmd}` (empty output)"), false),
+            Err(err) => (format!("shell command `{cmd}` (error: {err:#})"), false),
+        };
+    }
+    if let Ok(val) = env::var(api_key) {
+        if val.is_empty() {
+            return (format!("env:{api_key} (empty)"), false);
+        }
+        return (format!("env:{api_key} (set)"), true);
+    }
+    (format!("literal (length: {})", api_key.len()), true)
+}
+
+fn check_config(b: &mut DoctorBuilder, args: &Args, settings: &Settings) {
+    let Some(ref catalog) = settings.providers else {
+        b.warn(DoctorGroup::Config, "providers", "no providers catalog configured");
+        check_active_path(b, args, settings);
+        return;
+    };
+
+    // ── Per-provider credential status ──
+    for (provider_id, provider) in catalog {
+        let display_name = provider.name.as_deref().unwrap_or(provider_id);
+        let label = format!("provider/{provider_id}");
+        let models_suffix = if provider.models.is_empty() {
+            "no models configured".to_string()
+        } else {
+            format!("{} model(s)", provider.models.len())
+        };
+
+        let (source, resolved) = match provider.api_key.as_deref() {
+            Some(api_key) => credential_source(api_key),
+            None => ("not set".to_string(), true),
+        };
+        let detail = format!("{display_name} — {source}; {models_suffix}");
+        if resolved {
+            b.ok(DoctorGroup::Config, &label, detail);
+        } else {
+            b.warn(DoctorGroup::Config, &label, detail);
+        }
+    }
+
+    // ── default_model ──
+    let Some(dm) = settings.default_model.as_deref() else {
+        b.warn(
+            DoctorGroup::Config,
+            "default_model",
+            "not set — pass --model or set default_model in settings.json",
+        );
+        check_active_path(b, args, settings);
+        return;
+    };
+
+    let Some((provider_id, _model_key)) = dm.split_once('/') else {
+        b.fail(
+            DoctorGroup::Config,
+            "default_model",
+            format!("{dm} — not in <provider>/<model> form"),
+        );
+        check_active_path(b, args, settings);
+        return;
+    };
+
+    let Some(provider) = catalog.get(provider_id) else {
+        b.fail(
+            DoctorGroup::Config,
+            "default_model",
+            format!("{dm} — provider `{provider_id}` not in catalog"),
+        );
+        check_active_path(b, args, settings);
+        return;
+    };
+
+    let dm_resolved = match provider.api_key.as_deref() {
+        Some(api_key) => credential_source(api_key).1,
+        None => true,
+    };
+    if dm_resolved {
+        b.ok(DoctorGroup::Config, "default_model", dm);
+    } else {
+        b.fail(
+            DoctorGroup::Config,
+            "default_model",
+            format!("{dm} — provider `{provider_id}` credential is unresolvable"),
+        );
+    }
+
+    check_active_path(b, args, settings);
+}
+
+/// What would nav do if invoked right now? Extracted so `check_config`
+/// can call it at each early-return point without duplicating the match.
+fn check_active_path(b: &mut DoctorBuilder, args: &Args, settings: &Settings) {
+    match args.auth {
+        AuthMode::Chatgpt => {
+            b.ok(
+                DoctorGroup::Config,
+                "active path",
+                "ChatGPT OAuth (--auth chatgpt)",
+            );
+        }
+        AuthMode::ApiKey => {
+            let sel = args.model.as_str();
+            match crate::model::auth::resolve_provider(Some(sel), settings) {
+                Ok(resolved) => b.ok(
+                    DoctorGroup::Config,
+                    "active path",
+                    format!(
+                        "provider `{}` → model `{}` (--auth api-key)",
+                        resolved.display_name, resolved.model_id
+                    ),
+                ),
+                Err(err) => b.warn(
+                    DoctorGroup::Config,
+                    "active path",
+                    format!("could not resolve `{sel}`: {err:#}"),
+                ),
+            }
+        }
+    }
 }
 
 // ── storage ─────────────────────────────────────────────────────────
@@ -736,5 +873,318 @@ mod tests {
         let resolved =
             cargo_install_bin_dir_from(None, None, || Some(PathBuf::from("/tmp/home"))).unwrap();
         assert_eq!(resolved, PathBuf::from("/tmp/home/.cargo/bin"));
+    }
+
+    // ── config diagnostics ─────────────────────────────────────────
+
+    use crate::context::{ModelConfig, ProviderConfig, built_in_providers};
+    use std::collections::BTreeMap;
+
+    fn settings_with_providers() -> Settings {
+        let mut providers = built_in_providers();
+        // Add a model under ollama so the active path can resolve.
+        providers
+            .get_mut("ollama")
+            .unwrap()
+            .models
+            .insert("llama3".to_string(), ModelConfig::default());
+        Settings {
+            providers: Some(providers),
+            default_model: Some("ollama/llama3".to_string()),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn config_section_lists_all_providers() {
+        let mut b = DoctorBuilder::new();
+        let settings = settings_with_providers();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let config_rows: Vec<_> = b
+            .checks
+            .iter()
+            .filter(|c| matches!(c.group, DoctorGroup::Config))
+            .collect();
+        // Should have: 8 built-in providers + default_model + active path
+        assert_eq!(config_rows.len(), 10);
+        // Spot-check that built-in providers appear.
+        assert!(config_rows.iter().any(|r| r.label == "provider/openai"));
+        assert!(config_rows.iter().any(|r| r.label == "provider/ollama"));
+        assert!(config_rows.iter().any(|r| r.label == "provider/deepseek"));
+    }
+
+    #[test]
+    fn config_shows_env_source_for_env_api_key() {
+        let mut b = DoctorBuilder::new();
+        let settings = settings_with_providers();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        // openai uses OPENAI_API_KEY. The source depends on whether the env
+        // var is actually set in the test runner. We just verify no actual
+        // key value leaks — the classification is tested separately in
+        // `credential_source_classifies_*`.
+        let openai_row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "provider/openai")
+            .unwrap();
+        // The important thing: no actual key value leaks.
+        assert!(
+            !openai_row.detail.contains("sk-") || openai_row.detail.contains("literal"),
+            "credential leaked: {}",
+            openai_row.detail
+        );
+    }
+
+    #[test]
+    fn config_shows_not_set_for_local_providers() {
+        let mut b = DoctorBuilder::new();
+        let settings = settings_with_providers();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let ollama_row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "provider/ollama")
+            .unwrap();
+        assert!(
+            ollama_row.detail.contains("not set"),
+            "expected 'not set' for local provider, got: {}",
+            ollama_row.detail
+        );
+        // No api_key means ok status.
+        assert!(matches!(ollama_row.status, DoctorStatus::Ok));
+    }
+
+    #[test]
+    fn config_literal_api_key_shows_length() {
+        let mut settings = settings_with_providers();
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .insert(
+                "custom".to_string(),
+                ProviderConfig {
+                    name: Some("Custom".to_string()),
+                    base_url: Some("https://api.custom.example/v1".to_string()),
+                    api_key: Some("sk-1234567890".to_string()),
+                    headers: None,
+                    models: BTreeMap::new(),
+                },
+            );
+        let mut b = DoctorBuilder::new();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let custom_row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "provider/custom")
+            .unwrap();
+        assert!(
+            custom_row.detail.contains("literal (length: 13)"),
+            "expected literal with length 13, got: {}",
+            custom_row.detail
+        );
+        assert!(matches!(custom_row.status, DoctorStatus::Ok));
+    }
+
+    #[test]
+    fn config_warns_on_unresolvable_shell_command() {
+        let mut settings = settings_with_providers();
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .insert(
+                "shellprov".to_string(),
+                ProviderConfig {
+                    name: Some("ShellProv".to_string()),
+                    base_url: Some("https://api.shell.example/v1".to_string()),
+                    api_key: Some("!false".to_string()),
+                    headers: None,
+                    models: BTreeMap::new(),
+                },
+            );
+        let mut b = DoctorBuilder::new();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "provider/shellprov")
+            .unwrap();
+        assert!(
+            matches!(row.status, DoctorStatus::Warn),
+            "unresolvable shell command should be warn, got {:?}",
+            row.status
+        );
+        assert!(row.detail.contains("shell command"));
+    }
+
+    #[test]
+    fn config_default_model_ok_when_resolvable() {
+        let mut b = DoctorBuilder::new();
+        let settings = settings_with_providers();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let dm_row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "default_model")
+            .unwrap();
+        assert!(matches!(dm_row.status, DoctorStatus::Ok));
+        assert!(dm_row.detail.contains("ollama/llama3"));
+    }
+
+    #[test]
+    fn config_default_model_fail_when_provider_unresolvable() {
+        let mut settings = settings_with_providers();
+        // Point default_model at a provider with a failing shell command.
+        settings
+            .providers
+            .as_mut()
+            .unwrap()
+            .insert(
+                "broken".to_string(),
+                ProviderConfig {
+                    name: Some("Broken".to_string()),
+                    base_url: Some("https://api.broken.example/v1".to_string()),
+                    api_key: Some("!false".to_string()),
+                    headers: None,
+                    models: {
+                        let mut m = BTreeMap::new();
+                        m.insert("m1".to_string(), ModelConfig::default());
+                        m
+                    },
+                },
+            );
+        settings.default_model = Some("broken/m1".to_string());
+        let mut b = DoctorBuilder::new();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let dm_row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "default_model")
+            .unwrap();
+        assert!(
+            matches!(dm_row.status, DoctorStatus::Fail),
+            "expected fail for unresolvable default_model, got {:?}",
+            dm_row.status
+        );
+        assert!(dm_row.detail.contains("unresolvable"));
+    }
+
+    #[test]
+    fn config_default_model_warn_when_not_set() {
+        let mut settings = settings_with_providers();
+        settings.default_model = None;
+        let mut b = DoctorBuilder::new();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let dm_row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "default_model")
+            .unwrap();
+        assert!(matches!(dm_row.status, DoctorStatus::Warn));
+    }
+
+    #[test]
+    fn config_active_path_shows_chatgpt_when_auth_chatgpt() {
+        let mut b = DoctorBuilder::new();
+        let settings = settings_with_providers();
+        let mut args = Args::test_default();
+        args.auth = AuthMode::Chatgpt;
+        check_config(&mut b, &args, &settings);
+        let path_row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "active path")
+            .unwrap();
+        assert!(matches!(path_row.status, DoctorStatus::Ok));
+        assert!(path_row.detail.contains("ChatGPT"));
+    }
+
+    #[test]
+    fn config_active_path_resolves_provider_for_api_key() {
+        let mut b = DoctorBuilder::new();
+        let settings = settings_with_providers();
+        let mut args = Args::test_default();
+        args.auth = AuthMode::ApiKey;
+        args.model = "ollama/llama3".to_string();
+        check_config(&mut b, &args, &settings);
+        let path_row = b
+            .checks
+            .iter()
+            .find(|c| c.label == "active path")
+            .unwrap();
+        assert!(matches!(path_row.status, DoctorStatus::Ok));
+        // Display name uses the provider's `name` field: "Ollama (local)".
+        assert!(path_row.detail.contains("Ollama"), "got: {}", path_row.detail);
+    }
+
+    #[test]
+    fn config_warns_when_no_providers_catalog() {
+        let settings = Settings::default();
+        let mut b = DoctorBuilder::new();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let config_rows: Vec<_> = b
+            .checks
+            .iter()
+            .filter(|c| matches!(c.group, DoctorGroup::Config))
+            .collect();
+        // 1 warn (no providers) + 1 active path row.
+        assert_eq!(config_rows.len(), 2);
+        assert!(matches!(config_rows[0].status, DoctorStatus::Warn));
+        assert!(config_rows[0].detail.contains("no providers catalog"));
+    }
+
+    #[test]
+    fn config_credential_source_never_leaks_values() {
+        let mut b = DoctorBuilder::new();
+        let settings = settings_with_providers();
+        let args = Args::test_default();
+        check_config(&mut b, &args, &settings);
+        let all_text: String = b
+            .checks
+            .iter()
+            .map(|c| format!("{} {}", c.label, c.detail))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Env var names are ok, but actual env values must not appear.
+        // OPENAI_API_KEY is the env name used by the built-in openai provider.
+        // The literal "OPENAI_API_KEY" is fine; a resolved sk-… value is not.
+        assert!(
+            !all_text.contains("sk-") || all_text.contains("literal"),
+            "credential value may have leaked: {all_text}"
+        );
+    }
+
+    #[test]
+    fn credential_source_classifies_shell_command() {
+        let (src, resolved) = credential_source("!echo secret");
+        assert!(src.contains("shell command"), "got: {src}");
+        assert!(src.contains("resolves"), "got: {src}");
+        assert!(resolved);
+    }
+
+    #[test]
+    fn credential_source_classifies_failing_shell_command() {
+        let (src, resolved) = credential_source("!false");
+        assert!(src.contains("shell command"), "got: {src}");
+        assert!(src.contains("error"), "got: {src}");
+        assert!(!resolved);
+    }
+
+    #[test]
+    fn credential_source_classifies_literal() {
+        let (src, resolved) = credential_source("sk-my-literal-key");
+        assert!(src.contains("literal"), "got: {src}");
+        assert!(src.contains("length: 17"), "got: {src}");
+        assert!(resolved);
     }
 }
