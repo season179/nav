@@ -10,7 +10,7 @@ use super::events::{
     CompactionAnalyticsEvent, CompactionAnalyticsPhase, CompactionReason, CompactionStatus,
     CompactionTrigger,
 };
-use super::runner::{SessionBinding, drop_oldest_tool_pair};
+use super::runner::SessionBinding;
 use crate::cli::Args;
 use crate::context::compaction::{
     InitialContextInjection, append_compaction_details, build_history_summary_prompt,
@@ -267,6 +267,46 @@ pub(crate) fn trim_for_compaction(input: &mut Vec<Value>) -> usize {
         }
     }
     0
+}
+
+/// Drop the oldest `function_call` + matching `function_call_output` pair from
+/// the conversation `input`. Returns the number of pairs removed (`0` or `1`).
+/// Used as the in-compaction overflow fallback inside [`trim_for_compaction`];
+/// after #87, the normal-turn overflow path goes through a full compaction
+/// instead of calling this directly.
+pub(crate) fn drop_oldest_tool_pair(input: &mut Vec<Value>) -> usize {
+    let call_pos = input
+        .iter()
+        .position(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
+    let Some(call_pos) = call_pos else {
+        return 0;
+    };
+    let call_id = input[call_pos]
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(call_id) = call_id else {
+        // Malformed item — drop just this entry rather than nothing.
+        input.remove(call_pos);
+        return 1;
+    };
+    // Find the matching output anywhere after the call (it usually appears
+    // immediately, but the API sometimes interleaves additional items).
+    let output_pos = input
+        .iter()
+        .enumerate()
+        .skip(call_pos + 1)
+        .find(|(_, item)| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id.as_str())
+        })
+        .map(|(idx, _)| idx);
+    if let Some(out_pos) = output_pos {
+        // Remove output first so the call index stays valid.
+        input.remove(out_pos);
+    }
+    input.remove(call_pos);
+    1
 }
 
 /// Emit a structured analytics event via `tracing::info!`. This is

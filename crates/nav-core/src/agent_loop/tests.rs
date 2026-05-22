@@ -1,6 +1,6 @@
-use super::compaction_turn::trim_for_compaction;
+use super::compaction_turn::{drop_oldest_tool_pair, trim_for_compaction};
 use super::control::{PendingInput, PendingInputMode, TurnControls};
-use super::runner::{drop_oldest_tool_pair, emit_stream_events, extract_message_text};
+use super::runner::{emit_stream_events, extract_message_text};
 use super::*;
 use crate::cli::Args;
 use crate::context::compaction::{SUMMARIZATION_PROMPT, SUMMARY_PREFIX, summary_message};
@@ -3061,7 +3061,7 @@ async fn user_message_image_is_stripped_for_text_only_model() {
 // ── context-overflow recovery ─────────────────────────────────
 
 #[tokio::test]
-async fn overflow_one_shot_recovery_trims_and_continues() {
+async fn overflow_one_shot_recovery_compacts_and_continues() {
     // Turn 1: model asks for a tool call.
     let turn_one = vec![
         StubItem::Event(json!({
@@ -3081,8 +3081,13 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
             message: "input is too long".into(),
         },
     )];
-    // Turn 3 (after recovery trims the oldest tool pair): model finishes.
-    let turn_three = vec![
+    // Turn 3: the compaction-recovery summarisation turn fires next.
+    let turn_three_summary = compact_turn_with_text("HANDOFF: covered")
+        .into_iter()
+        .map(StubItem::Event)
+        .collect();
+    // Turn 4 (after recovery rewrites history): model finishes.
+    let turn_four = vec![
         StubItem::Event(json!({
             "type": "response.output_item.done",
             "item": {
@@ -3092,7 +3097,12 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
         })),
         StubItem::Event(json!({"type": "response.completed", "response": {}})),
     ];
-    let transport = StubTransport::with_items(vec![turn_one, turn_two, turn_three]);
+    let transport = StubTransport::with_items(vec![
+        turn_one,
+        turn_two,
+        turn_three_summary,
+        turn_four,
+    ]);
 
     let mut args = Args::test_default();
     args.max_turns = 6;
@@ -3122,34 +3132,43 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
         events.push(event);
     }
 
-    let trimmed = events
-        .iter()
-        .find(|e| matches!(e, AgentEvent::ContextTrimmed { .. }))
-        .expect("expected ContextTrimmed event");
-    assert!(matches!(
-        trimmed,
-        AgentEvent::ContextTrimmed { dropped_pairs } if *dropped_pairs == 1
-    ));
+    // Compaction lifecycle: Started → Completed, both with the Auto trigger.
+    let started_pos = event_position(&events, "CompactionStarted", |e| {
+        matches!(
+            e,
+            AgentEvent::CompactionStarted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    let completed_pos = event_position(&events, "CompactionCompleted", |e| {
+        matches!(
+            e,
+            AgentEvent::CompactionCompleted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    assert!(started_pos < completed_pos);
 
-    // The recovery-retry body (3rd `create()` call) must no longer contain
-    // the original `function_call` for call_1.
+    // The retry sampling (4th `create()` call) must no longer contain the
+    // original `function_call` for call_1 — compaction rewrote history.
     let bodies = transport.bodies();
     assert_eq!(
         bodies.len(),
-        3,
-        "agent should make exactly 3 transport calls"
+        4,
+        "tool sampling + overflow attempt + compaction summary + retry"
     );
-    let recovery_input = bodies[2]
+    let retry_input = bodies[3]
         .get("input")
         .and_then(Value::as_array)
-        .expect("recovery body has input");
-    let has_call_1 = recovery_input.iter().any(|item| {
+        .expect("retry body has input");
+    let has_call_1 = retry_input.iter().any(|item| {
         item.get("type").and_then(Value::as_str) == Some("function_call")
             && item.get("call_id").and_then(Value::as_str) == Some("call_1")
     });
-    assert!(!has_call_1, "call_1 should have been trimmed");
+    assert!(!has_call_1, "call_1 should be gone from the compacted retry");
 
-    // Recovery is one-shot; the flag is consumed. No need to assert directly.
+    // Recovery is one-shot; the flag is consumed. The retry's assistant
+    // message bubbles all the way back up to the user.
     assert!(
         events
             .iter()
@@ -3160,9 +3179,9 @@ async fn overflow_one_shot_recovery_trims_and_continues() {
 #[tokio::test]
 async fn overflow_recovery_does_not_consume_turn_budget() {
     // With max_turns=2, the agent must still be able to (1) run a tool-call
-    // turn, (2) hit overflow, trim, (3) retry, and (4) finish — even though
-    // the trim+retry conceptually happens on what would have been the "last"
-    // turn. Recovery is bookkeeping, not a real model turn.
+    // turn, (2) hit overflow, compact, (3) retry, and (4) finish — even
+    // though the compaction+retry conceptually happens on what would have
+    // been the "last" turn. Recovery is bookkeeping, not a real model turn.
     let turn_one = vec![
         StubItem::Event(json!({
             "type": "response.output_item.done",
@@ -3180,7 +3199,11 @@ async fn overflow_recovery_does_not_consume_turn_budget() {
             message: "too long".into(),
         },
     )];
-    let turn_three_after_trim = vec![
+    let turn_three_summary = compact_turn_with_text("HANDOFF: covered")
+        .into_iter()
+        .map(StubItem::Event)
+        .collect();
+    let turn_four_after_compact = vec![
         StubItem::Event(json!({
             "type": "response.output_item.done",
             "item": {
@@ -3190,8 +3213,12 @@ async fn overflow_recovery_does_not_consume_turn_budget() {
         })),
         StubItem::Event(json!({"type": "response.completed", "response": {}})),
     ];
-    let transport =
-        StubTransport::with_items(vec![turn_one, turn_two_overflow, turn_three_after_trim]);
+    let transport = StubTransport::with_items(vec![
+        turn_one,
+        turn_two_overflow,
+        turn_three_summary,
+        turn_four_after_compact,
+    ]);
 
     let mut args = Args::test_default();
     args.max_turns = 2;
@@ -3221,21 +3248,24 @@ async fn overflow_recovery_does_not_consume_turn_budget() {
         events.push(event);
     }
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ContextTrimmed { dropped_pairs: 1 }))
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::CompactionCompleted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )),
+        "expected CompactionCompleted from overflow recovery"
     );
     assert!(
         events
             .iter()
             .any(|e| matches!(e, AgentEvent::AssistantMessageDone { text } if text == "done"))
     );
-    assert_eq!(transport.bodies().len(), 3, "3 transport calls expected");
+    assert_eq!(transport.bodies().len(), 4, "4 transport calls expected");
 }
 
 #[tokio::test]
 async fn overflow_second_failure_surfaces_clean_error() {
-    // Turn 1: tool call to seed a droppable pair.
+    // Turn 1: tool call to seed history with droppable items.
     let turn_one = vec![
         StubItem::Event(json!({
             "type": "response.output_item.done",
@@ -3248,19 +3278,29 @@ async fn overflow_second_failure_surfaces_clean_error() {
         })),
         StubItem::Event(json!({"type": "response.completed", "response": {}})),
     ];
-    // First overflow.
+    // First overflow → triggers compaction-recovery.
     let turn_two = vec![StubItem::Err(
         crate::model::responses::ResponsesError::ContextWindowExceeded {
             message: "too long".into(),
         },
     )];
+    // Compaction summarisation succeeds with a summary.
+    let turn_three_summary = compact_turn_with_text("HANDOFF: covered")
+        .into_iter()
+        .map(StubItem::Event)
+        .collect();
     // Second overflow — recovery already consumed, must surface as Error.
-    let turn_three = vec![StubItem::Err(
+    let turn_four_overflow = vec![StubItem::Err(
         crate::model::responses::ResponsesError::ContextWindowExceeded {
             message: "still too long".into(),
         },
     )];
-    let transport = StubTransport::with_items(vec![turn_one, turn_two, turn_three]);
+    let transport = StubTransport::with_items(vec![
+        turn_one,
+        turn_two,
+        turn_three_summary,
+        turn_four_overflow,
+    ]);
 
     let mut args = Args::test_default();
     args.max_turns = 6;
@@ -3290,16 +3330,133 @@ async fn overflow_second_failure_surfaces_clean_error() {
     while let Some(event) = rx.recv().await {
         events.push(event);
     }
-    let trimmed_count = events
+    let compaction_started_count = events
         .iter()
-        .filter(|e| matches!(e, AgentEvent::ContextTrimmed { .. }))
+        .filter(|e| matches!(e, AgentEvent::CompactionStarted { .. }))
         .count();
-    assert_eq!(trimmed_count, 1, "recovery should only fire once");
+    assert_eq!(
+        compaction_started_count, 1,
+        "compaction-recovery should fire exactly once per run"
+    );
     let error_count = events
         .iter()
         .filter(|e| matches!(e, AgentEvent::Error { .. }))
         .count();
     assert_eq!(error_count, 1);
+}
+
+#[tokio::test]
+async fn overflow_recovery_retry_sees_compacted_history() {
+    // Acceptance criterion for #87: the retry sampling after an overflow
+    // must see the *compacted* history shape — its trailing user message
+    // carries the SUMMARY_PREFIX-marked summary, with the pre-compaction
+    // tool exchange gone.
+    let turn_one = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"echo hi\"}"
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let turn_two_overflow = vec![StubItem::Err(
+        crate::model::responses::ResponsesError::ContextWindowExceeded {
+            message: "too long".into(),
+        },
+    )];
+    let turn_three_summary = compact_turn_with_text("HANDOFF: rolled forward")
+        .into_iter()
+        .map(StubItem::Event)
+        .collect();
+    let turn_four_retry = vec![
+        StubItem::Event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "all done"}]
+            }
+        })),
+        StubItem::Event(json!({"type": "response.completed", "response": {}})),
+    ];
+    let transport = StubTransport::with_items(vec![
+        turn_one,
+        turn_two_overflow,
+        turn_three_summary,
+        turn_four_retry,
+    ]);
+
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "go",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("compaction recovery should succeed");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    let started_pos = event_position(&events, "CompactionStarted", |e| {
+        matches!(
+            e,
+            AgentEvent::CompactionStarted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    let completed_pos = event_position(&events, "CompactionCompleted", |e| {
+        matches!(
+            e,
+            AgentEvent::CompactionCompleted { trigger, .. }
+                if matches!(trigger, super::CompactionTrigger::Auto)
+        )
+    });
+    assert!(started_pos < completed_pos);
+
+    // The retry request body — the 4th create() — must show a compacted
+    // history: no `function_call_output` items, and the trailing item is
+    // the SUMMARY_PREFIX-marked user message.
+    let bodies = transport.bodies();
+    assert_eq!(bodies.len(), 4);
+    let retry_input = bodies[3]
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("retry input");
+    let function_outputs: Vec<&Value> = retry_input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .collect();
+    assert!(
+        function_outputs.is_empty(),
+        "compaction must drop function_call_output from the retry input: {function_outputs:?}"
+    );
+    let last_text = retry_input
+        .last()
+        .and_then(|item| item.get("content"))
+        .and_then(Value::as_str)
+        .expect("retry input ends with a user message carrying the summary");
+    assert!(
+        last_text.starts_with(SUMMARY_PREFIX),
+        "trailing item is the compaction summary: {last_text}"
+    );
 }
 
 #[tokio::test]

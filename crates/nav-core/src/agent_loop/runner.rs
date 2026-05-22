@@ -292,8 +292,10 @@ pub(super) async fn run_agent_inner(
         "content": content,
     }));
 
-    // One-shot recovery per `run_agent` call. The first overflow drops the
-    // oldest tool pair and retries the turn; a second overflow gives up.
+    // One-shot recovery per `run_agent` call. The first overflow fires a
+    // compaction and retries the turn with the compacted history; a second
+    // overflow gives up. Pair-drop survives only as the in-compaction trim
+    // inside `trim_for_compaction`.
     let mut overflow_recovery_attempted = false;
     // Tracked manually so an overflow trim+retry doesn't consume the user's
     // turn budget — the server rejected our request before any work happened.
@@ -356,22 +358,59 @@ pub(super) async fn run_agent_inner(
                     if !overflow_recovery_attempted =>
                 {
                     overflow_recovery_attempted = true;
-                    let dropped = drop_oldest_tool_pair(&mut input);
-                    if dropped == 0 {
-                        return fail(
-                            &events,
+                    let tokens_before =
+                        session.map(|binding| binding.rolling_input_tokens()).unwrap_or(0);
+                    let outcome = run_compaction_turn(
+                        CompactionTurnRequest {
+                            transport,
+                            args,
+                            cwd,
+                            trigger: CompactionTrigger::Auto,
+                            reason: CompactionReason::ContextLimit,
+                            phase: CompactionAnalyticsPhase::MidTurn,
+                            tokens_before,
                             session,
-                            anyhow!(
-                                "context window exceeded with no prior tool pair to drop: {message}"
-                            ),
-                        );
-                    }
-                    emit(
-                        &events,
-                        session,
-                        AgentEvent::ContextTrimmed {
-                            dropped_pairs: dropped,
+                            events: &events,
+                            skills,
+                            context,
+                            initial_context_injection:
+                                InitialContextInjection::BeforeLastUserMessage,
                         },
+                        &mut input,
+                    )
+                    .await;
+                    if let Err(err) = outcome {
+                        // `run_compaction_turn` already emitted
+                        // `CompactionFailed` with the structured cause
+                        // (summary error, persistence failure, or
+                        // in-compaction overflow exhaustion). Surface the
+                        // Err to the caller without also calling `fail()`
+                        // — that would double-emit `AgentEvent::Error`
+                        // alongside the existing `CompactionFailed`, and
+                        // the manual `/compact` failure path leaves the
+                        // event-level signal to `CompactionFailed`
+                        // exclusively. Stay consistent here.
+                        return Err(anyhow!(
+                            "context window exceeded; recovery compaction did not succeed: {err:#} (original overflow: {message})"
+                        ));
+                    }
+                    // Compaction succeeded — if an earlier post-finalize
+                    // auto-compact in this same user turn had failed and
+                    // latched `compaction_failed_this_turn`, this proves
+                    // compaction works again for the current session
+                    // state. Clear the latch so the post-finalize gate is
+                    // re-consulted on later iterations.
+                    compaction_failed_this_turn = false;
+                    // Compaction's carry-forward strips synthetic items, so
+                    // the ambient context pushed at the top of
+                    // `run_agent_inner` is gone. Re-inject it so the retried
+                    // sampling still sees cwd / git status alongside the
+                    // compacted history.
+                    push_ambient_context(
+                        &mut input,
+                        cwd,
+                        context,
+                        args.ambient_context_token_budget,
                     );
                     continue 'turns;
                 }
@@ -837,45 +876,6 @@ fn emit_turn_aborted(
             reason: reason.into(),
         },
     );
-}
-
-/// Drop the oldest `function_call` + matching `function_call_output` pair from
-/// the conversation `input`. Returns the number of pairs removed (`0` or `1`).
-/// Used for one-shot context-overflow recovery: we shed the oldest tool
-/// exchange and re-issue the turn with a shorter transcript.
-pub(crate) fn drop_oldest_tool_pair(input: &mut Vec<Value>) -> usize {
-    let call_pos = input
-        .iter()
-        .position(|item| item.get("type").and_then(Value::as_str) == Some("function_call"));
-    let Some(call_pos) = call_pos else {
-        return 0;
-    };
-    let call_id = input[call_pos]
-        .get("call_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let Some(call_id) = call_id else {
-        // Malformed item — drop just this entry rather than nothing.
-        input.remove(call_pos);
-        return 1;
-    };
-    // Find the matching output anywhere after the call (it usually appears
-    // immediately, but the API sometimes interleaves additional items).
-    let output_pos = input
-        .iter()
-        .enumerate()
-        .skip(call_pos + 1)
-        .find(|(_, item)| {
-            item.get("type").and_then(Value::as_str) == Some("function_call_output")
-                && item.get("call_id").and_then(Value::as_str) == Some(call_id.as_str())
-        })
-        .map(|(idx, _)| idx);
-    if let Some(out_pos) = output_pos {
-        // Remove output first so the call index stays valid.
-        input.remove(out_pos);
-    }
-    input.remove(call_pos);
-    1
 }
 
 fn fail<T>(
