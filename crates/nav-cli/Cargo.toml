@@ -12,8 +12,11 @@ nav-core = { path = "../nav-core" }
 nav-tui = { path = "../nav-tui" }
 anyhow.workspace = true
 clap.workspace = true
+dirs.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

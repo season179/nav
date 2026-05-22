@@ -23,10 +23,11 @@ use nav_core::{
 use std::env;
 use std::io::{IsTerminal, Read};
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+mod upgrade;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,7 +36,7 @@ async fn main() -> Result<()> {
         return list_sessions_command(&args);
     }
     if is_upgrade_command(&args.prompt) {
-        return run_upgrade();
+        return upgrade::run().await;
     }
 
     let cwd = env::current_dir()?
@@ -607,7 +608,7 @@ fn print_search_hits(hits: &[TranscriptHit]) {
 /// settings-merged `args` and pre-loaded `project` come from the caller so
 /// doctor reports the same configuration the agent loop would see — not the
 /// bare clap defaults. `CARGO_MANIFEST_DIR` is read here so doctor reports
-/// `nav-cli`'s manifest (the one `run_upgrade` installs from), not
+/// `nav-cli`'s manifest (the source-of-truth for any dev install), not
 /// `nav-core`'s — those would be the same nav-core function called from a
 /// different crate.
 fn doctor_command(args: &Args, cwd: &Path, project: &ProjectContext, json: bool) -> Result<()> {
@@ -774,79 +775,6 @@ fn combine_prompt(args_prompt: &[String], stdin_prompt: Option<&str>) -> Option<
         (None, Some(piped)) => Some(piped.to_string()),
         (None, None) => None,
     }
-}
-
-// The manifest dir is captured at compile time, so a globally installed `nav`
-// still knows which checkout it was built from. If the user moved or deleted
-// that checkout, `cargo install` fails with a clear message.
-fn run_upgrade() -> Result<()> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let pre_version = env!("CARGO_PKG_VERSION");
-
-    // Pre-flight the manifest dir ourselves so the error mentions nav's
-    // path explicitly. cargo's own "no such file or directory" leaves the
-    // user guessing which checkout it's looking for.
-    if !Path::new(manifest_dir).exists() {
-        bail!(
-            "cannot reinstall: manifest dir {manifest_dir} no longer exists. \
-             Re-clone the nav repo and run `cargo install --path <new-path> --force`."
-        );
-    }
-
-    println!("Reinstalling nav from {manifest_dir} (currently {pre_version})");
-    let status = Command::new("cargo")
-        .args(["install", "--path", manifest_dir, "--force"])
-        .status()
-        .context("failed to invoke `cargo` (is it on PATH?)")?;
-    if !status.success() {
-        bail!("`cargo install` exited with {status}");
-    }
-
-    // A silent PATH-shim mismatch — an older `nav` shadowing cargo's install
-    // dir — would happily say "reinstalled" while leaving the user on the
-    // old version. Compare the resolved binary's dir to cargo's install dir
-    // and warn if they don't agree.
-    let resolved = doctor::which_on_path("nav");
-    let cargo_bin_dir = doctor::cargo_install_bin_dir();
-    if let (Some(resolved_path), Some(install_dir)) = (resolved.as_ref(), cargo_bin_dir.as_ref()) {
-        let resolved_parent = resolved_path.parent();
-        if resolved_parent != Some(install_dir.as_path()) {
-            eprintln!(
-                "nav: warning — resolved `nav` ({}) is outside cargo's install dir ({}). \
-                 Update your PATH to include {} before {}, or remove the shim binary.",
-                resolved_path.display(),
-                install_dir.display(),
-                install_dir.display(),
-                resolved_parent
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
-            );
-        }
-    }
-
-    // Always read the cargo-installed binary directly for the post-install
-    // version. Falling back to whatever `PATH` resolves would report the
-    // shadow binary's version — the same case the warning above is for —
-    // and yield a bogus "already at X" summary when cargo's `bin/nav`
-    // genuinely changed underneath the shadow.
-    let post_install_bin = cargo_bin_dir
-        .as_ref()
-        .map(|dir| dir.join("nav"))
-        .filter(|p| p.exists());
-    let post_version = post_install_bin
-        .as_deref()
-        .or(resolved.as_deref())
-        .and_then(doctor::binary_version)
-        .unwrap_or_else(|| "unknown".to_string());
-
-    if post_version == "unknown" {
-        println!("nav reinstalled (currently {pre_version} — could not read post-install version)");
-    } else if post_version == pre_version {
-        println!("nav reinstalled (already at {post_version})");
-    } else {
-        println!("nav reinstalled (from {pre_version} → {post_version})");
-    }
-    Ok(())
 }
 
 /// One-shot startup banner emitted to stderr in headless mode so frontends
