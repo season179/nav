@@ -19,8 +19,8 @@
 //!   field-by-field; both feed [`crate::cli::Args::apply_settings`] which only
 //!   overwrites clap defaults.
 //! - **Workspace status**: branch name (via `.git/HEAD`) and dirty-or-not
-//!   (via one `git status --porcelain` invocation). Used by the TUI welcome
-//!   cell and status bar, and by the NDJSON startup banner.
+//!   (via one `git status --porcelain` invocation). Used by the TUI status
+//!   bar and the NDJSON startup banner.
 
 use crate::cli::{AuthMode, Transport};
 use serde::Deserialize;
@@ -45,7 +45,7 @@ pub struct ProjectContext {
 
 impl ProjectContext {
     /// `"main"` / `"main ✱ (dirty)"` / `None` when not in a repo. Shared by
-    /// the TUI welcome cell and the headless startup banner so both stay in
+    /// the headless startup banner and the doctor command so both stay in
     /// lock-step when the format changes.
     pub fn branch_summary(&self) -> Option<String> {
         let branch = self.workspace.branch.clone()?;

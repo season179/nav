@@ -673,9 +673,9 @@ fn run_upgrade() -> Result<()> {
     Ok(())
 }
 
-/// One-shot startup banner emitted to stderr in headless mode. Mirrors the
-/// lines the TUI welcome cell shows so frontends can still see which model,
-/// branch, and context files are in play. Stdout is reserved for machine data.
+/// One-shot startup banner emitted to stderr in headless mode so frontends
+/// can still see which model, branch, and context files are in play. Stdout
+/// is reserved for machine data.
 fn print_headless_banner(
     args: &Args,
     cwd: &Path,
