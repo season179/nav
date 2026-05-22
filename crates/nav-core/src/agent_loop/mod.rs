@@ -6,7 +6,10 @@ pub use control::{
     ControlPlane, PendingInput, PendingInputDraft, PendingInputMode, PendingSkill,
     PendingSteeringQueue, TurnControls,
 };
-pub use events::{AgentEvent, CompactionTrigger, TurnUsage, UserAttachment};
+pub use events::{
+    AgentEvent, CompactionAnalyticsEvent, CompactionAnalyticsPhase, CompactionReason,
+    CompactionStatus, CompactionTrigger, TurnUsage, UserAttachment,
+};
 pub use protocol::{
     HEADLESS_PROTOCOL_VERSION, JSONRPC_VERSION, METHOD_AGENT_EVENT, METHOD_APPROVAL_RESPOND,
     METHOD_SESSION_STARTED, agent_event_notification, session_started_notification,

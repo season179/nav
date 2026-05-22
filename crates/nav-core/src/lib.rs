@@ -24,7 +24,10 @@ mod sandbox;
 pub use agent_loop::{AgentTurnRequest, SessionBinding, run_agent};
 
 // Observable event/data types produced or consumed by the loop.
-pub use agent_loop::{AgentEvent, CompactionTrigger, TurnUsage, UserAttachment};
+pub use agent_loop::{
+    AgentEvent, CompactionAnalyticsEvent, CompactionAnalyticsPhase, CompactionReason,
+    CompactionStatus, CompactionTrigger, TurnUsage, UserAttachment,
+};
 
 // Model transport abstractions used by the loop.
 pub use agent_loop::{EventStream, ResponsesTransport};

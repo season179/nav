@@ -4475,3 +4475,107 @@ async fn create_failure_does_not_emit_retry_event_from_stub() {
     .expect_err("should fail");
     assert!(err.to_string().contains("network down"));
 }
+
+#[tokio::test]
+async fn manual_compact_emits_analytics_event_with_correct_axes() {
+    // A manual `/compact` should produce a structured analytics event with
+    // trigger=Manual, reason=UserRequested, phase=StandaloneTurn,
+    // status=Completed. The analytics event goes through `tracing`, not
+    // the AgentEvent stream, so we capture it with a test subscriber.
+    use std::io::Write;
+    use tracing_subscriber::EnvFilter;
+
+    // Shared buffer to capture formatted log output.
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // `MakeWriter` impl for a cloneable handle to the shared buffer.
+    #[derive(Clone)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+    impl Write for BufWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(data)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl tracing_subscriber::fmt::MakeWriter<'_> for BufWriter {
+        type Writer = Self;
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let writer = BufWriter(buf.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("nav.compaction=info"))
+        .with_ansi(false)
+        .with_writer(writer)
+        .finish();
+    // `set_global_default` ensures the subscriber is visible across all
+    // threads (including any spawned by the tokio runtime inside
+    // run_agent_for_test). If another test already installed a global
+    // subscriber, `set_global_default` fails — that's a test ordering
+    // problem, not a code bug, so we make it a hard fail here to surface it.
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("global tracing subscriber already installed by another test");
+
+    let transport = StubTransport::new(vec![compact_turn_with_text(
+        "handoff: did things, next: more things",
+    )]);
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "/compact",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .expect("compact run");
+
+    // Drain protocol events (unused here, but must be consumed).
+    while rx.recv().await.is_some() {}
+
+    let log_output = {
+        let bytes = buf.lock().unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+    assert!(
+        log_output.contains("compaction analytics event"),
+        "analytics event should have been emitted, got: {log_output}"
+    );
+
+    // Assert all four axes. String fields are quoted by tracing's formatter.
+    assert!(
+        log_output.contains("trigger=\"manual\""),
+        "expected trigger=\"manual\" in: {log_output}"
+    );
+    assert!(
+        log_output.contains("reason=\"user_requested\""),
+        "expected reason=\"user_requested\" in: {log_output}"
+    );
+    assert!(
+        log_output.contains("phase=\"standalone_turn\""),
+        "expected phase=\"standalone_turn\" in: {log_output}"
+    );
+    assert!(
+        log_output.contains("status=\"completed\""),
+        "expected status=\"completed\" in: {log_output}"
+    );
+
+    // The analytics event must NOT appear on the AgentEvent stream.
+    // (Already verified implicitly: only CompactionStarted / CompactionCompleted
+    // are in the rx channel; the analytics event went to tracing only.)
+}

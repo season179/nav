@@ -22,8 +22,10 @@ serde_yaml.workspace = true
 similar.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+tracing.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
 tempfile.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
