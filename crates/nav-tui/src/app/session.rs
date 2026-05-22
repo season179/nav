@@ -31,7 +31,6 @@ pub(super) fn push_context_report(
                 skills,
                 Some(project),
             );
-            chat.scroll_to_bottom();
             chat.push_session_notice("context", report.render_text(include_all));
         }
         Err(err) => chat.push_err(err),

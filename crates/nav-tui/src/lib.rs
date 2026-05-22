@@ -14,14 +14,17 @@
 //! - `bottom_pane`: composer input plus overlays like slash, mention, approval,
 //!   and session picker popups.
 //! - `cells`: transcript rows rendered by [`ChatWidget`].
-//! - `input`: slash-command parsing and transcript scrollback shortcuts.
+//! - `input`: slash-command parsing.
 //! - `streaming`: buffering rules for in-progress assistant text.
 
+mod ansi;
 mod app;
 pub mod bottom_pane;
 mod cells;
+mod custom_terminal;
 mod history;
 mod input;
+mod insert_history;
 mod streaming;
 mod theme;
 mod widget;

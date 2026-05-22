@@ -14,9 +14,10 @@ use nav_core::{
     cli::{Args, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
+
+use crate::custom_terminal::Terminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +33,7 @@ mod turn_task;
 
 use crate::ChatWidget;
 use crate::bottom_pane::{self, PendingApproval};
-use crate::input::{AppEvent, dispatch_submit, handle_scrollback_key, is_ctrl_c};
+use crate::input::{AppEvent, dispatch_submit, is_ctrl_c};
 use crate::theme::Theme;
 use crate::widget::parse_rewind_skill_prompt;
 use permissions::build_tui_permissions;
@@ -66,11 +67,16 @@ pub async fn run(
         bottom_pane::build_slash_entries_with_extensions(skills.as_ref(), extensions.as_ref());
     let theme = Theme::from_extensions(project.settings.theme.as_deref(), extensions.as_ref());
 
-    let backend = CrosstermBackend::new(io::stdout());
-    let terminal = Terminal::new(backend)?;
-    let mut term = TerminalGuard { terminal };
-    enter_tui(term.terminal.backend_mut())?;
+    // Enter raw mode + clear stale mouse capture BEFORE constructing the
+    // custom Terminal: `Terminal::with_options` issues a CPR query
+    // (`ESC[6n`) to discover the cursor row, and the response is only
+    // captured in raw mode.
+    let mut stdout = io::stdout();
+    enter_tui(&mut stdout)?;
     install_panic_teardown_hook();
+    let backend = CrosstermBackend::new(io::stdout());
+    let terminal = Terminal::with_options(backend)?;
+    let mut term = TerminalGuard { terminal };
 
     // Walk the workspace once at startup so the `@file` popup has something to
     // fuzzy-match against. A re-scan affordance can come later; an idle TUI
@@ -140,7 +146,12 @@ pub async fn run(
         &sandbox_policy,
     );
     let mut needs_draw = true;
-    let mut history_viewport = (1, 1);
+    // Resize coalescing: a drag-resize spits Resize events ~ once per row
+    // change. We track the *last applied* width and the *latest pending*
+    // width, then run a single reflow per draw cycle. Same-width events
+    // become no-ops, so a vertical drag never re-emits the transcript.
+    let mut last_reflow_width: u16 = 0;
+    let mut pending_reflow_width: Option<u16> = None;
 
     if let Some(prompt) = initial_prompt {
         app_tx
@@ -190,6 +201,63 @@ pub async fn run(
         }
 
         if needs_draw {
+            // Single backend-size query per draw cycle: viewport width on
+            // startup is zero, so fall back to backend.size() for the very
+            // first frame. After that, the viewport tracks the screen.
+            let screen_size = term.terminal.size().ok();
+            let screen_w = screen_size.map(|s| s.width).unwrap_or(80);
+            let screen_h = screen_size.map(|s| s.height).unwrap_or(40);
+            let scroll_width = if term.terminal.viewport_area.width > 0 {
+                term.terminal.viewport_area.width
+            } else {
+                screen_w
+            };
+
+            // Resize reflow runs at most once per draw cycle (drag-resize
+            // events coalesced above). Cap the emitted lines at the visible
+            // screen height: anything older is already in the user's
+            // scrollback at the previous width and we can't reach into it.
+            let reflow_lines = if let Some(new_w) = pending_reflow_width.take() {
+                last_reflow_width = new_w;
+                chat.reflow_tail_lines(new_w, screen_h as usize)
+            } else {
+                Vec::new()
+            };
+
+            // Flush newly-finalized cells into the terminal's native
+            // scrollback above the inline viewport. Use the current
+            // viewport width so each cell renders against the same width
+            // it would have at draw time.
+            let pending = chat.drain_pending(scroll_width);
+
+            // Bracket the scrollback insertion + viewport redraw in a
+            // synchronized update so terminals that support it commit
+            // both operations atomically — no tearing between the
+            // history rows landing above the viewport and the inline
+            // viewport repaint. The Begin/End pair is best-effort:
+            // terminals without DECSET 2026 support silently ignore it,
+            // so a failure here is not actionable.
+            use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+            let _ = crossterm::queue!(term.terminal.backend_mut(), BeginSynchronizedUpdate);
+
+            if !reflow_lines.is_empty()
+                && let Err(err) = crate::insert_history::insert_history_lines(
+                    &mut term.terminal,
+                    reflow_lines,
+                )
+            {
+                eprintln!("nav-tui: failed to insert reflowed history rows: {err:#}");
+            }
+
+            if !pending.is_empty()
+                && let Err(err) = crate::insert_history::insert_history_lines(
+                    &mut term.terminal,
+                    pending,
+                )
+            {
+                eprintln!("nav-tui: failed to insert pending history rows: {err:#}");
+            }
+
             let spinner = spinner_frame(spinner_tick);
             let state = match active_turn.as_ref() {
                 Some(handle) => AgentState::Working {
@@ -198,7 +266,7 @@ pub async fn run(
                 },
                 None => AgentState::Ready,
             };
-            history_viewport = draw_tui(
+            draw_tui(
                 &mut term.terminal,
                 &chat,
                 &pane,
@@ -211,7 +279,16 @@ pub async fn run(
                     tokens_input: last_tokens_input,
                     context_window: args.auto_compact_token_limit,
                 },
+                screen_w,
+                screen_h,
             )?;
+
+            // Close the synchronized update; pair this with the Begin
+            // above. Use execute! so the terminal commits the queued
+            // bytes immediately. Failing here is benign for the same
+            // reason as Begin: unsupported terminals ignore the sequence.
+            let _ = crossterm::execute!(term.terminal.backend_mut(), EndSynchronizedUpdate);
+
             needs_draw = false;
         }
 
@@ -404,14 +481,12 @@ pub async fn run(
                         // Replace any previously queued skill; selecting a new
                         // one before sending a prompt should override.
                         pending_skill = Some(skill.clone());
-                        chat.scroll_to_bottom();
                         chat.push_user(format!("/{}", skill.name));
                         chat.push_skill(skill.name, "queued for the next prompt");
                     }
                     AppEvent::ListSessions => {
                         match store.list_sessions(None) {
                             Ok(summaries) => {
-                                chat.scroll_to_bottom();
                                 chat.push_session_list(summaries);
                             }
                             Err(err) => chat.push_err(err),
@@ -658,7 +733,6 @@ pub async fn run(
                     AppEvent::ShowTree => match resolve_tree_root(&store, &session_id) {
                         Ok(root_id) => match store.walk_tree(&root_id) {
                             Ok(nodes) => {
-                                chat.scroll_to_bottom();
                                 chat.push_session_tree(nodes);
                             }
                             Err(err) => chat.push_err(err),
@@ -686,7 +760,6 @@ pub async fn run(
                     AppEvent::FindTranscript { query } => {
                         match store.search_transcript(&query, 20, None) {
                             Ok(hits) => {
-                                chat.scroll_to_bottom();
                                 chat.push_transcript_hits(query, hits);
                             }
                             Err(err) => chat.push_err(err),
@@ -822,14 +895,8 @@ pub async fn run(
                                 continue;
                             }
                             ctrl_c_count = 0;
-                            if handle_scrollback_key(
-                                &mut chat,
-                                &key,
-                                history_viewport,
-                                pane.can_scroll_transcript_with_arrows(),
-                            ) {
-                                continue;
-                            }
+                            // Scrollback navigation is owned by the terminal
+                            // (mouse wheel, PgUp/PgDn) — no in-app scroll keys.
                             match pane.handle_key(key) {
                                 bottom_pane::ComposerEvent::Submit { text, attachments } => {
                                     dispatch_submit(
@@ -851,7 +918,18 @@ pub async fn run(
                             // arm the payload would be silently dropped.
                             pane.on_paste(&text);
                         }
-                        CtEvent::Resize(_, _) => {
+                        CtEvent::Resize(new_w, _new_h) => {
+                            // Coalesce drag-resize: stash the latest width
+                            // and let the draw cycle reflow once. Skip the
+                            // bookkeeping entirely if the width hasn't
+                            // actually changed — vertical drags fire Resize
+                            // every row but don't change wrapping. Previous
+                            // scrollback at the old width stays put (the
+                            // terminal owns scrollback); a visible seam
+                            // appears if the user scrolls past the resize.
+                            if new_w != last_reflow_width {
+                                pending_reflow_width = Some(new_w);
+                            }
                             needs_draw = true;
                         }
                         _ => {}

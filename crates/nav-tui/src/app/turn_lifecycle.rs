@@ -270,7 +270,6 @@ pub(super) fn start_pending_turn(
     };
 
     *active_turn = Some(ActiveTurnHandle::new(handle, steering_queue));
-    chat.scroll_to_bottom();
     if let Some(skill) = item.skill.as_ref() {
         chat.push_skill(skill.name.clone(), "applied to this turn");
     }

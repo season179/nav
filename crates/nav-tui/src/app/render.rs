@@ -1,15 +1,30 @@
-//! Screen layout for the main TUI loop.
+//! Inline viewport layout for the main TUI loop.
+//!
+//! Finalized chat history lives in the terminal's native scrollback (see
+//! `crate::insert_history`), not inside ratatui. This module only paints
+//! the inline viewport: any in-flight streaming text, the composer, and
+//! the status bar. The viewport is sized per-frame and anchored to the
+//! bottom of the screen.
 
 use anyhow::Result;
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::widgets::Paragraph;
 use std::io::Stdout;
 
 use crate::ChatWidget;
 use crate::bottom_pane;
+use crate::custom_terminal::Terminal;
 
 use super::status_bar::{AgentState, StatusBar};
+
+/// Cap the streaming preview at this many rows so a long in-flight reply
+/// can't shove the composer off-screen. Once the reply finalizes it goes
+/// to scrollback and the cap stops mattering.
+const MAX_STREAMING_ROWS: u16 = 16;
+
+/// Bottom-anchored status bar height.
+const STATUS_ROWS: u16 = 1;
 
 pub(super) struct TuiStatus<'a> {
     pub model: &'a str,
@@ -26,22 +41,41 @@ pub(super) fn draw_tui(
     chat: &ChatWidget,
     pane: &bottom_pane::BottomPane,
     status: TuiStatus<'_>,
-) -> Result<(u16, u16)> {
-    let mut history_viewport = (1, 1);
+    screen_w: u16,
+    screen_h: u16,
+) -> Result<()> {
+    let screen_h = screen_h.max(2);
+
+    // Materialize the in-flight streaming cell once: one buffer walk yields
+    // both the rendered lines and their height. Empty Vec when no stream
+    // is active, so the streaming row collapses to zero height.
+    let streaming_lines = chat.streaming_lines(screen_w);
+    let streaming_h = (streaming_lines.len() as u16).min(MAX_STREAMING_ROWS);
+    let max_composer = screen_h
+        .saturating_sub(STATUS_ROWS + streaming_h)
+        .max(1);
+    let composer_h = pane
+        .desired_height(screen_w)
+        .max(3)
+        .min(max_composer);
+
+    let viewport_h = streaming_h + composer_h + STATUS_ROWS;
+    let viewport_y = screen_h.saturating_sub(viewport_h);
+    let viewport_area = Rect::new(0, viewport_y, screen_w, viewport_h);
+    terminal.set_viewport_area(viewport_area);
+
     terminal.draw(|f| {
         let area = f.area();
-        let pane_h = pane
-            .desired_height(area.width)
-            .max(3)
-            .min(area.height.saturating_sub(2));
         let chunks = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(pane_h),
-            Constraint::Length(1),
+            Constraint::Length(streaming_h),
+            Constraint::Length(composer_h),
+            Constraint::Length(STATUS_ROWS),
         ])
         .split(area);
-        history_viewport = (chunks[0].width, chunks[0].height);
-        f.render_widget(chat, chunks[0]);
+
+        if streaming_h > 0 {
+            f.render_widget(Paragraph::new(streaming_lines), chunks[0]);
+        }
         f.render_widget(pane, chunks[1]);
         if let Some((cx, cy)) = pane.cursor_position(chunks[1]) {
             f.set_cursor_position((cx, cy));
@@ -59,5 +93,6 @@ pub(super) fn draw_tui(
             chunks[2],
         );
     })?;
-    Ok(history_viewport)
+
+    Ok(())
 }

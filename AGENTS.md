@@ -43,6 +43,14 @@ path, so verify the real local checkout before assuming one is absent.
 
 ## Local Gotchas
 
+- The TUI uses an **inline viewport**, not the alternate screen. Finalized
+  history cells are written into the terminal's native scrollback via
+  `crates/nav-tui/src/insert_history.rs`; the ratatui viewport only paints
+  composer + status + active streaming cell. There is no in-app scroll
+  key — wheel / PgUp / PgDn are handled by the terminal itself. See
+  [docs/tui-architecture-migration.md](docs/tui-architecture-migration.md)
+  and [docs/tui-migration-plan.md](docs/tui-migration-plan.md) for the
+  decision record and what's still deferred.
 - `rg` must be on `PATH`; `code_search` shells out to it even though
   `Cargo.toml` does not mention it.
 - `nav update` / `nav upgrade` reinstalls from compile-time

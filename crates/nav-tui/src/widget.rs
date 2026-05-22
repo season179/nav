@@ -1,9 +1,5 @@
 use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit};
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget};
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::cells::{
@@ -16,93 +12,32 @@ use crate::cells::{
 use crate::history::HistoryCell;
 use crate::theme::Theme;
 
-/// Wraps a history cell with a per-width layout cache. Wrapping text into
-/// styled lines is the dominant cost in scrollback rendering; caching it
-/// makes PgUp/PgDown O(viewport) instead of O(transcript) per keystroke.
-struct CachedCell {
-    inner: Box<dyn HistoryCell>,
-    layout: RefCell<Option<CellLayout>>,
-}
-
-struct CellLayout {
-    width: u16,
-    lines: Vec<Line<'static>>,
-}
-
-impl CachedCell {
-    fn new(inner: Box<dyn HistoryCell>) -> Self {
-        Self {
-            inner,
-            layout: RefCell::new(None),
-        }
-    }
-
-    fn ensure(&self, width: u16) {
-        let stale = self
-            .layout
-            .borrow()
-            .as_ref()
-            .is_none_or(|l| l.width != width);
-        if stale {
-            let lines = self.inner.display_lines(width);
-            *self.layout.borrow_mut() = Some(CellLayout { width, lines });
-        }
-    }
-
-    fn height(&self, width: u16) -> usize {
-        self.ensure(width);
-        self.layout.borrow().as_ref().map_or(0, |l| l.lines.len())
-    }
-
-    /// Append the slice `[start, end)` of this cell's cached lines (relative
-    /// to the cell, in line coordinates) into `out`. Caller is responsible
-    /// for clamping `start..end` to `0..height(width)`.
-    fn append_window(&self, width: u16, start: usize, end: usize, out: &mut Vec<Line<'static>>) {
-        self.ensure(width);
-        if let Some(layout) = self.layout.borrow().as_ref() {
-            out.extend(layout.lines[start..end].iter().cloned());
-        }
-    }
-}
-
-/// Common viewport-overlap accumulator: given the next segment's `lines` and
-/// the absolute byte position `acc` of its top edge, emit the slice that
-/// overlaps the visible window `[start, end)` into `out` and return the new
-/// `acc` (top edge of the next segment).
-fn extend_window(
-    acc: usize,
-    lines_len: usize,
-    start: usize,
-    end: usize,
-    mut copy: impl FnMut(usize, usize),
-) -> usize {
-    let seg_bottom = acc + lines_len;
-    if seg_bottom > start && acc < end {
-        let lstart = start.saturating_sub(acc);
-        let lend = (end - acc).min(lines_len);
-        copy(lstart, lend);
-    }
-    seg_bottom
-}
-
-/// Flat scrollback widget. Holds the full history as a vector of cells and
-/// renders a viewport over their flattened lines.
+/// Scrollback-first chat widget. Finalized cells get rendered and queued
+/// in `pending_finalized`, which the main loop drains before each frame and
+/// writes into the terminal's native scrollback via `insert_history_lines`.
+/// Only the in-flight streaming assistant cell still renders inside the
+/// ratatui viewport, so the user sees text grow as the model emits it.
+///
+/// The transcript above the viewport is owned by the terminal itself; nav
+/// doesn't keep a transcript ledger here. Reflow on resize is handled
+/// outside the widget (see Phase 3 of the migration plan).
 pub struct ChatWidget {
-    cells: Vec<CachedCell>,
+    /// All cells ever finalized in this session. Kept so a future resize
+    /// can reflow + re-insert at the new width (see `reflow_tail_lines`).
+    /// `finalized[pending_start..]` is the slice that hasn't been pushed
+    /// into native scrollback yet.
+    finalized: Vec<Box<dyn HistoryCell>>,
+    /// Index of the first cell that has NOT yet been written to scrollback.
+    /// Advances as `drain_pending` runs.
+    pending_start: usize,
     theme: Theme,
     tool_calls: HashMap<String, ToolCallContext>,
     subagent_labels: HashMap<String, String>,
     turn_has_work: bool,
-    /// In-flight streaming assistant cell, anchored to its eventual index
-    /// in `cells`. Held outside `cells` so deltas can mutate it in place;
-    /// control-plane rows that fire mid-stream (pending-input queue ops)
-    /// push past the anchor without closing, and the cell splices back
-    /// at the same anchor on close. Guarantees one cell per assistant
-    /// message even when local events interleave.
-    streaming_assistant: Option<(usize, AssistantMessageCell)>,
-    /// `None` follows the newest transcript row. `Some(row)` pins the top of
-    /// the viewport while the user is reading older output.
-    scroll_top: Option<usize>,
+    /// In-flight streaming assistant cell. Rendered inside the viewport so
+    /// deltas appear immediately; when the message finalizes it joins
+    /// `finalized` and gets pushed to scrollback like everything else.
+    streaming_assistant: Option<AssistantMessageCell>,
 }
 
 impl ChatWidget {
@@ -112,13 +47,13 @@ impl ChatWidget {
 
     pub(crate) fn with_theme(theme: Theme) -> Self {
         Self {
-            cells: Vec::new(),
+            finalized: Vec::new(),
+            pending_start: 0,
             theme,
             tool_calls: HashMap::new(),
             subagent_labels: HashMap::new(),
             turn_has_work: false,
             streaming_assistant: None,
-            scroll_top: None,
         }
     }
 
@@ -150,15 +85,11 @@ impl ChatWidget {
     }
 
     pub fn push_session_tree(&mut self, nodes: Vec<SessionTreeNode>) {
-        self.cells
-            .push(CachedCell::new(Box::new(SessionTreeCell::new(nodes))));
+        self.push_cell(SessionTreeCell::new(nodes));
     }
 
     pub fn push_transcript_hits(&mut self, query: String, hits: Vec<TranscriptHit>) {
-        self.cells
-            .push(CachedCell::new(Box::new(TranscriptHitsCell::new(
-                query, hits,
-            ))));
+        self.push_cell(TranscriptHitsCell::new(query, hits));
     }
 
     /// Prepend a welcome cell that orients the user (model, cwd, session id).
@@ -182,17 +113,64 @@ impl ChatWidget {
         ));
     }
 
+    /// Drain finalized cells that haven't been pushed to scrollback yet,
+    /// rendering each at `width`. The main loop calls this once per tick
+    /// before drawing the viewport. Cells stay in `finalized` so a later
+    /// resize can reflow them.
+    pub fn drain_pending(&mut self, width: u16) -> Vec<Line<'static>> {
+        if self.pending_start >= self.finalized.len() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for cell in &self.finalized[self.pending_start..] {
+            out.extend(cell.display_lines(width));
+        }
+        self.pending_start = self.finalized.len();
+        out
+    }
+
+    /// Re-render up to `max_lines` worth of the most recent finalized cells
+    /// at `width`, returning them in chronological order. Older content stays
+    /// in the terminal's native scrollback at its previous width — the
+    /// terminal owns scrollback and we can't reach into it. Capping the work
+    /// keeps drag-resize from emitting megabytes of escape sequences for
+    /// content that would only land in scrollback again anyway.
+    ///
+    /// Also resets the pending pointer so a follow-up `drain_pending` call
+    /// won't re-emit the same cells.
+    pub fn reflow_tail_lines(&mut self, width: u16, max_lines: usize) -> Vec<Line<'static>> {
+        self.pending_start = self.finalized.len();
+        if max_lines == 0 || self.finalized.is_empty() {
+            return Vec::new();
+        }
+        let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
+        let mut total = 0usize;
+        for cell in self.finalized.iter().rev() {
+            let lines = cell.display_lines(width);
+            total = total.saturating_add(lines.len());
+            groups.push(lines);
+            if total >= max_lines {
+                break;
+            }
+        }
+        let mut out: Vec<Line<'static>> = Vec::with_capacity(total.min(max_lines));
+        for group in groups.into_iter().rev() {
+            out.extend(group);
+        }
+        if out.len() > max_lines {
+            let drop = out.len() - max_lines;
+            out.drain(..drop);
+        }
+        out
+    }
+
     /// Translate an agent event into a history cell and append it.
     ///
-    /// `AssistantMessageDelta` appends to the anchored in-flight streaming
-    /// cell. Events that end the assistant's message (tool calls, abort,
-    /// turn complete, retries, errors, compaction, the next user turn)
-    /// route through `push_cell`, which closes the streaming row by
-    /// splicing it back into `cells` at its anchor. Control-plane rows
-    /// that do NOT end the message (pending-input queue ops) route
-    /// through `push_local_cell` and render after the live stream without
-    /// finalizing it — preventing the single assistant message from
-    /// being split across two scrollback cells.
+    /// `AssistantMessageDelta` appends to the in-flight streaming cell.
+    /// Events that end the assistant's message (tool calls, abort, turn
+    /// complete, retries, errors, compaction, the next user turn) route
+    /// through `push_cell`, which finalizes the streaming row and queues
+    /// it before appending the new cell.
     pub fn ingest(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::UserMessage {
@@ -206,19 +184,16 @@ impl ChatWidget {
             }
             AgentEvent::AssistantMessageDelta { text } => {
                 if self.streaming_assistant.is_none() {
-                    self.streaming_assistant =
-                        Some((self.cells.len(), AssistantMessageCell::streaming()));
+                    self.streaming_assistant = Some(AssistantMessageCell::streaming());
                 }
-                if let Some((_, cell)) = self.streaming_assistant.as_mut() {
+                if let Some(cell) = self.streaming_assistant.as_mut() {
                     cell.push_delta(&text);
                 }
             }
             AgentEvent::AssistantMessageDone { text } => {
-                if let Some((idx, mut cell)) = self.streaming_assistant.take() {
+                if let Some(mut cell) = self.streaming_assistant.take() {
                     cell.finalize_with(&text);
-                    let insert_at = idx.min(self.cells.len());
-                    self.cells
-                        .insert(insert_at, CachedCell::new(Box::new(cell)));
+                    self.finalized.push(Box::new(cell));
                 } else {
                     self.push_cell(AssistantMessageCell::new(text));
                 }
@@ -426,65 +401,35 @@ impl ChatWidget {
         }
     }
 
-    pub fn scroll_up(&mut self, rows: u16, width: u16, viewport_height: u16) {
-        let (max_top, current) = self.scroll_anchor(width, viewport_height);
-        if max_top == 0 {
-            self.scroll_top = None;
-            return;
-        }
-        self.scroll_top = Some(current.saturating_sub(rows as usize));
+    /// Number of rows the in-flight streaming cell wants in the viewport.
+    /// `0` when there is no active stream.
+    pub fn streaming_height(&self, width: u16) -> u16 {
+        self.streaming_assistant
+            .as_ref()
+            .map(|cell| cell.desired_height(width))
+            .unwrap_or(0)
     }
 
-    pub fn scroll_down(&mut self, rows: u16, width: u16, viewport_height: u16) {
-        let (max_top, current) = self.scroll_anchor(width, viewport_height);
-        let next = current.saturating_add(rows as usize);
-        if next >= max_top {
-            self.scroll_top = None;
-        } else {
-            self.scroll_top = Some(next);
-        }
+    /// True if there's an in-flight streaming cell to draw inline.
+    pub fn has_streaming(&self) -> bool {
+        self.streaming_assistant.is_some()
     }
 
-    pub fn scroll_to_top(&mut self, width: u16, viewport_height: u16) {
-        let (max_top, _) = self.scroll_anchor(width, viewport_height);
-        if max_top == 0 {
-            self.scroll_top = None;
-        } else {
-            self.scroll_top = Some(0);
-        }
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_top = None;
-    }
-
-    /// Single-walk scroll math used by every key gesture. `max_top` is the
-    /// largest valid `scroll_top`; `current` is the effective top of the
-    /// viewport today, clamped to `max_top`. Folding both into one call keeps
-    /// PgUp/PgDown from walking the cell heights twice per keystroke (via
-    /// `max_top` + `current_top` previously).
-    fn scroll_anchor(&self, width: u16, viewport_height: u16) -> (usize, usize) {
-        let max_top = self
-            .rendered_height(width)
-            .saturating_sub(viewport_height as usize);
-        let current = self.scroll_top.unwrap_or(max_top).min(max_top);
-        (max_top, current)
-    }
-
-    fn rendered_height(&self, width: u16) -> usize {
-        let mut total: usize = self.cells.iter().map(|c| c.height(width)).sum();
-        if let Some((_, cell)) = &self.streaming_assistant {
-            total += cell.desired_height(width) as usize;
-        }
-        total
+    /// Rendered lines for the in-flight streaming cell at `width`. Empty
+    /// when no stream is active. Used by tests to inspect what the inline
+    /// viewport would display.
+    pub fn streaming_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.streaming_assistant
+            .as_ref()
+            .map(|cell| cell.display_lines(width))
+            .unwrap_or_default()
     }
 
     /// Push a cell that ends the in-flight assistant message. Closes the
-    /// streaming row first so it splices into scrollback at its anchored
-    /// position before this cell appends after it.
+    /// streaming row first so it lands in scrollback before this cell.
     fn push_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
         self.close_streaming_assistant();
-        self.cells.push(CachedCell::new(Box::new(cell)));
+        self.finalized.push(Box::new(cell));
     }
 
     fn push_work_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
@@ -493,20 +438,16 @@ impl ChatWidget {
     }
 
     /// Push a control-plane cell (pending-input queue ops) that does NOT
-    /// end the assistant's in-flight message. The cell sits past the
-    /// streaming anchor in `cells`, so it renders after the streaming row
-    /// without finalizing it — `AssistantMessageDone` then splices the
-    /// single assistant cell into its anchored position.
+    /// end the assistant's in-flight message. It still goes to scrollback,
+    /// but the streaming cell stays live so the message keeps growing.
     fn push_local_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
-        self.cells.push(CachedCell::new(Box::new(cell)));
+        self.finalized.push(Box::new(cell));
     }
 
     fn close_streaming_assistant(&mut self) {
-        if let Some((idx, mut cell)) = self.streaming_assistant.take() {
+        if let Some(mut cell) = self.streaming_assistant.take() {
             cell.finalize();
-            let insert_at = idx.min(self.cells.len());
-            self.cells
-                .insert(insert_at, CachedCell::new(Box::new(cell)));
+            self.finalized.push(Box::new(cell));
         }
     }
 
@@ -546,59 +487,6 @@ impl Default for ChatWidget {
     }
 }
 
-impl Widget for &ChatWidget {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let width = area.width;
-        let viewport_height = area.height as usize;
-
-        // Streaming assistant cell mutates on each delta, so it is not cached
-        // alongside the finalized cells. Materialize it once per frame and
-        // pair it with its anchor index.
-        let stream: Option<(usize, Vec<Line<'static>>)> = self
-            .streaming_assistant
-            .as_ref()
-            .map(|(idx, cell)| ((*idx).min(self.cells.len()), cell.display_lines(width)));
-
-        let cell_heights: Vec<usize> = self.cells.iter().map(|c| c.height(width)).collect();
-        let total: usize =
-            cell_heights.iter().sum::<usize>() + stream.as_ref().map_or(0, |(_, l)| l.len());
-
-        let max_scroll = total.saturating_sub(viewport_height);
-        let start = self.scroll_top.unwrap_or(max_scroll).min(max_scroll);
-        let end = (start + viewport_height).min(total);
-
-        let mut visible: Vec<Line<'static>> = Vec::with_capacity(viewport_height);
-        let mut acc: usize = 0;
-        let anchor = stream.as_ref().map(|(a, _)| *a).unwrap_or(self.cells.len());
-
-        // `0..=self.cells.len()` is inclusive so the streaming cell can fire
-        // even when its anchor sits past the last finalized cell. The index
-        // gates both the anchor comparison and the cell lookup, so an
-        // iterator-style rewrite hurts more than it helps here.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..=self.cells.len() {
-            if i == anchor
-                && let Some((_, ref lines)) = stream
-            {
-                acc = extend_window(acc, lines.len(), start, end, |lstart, lend| {
-                    visible.extend(lines[lstart..lend].iter().cloned());
-                });
-            }
-            if i < self.cells.len() {
-                let cell = &self.cells[i];
-                let len = cell_heights[i];
-                acc = extend_window(acc, len, start, end, |lstart, lend| {
-                    cell.append_window(width, lstart, lend, &mut visible);
-                });
-            }
-        }
-
-        Paragraph::new(visible).render(area, buf);
-    }
-}
 
 struct SkillPrompt {
     name: String,
@@ -723,9 +611,6 @@ mod skill_parse_tests {
 
     #[test]
     fn parse_rewind_skill_prompt_recovers_wrapper_and_request() {
-        // The agent_loop persists the full wrapped text on UserMessage.text.
-        // Rewind must be able to peel the wrapper off so the composer shows
-        // the visible request while restoring the wrapper for resubmit.
         let wrapped =
             "<skill name=\"reviewer\" dir=\"/skills/reviewer\">\nBODY\n</skill>\n\ndo the thing";
         let parsed = parse_rewind_skill_prompt(wrapped, Some("do the thing")).expect("must parse");
@@ -754,10 +639,6 @@ mod skill_parse_tests {
 
     #[test]
     fn parse_rewind_skill_prompt_recovers_prompt_template_wrapper() {
-        // /prompt:<name> invocations get a different wrapper than /<skill>;
-        // the persisted text starts with <prompt_template>. /rewind on that
-        // turn must still recover the wrapper so resubmit keeps the
-        // template's instructions.
         let wrapped = "<prompt_template name=\"review\" extension=\"core\" dir=\"/ext/core/prompts\">\nTEMPLATE BODY\n</prompt_template>\n\nplease review this diff";
         let parsed = parse_rewind_skill_prompt(wrapped, Some("please review this diff"))
             .expect("must parse prompt_template");
@@ -782,11 +663,6 @@ mod skill_parse_tests {
 
     #[test]
     fn parse_rewind_skill_prompt_does_not_split_at_close_tag_inside_request() {
-        // Regression: the parser used to use `rfind` to locate the wrapper's
-        // closing tag, which silently absorbs part of the user request when
-        // the request body itself contains `</skill>` (e.g. the user is
-        // reviewing XML or HTML). The composer would then show only a
-        // suffix on resubmit and the wrapper would carry stray content.
         let wrapped = "<skill name=\"reviewer\" dir=\"/skills/reviewer\">\nBODY\n</skill>\n\nplease audit this snippet: <skill name=\"x\">inner</skill> tail";
         let parsed = parse_rewind_skill_prompt(
             wrapped,
@@ -823,13 +699,6 @@ mod skill_parse_tests {
 
     #[test]
     fn parse_rewind_skill_prompt_uses_display_text_when_body_contains_close_tag() {
-        // Regression: a SKILL.md body that contains a literal `</skill>` (e.g.
-        // a skill discussing XML or HTML) used to cause a forward `find` to
-        // stop inside the body. The fallback path would then split there,
-        // truncating `wrapped_body` and pushing the remaining skill
-        // instructions into the composer as the user's request. When
-        // `display_text` is persisted (the slash-skill path always sets it),
-        // we anchor the split on the wrapper/request join instead.
         let wrapped = "<skill name=\"xmlhelper\" dir=\"/skills/xmlhelper\">\nTo nest a snippet, write </skill> inside a code block.\nMore body here.\n</skill>\n\ndo the thing";
         let parsed = parse_rewind_skill_prompt(wrapped, Some("do the thing"))
             .expect("display_text path must succeed");
@@ -849,10 +718,6 @@ mod skill_parse_tests {
 
     #[test]
     fn parse_rewind_skill_prompt_falls_back_to_first_close_without_display_text() {
-        // Legacy session logs (or any flow that didn't persist display_text)
-        // still need *something*. The fallback splits at the first close tag,
-        // which is correct for the common case where the skill body itself
-        // doesn't carry a literal close tag.
         let wrapped =
             "<skill name=\"plain\" dir=\"/skills/plain\">\nbody\n</skill>\n\ndo the thing";
         let parsed = parse_rewind_skill_prompt(wrapped, None).expect("fallback must succeed");
@@ -862,9 +727,6 @@ mod skill_parse_tests {
 
     #[test]
     fn parse_rewind_skill_prompt_rejects_malformed_prompt_template() {
-        // Missing the `extension=` middle attribute the real wrapper always
-        // emits — must not parse, or a hand-crafted look-alike could be
-        // mistaken for a real template wrapper.
         let bogus = "<prompt_template name=\"x\" dir=\"/whatever\">body</prompt_template>\n\nreq";
         assert!(parse_rewind_skill_prompt(bogus, Some("req")).is_none());
     }

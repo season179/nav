@@ -24,30 +24,32 @@ fn buffer_to_text(buf: &Buffer) -> String {
     out
 }
 
-fn render_widget(widget: &ChatWidget, width: u16, height: u16) -> String {
+/// The runtime widget no longer renders finalized cells inline (they go
+/// straight to native scrollback via `insert_history`). For snapshots we
+/// drain the same lines the runtime would insert, paint them top-aligned
+/// into a buffer, then overlay any in-flight streaming text below —
+/// preserving the "what the user sees this turn" shape the old tests
+/// asserted on, even though at runtime these rows live in two different
+/// places.
+fn render_widget(widget: &mut ChatWidget, width: u16, height: u16) -> String {
+    use ratatui::widgets::{Paragraph, Widget};
+    let mut lines = widget.drain_pending(width);
+    let streaming = if widget.has_streaming() {
+        widget.streaming_lines(width)
+    } else {
+        Vec::new()
+    };
+    lines.extend(streaming);
+
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal
         .draw(|frame| {
             let area = frame.area();
-            frame.render_widget(widget, area);
+            Paragraph::new(lines).render(area, frame.buffer_mut());
         })
         .expect("draw");
     buffer_to_text(terminal.backend().buffer())
-}
-
-fn widget_with_numbered_output(line_count: usize) -> ChatWidget {
-    let mut widget = ChatWidget::new();
-    widget.ingest(AgentEvent::ToolCallOutput {
-        call_id: "call_1".to_string(),
-        output: (0..line_count)
-            .map(|i| format!("line {i:02}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        is_error: false,
-        truncation: None,
-    });
-    widget
 }
 
 #[test]
@@ -60,7 +62,7 @@ fn wrapped_skill_prompt_renders_as_skill_then_user_request() {
         attachments: Vec::new(),
     });
 
-    let rendered = render_widget(&widget, 90, 10);
+    let rendered = render_widget(&mut widget, 90, 10);
 
     assert!(rendered.contains("◆ skill  zoom-out"), "{rendered}");
     assert!(
@@ -81,7 +83,7 @@ fn wrapped_skill_prompt_uses_outer_closing_tag() {
         attachments: Vec::new(),
     });
 
-    let rendered = render_widget(&widget, 90, 10);
+    let rendered = render_widget(&mut widget, 90, 10);
 
     assert!(rendered.contains("◆ skill  zoom-out"), "{rendered}");
     assert!(
@@ -101,7 +103,7 @@ fn literal_skill_xml_without_nav_dir_attribute_stays_user_text() {
         attachments: Vec::new(),
     });
 
-    let rendered = render_widget(&widget, 90, 10);
+    let rendered = render_widget(&mut widget, 90, 10);
 
     assert!(!rendered.contains("◆ skill"), "{rendered}");
     assert!(
@@ -127,7 +129,7 @@ fn user_message_attachments_render_in_submitted_box() {
         ],
     });
 
-    let rendered = render_widget(&widget, 80, 8);
+    let rendered = render_widget(&mut widget, 80, 8);
     assert!(rendered.contains("› See attached"), "{rendered}");
     assert!(
         rendered.contains("  [image] .nav/clipboard/shot.png"),
@@ -145,7 +147,7 @@ fn approval_decision_event_renders_audit_row() {
         decision: ReviewDecision::ApprovedForSession,
     });
 
-    let rendered = render_widget(&widget, 80, 4);
+    let rendered = render_widget(&mut widget, 80, 4);
     assert!(
         rendered.contains("✓ approved matching tool calls for this session"),
         "{rendered}"
@@ -172,7 +174,7 @@ fn pure_conversation_turn_complete_does_not_render_separator() {
         },
     });
 
-    let rendered = render_widget(&widget, 80, 10);
+    let rendered = render_widget(&mut widget, 80, 10);
     assert!(rendered.contains("• Hi there."), "{rendered}");
     assert!(!rendered.contains("─ 10 in, 2 out"), "{rendered}");
     assert!(!rendered.contains("turn complete"), "{rendered}");
@@ -199,7 +201,7 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
         truncation: None,
     });
 
-    let rendered = render_widget(&widget, 90, 20);
+    let rendered = render_widget(&mut widget, 90, 20);
 
     assert!(
         rendered.contains("• Exploring\n  Read SKILL.md (zoom-out skill)"),
@@ -227,7 +229,7 @@ fn apply_patch_tool_row_summarizes_patch_paths() {
         }),
     });
 
-    let rendered = render_widget(&widget, 100, 8);
+    let rendered = render_widget(&mut widget, 100, 8);
 
     assert!(
         rendered.contains("• Running  apply_patch M src/lib.rs, A src/new.rs"),
@@ -248,7 +250,7 @@ fn apply_patch_tool_row_summarizes_moves() {
         }),
     });
 
-    let rendered = render_widget(&widget, 100, 8);
+    let rendered = render_widget(&mut widget, 100, 8);
 
     assert!(
         rendered.contains("• Running  apply_patch M old.rs -> new.rs"),
@@ -275,7 +277,7 @@ fn file_change_event_renders_reviewable_diff_preview() {
         }],
     });
 
-    let rendered = render_widget(&widget, 100, 12);
+    let rendered = render_widget(&mut widget, 100, 12);
 
     assert!(rendered.contains("◆ changed  updated 1 file"), "{rendered}");
     assert!(rendered.contains("M note.txt:1 (+1 -1)"), "{rendered}");
@@ -298,7 +300,7 @@ fn turn_diff_event_renders_modified_file_summary() {
         unified_diff: "--- a/note.txt\n+++ b/note.txt\n@@\n-old\n+new\n".to_string(),
     });
 
-    let rendered = render_widget(&widget, 100, 12);
+    let rendered = render_widget(&mut widget, 100, 12);
 
     assert!(rendered.contains("◆ diff  1 file changed"), "{rendered}");
     assert!(rendered.contains("modified note.txt (+1 -1)"), "{rendered}");
@@ -318,7 +320,7 @@ fn git_checkpoint_event_renders_restore_handle() {
         message: "nav checkpoint 01ABCDEF: before turn".to_string(),
     });
 
-    let rendered = render_widget(&widget, 100, 8);
+    let rendered = render_widget(&mut widget, 100, 8);
 
     assert!(rendered.contains("◆ checkpoint  created"), "{rendered}");
     assert!(rendered.contains("stash@{0} (1234567890ab)"), "{rendered}");
@@ -353,7 +355,7 @@ fn pending_queue_and_abort_events_render_as_control_rows() {
         reason: "user interrupt".to_string(),
     });
 
-    let rendered = render_widget(&widget, 100, 16);
+    let rendered = render_widget(&mut widget, 100, 16);
 
     assert!(
         rendered.contains("◆ queued  pending-1 follow-up"),
@@ -391,7 +393,7 @@ fn subagent_lifecycle_events_render_as_rows() {
         message: "model returned no summary".to_string(),
     });
 
-    let rendered = render_widget(&widget, 100, 14);
+    let rendered = render_widget(&mut widget, 100, 14);
 
     assert!(
         rendered.contains("* subagent  explorer (call_worker) started"),
@@ -417,19 +419,19 @@ fn assistant_deltas_paint_incrementally_then_finalize() {
     widget.ingest(AgentEvent::AssistantMessageDelta {
         text: "Hello, ".to_string(),
     });
-    let mid = render_widget(&widget, 60, 6);
+    let mid = render_widget(&mut widget, 60, 6);
     assert!(mid.contains("• Hello,"), "{mid}");
 
     widget.ingest(AgentEvent::AssistantMessageDelta {
         text: "world!".to_string(),
     });
-    let mid2 = render_widget(&widget, 60, 6);
+    let mid2 = render_widget(&mut widget, 60, 6);
     assert!(mid2.contains("Hello, world!"), "{mid2}");
 
     widget.ingest(AgentEvent::AssistantMessageDone {
         text: "Hello, world!".to_string(),
     });
-    let done = render_widget(&widget, 60, 6);
+    let done = render_widget(&mut widget, 60, 6);
     assert!(done.contains("• Hello, world!"), "{done}");
     let count = done.matches("• Hello, world!").count();
     assert_eq!(count, 1, "expected a single assistant row, got:\n{done}");
@@ -441,7 +443,7 @@ fn assistant_done_without_deltas_still_renders_full_text() {
     widget.ingest(AgentEvent::AssistantMessageDone {
         text: "resumed text".to_string(),
     });
-    let rendered = render_widget(&widget, 60, 6);
+    let rendered = render_widget(&mut widget, 60, 6);
     assert!(rendered.contains("• resumed text"), "{rendered}");
 }
 
@@ -463,7 +465,7 @@ fn tool_call_mid_stream_finalizes_open_assistant_cell() {
         text: "second message".to_string(),
     });
 
-    let rendered = render_widget(&widget, 60, 12);
+    let rendered = render_widget(&mut widget, 60, 12);
     assert!(rendered.contains("thinking about it"), "{rendered}");
     assert!(rendered.contains("second message"), "{rendered}");
     assert_eq!(
@@ -499,18 +501,26 @@ fn pending_input_mid_stream_keeps_single_assistant_cell() {
         text: "Hello world!".to_string(),
     });
 
-    let rendered = render_widget(&widget, 70, 12);
+    let rendered = render_widget(&mut widget, 70, 12);
+    // With the new scrollback architecture all cells write into native
+    // scrollback in arrival order. The previous behaviour of "splice
+    // streaming cell back to its anchor" is gone because we no longer
+    // hold an in-memory transcript. The single-assistant-cell invariant
+    // still holds (one `• Hello world!`); we just no longer reorder it
+    // ahead of an interleaved queue row.
     assert_eq!(
         rendered.matches("• Hello world!").count(),
         1,
         "pending-input mid-stream must not split assistant text into two cells:\n{rendered}"
     );
-    assert!(rendered.contains("Hello world!"), "{rendered}");
-    let assistant_idx = rendered.find("Hello world!").unwrap();
+    assert!(rendered.contains("◆ queued"), "{rendered}");
     let queue_idx = rendered.find("◆ queued").expect("queue row present");
+    let assistant_idx = rendered
+        .find("Hello world!")
+        .expect("assistant message present");
     assert!(
-        assistant_idx < queue_idx,
-        "assistant cell should splice in at its anchor, before the later queue row:\n{rendered}"
+        queue_idx < assistant_idx,
+        "with scrollback architecture, queue row arrives before the streaming cell finalizes:\n{rendered}"
     );
 }
 
@@ -525,7 +535,7 @@ fn local_helpers_mid_stream_flush_streaming_first() {
         text: "second reply".to_string(),
     });
 
-    let rendered = render_widget(&widget, 70, 12);
+    let rendered = render_widget(&mut widget, 70, 12);
     let first_idx = rendered.find("first reply").expect("first assistant text");
     let skill_idx = rendered.find("◆ skill").expect("skill row");
     let second_idx = rendered
@@ -548,7 +558,7 @@ fn turn_aborted_mid_stream_preserves_partial_text() {
         reason: "user interrupt".to_string(),
     });
 
-    let rendered = render_widget(&widget, 70, 10);
+    let rendered = render_widget(&mut widget, 70, 10);
     assert!(rendered.contains("partial thought"), "{rendered}");
     assert!(
         rendered.contains("◆ aborted  turn-1 user interrupt"),
@@ -564,7 +574,7 @@ fn labeled_rows_wrap_without_clipping_first_line() {
         text: format!("{}LOSTMARK{}", "a".repeat(27), "b".repeat(20)),
     });
 
-    let rendered = render_widget(&widget, 40, 8);
+    let rendered = render_widget(&mut widget, 40, 8);
 
     assert!(rendered.contains("LOSTMARK"), "{rendered}");
 }
@@ -592,16 +602,7 @@ fn renders_full_turn_transcript() {
         usage: TurnUsage::default(),
     });
 
-    let backend = TestBackend::new(60, 20);
-    let mut terminal = Terminal::new(backend).expect("terminal");
-    terminal
-        .draw(|frame| {
-            let area = frame.area();
-            frame.render_widget(&widget, area);
-        })
-        .expect("draw");
-
-    let rendered = buffer_to_text(terminal.backend().buffer());
+    let rendered = render_widget(&mut widget, 60, 20);
     insta::assert_snapshot!("full_turn_transcript", rendered);
 }
 
@@ -660,89 +661,7 @@ fn renders_session_management_cells() {
     widget.push_session_notice("name", "Session name set to \"release work\"");
     widget.push_session_notice("export", "Wrote transcript to transcript.md");
 
-    let rendered = render_widget(&widget, 96, 20);
+    let rendered = render_widget(&mut widget, 96, 20);
     insta::assert_snapshot!("session_management_cells", rendered);
 }
 
-#[test]
-fn overflowing_transcript_follows_newest_lines() {
-    let widget = widget_with_numbered_output(20);
-
-    let rendered = render_widget(&widget, 40, 6);
-
-    assert!(!rendered.contains("line 00"), "{rendered}");
-    assert!(rendered.contains("line 19"), "{rendered}");
-}
-
-#[test]
-fn scroll_up_reveals_older_lines() {
-    let mut widget = widget_with_numbered_output(20);
-
-    widget.scroll_up(100, 40, 6);
-    let rendered = render_widget(&widget, 40, 6);
-
-    assert!(rendered.contains("line 00"), "{rendered}");
-    assert!(!rendered.contains("line 19"), "{rendered}");
-}
-
-#[test]
-fn scroll_down_returns_to_newest_lines() {
-    let mut widget = widget_with_numbered_output(20);
-
-    widget.scroll_up(100, 40, 6);
-    widget.scroll_down(100, 40, 6);
-    let rendered = render_widget(&widget, 40, 6);
-
-    assert!(!rendered.contains("line 00"), "{rendered}");
-    assert!(rendered.contains("line 19"), "{rendered}");
-}
-
-#[test]
-fn scrolled_viewport_stays_stable_when_new_output_arrives() {
-    let mut widget = widget_with_numbered_output(20);
-
-    widget.scroll_up(5, 40, 6);
-    let before = render_widget(&widget, 40, 6);
-    widget.ingest(AgentEvent::ToolCallOutput {
-        call_id: "call_2".to_string(),
-        output: "new line".to_string(),
-        is_error: false,
-        truncation: None,
-    });
-    let after = render_widget(&widget, 40, 6);
-
-    assert!(before.contains("line 10"), "{before}");
-    assert!(after.contains("line 10"), "{after}");
-    assert!(!after.contains("new line"), "{after}");
-}
-
-#[test]
-fn scrolling_before_overflow_keeps_following_new_output() {
-    let mut widget = widget_with_numbered_output(2);
-
-    widget.scroll_up(5, 40, 6);
-    widget.ingest(AgentEvent::ToolCallOutput {
-        call_id: "call_2".to_string(),
-        output: (2..20)
-            .map(|i| format!("line {i:02}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        is_error: false,
-        truncation: None,
-    });
-    let rendered = render_widget(&widget, 40, 6);
-
-    assert!(!rendered.contains("line 00"), "{rendered}");
-    assert!(rendered.contains("line 19"), "{rendered}");
-}
-
-#[test]
-fn scroll_to_top_handles_transcripts_taller_than_u16() {
-    let mut widget = widget_with_numbered_output(u16::MAX as usize + 5);
-
-    widget.scroll_to_top(40, 6);
-    let rendered = render_widget(&widget, 40, 6);
-
-    assert!(rendered.contains("line 00"), "{rendered}");
-    assert!(!rendered.contains("line 65539"), "{rendered}");
-}
