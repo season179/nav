@@ -7,7 +7,7 @@ use crate::cells::{
     FileChangeCell, GitCheckpointCell, NoticeCell, PendingInputCell, SessionListCell,
     SessionNoticeCell, SessionTreeCell, SkillInvocationCell, SubagentCell, ToolCallCell,
     ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell, TurnDiffCell,
-    TurnSeparatorCell, UserMessageCell, WelcomeCell,
+    TurnSeparatorCell, UserMessageCell,
 };
 use crate::history::HistoryCell;
 use crate::theme::Theme;
@@ -103,27 +103,6 @@ impl ChatWidget {
 
     pub fn push_transcript_hits(&mut self, query: String, hits: Vec<TranscriptHit>) {
         self.push_cell(TranscriptHitsCell::new(query, hits));
-    }
-
-    /// Prepend a welcome cell that orients the user (model, cwd, session id).
-    /// Called at TUI launch on a fresh session.
-    pub fn push_welcome(
-        &mut self,
-        model: impl Into<String>,
-        cwd: impl Into<String>,
-        session_id: impl Into<String>,
-        branch_summary: Option<String>,
-        context_summary: Option<String>,
-        settings_summary: Option<String>,
-    ) {
-        self.push_cell(WelcomeCell::new(
-            model,
-            cwd,
-            session_id,
-            branch_summary,
-            context_summary,
-            settings_summary,
-        ));
     }
 
     /// Drain finalized cells that haven't been pushed to scrollback yet,

@@ -84,21 +84,7 @@ pub async fn run(
     // doesn't need a filesystem watcher to earn its keep.
     let mention_entries = bottom_pane::build_mention_entries(&cwd);
 
-    let branch_summary = project.branch_summary();
-    let context_summary = project.context_summary();
-    let settings_summary = project.settings_summary(&cwd);
-
     let mut chat = ChatWidget::with_theme(theme);
-    if resume_events.is_empty() {
-        chat.push_welcome(
-            &args.model,
-            cwd.display().to_string(),
-            &session_id,
-            branch_summary.clone(),
-            context_summary.clone(),
-            settings_summary.clone(),
-        );
-    }
     // Replay startup-time warnings as styled cells so skill/extension
     // discovery messages live in scrollback like the rest of the
     // transcript, instead of stderr leaking above the inline viewport.
@@ -384,14 +370,6 @@ pub async fn run(
                     AppEvent::Quit => break,
                     AppEvent::Clear => {
                         chat = ChatWidget::with_theme(theme);
-                        chat.push_welcome(
-                            &args.model,
-                            cwd.display().to_string(),
-                            &session_id,
-                            branch_summary.clone(),
-                            context_summary.clone(),
-                            settings_summary.clone(),
-                        );
                         pending_skill = None;
                         clear_pending_inputs(
                             &mut control,
@@ -610,14 +588,6 @@ pub async fn run(
                                 pending_skill = None;
                                 active_turn = None;
                                 chat = ChatWidget::with_theme(theme);
-                                chat.push_welcome(
-                                    &args.model,
-                                    cwd.display().to_string(),
-                                    &session_id,
-                                    branch_summary.clone(),
-                                    context_summary.clone(),
-                                    settings_summary.clone(),
-                                );
                                 pane.set_composer_text(&draft.text);
                                 chat.push_session_notice(
                                     "handoff",
@@ -726,14 +696,6 @@ pub async fn run(
                         };
                         pending_skill = restored_skill;
                         chat = ChatWidget::with_theme(theme);
-                        chat.push_welcome(
-                            &args.model,
-                            cwd.display().to_string(),
-                            &session_id,
-                            branch_summary.clone(),
-                            context_summary.clone(),
-                            settings_summary.clone(),
-                        );
                         for event in truncated_events {
                             chat.ingest(event);
                         }

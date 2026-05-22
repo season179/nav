@@ -32,7 +32,7 @@ mod widget;
 pub use app::run;
 pub use cells::{
     AssistantMessageCell, ErrorCell, SkillInvocationCell, ToolCallCell, ToolOutputCell,
-    UserMessageCell, WelcomeCell,
+    UserMessageCell,
 };
 pub use history::HistoryCell;
 pub use input::{SlashAction, classify_slash, prepend_pending_skill};

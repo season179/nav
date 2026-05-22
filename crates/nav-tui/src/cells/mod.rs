@@ -14,7 +14,6 @@ mod sessions;
 mod subagents;
 mod system;
 mod tools;
-mod welcome;
 mod wrapping;
 
 pub(crate) use tools::ToolCallContext;
@@ -28,4 +27,3 @@ pub use sessions::{SessionListCell, SessionNoticeCell, SessionTreeCell, Transcri
 pub use subagents::SubagentCell;
 pub use system::{ApprovalDecisionCell, ErrorCell, NoticeCell, TurnSeparatorCell};
 pub use tools::{ToolCallCell, ToolOutputCell};
-pub use welcome::WelcomeCell;
