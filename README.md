@@ -280,6 +280,116 @@ Example:
 Malformed settings fall back to defaults with an error on stderr. Unknown keys
 are rejected so typos do not silently change behavior.
 
+## Providers
+
+`nav` ships with built-in provider entries so you can connect to common
+OpenAI-compatible APIs with zero configuration. Set the environment variable,
+add the models you want, and run.
+
+Built-in providers:
+
+| ID | Service | `base_url` | Env var |
+|---|---|---|---|
+| `openai` | OpenAI | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `openrouter` | OpenRouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `deepseek` | DeepSeek | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
+| `groq` | Groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `together` | Together | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
+| `zai` | Z.AI | `https://api.z.ai/v1` | `ZAI_API_KEY` |
+| `ollama` | Ollama (local) | `http://localhost:11434/v1` | (none) |
+| `vllm` | vLLM (local) | `http://localhost:8000/v1` | (none) |
+
+No `models` are pre-seeded — add the ones you use under the matching provider
+id. User and project `settings.json` entries override built-ins by id (shallow
+merge: a user entry fully replaces the built-in with the same id).
+
+`default_model` uses `<provider_id>/<model_key>` form — the part before the
+slash selects the provider, the part after selects a model from that provider's
+`models` map.
+
+### Using a built-in provider
+
+Export the env var from the table above, then declare the models you want in
+`~/.nav/settings.json`. The pattern is the same for every cloud provider —
+just swap the id and model names:
+
+```sh
+export OPENAI_API_KEY=sk-...
+```
+
+```jsonc
+// ~/.nav/settings.json
+{
+  "providers": {
+    "openai": {
+      "models": {
+        "gpt-5.5": { "model_id": "gpt-5.5" }
+      }
+    }
+  },
+  "default_model": "openai/gpt-5.5"
+}
+```
+
+```sh
+nav "Refactor the parser module"
+```
+
+For **Ollama** or **vLLM**, no env var is needed — just make sure the local
+server is running and declare your models the same way.
+
+### macOS Keychain
+
+The `api_key` field resolves through three semantics in order:
+
+1. **`!command`** — runs the rest via `sh -c`, returns trimmed stdout
+2. **Env var** — if `std::env::var(input)` is set and non-empty, returns that
+3. **Literal** — returns the string as-is
+
+Use the `!command` form to pull secrets from macOS Keychain:
+
+```sh
+security add-generic-password -s nav-openai -a "$USER" -w "sk-..."
+```
+
+```jsonc
+// ~/.nav/settings.json
+{
+  "providers": {
+    "openai": {
+      "api_key": "!security find-generic-password -s nav-openai -w",
+      "models": {
+        "gpt-5.5": { "model_id": "gpt-5.5" }
+      }
+    }
+  },
+  "default_model": "openai/gpt-5.5"
+}
+```
+
+### Custom / Self-Hosted
+
+For a provider not in the built-in catalog, declare the full entry yourself.
+The id can be anything — just use the same `provider/model` form in
+`default_model`:
+
+```jsonc
+// ~/.nav/settings.json
+{
+  "providers": {
+    "my-vllm": {
+      "name": "My vLLM Cluster",
+      "base_url": "https://vllm.internal.example.com/v1",
+      "api_key": "!security find-generic-password -s nav-my-vllm -w",
+      "models": {
+        "codestral": { "model_id": "mistralai/Codestral-22B-v0.1" }
+      }
+    }
+  },
+  "default_model": "my-vllm/codestral"
+}
+```
+
 ## Skills And Extensions
 
 Project skills live in `<cwd>/.agents/skills/`. User skills live in
