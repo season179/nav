@@ -192,7 +192,7 @@ pub fn run(
 ) -> DoctorReport {
     let mut b = DoctorBuilder::new();
     check_runtime(&mut b, args);
-    check_auth(&mut b, args);
+    check_auth(&mut b, args, &project.settings);
     check_config(&mut b, args, &project.settings);
     check_storage(&mut b, args);
     check_project(&mut b, cwd, project);
@@ -258,13 +258,13 @@ fn value_enum_label<V: ValueEnum>(mode: V) -> String {
 
 // ── auth ────────────────────────────────────────────────────────────
 
-fn check_auth(b: &mut DoctorBuilder, args: &Args) {
+fn check_auth(b: &mut DoctorBuilder, args: &Args, settings: &crate::context::Settings) {
     b.ok(
         DoctorGroup::Auth,
         "active mode",
         format!("--auth {}", value_enum_label(args.auth)),
     );
-    match load_auth(args) {
+    match load_auth(args, settings) {
         Ok(config) => b.ok(
             DoctorGroup::Auth,
             "credential",
