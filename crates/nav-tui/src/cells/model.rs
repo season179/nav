@@ -34,7 +34,11 @@ impl ModelListCell {
 
 impl HistoryCell for ModelListCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let body = model_list_body(&self.lines, &self.current_model, self.default_model.as_deref());
+        let body = model_list_body(
+            &self.lines,
+            &self.current_model,
+            self.default_model.as_deref(),
+        );
         TranscriptRow::new(TranscriptRowKind::ModelList, body).render(width)
     }
 }
@@ -71,10 +75,10 @@ fn model_list_body(
     }
 
     write!(out, "\nCurrent: {current_model}").unwrap();
-    if let Some(default) = default_model {
-        if default != current_model {
-            write!(out, "\nDefault: {default}").unwrap();
-        }
+    if let Some(default) = default_model
+        && default != current_model
+    {
+        write!(out, "\nDefault: {default}").unwrap();
     }
 
     out

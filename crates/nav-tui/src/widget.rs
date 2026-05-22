@@ -1,5 +1,5 @@
-use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit};
 use nav_core::cli::ModelLine;
+use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit};
 use ratatui::text::Line;
 use std::collections::HashMap;
 

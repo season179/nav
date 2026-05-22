@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use nav_core::guardrails::PermissionContext;
 use nav_core::{
-    AgentEvent, AgentTurnRequest, Catalog, OpenAiTransport, ProjectContext, SessionBinding,
+    AgentEvent, AgentTurnRequest, Catalog, ModelTransportHandle, ProjectContext, SessionBinding,
     SessionId, SessionStore, TurnControls, UserAttachment, cli::Args, rebuild_responses_input,
     run_agent,
 };
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub(crate) struct TurnSpawn {
-    pub transport: Arc<OpenAiTransport>,
+    pub transport: ModelTransportHandle,
     pub args: Args,
     pub cwd: PathBuf,
     pub store: Arc<SessionStore>,
@@ -68,7 +68,7 @@ pub(crate) fn spawn_turn(request: TurnSpawn) -> Result<tokio::task::JoinHandle<(
         };
         let _ = run_agent(
             AgentTurnRequest::new(
-                transport.as_ref(),
+                &transport,
                 &args,
                 &cwd,
                 &model_prompt,

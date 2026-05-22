@@ -24,6 +24,15 @@ const FIXTURE_SETTINGS: &str = r#"{
     }
 }"#;
 
+const PROVIDER_API_KEY_ENV: &[&str] = &[
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GROQ_API_KEY",
+    "TOGETHER_API_KEY",
+    "ZAI_API_KEY",
+];
+
 /// Lay out a workspace with `.nav/settings.json` and a separate `HOME` so
 /// the test never reads the developer's real `~/.nav/`.
 fn write_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
@@ -36,12 +45,12 @@ fn write_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
 }
 
 fn run_nav(args: &[&str], cwd: &std::path::Path, home: &std::path::Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_nav"))
-        .args(args)
-        .current_dir(cwd)
-        .env("HOME", home)
-        .output()
-        .expect("invoke nav binary")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nav"));
+    command.args(args).current_dir(cwd).env("HOME", home);
+    for key in PROVIDER_API_KEY_ENV {
+        command.env_remove(key);
+    }
+    command.output().expect("invoke nav binary")
 }
 
 #[test]
@@ -106,18 +115,16 @@ fn providers_list_text_output_reports_credential_state() {
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 2, "stdout: {stdout}");
-    // Fixture omits `api_key` for both providers — `n/a` is the only value
-    // the renderer can produce. The display-name column for ollama is the
-    // fallback-to-id; we assert the exact text so a regression that emits
-    // an empty column can't pass.
-    assert_eq!(
-        lines[0],
-        "ollama  ollama  http://localhost:11434/v1  credential resolvable: n/a"
+    assert_eq!(lines.len(), 9, "stdout: {stdout}");
+    // Built-ins are always present; project providers with the same id replace
+    // the built-in entry. The fixture's `ollama` has no display name and no
+    // api_key, so it should render with fallback display text and `n/a`.
+    assert!(
+        lines.contains(&"ollama  ollama  http://localhost:11434/v1  credential resolvable: n/a")
     );
-    assert_eq!(
-        lines[1],
-        "z.ai  Z.AI  https://api.z.ai/v1  credential resolvable: n/a"
+    assert!(lines.contains(&"z.ai  Z.AI  https://api.z.ai/v1  credential resolvable: n/a"));
+    assert!(
+        lines.contains(&"openai  OpenAI  https://api.openai.com/v1  credential resolvable: yes")
     );
 }
 
@@ -137,13 +144,21 @@ fn providers_list_json_output_is_array() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let arr = parsed.as_array().expect("array");
-    assert_eq!(arr.len(), 2);
-    assert_eq!(arr[0]["id"], "ollama");
-    assert_eq!(arr[0]["display_name"], "ollama");
-    assert_eq!(arr[0]["credential_configured"], false);
-    assert_eq!(arr[0]["credential_resolvable"], true);
-    assert_eq!(arr[1]["id"], "z.ai");
-    assert_eq!(arr[1]["display_name"], "Z.AI");
+    assert_eq!(arr.len(), 9);
+    let by_id = |id: &str| {
+        arr.iter()
+            .find(|entry| entry["id"] == id)
+            .unwrap_or_else(|| panic!("missing provider {id}: {arr:#?}"))
+    };
+    let ollama = by_id("ollama");
+    assert_eq!(ollama["display_name"], "ollama");
+    assert_eq!(ollama["credential_configured"], false);
+    assert_eq!(ollama["credential_resolvable"], true);
+    let zai_custom = by_id("z.ai");
+    assert_eq!(zai_custom["display_name"], "Z.AI");
+    let openai = by_id("openai");
+    assert_eq!(openai["credential_configured"], true);
+    assert_eq!(openai["credential_resolvable"], true);
 }
 
 #[test]
@@ -173,8 +188,8 @@ fn broken_pipe_does_not_panic() {
 fn empty_catalog_prints_placeholder() {
     let workspace = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    // No .nav/settings.json — both commands report no entries instead of
-    // crashing or talking to the network.
+    // No .nav/settings.json — models are empty, while providers still show
+    // the built-in provider catalog.
     let out = run_nav(&["models", "list"], workspace.path(), home.path());
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -186,8 +201,13 @@ fn empty_catalog_prints_placeholder() {
     let out = run_nav(&["providers", "list"], workspace.path(), home.path());
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("openai  OpenAI"), "stdout: {stdout}");
     assert!(
-        stdout.contains("(no providers configured)"),
+        stdout.contains("ollama  Ollama (local)"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(no providers configured)"),
         "stdout: {stdout}"
     );
 }

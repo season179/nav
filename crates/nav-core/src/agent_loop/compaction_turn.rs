@@ -10,6 +10,7 @@ use super::events::{
     CompactionAnalyticsEvent, CompactionAnalyticsPhase, CompactionReason, CompactionStatus,
     CompactionTrigger,
 };
+use super::model_backend;
 use super::runner::SessionBinding;
 use crate::cli::Args;
 use crate::context::compaction::{
@@ -186,20 +187,22 @@ async fn request_compaction_summary(
             "role": "user",
             "content": prompt,
         })];
-        let body = responses::response_body_with_options(
+        let body = model_backend::request_body(
+            request.transport,
             request.args,
             request.cwd,
             &compaction_input,
             request.skills,
             request.context,
             responses::ResponseBodyOptions::read_only(),
-        );
+        )?;
         let mut stream = request
             .transport
             .create(body, request.events.clone())
             .await
             .map_err(|err| anyhow!("{err:#}"))?;
         let mut collector = ResponseCollector::default();
+        let source_name = model_backend::compact_source_name(request.transport);
         let mut retry_after_trim = false;
 
         loop {
@@ -228,7 +231,7 @@ async fn request_compaction_summary(
                 Some(Err(err)) => return Err(anyhow!("{err:#}")),
                 None => break,
             };
-            match collector.push_event(&value, "Responses API (compact)") {
+            match collector.push_event(&value, source_name) {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(err) => return Err(err),
@@ -238,8 +241,9 @@ async fn request_compaction_summary(
         if retry_after_trim {
             continue;
         }
-        let envelope = collector.finish("Responses API (compact)")?;
-        let summary = responses::assistant_text(&envelope).unwrap_or_default();
+        let envelope = collector.finish(source_name)?;
+        let summary =
+            model_backend::assistant_text(request.transport, &envelope).unwrap_or_default();
         if summary.trim().is_empty() {
             return Err(anyhow!("compaction summary was empty"));
         }

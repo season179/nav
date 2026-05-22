@@ -8,6 +8,7 @@ use super::events::{CompactionAnalyticsPhase, CompactionReason, CompactionTrigge
 use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::agent_loop::compaction_turn::{CompactionTurnRequest, run_compaction_turn};
 use crate::agent_loop::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::agent_loop::model_backend;
 use crate::agent_loop::prune::prune_to_budget;
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
@@ -343,14 +344,19 @@ pub(super) async fn run_agent_inner(
                 },
             );
         }
-        let body =
-            responses::response_body_with_options(args, cwd, &input, skills, context, options);
+        let body = match model_backend::request_body(
+            transport, args, cwd, &input, skills, context, options,
+        ) {
+            Ok(body) => body,
+            Err(err) => return fail(&events, session, err),
+        };
         let mut stream = match transport.create(body, events.clone()).await {
             Ok(stream) => stream,
             Err(err) => return fail(&events, session, err),
         };
 
         let mut collector = ResponseCollector::default();
+        let source = model_backend::source_name(transport);
         loop {
             let event = match stream.next().await {
                 Some(Ok(event)) => event,
@@ -419,7 +425,7 @@ pub(super) async fn run_agent_inner(
                 None => break,
             };
             emit_stream_events(&event, &events, session);
-            match collector.push_event(&event, "Responses API") {
+            match collector.push_event(&event, source) {
                 Ok(true) => break,
                 Ok(false) => {}
                 Err(err) => {
@@ -428,12 +434,12 @@ pub(super) async fn run_agent_inner(
             }
         }
 
-        let envelope = match collector.finish("Responses API") {
+        let envelope = match collector.finish(source) {
             Ok(envelope) => envelope,
             Err(err) => return fail(&events, session, err),
         };
-        let usage = responses::turn_usage_from(&envelope);
-        let calls = match responses::function_calls_from(&envelope) {
+        let usage = model_backend::turn_usage_from(transport, &envelope);
+        let calls = match model_backend::function_calls_from(transport, &envelope) {
             Ok(calls) => calls,
             Err(err) => return fail(&events, session, err),
         };
@@ -477,8 +483,8 @@ pub(super) async fn run_agent_inner(
         // sanitized items are emitted as a durable event so a new `run_agent`
         // invocation rehydrating from the session log can replay the same
         // continuation without storing hidden plaintext reasoning.
-        let raw_output = responses::into_raw_output(envelope);
-        let continuation_items = responses::sanitize_continuation_items(&raw_output);
+        let raw_output = model_backend::into_raw_output(transport, envelope);
+        let continuation_items = model_backend::sanitize_continuation_items(transport, &raw_output);
         if !continuation_items.is_empty() {
             emit(
                 &events,

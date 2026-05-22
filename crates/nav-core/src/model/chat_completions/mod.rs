@@ -14,11 +14,9 @@
 //!   [`crate::model::auth::resolve_provider`] from the providers catalog ⇒
 //!   [`ChatCompletionsTransport`].
 //!
-//! Today only the Codex path is reachable from `nav-cli`; G9 will rewrite
-//! `load_auth`'s api-key branch to consult the catalog and instantiate this
-//! transport. Request body construction (C1) and SSE event normalization
-//! (F2) are implemented; response parsing (C2) delegates to the Responses
-//! parser where the envelope shape is shared.
+//! Request body construction, SSE normalization, and response parsing all
+//! normalize into the shared Responses-shaped event/envelope path so the
+//! agent loop can stay backend-agnostic after transport selection.
 
 mod collector;
 mod delta;
@@ -33,18 +31,20 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::Result;
+use futures_util::stream;
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::agent_loop::AgentEvent;
 use crate::model::auth::ResolvedProvider;
 use crate::model::responses::RetryPolicy;
-use crate::model::{EventStream, ResponsesTransport};
+use crate::model::responses::{ResponsesError, retry};
+use crate::model::{EventStream, ResponsesTransport, WireFormat};
 
 pub(crate) use parser::{
-    assistant_text, into_raw_output, process_response, sanitize_continuation_items,
-    turn_usage_from,
+    assistant_text, into_raw_output, process_response, sanitize_continuation_items, turn_usage_from,
 };
+pub(crate) use request::build_request_body_with_options;
 
 /// Transport for OpenAI-compatible `POST {base_url}/chat/completions` SSE
 /// endpoints, parameterized by a resolved provider/model entry from the
@@ -81,24 +81,72 @@ impl ChatCompletionsTransport {
             retry_policy,
         }
     }
+
+    /// Construct using nav's normal streaming-client timeouts.
+    pub fn with_default_client(
+        resolved: ResolvedProvider,
+        idle_timeout: Duration,
+        retry_policy: RetryPolicy,
+    ) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()?;
+        Ok(Self::new(client, resolved, idle_timeout, retry_policy))
+    }
 }
 
 impl ResponsesTransport for ChatCompletionsTransport {
+    fn wire_format(&self) -> WireFormat {
+        WireFormat::ChatCompletions
+    }
+
+    fn chat_completions_provider(&self) -> Option<ResolvedProvider> {
+        Some(self.resolved.clone())
+    }
+
     fn create<'a>(
         &'a self,
-        _body: Value,
-        _events: UnboundedSender<AgentEvent>,
+        body: Value,
+        events: UnboundedSender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = Result<EventStream>> + Send + 'a>> {
-        // The body is built by `request::build_request_body` (C1), driven by
-        // `sse::connect_sse` + `sse::drive_sse` (F2), normalized through
-        // `delta::normalize_event` (F2), and folded into a `ResponseEnvelope`
-        // by `collector::ChatCompletionsCollector` (C2). Until those land
-        // this transport is unreachable from production code — selection in
-        // `nav-cli` still goes through `OpenAiTransport` only.
-        Box::pin(async {
-            unimplemented!(
-                "ChatCompletionsTransport::create — request/parser/sse/collector are filled in by C1/C2/F2"
-            )
+        let client = self.client.clone();
+        let resolved = self.resolved.clone();
+        let idle_timeout = self.idle_timeout;
+        let policy = self.retry_policy;
+        Box::pin(async move {
+            let (tx, rx) = mpsc::unbounded_channel::<Result<Value, ResponsesError>>();
+            let max_attempts = policy.max_attempts;
+            let on_retry = |attempt: u32, delay: Duration, err: &retry::TransportError| {
+                let _ = events.send(AgentEvent::ProviderRetry {
+                    attempt,
+                    max_attempts,
+                    delay_ms: delay.as_millis() as u64,
+                    reason: err.to_string(),
+                });
+            };
+
+            let result = retry::retry(&policy, on_retry, || async {
+                sse::connect_sse(&client, &resolved, body.clone()).await
+            })
+            .await;
+            match result {
+                Ok(response) => {
+                    tokio::spawn(async move {
+                        sse::drive_sse(response, idle_timeout, tx).await;
+                    });
+                }
+                Err(retry::TransportError::ContextWindowExceeded { message }) => {
+                    let _ = tx.send(Err(ResponsesError::ContextWindowExceeded { message }));
+                }
+                Err(err) => return Err(err.into()),
+            }
+
+            let stream = stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            let boxed: EventStream = Box::pin(stream);
+            Ok(boxed)
         })
     }
 }

@@ -8,9 +8,10 @@ use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent};
 use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
-    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, HandoffDraft, NoticeLevel,
-    OpenAiTransport, PROVIDER_OPENAI_RESPONSES, PendingInputMode, PendingSkill, ProjectContext,
-    SessionId, SessionStore, StartupNotices, build_handoff_draft,
+    AgentEvent, Catalog, ChatCompletionsTransport, ControlPlane, ExtensionCatalog, HandoffDraft,
+    ModelSwapOutcome, ModelTransportHandle, NoticeLevel, PROVIDER_OPENAI_RESPONSES,
+    PendingInputMode, PendingSkill, ProjectContext, ResolvedProvider, RetryPolicy, SessionId,
+    SessionStore, StartupNotices, WireFormat, build_handoff_draft,
     cli::{Args, list_models, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };
@@ -52,8 +53,8 @@ use turn_lifecycle::{
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    transport: Arc<OpenAiTransport>,
-    args: Args,
+    transport: ModelTransportHandle,
+    mut args: Args,
     cwd: PathBuf,
     store: Arc<SessionStore>,
     mut session_id: SessionId,
@@ -115,6 +116,7 @@ pub async fn run(
     let mut pending_skill: Option<PendingSkill> = None;
     let mut control = ControlPlane::new();
     let mut active_turn: Option<ActiveTurnHandle> = None;
+    let mut pending_model_swap: Option<PendingModelSwap> = None;
     let mut spinner_tick: u64 = 0;
     // Latest provider-reported `tokens_input`. For `store: false` transports
     // this is also the current context occupancy, since every turn resends the
@@ -174,6 +176,14 @@ pub async fn run(
             needs_draw = true;
             let active_id = control.active().map(|active| active.id().to_string());
             active_turn = None;
+            apply_pending_model_swap(
+                &mut pending_model_swap,
+                &transport,
+                &mut args,
+                store.as_ref(),
+                &session_id,
+                &mut chat,
+            );
             if let Some(id) = active_id
                 && let Ok(settled) = control.finish_turn(&id)
             {
@@ -317,6 +327,14 @@ pub async fn run(
                         );
                     }
                     active_turn = None;
+                    apply_pending_model_swap(
+                        &mut pending_model_swap,
+                        &transport,
+                        &mut args,
+                        store.as_ref(),
+                        &session_id,
+                        &mut chat,
+                    );
                     if let Some(id) = active_id
                         && let Ok(settled) = control.finish_turn(&id)
                     {
@@ -569,13 +587,21 @@ pub async fn run(
                         };
                         match match_model_selector(&selector, catalog) {
                             ModelMatch::Exact(sel) | ModelMatch::BareUnique(sel) => {
-                                match store.set_session_model(&session_id, &sel) {
-                                    Ok(()) => {
+                                match resolve_model_swap(&sel, project.as_ref()) {
+                                    Ok(swap) if active_turn.is_some() => {
+                                        pending_model_swap = Some(swap);
                                         chat.push_model_set(format!(
-                                            "Set next session model to \"{sel}\".\n\
-                                            Restart nav (Ctrl+C, rerun) for the change to take effect."
+                                            "Queued model swap to \"{sel}\" after the current turn."
                                         ));
                                     }
+                                    Ok(swap) => apply_model_swap(
+                                        swap,
+                                        &transport,
+                                        &mut args,
+                                        store.as_ref(),
+                                        &session_id,
+                                        &mut chat,
+                                    ),
                                     Err(err) => chat.push_err(err),
                                 }
                             }
@@ -1010,6 +1036,85 @@ fn emit_pending_cleared(
     );
 }
 
+#[derive(Clone)]
+struct PendingModelSwap {
+    selector: String,
+    resolved: ResolvedProvider,
+}
+
+fn resolve_model_swap(selector: &str, project: &ProjectContext) -> Result<PendingModelSwap> {
+    let resolved = nav_core::model::resolve_provider(Some(selector), &project.settings)?;
+    Ok(PendingModelSwap {
+        selector: selector.to_string(),
+        resolved,
+    })
+}
+
+fn apply_pending_model_swap(
+    pending: &mut Option<PendingModelSwap>,
+    transport: &ModelTransportHandle,
+    args: &mut Args,
+    store: &SessionStore,
+    session_id: &SessionId,
+    chat: &mut ChatWidget,
+) {
+    let Some(swap) = pending.take() else {
+        return;
+    };
+    apply_model_swap(swap, transport, args, store, session_id, chat);
+}
+
+fn apply_model_swap(
+    swap: PendingModelSwap,
+    transport: &ModelTransportHandle,
+    args: &mut Args,
+    store: &SessionStore,
+    session_id: &SessionId,
+    chat: &mut ChatWidget,
+) {
+    match swap_active_transport(&swap, transport, args, store, session_id) {
+        Ok(outcome) => {
+            args.model = swap.selector.clone();
+            chat.push_model_set(model_swap_message(&swap.selector, outcome.from, outcome.to));
+        }
+        Err(err) => chat.push_err(err),
+    }
+}
+
+fn swap_active_transport(
+    swap: &PendingModelSwap,
+    transport: &ModelTransportHandle,
+    args: &Args,
+    store: &SessionStore,
+    session_id: &SessionId,
+) -> Result<ModelSwapOutcome> {
+    let next = build_chat_completions_transport(swap, args)?;
+    store.set_session_model(session_id, &swap.selector)?;
+    transport.swap_to(next)
+}
+
+fn build_chat_completions_transport(
+    swap: &PendingModelSwap,
+    args: &Args,
+) -> Result<ChatCompletionsTransport> {
+    ChatCompletionsTransport::with_default_client(
+        swap.resolved.clone(),
+        Duration::from_secs(args.idle_timeout_secs),
+        RetryPolicy::default(),
+    )
+}
+
+fn model_swap_message(selector: &str, from: WireFormat, to: WireFormat) -> String {
+    if from == to {
+        return format!("Switched model to \"{selector}\".");
+    }
+    format!(
+        "Switched model to \"{selector}\" ({} -> {}).",
+        from.label(),
+        to.label()
+    )
+}
+
 fn handoff_session_name(goal: &str) -> String {
     let trimmed = goal.trim();
     if trimmed.is_empty() {
@@ -1073,5 +1178,110 @@ fn run_idle_git_action(
     match run() {
         Ok(outcome) => emit_local_event(outcome.into(), store, session_id, chat, pane),
         Err(err) => chat.push_err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream;
+    use nav_core::cli::{AuthMode, SandboxMode, Transport};
+    use nav_core::{AskForApproval, EventStream, ResponsesTransport};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use tokio::sync::mpsc;
+
+    struct NoopTransport;
+
+    impl ResponsesTransport for NoopTransport {
+        fn create<'a>(
+            &'a self,
+            _body: Value,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Pin<Box<dyn Future<Output = Result<EventStream>> + Send + 'a>> {
+            Box::pin(async {
+                let boxed: EventStream = Box::pin(stream::empty());
+                Ok(boxed)
+            })
+        }
+    }
+
+    fn test_swap() -> PendingModelSwap {
+        PendingModelSwap {
+            selector: "ollama/llama3".into(),
+            resolved: ResolvedProvider {
+                base_url: "http://localhost:11434/v1".into(),
+                bearer: None,
+                headers: BTreeMap::new(),
+                model_id: "llama3".into(),
+                reasoning_effort: None,
+                max_output_tokens: None,
+                display_name: "Ollama (local)/llama3".into(),
+            },
+        }
+    }
+
+    fn test_args() -> Args {
+        Args {
+            model: "gpt-5.5".into(),
+            auth: AuthMode::Chatgpt,
+            transport: Transport::Websocket,
+            codex_home: None,
+            max_turns: 4,
+            tool_call_soft_budget: 0,
+            bash_timeout_secs: 10,
+            idle_timeout_secs: 30,
+            resume: None,
+            list_sessions: false,
+            pick_session: false,
+            name: None,
+            cwd: None,
+            db_path: None,
+            json_events: false,
+            json_rpc: false,
+            approval_policy: AskForApproval::Never,
+            sandbox: SandboxMode::DangerFullAccess,
+            dangerously_bypass_approvals_and_sandbox: false,
+            auto_compact_token_limit: 0,
+            auto_compact_fraction: 1.0,
+            ambient_context_token_budget: 0,
+            git_checkpoints: false,
+            no_git_checkpoints: false,
+            reasoning_effort: None,
+            command: None,
+            prompt: vec![],
+        }
+    }
+
+    #[test]
+    fn pending_model_swap_applies_to_transport_args_and_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        let db_path = dir.path().join("nav.sqlite");
+        let store = SessionStore::open(Some(db_path)).unwrap();
+        let session_id = store
+            .create_session(&cwd, PROVIDER_OPENAI_RESPONSES, "gpt-5.5", None)
+            .unwrap();
+        let transport = ModelTransportHandle::new(NoopTransport);
+        let mut args = test_args();
+        let mut chat = ChatWidget::new();
+        let mut pending = Some(test_swap());
+
+        apply_pending_model_swap(
+            &mut pending,
+            &transport,
+            &mut args,
+            &store,
+            &session_id,
+            &mut chat,
+        );
+
+        assert!(pending.is_none());
+        assert_eq!(args.model, "ollama/llama3");
+        assert_eq!(transport.wire_format(), WireFormat::ChatCompletions);
+        let summary = store.session_summary(&session_id).unwrap().unwrap();
+        assert_eq!(summary.model, "ollama/llama3");
     }
 }

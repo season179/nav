@@ -8,8 +8,9 @@
 //! structurally identical to what the Responses backend produces. Most helpers
 //! here delegate to the Responses parser directly. CC-specific differences:
 //!
-//! - [`sanitize_continuation_items`]: identity pass-through (no encrypted
-//!   reasoning to strip).
+//! - [`sanitize_continuation_items`]: drops assistant message items just like
+//!   the Responses path; `AssistantMessageDone` is already the durable text
+//!   record in the session log.
 //! - [`turn_usage_from`]: `tokens_reasoning` is always 0.
 
 use crate::agent_loop::TurnUsage;
@@ -40,15 +41,14 @@ pub(crate) fn into_raw_output(response: ResponseEnvelope) -> Vec<Value> {
     responses::into_raw_output(response)
 }
 
-/// Identity pass-through for continuation items.
+/// Strip continuation items down to the replay-only shapes nav persists.
 ///
-/// The Responses backend strips encrypted reasoning and drops assistant
-/// `message` items. CC has no encrypted reasoning, and message items are
-/// handled during continuation conversion by [`super::history], so all items
-/// pass through unchanged. Mirrors the call-site shape of
-/// [`responses::sanitize_continuation_items`].
+/// Chat Completions has no encrypted reasoning items, but message items still
+/// need the same treatment as Responses: live text is already durable as
+/// `AssistantMessageDone`, so persisting the message again in
+/// `ResponseContinuation` would replay duplicate assistant text.
 pub(crate) fn sanitize_continuation_items(items: &[Value]) -> Vec<Value> {
-    items.to_vec()
+    responses::sanitize_continuation_items(items)
 }
 
 /// Map usage fields into [`TurnUsage`].
@@ -136,13 +136,21 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_continuation_items_is_identity() {
+    fn sanitize_continuation_items_drops_message_items() {
         let items = vec![
             json!({"type": "message", "content": [{"type": "output_text", "text": "hi"}]}),
             json!({"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{}"}),
         ];
         let result = sanitize_continuation_items(&items);
-        assert_eq!(result, items);
+        assert_eq!(
+            result,
+            vec![json!({
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "bash",
+                "arguments": "{}",
+            })]
+        );
     }
 
     #[test]

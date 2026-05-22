@@ -6,8 +6,8 @@
 
 mod changes;
 mod compaction;
-mod model;
 mod messages;
+mod model;
 mod pending;
 mod preview;
 mod row;
