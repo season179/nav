@@ -16,8 +16,9 @@
 //!
 //! Today only the Codex path is reachable from `nav-cli`; G9 will rewrite
 //! `load_auth`'s api-key branch to consult the catalog and instantiate this
-//! transport. F1 only puts the module in place — request body construction
-//! (C1), response parsing (C2), and SSE event normalization (F2) follow.
+//! transport. Request body construction (C1) and SSE event normalization
+//! (F2) are implemented; response parsing (C2) delegates to the Responses
+//! parser where the envelope shape is shared.
 
 mod collector;
 mod delta;
@@ -39,6 +40,11 @@ use crate::agent_loop::AgentEvent;
 use crate::model::auth::ResolvedProvider;
 use crate::model::responses::RetryPolicy;
 use crate::model::{EventStream, ResponsesTransport};
+
+pub(crate) use parser::{
+    assistant_text, into_raw_output, process_response, sanitize_continuation_items,
+    turn_usage_from,
+};
 
 /// Transport for OpenAI-compatible `POST {base_url}/chat/completions` SSE
 /// endpoints, parameterized by a resolved provider/model entry from the

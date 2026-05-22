@@ -1,6 +1,8 @@
 //! ChatCompletions-specific structs that map into the shared
 //! [`crate::model::responses::types::ResponseEnvelope`] surface.
 //!
-//! Filled in by C2 (response parsing). Today this file is a placeholder so the
-//! module tree mirrors `responses/` and review tooling has a stable shape to
-//! diff against when C2 lands.
+//! The accumulator normalizes CC SSE chunks into Responses-shaped events, so
+//! the collected envelope is structurally identical to what the Responses
+//! backend produces. No CC-specific types are needed today — the parser
+//! (C2) works entirely through the shared types and delegates to the
+//! Responses parser for identical operations.
