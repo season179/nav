@@ -28,6 +28,7 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::context::ReasoningEffort;
 use crate::context::DEFAULT_AMBIENT_CONTEXT_TOKEN_BUDGET;
 use crate::context::compaction::{DEFAULT_AUTO_COMPACT_FRACTION, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT};
 use crate::guardrails::AskForApproval;
@@ -182,6 +183,12 @@ pub struct Args {
     #[arg(long, conflicts_with = "git_checkpoints")]
     pub no_git_checkpoints: bool,
 
+    /// Reasoning effort for the model. Overrides the `reasoning_effort` value
+    /// from the resolved provider/model catalog entry. Only emitted on
+    /// Chat Completions requests; the Codex/ChatGPT path is unaffected.
+    #[arg(long, value_enum)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+
     #[command(subcommand)]
     pub command: Option<CliCommand>,
 
@@ -225,6 +232,7 @@ impl Args {
             ambient_context_token_budget: 0,
             git_checkpoints: false,
             no_git_checkpoints: false,
+            reasoning_effort: None,
             command: None,
             prompt: vec!["test".into()],
         }

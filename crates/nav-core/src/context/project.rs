@@ -23,6 +23,7 @@
 //!   bar and the NDJSON startup banner.
 
 use crate::cli::{AuthMode, Transport};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -157,7 +158,10 @@ impl ContextScope {
 }
 
 /// Reasoning effort level for a model configuration.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+///
+/// Shared by the model catalog (`ModelConfig.reasoning_effort`), the
+/// `--reasoning-effort` CLI flag, and the `reasoning_effort` settings key.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,
@@ -335,6 +339,11 @@ pub struct Settings {
     /// dangling reference logs a single stderr line and is ignored so nav
     /// can still start for the user to fix it.
     pub default_model: Option<String>,
+    /// Reasoning effort override. When set, takes precedence over
+    /// `ModelConfig.reasoning_effort` from the resolved provider catalog.
+    /// The CLI flag (`--reasoning-effort`) beats project settings, which
+    /// beat user settings; the model entry is the lowest-priority source.
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl Settings {
@@ -370,6 +379,7 @@ impl Settings {
         }
 
         self.default_model = other.default_model.or(self.default_model.take());
+        self.reasoning_effort = other.reasoning_effort.or(self.reasoning_effort);
     }
 
     /// Validate `default_model` against the merged providers catalog.
@@ -846,6 +856,34 @@ mod tests {
         assert_eq!(ctx.settings.tool_call_soft_budget, Some(0));
         assert_eq!(ctx.settings.theme.as_deref(), Some("night"));
         assert_eq!(ctx.settings_sources.len(), 2);
+    }
+
+    #[test]
+    fn reasoning_effort_settings_merge() {
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_cwd = TempDir::new().unwrap();
+        write(
+            &tmp_home.path().join(".nav").join("settings.json"),
+            r#"{"reasoning_effort":"low"}"#,
+        );
+        write(
+            &tmp_cwd.path().join(".nav").join("settings.json"),
+            r#"{"reasoning_effort":"high"}"#,
+        );
+        let ctx = load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
+        assert_eq!(ctx.settings.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn reasoning_effort_from_user_settings_alone() {
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_cwd = TempDir::new().unwrap();
+        write(
+            &tmp_home.path().join(".nav").join("settings.json"),
+            r#"{"reasoning_effort":"medium"}"#,
+        );
+        let ctx = load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
+        assert_eq!(ctx.settings.reasoning_effort, Some(ReasoningEffort::Medium));
     }
 
     #[test]

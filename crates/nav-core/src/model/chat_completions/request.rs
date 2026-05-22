@@ -8,7 +8,7 @@
 use crate::cli::Args;
 use crate::context::build_instructions;
 use crate::context::history::strip_synthetic_markers;
-use crate::context::{Catalog, ProjectContext};
+use crate::context::{Catalog, ProjectContext, ReasoningEffort};
 use crate::model::auth::ResolvedProvider;
 use crate::tool_registry::{ToolAccess, tool_definitions};
 use serde_json::{Map, Value, json};
@@ -55,6 +55,20 @@ pub(crate) fn wrap_tools(tools: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Resolve the effective reasoning effort: CLI flag > settings > model entry.
+///
+/// The CLI flag and settings override (`Args.reasoning_effort`) takes
+/// precedence over the provider catalog's per-model default
+/// (`ResolvedProvider.reasoning_effort`). When both are `None`, the field
+/// is omitted from the request body entirely.
+#[allow(dead_code)]
+pub(crate) fn effective_reasoning_effort(
+    args: &Args,
+    resolved: &ResolvedProvider,
+) -> Option<ReasoningEffort> {
+    args.reasoning_effort.or(resolved.reasoning_effort)
+}
+
 /// Build the JSON body for `POST {base_url}/chat/completions`.
 ///
 /// Mirrors [`crate::model::responses::request::response_body_with_options`]
@@ -69,7 +83,7 @@ pub(crate) fn wrap_tools(tools: &[Value]) -> Vec<Value> {
 /// provider catalog overrides it).
 #[allow(dead_code)] // Wired into the agent loop by G9.
 pub(crate) fn build_request_body(
-    _args: &Args,
+    args: &Args,
     resolved: &ResolvedProvider,
     cwd: &Path,
     input: &[Value],
@@ -102,7 +116,7 @@ pub(crate) fn build_request_body(
     body.insert("tools".into(), Value::Array(tools));
     body.insert("stream".into(), Value::Bool(true));
 
-    if let Some(effort) = resolved.reasoning_effort {
+    if let Some(effort) = effective_reasoning_effort(args, resolved) {
         body.insert("reasoning_effort".into(), Value::String(effort.to_string()));
     }
     if let Some(max_tokens) = resolved.max_output_tokens {
@@ -145,6 +159,14 @@ mod tests {
             ..resolved(model_id)
         }
     }
+
+    fn test_args(effort: Option<ReasoningEffort>) -> Args {
+        let mut args = Args::test_default();
+        args.reasoning_effort = effort;
+        args
+    }
+
+    // ── wrap_tools tests ───────────────────────────────────────
 
     #[test]
     fn wrap_tools_moves_fields_under_function_key() {
@@ -388,5 +410,69 @@ mod tests {
 
         insta::assert_snapshot!("with_max_tokens", snap_body(&body));
         assert_eq!(body["max_tokens"], 4096);
+    }
+
+    // ── effective_reasoning_effort tests (G5) ────────────────
+
+    #[test]
+    fn cli_flag_overrides_model_entry() {
+        let resolved = resolved_with_effort("test", ReasoningEffort::Low);
+        let args = test_args(Some(ReasoningEffort::High));
+        assert_eq!(
+            effective_reasoning_effort(&args, &resolved),
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn model_entry_used_when_flag_absent() {
+        let resolved = resolved_with_effort("test", ReasoningEffort::Medium);
+        let args = test_args(None);
+        assert_eq!(
+            effective_reasoning_effort(&args, &resolved),
+            Some(ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn none_when_both_absent() {
+        let resolved = resolved("test");
+        let args = test_args(None);
+        assert_eq!(effective_reasoning_effort(&args, &resolved), None);
+    }
+
+    #[test]
+    fn cli_flag_used_when_model_entry_absent() {
+        let resolved = resolved("test");
+        let args = test_args(Some(ReasoningEffort::Low));
+        assert_eq!(
+            effective_reasoning_effort(&args, &resolved),
+            Some(ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_cli_flag_in_build_request_body() {
+        // The CLI flag should override the model entry in the full body too.
+        let resolved = resolved_with_effort("glm-5.1", ReasoningEffort::Low);
+        let mut args = Args::test_default();
+        args.reasoning_effort = Some(ReasoningEffort::High);
+        let cwd = std::path::Path::new("/tmp/project");
+        let input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": "override test",
+        })];
+
+        let body = build_request_body(
+            &args,
+            &resolved,
+            cwd,
+            &input,
+            &Default::default(),
+            None,
+        );
+
+        assert_eq!(body["reasoning_effort"], "high");
     }
 }

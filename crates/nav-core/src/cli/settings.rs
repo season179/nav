@@ -101,5 +101,10 @@ impl Args {
         {
             self.git_checkpoints = enabled;
         }
+        if let Some(effort) = settings.reasoning_effort
+            && !provided.was_provided("reasoning_effort")
+        {
+            self.reasoning_effort = Some(effort);
+        }
     }
 }
