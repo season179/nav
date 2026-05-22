@@ -1,0 +1,13 @@
+{
+  "description": "Pure text response with no tool calls. Content arrives as delta.content chunks.",
+  "expected": {
+    "assistant_text": "Hello! I'm ready to help.",
+    "tool_calls": [],
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 15,
+      "completion_tokens": 8,
+      "total_tokens": 23
+    }
+  }
+}
