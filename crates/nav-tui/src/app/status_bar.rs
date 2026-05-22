@@ -18,9 +18,10 @@ pub struct StatusBar<'a> {
     /// uncommitted changes. False when not in a repo.
     pub dirty: bool,
     pub state: AgentState,
-    /// Current context-window occupancy: the latest provider-reported
-    /// `tokens_input`. `0` before the first `TurnComplete`.
+    /// Latest provider-reported token counts for the status bar.
     pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cached: u64,
     /// Effective context window used to compute the percentage. `0` hides the
     /// gauge entirely.
     pub context_window: u64,
@@ -94,18 +95,32 @@ impl<'a> Widget for StatusBar<'a> {
                 ));
             }
         }
-        if let Some(pct) = self
-            .tokens_input
-            .saturating_mul(100)
-            .checked_div(self.context_window)
-            && self.tokens_input >= 1_000
-        {
-            let denom_k = (self.context_window + 500) / 1_000;
+        // Token usage segment: show in/out/cached when we have data,
+        // plus context-window percentage.
+        if self.tokens_input >= 1_000 {
             spans.push(Span::styled("  ·  ", dim));
-            spans.push(Span::styled(
-                format!("{}/{denom_k}k {pct}%", format_tokens_k(self.tokens_input)),
-                dim,
-            ));
+            let in_k = format_tokens_k(self.tokens_input);
+            let out_display = if self.tokens_output >= 1_000 {
+                format!(" ↑{}", format_tokens_k(self.tokens_output))
+            } else {
+                String::new()
+            };
+            let mut usage = format!("↓{}{}", in_k, out_display);
+            if self.tokens_cached >= 1_000 {
+                usage.push_str(&format!(" 💥{}", format_tokens_k(self.tokens_cached)));
+            }
+            spans.push(Span::styled(usage, dim));
+            if let Some(pct) = self
+                .tokens_input
+                .saturating_mul(100)
+                .checked_div(self.context_window)
+            {
+                let denom_k = (self.context_window + 500) / 1_000;
+                spans.push(Span::styled(
+                    format!(" · {denom_k}k {pct}%"),
+                    dim,
+                ));
+            }
         }
         Paragraph::new(Line::from(spans)).render(area, buf);
     }

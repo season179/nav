@@ -1231,7 +1231,7 @@
         <div class="row"><div class="who">ToolCallOutput</div><div class="what"><code>ToolOutputCell</code>, gutter glyph <code>└</code>, dim grey (red if <code>is_error</code>).</div></div>
         <div class="row"><div class="who">Error</div><div class="what"><code>ErrorCell</code>, red.</div></div>
         <div class="row"><div class="who">AssistantMessageDelta</div><div class="what">Appended to the in-flight <code>AssistantMessageCell</code> in the viewport so the user sees text grow as it streams. <code>AssistantMessageDone</code> finalizes the cell and pushes it to scrollback.</div></div>
-        <div class="row"><div class="who">TurnComplete</div><div class="what">Flips the status bar back to <em>Ready</em> and (if the turn produced any work) appends a <code>TurnSeparatorCell</code> with token usage.</div></div>
+        <div class="row"><div class="who">TurnComplete</div><div class="what">Flips the status bar back to <em>Ready</em>, closes the streaming assistant cell, drains inflight tool-call placeholders, and updates the status-bar token gauge (input, output, cached).</div></div>
       </div>
     </section>
 

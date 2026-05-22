@@ -50,6 +50,8 @@ pub(super) struct TuiStatus<'a> {
     pub dirty: bool,
     pub state: AgentState,
     pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cached: u64,
     pub context_window: u64,
 }
 
@@ -161,6 +163,8 @@ pub(super) fn draw_tui(
                 dirty: status.dirty,
                 state: status.state,
                 tokens_input: status.tokens_input,
+                tokens_output: status.tokens_output,
+                tokens_cached: status.tokens_cached,
                 context_window: status.context_window,
             },
             chunks[2],

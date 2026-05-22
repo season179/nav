@@ -225,18 +225,25 @@ fn apply_gutter_header(lines: &mut [Line<'static>], style: TranscriptRowStyle, l
     let Some(first) = lines.first_mut() else {
         return;
     };
-    let Some(span) = first.spans.first_mut() else {
+    if first.spans.is_empty() {
         return;
+    }
+
+    // The first span is expected to be the "  " body indent. After stripping
+    // it, any remaining text is body content; subsequent spans (from inline
+    // markdown parsing) are preserved as-is.
+    let first_content = first.spans[0].content.clone();
+    let rest_owned = if let Some(rest) = first_content.strip_prefix(BODY_INDENT) {
+        rest.to_string()
+    } else {
+        first_content.to_string()
     };
-    let rest = span
-        .content
-        .strip_prefix(BODY_INDENT)
-        .unwrap_or(&span.content);
-    let rest_owned = rest.to_string();
-    let trailing = std::mem::take(&mut first.spans).into_iter().skip(1);
-    let mut spans = row_header_spans(style, label, !rest_owned.is_empty());
+
+    let mut trailing: Vec<_> = std::mem::take(&mut first.spans).into_iter().skip(1).collect();
+    let has_body = !rest_owned.is_empty() || !trailing.is_empty();
+    let mut spans = row_header_spans(style, label, has_body);
     spans.push(Span::raw(rest_owned));
-    spans.extend(trailing);
+    spans.append(&mut trailing);
     first.spans = spans;
 }
 

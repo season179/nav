@@ -118,11 +118,11 @@ pub async fn run(
     let mut active_turn: Option<ActiveTurnHandle> = None;
     let mut pending_model_swap: Option<PendingModelSwap> = None;
     let mut spinner_tick: u64 = 0;
-    // Latest provider-reported `tokens_input`. For `store: false` transports
-    // this is also the current context occupancy, since every turn resends the
-    // full history. Updated on `TurnComplete`; pre-first-turn value of `0`
-    // renders as `0/200k 0%`.
+    // Latest provider-reported token usage for the status bar.
+    // Updated on `TurnComplete`; pre-first-turn value of `0` hides the gauge.
     let mut last_tokens_input: u64 = 0;
+    let mut last_tokens_output: u64 = 0;
+    let mut last_tokens_cached: u64 = 0;
     let cwd_short = shorten_home(&cwd);
     let branch = project.workspace.branch.clone();
     let dirty = project.workspace.dirty;
@@ -249,6 +249,8 @@ pub async fn run(
                     dirty,
                     state,
                     tokens_input: last_tokens_input,
+                    tokens_output: last_tokens_output,
+                    tokens_cached: last_tokens_cached,
                     context_window: args.auto_compact_token_limit,
                 },
                 screen_w,
@@ -292,6 +294,8 @@ pub async fn run(
                     && usage.tokens_input > 0
                 {
                     last_tokens_input = usage.tokens_input;
+                    last_tokens_output = usage.tokens_output;
+                    last_tokens_cached = usage.tokens_input_cached;
                 }
                 if turn_is_terminal(&ev) {
                     let active_id = control.active().map(|active| active.id().to_string());

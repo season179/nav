@@ -228,24 +228,24 @@ mod tests {
             Some("openai/gpt-5.5".to_string()),
         );
         insta::assert_snapshot!(lines_text(&cell.display_lines(80)), @"
-◆ models  3 configured
-    OpenAI (openai)
-      openai/gpt-5.5
-  
-    OpenRouter (openrouter)
-      openrouter/zai/glm-5.1
-  
-    Ollama (local) (ollama)
-      ollama/qwen-local
-  
-  Current: openai/gpt-5.5");
+        ◆ models  3 configured
+            OpenAI (openai)
+              openai/gpt-5.5
+          
+            OpenRouter (openrouter)
+              openrouter/zai/glm-5.1
+          
+            Ollama (local) (ollama)
+              ollama/qwen-local
+          
+          Current: openai/gpt-5.5
+        ");
     }
 
     #[test]
     fn snapshot_model_list_empty() {
         let cell = ModelListCell::new(vec![], "gpt-5.5".to_string(), None);
-        insta::assert_snapshot!(lines_text(&cell.display_lines(80)), @"
-◆ models  no models configured — add providers.models to .nav/settings.json");
+        insta::assert_snapshot!(lines_text(&cell.display_lines(80)), @"◆ models  no models configured — add providers.models to .nav/settings.json");
     }
 
     #[test]
@@ -254,8 +254,9 @@ mod tests {
             "Set next session model to \"openrouter/zai/glm-5.1\".\n\
             Restart nav (Ctrl+C, rerun) for the change to take effect.",
         );
-        insta::assert_snapshot!(lines_text(&cell.display_lines(80)), @"
-◆ models  Set next session model to \"openrouter/zai/glm-5.1\".
-  Restart nav (Ctrl+C, rerun) for the change to take effect.");
+        insta::assert_snapshot!(lines_text(&cell.display_lines(80)), @r#"
+        ◆ models  Set next session model to "openrouter/zai/glm-5.1".
+          Restart nav (Ctrl+C, rerun) for the change to take effect.
+        "#);
     }
 }

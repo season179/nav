@@ -8,7 +8,7 @@ use crate::cells::{
     FileChangeCell, GitCheckpointCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell,
     SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell, SubagentCell,
     ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell,
-    TurnDiffCell, TurnSeparatorCell, UserMessageCell,
+    TurnDiffCell, UserMessageCell,
 };
 use crate::history::HistoryCell;
 use crate::theme::Theme;
@@ -179,12 +179,9 @@ impl ChatWidget {
                     self.push_cell(AssistantMessageCell::new(text));
                 }
             }
-            AgentEvent::TurnComplete { usage } => {
+            AgentEvent::TurnComplete { usage: _ } => {
                 self.close_streaming_assistant();
                 self.drain_inflight_tool_calls();
-                if self.turn_has_work {
-                    self.push_cell(TurnSeparatorCell::new(usage));
-                }
                 self.turn_has_work = false;
             }
             AgentEvent::ToolCallApprovalRequest { .. } => {

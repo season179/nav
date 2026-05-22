@@ -27,5 +27,5 @@ pub use model::{ModelListCell, ModelSetCell};
 pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use sessions::{SessionListCell, SessionNoticeCell, SessionTreeCell, TranscriptHitsCell};
 pub use subagents::SubagentCell;
-pub use system::{ApprovalDecisionCell, ErrorCell, NoticeCell, TurnSeparatorCell};
+pub use system::{ApprovalDecisionCell, ErrorCell, NoticeCell};
 pub use tools::{ToolCallCell, ToolOutputCell};
