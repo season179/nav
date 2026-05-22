@@ -18,10 +18,12 @@
 //! shortened.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::{Catalog, ProjectContext};
 use crate::agent_loop::AgentEvent;
 
 /// Initial compaction prompt. The runner wraps the serialized conversation in
@@ -352,6 +354,27 @@ fn real_user_text(item: &Value) -> Option<String> {
     Some(text)
 }
 
+/// Controls whether [`build_replacement_history`] re-injects the canonical
+/// initial context block (project context, skills, base instructions) into
+/// the replacement history.
+///
+/// The model has been fine-tuned to see the compaction summary as the last
+/// item in history. Mid-turn (in-loop) compaction therefore re-injects
+/// initial context *before* the last real user message; manual and pre-turn
+/// compaction drop it because the next regular turn re-assembles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialContextInjection {
+    /// Manual and pre-turn compaction: replace history with summary and
+    /// clear reference context. The next regular turn re-injects initial
+    /// context.
+    DoNotInject,
+
+    /// Mid-turn (in-loop) compaction: re-inject initial context just above
+    /// the last real user message (or above the summary if no user messages
+    /// survived). The summary stays at the tail.
+    BeforeLastUserMessage,
+}
+
 /// Build the model-visible history that replaces the pre-compaction
 /// transcript. Matches the Codex compaction shape:
 ///
@@ -361,12 +384,114 @@ fn real_user_text(item: &Value) -> Option<String> {
 /// [`KEEP_RECENT_TOKENS`]. Truncates the boundary message if it doesn't fit.
 /// Filters out prior summary messages. The summary is always the final item
 /// because the model has been fine-tuned to expect it there.
-pub fn build_replacement_history(summary: &str, input: &[Value]) -> Vec<Value> {
+///
+/// When `injection` is [`InitialContextInjection::BeforeLastUserMessage`],
+/// `initial_context` is spliced in just before the last real user message,
+/// or before the summary if no user messages survived. With
+/// [`InitialContextInjection::DoNotInject`], `initial_context` is ignored.
+pub fn build_replacement_history(
+    summary: &str,
+    input: &[Value],
+    initial_context: &[Value],
+    injection: InitialContextInjection,
+) -> Vec<Value> {
     let user_msgs = select_recent_user_messages(input, KEEP_RECENT_TOKENS);
-    let mut out = Vec::with_capacity(user_msgs.len() + 1);
+    let extra = match injection {
+        InitialContextInjection::DoNotInject => 0,
+        InitialContextInjection::BeforeLastUserMessage => initial_context.len(),
+    };
+    let mut out = Vec::with_capacity(user_msgs.len() + extra + 1);
     out.extend(user_msgs);
     out.push(summary_message(summary));
-    out
+
+    match injection {
+        InitialContextInjection::DoNotInject => out,
+        InitialContextInjection::BeforeLastUserMessage => {
+            insert_initial_context_before_last_user_message(out, initial_context)
+        }
+    }
+}
+
+/// Splice `initial_context` immediately before the last real user message in
+/// `history`. Falls back to inserting before the trailing summary when no
+/// real user message survives the carry-forward.
+///
+/// Callers are expected to pass the output of [`build_replacement_history`],
+/// which always pushes a trailing summary; the empty-history fallback below is
+/// only a defensive belt-and-braces against a future refactor that makes
+/// summary insertion fallible.
+fn insert_initial_context_before_last_user_message(
+    mut history: Vec<Value>,
+    initial_context: &[Value],
+) -> Vec<Value> {
+    if initial_context.is_empty() {
+        return history;
+    }
+    debug_assert!(
+        !history.is_empty(),
+        "insert_initial_context_before_last_user_message expects build_replacement_history's \
+         trailing summary; an empty history would silently produce a replacement history with no \
+         summary at the tail",
+    );
+
+    // `real_user_text` already filters out prior summary-prefixed messages,
+    // so this walks back to the most recent *non-summary* user message.
+    let insertion_index = history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, item)| real_user_text(item).map(|_| idx))
+        // No real user message survived — drop in just before the trailing
+        // summary so the summary stays last.
+        .unwrap_or_else(|| history.len().saturating_sub(1));
+
+    history.splice(
+        insertion_index..insertion_index,
+        initial_context.iter().cloned(),
+    );
+    history
+}
+
+/// Build the canonical initial-context items used for mid-turn compaction's
+/// [`InitialContextInjection::BeforeLastUserMessage`] path.
+///
+/// Reuses [`build_instructions`](super::build_instructions) — the same
+/// assembly path that produces the `instructions` field on every regular
+/// turn — so there is a single source of truth for "the initial context
+/// block." Returns an empty vec when there is nothing to inject.
+///
+/// The first live consumer is the mid-turn auto-compact path (tracked
+/// separately); until that lands, this helper is invoked only from tests,
+/// which is why the dead_code allowance is intentional.
+///
+/// Open questions for the live consumer:
+/// - **Accumulation across compactions.** The wrapped item is `role=user`
+///   with a non-summary body, so [`select_recent_user_messages`] will pick
+///   it up on the *next* compaction and a fresh copy will be spliced again
+///   — N compactions ⇒ N copies. The consumer must either filter injected
+///   items out of the carry-forward (sentinel prefix, structural marker, or
+///   a parallel "this is initial context, drop on next compaction" channel)
+///   or accept the duplication.
+/// - **Channel choice.** `build_instructions` produces system-flavoured text
+///   ("You are a small coding agent …"); delivering it over `role=user`
+///   may compete with the trailing summary for the model's attention. The
+///   consumer may want a developer/system-role item if the transport
+///   supports it.
+#[allow(dead_code)]
+pub(crate) fn build_initial_context_items(
+    cwd: &Path,
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+) -> Vec<Value> {
+    let body = super::build_instructions(cwd, skills, context);
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": body }],
+    })]
 }
 
 /// Walk `input` backwards collecting user messages up to `keep_recent_tokens`.
@@ -982,7 +1107,12 @@ mod tests {
             json!({"type": "message", "role": "user", "content": "older"}),
             json!({"type": "message", "role": "user", "content": "recent"}),
         ];
-        let new_history = build_replacement_history("the summary", &input);
+        let new_history = build_replacement_history(
+            "the summary",
+            &input,
+            &[],
+            InitialContextInjection::DoNotInject,
+        );
 
         assert_eq!(new_history.len(), 3);
         // User messages in chronological order.
@@ -1013,7 +1143,12 @@ mod tests {
             json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking..."}]}),
             json!({"type": "message", "role": "user", "content": "follow up"}),
         ];
-        let new_history = build_replacement_history("summary text", &input);
+        let new_history = build_replacement_history(
+            "summary text",
+            &input,
+            &[],
+            InitialContextInjection::DoNotInject,
+        );
 
         // Only two user messages + summary.
         assert_eq!(new_history.len(), 3);
@@ -1031,7 +1166,12 @@ mod tests {
             json!({"type": "message", "role": "user", "content": prior_summary_text}),
             json!({"type": "message", "role": "user", "content": "real question"}),
         ];
-        let new_history = build_replacement_history("new summary", &input);
+        let new_history = build_replacement_history(
+            "new summary",
+            &input,
+            &[],
+            InitialContextInjection::DoNotInject,
+        );
 
         // Only the real user message + new summary; prior summary is dropped.
         assert_eq!(new_history.len(), 2);
@@ -1048,7 +1188,12 @@ mod tests {
             json!({"type": "message", "role": "user", "content": "small msg"}),
             json!({"type": "message", "role": "user", "content": huge_text}),
         ];
-        let new_history = build_replacement_history("sum", &input);
+        let new_history = build_replacement_history(
+            "sum",
+            &input,
+            &[],
+            InitialContextInjection::DoNotInject,
+        );
 
         // Summary is last.
         let last_text = extract_user_text(new_history.last().unwrap()).unwrap();
@@ -1066,7 +1211,12 @@ mod tests {
 
     #[test]
     fn build_replacement_history_with_no_user_messages_still_includes_summary() {
-        let new_history = build_replacement_history("only summary", &[]);
+        let new_history = build_replacement_history(
+            "only summary",
+            &[],
+            &[],
+            InitialContextInjection::DoNotInject,
+        );
         assert_eq!(new_history.len(), 1);
         let content = new_history[0]
             .get("content")
@@ -1074,6 +1224,141 @@ mod tests {
             .unwrap();
         assert!(content.starts_with(SUMMARY_PREFIX));
         assert!(content.contains("only summary"));
+    }
+
+    #[test]
+    fn build_replacement_history_do_not_inject_ignores_initial_context() {
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": "first"}),
+            json!({"type": "message", "role": "user", "content": "second"}),
+        ];
+        let initial = vec![
+            json!({"type": "message", "role": "user", "content": "should-not-appear"}),
+        ];
+
+        let history = build_replacement_history(
+            "summary",
+            &input,
+            &initial,
+            InitialContextInjection::DoNotInject,
+        );
+
+        // Pre-change shape: [first, second, summary]; initial_context is ignored.
+        assert_eq!(history.len(), 3);
+        assert_eq!(extract_user_text(&history[0]), Some("first".to_string()));
+        assert_eq!(extract_user_text(&history[1]), Some("second".to_string()));
+        let last = extract_user_text(&history[2]).unwrap();
+        assert!(last.starts_with(SUMMARY_PREFIX));
+    }
+
+    #[test]
+    fn build_replacement_history_before_last_user_inserts_initial_context() {
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": "older"}),
+            json!({"type": "message", "role": "user", "content": "recent"}),
+        ];
+        let initial = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "initial-context"}],
+        })];
+
+        let history = build_replacement_history(
+            "the summary",
+            &input,
+            &initial,
+            InitialContextInjection::BeforeLastUserMessage,
+        );
+
+        // Shape: [older, initial-context, recent, summary].
+        assert_eq!(history.len(), 4);
+        assert_eq!(extract_user_text(&history[0]), Some("older".to_string()));
+        assert_eq!(
+            extract_user_text(&history[1]),
+            Some("initial-context".to_string())
+        );
+        assert_eq!(extract_user_text(&history[2]), Some("recent".to_string()));
+        let summary_text = extract_user_text(&history[3]).unwrap();
+        assert!(summary_text.starts_with(SUMMARY_PREFIX));
+        assert!(summary_text.contains("the summary"));
+    }
+
+    #[test]
+    fn build_replacement_history_before_last_user_inserts_above_summary_when_no_user_msgs() {
+        let initial = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "initial-context"}],
+        })];
+
+        let history = build_replacement_history(
+            "only summary",
+            &[],
+            &initial,
+            InitialContextInjection::BeforeLastUserMessage,
+        );
+
+        // Shape: [initial-context, summary] — initial context above the summary.
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            extract_user_text(&history[0]),
+            Some("initial-context".to_string())
+        );
+        let summary_text = extract_user_text(&history[1]).unwrap();
+        assert!(summary_text.starts_with(SUMMARY_PREFIX));
+        assert!(summary_text.contains("only summary"));
+    }
+
+    #[test]
+    fn build_replacement_history_before_last_user_skips_prior_summaries() {
+        let prior_summary_text = format!("{SUMMARY_PREFIX}\nprevious summary body");
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": prior_summary_text}),
+            json!({"type": "message", "role": "user", "content": "real question"}),
+        ];
+        let initial = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "initial-context"}],
+        })];
+
+        let history = build_replacement_history(
+            "new summary",
+            &input,
+            &initial,
+            InitialContextInjection::BeforeLastUserMessage,
+        );
+
+        // Prior summary is filtered out of the carry-forward, and the
+        // initial-context goes just above the real user message.
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            extract_user_text(&history[0]),
+            Some("initial-context".to_string())
+        );
+        assert_eq!(
+            extract_user_text(&history[1]),
+            Some("real question".to_string())
+        );
+        let summary_text = extract_user_text(&history[2]).unwrap();
+        assert!(summary_text.contains("new summary"));
+    }
+
+    #[test]
+    fn build_initial_context_items_wraps_existing_assembly() {
+        let cwd = std::path::PathBuf::from("/work");
+        let skills = Catalog::default();
+        let project = ProjectContext::default();
+
+        let items = build_initial_context_items(&cwd, &skills, Some(&project));
+
+        // The current assembly always produces a non-empty base instruction
+        // section (it includes `cwd`), so we expect exactly one wrapped
+        // user message item.
+        assert_eq!(items.len(), 1);
+        let text = extract_user_text(&items[0]).expect("wrapped initial context");
+        assert!(text.contains("/work"));
+        assert!(text.contains("small coding agent"));
     }
 
     #[test]

@@ -9,9 +9,9 @@ pub use ambient::DEFAULT_AMBIENT_CONTEXT_TOKEN_BUDGET;
 pub(crate) use ambient::{build_ambient_context, push_ambient_context};
 pub(crate) use attachments::build_user_content;
 pub use compaction::{
-    AutoCompactDecision, CheckpointSlice, CompactionDetails, build_replacement_history,
-    current_context_tokens, is_summary_message, latest_checkpoint_slice,
-    should_auto_compact, summary_message,
+    AutoCompactDecision, CheckpointSlice, CompactionDetails, InitialContextInjection,
+    build_replacement_history, current_context_tokens, is_summary_message,
+    latest_checkpoint_slice, should_auto_compact, summary_message,
 };
 pub use extensions::{
     Extension, ExtensionCatalog, ExtensionScope, ExtensionTheme, PromptTemplate, ThemeColors,
