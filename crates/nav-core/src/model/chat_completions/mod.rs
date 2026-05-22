@@ -21,6 +21,7 @@
 
 mod collector;
 mod delta;
+mod history;
 mod parser;
 mod request;
 mod sse;
