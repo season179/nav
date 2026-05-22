@@ -11,7 +11,9 @@ use crate::agent_loop::control::{PendingInput, PendingInputMode, TurnControls};
 use crate::agent_loop::prune::prune_to_budget;
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
 use crate::cli::Args;
-use crate::context::compaction::{is_compact_command, should_auto_compact};
+use crate::context::compaction::{
+    current_context_tokens as estimate_context_tokens, is_compact_command, should_auto_compact,
+};
 use crate::context::history::{
     ModelCapabilities, NAV_SYNTHETIC_MARKER_KEY, remove_orphan_outputs, shed_old_images,
     shed_old_reasoning, strip_unsupported_images,
@@ -128,11 +130,21 @@ impl<'a> SessionBinding<'a> {
     /// current context occupancy, so it's the right auto-compaction signal —
     /// the cumulative rollup would double-count history across iterations.
     fn current_context_tokens(&self) -> u64 {
-        self.store
+        self.context_token_status(&[])
+    }
+
+    /// Auto-compaction token count: last server-reported `tokens_input` plus
+    /// an estimate for `pending_items` added to the transcript since that
+    /// response. With no pending items this equals
+    /// [`Self::current_context_tokens`].
+    fn context_token_status(&self, pending_items: &[Value]) -> u64 {
+        let last_server_tokens = self
+            .store
             .latest_input_tokens(&self.session_id)
             .ok()
             .flatten()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        estimate_context_tokens(last_server_tokens, pending_items)
     }
 }
 
