@@ -3,9 +3,36 @@
 //! Before each Responses request, the runner measures the assembled
 //! model-visible input and sheds the oldest tool call/output pairs to fit a
 //! budget. This avoids paying for a turn the provider would reject with
-//! `context_length_exceeded`. The reactive recovery in [`crate::agent_loop`]
-//! still acts as a one-shot fallback when the pre-call estimate underweights
-//! the actual prompt size.
+//! `context_length_exceeded`.
+//!
+//! # Pair-shedding mechanisms across the runner
+//!
+//! Three functions can drop tool pairs. They run at different layers and have
+//! distinct roles — keep this in mind before touching any of them:
+//!
+//! 1. **Proactive (this module): [`prune_to_budget`]** — runs before every
+//!    sampling request in
+//!    [`super::runner`](crate::agent_loop::runner). Sheds oldest
+//!    non-protected pairs until total tool-output bytes fit
+//!    [`ReplayBudget::max_total_tool_output_bytes`]. Cheap, deterministic,
+//!    always-on.
+//! 2. **Reactive on a normal turn: compaction** — if the provider still
+//!    returns `ContextWindowExceeded` after the proactive prune, the runner
+//!    fires a full compaction turn (`CompactionTrigger::Auto`,
+//!    `CompactionReason::ContextLimit`) and retries once with the compacted
+//!    history. This is the primary long-session strategy after #87.
+//! 3. **In-compaction retry:
+//!    [`super::compaction_turn::trim_for_compaction`]** — if the compaction
+//!    *itself* overflows, that helper drops the oldest tool pair (via
+//!    [`super::compaction_turn::drop_oldest_tool_pair`]) and retries the
+//!    compaction request. Trimming from the beginning preserves the prefix
+//!    cache and keeps the trailing summarisation prompt intact.
+//!
+//! The two pair-drop primitives — [`prune_to_budget`] here and
+//! [`super::compaction_turn::drop_oldest_tool_pair`] over in the compaction
+//! module — are *not* called from the normal-turn overflow path. After #87
+//! the normal turn always recovers via compaction; pair-drop survives only
+//! as the in-compaction fallback.
 //!
 //! Pairing, orphan handling, and output-policy helpers live in
 //! [`crate::context::history`] so this module and the replay path enforce
@@ -23,6 +50,12 @@ use crate::context::replay_policy::ReplayBudget;
 /// [`ReplayBudget::max_total_tool_output_bytes`]. Returns the number of pairs
 /// removed (`0` means no pruning was needed or every candidate was protected).
 ///
+/// **Role: primary, proactive.** Called before every sampling request in
+/// [`super::runner`](crate::agent_loop::runner). If the provider still
+/// rejects the request with `ContextWindowExceeded`, the runner falls back
+/// to a full compaction turn (not to this function or to
+/// [`super::compaction_turn::drop_oldest_tool_pair`]).
+///
 /// Pairs are protected when:
 /// - they appear after the most recent [`ReplayBudget::raw_tool_turns`]
 ///   user-message boundaries, or
@@ -30,6 +63,12 @@ use crate::context::replay_policy::ReplayBudget;
 ///   (`tool error:` / `tool <name> blocked:` prefixes that the runner emits).
 ///
 /// Call and output are removed together so replay stays structurally valid.
+///
+/// See also:
+/// - [`super::compaction_turn::trim_for_compaction`] — fallback used inside
+///   a compaction turn when the compaction request itself overflows.
+/// - [`super::compaction_turn::drop_oldest_tool_pair`] — the primitive that
+///   `trim_for_compaction` calls; not used from the normal-turn path.
 pub fn prune_to_budget(input: &mut Vec<Value>, budget: &ReplayBudget) -> usize {
     if input.is_empty()
         || history::total_tool_output_bytes(input) <= budget.max_total_tool_output_bytes
