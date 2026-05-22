@@ -52,27 +52,28 @@ fn model_list_body(
     let mut out = format!("{count} configured\n");
 
     // Group by provider: lines are already sorted by provider then model key.
+    use std::fmt::Write as _;
+
     let mut last_provider: Option<&str> = None;
     for line in lines {
         if last_provider != Some(line.provider.as_str()) {
             if last_provider.is_some() {
                 out.push('\n');
             }
-            out.push_str(&format!("  {} ({})\n", line.provider_display_name, line.provider));
+            writeln!(out, "  {} ({})", line.provider_display_name, line.provider).unwrap();
             last_provider = Some(&line.provider);
         }
-        let mut row = format!("    {}", line.selector);
+        write!(out, "    {}", line.selector).unwrap();
         if let Some(effort) = line.reasoning_effort {
-            row.push_str(&format!("  reasoning={effort}"));
+            write!(out, "  reasoning={effort}").unwrap();
         }
-        out.push_str(&row);
         out.push('\n');
     }
 
-    out.push_str(&format!("\nCurrent: {current_model}"));
+    write!(out, "\nCurrent: {current_model}").unwrap();
     if let Some(default) = default_model {
         if default != current_model {
-            out.push_str(&format!("\nDefault: {default}"));
+            write!(out, "\nDefault: {default}").unwrap();
         }
     }
 

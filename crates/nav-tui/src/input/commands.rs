@@ -363,7 +363,8 @@ pub(crate) fn match_model_selector(
         return ModelMatch::NotFound;
     }
 
-    // Bare name: search across all providers.
+    // Bare name: search across all providers. Model keys can themselves
+    // contain slashes (e.g. "zai/glm-5.1"), so match the last segment.
     let matches: Vec<String> = catalog
         .iter()
         .flat_map(|(provider_id, provider)| {
@@ -372,7 +373,6 @@ pub(crate) fn match_model_selector(
             })
         })
         .filter(|full_selector| {
-            // Match if the bare name equals the model key (after the last slash).
             full_selector
                 .rsplit_once('/')
                 .is_some_and(|(_, key)| key == selector)
@@ -392,49 +392,32 @@ mod tests {
     use nav_core::context::{ModelConfig, ProviderConfig};
     use std::collections::BTreeMap;
 
+    fn provider(display: &str, models: BTreeMap<String, ModelConfig>) -> ProviderConfig {
+        ProviderConfig {
+            name: Some(display.into()),
+            base_url: None,
+            api_key: None,
+            headers: None,
+            models,
+        }
+    }
+
     fn test_catalog() -> ProviderCatalog {
         let mut providers = ProviderCatalog::new();
 
         let mut openai_models = BTreeMap::new();
         openai_models.insert("gpt-5.5".into(), ModelConfig::default());
         openai_models.insert("gpt-4o".into(), ModelConfig::default());
-        providers.insert(
-            "openai".into(),
-            ProviderConfig {
-                name: Some("OpenAI".into()),
-                base_url: None,
-                api_key: None,
-                headers: None,
-                models: openai_models,
-            },
-        );
+        providers.insert("openai".into(), provider("OpenAI", openai_models));
 
         let mut openrouter_models = BTreeMap::new();
         openrouter_models.insert("zai/glm-5.1".into(), ModelConfig::default());
-        providers.insert(
-            "openrouter".into(),
-            ProviderConfig {
-                name: Some("OpenRouter".into()),
-                base_url: None,
-                api_key: None,
-                headers: None,
-                models: openrouter_models,
-            },
-        );
+        providers.insert("openrouter".into(), provider("OpenRouter", openrouter_models));
 
         let mut ollama_models = BTreeMap::new();
         ollama_models.insert("qwen-local".into(), ModelConfig::default());
         ollama_models.insert("gpt-4o".into(), ModelConfig::default());
-        providers.insert(
-            "ollama".into(),
-            ProviderConfig {
-                name: Some("Ollama".into()),
-                base_url: None,
-                api_key: None,
-                headers: None,
-                models: ollama_models,
-            },
-        );
+        providers.insert("ollama".into(), provider("Ollama", ollama_models));
 
         providers
     }
