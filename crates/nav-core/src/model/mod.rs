@@ -11,6 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent_loop::AgentEvent;
 
 pub use auth::{AuthConfig, ResolvedProvider, load_auth, resolve_provider};
+pub use chat_completions::ChatCompletionsTransport;
 pub use names::did_you_mean;
 pub use responses::types::ResponseEnvelope;
 pub use responses::{
@@ -30,6 +31,14 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<Value, ResponsesError>> 
 /// `events` lets the transport surface durable provider events onto the same
 /// channel the rest of the agent loop uses, without forcing the transport to
 /// know about session persistence.
+///
+/// Two concrete implementors ship today: [`OpenAiTransport`] for the OpenAI
+/// Responses API (Codex/ChatGPT auth) and [`ChatCompletionsTransport`] for
+/// OpenAI-compatible `/chat/completions` endpoints resolved through the
+/// providers catalog ([`resolve_provider`]). The trait name predates the
+/// second backend — keep it; renaming is a separate cleanup. Selection
+/// happens at construction time in `nav-cli`/`nav-tui`: the agent loop only
+/// sees a `&dyn ResponsesTransport`.
 pub trait ResponsesTransport: Send + Sync {
     fn create<'a>(
         &'a self,
@@ -39,6 +48,8 @@ pub trait ResponsesTransport: Send + Sync {
 }
 
 pub mod auth;
+
+pub mod chat_completions;
 
 pub mod names;
 
