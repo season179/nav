@@ -22,7 +22,7 @@ pub use sandbox::{SandboxMode, sandbox_policy_from_args};
 pub use settings::ProvidedArgs;
 
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::context::DEFAULT_AMBIENT_CONTEXT_TOKEN_BUDGET;
@@ -239,14 +239,14 @@ fn parse_unit_fraction(s: &str) -> Result<f32, String> {
     Ok(value)
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum, Deserialize, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, ValueEnum, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthMode {
     Chatgpt,
     ApiKey,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum, Deserialize, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, ValueEnum, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transport {
     Websocket,

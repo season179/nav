@@ -19,8 +19,8 @@ pub use extensions::{
 };
 pub use handoff::{HANDOFF_SLASH, HandoffBudget, HandoffDraft, build_handoff_draft};
 pub use project::{
-    ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,
-    shorten_home,
+    ContextFile, ContextScope, ModelConfig, ProjectContext, ProviderCatalog, ProviderConfig,
+    ReasoningEffort, Settings, WorkspaceStatus, load_project_context, shorten_home,
 };
 pub use replay::rebuild_responses_input;
 pub use report::{

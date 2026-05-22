@@ -23,7 +23,9 @@
 //!   bar and the NDJSON startup banner.
 
 use crate::cli::{AuthMode, Transport};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -136,12 +138,74 @@ impl ContextScope {
     }
 }
 
+/// Reasoning effort level for a model configuration.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReasoningEffort::Low => f.write_str("low"),
+            ReasoningEffort::Medium => f.write_str("medium"),
+            ReasoningEffort::High => f.write_str("high"),
+        }
+    }
+}
+
+/// Per-model configuration nested under a provider.
+///
+/// The map key in [`ProviderConfig::models`] doubles as the model name;
+/// `model_id` overrides it only when the wire name differs.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelConfig {
+    /// Wire name sent to the provider. Defaults to the map key if omitted.
+    pub model_id: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub max_output_tokens: Option<u64>,
+}
+
+/// A single OpenAI-compatible provider entry.
+///
+/// `base_url` is required when the provider is not a built-in (G4).
+/// `api_key` is optional — local providers like Ollama don't need one.
+/// Resolution semantics for env-var references live in G3.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderConfig {
+    /// Human-readable name for display (e.g. in `/model`). Defaults to the
+    /// provider id (the map key) when absent.
+    pub name: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    /// Extra HTTP headers to send with every request.
+    pub headers: Option<BTreeMap<String, String>>,
+    /// Models available under this provider.
+    pub models: BTreeMap<String, ModelConfig>,
+}
+
+/// Top-level providers catalog: `"<provider_id>" → ProviderConfig`.
+///
+/// Uses [`BTreeMap`] for deterministic ordering in serialization and
+/// display output.
+pub type ProviderCatalog = BTreeMap<String, ProviderConfig>;
+
 /// On-disk shape for `.nav/settings.json` and `~/.nav/settings.json`.
 ///
 /// Every field is `Option<T>` so an absent key falls through to the next
 /// source in the precedence chain (project → user → clap default → explicit
 /// CLI flag).
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+///
+/// The `providers` map is merged **shallowly** at the provider-id level: a
+/// project entry with the same provider id as a user entry fully replaces it
+/// — fields are not deep-merged. This keeps the merge rule simple and
+/// auditable.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub model: Option<String>,
@@ -170,10 +234,22 @@ pub struct Settings {
     /// discovered from `.nav/extensions/*/extension.json` and
     /// `~/.nav/extensions/*/extension.json`.
     pub theme: Option<String>,
+    /// OpenAI-compatible provider catalog. Merged shallowly: a project
+    /// provider with the same id fully replaces the user entry.
+    pub providers: Option<ProviderCatalog>,
+    /// Default model selector in `<provider_id>/<model_key>` form.
+    /// Validated against the merged `providers` catalog at load time; a
+    /// dangling reference logs a single stderr line and is ignored so nav
+    /// can still start for the user to fix it.
+    pub default_model: Option<String>,
 }
 
 impl Settings {
     /// Merge `other` on top of `self`. Any `Some(_)` field on `other` wins.
+    ///
+    /// For `providers`, the merge is **shallow** at the provider-id level: a
+    /// project provider with the same id fully replaces the user entry rather
+    /// than deep-merging individual fields.
     fn merge(&mut self, other: Settings) {
         self.model = other.model.or(self.model.take());
         self.auth = other.auth.or(self.auth);
@@ -191,6 +267,51 @@ impl Settings {
             .or(self.ambient_context_token_budget);
         self.git_checkpoints = other.git_checkpoints.or(self.git_checkpoints);
         self.theme = other.theme.or(self.theme.take());
+
+        // Shallow provider merge: project providers replace user providers
+        // with the same id entirely.
+        if let Some(other_providers) = other.providers {
+            self.providers
+                .get_or_insert_with(BTreeMap::new)
+                .extend(other_providers);
+        }
+
+        self.default_model = other.default_model.or(self.default_model.take());
+    }
+
+    /// Validate `default_model` against the merged providers catalog.
+    ///
+    /// A dangling reference logs a single stderr line and clears the field
+    /// so nav can still start.
+    fn validate_default_model(&mut self) {
+        // Clone the selector upfront so we can mutate `self` freely below.
+        let Some(selector) = self.default_model.clone() else {
+            return;
+        };
+        let Some(ref providers) = self.providers else {
+            self.reject_default_model(&selector, "no providers defined");
+            return;
+        };
+
+        let Some((provider_id, model_key)) = selector.split_once('/') else {
+            self.reject_default_model(&selector, "must be in <provider>/<model> form");
+            return;
+        };
+
+        if providers
+            .get(provider_id)
+            .is_some_and(|p| p.models.contains_key(model_key))
+        {
+            return;
+        }
+
+        self.reject_default_model(&selector, "provider or model not found in providers catalog");
+    }
+
+    /// Log a validation failure and clear `default_model`.
+    fn reject_default_model(&mut self, selector: &str, reason: &str) {
+        eprintln!("nav: default_model \"{selector}\" ignored — {reason}");
+        self.default_model = None;
     }
 }
 
@@ -223,6 +344,10 @@ pub fn load_project_context(launch_cwd: &Path) -> ProjectContext {
         settings.merge(parsed);
         settings_sources.push(project_path);
     }
+
+    // Validate default_model against the merged providers catalog.
+    // A dangling reference is non-fatal — log and clear so nav still starts.
+    settings.validate_default_model();
 
     let context_files = if settings.disable_context_files.unwrap_or(false) {
         Vec::new()
@@ -628,6 +753,237 @@ mod tests {
         assert_eq!(ctx.settings, Settings::default());
     }
 
+    // ---- Provider / model schema tests ----
+
+    #[test]
+    fn providers_round_trip_through_serde() {
+        let json = r#"{
+            "providers": {
+                "z.ai": {
+                    "name": "Z.AI",
+                    "base_url": "https://api.z.ai/v1",
+                    "api_key": "ZAI_API_KEY",
+                    "headers": { "X-Custom": "value" },
+                    "models": {
+                        "glm-5.1": {
+                            "model_id": "glm-5.1",
+                            "reasoning_effort": "high",
+                            "max_output_tokens": 16384
+                        }
+                    }
+                }
+            },
+            "default_model": "z.ai/glm-5.1"
+        }"#;
+        let tmp = TempDir::new().unwrap();
+        write(&tmp.path().join(".nav").join("settings.json"), json);
+        let ctx = load_project_context_with_home(tmp.path(), None);
+
+        let providers = ctx.settings.providers.as_ref().unwrap();
+        assert!(providers.contains_key("z.ai"));
+        let provider = &providers["z.ai"];
+        assert_eq!(provider.name.as_deref(), Some("Z.AI"));
+        assert_eq!(provider.base_url.as_deref(), Some("https://api.z.ai/v1"));
+        assert_eq!(provider.api_key.as_deref(), Some("ZAI_API_KEY"));
+        assert_eq!(provider.headers.as_ref().unwrap()["X-Custom"], "value");
+        let model = &provider.models["glm-5.1"];
+        assert_eq!(model.model_id.as_deref(), Some("glm-5.1"));
+        assert_eq!(model.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(model.max_output_tokens, Some(16384));
+        assert_eq!(ctx.settings.default_model.as_deref(), Some("z.ai/glm-5.1"));
+
+        // Round-trip back through serde.
+        let re_serialized = serde_json::to_string(&ctx.settings).unwrap();
+        let re_parsed: Settings = serde_json::from_str(&re_serialized).unwrap();
+        assert_eq!(ctx.settings, re_parsed);
+    }
+
+    #[test]
+    fn project_provider_replaces_user_provider_same_id() {
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_cwd = TempDir::new().unwrap();
+        write(
+            &tmp_home.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "ollama": {
+                        "base_url": "http://user-host:11434/v1",
+                        "models": { "llama3": {} }
+                    }
+                }
+            }"#,
+        );
+        write(
+            &tmp_cwd.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "ollama": {
+                        "base_url": "http://project-host:11434/v1",
+                        "models": { "mistral": {} }
+                    }
+                }
+            }"#,
+        );
+        let ctx =
+            load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
+        let providers = ctx.settings.providers.unwrap();
+        // Project entry fully replaces user entry — shallow merge.
+        let ollama = &providers["ollama"];
+        assert_eq!(ollama.base_url.as_deref(), Some("http://project-host:11434/v1"));
+        assert!(ollama.models.contains_key("mistral"));
+        assert!(!ollama.models.contains_key("llama3"),
+            "user model 'llama3' should not survive shallow replace");
+    }
+
+    #[test]
+    fn merge_preserves_user_providers_with_different_ids() {
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_cwd = TempDir::new().unwrap();
+        write(
+            &tmp_home.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "ollama": {
+                        "base_url": "http://localhost:11434/v1",
+                        "models": { "llama3": {} }
+                    }
+                }
+            }"#,
+        );
+        write(
+            &tmp_cwd.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "z.ai": {
+                        "base_url": "https://api.z.ai/v1",
+                        "models": { "glm-5.1": {} }
+                    }
+                }
+            }"#,
+        );
+        let ctx =
+            load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
+        let providers = ctx.settings.providers.as_ref().unwrap();
+        // Both providers survive: user's ollama + project's z.ai.
+        assert!(providers.contains_key("ollama"));
+        assert!(providers.contains_key("z.ai"));
+        assert_eq!(providers.len(), 2);
+    }
+
+    #[test]
+    fn default_model_dangling_logs_and_clears() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "z.ai": {
+                        "base_url": "https://api.z.ai/v1",
+                        "models": { "glm-5.1": {} }
+                    }
+                },
+                "default_model": "z.ai/nonexistent"
+            }"#,
+        );
+        let ctx = load_project_context_with_home(tmp.path(), None);
+        // default_model cleared because model key doesn't exist.
+        assert_eq!(ctx.settings.default_model, None);
+        // Providers still loaded so user can fix it.
+        assert!(ctx.settings.providers.unwrap().contains_key("z.ai"));
+    }
+
+    #[test]
+    fn default_model_without_providers_logs_and_clears() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join(".nav").join("settings.json"),
+            r#"{"default_model":"z.ai/glm-5.1"}"#,
+        );
+        let ctx = load_project_context_with_home(tmp.path(), None);
+        assert_eq!(ctx.settings.default_model, None);
+    }
+
+    #[test]
+    fn deny_unknown_fields_on_provider_structs() {
+        let tmp = TempDir::new().unwrap();
+        // "baseUrl" instead of "base_url" → parse failure.
+        write(
+            &tmp.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "z.ai": {
+                        "baseUrl": "https://api.z.ai/v1"
+                    }
+                }
+            }"#,
+        );
+        let ctx = load_project_context_with_home(tmp.path(), None);
+        // Entire settings file rejected because deny_unknown_fields.
+        assert_eq!(ctx.settings, Settings::default());
+    }
+
+    #[test]
+    fn deny_unknown_fields_on_model_config() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "z.ai": {
+                        "base_url": "https://api.z.ai/v1",
+                        "models": {
+                            "glm-5.1": {
+                                "maxTokens": 9999
+                            }
+                        }
+                    }
+                }
+            }"#,
+        );
+        let ctx = load_project_context_with_home(tmp.path(), None);
+        assert_eq!(ctx.settings, Settings::default());
+    }
+
+    #[test]
+    fn default_model_missing_slash_cleared() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "z.ai": {
+                        "base_url": "https://api.z.ai/v1",
+                        "models": { "glm-5.1": {} }
+                    }
+                },
+                "default_model": "just-a-string"
+            }"#,
+        );
+        let ctx = load_project_context_with_home(tmp.path(), None);
+        assert_eq!(ctx.settings.default_model, None);
+    }
+
+    #[test]
+    fn model_id_defaults_to_key_when_omitted() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "ollama": {
+                        "base_url": "http://localhost:11434/v1",
+                        "models": {
+                            "llama3": {}
+                        }
+                    }
+                }
+            }"#,
+        );
+        let ctx = load_project_context_with_home(tmp.path(), None);
+        let model = &ctx.settings.providers.unwrap()["ollama"].models["llama3"];
+        assert_eq!(model.model_id, None, "model_id should be None when omitted");
+    }
+
     /// Test helper that lets us inject a fake `$HOME` so tests don't read the
     /// developer's real `~/.nav/` or `~/.agents/`.
     fn load_project_context_with_home(launch_cwd: &Path, home: Option<&Path>) -> ProjectContext {
@@ -645,6 +1001,7 @@ mod tests {
             settings.merge(parsed);
             settings_sources.push(project_path);
         }
+        settings.validate_default_model();
         let context_files = if settings.disable_context_files.unwrap_or(false) {
             Vec::new()
         } else {

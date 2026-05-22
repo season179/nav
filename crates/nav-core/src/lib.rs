@@ -58,8 +58,8 @@ pub use context::{HANDOFF_SLASH, HandoffBudget, HandoffDraft, build_handoff_draf
 
 // Project context and settings loaded from the launch workspace.
 pub use context::{
-    ContextFile, ContextScope, ProjectContext, Settings, WorkspaceStatus, load_project_context,
-    shorten_home,
+    ContextFile, ContextScope, ModelConfig, ProjectContext, ProviderCatalog, ProviderConfig,
+    ReasoningEffort, Settings, WorkspaceStatus, load_project_context, shorten_home,
 };
 
 // Session persistence, transcript search/export, and session tree layout.
