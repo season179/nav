@@ -42,4 +42,6 @@ pub mod auth;
 
 pub mod names;
 
+pub mod resolve_value;
+
 pub mod responses;
