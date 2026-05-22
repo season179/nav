@@ -9,8 +9,9 @@
 //! 2. Persist the summary as a durable [`AgentEvent::CompactionCompleted`]
 //!    checkpoint, so resume and replay can use it instead of replaying the
 //!    full pre-compaction transcript.
-//! 3. Build a replacement history (summary + the recent suffix) and feed
-//!    *that* to the next turn instead of the original transcript.
+//! 3. Build a replacement history `[user_msgs..., summary]` — only user
+//!    messages survive (assistant/tool/reasoning items are dropped), the
+//!    summary is always last — and feed that to the next turn.
 //!
 //! Visible scrollback is preserved separately by the TUI/NDJSON consumers
 //! reading from the durable event log; only the *model-visible* transcript is
@@ -146,7 +147,6 @@ impl CompactionDetails {
 #[derive(Debug, Clone)]
 pub struct CompactionPreparation {
     pub summary_source: Vec<Value>,
-    pub recent_context: Vec<Value>,
     pub replaced_events: usize,
     pub details: CompactionDetails,
 }
@@ -180,11 +180,11 @@ pub fn prepare_compaction(input: &[Value]) -> CompactionPreparation {
     }
 
     let selection = select_recent_context(input, KEEP_RECENT_TOKENS);
-    let (summary_source, recent_context) =
+    let summary_source =
         if selection.summary_source.is_empty() && !input.is_empty() {
-            (input.to_vec(), Vec::new())
+            input.to_vec()
         } else {
-            (selection.summary_source, selection.recent_context)
+            selection.summary_source
         };
 
     file_ops.extract_from_input(&summary_source);
@@ -193,7 +193,6 @@ pub fn prepare_compaction(input: &[Value]) -> CompactionPreparation {
 
     CompactionPreparation {
         summary_source,
-        recent_context,
         replaced_events,
         details,
     }
@@ -309,29 +308,6 @@ pub fn select_recent_context(input: &[Value], keep_recent_tokens: u64) -> Recent
     }
 }
 
-/// Collect the recent real user messages from a Responses-API `input` array.
-/// Compaction summaries (prefixed with [`SUMMARY_PREFIX`]) are skipped so they
-/// don't get re-summarised. Returned newest-last, like the source order.
-pub fn collect_recent_user_messages(input: &[Value]) -> Vec<String> {
-    let mut out = Vec::new();
-    for item in input {
-        if item.get("type").and_then(Value::as_str) != Some("message") {
-            continue;
-        }
-        if item.get("role").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        let Some(text) = extract_user_text(item) else {
-            continue;
-        };
-        if is_summary_message(&text) {
-            continue;
-        }
-        out.push(text);
-    }
-    out
-}
-
 fn extract_user_text(item: &Value) -> Option<String> {
     match item.get("content") {
         Some(Value::String(s)) => Some(s.clone()),
@@ -357,22 +333,78 @@ fn extract_user_text(item: &Value) -> Option<String> {
     }
 }
 
+/// Returns the text of a real, non-summary user message — or [`None`] if the
+/// item is not a user message, has no text, or is a prior summary.
+fn real_user_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("message") {
+        return None;
+    }
+    if item.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let text = extract_user_text(item)?;
+    if text.is_empty() {
+        return None;
+    }
+    if is_summary_message(&text) {
+        return None;
+    }
+    Some(text)
+}
+
 /// Build the model-visible history that replaces the pre-compaction
-/// transcript. The shape is:
+/// transcript. Matches the Codex compaction shape:
 ///
-/// 1. A single synthesized user message carrying the summary text prefixed
-///    with [`SUMMARY_PREFIX`] so the next assistant turn knows it is reading
-///    a handoff rather than a fresh instruction.
-/// 2. The recent suffix selected by [`select_recent_context`], kept in its
-///    original Responses-API shape.
+/// `[user_1, user_2, ..., user_N, SUMMARY_PREFIX + summary]`
 ///
-/// Older items before that suffix are hidden behind the summary; visible
-/// scrollback remains in the durable event log.
-pub fn build_replacement_history(summary: &str, recent_context: &[Value]) -> Vec<Value> {
-    let mut out = Vec::with_capacity(recent_context.len() + 1);
+/// Walks user messages from `input` backwards, accumulating up to
+/// [`KEEP_RECENT_TOKENS`]. Truncates the boundary message if it doesn't fit.
+/// Filters out prior summary messages. The summary is always the final item
+/// because the model has been fine-tuned to expect it there.
+pub fn build_replacement_history(summary: &str, input: &[Value]) -> Vec<Value> {
+    let user_msgs = select_recent_user_messages(input, KEEP_RECENT_TOKENS);
+    let mut out = Vec::with_capacity(user_msgs.len() + 1);
+    out.extend(user_msgs);
     out.push(summary_message(summary));
-    out.extend(recent_context.iter().cloned());
     out
+}
+
+/// Walk `input` backwards collecting user messages up to `keep_recent_tokens`.
+/// The boundary message is truncated to fit. Prior summary messages are
+/// excluded. Returned in **chronological order**.
+fn select_recent_user_messages(input: &[Value], keep_recent_tokens: u64) -> Vec<Value> {
+    let mut kept = Vec::new();
+    let mut accumulated: u64 = 0;
+
+    for item in input.iter().rev() {
+        let Some(text) = real_user_text(item) else {
+            continue;
+        };
+
+        let msg_tokens = chars_to_tokens(text.chars().count());
+        let room = keep_recent_tokens.saturating_sub(accumulated);
+
+        if room == 0 {
+            break;
+        }
+
+        if msg_tokens > room {
+            let max_chars = (room as usize) * 4;
+            let truncated = truncate_for_summary(&text, max_chars);
+            kept.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": truncated }],
+            }));
+            break;
+        }
+
+        kept.push(item.clone());
+        accumulated += msg_tokens;
+    }
+
+    kept.reverse();
+    kept
 }
 
 /// Replay the post-checkpoint slice of an event log from the latest
@@ -830,20 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn collect_recent_user_messages_skips_summaries_and_assistant() {
-        let summary_text = format!("{SUMMARY_PREFIX}\nsummary body");
-        let input = vec![
-            json!({"type": "message", "role": "user", "content": "first"}),
-            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "thinking"}]}),
-            json!({"type": "function_call", "call_id": "c", "name": "n", "arguments": "{}"}),
-            json!({"type": "message", "role": "user", "content": summary_text}),
-            json!({"type": "message", "role": "user", "content": "second"}),
-        ];
-        let users = collect_recent_user_messages(&input);
-        assert_eq!(users, vec!["first".to_string(), "second".to_string()]);
-    }
-
-    #[test]
     fn serialize_for_compaction_truncates_only_tool_results() {
         let over_budget = "x".repeat(TOOL_RESULT_MAX_CHARS + 5);
         let long_user = "u".repeat(TOOL_RESULT_MAX_CHARS + 20);
@@ -959,22 +977,91 @@ mod tests {
     }
 
     #[test]
-    fn build_replacement_history_keeps_summary_then_recent_context() {
-        let recent = vec![
+    fn build_replacement_history_user_msgs_first_summary_last() {
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": "older"}),
             json!({"type": "message", "role": "user", "content": "recent"}),
-            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ack"}]}),
         ];
-        let new_history = build_replacement_history("the summary", &recent);
+        let new_history = build_replacement_history("the summary", &input);
 
         assert_eq!(new_history.len(), 3);
-        let content = new_history[0]
+        // User messages in chronological order.
+        assert_eq!(
+            extract_user_text(&new_history[0]),
+            Some("older".to_string())
+        );
+        assert_eq!(
+            extract_user_text(&new_history[1]),
+            Some("recent".to_string())
+        );
+        // Summary is the final item.
+        let summary_content = new_history[2]
             .get("content")
             .and_then(Value::as_str)
             .unwrap();
-        assert!(content.starts_with(SUMMARY_PREFIX));
-        assert!(content.contains("the summary"));
-        assert_eq!(new_history[1], recent[0]);
-        assert_eq!(new_history[2], recent[1]);
+        assert!(summary_content.starts_with(SUMMARY_PREFIX));
+        assert!(summary_content.contains("the summary"));
+    }
+
+    #[test]
+    fn build_replacement_history_drops_non_user_items() {
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": "hello"}),
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ack"}]}),
+            json!({"type": "function_call", "call_id": "c1", "name": "bash", "arguments": "{\"command\":\"ls\"}"}),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "file.rs"}),
+            json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking..."}]}),
+            json!({"type": "message", "role": "user", "content": "follow up"}),
+        ];
+        let new_history = build_replacement_history("summary text", &input);
+
+        // Only two user messages + summary.
+        assert_eq!(new_history.len(), 3);
+        assert_eq!(extract_user_text(&new_history[0]), Some("hello".to_string()));
+        assert_eq!(extract_user_text(&new_history[1]), Some("follow up".to_string()));
+        let summary_content = extract_user_text(&new_history[2]).unwrap();
+        assert!(summary_content.starts_with(SUMMARY_PREFIX));
+        assert!(summary_content.contains("summary text"));
+    }
+
+    #[test]
+    fn build_replacement_history_filters_prior_summaries() {
+        let prior_summary_text = format!("{SUMMARY_PREFIX}\nprevious summary body");
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": prior_summary_text}),
+            json!({"type": "message", "role": "user", "content": "real question"}),
+        ];
+        let new_history = build_replacement_history("new summary", &input);
+
+        // Only the real user message + new summary; prior summary is dropped.
+        assert_eq!(new_history.len(), 2);
+        assert_eq!(extract_user_text(&new_history[0]), Some("real question".to_string()));
+        let summary_content = extract_user_text(&new_history[1]).unwrap();
+        assert!(summary_content.contains("new summary"));
+    }
+
+    #[test]
+    fn build_replacement_history_truncates_oversized_boundary_message() {
+        // A huge user message that exceeds KEEP_RECENT_TOKENS.
+        let huge_text = "x".chars().cycle().take(KEEP_RECENT_TOKENS as usize * 8).collect::<String>();
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": "small msg"}),
+            json!({"type": "message", "role": "user", "content": huge_text}),
+        ];
+        let new_history = build_replacement_history("sum", &input);
+
+        // Summary is last.
+        let last_text = extract_user_text(new_history.last().unwrap()).unwrap();
+        assert!(last_text.starts_with(SUMMARY_PREFIX));
+        assert!(last_text.contains("sum"));
+
+        // The huge message (newest) is truncated to fit the budget.
+        // "small msg" (older) has no room left, so it's dropped — that matches
+        // codex behavior where the newest messages take priority.
+        assert_eq!(new_history.len(), 2);
+        let truncated_text = extract_user_text(&new_history[0]).unwrap();
+        assert!(truncated_text.chars().count() < huge_text.chars().count());
+        assert!(truncated_text.chars().count() > 0);
     }
 
     #[test]
