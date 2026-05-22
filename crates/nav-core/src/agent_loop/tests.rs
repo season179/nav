@@ -3786,7 +3786,7 @@ async fn manual_compact_emits_lifecycle_events_and_does_not_steer_prompt() {
     assert!(
         user_texts
             .iter()
-            .any(|t| t.contains("structured context checkpoint summary") && t.contains("## Goal")),
+            .any(|t| t.contains("CONTEXT CHECKPOINT COMPACTION")),
         "summarization prompt should be the user content: {user_texts:?}"
     );
     assert!(

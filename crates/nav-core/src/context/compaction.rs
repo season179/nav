@@ -25,40 +25,16 @@ use crate::agent_loop::AgentEvent;
 
 /// Initial compaction prompt. The runner wraps the serialized conversation in
 /// `<conversation>` tags before appending this instruction.
-pub const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. \
-Create a structured context checkpoint summary that another LLM will use to continue the work.\n\
+pub const SUMMARIZATION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. \
+Create a handoff summary for another LLM that will resume the task.\n\
 \n\
-Use this EXACT format:\n\
+Include:\n\
+- Current progress and key decisions made\n\
+- Important context, constraints, or user preferences\n\
+- What remains to be done (clear next steps)\n\
+- Any critical data, examples, or references needed to continue\n\
 \n\
-## Goal\n\
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\
-\n\
-## Constraints & Preferences\n\
-- [Any constraints, preferences, or requirements mentioned by user]\n\
-- [Or \"(none)\" if none were mentioned]\n\
-\n\
-## Progress\n\
-### Done\n\
-- [x] [Completed tasks/changes]\n\
-\n\
-### In Progress\n\
-- [ ] [Current work]\n\
-\n\
-### Blocked\n\
-- [Issues preventing progress, if any]\n\
-\n\
-## Key Decisions\n\
-- **[Decision]**: [Brief rationale]\n\
-\n\
-## Next Steps\n\
-1. [Ordered list of what should happen next]\n\
-\n\
-## Critical Context\n\
-- [Any data, examples, or references needed to continue]\n\
-- [Or \"(none)\" if not applicable]\n\
-\n\
-Keep each section concise. Preserve exact file paths, function names, and error messages. \
-Do not continue the conversation. Only output the structured summary.";
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.";
 
 /// Incremental compaction prompt used when a previous summary is already part
 /// of the replayed context.
@@ -1000,21 +976,36 @@ mod tests {
     }
 
     #[test]
-    fn structured_prompts_lock_section_headers() {
-        for prompt in [SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT] {
-            for section in [
-                "## Goal",
-                "## Constraints & Preferences",
-                "## Progress",
-                "### Done",
-                "### In Progress",
-                "### Blocked",
-                "## Key Decisions",
-                "## Next Steps",
-                "## Critical Context",
-            ] {
-                assert!(prompt.contains(section), "missing {section}");
-            }
+    fn summarization_prompt_uses_codex_verbatim_text() {
+        assert!(
+            SUMMARIZATION_PROMPT.contains("CONTEXT CHECKPOINT COMPACTION"),
+            "SUMMARIZATION_PROMPT must start with the codex verbatim text"
+        );
+        assert!(
+            !SUMMARIZATION_PROMPT.contains("## Goal"),
+            "SUMMARIZATION_PROMPT must not contain structured headers"
+        );
+    }
+
+    #[test]
+    fn incremental_prompt_locks_section_headers() {
+        // UPDATE_SUMMARIZATION_PROMPT still uses the structured template so
+        // incremental summaries remain compatible with the original shape.
+        for section in [
+            "## Goal",
+            "## Constraints & Preferences",
+            "## Progress",
+            "### Done",
+            "### In Progress",
+            "### Blocked",
+            "## Key Decisions",
+            "## Next Steps",
+            "## Critical Context",
+        ] {
+            assert!(
+                UPDATE_SUMMARIZATION_PROMPT.contains(section),
+                "missing {section}"
+            );
         }
     }
 
