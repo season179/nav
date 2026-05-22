@@ -3997,7 +3997,7 @@ async fn manual_compact_persists_file_ops_details_for_replay() {
 }
 
 #[tokio::test]
-async fn consecutive_compactions_use_incremental_smaller_prompt() {
+async fn consecutive_compactions_re_summarize_from_scratch() {
     let cwd_dir = tempdir().unwrap();
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let large_first_input = vec![
@@ -4056,8 +4056,15 @@ async fn consecutive_compactions_use_incremental_smaller_prompt() {
         .as_str()
         .expect("second prompt");
 
-    assert!(second_prompt.contains("<previous-summary>\n## Goal\nfirst\n</previous-summary>"));
-    assert!(second_prompt.len() < first_prompt.len());
+    // Both compactions use SUMMARIZATION_PROMPT — no <previous-summary> block,
+    // no incremental/turn-prefix variants.
+    assert!(first_prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(second_prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(!second_prompt.contains("<previous-summary>"));
+    // Codex parity: the prior summary stays in the source so the model can
+    // carry its narrative (goals, decisions, next steps) into the new summary
+    // rather than seeing only the new turns since the last checkpoint.
+    assert!(second_prompt.contains("## Goal\nfirst"));
 }
 
 #[tokio::test]

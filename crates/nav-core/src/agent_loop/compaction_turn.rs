@@ -14,8 +14,7 @@ use super::runner::{SessionBinding, drop_oldest_tool_pair};
 use crate::cli::Args;
 use crate::context::compaction::{
     append_compaction_details, build_history_summary_prompt, build_replacement_history,
-    build_turn_prefix_summary_prompt, estimate_input_tokens, merge_split_turn_summary,
-    prepare_compaction,
+    estimate_input_tokens, prepare_compaction,
 };
 use crate::context::{Catalog, ProjectContext};
 use crate::model::ResponsesTransport;
@@ -63,31 +62,8 @@ pub(crate) async fn run_compaction_turn(
     );
 
     let preparation = prepare_compaction(input);
-    let summary_result = if preparation.is_split_turn() {
-        let history = request_compaction_summary(
-            &request,
-            preparation.summary_source.clone(),
-            preparation.previous_summary.clone(),
-            CompactionPromptKind::History,
-        );
-        let turn_prefix = request_compaction_summary(
-            &request,
-            preparation.turn_prefix_source.clone(),
-            None,
-            CompactionPromptKind::TurnPrefix,
-        );
-        tokio::try_join!(history, turn_prefix).map(|(history_summary, turn_prefix_summary)| {
-            merge_split_turn_summary(&history_summary, &turn_prefix_summary)
-        })
-    } else {
-        request_compaction_summary(
-            &request,
-            preparation.summary_source.clone(),
-            preparation.previous_summary.clone(),
-            CompactionPromptKind::History,
-        )
-        .await
-    };
+    let summary_result =
+        request_compaction_summary(&request, preparation.summary_source.clone()).await;
     let summary = match summary_result {
         Ok(summary) => append_compaction_details(&summary, &preparation.details),
         Err(err) => {
@@ -180,29 +156,16 @@ pub(crate) async fn run_compaction_turn(
     Ok(summary)
 }
 
-#[derive(Debug, Clone, Copy)]
-enum CompactionPromptKind {
-    History,
-    TurnPrefix,
-}
-
 /// Upper bound on overflow-trim retries inside a single compaction turn.
 const MAX_COMPACTION_TRIMS: usize = 32;
 
 async fn request_compaction_summary(
     request: &CompactionTurnRequest<'_, '_>,
     mut source: Vec<Value>,
-    previous_summary: Option<String>,
-    kind: CompactionPromptKind,
 ) -> Result<String> {
     let mut compaction_trims_used: usize = 0;
     loop {
-        let prompt = match kind {
-            CompactionPromptKind::History => {
-                build_history_summary_prompt(&source, previous_summary.as_deref())
-            }
-            CompactionPromptKind::TurnPrefix => build_turn_prefix_summary_prompt(&source),
-        };
+        let prompt = build_history_summary_prompt(&source);
         let compaction_input = vec![json!({
             "type": "message",
             "role": "user",
