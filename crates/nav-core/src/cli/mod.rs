@@ -17,7 +17,10 @@ mod settings;
 #[cfg(test)]
 mod tests;
 
-pub use commands::{CliCommand, CliExportFormat, ExtensionsAction, GitAction, SessionsAction};
+pub use commands::{
+    CliCommand, CliExportFormat, ExtensionsAction, GitAction, ModelLine, ModelsAction,
+    ProviderLine, ProvidersAction, SessionsAction, list_models, list_providers,
+};
 pub use sandbox::{SandboxMode, sandbox_policy_from_args};
 pub use settings::ProvidedArgs;
 

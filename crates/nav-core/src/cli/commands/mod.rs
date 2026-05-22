@@ -1,6 +1,12 @@
 //! Subcommands that hang off `nav`, such as `nav doctor`, `nav sessions`, and
 //! `nav git`. The top-level [`super::Args`] struct owns the ordinary flags.
 
+pub mod models;
+pub mod providers;
+
+pub use models::{ModelLine, ModelsAction, list_models};
+pub use providers::{ProviderLine, ProvidersAction, list_providers};
+
 use clap::{Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -43,6 +49,18 @@ pub enum CliCommand {
     Extensions {
         #[command(subcommand)]
         action: ExtensionsAction,
+    },
+    /// List models from the merged providers catalog. CLI mirror of the
+    /// `/model` slash command's model listing.
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
+    /// List providers from the merged providers catalog. CLI mirror of the
+    /// `/model` slash command's provider grouping.
+    Providers {
+        #[command(subcommand)]
+        action: ProvidersAction,
     },
 }
 
