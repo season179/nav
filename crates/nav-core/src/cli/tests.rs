@@ -1,5 +1,5 @@
 use super::*;
-use crate::context::Settings;
+use crate::context::{ReasoningEffort, Settings};
 use crate::guardrails::AskForApproval;
 use clap::{CommandFactory, Parser};
 use std::path::Path;
@@ -22,6 +22,7 @@ fn defaults_are_correct() {
     assert!(!args.dangerously_bypass_approvals_and_sandbox);
     assert!(!args.git_checkpoints);
     assert!(!args.no_git_checkpoints);
+    assert!(args.reasoning_effort.is_none());
 }
 
 #[test]
@@ -333,4 +334,49 @@ fn no_git_checkpoints_overrides_settings() {
 
     assert!(!args.git_checkpoints);
     assert!(args.no_git_checkpoints);
+}
+
+#[test]
+fn reasoning_effort_flag_parses() {
+    for (input, expected) in [
+        ("low", ReasoningEffort::Low),
+        ("medium", ReasoningEffort::Medium),
+        ("high", ReasoningEffort::High),
+    ] {
+        let args = Args::try_parse_from(["nav", "--reasoning-effort", input, "x"]).unwrap();
+        assert_eq!(args.reasoning_effort, Some(expected));
+    }
+}
+
+#[test]
+fn reasoning_effort_rejects_invalid() {
+    assert!(Args::try_parse_from(["nav", "--reasoning-effort", "extreme", "x"]).is_err());
+}
+
+#[test]
+fn reasoning_effort_default_is_none() {
+    let args = Args::try_parse_from(["nav", "x"]).unwrap();
+    assert!(args.reasoning_effort.is_none());
+}
+
+#[test]
+fn reasoning_effort_settings_fill_in_when_flag_absent() {
+    let (mut args, provided) = matches(&["nav", "hi"]);
+    let settings = Settings {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..Settings::default()
+    };
+    args.apply_settings(&settings, &provided);
+    assert_eq!(args.reasoning_effort, Some(ReasoningEffort::High));
+}
+
+#[test]
+fn reasoning_effort_cli_flag_beats_settings() {
+    let (mut args, provided) = matches(&["nav", "--reasoning-effort", "low", "hi"]);
+    let settings = Settings {
+        reasoning_effort: Some(ReasoningEffort::High),
+        ..Settings::default()
+    };
+    args.apply_settings(&settings, &provided);
+    assert_eq!(args.reasoning_effort, Some(ReasoningEffort::Low));
 }
