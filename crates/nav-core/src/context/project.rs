@@ -33,7 +33,7 @@ use std::time::Duration;
 
 /// Aggregated result of `load_project_context`. Owned by `nav-cli` and passed
 /// by reference into the agent loop, the TUI, and the NDJSON banner.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProjectContext {
     pub settings: Settings,
     /// Paths of the settings files that contributed to `settings`, in merge
@@ -43,6 +43,24 @@ pub struct ProjectContext {
     /// the project block is the most-recent anchor in the instructions).
     pub context_files: Vec<ContextFile>,
     pub workspace: WorkspaceStatus,
+}
+
+impl Default for ProjectContext {
+    /// Mirrors `load_project_context` on an empty filesystem: built-in
+    /// providers are seeded so test fixtures share the same baseline as
+    /// production and don't accidentally exercise a different validation
+    /// branch.
+    fn default() -> Self {
+        Self {
+            settings: Settings {
+                providers: Some(built_in_providers()),
+                ..Settings::default()
+            },
+            settings_sources: Vec::new(),
+            context_files: Vec::new(),
+            workspace: WorkspaceStatus::default(),
+        }
+    }
 }
 
 impl ProjectContext {
@@ -195,6 +213,81 @@ pub struct ProviderConfig {
 /// display output.
 pub type ProviderCatalog = BTreeMap<String, ProviderConfig>;
 
+/// Built-in OpenAI-compatible provider catalog.
+///
+/// Layered as the base of `ProjectContext.settings.providers` so users
+/// don't have to redeclare common providers from scratch. User and project
+/// `settings.json` entries override built-ins by id via the shallow merge
+/// in [`Settings::merge`]; an entry that only sets `base_url` will lose
+/// the built-in's `api_key` and `name` — that's the documented shallow
+/// semantics, not a deep merge.
+///
+/// No `models` are seeded — users add the ones they want under the
+/// matching provider id. Until the catalog is wired through transport and
+/// auth in subsequent work, the entries here are data-only.
+pub fn built_in_providers() -> ProviderCatalog {
+    // (id, display name, base_url, api_key env var name or None)
+    //
+    // Canonical id for Z.AI is `zai` (no dot). Tests/examples that use
+    // `z.ai` intentionally pick a distinct, non-built-in id.
+    const ENTRIES: &[(&str, &str, &str, Option<&str>)] = &[
+        (
+            "openai",
+            "OpenAI",
+            "https://api.openai.com/v1",
+            Some("OPENAI_API_KEY"),
+        ),
+        (
+            "openrouter",
+            "OpenRouter",
+            "https://openrouter.ai/api/v1",
+            Some("OPENROUTER_API_KEY"),
+        ),
+        (
+            "deepseek",
+            "DeepSeek",
+            "https://api.deepseek.com/v1",
+            Some("DEEPSEEK_API_KEY"),
+        ),
+        (
+            "groq",
+            "Groq",
+            "https://api.groq.com/openai/v1",
+            Some("GROQ_API_KEY"),
+        ),
+        (
+            "together",
+            "Together",
+            "https://api.together.xyz/v1",
+            Some("TOGETHER_API_KEY"),
+        ),
+        ("zai", "Z.AI", "https://api.z.ai/v1", Some("ZAI_API_KEY")),
+        (
+            "ollama",
+            "Ollama (local)",
+            "http://localhost:11434/v1",
+            None,
+        ),
+        ("vllm", "vLLM (local)", "http://localhost:8000/v1", None),
+    ];
+
+    ENTRIES
+        .iter()
+        .map(|(id, name, base_url, api_key_env)| {
+            (
+                (*id).to_string(),
+                ProviderConfig {
+                    name: Some((*name).to_string()),
+                    base_url: Some((*base_url).to_string()),
+                    api_key: api_key_env.map(|s| s.to_string()),
+                    headers: None,
+                    models: BTreeMap::new(),
+                },
+            )
+        })
+        .collect()
+}
+
 /// On-disk shape for `.nav/settings.json` and `~/.nav/settings.json`.
 ///
 /// Every field is `Option<T>` so an absent key falls through to the next
@@ -288,8 +381,10 @@ impl Settings {
         let Some(selector) = self.default_model.clone() else {
             return;
         };
+        // Built-ins always seed `providers` in `load_project_context`, so
+        // this branch is defensive: silently skip validation if a future
+        // caller hands us a `Settings` with no catalog at all.
         let Some(ref providers) = self.providers else {
-            self.reject_default_model(&selector, "no providers defined");
             return;
         };
 
@@ -298,14 +393,20 @@ impl Settings {
             return;
         };
 
-        if providers
-            .get(provider_id)
-            .is_some_and(|p| p.models.contains_key(model_key))
-        {
+        let Some(provider) = providers.get(provider_id) else {
+            self.reject_default_model(&selector, &format!("unknown provider \"{provider_id}\""));
             return;
-        }
+        };
 
-        self.reject_default_model(&selector, "provider or model not found in providers catalog");
+        if !provider.models.contains_key(model_key) {
+            self.reject_default_model(
+                &selector,
+                &format!(
+                    "no model \"{model_key}\" declared under providers.{provider_id}.models \
+                     — add it to your settings.json"
+                ),
+            );
+        }
     }
 
     /// Log a validation failure and clear `default_model`.
@@ -327,12 +428,26 @@ pub struct WorkspaceStatus {
 /// defaults so a broken `.nav/settings.json` cannot prevent `nav` from
 /// starting.
 pub fn load_project_context(launch_cwd: &Path) -> ProjectContext {
-    let user_home = dirs::home_dir();
+    load_project_context_with_home(launch_cwd, dirs::home_dir().as_deref())
+}
 
-    // Settings: user first, project overrides.
-    let mut settings = Settings::default();
+/// Same as [`load_project_context`] but takes the user home explicitly so
+/// tests can inject a fake `$HOME` without going through `dirs::home_dir`.
+/// Single source of truth — `load_project_context` is just a thin wrapper.
+pub(crate) fn load_project_context_with_home(
+    launch_cwd: &Path,
+    user_home: Option<&Path>,
+) -> ProjectContext {
+    // Settings: built-ins → user → project. Built-ins seed the providers
+    // catalog so users don't have to redeclare common providers from
+    // scratch. User/project entries with the same id replace built-ins
+    // via the shallow merge in [`Settings::merge`].
+    let mut settings = Settings {
+        providers: Some(built_in_providers()),
+        ..Settings::default()
+    };
     let mut settings_sources: Vec<PathBuf> = Vec::new();
-    if let Some(home) = user_home.as_deref() {
+    if let Some(home) = user_home {
         let user_path = home.join(".nav").join("settings.json");
         if let Some(parsed) = read_settings(&user_path) {
             settings.merge(parsed);
@@ -352,7 +467,7 @@ pub fn load_project_context(launch_cwd: &Path) -> ProjectContext {
     let context_files = if settings.disable_context_files.unwrap_or(false) {
         Vec::new()
     } else {
-        discover_context_files(launch_cwd, user_home.as_deref())
+        discover_context_files(launch_cwd, user_home)
     };
 
     let workspace = probe_workspace(launch_cwd);
@@ -576,13 +691,30 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
+    /// Settings as expected after a load with no user/project file:
+    /// only the built-in provider catalog populated, everything else at
+    /// `Settings::default()`.
+    fn default_settings_with_builtins() -> Settings {
+        Settings {
+            providers: Some(built_in_providers()),
+            ..Settings::default()
+        }
+    }
+
     #[test]
     fn empty_dir_returns_defaults() {
         let tmp = TempDir::new().unwrap();
         let ctx = load_project_context_with_home(tmp.path(), None);
         assert!(ctx.context_files.is_empty());
         assert!(ctx.settings_sources.is_empty());
-        assert_eq!(ctx.settings, Settings::default());
+        // Pin user-supplied fields at None independently of the catalog so
+        // a future change to `built_in_providers()` can't mask a regression
+        // that smuggles in stray settings.
+        assert!(ctx.settings.model.is_none());
+        assert!(ctx.settings.max_turns.is_none());
+        assert!(ctx.settings.theme.is_none());
+        assert!(ctx.settings.default_model.is_none());
+        assert_eq!(ctx.settings, default_settings_with_builtins());
         assert!(!ctx.workspace.is_repo);
         assert!(!ctx.workspace.dirty);
     }
@@ -724,7 +856,11 @@ mod tests {
             "{ not valid json",
         );
         let ctx = load_project_context_with_home(tmp.path(), None);
-        assert_eq!(ctx.settings, Settings::default());
+        // Independent of the built-in list, malformed JSON must leave no
+        // user-supplied state behind.
+        assert!(ctx.settings.model.is_none());
+        assert!(ctx.settings.default_model.is_none());
+        assert_eq!(ctx.settings, default_settings_with_builtins());
         assert!(ctx.settings_sources.is_empty());
     }
 
@@ -750,7 +886,11 @@ mod tests {
         );
         let ctx = load_project_context_with_home(tmp.path(), None);
         // Falls back to default because deny_unknown_fields makes the parse fail.
-        assert_eq!(ctx.settings, Settings::default());
+        // Pin the lack of user-supplied state independently of the catalog.
+        assert!(ctx.settings.model.is_none());
+        assert!(ctx.settings.default_model.is_none());
+        assert!(ctx.settings_sources.is_empty());
+        assert_eq!(ctx.settings, default_settings_with_builtins());
     }
 
     // ---- Provider / model schema tests ----
@@ -824,27 +964,33 @@ mod tests {
                 }
             }"#,
         );
-        let ctx =
-            load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
+        let ctx = load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
         let providers = ctx.settings.providers.unwrap();
         // Project entry fully replaces user entry — shallow merge.
         let ollama = &providers["ollama"];
-        assert_eq!(ollama.base_url.as_deref(), Some("http://project-host:11434/v1"));
+        assert_eq!(
+            ollama.base_url.as_deref(),
+            Some("http://project-host:11434/v1")
+        );
         assert!(ollama.models.contains_key("mistral"));
-        assert!(!ollama.models.contains_key("llama3"),
-            "user model 'llama3' should not survive shallow replace");
+        assert!(
+            !ollama.models.contains_key("llama3"),
+            "user model 'llama3' should not survive shallow replace"
+        );
     }
 
     #[test]
     fn merge_preserves_user_providers_with_different_ids() {
         let tmp_home = TempDir::new().unwrap();
         let tmp_cwd = TempDir::new().unwrap();
+        // User's ollama uses a distinct host so the assertion below has
+        // signal — matching the built-in's default would be a tautology.
         write(
             &tmp_home.path().join(".nav").join("settings.json"),
             r#"{
                 "providers": {
                     "ollama": {
-                        "base_url": "http://localhost:11434/v1",
+                        "base_url": "http://ollama.user.test:11434/v1",
                         "models": { "llama3": {} }
                     }
                 }
@@ -861,13 +1007,18 @@ mod tests {
                 }
             }"#,
         );
-        let ctx =
-            load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
+        let ctx = load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
         let providers = ctx.settings.providers.as_ref().unwrap();
-        // Both providers survive: user's ollama + project's z.ai.
+        // Both providers survive: user's ollama (overriding the built-in)
+        // and project's z.ai (new id alongside built-ins).
         assert!(providers.contains_key("ollama"));
         assert!(providers.contains_key("z.ai"));
-        assert_eq!(providers.len(), 2);
+        // User's ollama replaced the built-in entry, including base_url.
+        assert_eq!(
+            providers["ollama"].base_url.as_deref(),
+            Some("http://ollama.user.test:11434/v1")
+        );
+        assert!(providers["ollama"].models.contains_key("llama3"));
     }
 
     #[test]
@@ -893,8 +1044,11 @@ mod tests {
     }
 
     #[test]
-    fn default_model_without_providers_logs_and_clears() {
+    fn default_model_unknown_provider_clears() {
         let tmp = TempDir::new().unwrap();
+        // `z.ai` (with a dot) is intentionally not a built-in id — the
+        // canonical built-in is `zai`. The user-supplied default_model
+        // references a provider id that isn't in the merged catalog.
         write(
             &tmp.path().join(".nav").join("settings.json"),
             r#"{"default_model":"z.ai/glm-5.1"}"#,
@@ -919,7 +1073,7 @@ mod tests {
         );
         let ctx = load_project_context_with_home(tmp.path(), None);
         // Entire settings file rejected because deny_unknown_fields.
-        assert_eq!(ctx.settings, Settings::default());
+        assert_eq!(ctx.settings, default_settings_with_builtins());
     }
 
     #[test]
@@ -941,7 +1095,7 @@ mod tests {
             }"#,
         );
         let ctx = load_project_context_with_home(tmp.path(), None);
-        assert_eq!(ctx.settings, Settings::default());
+        assert_eq!(ctx.settings, default_settings_with_builtins());
     }
 
     #[test]
@@ -963,6 +1117,169 @@ mod tests {
         assert_eq!(ctx.settings.default_model, None);
     }
 
+    // ---- Built-in provider catalog tests (G4) ----
+
+    #[test]
+    fn built_in_catalog_present_with_empty_user_settings() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = load_project_context_with_home(tmp.path(), None);
+        let providers = ctx.settings.providers.as_ref().unwrap();
+        for id in [
+            "openai",
+            "openrouter",
+            "deepseek",
+            "groq",
+            "together",
+            "zai",
+            "ollama",
+            "vllm",
+        ] {
+            assert!(providers.contains_key(id), "missing built-in: {id}");
+        }
+        // Sanity-check a hosted entry and a local entry.
+        let openai = &providers["openai"];
+        assert_eq!(
+            openai.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(openai.api_key.as_deref(), Some("OPENAI_API_KEY"));
+        let ollama = &providers["ollama"];
+        assert_eq!(
+            ollama.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert!(ollama.api_key.is_none());
+    }
+
+    #[test]
+    fn user_override_of_built_in_base_url_wins() {
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_cwd = TempDir::new().unwrap();
+        // Write under the user (home) path so we actually exercise the
+        // user-scope override, not the project-scope override.
+        write(
+            &tmp_home.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "openai": {
+                        "base_url": "https://proxy.example.com/v1",
+                        "api_key": "OPENAI_API_KEY"
+                    }
+                }
+            }"#,
+        );
+        let ctx = load_project_context_with_home(tmp_cwd.path(), Some(tmp_home.path()));
+        let openai = &ctx.settings.providers.as_ref().unwrap()["openai"];
+        assert_eq!(
+            openai.base_url.as_deref(),
+            Some("https://proxy.example.com/v1")
+        );
+        // Built-in `name` was replaced (shallow merge) — user did not set one.
+        assert!(openai.name.is_none());
+    }
+
+    #[test]
+    fn user_can_add_provider_alongside_built_ins() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            &tmp.path().join(".nav").join("settings.json"),
+            r#"{
+                "providers": {
+                    "custom": {
+                        "base_url": "https://api.custom.example/v1",
+                        "api_key": "CUSTOM_API_KEY"
+                    }
+                }
+            }"#,
+        );
+        let ctx = load_project_context_with_home(tmp.path(), None);
+        let providers = ctx.settings.providers.as_ref().unwrap();
+        assert!(providers.contains_key("custom"));
+        // All eight built-ins must survive adding an unrelated user
+        // provider — this doubles as the "removing a built-in is not
+        // supported" coverage from the issue's acceptance criteria.
+        for id in [
+            "openai",
+            "openrouter",
+            "deepseek",
+            "groq",
+            "together",
+            "zai",
+            "ollama",
+            "vllm",
+        ] {
+            assert!(
+                providers.contains_key(id),
+                "built-in {id} should survive adding a custom provider"
+            );
+        }
+    }
+
+    #[test]
+    fn project_context_default_seeds_built_ins() {
+        // Test fixtures that build `ProjectContext::default()` must see the
+        // same providers baseline as production load — otherwise a future
+        // check written against the fixture (where providers would be
+        // `None` under the derived default) would silently be dead in real
+        // use.
+        let ctx = ProjectContext::default();
+        let providers = ctx
+            .settings
+            .providers
+            .as_ref()
+            .expect("default should seed built-ins");
+        assert!(providers.contains_key("openai"));
+        assert!(providers.contains_key("ollama"));
+        // No other side-effects.
+        assert!(ctx.settings.model.is_none());
+        assert!(ctx.settings_sources.is_empty());
+        assert!(ctx.context_files.is_empty());
+    }
+
+    #[test]
+    fn default_model_unknown_provider_uses_targeted_message() {
+        // `unknown provider` message should fire when the provider id is
+        // not in the catalog, distinct from the "no such model under
+        // provider" message — gives the user actionable guidance.
+        let mut s = Settings {
+            default_model: Some("nope/whatever".to_string()),
+            providers: Some(built_in_providers()),
+            ..Settings::default()
+        };
+        s.validate_default_model();
+        assert_eq!(s.default_model, None);
+    }
+
+    #[test]
+    fn default_model_known_provider_missing_model_uses_targeted_message() {
+        // The selector points at a real built-in id (`openai`) but built-in
+        // models maps are empty, so validation must fail with the
+        // "model not declared" branch rather than "unknown provider".
+        let mut s = Settings {
+            default_model: Some("openai/gpt-x".to_string()),
+            providers: Some(built_in_providers()),
+            ..Settings::default()
+        };
+        s.validate_default_model();
+        assert_eq!(s.default_model, None);
+    }
+
+    #[test]
+    fn validate_default_model_with_no_catalog_is_a_noop() {
+        // Defensive branch: if a caller hands `validate_default_model` a
+        // Settings with `providers: None`, the function should silently
+        // return rather than emit the old misleading "no providers
+        // defined" log. The selector survives — there is nothing to
+        // validate against.
+        let mut s = Settings {
+            default_model: Some("openai/gpt-4".to_string()),
+            providers: None,
+            ..Settings::default()
+        };
+        s.validate_default_model();
+        assert_eq!(s.default_model.as_deref(), Some("openai/gpt-4"));
+    }
+
     #[test]
     fn model_id_defaults_to_key_when_omitted() {
         let tmp = TempDir::new().unwrap();
@@ -982,37 +1299,5 @@ mod tests {
         let ctx = load_project_context_with_home(tmp.path(), None);
         let model = &ctx.settings.providers.unwrap()["ollama"].models["llama3"];
         assert_eq!(model.model_id, None, "model_id should be None when omitted");
-    }
-
-    /// Test helper that lets us inject a fake `$HOME` so tests don't read the
-    /// developer's real `~/.nav/` or `~/.agents/`.
-    fn load_project_context_with_home(launch_cwd: &Path, home: Option<&Path>) -> ProjectContext {
-        let mut settings = Settings::default();
-        let mut settings_sources: Vec<PathBuf> = Vec::new();
-        if let Some(home) = home {
-            let user_path = home.join(".nav").join("settings.json");
-            if let Some(parsed) = read_settings(&user_path) {
-                settings.merge(parsed);
-                settings_sources.push(user_path);
-            }
-        }
-        let project_path = launch_cwd.join(".nav").join("settings.json");
-        if let Some(parsed) = read_settings(&project_path) {
-            settings.merge(parsed);
-            settings_sources.push(project_path);
-        }
-        settings.validate_default_model();
-        let context_files = if settings.disable_context_files.unwrap_or(false) {
-            Vec::new()
-        } else {
-            discover_context_files(launch_cwd, home)
-        };
-        let workspace = probe_workspace(launch_cwd);
-        ProjectContext {
-            settings,
-            settings_sources,
-            context_files,
-            workspace,
-        }
     }
 }

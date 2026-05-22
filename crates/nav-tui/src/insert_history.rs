@@ -185,8 +185,14 @@ fn write_history_line<W: Write>(writer: &mut W, line: &Line, wrap_width: usize) 
     queue!(
         writer,
         SetColors(Colors::new(
-            line.style.fg.map(ratatui_to_crossterm).unwrap_or(CColor::Reset),
-            line.style.bg.map(ratatui_to_crossterm).unwrap_or(CColor::Reset),
+            line.style
+                .fg
+                .map(ratatui_to_crossterm)
+                .unwrap_or(CColor::Reset),
+            line.style
+                .bg
+                .map(ratatui_to_crossterm)
+                .unwrap_or(CColor::Reset),
         ))
     )?;
     queue!(writer, Clear(ClearType::UntilNewLine))?;

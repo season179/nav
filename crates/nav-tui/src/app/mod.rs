@@ -8,9 +8,9 @@ use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent};
 use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
-    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, HandoffDraft, NoticeLevel, OpenAiTransport,
-    PROVIDER_OPENAI_RESPONSES, PendingInputMode, PendingSkill, ProjectContext, SessionId,
-    SessionStore, StartupNotices, build_handoff_draft,
+    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, HandoffDraft, NoticeLevel,
+    OpenAiTransport, PROVIDER_OPENAI_RESPONSES, PendingInputMode, PendingSkill, ProjectContext,
+    SessionId, SessionStore, StartupNotices, build_handoff_draft,
     cli::{Args, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };

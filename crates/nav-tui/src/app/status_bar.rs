@@ -103,10 +103,7 @@ impl<'a> Widget for StatusBar<'a> {
             let denom_k = (self.context_window + 500) / 1_000;
             spans.push(Span::styled("  ·  ", dim));
             spans.push(Span::styled(
-                format!(
-                    "{}/{denom_k}k {pct}%",
-                    format_tokens_k(self.tokens_input)
-                ),
+                format!("{}/{denom_k}k {pct}%", format_tokens_k(self.tokens_input)),
                 dim,
             ));
         }

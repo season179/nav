@@ -91,9 +91,7 @@ fn resolve_command(cache_key: &str, cmd: &str) -> Result<Option<String>> {
             .status
             .code()
             .map_or("<signal>".to_string(), |c| c.to_string());
-        bail!(
-            "shell command `sh -c '{cmd}'` exited with status {code}: {stderr}",
-        );
+        bail!("shell command `sh -c '{cmd}'` exited with status {code}: {stderr}",);
     }
 
     let stdout = String::from_utf8(output.stdout)
@@ -103,9 +101,7 @@ fn resolve_command(cache_key: &str, cmd: &str) -> Result<Option<String>> {
 
     // Empty stdout is treated as failure.
     if trimmed.is_empty() {
-        bail!(
-            "shell command `sh -c '{cmd}'` produced empty output",
-        );
+        bail!("shell command `sh -c '{cmd}'` produced empty output",);
     }
 
     // Store in cache.
@@ -186,10 +182,7 @@ mod tests {
 
     #[test]
     fn env_var_empty_returns_none() {
-        let guard = EnvVarGuard::new(
-            format!("NAV_TEST_RESOLVE_EMPTY_{}", std::process::id()),
-            "",
-        );
+        let guard = EnvVarGuard::new(format!("NAV_TEST_RESOLVE_EMPTY_{}", std::process::id()), "");
         let val = resolve_value(guard.key()).unwrap();
         assert_eq!(val, None);
     }

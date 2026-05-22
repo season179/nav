@@ -54,13 +54,8 @@ pub(super) fn draw_tui(
     // is active, so the streaming row collapses to zero height.
     let streaming_lines = chat.streaming_lines(screen_w);
     let streaming_h = (streaming_lines.len() as u16).min(MAX_STREAMING_ROWS);
-    let max_composer = screen_h
-        .saturating_sub(STATUS_ROWS + streaming_h)
-        .max(1);
-    let composer_h = pane
-        .desired_height(screen_w)
-        .max(3)
-        .min(max_composer);
+    let max_composer = screen_h.saturating_sub(STATUS_ROWS + streaming_h).max(1);
+    let composer_h = pane.desired_height(screen_w).max(3).min(max_composer);
 
     let viewport_h = streaming_h + composer_h + STATUS_ROWS;
     let viewport_y = screen_h.saturating_sub(viewport_h);
