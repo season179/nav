@@ -13,8 +13,8 @@ use super::events::{
 use super::runner::{SessionBinding, drop_oldest_tool_pair};
 use crate::cli::Args;
 use crate::context::compaction::{
-    append_compaction_details, build_history_summary_prompt, build_replacement_history,
-    estimate_input_tokens, prepare_compaction,
+    InitialContextInjection, append_compaction_details, build_history_summary_prompt,
+    build_replacement_history, estimate_input_tokens, prepare_compaction,
 };
 use crate::context::{Catalog, ProjectContext};
 use crate::model::ResponsesTransport;
@@ -140,7 +140,7 @@ pub(crate) async fn run_compaction_turn(
         });
         return Err(anyhow!(message));
     }
-    *input = build_replacement_history(&summary, input);
+    *input = build_replacement_history(&summary, input, &[], InitialContextInjection::DoNotInject);
     let _ = request.events.send(completed);
 
     emit_compaction_analytics(CompactionAnalyticsEvent {
