@@ -35,7 +35,7 @@ pub(crate) struct CompactionTurnRequest<'a, 's> {
 }
 
 /// Run a single compaction turn. Mutates `input` in place: on success it is
-/// replaced with `[summary, recent_context_suffix...]`; on failure the caller's
+/// replaced with `[user_msgs..., summary]`; on failure the caller's
 /// `input` is left untouched.
 ///
 /// The compaction request is non-steerable: the manual `/compact` command is
@@ -140,7 +140,7 @@ pub(crate) async fn run_compaction_turn(
         });
         return Err(anyhow!(message));
     }
-    *input = build_replacement_history(&summary, &preparation.recent_context);
+    *input = build_replacement_history(&summary, input);
     let _ = request.events.send(completed);
 
     emit_compaction_analytics(CompactionAnalyticsEvent {
