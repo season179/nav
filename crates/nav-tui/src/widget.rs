@@ -23,10 +23,10 @@ use crate::theme::Theme;
 /// doesn't keep a transcript ledger here. Reflow on resize is handled
 /// outside the widget (see Phase 3 of the migration plan).
 pub struct ChatWidget {
-    /// All cells ever finalized in this session. Kept so a future resize
-    /// can reflow + re-insert at the new width (see `reflow_tail_lines`).
+    /// All cells ever finalized in this session.
     /// `finalized[pending_start..]` is the slice that hasn't been pushed
-    /// into native scrollback yet.
+    /// into native scrollback yet. The terminal owns its own scrollback —
+    /// nav doesn't re-emit cells on resize.
     finalized: Vec<Box<dyn HistoryCell>>,
     /// Index of the first cell that has NOT yet been written to scrollback.
     /// Advances as `drain_pending` runs.
@@ -39,6 +39,15 @@ pub struct ChatWidget {
     /// deltas appear immediately; when the message finalizes it joins
     /// `finalized` and gets pushed to scrollback like everything else.
     streaming_assistant: Option<AssistantMessageCell>,
+    /// In-flight `Exploring`/`Running` placeholder rows, in arrival order
+    /// keyed by `call_id`. Rendered inline (below the streaming cell) so the
+    /// placeholder lives in the viewport only — when the matching
+    /// `ToolCallOutput` arrives the entry is dropped and a single
+    /// `Explored`/`Ran` row goes to scrollback. A `Vec` (not a map) so the
+    /// display order matches issuance order; the OpenAI Responses API hands
+    /// out opaque random `call_id`s, so a hash- or btree-keyed container
+    /// would shuffle parallel placeholders.
+    inflight_tool_calls: Vec<(String, ToolCallCell)>,
 }
 
 impl ChatWidget {
@@ -55,6 +64,7 @@ impl ChatWidget {
             subagent_labels: HashMap::new(),
             turn_has_work: false,
             streaming_assistant: None,
+            inflight_tool_calls: Vec::new(),
         }
     }
 
@@ -135,41 +145,6 @@ impl ChatWidget {
         out
     }
 
-    /// Re-render up to `max_lines` worth of the most recent finalized cells
-    /// at `width`, returning them in chronological order. Older content stays
-    /// in the terminal's native scrollback at its previous width — the
-    /// terminal owns scrollback and we can't reach into it. Capping the work
-    /// keeps drag-resize from emitting megabytes of escape sequences for
-    /// content that would only land in scrollback again anyway.
-    ///
-    /// Also resets the pending pointer so a follow-up `drain_pending` call
-    /// won't re-emit the same cells.
-    pub fn reflow_tail_lines(&mut self, width: u16, max_lines: usize) -> Vec<Line<'static>> {
-        self.pending_start = self.finalized.len();
-        if max_lines == 0 || self.finalized.is_empty() {
-            return Vec::new();
-        }
-        let mut groups: Vec<Vec<Line<'static>>> = Vec::new();
-        let mut total = 0usize;
-        for cell in self.finalized.iter().rev() {
-            let lines = cell.display_lines(width);
-            total = total.saturating_add(lines.len());
-            groups.push(lines);
-            if total >= max_lines {
-                break;
-            }
-        }
-        let mut out: Vec<Line<'static>> = Vec::with_capacity(total.min(max_lines));
-        for group in groups.into_iter().rev() {
-            out.extend(group);
-        }
-        if out.len() > max_lines {
-            let drop = out.len() - max_lines;
-            out.drain(..drop);
-        }
-        out
-    }
-
     /// Translate an agent event into a history cell and append it.
     ///
     /// `AssistantMessageDelta` appends to the in-flight streaming cell.
@@ -206,6 +181,7 @@ impl ChatWidget {
             }
             AgentEvent::TurnComplete { usage } => {
                 self.close_streaming_assistant();
+                self.drain_inflight_tool_calls();
                 if self.turn_has_work {
                     self.push_cell(TurnSeparatorCell::new(usage));
                 }
@@ -246,9 +222,23 @@ impl ChatWidget {
                 name,
                 arguments,
             } => {
+                // Close any streaming assistant (the model is moving on to a
+                // tool call) and mark the turn as having produced work, but
+                // hold the placeholder inline instead of pushing it to
+                // scrollback. The matching `ToolCallOutput` drops the inline
+                // entry and pushes a single `Explored`/`Ran` row to
+                // scrollback — without this, both `Exploring` and `Explored`
+                // would land separately in scrollback for every tool call.
+                self.close_streaming_assistant();
+                self.turn_has_work = true;
                 let cell = ToolCallCell::new(name, arguments);
-                self.tool_calls.insert(call_id, cell.context());
-                self.push_work_cell(cell);
+                self.tool_calls.insert(call_id.clone(), cell.context());
+                // Defensively dedupe by call_id — the provider shouldn't
+                // re-emit ToolCallStarted for the same id, but if it did, the
+                // newer placeholder replaces the older one in place rather
+                // than appearing twice.
+                self.inflight_tool_calls.retain(|(id, _)| id != &call_id);
+                self.inflight_tool_calls.push((call_id, cell));
             }
             AgentEvent::ToolCallOutput {
                 call_id,
@@ -257,6 +247,7 @@ impl ChatWidget {
                 ..
             } => {
                 let context = self.tool_calls.remove(&call_id);
+                self.inflight_tool_calls.retain(|(id, _)| id != &call_id);
                 self.push_work_cell(ToolOutputCell::with_context(output, is_error, context));
             }
             AgentEvent::SubagentStarted { id, label, task } => {
@@ -303,6 +294,12 @@ impl ChatWidget {
                 ));
             }
             AgentEvent::Error { message } => {
+                // Flush any in-flight tool placeholders to scrollback first.
+                // The agent loop emits `Error` for transport/store failures
+                // that can leave a `ToolCallStarted` without a matching
+                // `ToolCallOutput`; without this drain the placeholder paints
+                // forever in the inline viewport across every later turn.
+                self.drain_inflight_tool_calls();
                 self.push_cell(ErrorCell::new(message));
             }
             AgentEvent::ToolCallBlocked {
@@ -350,6 +347,12 @@ impl ChatWidget {
                 self.push_local_cell(PendingInputCell::dequeued(id, mode));
             }
             AgentEvent::TurnAborted { turn_id, reason } => {
+                // A turn aborted mid-tool-call leaves orphaned `Exploring`/
+                // `Running` placeholders in `inflight_tool_calls`. Flush them
+                // to scrollback so the user can see what was attempted, and
+                // so the inline viewport doesn't keep re-rendering them on
+                // every later frame.
+                self.drain_inflight_tool_calls();
                 self.push_cell(TurnAbortedCell::new(turn_id, reason));
             }
             AgentEvent::CompactionStarted {
@@ -394,6 +397,12 @@ impl ChatWidget {
                 preview,
             } => {
                 self.close_streaming_assistant();
+                // Drop any in-flight placeholders silently — the rewind is
+                // explicitly undoing the events that spawned them, so the
+                // user does NOT want their `Exploring`/`Running` rows
+                // resurrected in scrollback (unlike `TurnAborted`/`Error`
+                // where the drain is informational).
+                self.clear_inflight_tool_calls();
                 self.turn_has_work = false;
                 let detail = if preview.is_empty() {
                     format!("rewound to seq {target_seq}, removed {removed_events} event(s)")
@@ -431,6 +440,56 @@ impl ChatWidget {
             .unwrap_or_default()
     }
 
+    /// Combined inline-viewport lines: streaming assistant cell (if any),
+    /// followed by each in-flight `Exploring`/`Running` placeholder in the
+    /// order they started. Both live in the viewport, not in scrollback, so
+    /// the placeholder vanishes when its matching `ToolCallOutput` arrives
+    /// rather than producing a duplicate row.
+    pub fn inline_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = self.streaming_lines(width);
+        for (_, cell) in &self.inflight_tool_calls {
+            out.extend(cell.display_lines(width));
+        }
+        out
+    }
+
+    /// `inline_lines` clamped to `max_rows`, with placeholders prioritized
+    /// over streaming-assistant text. When the combined height exceeds the
+    /// cap, the streaming assistant is head-clipped (oldest tokens drop
+    /// off the top) so the user keeps seeing newly streamed text AND every
+    /// in-flight tool placeholder. Without this, a long streaming reply
+    /// pushes `Exploring`/`Running` rows past `MAX_STREAMING_ROWS` where
+    /// ratatui's `Paragraph` silently clips them.
+    pub fn inline_lines_capped(&self, width: u16, max_rows: u16) -> Vec<Line<'static>> {
+        let max = max_rows as usize;
+        if max == 0 {
+            return Vec::new();
+        }
+        let streaming = self.streaming_lines(width);
+        let placeholders: Vec<Line<'static>> = self
+            .inflight_tool_calls
+            .iter()
+            .flat_map(|(_, cell)| cell.display_lines(width))
+            .collect();
+        let total = streaming.len() + placeholders.len();
+        if total <= max {
+            let mut out = streaming;
+            out.extend(placeholders);
+            return out;
+        }
+        if placeholders.len() >= max {
+            // Placeholders alone overflow — drop streaming entirely, keep
+            // the earliest placeholders so the order remains stable as
+            // calls resolve.
+            return placeholders.into_iter().take(max).collect();
+        }
+        let streaming_budget = max - placeholders.len();
+        let streaming_skip = streaming.len() - streaming_budget;
+        let mut out: Vec<_> = streaming.into_iter().skip(streaming_skip).collect();
+        out.extend(placeholders);
+        out
+    }
+
     /// Push a cell that ends the in-flight assistant message. Closes the
     /// streaming row first so it lands in scrollback before this cell.
     fn push_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
@@ -454,6 +513,32 @@ impl ChatWidget {
         if let Some(mut cell) = self.streaming_assistant.take() {
             cell.finalize();
             self.finalized.push(Box::new(cell));
+        }
+    }
+
+    /// Move any in-flight tool placeholders to scrollback on turn end.
+    /// Reached when a tool call started but its output never arrived
+    /// (model aborted mid-call, transport dropped, etc.); the user still
+    /// deserves to see what was attempted, so the placeholder is flushed.
+    /// Also clears the parallel `tool_calls` context map for the drained
+    /// ids — otherwise it would leak entries indefinitely.
+    fn drain_inflight_tool_calls(&mut self) {
+        if self.inflight_tool_calls.is_empty() {
+            return;
+        }
+        let stale = std::mem::take(&mut self.inflight_tool_calls);
+        for (id, cell) in stale {
+            self.tool_calls.remove(&id);
+            self.finalized.push(Box::new(cell));
+        }
+    }
+
+    /// Drop in-flight placeholders WITHOUT flushing them to scrollback.
+    /// Used by `SessionRewound`, which is explicitly undoing the events
+    /// that produced the placeholders.
+    fn clear_inflight_tool_calls(&mut self) {
+        for (id, _) in self.inflight_tool_calls.drain(..) {
+            self.tool_calls.remove(&id);
         }
     }
 

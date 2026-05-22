@@ -49,22 +49,49 @@ pub(super) fn draw_tui(
 ) -> Result<()> {
     let screen_h = screen_h.max(2);
 
-    // Materialize the in-flight streaming cell once: one buffer walk yields
-    // both the rendered lines and their height. Empty Vec when no stream
-    // is active, so the streaming row collapses to zero height.
-    let streaming_lines = chat.streaming_lines(screen_w);
-    let streaming_h = (streaming_lines.len() as u16).min(MAX_STREAMING_ROWS);
+    // Materialize the live inline cells once: streaming assistant followed
+    // by any `Exploring`/`Running` tool-call placeholders. `inline_lines_capped`
+    // already caps the row count at `MAX_STREAMING_ROWS` and prioritizes
+    // placeholders over streaming-assistant tokens — without that, a long
+    // streaming reply would push `Exploring`/`Running` rows past the cap
+    // and they'd be invisibly clipped by ratatui's `Paragraph`.
+    let streaming_lines = chat.inline_lines_capped(screen_w, MAX_STREAMING_ROWS);
+    let streaming_h = streaming_lines.len() as u16;
     let max_composer = screen_h.saturating_sub(STATUS_ROWS + streaming_h).max(1);
     let composer_h = pane.desired_height(screen_w).max(3).min(max_composer);
 
-    let viewport_h = streaming_h + composer_h + STATUS_ROWS;
-    let viewport_y = screen_h.saturating_sub(viewport_h);
-    let viewport_area = Rect::new(0, viewport_y, screen_w, viewport_h);
+    // Sticky-top viewport: preserve `viewport_area.top()` so the inline frame
+    // doesn't slam against the bottom of the screen on every frame. On the
+    // first frame this anchors the viewport just below the cursor's startup
+    // row (where the shell prompt was), avoiding the "empty rows below the
+    // viewport snapshotted into scrollback" leak. The viewport slides DOWN
+    // naturally as `insert_history_lines` pushes content above it, and
+    // bottom-anchors permanently once it reaches the screen floor.
+    let old_area = terminal.viewport_area;
+    let viewport_h = (streaming_h + composer_h + STATUS_ROWS).min(screen_h).max(1);
+    let mut viewport_area = Rect::new(0, old_area.y, screen_w, viewport_h);
+
+    // Expansion-overflow: if growing the viewport would push it past the
+    // screen floor, scroll the rows directly above it into native scrollback
+    // before slamming the viewport to bottom-anchored. This is what saves
+    // the user-prompt row from being overwritten when streaming kicks in —
+    // those rows are now in the terminal's scrollback instead of about to be
+    // overpainted by the inline frame.
+    if viewport_area.bottom() > screen_h {
+        let scroll_by = viewport_area.bottom() - screen_h;
+        if old_area.width > 0 && old_area.top() > 0 {
+            crate::insert_history::scroll_region_above_into_scrollback(
+                terminal,
+                old_area.top(),
+                scroll_by,
+            )?;
+        }
+        viewport_area.y = screen_h - viewport_area.height;
+    }
 
     // Blank rows the viewport is about to vacate (streaming cell finalized
     // or shrunk) before the next `insert_history_lines` scrolls them into
     // native scrollback as orphan fragments of a mid-stream paint.
-    let old_area = terminal.viewport_area;
     if old_area.width > 0 /* skip the pre-first-frame zero-sized area */
         && viewport_area.top() > old_area.top()
     {

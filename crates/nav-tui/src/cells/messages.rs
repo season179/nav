@@ -176,7 +176,7 @@ mod tests {
 
         insta::assert_snapshot!(lines_text(&cell.display_lines(36)), @r"
         • This assistant reply wraps cleanly
-           under the bullet marker.
+          under the bullet marker.
 
         ");
     }

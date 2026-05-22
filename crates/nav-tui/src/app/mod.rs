@@ -144,12 +144,6 @@ pub async fn run(
         &sandbox_policy,
     );
     let mut needs_draw = true;
-    // Resize coalescing: a drag-resize spits Resize events ~ once per row
-    // change. We track the *last applied* width and the *latest pending*
-    // width, then run a single reflow per draw cycle. Same-width events
-    // become no-ops, so a vertical drag never re-emits the transcript.
-    let mut last_reflow_width: u16 = 0;
-    let mut pending_reflow_width: Option<u16> = None;
 
     if let Some(prompt) = initial_prompt {
         app_tx
@@ -219,17 +213,6 @@ pub async fn run(
                 screen_w
             };
 
-            // Resize reflow runs at most once per draw cycle (drag-resize
-            // events coalesced above). Cap the emitted lines at the visible
-            // screen height: anything older is already in the user's
-            // scrollback at the previous width and we can't reach into it.
-            let reflow_lines = if let Some(new_w) = pending_reflow_width.take() {
-                last_reflow_width = new_w;
-                chat.reflow_tail_lines(new_w, screen_h as usize)
-            } else {
-                Vec::new()
-            };
-
             // Flush newly-finalized cells into the terminal's native
             // scrollback above the inline viewport. Use the current
             // viewport width so each cell renders against the same width
@@ -245,16 +228,6 @@ pub async fn run(
             // so a failure here is not actionable.
             use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
             let _ = crossterm::queue!(term.terminal.backend_mut(), BeginSynchronizedUpdate);
-
-            if !reflow_lines.is_empty()
-                && let Err(err) = crate::insert_history::insert_history_lines(
-                    &mut term.terminal,
-                    reflow_lines,
-                    scroll_width,
-                )
-            {
-                eprintln!("nav-tui: failed to insert reflowed history rows: {err:#}");
-            }
 
             if !pending.is_empty()
                 && let Err(err) = crate::insert_history::insert_history_lines(
@@ -960,18 +933,17 @@ pub async fn run(
                             // arm the payload would be silently dropped.
                             pane.on_paste(&text);
                         }
-                        CtEvent::Resize(new_w, _new_h) => {
-                            // Coalesce drag-resize: stash the latest width
-                            // and let the draw cycle reflow once. Skip the
-                            // bookkeeping entirely if the width hasn't
-                            // actually changed — vertical drags fire Resize
-                            // every row but don't change wrapping. Previous
-                            // scrollback at the old width stays put (the
-                            // terminal owns scrollback); a visible seam
-                            // appears if the user scrolls past the resize.
-                            if new_w != last_reflow_width {
-                                pending_reflow_width = Some(new_w);
-                            }
+                        CtEvent::Resize(_new_w, _new_h) => {
+                            // The terminal handles re-wrapping its own
+                            // scrollback at the new width; nav doesn't
+                            // re-emit cells. A previous version did, which
+                            // produced a duplicate transcript: re-emitted
+                            // rows landed in scrollback _above_ the
+                            // identical old-width copies the terminal had
+                            // already kept. The visible seam at the resize
+                            // point (old rows hard-wrapped or padded by the
+                            // terminal) is accepted by design — see the
+                            // discussion in CLAUDE.md.
                             needs_draw = true;
                         }
                         _ => {}

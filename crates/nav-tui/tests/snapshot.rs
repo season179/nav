@@ -34,12 +34,11 @@ fn buffer_to_text(buf: &Buffer) -> String {
 fn render_widget(widget: &mut ChatWidget, width: u16, height: u16) -> String {
     use ratatui::widgets::{Paragraph, Widget};
     let mut lines = widget.drain_pending(width);
-    let streaming = if widget.has_streaming() {
-        widget.streaming_lines(width)
-    } else {
-        Vec::new()
-    };
-    lines.extend(streaming);
+    // `inline_lines` covers both the streaming assistant cell and any
+    // `Exploring`/`Running` tool placeholders — the latter no longer flow
+    // through `drain_pending` (they live inline until the matching
+    // `ToolCallOutput` arrives), so we have to overlay them explicitly.
+    lines.extend(widget.inline_lines(width));
 
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -191,6 +190,14 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
             "path": "/Users/season/.agents/skills/zoom-out/SKILL.md"
         }),
     });
+    // While the call is in flight, the placeholder lives inline and
+    // shows the `Exploring` label — that row will be dropped (not
+    // duplicated) the moment `ToolCallOutput` arrives.
+    let started = render_widget(&mut widget, 90, 20);
+    assert!(
+        started.contains("• Exploring\n  Read SKILL.md (zoom-out skill)"),
+        "{started}"
+    );
     widget.ingest(AgentEvent::ToolCallOutput {
         call_id: "call_1".to_string(),
         output: (0..20)
@@ -204,8 +211,8 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
     let rendered = render_widget(&mut widget, 90, 20);
 
     assert!(
-        rendered.contains("• Exploring\n  Read SKILL.md (zoom-out skill)"),
-        "{rendered}"
+        !rendered.contains("• Exploring"),
+        "in-flight placeholder must be replaced once the output lands; got:\n{rendered}"
     );
     assert!(
         rendered.contains("• Explored  Read SKILL.md (zoom-out skill)"),
@@ -474,10 +481,13 @@ fn tool_call_mid_stream_finalizes_open_assistant_cell() {
         2,
         "expected two separate assistant rows, got:\n{rendered}"
     );
-    let tool_idx = rendered.find("• Running").expect("tool row present");
+    // The tool call's `Running` placeholder lives inline (not in scrollback)
+    // until its matching `ToolCallOutput` arrives, so it appears below the
+    // finalized assistant messages in this rendered overlay.
+    assert!(rendered.contains("• Running"), "{rendered}");
     let first_idx = rendered.find("thinking about it").unwrap();
     let second_idx = rendered.find("second message").unwrap();
-    assert!(first_idx < tool_idx && tool_idx < second_idx, "{rendered}");
+    assert!(first_idx < second_idx, "{rendered}");
 }
 
 #[test]
@@ -663,4 +673,169 @@ fn renders_session_management_cells() {
 
     let rendered = render_widget(&mut widget, 96, 20);
     insta::assert_snapshot!("session_management_cells", rendered);
+}
+
+#[test]
+fn turn_aborted_flushes_inflight_tool_placeholder_to_scrollback() {
+    // Regression: a tool call that started but never produced output used
+    // to leak its `Exploring` placeholder into `inflight_tool_calls`
+    // forever, repainting on every later frame across every later turn.
+    // `TurnAborted` must drain the placeholder into scrollback so the
+    // inline viewport returns to a clean state.
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_orphan".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "/tmp/x.txt" }),
+    });
+    widget.ingest(AgentEvent::TurnAborted {
+        turn_id: "turn-1".to_string(),
+        reason: "user interrupt".to_string(),
+    });
+
+    let rendered = render_widget(&mut widget, 80, 10);
+    assert!(
+        rendered.contains("• Exploring"),
+        "drained placeholder must land in scrollback; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("◆ aborted  turn-1 user interrupt"),
+        "{rendered}"
+    );
+    // The inline overlay should now be empty — the placeholder lives in
+    // `finalized`, not in `inflight_tool_calls`.
+    assert_eq!(
+        widget.inline_lines(80).len(),
+        0,
+        "inflight_tool_calls must be empty after TurnAborted"
+    );
+}
+
+#[test]
+fn error_event_flushes_inflight_tool_placeholder_to_scrollback() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_orphan".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "/tmp/x.txt" }),
+    });
+    widget.ingest(AgentEvent::Error {
+        message: "transport dropped".to_string(),
+    });
+
+    let rendered = render_widget(&mut widget, 80, 10);
+    assert!(
+        rendered.contains("• Exploring"),
+        "drained placeholder must land in scrollback; got:\n{rendered}"
+    );
+    assert!(rendered.contains("transport dropped"), "{rendered}");
+    assert_eq!(widget.inline_lines(80).len(), 0);
+}
+
+#[test]
+fn session_rewound_drops_inflight_placeholder_silently() {
+    // Rewind explicitly undoes the events that spawned the placeholder, so
+    // unlike `TurnAborted`/`Error` we drop it WITHOUT flushing to scrollback.
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_undone".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "/tmp/x.txt" }),
+    });
+    widget.ingest(AgentEvent::SessionRewound {
+        target_seq: 5,
+        removed_events: 3,
+        preview: "user msg".to_string(),
+    });
+
+    let rendered = render_widget(&mut widget, 80, 10);
+    assert!(
+        !rendered.contains("• Exploring"),
+        "rewind must drop placeholders without resurrecting them in scrollback; got:\n{rendered}"
+    );
+    assert!(rendered.contains("◆ rewind"), "{rendered}");
+    assert_eq!(widget.inline_lines(80).len(), 0);
+}
+
+#[test]
+fn inflight_tool_placeholders_preserve_arrival_order() {
+    // Regression: with `BTreeMap<String, _>` the placeholders rendered in
+    // lexicographic call-id order. OpenAI Responses call_ids are opaque
+    // random strings, so lex order is effectively random. With a Vec the
+    // display order matches issuance order.
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "z_first".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "/first.txt" }),
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "a_second".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "/second.txt" }),
+    });
+
+    let rendered = render_widget(&mut widget, 80, 8);
+    let first_idx = rendered.find("first.txt").expect("first placeholder");
+    let second_idx = rendered.find("second.txt").expect("second placeholder");
+    assert!(
+        first_idx < second_idx,
+        "arrival order (z_first, a_second) must beat lex order; got:\n{rendered}"
+    );
+}
+
+#[test]
+fn inline_lines_capped_preserves_placeholders_over_long_stream() {
+    // Regression: ratatui's `Paragraph` silently clips rows beyond its
+    // chunk height. When `inline_lines` returned (streaming + placeholders)
+    // and the chunk was capped at MAX_STREAMING_ROWS, the placeholders at
+    // the tail of the Vec were invisibly clipped. The capped variant must
+    // keep them visible by head-clipping the streaming cell instead.
+    let mut widget = ChatWidget::new();
+    // Each line ends with `\n` so the StreamController flushes it to the
+    // stable half (otherwise it sits in the tail and the cell collapses to
+    // one row).
+    let long_stream = (0..40)
+        .map(|i| format!("line {i:02}\n"))
+        .collect::<String>();
+    widget.ingest(AgentEvent::AssistantMessageDelta { text: long_stream });
+    // `inline_lines` (uncapped) materializes everything — by construction
+    // it must exceed the cap we'll pass below, otherwise the test exercises
+    // the wrong branch.
+    let uncapped_streaming_only = widget.inline_lines(80).len();
+    assert!(
+        uncapped_streaming_only > 8,
+        "test setup: streaming cell must overflow the cap (got {uncapped_streaming_only} lines)"
+    );
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_visible".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "/visible.txt" }),
+    });
+
+    let capped = widget.inline_lines_capped(80, 8);
+    assert!(
+        capped.len() <= 8,
+        "must not exceed cap; got {} lines",
+        capped.len()
+    );
+    let rendered: String = capped
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("visible.txt"),
+        "tool-call placeholder must survive the cap; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("line 00"),
+        "streaming head should be clipped, not the tail; got:\n{rendered}"
+    );
 }
