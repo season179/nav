@@ -17,7 +17,6 @@ use serde::Serialize;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 /// Outcome of a single doctor check. The three-state ladder mirrors common
 /// CI conventions: `Ok` is silently passing, `Warn` flags something the user
@@ -180,10 +179,11 @@ impl DoctorBuilder {
 /// stay in lock-step with what the agent loop actually saw);
 /// `install_manifest_dir` is the cargo manifest directory the *binary
 /// crate* was compiled from — `nav-cli` passes its own `CARGO_MANIFEST_DIR`
-/// here so doctor reports the same path `nav update` will pass to `cargo
-/// install --path`. Reading the env macro inside this `nav-core` module
-/// would instead report `crates/nav-core`, which is not what gets
-/// installed.
+/// here so doctor reports the path the binary was built from. Reading the
+/// env macro inside this `nav-core` module would instead report
+/// `crates/nav-core`, which is not what was installed. Self-update
+/// (`nav update`) no longer depends on this path; it is reported for
+/// developers who want to rebuild from source.
 pub fn run(
     args: &Args,
     cwd: &Path,
@@ -218,7 +218,7 @@ fn check_runtime(b: &mut DoctorBuilder, args: &Args) {
         "cargo",
         |p| format!("cargo on PATH at {}", p.display()),
         DoctorStatus::Warn,
-        "cargo not on PATH — `nav update` will fail until rustup/cargo is installed",
+        "cargo not on PATH — only needed to rebuild nav from source; `nav update` works without it",
     );
     if cfg!(target_os = "macos") {
         b.check_on_path(
@@ -528,11 +528,15 @@ fn check_install(b: &mut DoctorBuilder, manifest_dir: &str) {
     if Path::new(manifest_dir).exists() {
         b.ok(DoctorGroup::Install, "manifest dir", manifest_dir);
     } else {
-        b.fail(
+        // `nav update` downloads a prebuilt tarball from GitHub Releases
+        // (see `crates/nav-cli/src/upgrade.rs`) and does not touch this
+        // directory, so a missing manifest dir is no longer ship-blocking —
+        // only the developer rebuilding from source cares.
+        b.warn(
             DoctorGroup::Install,
             "manifest dir",
             format!(
-                "manifest dir {manifest_dir} no longer exists — `nav update` will fail; reinstall from a current checkout"
+                "manifest dir {manifest_dir} no longer exists — only relevant for rebuilding from source; `nav update` is unaffected"
             ),
         );
     }
@@ -582,61 +586,6 @@ fn is_executable_file(path: &Path) -> bool {
     {
         true
     }
-}
-
-/// Resolve `cargo`'s install prefix (the `bin` dir cargo writes into for
-/// `cargo install`). Used by `nav update` to detect a PATH-shim mismatch
-/// where the global `nav` is shadowed by an older binary in a sibling dir.
-/// Returns `$CARGO_INSTALL_ROOT/bin` or `$CARGO_HOME/bin`, falling back to
-/// `~/.cargo/bin`.
-pub fn cargo_install_bin_dir() -> Option<PathBuf> {
-    cargo_install_bin_dir_from(
-        env::var_os("CARGO_INSTALL_ROOT").as_deref(),
-        env::var_os("CARGO_HOME").as_deref(),
-        dirs::home_dir,
-    )
-}
-
-/// Resolution logic for [`cargo_install_bin_dir`], split out so tests can
-/// inject synthetic env without mutating the process environment (which
-/// races with parallel tests that also read `CARGO_*` vars).
-fn cargo_install_bin_dir_from(
-    install_root: Option<&std::ffi::OsStr>,
-    cargo_home: Option<&std::ffi::OsStr>,
-    home_dir: impl FnOnce() -> Option<PathBuf>,
-) -> Option<PathBuf> {
-    if let Some(root) = install_root {
-        return Some(PathBuf::from(root).join("bin"));
-    }
-    if let Some(home) = cargo_home {
-        return Some(PathBuf::from(home).join("bin"));
-    }
-    home_dir().map(|h| h.join(".cargo").join("bin"))
-}
-
-/// Run a freshly installed binary with `--version` and return the trimmed
-/// first line of stdout. Used by `nav update` to print a `from X → Y`
-/// summary that proves the reinstall actually took effect.
-pub fn binary_version(bin: &Path) -> Option<String> {
-    let output = Command::new(bin)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let line = String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    // `clap` formats this as `nav 26.5.2` — strip the leading binary name so
-    // callers can compare versions directly.
-    Some(line.split_whitespace().last().unwrap_or(&line).to_string())
 }
 
 #[cfg(test)]
@@ -807,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn check_install_flags_missing_manifest_dir() {
+    fn check_install_warns_on_missing_manifest_dir_without_failing() {
         let mut b = DoctorBuilder::new();
         check_install(&mut b, "/definitely/not/a/real/manifest/dir");
         let row = b
@@ -815,8 +764,10 @@ mod tests {
             .iter()
             .find(|c| c.label == "manifest dir")
             .expect("manifest dir row");
-        assert!(matches!(row.status, DoctorStatus::Fail));
-        assert!(row.detail.contains("no longer exists"));
+        // `nav update` works without this path, so a missing manifest dir
+        // must not be ship-blocking.
+        assert!(matches!(row.status, DoctorStatus::Warn));
+        assert!(row.detail.contains("only relevant for rebuilding from source"));
     }
 
     #[test]
@@ -830,53 +781,6 @@ mod tests {
             .find(|c| c.label == "manifest dir")
             .expect("manifest dir row");
         assert!(matches!(row.status, DoctorStatus::Ok));
-    }
-
-    #[test]
-    fn binary_version_strips_clap_prefix() {
-        // Synthesise a shim that prints the canonical `clap` --version line.
-        let tmp = TempDir::new().unwrap();
-        let shim = tmp.path().join("nav-shim");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::write(&shim, "#!/bin/sh\necho 'nav 99.0.0'\n").unwrap();
-            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
-            let parsed = binary_version(&shim).unwrap();
-            assert_eq!(parsed, "99.0.0");
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = shim;
-        }
-    }
-
-    #[test]
-    fn cargo_install_bin_dir_prefers_install_root() {
-        let install_root = std::ffi::OsString::from("/tmp/install-root");
-        let cargo_home = std::ffi::OsString::from("/tmp/cargo-home");
-        let resolved = cargo_install_bin_dir_from(Some(&install_root), Some(&cargo_home), || {
-            Some(PathBuf::from("/tmp/home"))
-        })
-        .unwrap();
-        assert_eq!(resolved, PathBuf::from("/tmp/install-root/bin"));
-    }
-
-    #[test]
-    fn cargo_install_bin_dir_falls_back_to_cargo_home() {
-        let cargo_home = std::ffi::OsString::from("/tmp/cargo-home");
-        let resolved = cargo_install_bin_dir_from(None, Some(&cargo_home), || {
-            Some(PathBuf::from("/tmp/home"))
-        })
-        .unwrap();
-        assert_eq!(resolved, PathBuf::from("/tmp/cargo-home/bin"));
-    }
-
-    #[test]
-    fn cargo_install_bin_dir_falls_back_to_home_dot_cargo() {
-        let resolved =
-            cargo_install_bin_dir_from(None, None, || Some(PathBuf::from("/tmp/home"))).unwrap();
-        assert_eq!(resolved, PathBuf::from("/tmp/home/.cargo/bin"));
     }
 
     // ── config diagnostics ─────────────────────────────────────────

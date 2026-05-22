@@ -67,8 +67,10 @@ path, so verify the real local checkout before assuming one is absent.
     transcript.
 - `rg` must be on `PATH`; `code_search` shells out to it even though
   `Cargo.toml` does not mention it.
-- `nav update` / `nav upgrade` reinstalls from compile-time
-  `CARGO_MANIFEST_DIR`, not from the current working directory.
+- `nav update` / `nav upgrade` downloads the latest tarball from GitHub
+  Releases (Apple Silicon macOS only) and replaces the running binary in
+  place via `std::env::current_exe()`. No Rust toolchain or source
+  checkout required — see `crates/nav-cli/src/upgrade.rs`.
 - Auth, transport, session storage, settings keys, and CLI defaults are
   documented in `README.md`; prefer linking there instead of duplicating them
   here.
