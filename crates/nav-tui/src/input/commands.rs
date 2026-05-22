@@ -349,10 +349,7 @@ pub(crate) enum ModelMatch {
 /// Bare names are matched against model keys across all providers; if
 /// exactly one matches, it's used; if multiple match, the caller gets the
 /// ambiguous list so it can ask for a qualified selector.
-pub(crate) fn match_model_selector(
-    selector: &str,
-    catalog: &ProviderCatalog,
-) -> ModelMatch {
+pub(crate) fn match_model_selector(selector: &str, catalog: &ProviderCatalog) -> ModelMatch {
     let selector = selector.trim();
 
     // Qualified selector: `<provider>/<model_key>`.  Model keys can
@@ -361,10 +358,10 @@ pub(crate) fn match_model_selector(
     if let Some((provider_id, model_key)) = selector.split_once('/') {
         let provider_id = provider_id.trim();
         let model_key = model_key.trim();
-        if let Some(provider) = catalog.get(provider_id) {
-            if provider.models.contains_key(model_key) {
-                return ModelMatch::Exact(selector.to_string());
-            }
+        if let Some(provider) = catalog.get(provider_id)
+            && provider.models.contains_key(model_key)
+        {
+            return ModelMatch::Exact(selector.to_string());
         }
         // Qualified match failed — fall through to bare-name search.
         // The user may have typed a slash-containing model key without
@@ -378,9 +375,10 @@ pub(crate) fn match_model_selector(
     let matches: Vec<String> = catalog
         .iter()
         .flat_map(|(provider_id, provider)| {
-            provider.models.keys().map(move |model_key| {
-                format!("{provider_id}/{model_key}")
-            })
+            provider
+                .models
+                .keys()
+                .map(move |model_key| format!("{provider_id}/{model_key}"))
         })
         .filter(|full_selector| {
             // Match if the selector equals the full model key.
@@ -427,7 +425,10 @@ mod tests {
 
         let mut openrouter_models = BTreeMap::new();
         openrouter_models.insert("zai/glm-5.1".into(), ModelConfig::default());
-        providers.insert("openrouter".into(), provider("OpenRouter", openrouter_models));
+        providers.insert(
+            "openrouter".into(),
+            provider("OpenRouter", openrouter_models),
+        );
 
         let mut ollama_models = BTreeMap::new();
         ollama_models.insert("qwen-local".into(), ModelConfig::default());

@@ -79,7 +79,7 @@ fn builtin_description(command: &str) -> Option<&'static str> {
         "/checkpoint" => Some("save reversible git checkpoint"),
         "/stash" => Some("stash current git changes"),
         "/restore" => Some("restore a nav git checkpoint"),
-        "/model" => Some("list or set model (restart to apply)"),
+        "/model" => Some("list or switch model"),
         _ => None,
     }
 }

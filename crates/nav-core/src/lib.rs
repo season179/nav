@@ -84,8 +84,11 @@ pub use git_checkpoint::{
 // Guardrail policy and approval-decision types shared by tools and frontends.
 pub use guardrails::{ApprovalReason, AskForApproval, BlockRule, ReviewDecision, SandboxPolicy};
 
-// Concrete OpenAI Responses transport and retry configuration.
-pub use model::{OpenAiTransport, RetryPolicy};
+// Concrete model transports and retry configuration.
+pub use model::{
+    ChatCompletionsTransport, ModelSwapOutcome, ModelTransportHandle, OpenAiTransport,
+    ResolvedProvider, RetryPolicy, WireFormat,
+};
 
 // Verification summaries for file mutations and turn-level diffs.
 pub use verify::{

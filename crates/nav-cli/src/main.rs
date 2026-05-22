@@ -6,11 +6,12 @@ use nav_core::guardrails::{
     AskForApproval, PermissionContext, SessionAllowlist, select_for_platform,
 };
 use nav_core::{
-    AgentEvent, AgentTurnRequest, OpenAiTransport, PROVIDER_OPENAI_RESPONSES, ProjectContext,
-    RetryPolicy, SessionBinding, SessionStore, SessionSummary, SessionTreeNode, StartupNotices,
-    TranscriptHit, agent_event_notification,
+    AgentEvent, AgentTurnRequest, ChatCompletionsTransport, ModelTransportHandle, OpenAiTransport,
+    PROVIDER_OPENAI_RESPONSES, ProjectContext, RetryPolicy, SessionBinding, SessionStore,
+    SessionSummary, SessionTreeNode, Settings, StartupNotices, TranscriptHit,
+    agent_event_notification,
     cli::{
-        Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, ModelsAction,
+        Args, CliCommand, CliExportFormat, ExtensionsAction, GitAction, ModelsAction, ProvidedArgs,
         ProvidersAction, SessionsAction, list_models, list_providers, sandbox_policy_from_args,
     },
     discover_extensions, discover_skills, git_checkpoint, layout_session_tree,
@@ -46,6 +47,7 @@ async fn main() -> Result<()> {
     // from settings, but a settings file can fill defaults.
     let project = Arc::new(load_project_context(&cwd));
     args.apply_settings(&project.settings, &provided);
+    apply_provider_default_model(&mut args, &provided, &project.settings);
 
     // Capture warnings emitted by skill/extension discovery so the TUI can
     // render them as styled cells (and headless modes can keep printing
@@ -102,10 +104,10 @@ async fn main() -> Result<()> {
             // If the user didn't explicitly pass --model, pick up the
             // session's stored model so `/model` changes persist across
             // restarts when resuming.
-            if !provided.was_provided("model") {
-                if let Some(summary) = store.session_summary(id)? {
-                    args.model = summary.model;
-                }
+            if !provided.was_provided("model")
+                && let Some(summary) = store.session_summary(id)?
+            {
+                args.model = summary.model;
             }
 
             (
@@ -126,22 +128,13 @@ async fn main() -> Result<()> {
         }
     };
 
-    let auth_config = auth::load_auth(&args, &project.settings)?;
-    // No global `.timeout()` — a streaming turn legitimately runs for minutes.
-    // The SSE/WS idle timeout below is what catches stuck streams.
-    let client = reqwest::Client::builder()
-        .default_headers(auth::default_headers(&auth_config)?)
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .build()?;
     let idle_timeout = Duration::from_secs(args.idle_timeout_secs);
-    let transport = Arc::new(OpenAiTransport::with_config(
-        client,
-        auth_config,
-        args.transport,
+    let transport = build_initial_transport(
+        &args,
+        &project.settings,
         idle_timeout,
-        RetryPolicy::default(),
-    ));
+        should_try_provider_transport(&args, provided.was_provided("model"), &project.settings),
+    )?;
 
     let stdin_is_tty = std::io::stdin().is_terminal();
     // Raw mode keeps the convenience flow where piped stdin becomes prompt
@@ -207,7 +200,7 @@ async fn main() -> Result<()> {
 
     let agent = run_agent(
         AgentTurnRequest::new(
-            transport.as_ref(),
+            &transport,
             &args,
             &cwd,
             &prompt,
@@ -231,6 +224,68 @@ async fn main() -> Result<()> {
     };
     let (result, _) = tokio::join!(agent, drainer);
     result
+}
+
+fn apply_provider_default_model(args: &mut Args, provided: &ProvidedArgs, settings: &Settings) {
+    if provided.was_provided("model") || settings.model.is_some() {
+        return;
+    }
+    if let Some(default_model) = settings.default_model.as_deref() {
+        args.model = default_model.to_string();
+    }
+}
+
+fn build_initial_transport(
+    args: &Args,
+    settings: &Settings,
+    idle_timeout: Duration,
+    try_provider_transport: bool,
+) -> Result<ModelTransportHandle> {
+    if args.model.contains('/')
+        || (try_provider_transport && provider_catalog_contains_bare_model(settings, &args.model))
+    {
+        let resolved = auth::resolve_provider(Some(&args.model), settings)?;
+        let transport = ChatCompletionsTransport::with_default_client(
+            resolved,
+            idle_timeout,
+            RetryPolicy::default(),
+        )?;
+        return Ok(ModelTransportHandle::new(transport));
+    }
+
+    let auth_config = auth::load_auth(args, settings)?;
+    // No global `.timeout()` — a streaming turn legitimately runs for minutes.
+    // The SSE/WS idle timeout below is what catches stuck streams.
+    let client = reqwest::Client::builder()
+        .default_headers(auth::default_headers(&auth_config)?)
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()?;
+    Ok(ModelTransportHandle::new(OpenAiTransport::with_config(
+        client,
+        auth_config,
+        args.transport,
+        idle_timeout,
+        RetryPolicy::default(),
+    )))
+}
+
+fn should_try_provider_transport(
+    args: &Args,
+    model_was_provided: bool,
+    settings: &Settings,
+) -> bool {
+    args.model.contains('/')
+        || model_was_provided
+        || settings.model.is_some()
+        || settings.default_model.is_some()
+}
+
+fn provider_catalog_contains_bare_model(settings: &Settings, model: &str) -> bool {
+    settings
+        .providers
+        .as_ref()
+        .is_some_and(|providers| providers.values().any(|p| p.models.contains_key(model)))
 }
 
 fn run_cli_command(
@@ -809,6 +864,119 @@ mod tests {
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn provider_default_model_fills_clap_default_only() {
+        let mut args = Args::try_parse_from(["nav"]).unwrap();
+        let provided = ProvidedArgs::default();
+        let settings = Settings {
+            default_model: Some("ollama/llama3".into()),
+            ..Settings::default()
+        };
+
+        apply_provider_default_model(&mut args, &provided, &settings);
+
+        assert_eq!(args.model, "ollama/llama3");
+    }
+
+    #[test]
+    fn provider_default_model_does_not_override_model_setting() {
+        let mut args = Args::try_parse_from(["nav"]).unwrap();
+        let provided = ProvidedArgs::default();
+        let settings = Settings {
+            model: Some("gpt-custom".into()),
+            default_model: Some("ollama/llama3".into()),
+            ..Settings::default()
+        };
+
+        args.apply_settings(&settings, &provided);
+        apply_provider_default_model(&mut args, &provided, &settings);
+
+        assert_eq!(args.model, "gpt-custom");
+    }
+
+    #[test]
+    fn provider_transport_candidate_keeps_clap_default_on_codex_path() {
+        let args = Args::try_parse_from(["nav"]).unwrap();
+
+        assert!(!should_try_provider_transport(
+            &args,
+            false,
+            &Settings::default()
+        ));
+    }
+
+    #[test]
+    fn provider_transport_candidate_accepts_explicit_bare_model() {
+        let args = Args::try_parse_from(["nav", "--model", "llama3"]).unwrap();
+
+        assert!(should_try_provider_transport(
+            &args,
+            true,
+            &Settings::default()
+        ));
+    }
+
+    #[test]
+    fn provider_transport_candidate_accepts_qualified_model() {
+        let args = Args::try_parse_from(["nav", "--model", "ollama/llama3"]).unwrap();
+
+        assert!(should_try_provider_transport(
+            &args,
+            true,
+            &Settings::default()
+        ));
+    }
+
+    #[test]
+    fn initial_transport_resolves_explicit_bare_provider_model() {
+        let mut providers = nav_core::built_in_providers();
+        providers
+            .get_mut("ollama")
+            .unwrap()
+            .models
+            .insert("llama3".into(), nav_core::ModelConfig::default());
+        let settings = Settings {
+            providers: Some(providers),
+            ..Settings::default()
+        };
+        let args = Args::try_parse_from(["nav", "--model", "llama3"]).unwrap();
+
+        let transport =
+            build_initial_transport(&args, &settings, Duration::from_secs(1), true).unwrap();
+
+        assert_eq!(
+            transport.wire_format(),
+            nav_core::WireFormat::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn initial_transport_reports_ambiguous_bare_provider_model() {
+        let mut providers = nav_core::built_in_providers();
+        providers
+            .get_mut("ollama")
+            .unwrap()
+            .models
+            .insert("same".into(), nav_core::ModelConfig::default());
+        providers
+            .get_mut("vllm")
+            .unwrap()
+            .models
+            .insert("same".into(), nav_core::ModelConfig::default());
+        let settings = Settings {
+            providers: Some(providers),
+            ..Settings::default()
+        };
+        let args = Args::try_parse_from(["nav", "--model", "same"]).unwrap();
+
+        let err = match build_initial_transport(&args, &settings, Duration::from_secs(1), true) {
+            Ok(_) => panic!("expected ambiguous selector error"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("ambiguous"), "{err}");
     }
 
     #[test]

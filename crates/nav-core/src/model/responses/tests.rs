@@ -113,7 +113,8 @@ fn detect_http_overflow_message_match_is_case_insensitive() {
 #[test]
 fn detect_http_overflow_message_match_is_conservative() {
     // A message about "context" but not about overflow — should NOT match.
-    let body = r#"{"error":{"message":"Invalid context parameter.","type":"invalid_request_error"}}"#;
+    let body =
+        r#"{"error":{"message":"Invalid context parameter.","type":"invalid_request_error"}}"#;
     assert!(detect_http_overflow(body).is_none());
 }
 

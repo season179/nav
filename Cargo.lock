@@ -1729,6 +1729,7 @@ dependencies = [
  "arboard",
  "crossterm",
  "dirs",
+ "futures-util",
  "ignore",
  "image",
  "insta",

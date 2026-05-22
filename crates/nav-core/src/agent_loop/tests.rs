@@ -17,6 +17,7 @@ use crate::tool_registry::{SPAWN_SUBAGENT_TOOL, unchecked_permission_context};
 use anyhow::Result;
 use futures_util::stream;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,8 @@ enum StubItem {
 struct StubTransport {
     turns: Mutex<Vec<Vec<StubItem>>>,
     bodies: Mutex<Vec<Value>>,
+    wire_format: crate::model::WireFormat,
+    resolved: Option<crate::model::ResolvedProvider>,
 }
 
 impl StubTransport {
@@ -107,6 +110,8 @@ impl StubTransport {
         Self {
             turns: Mutex::new(turns),
             bodies: Mutex::new(Vec::new()),
+            wire_format: crate::model::WireFormat::Responses,
+            resolved: None,
         }
     }
 
@@ -114,6 +119,24 @@ impl StubTransport {
         Self {
             turns: Mutex::new(turns),
             bodies: Mutex::new(Vec::new()),
+            wire_format: crate::model::WireFormat::Responses,
+            resolved: None,
+        }
+    }
+
+    fn chat_completions(turns: Vec<Vec<Value>>) -> Self {
+        Self {
+            wire_format: crate::model::WireFormat::ChatCompletions,
+            resolved: Some(crate::model::ResolvedProvider {
+                base_url: "https://api.example.com/v1".into(),
+                bearer: Some("sk-test".into()),
+                headers: BTreeMap::new(),
+                model_id: "wire-model".into(),
+                reasoning_effort: None,
+                max_output_tokens: None,
+                display_name: "test/wire-model".into(),
+            }),
+            ..Self::new(turns)
         }
     }
 
@@ -234,6 +257,14 @@ fn git(cwd: &std::path::Path, args: &[&str]) {
 }
 
 impl ResponsesTransport for StubTransport {
+    fn wire_format(&self) -> crate::model::WireFormat {
+        self.wire_format
+    }
+
+    fn chat_completions_provider(&self) -> Option<crate::model::ResolvedProvider> {
+        self.resolved.clone()
+    }
+
     fn create<'a>(
         &'a self,
         body: Value,
@@ -1314,6 +1345,75 @@ async fn run_agent_injects_ambient_context_before_user_prompt_when_budget_allows
     assert!(ambient.starts_with("Ambient context (turn-local; not a user request):"));
     assert!(ambient.contains("Cargo.toml"));
     assert!(is_input_user_message(&input[1], "hello"));
+}
+
+#[tokio::test]
+async fn run_agent_builds_chat_completions_body_for_chat_transport() {
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let transport = StubTransport::chat_completions(vec![vec![json!({
+        "type": "response.completed",
+        "response": {}
+    })]]);
+
+    run_agent_for_test(
+        &transport,
+        &args,
+        &cwd,
+        "hello",
+        None,
+        Vec::new(),
+        tx,
+        None,
+        None,
+        &Catalog::default(),
+        None,
+        unchecked_permission_context(),
+    )
+    .await
+    .unwrap();
+
+    let bodies = transport.bodies();
+    let body = &bodies[0];
+    assert_eq!(body["model"], "wire-model");
+    assert!(
+        body.get("input").is_none(),
+        "Chat Completions body must not use Responses input"
+    );
+    assert!(body.get("instructions").is_none());
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages.last().unwrap()["role"], "user");
+    assert_eq!(messages.last().unwrap()["content"], "hello");
+    let first_tool = &body["tools"].as_array().unwrap()[0];
+    assert_eq!(first_tool["type"], "function");
+    assert!(first_tool.get("function").is_some());
+}
+
+#[test]
+fn model_transport_handle_allows_responses_to_chat_swap() {
+    let handle = crate::model::ModelTransportHandle::new(StubTransport::new(Vec::new()));
+    let outcome = handle
+        .swap_to(StubTransport::chat_completions(Vec::new()))
+        .unwrap();
+    assert_eq!(outcome.from, crate::model::WireFormat::Responses);
+    assert_eq!(outcome.to, crate::model::WireFormat::ChatCompletions);
+    assert_eq!(
+        handle.wire_format(),
+        crate::model::WireFormat::ChatCompletions
+    );
+}
+
+#[test]
+fn model_transport_handle_rejects_chat_to_responses_swap() {
+    let handle =
+        crate::model::ModelTransportHandle::new(StubTransport::chat_completions(Vec::new()));
+    let err = handle
+        .swap_to(StubTransport::new(Vec::new()))
+        .expect_err("reverse swap should be rejected");
+    assert!(err.to_string().contains("reverse history conversion"));
 }
 
 #[tokio::test]

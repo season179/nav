@@ -10,7 +10,8 @@ use crate::context::build_instructions;
 use crate::context::history::strip_synthetic_markers;
 use crate::context::{Catalog, ProjectContext, ReasoningEffort};
 use crate::model::auth::ResolvedProvider;
-use crate::tool_registry::{ToolAccess, tool_definitions};
+use crate::model::responses::ResponseBodyOptions;
+use crate::tool_registry::tool_definitions;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
@@ -90,6 +91,26 @@ pub(crate) fn build_request_body(
     skills: &Catalog,
     context: Option<&ProjectContext>,
 ) -> Value {
+    build_request_body_with_options(
+        args,
+        resolved,
+        cwd,
+        input,
+        skills,
+        context,
+        ResponseBodyOptions::default(),
+    )
+}
+
+pub(crate) fn build_request_body_with_options(
+    args: &Args,
+    resolved: &ResolvedProvider,
+    cwd: &Path,
+    input: &[Value],
+    skills: &Catalog,
+    context: Option<&ProjectContext>,
+    options: ResponseBodyOptions,
+) -> Value {
     let instructions = build_instructions(cwd, skills, context);
 
     // System message is always first.
@@ -107,7 +128,7 @@ pub(crate) fn build_request_body(
     messages.extend(history);
 
     // C3: wrap tool definitions into Chat Completions wire shape.
-    let tools_defs = tool_definitions(ToolAccess::Full, true);
+    let tools_defs = tool_definitions(options.tool_access, options.include_subagents);
     let tools = wrap_tools(&tools_defs);
 
     let mut body = Map::new();
@@ -291,14 +312,7 @@ mod tests {
             "content": "hello",
         })];
 
-        let body = build_request_body(
-            &args,
-            &resolved,
-            cwd,
-            &input,
-            &Default::default(),
-            None,
-        );
+        let body = build_request_body(&args, &resolved, cwd, &input, &Default::default(), None);
 
         insta::assert_snapshot!("simple_user_turn", snap_body(&body));
 
@@ -306,8 +320,14 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["model"], "glm-5.1");
         assert!(body.get("store").is_none(), "no Responses-only store knob");
-        assert!(body.get("include").is_none(), "no Responses-only include knob");
-        assert!(body.get("prompt_cache_key").is_none(), "no prompt_cache_key");
+        assert!(
+            body.get("include").is_none(),
+            "no Responses-only include knob"
+        );
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "no prompt_cache_key"
+        );
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("max_tokens").is_none());
 
@@ -341,14 +361,7 @@ mod tests {
             }),
         ];
 
-        let body = build_request_body(
-            &args,
-            &resolved,
-            cwd,
-            &input,
-            &Default::default(),
-            None,
-        );
+        let body = build_request_body(&args, &resolved, cwd, &input, &Default::default(), None);
 
         insta::assert_snapshot!("turn_with_tool_call", snap_body(&body));
 
@@ -375,14 +388,7 @@ mod tests {
             "content": "think hard",
         })];
 
-        let body = build_request_body(
-            &args,
-            &resolved,
-            cwd,
-            &input,
-            &Default::default(),
-            None,
-        );
+        let body = build_request_body(&args, &resolved, cwd, &input, &Default::default(), None);
 
         insta::assert_snapshot!("with_reasoning_effort", snap_body(&body));
         assert_eq!(body["reasoning_effort"], "high");
@@ -399,14 +405,7 @@ mod tests {
             "content": "short answer",
         })];
 
-        let body = build_request_body(
-            &args,
-            &resolved,
-            cwd,
-            &input,
-            &Default::default(),
-            None,
-        );
+        let body = build_request_body(&args, &resolved, cwd, &input, &Default::default(), None);
 
         insta::assert_snapshot!("with_max_tokens", snap_body(&body));
         assert_eq!(body["max_tokens"], 4096);
@@ -464,14 +463,7 @@ mod tests {
             "content": "override test",
         })];
 
-        let body = build_request_body(
-            &args,
-            &resolved,
-            cwd,
-            &input,
-            &Default::default(),
-            None,
-        );
+        let body = build_request_body(&args, &resolved, cwd, &input, &Default::default(), None);
 
         assert_eq!(body["reasoning_effort"], "high");
     }

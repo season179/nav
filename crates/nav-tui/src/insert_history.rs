@@ -122,7 +122,7 @@ fn simple_wrap_line(line: Line<'static>, wrap_width: usize) -> Vec<Line<'static>
     }
     // Fast path: line already fits in the wrap budget. Avoids touching the
     // span Cow contents at all when the terminal is wide enough.
-    if (line.width() as usize) <= wrap_width {
+    if line.width() <= wrap_width {
         return vec![line];
     }
 

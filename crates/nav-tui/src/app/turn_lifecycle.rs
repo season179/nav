@@ -7,7 +7,7 @@
 use anyhow::Result;
 use nav_core::guardrails::PermissionContext;
 use nav_core::{
-    AgentEvent, Catalog, ControlPlane, OpenAiTransport, PendingInput, PendingInputDraft,
+    AgentEvent, Catalog, ControlPlane, ModelTransportHandle, PendingInput, PendingInputDraft,
     PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
     TurnControls, UserAttachment, cli::Args,
 };
@@ -69,7 +69,7 @@ pub(super) fn start_next_follow_up(
     next: Option<PendingInput>,
     control: &mut ControlPlane,
     active_turn: &mut Option<ActiveTurnHandle>,
-    transport: &Arc<OpenAiTransport>,
+    transport: &ModelTransportHandle,
     args: &Args,
     cwd: &Path,
     store: &Arc<SessionStore>,
@@ -231,7 +231,7 @@ pub(super) fn start_pending_turn(
     item: PendingInput,
     control: &mut ControlPlane,
     active_turn: &mut Option<ActiveTurnHandle>,
-    transport: &Arc<OpenAiTransport>,
+    transport: &ModelTransportHandle,
     args: &Args,
     cwd: &Path,
     store: &Arc<SessionStore>,
@@ -245,7 +245,7 @@ pub(super) fn start_pending_turn(
     let active = control.start_turn()?;
     let steering_queue: PendingSteeringQueue = Arc::new(Mutex::new(VecDeque::new()));
     let handle = match spawn_turn(TurnSpawn {
-        transport: Arc::clone(transport),
+        transport: transport.clone(),
         args: args.clone(),
         cwd: cwd.to_path_buf(),
         store: Arc::clone(store),

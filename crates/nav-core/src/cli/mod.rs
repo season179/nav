@@ -28,8 +28,8 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::context::ReasoningEffort;
 use crate::context::DEFAULT_AMBIENT_CONTEXT_TOKEN_BUDGET;
+use crate::context::ReasoningEffort;
 use crate::context::compaction::{DEFAULT_AUTO_COMPACT_FRACTION, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT};
 use crate::guardrails::AskForApproval;
 

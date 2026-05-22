@@ -421,7 +421,11 @@ mod tests {
         let auth_json = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"tok_abc"}}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let auth = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap();
+        let auth = load_auth(
+            &chatgpt_args(temp.path().to_path_buf()),
+            &Settings::default(),
+        )
+        .unwrap();
         assert_eq!(auth.bearer, "tok_abc");
         assert!(auth.http_base_url.contains("chatgpt.com"));
         assert!(auth.websocket_url.contains("chatgpt.com"));
@@ -433,7 +437,11 @@ mod tests {
         let auth_json = r#"{"auth_mode":"api_key","tokens":{"access_token":"tok"}}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
+        let err = load_auth(
+            &chatgpt_args(temp.path().to_path_buf()),
+            &Settings::default(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not in ChatGPT auth mode"));
         assert!(msg.contains("Failed to resolve provider"));
@@ -445,7 +453,11 @@ mod tests {
         let auth_json = r#"{"auth_mode":"chatgpt"}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
+        let err = load_auth(
+            &chatgpt_args(temp.path().to_path_buf()),
+            &Settings::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("access token"));
     }
 
@@ -456,7 +468,11 @@ mod tests {
         let auth_json = r#"{"auth_mode":"chatgpt","tokens":{}}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
+        let err = load_auth(
+            &chatgpt_args(temp.path().to_path_buf()),
+            &Settings::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("parse"));
     }
 
@@ -477,7 +493,11 @@ mod tests {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("auth.json"), "not json").unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
+        let err = load_auth(
+            &chatgpt_args(temp.path().to_path_buf()),
+            &Settings::default(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         // Path included and a concrete action.
         assert!(msg.contains("parse"));
@@ -491,7 +511,11 @@ mod tests {
         let auth_json = r#"{"auth_mode":null,"tokens":{"access_token":"tok"}}"#;
         fs::write(temp.path().join("auth.json"), auth_json).unwrap();
 
-        let err = load_auth(&chatgpt_args(temp.path().to_path_buf()), &Settings::default()).unwrap_err();
+        let err = load_auth(
+            &chatgpt_args(temp.path().to_path_buf()),
+            &Settings::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not in ChatGPT auth mode"));
     }
 
@@ -534,8 +558,14 @@ mod tests {
 
         let err = load_auth(&args, &Settings::default()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("could not read"), "original Codex error: {msg}");
-        assert!(msg.contains("Failed to resolve provider"), "fallback note: {msg}");
+        assert!(
+            msg.contains("could not read"),
+            "original Codex error: {msg}"
+        );
+        assert!(
+            msg.contains("Failed to resolve provider"),
+            "fallback note: {msg}"
+        );
         assert!(msg.contains("nav providers list"), "hint: {msg}");
     }
 
