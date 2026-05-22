@@ -353,18 +353,28 @@ pub(crate) fn match_model_selector(
     selector: &str,
     catalog: &ProviderCatalog,
 ) -> ModelMatch {
-    // Qualified selector: `provider/model_key`.
+    let selector = selector.trim();
+
+    // Qualified selector: `<provider>/<model_key>`.  Model keys can
+    // themselves contain slashes (e.g. "zai/glm-5.1" under provider
+    // "openrouter"), so `split_once` splits on the *first* slash only.
     if let Some((provider_id, model_key)) = selector.split_once('/') {
+        let provider_id = provider_id.trim();
+        let model_key = model_key.trim();
         if let Some(provider) = catalog.get(provider_id) {
             if provider.models.contains_key(model_key) {
                 return ModelMatch::Exact(selector.to_string());
             }
         }
-        return ModelMatch::NotFound;
+        // Qualified match failed — fall through to bare-name search.
+        // The user may have typed a slash-containing model key without
+        // a provider prefix (e.g. "zai/glm-5.1" instead of
+        // "openrouter/zai/glm-5.1").
     }
 
-    // Bare name: search across all providers. Model keys can themselves
-    // contain slashes (e.g. "zai/glm-5.1"), so match the last segment.
+    // Bare name: search across all providers. Match against the full
+    // model key (everything after provider '/') and against the last
+    // segment after the final '/' for convenience.
     let matches: Vec<String> = catalog
         .iter()
         .flat_map(|(provider_id, provider)| {
@@ -373,9 +383,14 @@ pub(crate) fn match_model_selector(
             })
         })
         .filter(|full_selector| {
+            // Match if the selector equals the full model key.
             full_selector
-                .rsplit_once('/')
+                .split_once('/')
                 .is_some_and(|(_, key)| key == selector)
+                // Or if it equals the last segment of the model key.
+                || full_selector
+                    .rsplit_once('/')
+                    .is_some_and(|(_, key)| key == selector)
         })
         .collect();
 
@@ -487,6 +502,47 @@ mod tests {
         match match_model_selector("glm-5.1", &catalog) {
             ModelMatch::BareUnique(sel) => assert_eq!(sel, "openrouter/zai/glm-5.1"),
             other => panic!("expected BareUnique for glm-5.1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_match_with_slash_in_model_key() {
+        // "openrouter/zai/glm-5.1": provider="openrouter", model_key="zai/glm-5.1".
+        let catalog = test_catalog();
+        match match_model_selector("openrouter/zai/glm-5.1", &catalog) {
+            ModelMatch::Exact(sel) => assert_eq!(sel, "openrouter/zai/glm-5.1"),
+            other => panic!("expected Exact, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_model_key_without_provider_falls_back_to_bare() {
+        // "zai/glm-5.1" typed without provider prefix should still match
+        // via the model-key fallback.
+        let catalog = test_catalog();
+        match match_model_selector("zai/glm-5.1", &catalog) {
+            ModelMatch::BareUnique(sel) => assert_eq!(sel, "openrouter/zai/glm-5.1"),
+            other => panic!("expected BareUnique for zai/glm-5.1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_unknown_provider_falls_back_to_bare_and_not_found() {
+        // "nope/gpt-5.5" — no provider "nope", and "gpt-5.5" is not
+        // a model key, so the bare-name fallback also finds nothing.
+        let catalog = test_catalog();
+        assert!(matches!(
+            match_model_selector("nope/gpt-5.5", &catalog),
+            ModelMatch::NotFound
+        ));
+    }
+
+    #[test]
+    fn selector_whitespace_is_trimmed() {
+        let catalog = test_catalog();
+        match match_model_selector("  gpt-5.5  ", &catalog) {
+            ModelMatch::BareUnique(sel) => assert_eq!(sel, "openai/gpt-5.5"),
+            other => panic!("expected BareUnique, got {other:?}"),
         }
     }
 }
