@@ -33,14 +33,15 @@ TOOLS_BOTH="[${TOOL_READ_FILE},${TOOL_BASH}]"
 # ── Helpers ────────────────────────────────────────────────────
 
 stream() {
-  local name="$1" body="$2"
+  local name="$1" body="$2" rc=0
   local out="${DIR}/${name}.sse"
   echo "→ Recording ${name}.sse ..."
-  curl -sf -N "${URL}" \
+  curl -sS -N "${URL}" \
     -H "Content-Type: application/json" \
     -d "${body}" \
-    -o "${out}"
+    -o "${out}" || rc=$?
   echo "  ✓ ${out} ($(wc -l < "${out}") lines)"
+  return $rc
 }
 
 sidecar() {
