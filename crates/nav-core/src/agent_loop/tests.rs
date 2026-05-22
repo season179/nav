@@ -3997,7 +3997,7 @@ async fn manual_compact_persists_file_ops_details_for_replay() {
 }
 
 #[tokio::test]
-async fn consecutive_compactions_use_incremental_smaller_prompt() {
+async fn consecutive_compactions_re_summarize_from_scratch() {
     let cwd_dir = tempdir().unwrap();
     let cwd = cwd_dir.path().canonicalize().unwrap();
     let large_first_input = vec![
@@ -4056,7 +4056,15 @@ async fn consecutive_compactions_use_incremental_smaller_prompt() {
         .as_str()
         .expect("second prompt");
 
-    assert!(second_prompt.contains("<previous-summary>\n## Goal\nfirst\n</previous-summary>"));
+    // Both compactions use SUMMARIZATION_PROMPT — no <previous-summary> block.
+    assert!(first_prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(second_prompt.contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(!second_prompt.contains("<previous-summary>"));
+    // The previous summary is filtered from the source so it is not
+    // re-summarised as a user message.
+    assert!(!second_prompt.contains("## Goal\nfirst"));
+    // The second prompt is still smaller because the summary replaces the
+    // large original input.
     assert!(second_prompt.len() < first_prompt.len());
 }
 
