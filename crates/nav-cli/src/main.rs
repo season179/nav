@@ -62,12 +62,11 @@ async fn main() -> Result<()> {
         return run_cli_command(&args, &cwd, project.as_ref(), extensions.as_ref(), command);
     }
 
-    // The known-family-prefix check is scoped to bare OpenAI-style names;
-    // a `<provider>/<model>` selector is opaque to it (e.g. `z.ai/glm-5.1`
-    // doesn't start with any OpenAI prefix and would always warn). Skip the
-    // check for qualified selectors so the new providers catalog flow is
-    // quiet by default.
-    if !args.model.contains('/') && !names::is_known_model_prefix(&args.model) {
+    if should_show_typo_nudge(
+        &args,
+        provided.was_provided("model"),
+        &project.settings,
+    ) {
         // Warn (not error) — a brand-new model the provider supports but
         // nav's prefix list hasn't learned about yet should still work.
         let hint = names::did_you_mean(&args.model)
@@ -286,6 +285,34 @@ fn provider_catalog_contains_bare_model(settings: &Settings, model: &str) -> boo
         .providers
         .as_ref()
         .is_some_and(|providers| providers.values().any(|p| p.models.contains_key(model)))
+}
+
+/// Whether the OpenAI-specific typo nudge should fire for `args.model`.
+///
+/// The nudge is only useful when the model will actually be sent to the
+/// OpenAI Responses API. Qualified selectors (`provider/model`) and bare
+/// names that resolve through the providers catalog will be routed to a
+/// non-OpenAI Chat Completions transport where suggestions like "Did you
+/// mean gpt-5?" are unhelpful, so the guard is skipped for both.
+///
+/// The `should_try_provider_transport` gate mirrors the one in
+/// [`build_initial_transport`] so the nudge decision stays in sync with
+/// actual transport selection: when the user didn't provide `--model` and
+/// no settings default exists, a bare name that happens to appear in the
+/// catalog still goes through OpenAI Responses and should still get the
+/// nudge.
+fn should_show_typo_nudge(
+    args: &Args,
+    model_was_provided: bool,
+    settings: &Settings,
+) -> bool {
+    if args.model.contains('/') {
+        return false;
+    }
+    let try_provider = should_try_provider_transport(args, model_was_provided, settings);
+    let uses_openai_responses =
+        !(try_provider && provider_catalog_contains_bare_model(settings, &args.model));
+    uses_openai_responses && !names::is_known_model_prefix(&args.model)
 }
 
 fn run_cli_command(
@@ -977,6 +1004,68 @@ mod tests {
         };
 
         assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    // ── should_show_typo_nudge ──────────────────────────────────
+
+    #[test]
+    fn typo_nudge_fires_for_unknown_openai_model() {
+        let args = Args::try_parse_from(["nav", "--model", "totally-madeup"]).unwrap();
+        assert!(should_show_typo_nudge(
+            &args,
+            true, // model was provided
+            &Settings::default(),
+        ));
+    }
+
+    #[test]
+    fn typo_nudge_suppressed_for_known_prefix() {
+        let args = Args::try_parse_from(["nav", "--model", "gpt-5.5"]).unwrap();
+        assert!(!should_show_typo_nudge(&args, true, &Settings::default()));
+    }
+
+    #[test]
+    fn typo_nudge_suppressed_for_qualified_selector() {
+        let args = Args::try_parse_from(["nav", "--model", "z.ai/glm-5.1"]).unwrap();
+        assert!(!should_show_typo_nudge(&args, true, &Settings::default()));
+    }
+
+    #[test]
+    fn typo_nudge_suppressed_for_catalog_bare_model() {
+        let mut providers = nav_core::built_in_providers();
+        providers
+            .get_mut("ollama")
+            .unwrap()
+            .models
+            .insert("llama3".into(), nav_core::ModelConfig::default());
+        let settings = Settings {
+            providers: Some(providers),
+            ..Settings::default()
+        };
+        let args = Args::try_parse_from(["nav", "--model", "llama3"]).unwrap();
+        assert!(!should_show_typo_nudge(&args, true, &settings));
+    }
+
+    #[test]
+    fn typo_nudge_fires_for_catalog_model_when_no_provider_transport() {
+        // A bare name that happens to be in the catalog, but the user didn't
+        // provide --model and no settings default exists — so transport
+        // selection falls through to OpenAI Responses and the nudge should
+        // fire.
+        let mut providers = nav_core::built_in_providers();
+        providers
+            .get_mut("ollama")
+            .unwrap()
+            .models
+            .insert("totally-madeup".into(), nav_core::ModelConfig::default());
+        let settings = Settings {
+            providers: Some(providers),
+            ..Settings::default()
+        };
+        // Override the clap default so the model is not a known prefix.
+        let mut args = Args::try_parse_from(["nav"]).unwrap();
+        args.model = "totally-madeup".to_string();
+        assert!(should_show_typo_nudge(&args, false, &settings));
     }
 
     #[test]
