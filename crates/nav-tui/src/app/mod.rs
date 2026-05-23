@@ -37,7 +37,7 @@ use crate::input::{AppEvent, ModelMatch, dispatch_submit, is_ctrl_c, match_model
 use crate::theme::Theme;
 use crate::widget::parse_rewind_skill_prompt;
 use permissions::build_tui_permissions;
-use render::{TuiStatus, draw_tui};
+use render::draw_tui;
 use session::{
     export_current_session, open_session_picker, push_context_report, resolve_tree_root,
     resume_session,
@@ -248,24 +248,7 @@ pub async fn run(
                 tokens_cached: last_tokens_cached,
                 context_window: args.auto_compact_token_limit,
             });
-            draw_tui(
-                &mut term.terminal,
-                &chat,
-                &pane,
-                TuiStatus {
-                    model: &args.model,
-                    cwd_short: &cwd_short,
-                    branch: branch.as_deref(),
-                    dirty,
-                    state,
-                    tokens_input: last_tokens_input,
-                    tokens_output: last_tokens_output,
-                    tokens_cached: last_tokens_cached,
-                    context_window: args.auto_compact_token_limit,
-                },
-                screen_w,
-                screen_h,
-            )?;
+            draw_tui(&mut term.terminal, &chat, &pane, screen_w, screen_h)?;
 
             // Flush finalized rows into native scrollback AFTER the resize.
             // When the viewport just shrank (e.g. a streaming cell
