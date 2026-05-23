@@ -19,7 +19,7 @@ use nav_core::{
 use ratatui::backend::CrosstermBackend;
 use std::io;
 
-use crate::app::overlay::{AppOverlay, Overlay};
+use crate::app::overlay::{AppOverlay, Overlay, leave_app_overlay};
 use crate::custom_terminal::{InlineViewportState, Terminal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +30,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 mod inline_region;
 mod overlay;
 mod permissions;
+mod resume_picker;
 mod render;
 mod session;
 mod terminal;
@@ -46,8 +47,8 @@ use crate::theme::Theme;
 use permissions::build_tui_permissions;
 use render::draw_tui;
 use session::{
-    export_current_session, open_session_picker, push_context_report, resolve_tree_root,
-    resume_session,
+    dismiss_app_overlay, export_current_session, push_context_report, resolve_tree_root,
+    resume_session, try_open_resume_picker, try_open_resume_picker_unless_busy,
 };
 use terminal::{TerminalGuard, enter_tui, install_panic_teardown_hook};
 use turn_lifecycle::{
@@ -407,9 +408,6 @@ pub async fn run(
         cwd.clone(),
         theme,
     );
-    if args.pick_session {
-        open_session_picker(&store, &mut pane, Some(&session_id), &mut chat);
-    }
     let mut ctrl_c_count = 0u8;
     // A standalone `/<skill>` is a local TUI gesture, not a model turn. Hold
     // its wrapped body here and prepend it onto the next non-slash prompt.
@@ -420,6 +418,17 @@ pub async fn run(
     let mut spinner_tick: u64 = 0;
     let mut app_overlay: Option<Overlay> = None;
     let mut overlay_state: Option<InlineViewportState> = None;
+    if args.pick_session {
+        try_open_resume_picker(
+            Arc::clone(&store),
+            Some(&session_id),
+            theme,
+            &mut term,
+            &mut app_overlay,
+            &mut overlay_state,
+            &mut chat,
+        );
+    }
     // Latest provider-reported token usage for the status bar.
     // Updated on `TurnComplete`; pre-first-turn value of `0` hides the gauge.
     let mut last_tokens_input: u64 = 0;
@@ -691,11 +700,7 @@ pub async fn run(
             // returns to whatever inline state it had before the overlay.
             // The `app_overlay = None` reset that would normally accompany
             // this is elided — `break` exits the loop immediately.
-            if let Some(state) = overlay_state.take()
-                && let Err(err) = term.terminal.leave_alternate_screen(state)
-            {
-                eprintln!("nav-tui: failed to leave alternate screen: {err:#}");
-            }
+            leave_app_overlay(&mut term, &mut overlay_state);
             break;
         }
 
@@ -860,12 +865,17 @@ pub async fn run(
                         chat.push_skill(skill.name, "queued for the next prompt");
                     }
                     AppEvent::ListSessions => {
-                        match store.list_sessions(None) {
-                            Ok(summaries) => {
-                                chat.push_session_list(summaries);
-                            }
-                            Err(err) => chat.push_err(err),
-                        }
+                        try_open_resume_picker_unless_busy(
+                            active_turn.is_some(),
+                            "cannot open session picker while a turn is running",
+                            Arc::clone(&store),
+                            None,
+                            theme,
+                            &mut term,
+                            &mut app_overlay,
+                            &mut overlay_state,
+                            &mut chat,
+                        );
                     }
                     AppEvent::Resume { query: Some(query) } => {
                         if active_turn.is_some() {
@@ -898,13 +908,17 @@ pub async fn run(
                         }
                     }
                     AppEvent::Resume { query: None } => {
-                        if active_turn.is_some() {
-                            chat.ingest(AgentEvent::Error {
-                                message: "cannot resume while a turn is running".to_string(),
-                            });
-                            continue;
-                        }
-                        open_session_picker(&store, &mut pane, None, &mut chat);
+                        try_open_resume_picker_unless_busy(
+                            active_turn.is_some(),
+                            "cannot resume while a turn is running",
+                            Arc::clone(&store),
+                            Some(&session_id),
+                            theme,
+                            &mut term,
+                            &mut app_overlay,
+                            &mut overlay_state,
+                            &mut chat,
+                        );
                     }
                     AppEvent::NameSession { name } => {
                         match store.set_session_name(&session_id, &name) {
@@ -1304,15 +1318,17 @@ pub async fn run(
                             if let Some(overlay) = app_overlay.as_mut() {
                                 let overlay_result = overlay.handle_key(key);
                                 if overlay.is_complete() {
-                                    if let Some(state) = overlay_state.take()
-                                        && let Err(err) =
-                                            term.terminal.leave_alternate_screen(state)
-                                    {
-                                        eprintln!(
-                                            "nav-tui: failed to leave alternate screen: {err:#}"
-                                        );
+                                    if let Some(id) = dismiss_app_overlay(
+                                        &mut term,
+                                        &mut app_overlay,
+                                        &mut overlay_state,
+                                    ) {
+                                        app_tx
+                                            .send(AppEvent::Resume {
+                                                query: Some(id),
+                                            })
+                                            .ok();
                                     }
-                                    app_overlay = None;
                                     continue;
                                 }
                                 if matches!(overlay_result, bottom_pane::InputResult::Handled) {
@@ -1423,13 +1439,6 @@ pub async fn run(
                             &mut pane,
                         );
                         pending_approvals.respond(&approval_id, decision);
-                    }
-                    if let Some(session_id) = pane.take_session_selection() {
-                        app_tx
-                            .send(AppEvent::Resume {
-                                query: Some(session_id),
-                            })
-                            .ok();
                     }
                 }
                 if pane.promote_pending_approval_if_idle() {
