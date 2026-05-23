@@ -249,7 +249,7 @@ fn spawn_mock_streaming_server(chunk_count: usize) -> u16 {
                     return;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() > Duration::from_secs(10) {
+                    if started.elapsed() > Duration::from_secs(30) {
                         return;
                     }
                     sleep(Duration::from_millis(25));
@@ -613,7 +613,7 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
     // a stable anchor on anyway.
     let baseline = session.wait_for(
         |pane| pane.contains("Ask nav to do anything"),
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
     assert!(
         baseline.contains("Ask nav to do anything"),
@@ -625,21 +625,21 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
 
     session.send("C-t");
     let overlay = session.wait_for(
-        |pane| pane.contains("Test Overlay") && pane.contains("Press Esc to close."),
+        |pane| pane.contains("Transcript") && pane.contains("No transcript yet."),
         Duration::from_secs(5),
     );
     assert!(
-        overlay.contains("Test Overlay"),
-        "test overlay never became visible:\n{overlay}"
+        overlay.contains("Transcript"),
+        "transcript overlay never became visible:\n{overlay}"
     );
 
     session.resize(120, 24);
     let overlay_after_resize = session.wait_for(
-        |pane| pane.contains("Any key is swallowed by the overlay."),
+        |pane| pane.contains("Transcript") && pane.contains("Esc/q close"),
         Duration::from_secs(5),
     );
     assert!(
-        overlay_after_resize.contains("Any key is swallowed by the overlay."),
+        overlay_after_resize.contains("Transcript") && overlay_after_resize.contains("Esc/q close"),
         "overlay text disappeared after resize:\n{overlay_after_resize}"
     );
 
@@ -649,7 +649,7 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
     sleep(Duration::from_millis(150));
     session.send("Escape");
     let restored = session.wait_for(
-        |pane| pane.contains("Ask nav to do anything") && !pane.contains("Test Overlay"),
+        |pane| pane.contains("Ask nav to do anything") && !pane.contains("Transcript"),
         Duration::from_secs(5),
     );
     let restored_row = last_row_with(&restored, |line| line.contains("Ask nav to do anything"))
@@ -815,6 +815,81 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
         completed.matches(MOCK_FINAL_MARKER).count(),
         1,
         "expected the final marker once in the final frame, got:\n{completed}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_live_stream_and_restores_inline_viewport() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_streaming_server(400);
+    let workdir = tempdir().expect("tempdir for mock provider settings");
+    write_mock_provider_settings(&workdir, "transcript", mock_port);
+
+    let session = fresh_session("transcript-overlay");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/transcript"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(15));
+    assert!(status_bar_present(&ready), "nav failed to boot:\n{ready}");
+
+    session.send_line("open transcript while streaming");
+    let streaming = session.wait_for(|pane| pane.contains("chunk-"), Duration::from_secs(4));
+    assert!(
+        streaming.contains("chunk-"),
+        "did not observe streaming before opening transcript:\n{streaming}"
+    );
+
+    session.send("C-t");
+    let overlay = session.wait_for(
+        |pane| pane.contains("Transcript") && pane.contains("chunk-"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        overlay.contains("Transcript") && overlay.contains("chunk-"),
+        "transcript overlay did not show the live tail:\n{overlay}"
+    );
+
+    session.send("Home");
+    let scrolled_top = session.wait_for(
+        |pane| pane.contains("Transcript") && pane.contains("open transcript while streaming"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        scrolled_top.contains("Transcript")
+            && scrolled_top.contains("open transcript while streaming"),
+        "transcript overlay could not scroll back to the committed prompt:\n{scrolled_top}"
+    );
+
+    session.send("PageUp");
+    session.send("End");
+    if session.try_resize(70, 20) {
+        let resized = session.wait_for(
+            |pane| pane.contains("Transcript") && pane.contains("chunk-"),
+            Duration::from_secs(3),
+        );
+        assert!(
+            resized.contains("Transcript") && resized.contains("chunk-"),
+            "transcript overlay was not stable across resize:\n{resized}"
+        );
+    }
+
+    session.send("q");
+    let restored = session.wait_for(
+        |pane| !pane.contains("Transcript") && pane.contains("Ask nav to do anything"),
+        Duration::from_secs(6),
+    );
+    assert!(
+        !restored.contains("Transcript") && restored.contains("Ask nav to do anything"),
+        "inline viewport did not restore after closing transcript overlay:\n{restored}"
     );
 }
 

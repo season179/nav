@@ -245,6 +245,10 @@ pub async fn run(
                 context_window: args.auto_compact_token_limit,
                 show_indicator,
             });
+            if let Some(overlay) = app_overlay.as_mut() {
+                let overlay_width = screen_w.saturating_sub(2).max(1);
+                overlay.prepare(&chat, overlay_width, spinner_tick);
+            }
             let overlay: Option<&dyn AppOverlay> =
                 app_overlay.as_ref().map(|o| o as &dyn AppOverlay);
             draw_tui(
@@ -964,7 +968,7 @@ pub async fn run(
                             } else if is_ctrl_t(&key) {
                                 match term.terminal.enter_alternate_screen() {
                                     Ok(state) => {
-                                        app_overlay = Some(Overlay::test());
+                                        app_overlay = Some(Overlay::transcript());
                                         overlay_state = Some(state);
                                     }
                                     Err(err) => {
