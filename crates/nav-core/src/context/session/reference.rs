@@ -352,6 +352,30 @@ fn event_label_and_body(event: &AgentEvent) -> (&'static str, String) {
             format!("trigger={}: {message}", trigger.as_str()),
         ),
         AgentEvent::Error { message } => ("error", message.clone()),
+        AgentEvent::HookStarted { name, event_type } => (
+            "hook started",
+            format!("{name} ({event_type})"),
+        ),
+        AgentEvent::HookCompleted {
+            name,
+            event_type,
+            duration_ms,
+            stdout,
+            stderr,
+            success,
+        } => {
+            let status = if *success { "ok" } else { "failed" };
+            let output = match (stdout.is_empty(), stderr.is_empty()) {
+                (true, true) => String::new(),
+                (false, true) => stdout.clone(),
+                (true, false) => stderr.clone(),
+                (false, false) => format!("{stdout}\n{stderr}"),
+            };
+            (
+                "hook completed",
+                format!("{name} ({event_type}) {status} {duration_ms}ms\n{output}"),
+            )
+        }
         AgentEvent::ResponseContinuation { items } => {
             ("response continuation", format!("{} item(s)", items.len()))
         }

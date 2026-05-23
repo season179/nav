@@ -175,9 +175,11 @@ pub enum AgentEvent {
     ReasoningDelta {
         text: String,
     },
-    /// Durable reasoning text emitted once per reasoning item when the
+    /// Transient reasoning text emitted once per reasoning item when the
     /// provider finishes it. Carries the coalesced summary text so the
-    /// TUI can render a collapsible `ReasoningCell` in scrollback.
+    /// TUI can render a collapsible `ReasoningCell` in scrollback. Not
+    /// persisted to the session log — the encrypted handle in
+    /// `ResponseContinuation` is the durable record.
     ReasoningDone {
         text: String,
     },
@@ -387,6 +389,27 @@ pub enum AgentEvent {
         trigger: CompactionTrigger,
         message: String,
     },
+    /// A hook from an extension is about to run. Persisted for audit;
+    /// the TUI does not render an in-progress indicator (see
+    /// [`HookCompleted`] for the visible cell).
+    HookStarted {
+        name: String,
+        /// The hook trigger (e.g. `"pre_turn"`), matching the extension
+        /// manifest's `"event"` field.
+        event_type: String,
+    },
+    /// A hook from an extension finished executing. The TUI uses duration
+    /// and output to decide visibility (see CELL-04 HookCell spec).
+    HookCompleted {
+        name: String,
+        /// The hook trigger (e.g. `"pre_turn"`), matching the extension
+        /// manifest's `"event"` field.
+        event_type: String,
+        duration_ms: u64,
+        stdout: String,
+        stderr: String,
+        success: bool,
+    },
     Error {
         message: String,
     },
@@ -428,6 +451,8 @@ impl AgentEvent {
             AgentEvent::CompactionStarted { .. } => "compaction_started",
             AgentEvent::CompactionCompleted { .. } => "compaction_completed",
             AgentEvent::CompactionFailed { .. } => "compaction_failed",
+            AgentEvent::HookStarted { .. } => "hook_started",
+            AgentEvent::HookCompleted { .. } => "hook_completed",
             AgentEvent::Error { .. } => "error",
         }
     }
@@ -874,6 +899,65 @@ mod tests {
         );
         assert_eq!(event.kind(), "git_checkpoint");
         assert!(event.is_durable());
+    }
+
+    #[test]
+    fn hook_events_have_stable_wire_format() {
+        let started = AgentEvent::HookStarted {
+            name: "pre_turn".into(),
+            event_type: "pre_turn".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&started).unwrap(),
+            json!({
+                "kind": "hook_started",
+                "name": "pre_turn",
+                "event_type": "pre_turn"
+            })
+        );
+        assert_eq!(started.kind(), "hook_started");
+        assert!(started.is_durable());
+
+        let completed = AgentEvent::HookCompleted {
+            name: "pre_commit".into(),
+            event_type: "pre_commit".into(),
+            duration_ms: 350,
+            stdout: String::new(),
+            stderr: String::new(),
+            success: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&completed).unwrap(),
+            json!({
+                "kind": "hook_completed",
+                "name": "pre_commit",
+                "event_type": "pre_commit",
+                "duration_ms": 350,
+                "stdout": "",
+                "stderr": "",
+                "success": true
+            })
+        );
+        assert_eq!(completed.kind(), "hook_completed");
+        assert!(completed.is_durable());
+
+        // Round-trip deserialization.
+        let json = serde_json::to_value(&completed).unwrap();
+        let rt: AgentEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(rt.kind(), "hook_completed");
+
+        // Failed hook with output round-trips.
+        let failed = AgentEvent::HookCompleted {
+            name: "lint".into(),
+            event_type: "pre_commit".into(),
+            duration_ms: 1200,
+            stdout: "3 warnings".into(),
+            stderr: "type mismatch".into(),
+            success: false,
+        };
+        let json = serde_json::to_value(&failed).unwrap();
+        let rt: AgentEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(rt.kind(), "hook_completed");
     }
 
     #[test]

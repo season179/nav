@@ -339,6 +339,7 @@ fn spawn_mock_reasoning_server() -> u16 {
 }
 
 fn write_mock_reasoning_response(mut stream: TcpStream) {
+    read_http_request(&mut stream);
     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if stream.write_all(header).is_err() {
         return;
@@ -1243,10 +1244,10 @@ fn reasoning_content_lands_in_reasoning_cell_not_assistant() {
 
     session.send_line("think about this problem");
 
-    // Wait for the final assistant reply to land — proves the full stream
-    // completed.
+    // Wait for both the reasoning label and the final assistant reply so we
+    // don't assert on a pane that finished before ReasoningDone rendered.
     let completed = session.wait_for(
-        |pane| pane.contains("REASONING_TEST_OK"),
+        |pane| pane.contains("REASONING_TEST_OK") && pane.contains("◆ reasoning"),
         Duration::from_secs(10),
     );
     assert!(

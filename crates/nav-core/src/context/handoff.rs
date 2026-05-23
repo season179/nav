@@ -301,6 +301,8 @@ fn candidates_from_events(
             | AgentEvent::ToolBudgetWarning { .. }
             | AgentEvent::CompactionStarted { .. }
             | AgentEvent::CompactionFailed { .. }
+            | AgentEvent::HookStarted { .. }
+            | AgentEvent::HookCompleted { .. }
             | AgentEvent::SessionRewound { .. } => {}
         }
     }

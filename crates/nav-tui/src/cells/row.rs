@@ -46,6 +46,9 @@ pub(crate) enum TranscriptRowKind {
     CompactionStarted,
     CompactionCompleted,
     CompactionFailed,
+    HookCompact,
+    HookOutput,
+    HookFailed,
     Error,
     Reasoning,
 }
@@ -108,6 +111,9 @@ impl TranscriptRowKind {
                 TranscriptRowStyle::labeled("◆", "compacted", Color::Magenta)
             }
             Self::CompactionFailed => TranscriptRowStyle::labeled("◆", "compact!", Color::Red),
+            Self::HookCompact => TranscriptRowStyle::bullet("✓", Color::DarkGray),
+            Self::HookOutput => TranscriptRowStyle::labeled("◆", "hook", Color::Cyan),
+            Self::HookFailed => TranscriptRowStyle::labeled("■", "hook", Color::Red),
             Self::Error => TranscriptRowStyle::bullet("■", Color::Red),
             Self::Reasoning => {
                 TranscriptRowStyle::labeled("◆", "reasoning", Color::DarkGray)

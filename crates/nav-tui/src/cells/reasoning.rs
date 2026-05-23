@@ -65,7 +65,8 @@ impl HistoryCell for ReasoningCell {
             if count == 0 {
                 "Reasoning".to_string()
             } else {
-                format!("Reasoning ({count} lines)")
+                let noun = if count == 1 { "line" } else { "lines" };
+                format!("Reasoning ({count} {noun})")
             }
         };
         TranscriptRow::new(TranscriptRowKind::Reasoning, body).render(width)

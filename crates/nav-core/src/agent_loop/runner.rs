@@ -1010,7 +1010,11 @@ fn emit_text_delta(
     session: Option<&SessionBinding<'_>>,
     make_event: impl FnOnce(String) -> AgentEvent,
 ) {
-    if let Some(text) = event.get("delta").and_then(Value::as_str) {
+    if let Some(text) = event
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
         emit(events, session, make_event(text.to_string()));
     }
 }

@@ -1600,7 +1600,7 @@ fn reasoning_cell_distinct_from_assistant_message() {
         "reasoning must use its own label; got:\n{finalized}"
     );
     assert!(
-        finalized.contains("internal reasoning") || finalized.contains("Reasoning (1 lines)"),
+        finalized.contains("internal reasoning") || finalized.contains("Reasoning (1 line)"),
         "reasoning content or collapsed header must be present; got:\n{finalized}"
     );
     // Assistant message must use the bullet, not the reasoning label.
