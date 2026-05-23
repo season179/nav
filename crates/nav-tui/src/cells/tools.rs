@@ -189,27 +189,123 @@ fn skill_name_from_skill_md_path(path: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+enum ToolCallCellKind {
+    Single(ToolCallContext),
+    /// Consecutive read-only tool calls collapsed into one row (Codex-style exec group).
+    ExploringGroup {
+        calls: Vec<ToolCallContext>,
+        /// When set, this group is the inline running preview and the value is the
+        /// most recently started in-flight target.
+        live_target: Option<String>,
+    },
+}
+
 pub struct ToolCallCell {
-    context: ToolCallContext,
+    kind: ToolCallCellKind,
+    expanded: bool,
 }
 
 impl ToolCallCell {
     pub fn new(name: impl Into<String>, arguments: Value) -> Self {
         Self {
-            context: ToolCallContext::new(name, arguments),
+            kind: ToolCallCellKind::Single(ToolCallContext::new(name, arguments)),
+            expanded: false,
         }
     }
 
+    pub(crate) fn exploring_group(
+        calls: Vec<ToolCallContext>,
+        live_target: Option<String>,
+    ) -> Self {
+        debug_assert!(
+            !calls.is_empty(),
+            "exploring_group requires at least one call"
+        );
+        Self {
+            kind: ToolCallCellKind::ExploringGroup {
+                calls,
+                live_target,
+            },
+            expanded: false,
+        }
+    }
+
+    #[allow(dead_code)] // wired when transcript expand/collapse lands (see ReasoningCell)
+    pub fn with_expanded(mut self, expanded: bool) -> Self {
+        self.expanded = expanded;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn set_expanded(&mut self, expanded: bool) {
+        self.expanded = expanded;
+    }
+
+    #[allow(dead_code)]
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
     pub(crate) fn context(&self) -> ToolCallContext {
-        self.context.clone()
+        match &self.kind {
+            ToolCallCellKind::Single(context) => context.clone(),
+            ToolCallCellKind::ExploringGroup { calls, .. } => calls
+                .last()
+                .expect("exploring_group invariant: non-empty calls")
+                .clone(),
+        }
     }
 }
 
 impl HistoryCell for ToolCallCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let (label, body) = self.context.started_row();
-        TranscriptRow::with_label(TranscriptRowKind::ToolCall, label, body).render(width)
+        match &self.kind {
+            ToolCallCellKind::Single(context) => {
+                let (label, body) = context.started_row();
+                TranscriptRow::with_label(TranscriptRowKind::ToolCall, label, body).render(width)
+            }
+            ToolCallCellKind::ExploringGroup {
+                calls,
+                live_target,
+            } => {
+                if calls.is_empty() {
+                    return Vec::new();
+                }
+                let n = calls.len();
+                let noun = if n == 1 { "call" } else { "calls" };
+                let label = format!("Exploring ({n} {noun})");
+                let body = if self.expanded {
+                    exploring_group_expanded_body(calls)
+                } else {
+                    exploring_group_collapsed_body(calls, live_target.as_deref())
+                };
+                TranscriptRow::with_label(TranscriptRowKind::ToolCall, label, body).render(width)
+            }
+        }
     }
+}
+
+fn exploring_group_collapsed_body(
+    calls: &[ToolCallContext],
+    live_target: Option<&str>,
+) -> String {
+    let target = live_target
+        .map(str::to_string)
+        .or_else(|| {
+            calls
+                .last()
+                .and_then(ExplorationEntry::from_context)
+                .map(|entry| entry.target)
+        });
+    target.map(|t| format!("└ {t}")).unwrap_or_default()
+}
+
+fn exploring_group_expanded_body(calls: &[ToolCallContext]) -> String {
+    calls
+        .iter()
+        .filter_map(ExplorationEntry::from_context)
+        .map(|entry| format!("\n  {}", entry.detail_line()))
+        .collect()
 }
 
 pub struct ToolOutputCell {
@@ -316,163 +412,27 @@ pub(crate) struct ExplorationEntry {
 }
 
 impl ExplorationEntry {
+    pub(crate) fn is_read_only(context: &ToolCallContext) -> bool {
+        Self::from_context(context).is_some()
+    }
+
+    pub(crate) fn detail_line(&self) -> String {
+        format!("{} {}", self.action, self.target)
+    }
+
     pub(crate) fn from_context(context: &ToolCallContext) -> Option<Self> {
         match context.visual() {
             ToolVisual::Exploration { action, target } => {
                 Some(ExplorationEntry { action, target })
             }
-            // Successful bash runs join the same `Explored` summary as
-            // read/list/search so the user sees `ran 1 shell command` instead
-            // of a noisy per-command `Ran` row. Failed bash still flows
-            // through `ToolOutputCell` (the `is_error` branch in
-            // `widget::ingest`) so the preview stays visible.
+            // Successful bash runs join the exploring group with read/list/search.
+            // Failed bash still uses `ToolOutputCell` so the error preview stays visible.
             ToolVisual::Command { target } => Some(ExplorationEntry {
                 action: "Bash",
                 target,
             }),
             ToolVisual::Other { .. } => None,
         }
-    }
-}
-
-/// A collapsed exploration cell. Renders as a single line summarizing the
-/// turn's exploration work by count, e.g.:
-/// `• Read 3 files, searched for 2 patterns, ran 1 shell command`.
-///
-/// Paths are deduped per action group before counting so re-reading the same
-/// file shows as `1 file`, not `2`. The first phrase is capitalized. Shares
-/// the [`TranscriptRowKind::ExploringSummary`] bullet chrome with the inline
-/// running preview so the transition from in-flight ("reading 3 files…") to
-/// scrollback ("read 3 files") reads as the same row, not a re-labeled cell.
-pub struct ExplorationOutputCell {
-    groups: Vec<(&'static str, Vec<String>)>,
-}
-
-impl ExplorationOutputCell {
-    pub(crate) fn from_groups(groups: Vec<(&'static str, Vec<String>)>) -> Self {
-        Self { groups }
-    }
-}
-
-impl HistoryCell for ExplorationOutputCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let body = format_summary(&self.groups, Tense::Past);
-        TranscriptRow::new(TranscriptRowKind::ExploringSummary, body).render(width)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum Tense {
-    Past,
-    Present,
-}
-
-/// Render the running summary phrase shared by [`ExplorationOutputCell`]
-/// (past tense, in scrollback) and [`ExploringSummaryCell`] (present tense,
-/// inline). Counts come from the per-action target lists so the caller can
-/// dedup paths before handing them in.
-pub(crate) fn format_summary(groups: &[(&'static str, Vec<String>)], tense: Tense) -> String {
-    let mut phrases: Vec<String> = Vec::with_capacity(groups.len());
-    for (i, (action, targets)) in groups.iter().enumerate() {
-        let phrase = action_phrase(action, targets.len(), tense);
-        phrases.push(if i == 0 {
-            capitalize_first(&phrase)
-        } else {
-            phrase
-        });
-    }
-    phrases.join(", ")
-}
-
-fn action_phrase(action: &str, count: usize, tense: Tense) -> String {
-    match (action, tense) {
-        ("Read", Tense::Past) => format!("read {count} {}", pluralize(count, "file", "files")),
-        ("Read", Tense::Present) => {
-            format!("reading {count} {}", pluralize(count, "file", "files"))
-        }
-        ("List", Tense::Past) => format!(
-            "listed {count} {}",
-            pluralize(count, "directory", "directories")
-        ),
-        ("List", Tense::Present) => format!(
-            "listing {count} {}",
-            pluralize(count, "directory", "directories")
-        ),
-        ("Search", Tense::Past) => format!(
-            "searched for {count} {}",
-            pluralize(count, "pattern", "patterns")
-        ),
-        ("Search", Tense::Present) => format!(
-            "searching for {count} {}",
-            pluralize(count, "pattern", "patterns")
-        ),
-        ("Bash", Tense::Past) => format!(
-            "ran {count} shell {}",
-            pluralize(count, "command", "commands")
-        ),
-        ("Bash", Tense::Present) => format!(
-            "running {count} shell {}",
-            pluralize(count, "command", "commands")
-        ),
-        (other, _) => format!("{} {count}", other.to_lowercase()),
-    }
-}
-
-fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
-    if count == 1 {
-        singular
-    } else {
-        plural
-    }
-}
-
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
-}
-
-/// Inline-only running summary used while exploration tools are still in
-/// flight or buffered. Renders with present-tense verbs, an ellipsis, and the
-/// most recently active target underneath (e.g. the path of the read currently
-/// in flight) so the user can see what's actually happening right now.
-pub struct ExploringSummaryCell {
-    groups: Vec<(&'static str, Vec<String>)>,
-    current_target: Option<String>,
-}
-
-impl ExploringSummaryCell {
-    pub(crate) fn new(
-        groups: Vec<(&'static str, Vec<String>)>,
-        current_target: Option<String>,
-    ) -> Self {
-        Self {
-            groups,
-            current_target,
-        }
-    }
-}
-
-impl HistoryCell for ExploringSummaryCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        // Present-tense + ellipsis + current-target line only while something
-        // is actually in flight. With nothing live (between batches of tool
-        // calls, while pending_explorations waits for its next flush trigger)
-        // past tense reads honestly and matches the shape of the eventual
-        // scrollback row.
-        let body = match &self.current_target {
-            Some(target) => {
-                let mut body = format_summary(&self.groups, Tense::Present);
-                body.push('…');
-                body.push_str("\n└ ");
-                body.push_str(target);
-                body
-            }
-            None => format_summary(&self.groups, Tense::Past),
-        };
-        TranscriptRow::new(TranscriptRowKind::ExploringSummary, body).render(width)
     }
 }
 
@@ -554,5 +514,41 @@ mod tests {
         let rendered = lines_text(&output.display_lines(80));
 
         assert!(rendered.starts_with("■ Failed  Read src/main.rs\n"));
+    }
+
+    #[test]
+    fn exploring_group_collapsed_shows_count_and_latest_target() {
+        let calls = vec![
+            ToolCallContext::new("read_file", json!({ "path": "a.rs" })),
+            ToolCallContext::new("read_file", json!({ "path": "b.rs" })),
+        ];
+        let cell = ToolCallCell::exploring_group(calls, None);
+        let rendered = lines_text(&cell.display_lines(80));
+
+        assert!(
+            rendered.contains("Exploring (2 calls)"),
+            "got:\n{rendered}"
+        );
+        assert!(rendered.contains("└ b.rs"), "got:\n{rendered}");
+        assert!(!rendered.contains("a.rs"), "collapsed must hide other rows; got:\n{rendered}");
+    }
+
+    #[test]
+    fn exploring_group_expanded_lists_each_call() {
+        let calls = vec![
+            ToolCallContext::new("read_file", json!({ "path": "a.rs" })),
+            ToolCallContext::new(
+                "code_search",
+                json!({ "pattern": "foo", "path": "src" }),
+            ),
+        ];
+        let cell = ToolCallCell::exploring_group(calls, None).with_expanded(true);
+        let rendered = lines_text(&cell.display_lines(80));
+
+        assert!(rendered.contains("Read a.rs"), "got:\n{rendered}");
+        assert!(
+            rendered.contains("Search \"foo\" in src"),
+            "got:\n{rendered}"
+        );
     }
 }
