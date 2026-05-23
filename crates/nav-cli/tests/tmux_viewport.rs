@@ -311,3 +311,80 @@ fn cursor_lands_inside_composer_on_startup() {
         "cursor column should be inside the composer content area, found {cx}\n{pane}"
     );
 }
+
+/// Locks in the [`BottomPaneView`] trait-dispatch path end-to-end (BP-01).
+///
+/// Exercises the three places the refactor changed:
+///
+/// 1. `reconcile_popups` constructs a `Box<dyn BottomPaneView>` for the slash
+///    popup when the composer starts with `/`.
+/// 2. `handle_key` dispatches the keystroke through the trait method and
+///    routes navigation (`Down`) inside the popup.
+/// 3. On Esc-dismiss, the `view.as_any_mut().is::<SlashCommandPopup>()`
+///    downcast must fire so the suppression flag is set — otherwise the
+///    composer would still start with `/h` and `reconcile_popups` would
+///    immediately reopen the popup, defeating the dismiss.
+///
+/// Before committing, temporarily revert the trait refactor in
+/// `bottom_pane/view.rs` and `bottom_pane/key_handling.rs` and confirm this
+/// test fails — a refactor that no test can catch is a refactor worth nothing.
+#[test]
+fn slash_popup_open_navigate_dismiss_via_trait_dispatch() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("slash-trait-dispatch");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Wait for the composer placeholder so we know the first frame is up.
+    session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(5),
+    );
+
+    // (1) Open the slash popup. `/h` filters to `/help`, `/handoff`. The
+    // popup must render — proves `reconcile_popups` boxed up a popup and
+    // `BottomPane::render` ran trait-dispatched `view.render`.
+    session.send("/h");
+    let with_popup = session.wait_for(|p| p.contains("/help"), Duration::from_secs(3));
+    assert!(
+        with_popup.contains("/help"),
+        "slash popup did not render `/help` row — trait `render` dispatch may be broken:\n{with_popup}"
+    );
+
+    // (2) Navigate. `Down` only does anything if `handle_key` reached the
+    // popup's `handle_key_inner` through the trait. We don't assert on which
+    // row is highlighted (terminal colour rendering is finicky in tmux) — but
+    // a stray panic / no-op here would still show up as the popup vanishing
+    // or the composer eating the keystroke.
+    session.send("Down");
+    let after_nav = session.wait_for(|p| p.contains("/help"), Duration::from_secs(1));
+    assert!(
+        after_nav.contains("/help"),
+        "popup disappeared after Down — `handle_key` did not route through trait:\n{after_nav}"
+    );
+
+    // (3) Dismiss with Esc. The popup must clear AND `slash_popup_suppressed`
+    // must be set so the popup does not immediately reopen — that flag is
+    // gated by the `any.is::<SlashCommandPopup>()` downcast in `handle_key`.
+    // Composer keeps `/h` (Esc only dismisses the popup, not the text).
+    session.send("Escape");
+    let after_dismiss = session.wait_for(
+        |p| !p.contains("/help") && !p.contains("/handoff"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        !after_dismiss.contains("/help"),
+        "popup did not dismiss on Esc — suppression-flag downcast may be broken:\n{after_dismiss}"
+    );
+    assert!(
+        status_bar_present(&after_dismiss),
+        "status bar missing after popup dismiss:\n{after_dismiss}"
+    );
+}
