@@ -1,5 +1,6 @@
 use nav_core::cli::ModelLine;
-use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit};
+use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit, TurnUsage};
+use std::time::Duration;
 use ratatui::text::Line;
 use std::collections::HashMap;
 
@@ -10,7 +11,7 @@ use crate::cells::{
     GitCheckpointCell, HookCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell,
     ReasoningCell, SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell,
     SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
-    TurnAbortedCell, TurnDiffCell, UserMessageCell,
+    FinalMessageSeparator, TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
 use crate::history::HistoryCell;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
@@ -199,6 +200,15 @@ impl ChatWidget {
         self.push_cell(TranscriptHitsCell::new(query, hits));
     }
 
+    /// Scrollback divider after a user turn finishes successfully.
+    ///
+    /// Not used for aborted or errored turns — those already have their own cells.
+    pub fn push_final_message_separator(&mut self, duration: Duration, usage: TurnUsage) {
+        self.end_active_turn_viewport();
+        self.finalized
+            .push(Box::new(FinalMessageSeparator::new(duration, usage)));
+    }
+
     /// Drain finalized cells that haven't been pushed to scrollback yet,
     /// rendering each at `width`. The main loop calls this once per tick
     /// before drawing the viewport. Cells stay in `finalized` so a later
@@ -279,10 +289,8 @@ impl ChatWidget {
                     self.push_local_cell(ReasoningCell::new(text));
                 }
             }
-            AgentEvent::TurnComplete { usage: _ } => {
-                self.close_streaming_assistant();
-                self.drain_inflight_tool_calls();
-                self.turn_has_work = false;
+            AgentEvent::TurnComplete { .. } => {
+                self.end_active_turn_viewport();
             }
             AgentEvent::ToolCallApprovalRequest { .. } => {
                 self.close_streaming_assistant();
@@ -675,6 +683,12 @@ impl ChatWidget {
     fn push_local_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
         self.flush_explorations();
         self.finalized.push(Box::new(cell));
+    }
+
+    fn end_active_turn_viewport(&mut self) {
+        self.close_streaming_assistant();
+        self.drain_inflight_tool_calls();
+        self.turn_has_work = false;
     }
 
     fn close_streaming_assistant(&mut self) {
