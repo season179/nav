@@ -219,6 +219,7 @@ pub async fn run(
                 Some(handle) => AgentState::Working {
                     elapsed: handle.elapsed(),
                     spinner,
+                    tick: spinner_tick,
                 },
                 None => AgentState::Ready,
             };

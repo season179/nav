@@ -398,6 +398,7 @@ fn working_status(show_indicator: bool) -> StatusBarState {
         agent_state: AgentState::Working {
             elapsed: std::time::Duration::from_secs(7),
             spinner: '⠴',
+            tick: 0,
         },
         show_indicator,
         ..StatusBarState::default()
