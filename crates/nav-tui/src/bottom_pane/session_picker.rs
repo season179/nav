@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::composer::Composer;
-use super::view::InputResult;
+use super::view::{BottomPaneView, InputResult};
 use crate::theme::Theme;
 
 /// One row in the recent-session picker.
@@ -59,23 +59,11 @@ impl SessionPickerPopup {
         }
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.completed
-    }
-
     pub fn take_selection(&mut self) -> Option<String> {
         self.selected_id.take()
     }
 
-    pub fn desired_height(&self, _width: u16) -> u16 {
-        if self.entries.is_empty() {
-            1
-        } else {
-            self.entries.len().min(MAX_VISIBLE) as u16
-        }
-    }
-
-    pub fn handle_key(&mut self, key: KeyEvent, _composer: &mut Composer) -> InputResult {
+    fn handle_key_inner(&mut self, key: KeyEvent, _composer: &mut Composer) -> InputResult {
         if key.kind == KeyEventKind::Release {
             return InputResult::Unhandled;
         }
@@ -107,7 +95,7 @@ impl SessionPickerPopup {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    fn render_inner(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -158,5 +146,27 @@ impl SessionPickerPopup {
             })
             .collect();
         Paragraph::new(lines).style(bg).render(area, buf);
+    }
+}
+
+impl BottomPaneView for SessionPickerPopup {
+    fn handle_key(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
+        self.handle_key_inner(key, composer)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completed
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        if self.entries.is_empty() {
+            1
+        } else {
+            self.entries.len().min(MAX_VISIBLE) as u16
+        }
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_inner(area, buf);
     }
 }

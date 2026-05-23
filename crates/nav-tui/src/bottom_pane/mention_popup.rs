@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::composer::Composer;
-use super::view::InputResult;
+use super::view::{BottomPaneView, InputResult};
 use crate::theme::Theme;
 
 /// One row in the @file mention popup.
@@ -72,14 +72,6 @@ impl FileMentionPopup {
         self.matches.iter().map(|&i| &self.entries[i]).collect()
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.completed
-    }
-
-    pub fn desired_height(&self, _width: u16) -> u16 {
-        self.matches.len().clamp(1, MAX_VISIBLE) as u16
-    }
-
     /// Re-rank `entries` against `query` using `nucleo-matcher` and keep the
     /// top [`MAX_VISIBLE`] scores. Empty query surfaces a prefix so the popup
     /// is never blank. A no-op call (same query as last time) is a fast
@@ -131,7 +123,7 @@ impl FileMentionPopup {
         self.selected = 0;
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
+    fn handle_key_inner(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
         if key.kind == KeyEventKind::Release {
             return InputResult::Unhandled;
         }
@@ -175,7 +167,7 @@ impl FileMentionPopup {
         InputResult::Handled
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    fn render_inner(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -209,6 +201,28 @@ impl FileMentionPopup {
             })
             .collect();
         Paragraph::new(lines).style(bg).render(area, buf);
+    }
+}
+
+impl BottomPaneView for FileMentionPopup {
+    fn handle_key(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
+        self.handle_key_inner(key, composer)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completed
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        self.matches.len().clamp(1, MAX_VISIBLE) as u16
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_inner(area, buf);
+    }
+
+    fn is_text_driven(&self) -> bool {
+        true
     }
 }
 

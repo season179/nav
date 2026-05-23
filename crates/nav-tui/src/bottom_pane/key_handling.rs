@@ -6,9 +6,12 @@ use std::sync::Arc;
 use crossterm::event::KeyEvent;
 use nav_core::UserAttachment;
 
-use super::SlashCommandPopup;
+use super::approval::ApprovalOverlay;
 use super::clipboard::{recognized_image_path, try_save_clipboard_image, workspace_relative_image};
-use super::{BottomPane, BottomPaneView, ComposerEvent, FileMentionPopup, InputResult};
+use super::session_picker::SessionPickerPopup;
+use super::{
+    BottomPane, BottomPaneView, ComposerEvent, FileMentionPopup, InputResult, SlashCommandPopup,
+};
 
 impl BottomPane {
     /// Replace the editable composer buffer with a generated draft prompt.
@@ -93,22 +96,30 @@ impl BottomPane {
                         // capture the decision before dropping — otherwise the
                         // app loop never sees the user's choice and the tool
                         // call hangs forever waiting on the oneshot.
-                        match view {
-                            BottomPaneView::SlashCommand(_) => {
-                                self.slash_popup_suppressed = true;
+                        let any = view.as_any_mut();
+                        if any.is::<SlashCommandPopup>() {
+                            self.slash_popup_suppressed = true;
+                        } else if any.is::<FileMentionPopup>() {
+                            self.mention_popup_suppressed = true;
+                        } else if let Some(o) = any.downcast_mut::<ApprovalOverlay>() {
+                            // Keep the downcast and `take_decision()` as
+                            // separate steps. Collapsing them with `&&` would
+                            // make any approval whose `is_complete()` returns
+                            // true but whose decision is absent (e.g. if those
+                            // ever decouple) silently fall through into the
+                            // SessionPicker branch below — meaning an
+                            // ApprovalOverlay would be tested for session-id
+                            // selection. The branches must be matched on
+                            // type, not on combined type+state.
+                            #[allow(clippy::collapsible_if)]
+                            if let Some(decision) = o.take_decision() {
+                                self.last_decision =
+                                    Some((o.approval_id.clone(), decision));
                             }
-                            BottomPaneView::FileMention(_) => {
-                                self.mention_popup_suppressed = true;
-                            }
-                            BottomPaneView::Approval(o) => {
-                                if let Some(decision) = o.take_decision() {
-                                    self.last_decision = Some((o.approval_id.clone(), decision));
-                                }
-                            }
-                            BottomPaneView::SessionPicker(p) => {
-                                if let Some(session_id) = p.take_selection() {
-                                    self.last_session_selection = Some(session_id);
-                                }
+                        } else if let Some(p) = any.downcast_mut::<SessionPickerPopup>() {
+                            #[allow(clippy::collapsible_if)]
+                            if let Some(session_id) = p.take_selection() {
+                                self.last_session_selection = Some(session_id);
                             }
                         }
                         self.view = None;
@@ -154,42 +165,41 @@ impl BottomPane {
 
         // Fast path: the active popup already matches the desired target —
         // just refresh its filter and bail. Avoids reconstructing the popup
-        // (and re-cloning the entries `Arc`) on every keystroke.
-        match (&mut self.view, want_slash, want_mention) {
-            (Some(BottomPaneView::SlashCommand(p)), true, _) => {
+        // (and re-cloning the entries `Arc`) on every keystroke. Modal
+        // overlays (anything where `is_text_driven()` is false — approval,
+        // session picker, future confirmation dialogs, list pickers)
+        // short-circuit here so the slow path below can't silently dismiss
+        // them on a stray keystroke.
+        if let Some(view) = self.view.as_mut() {
+            if !view.is_text_driven() {
+                return;
+            }
+            let any = view.as_any_mut();
+            if want_slash && let Some(p) = any.downcast_mut::<SlashCommandPopup>() {
                 p.on_composer_text_changed(&first_owned);
                 if p.is_complete() {
                     self.view = None;
                 }
                 return;
             }
-            (Some(BottomPaneView::FileMention(p)), _, true) => {
+            if want_mention && let Some(p) = any.downcast_mut::<FileMentionPopup>() {
                 p.set_query(mention_token.as_deref().unwrap_or(""));
                 return;
             }
-            (Some(BottomPaneView::Approval(_)), _, _) => {
-                // Approval modal is unaffected by composer text changes.
-                return;
-            }
-            (Some(BottomPaneView::SessionPicker(_)), _, _) => {
-                // Session picker is a modal decision flow, not a text popup.
-                return;
-            }
-            _ => {}
         }
 
         // Slow path: open the right popup, or close whatever is open.
         if want_slash {
             let mut popup = SlashCommandPopup::new(Arc::clone(&self.slash_entries), self.theme);
             popup.on_composer_text_changed(&first_owned);
-            self.view = (!popup.is_complete()).then_some(BottomPaneView::SlashCommand(popup));
+            self.view = (!popup.is_complete()).then_some(Box::new(popup));
         } else if want_mention {
             let popup = FileMentionPopup::new(
                 Arc::clone(&self.mention_entries),
                 mention_token.as_deref().unwrap_or(""),
                 self.theme,
             );
-            self.view = Some(BottomPaneView::FileMention(popup));
+            self.view = Some(Box::new(popup));
         } else {
             self.view = None;
         }
