@@ -617,6 +617,44 @@ fn history_search_esc_restores_pre_search_buffer() {
 }
 
 #[test]
+fn ctrl_c_dismisses_history_search_and_restores_pre_search_buffer() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "saved");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut pane, "draft");
+    let _ = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert!(pane.has_overlay());
+
+    assert!(pane.handle_ctrl_c());
+    assert!(!pane.has_overlay());
+    assert_eq!(pane.composer().text(), "draft");
+}
+
+#[test]
+fn ctrl_c_dismisses_popup_before_clearing_composer() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "/h");
+    assert!(pane.has_overlay());
+
+    assert!(pane.handle_ctrl_c());
+    assert!(!pane.has_overlay());
+    assert_eq!(pane.composer().text(), "/h");
+}
+
+#[test]
+fn ctrl_c_clears_non_empty_composer_when_no_popup_is_active() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "draft");
+
+    assert!(pane.handle_ctrl_c());
+    assert_eq!(pane.composer().text(), "");
+    assert!(!pane.handle_ctrl_c());
+}
+
+#[test]
 fn history_search_up_down_navigate_matches() {
     let mut pane = BottomPane::new();
 

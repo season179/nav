@@ -5,7 +5,7 @@
 //! is owned by the terminal itself now (history is written into native
 //! scrollback above an inline viewport), so there are no in-app scroll keys.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 mod classify;
 mod dispatch;
@@ -18,7 +18,9 @@ use classify::classify_slash_with_extensions;
 pub use classify::{SlashAction, classify_slash, prepend_pending_skill};
 
 pub(crate) fn is_ctrl_c(key: &KeyEvent) -> bool {
-    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('c')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 #[cfg(test)]

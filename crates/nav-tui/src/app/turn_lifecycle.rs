@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use nav_core::guardrails::PermissionContext;
+use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
     AgentEvent, Catalog, ControlPlane, ModelTransportHandle, PendingInput, PendingInputDraft,
     PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
@@ -133,6 +134,71 @@ pub(super) fn clear_pending_inputs(
         chat,
         pane,
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn abort_active_turn(
+    control: &mut ControlPlane,
+    active_turn: &mut Option<ActiveTurnHandle>,
+    pending_approvals: &mut PendingApprovals,
+    transport: &ModelTransportHandle,
+    args: &Args,
+    cwd: &Path,
+    store: &Arc<SessionStore>,
+    session_id: &SessionId,
+    agent_tx: &mpsc::UnboundedSender<AgentEvent>,
+    skills: &Arc<Catalog>,
+    project: &Arc<ProjectContext>,
+    permissions: &PermissionContext,
+    chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
+) {
+    let Some(active) = control.active().cloned() else {
+        return;
+    };
+    let turn_id = active.id().to_string();
+    let abort = control.abort_turn(&turn_id, "user interrupt").ok();
+    pending_approvals.abort_pending();
+    if let Some(handle) = active_turn.take() {
+        handle.abort();
+    }
+    if let Some(abort) = abort {
+        emit_pending_cleared(
+            abort.cleared_steering_ids,
+            store.as_ref(),
+            session_id,
+            chat,
+            pane,
+        );
+    }
+    emit_local_event(
+        AgentEvent::TurnAborted {
+            turn_id: turn_id.clone(),
+            reason: "user interrupt".into(),
+        },
+        store.as_ref(),
+        session_id,
+        chat,
+        pane,
+    );
+    if let Ok(settled) = control.finish_turn(&turn_id) {
+        start_next_follow_up(
+            settled.next_follow_up,
+            control,
+            active_turn,
+            transport,
+            args,
+            cwd,
+            store,
+            session_id,
+            agent_tx,
+            skills,
+            project,
+            permissions,
+            chat,
+            pane,
+        );
+    }
 }
 
 pub(super) fn queue_active_steering(active_turn: &Option<ActiveTurnHandle>, item: PendingInput) {
