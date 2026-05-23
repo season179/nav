@@ -75,6 +75,32 @@ impl Session {
         assert!(status.success(), "tmux send-keys exited non-zero");
     }
 
+    /// Resize the tmux window so the running TUI sees a `SIGWINCH` /
+    /// resize event. Tests use this to verify rect math under varying
+    /// `area.height` / `area.width`.
+    ///
+    /// Returns `false` when `tmux resize-window` is unavailable (added
+    /// in tmux 2.9, May 2019) so callers can skip cleanly rather than
+    /// panic on hosts pinning an older tmux — matches the
+    /// "skip cleanly when tmux is absent" rule in CLAUDE.md.
+    fn try_resize(&self, width: u16, height: u16) -> bool {
+        let out = Command::new("tmux")
+            .args([
+                "resize-window",
+                "-t",
+                &self.name,
+                "-x",
+                &width.to_string(),
+                "-y",
+                &height.to_string(),
+            ])
+            .output();
+        match out {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+
     /// Live cursor coordinates as reported by tmux. `capture-pane` only
     /// reports glyph content, so we ask the pane for its `cursor_x` and
     /// `cursor_y` directly via `display-message`. Returns `(col, row)`
@@ -485,5 +511,174 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
         completed.matches("SMOKE_OK_STREAM").count(),
         1,
         "expected the final marker once in the final frame, got:\n{completed}"
+    );
+}
+
+/// Locks in the [`BottomPaneView`] trait-dispatch path end-to-end (BP-01).
+///
+/// Exercises the three places the refactor changed:
+///
+/// 1. `reconcile_popups` constructs a `Box<dyn BottomPaneView>` for the slash
+///    popup when the composer starts with `/`.
+/// 2. `handle_key` dispatches the keystroke through the trait method and
+///    routes navigation (`Down`) inside the popup.
+/// 3. On Esc-dismiss, the `view.as_any_mut().is::<SlashCommandPopup>()`
+///    downcast must fire so the suppression flag is set — otherwise the
+///    composer would still start with `/h` and `reconcile_popups` would
+///    immediately reopen the popup, defeating the dismiss.
+///
+/// Before committing, temporarily revert the trait refactor in
+/// `bottom_pane/view.rs` and `bottom_pane/key_handling.rs` and confirm this
+/// test fails — a refactor that no test can catch is a refactor worth nothing.
+#[test]
+fn slash_popup_open_navigate_dismiss_via_trait_dispatch() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("slash-trait-dispatch");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Wait for the composer placeholder so we know the first frame is up.
+    session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(5),
+    );
+
+    // (1) Open the slash popup. `/h` filters to `/help`, `/handoff`. The
+    // popup must render — proves `reconcile_popups` boxed up a popup and
+    // `BottomPane::render` ran trait-dispatched `view.render`.
+    session.send("/h");
+    let with_popup = session.wait_for(|p| p.contains("/help"), Duration::from_secs(3));
+    assert!(
+        with_popup.contains("/help"),
+        "slash popup did not render `/help` row — trait `render` dispatch may be broken:\n{with_popup}"
+    );
+
+    // (2) Navigate. `Down` only does anything if `handle_key` reached the
+    // popup's `handle_key_inner` through the trait. We don't assert on which
+    // row is highlighted (terminal colour rendering is finicky in tmux) — but
+    // a stray panic / no-op here would still show up as the popup vanishing
+    // or the composer eating the keystroke.
+    session.send("Down");
+    let after_nav = session.wait_for(|p| p.contains("/help"), Duration::from_secs(1));
+    assert!(
+        after_nav.contains("/help"),
+        "popup disappeared after Down — `handle_key` did not route through trait:\n{after_nav}"
+    );
+
+    // (3) Dismiss with Esc. The popup must clear AND `slash_popup_suppressed`
+    // must be set so the popup does not immediately reopen — that flag is
+    // gated by the `any.is::<SlashCommandPopup>()` downcast in `handle_key`.
+    // Composer keeps `/h` (Esc only dismisses the popup, not the text).
+    session.send("Escape");
+    let after_dismiss = session.wait_for(
+        |p| !p.contains("/help") && !p.contains("/handoff"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        !after_dismiss.contains("/help"),
+        "popup did not dismiss on Esc — suppression-flag downcast may be broken:\n{after_dismiss}"
+    );
+    assert!(
+        status_bar_present(&after_dismiss),
+        "status bar missing after popup dismiss:\n{after_dismiss}"
+    );
+}
+
+/// Resize regression for the FlexRenderable-driven bottom-pane layout.
+///
+/// Before LAY-01, the pane split rows with `Layout::vertical([...])` and
+/// each helper (`desired_height`, `cursor_position`, `Widget::render`)
+/// recomputed the constraints inline. After LAY-01 they all share a
+/// `FlexRenderable` built from the same chunk wrappers. This test resizes
+/// the terminal between a tall and a short geometry and asserts the
+/// composer row + caret stay locked to the same flex slot — if the flex
+/// allocator returned a stale or off-by-one rect on resize, the composer
+/// would drift up or the caret would land on the wrong row.
+///
+/// Self-check: revert `bottom_pane/render.rs` to use `Layout::vertical`
+/// only in `Widget::render` (without updating `cursor_position`) and the
+/// caret-row assertion after the second resize will fire, because the
+/// two paths no longer agree on which row the composer occupies.
+#[test]
+fn bottom_pane_layout_survives_resize() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("layout-resize");
+    // Start tall so the initial composer paints well clear of any rows
+    // tmux might keep around from the surrounding shell prompt.
+    session.start(120, 30);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Composer must render before the first resize, otherwise the test
+    // would race the launch banner.
+    let initial = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        initial.contains("Ask nav to do anything"),
+        "composer placeholder did not render at 120x30:\n{initial}"
+    );
+
+    // Shrink. The pane absorbs less vertical space; FlexRenderable's
+    // flex-1 composer slot has to recompute against the new height.
+    if !session.try_resize(80, 18) {
+        eprintln!("tmux resize-window unsupported (needs tmux >= 2.9), skipping");
+        return;
+    }
+    let small = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(3),
+    );
+    let small_composer_row = last_row_with(&small, |line| {
+        line.contains("Ask nav to do anything")
+    })
+    .unwrap_or_else(|| panic!("composer missing after shrink:\n{small}"));
+    let (cx_small, cy_small) = session.cursor();
+    assert_eq!(
+        cy_small as usize, small_composer_row,
+        "after shrink the caret row drifted from the composer (\
+         composer_row={small_composer_row}, cursor=({cx_small},{cy_small}))\n{small}"
+    );
+    assert!(
+        cx_small >= 2,
+        "after shrink the caret should sit past the 2-col gutter, got cx={cx_small}\n{small}"
+    );
+
+    // Grow back. The flex slot must expand again without leaving the
+    // composer pinned at the smaller row — a sign of stale constraints.
+    assert!(
+        session.try_resize(120, 30),
+        "second resize-window failed after the first succeeded"
+    );
+    let big = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(3),
+    );
+    let big_composer_row =
+        last_row_with(&big, |line| line.contains("Ask nav to do anything"))
+            .unwrap_or_else(|| panic!("composer missing after regrow:\n{big}"));
+    let (cx_big, cy_big) = session.cursor();
+    assert_eq!(
+        cy_big as usize, big_composer_row,
+        "after regrow the caret row drifted from the composer (\
+         composer_row={big_composer_row}, cursor=({cx_big},{cy_big}))\n{big}"
+    );
+    assert!(
+        cx_big >= 2,
+        "after regrow the caret should sit past the 2-col gutter, got cx={cx_big}\n{big}"
     );
 }

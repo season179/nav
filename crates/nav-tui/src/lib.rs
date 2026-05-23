@@ -25,6 +25,7 @@ mod custom_terminal;
 mod history;
 mod commands;
 mod insert_history;
+mod render;
 mod streaming;
 mod theme;
 mod chat;

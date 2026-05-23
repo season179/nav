@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::composer::Composer;
-use super::view::InputResult;
+use super::view::{BottomPaneView, InputResult};
 use crate::theme::Theme;
 
 /// Built-in slash commands the TUI always offers.
@@ -120,15 +120,7 @@ impl SlashCommandPopup {
         &self.filter
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.completed
-    }
-
-    pub fn desired_height(&self, _width: u16) -> u16 {
-        self.matches.len().max(1) as u16
-    }
-
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    fn render_inner(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -159,7 +151,7 @@ impl SlashCommandPopup {
         Paragraph::new(lines).style(bg).render(area, buf);
     }
 
-    pub fn on_composer_text_changed(&mut self, first_line: &str) {
+    fn on_composer_text_changed_inner(&mut self, first_line: &str) {
         if !first_line.starts_with('/') {
             self.completed = true;
             return;
@@ -172,7 +164,7 @@ impl SlashCommandPopup {
         self.refilter();
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
+    fn handle_key_inner(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
         if key.kind == KeyEventKind::Release {
             return InputResult::Unhandled;
         }
@@ -249,6 +241,32 @@ impl SlashCommandPopup {
         if self.selected >= self.matches.len() {
             self.selected = 0;
         }
+    }
+}
+
+impl BottomPaneView for SlashCommandPopup {
+    fn handle_key(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
+        self.handle_key_inner(key, composer)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.completed
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        self.matches.len().max(1) as u16
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_inner(area, buf);
+    }
+
+    fn on_composer_text_changed(&mut self, first_line: &str) {
+        self.on_composer_text_changed_inner(first_line);
+    }
+
+    fn is_text_driven(&self) -> bool {
+        true
     }
 }
 
