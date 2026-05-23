@@ -21,6 +21,10 @@ image = "0.25.10"
 uuid = { version = "1.23.1", features = ["v4"] }
 url = "2.5"
 unicode-width = "0.2.2"
+supports-color.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 futures-util.workspace = true

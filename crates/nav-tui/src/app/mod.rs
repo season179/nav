@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use crossterm::event::{self, Event as CtEvent, KeyCode, KeyModifiers};
+use nav_core::guardrails::PermissionContext;
 use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
     AgentEvent, Catalog, ChatCompletionsTransport, ControlPlane, ExtensionCatalog, HandoffDraft,
@@ -38,9 +39,9 @@ use crate::ChatWidget;
 use crate::bottom_pane::{
     self, AgentState, INDICATOR_SCREEN_FLOOR, PendingApproval, StatusBarState,
 };
+use crate::chat::parse_rewind_skill_prompt;
 use crate::commands::{AppEvent, ModelMatch, dispatch_submit, is_ctrl_c, match_model_selector};
 use crate::theme::Theme;
-use crate::chat::parse_rewind_skill_prompt;
 use permissions::build_tui_permissions;
 use render::draw_tui;
 use session::{
@@ -54,6 +55,182 @@ use turn_lifecycle::{
     replace_active_steering, spinner_frame, start_next_follow_up, start_pending_turn,
     turn_is_terminal,
 };
+
+/// `true` when the caller should skip the rest of the current `select!` arm
+/// (e.g. replayed `UserMessage` is handled elsewhere).
+type AgentEventSkip = bool;
+
+#[allow(clippy::too_many_arguments)]
+fn process_agent_event(
+    ev: AgentEvent,
+    control: &mut ControlPlane,
+    active_turn: &mut Option<ActiveTurnHandle>,
+    last_tokens_input: &mut u64,
+    last_tokens_output: &mut u64,
+    last_tokens_cached: &mut u64,
+    _store: &SessionStore,
+    _session_id: &SessionId,
+    chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
+) -> AgentEventSkip {
+    pane.apply_agent_event(&ev);
+    if let AgentEvent::PendingInputDequeued { id, .. } = &ev {
+        control.remove_pending(id);
+    }
+    if let AgentEvent::TurnComplete { usage } = &ev {
+        if let Some(handle) = active_turn.as_mut() {
+            handle.usage.accumulate(usage);
+        }
+        if usage.tokens_input > 0 {
+            *last_tokens_input = usage.tokens_input;
+            *last_tokens_output = usage.tokens_output;
+            *last_tokens_cached = usage.tokens_input_cached;
+        }
+    }
+    if matches!(ev, AgentEvent::UserMessage { .. }) {
+        return true;
+    }
+    if let AgentEvent::ToolCallApprovalRequest {
+        approval_id,
+        tool,
+        command,
+        path,
+        cwd: req_cwd,
+        reason,
+        ..
+    } = &ev
+    {
+        pane.enqueue_approval(PendingApproval {
+            approval_id: approval_id.clone(),
+            tool: tool.clone(),
+            command: command.clone(),
+            path: path.clone(),
+            cwd: req_cwd.clone(),
+            reason: reason.clone(),
+        });
+        chat.ingest(ev);
+        return false;
+    }
+    chat.ingest(ev);
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_terminal_turn(
+    is_abort: bool,
+    active_turn: &mut Option<ActiveTurnHandle>,
+    control: &mut ControlPlane,
+    pending_model_swap: &mut Option<PendingModelSwap>,
+    transport: &ModelTransportHandle,
+    args: &mut Args,
+    cwd: &Path,
+    store: &Arc<SessionStore>,
+    session_id: &SessionId,
+    agent_tx: &mpsc::UnboundedSender<AgentEvent>,
+    skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
+    project: &Arc<ProjectContext>,
+    permissions: &PermissionContext,
+    chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
+) {
+    let active_id = control.active().map(|active| active.id().to_string());
+    if is_abort
+        && let Some(id) = active_id.as_deref()
+        && let Ok(abort) = control.abort_turn(id, "turn aborted")
+    {
+        emit_pending_cleared(
+            abort.cleared_steering_ids,
+            store.as_ref(),
+            session_id,
+            chat,
+            pane,
+        );
+    }
+    *active_turn = None;
+    apply_pending_model_swap(
+        pending_model_swap,
+        transport,
+        args,
+        store.as_ref(),
+        session_id,
+        chat,
+    );
+    if let Some(id) = active_id
+        && let Ok(settled) = control.finish_turn(&id)
+    {
+        start_next_follow_up(
+            settled.next_follow_up,
+            control,
+            active_turn,
+            transport,
+            args,
+            cwd,
+            store,
+            session_id,
+            agent_tx,
+            skills,
+            extensions,
+            project,
+            permissions,
+            chat,
+            pane,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reap_finished_turn(
+    active_turn: &mut Option<ActiveTurnHandle>,
+    control: &mut ControlPlane,
+    pending_model_swap: &mut Option<PendingModelSwap>,
+    transport: &ModelTransportHandle,
+    args: &mut Args,
+    cwd: &Path,
+    store: &Arc<SessionStore>,
+    session_id: &SessionId,
+    agent_tx: &mpsc::UnboundedSender<AgentEvent>,
+    skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
+    project: &Arc<ProjectContext>,
+    permissions: &PermissionContext,
+    chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
+) {
+    let active_id = control.active().map(|active| active.id().to_string());
+    if let Some(handle) = active_turn.take() {
+        chat.push_final_message_separator(handle.elapsed(), handle.usage);
+    }
+    apply_pending_model_swap(
+        pending_model_swap,
+        transport,
+        args,
+        store.as_ref(),
+        session_id,
+        chat,
+    );
+    if let Some(id) = active_id
+        && let Ok(settled) = control.finish_turn(&id)
+    {
+        start_next_follow_up(
+            settled.next_follow_up,
+            control,
+            active_turn,
+            transport,
+            args,
+            cwd,
+            store,
+            session_id,
+            agent_tx,
+            skills,
+            extensions,
+            project,
+            permissions,
+            chat,
+            pane,
+        );
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -72,7 +249,6 @@ pub async fn run(
     let slash_entries =
         bottom_pane::build_slash_entries_with_extensions(skills.as_ref(), extensions.as_ref());
     let skill_entries = bottom_pane::build_skill_entries(skills.as_ref());
-    let theme = Theme::from_extensions(project.settings.theme.as_deref(), extensions.as_ref());
 
     // Enter raw mode + clear stale mouse capture BEFORE constructing the
     // custom Terminal: `Terminal::with_options` issues a CPR query
@@ -80,6 +256,9 @@ pub async fn run(
     // captured in raw mode.
     let mut stdout = io::stdout();
     enter_tui(&mut stdout)?;
+    #[cfg(unix)]
+    crate::terminal_palette::probe_default_colors_at_startup();
+    let theme = Theme::from_extensions(project.settings.theme.as_deref(), extensions.as_ref());
     install_panic_teardown_hook();
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::with_options(backend)?;
@@ -179,25 +358,68 @@ pub async fn run(
             .is_some_and(ActiveTurnHandle::is_finished)
         {
             needs_draw = true;
-            let active_id = control.active().map(|active| active.id().to_string());
-            active_turn = None;
-            apply_pending_model_swap(
-                &mut pending_model_swap,
-                &transport,
-                &mut args,
-                store.as_ref(),
-                &session_id,
-                &mut chat,
-            );
-            if let Some(id) = active_id
-                && let Ok(settled) = control.finish_turn(&id)
-            {
-                start_next_follow_up(
-                    settled.next_follow_up,
+            if let Ok(ev) = agent_rx.try_recv() {
+                let terminal = turn_is_terminal(&ev);
+                let is_abort = matches!(&ev, AgentEvent::TurnAborted { .. });
+                if process_agent_event(
+                    ev,
                     &mut control,
                     &mut active_turn,
+                    &mut last_tokens_input,
+                    &mut last_tokens_output,
+                    &mut last_tokens_cached,
+                    store.as_ref(),
+                    &session_id,
+                    &mut chat,
+                    &mut pane,
+                ) {
+                    continue;
+                }
+                if terminal {
+                    settle_terminal_turn(
+                        is_abort,
+                        &mut active_turn,
+                        &mut control,
+                        &mut pending_model_swap,
+                        &transport,
+                        &mut args,
+                        &cwd,
+                        &store,
+                        &session_id,
+                        &agent_tx,
+                        &skills,
+                        &extensions,
+                        &project,
+                        &permissions,
+                        &mut chat,
+                        &mut pane,
+                    );
+                } else if agent_rx.try_recv().is_err() {
+                    reap_finished_turn(
+                        &mut active_turn,
+                        &mut control,
+                        &mut pending_model_swap,
+                        &transport,
+                        &mut args,
+                        &cwd,
+                        &store,
+                        &session_id,
+                        &agent_tx,
+                        &skills,
+                        &extensions,
+                        &project,
+                        &permissions,
+                        &mut chat,
+                        &mut pane,
+                    );
+                }
+            } else {
+                reap_finished_turn(
+                    &mut active_turn,
+                    &mut control,
+                    &mut pending_model_swap,
                     &transport,
-                    &args,
+                    &mut args,
                     &cwd,
                     &store,
                     &session_id,
@@ -232,8 +454,8 @@ pub async fn run(
             // Dedicated indicator row only when the agent is actually
             // working AND there's vertical room. Below the floor the
             // spinner stays inline in the status bar.
-            let show_indicator = matches!(state, AgentState::Working { .. })
-                && screen_h >= INDICATOR_SCREEN_FLOOR;
+            let show_indicator =
+                matches!(state, AgentState::Working { .. }) && screen_h >= INDICATOR_SCREEN_FLOOR;
             pane.update_status(StatusBarState {
                 model: args.model.clone(),
                 cwd_short: cwd_short.clone(),
@@ -246,6 +468,10 @@ pub async fn run(
                 context_window: args.auto_compact_token_limit,
                 show_indicator,
             });
+            if let Some(overlay) = app_overlay.as_mut() {
+                let overlay_width = screen_w.saturating_sub(2).max(1);
+                overlay.prepare(&chat, overlay_width, spinner_tick);
+            }
             let overlay: Option<&dyn AppOverlay> =
                 app_overlay.as_ref().map(|o| o as &dyn AppOverlay);
             draw_tui(
@@ -333,87 +559,64 @@ pub async fn run(
         tokio::select! {
             Some(ev) = agent_rx.recv() => {
                 needs_draw = true;
-                pane.apply_agent_event(&ev);
-                if let AgentEvent::PendingInputDequeued { id, .. } = &ev {
-                    control.remove_pending(id);
+                let terminal = turn_is_terminal(&ev);
+                let is_abort = matches!(&ev, AgentEvent::TurnAborted { .. });
+                if process_agent_event(
+                    ev,
+                    &mut control,
+                    &mut active_turn,
+                    &mut last_tokens_input,
+                    &mut last_tokens_output,
+                    &mut last_tokens_cached,
+                    store.as_ref(),
+                    &session_id,
+                    &mut chat,
+                    &mut pane,
+                ) {
+                    continue;
                 }
-                if let AgentEvent::TurnComplete { usage } = &ev
-                    && usage.tokens_input > 0
-                {
-                    last_tokens_input = usage.tokens_input;
-                    last_tokens_output = usage.tokens_output;
-                    last_tokens_cached = usage.tokens_input_cached;
-                }
-                if turn_is_terminal(&ev) {
-                    let active_id = control.active().map(|active| active.id().to_string());
-                    if matches!(ev, AgentEvent::TurnAborted { .. })
-                        && let Some(id) = active_id.as_deref()
-                        && let Ok(abort) = control.abort_turn(id, "turn aborted")
-                    {
-                        emit_pending_cleared(
-                            abort.cleared_steering_ids,
-                            store.as_ref(),
-                            &session_id,
-                            &mut chat,
-                            &mut pane,
-                        );
-                    }
-                    active_turn = None;
-                    apply_pending_model_swap(
+                if terminal {
+                    settle_terminal_turn(
+                        is_abort,
+                        &mut active_turn,
+                        &mut control,
                         &mut pending_model_swap,
                         &transport,
                         &mut args,
-                        store.as_ref(),
+                        &cwd,
+                        &store,
                         &session_id,
+                        &agent_tx,
+                        &skills,
+                        &extensions,
+                        &project,
+                        &permissions,
                         &mut chat,
+                        &mut pane,
                     );
-                    if let Some(id) = active_id
-                        && let Ok(settled) = control.finish_turn(&id)
-                    {
-                        start_next_follow_up(
-                            settled.next_follow_up,
-                            &mut control,
-                            &mut active_turn,
-                            &transport,
-                            &args,
-                            &cwd,
-                            &store,
-                            &session_id,
-                            &agent_tx,
-                            &skills,
-                            &extensions,
-                            &project,
-                            &permissions,
-                            &mut chat,
-                            &mut pane,
-                        );
-                    }
-                }
-                if matches!(ev, AgentEvent::UserMessage { .. }) {
-                    continue;
-                }
-                if let AgentEvent::ToolCallApprovalRequest {
-                    approval_id,
-                    tool,
-                    command,
-                    path,
-                    cwd: req_cwd,
-                    reason,
-                    ..
-                } = &ev
+                } else if active_turn
+                    .as_ref()
+                    .is_some_and(ActiveTurnHandle::is_finished)
+                    && agent_rx.try_recv().is_err()
                 {
-                    pane.enqueue_approval(PendingApproval {
-                        approval_id: approval_id.clone(),
-                        tool: tool.clone(),
-                        command: command.clone(),
-                        path: path.clone(),
-                        cwd: req_cwd.clone(),
-                        reason: reason.clone(),
-                    });
-                    chat.ingest(ev);
-                    continue;
+                    reap_finished_turn(
+                        &mut active_turn,
+                        &mut control,
+                        &mut pending_model_swap,
+                        &transport,
+                        &mut args,
+                        &cwd,
+                        &store,
+                        &session_id,
+                        &agent_tx,
+                        &skills,
+                        &extensions,
+                        &project,
+                        &permissions,
+                        &mut chat,
+                        &mut pane,
+                    );
                 }
-                chat.ingest(ev);
             }
             Some(app) = app_rx.recv() => {
                 needs_draw = true;
@@ -968,7 +1171,7 @@ pub async fn run(
                             } else if is_ctrl_t(&key) {
                                 match term.terminal.enter_alternate_screen() {
                                     Ok(state) => {
-                                        app_overlay = Some(Overlay::test());
+                                        app_overlay = Some(Overlay::transcript());
                                         overlay_state = Some(state);
                                     }
                                     Err(err) => {

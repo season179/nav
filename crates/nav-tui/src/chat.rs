@@ -1,17 +1,18 @@
 use nav_core::cli::ModelLine;
-use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit};
+use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit, TurnUsage};
+use std::time::Duration;
 use ratatui::text::Line;
 use std::collections::HashMap;
 
+use crate::cells::ExplorationEntry;
 use crate::cells::{
     AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
     CompactionPhase, ErrorCell, ExplorationOutputCell, ExploringSummaryCell, FileChangeCell,
     GitCheckpointCell, HookCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell,
     ReasoningCell, SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell,
     SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
-    TurnAbortedCell, TurnDiffCell, UserMessageCell,
+    FinalMessageSeparator, TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
-use crate::cells::ExplorationEntry;
 use crate::history::HistoryCell;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::theme::Theme;
@@ -70,6 +71,9 @@ pub struct ChatWidget {
     /// allow the next reply to immediately re-enter catch-up. Driven by
     /// [`Self::on_commit_tick`] from the app's frame loop.
     adaptive_chunking: AdaptiveChunkingPolicy,
+    /// Monotonic revision for overlay caches that render the full transcript
+    /// from finalized cells plus the in-flight live tail.
+    transcript_revision: u64,
 }
 
 impl ChatWidget {
@@ -90,6 +94,7 @@ impl ChatWidget {
             inflight_tool_calls: Vec::new(),
             pending_explorations: Vec::new(),
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
+            transcript_revision: 0,
         }
     }
 
@@ -101,7 +106,37 @@ impl ChatWidget {
         let Some(cell) = self.streaming_assistant.as_mut() else {
             return false;
         };
-        cell.on_commit_tick(&mut self.adaptive_chunking)
+        let changed = cell.on_commit_tick(&mut self.adaptive_chunking);
+        if changed {
+            self.bump_transcript_revision();
+        }
+        changed
+    }
+
+    pub(crate) fn transcript_revision(&self) -> u64 {
+        self.transcript_revision
+    }
+
+    pub(crate) fn has_live_tail(&self) -> bool {
+        self.streaming_assistant.is_some()
+            || !self.inflight_tool_calls.is_empty()
+            || !self.pending_explorations.is_empty()
+    }
+
+    /// Render the full app-owned transcript: finalized history cells plus the
+    /// current inline-only live tail (streaming text and in-flight tools).
+    pub(crate) fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        let mut out = Vec::new();
+        for cell in &self.finalized {
+            out.extend(cell.display_lines(width));
+        }
+        out.extend(self.inline_lines(width));
+        out
+    }
+
+    fn bump_transcript_revision(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
     }
 
     /// Append a user-authored message before the agent loop echoes the durable
@@ -165,6 +200,15 @@ impl ChatWidget {
         self.push_cell(TranscriptHitsCell::new(query, hits));
     }
 
+    /// Scrollback divider after a user turn finishes successfully.
+    ///
+    /// Not used for aborted or errored turns — those already have their own cells.
+    pub fn push_final_message_separator(&mut self, duration: Duration, usage: TurnUsage) {
+        self.end_active_turn_viewport();
+        self.finalized
+            .push(Box::new(FinalMessageSeparator::new(duration, usage)));
+    }
+
     /// Drain finalized cells that haven't been pushed to scrollback yet,
     /// rendering each at `width`. The main loop calls this once per tick
     /// before drawing the viewport. Cells stay in `finalized` so a later
@@ -195,6 +239,7 @@ impl ChatWidget {
     /// through `push_cell`, which finalizes the streaming row and queues
     /// it before appending the new cell.
     pub fn ingest(&mut self, event: AgentEvent) {
+        self.bump_transcript_revision();
         match event {
             AgentEvent::UserMessage {
                 text,
@@ -244,10 +289,8 @@ impl ChatWidget {
                     self.push_local_cell(ReasoningCell::new(text));
                 }
             }
-            AgentEvent::TurnComplete { usage: _ } => {
-                self.close_streaming_assistant();
-                self.drain_inflight_tool_calls();
-                self.turn_has_work = false;
+            AgentEvent::TurnComplete { .. } => {
+                self.end_active_turn_viewport();
             }
             AgentEvent::ToolCallApprovalRequest { .. } => {
                 self.close_streaming_assistant();
@@ -640,6 +683,12 @@ impl ChatWidget {
     fn push_local_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
         self.flush_explorations();
         self.finalized.push(Box::new(cell));
+    }
+
+    fn end_active_turn_viewport(&mut self) {
+        self.close_streaming_assistant();
+        self.drain_inflight_tool_calls();
+        self.turn_has_work = false;
     }
 
     fn close_streaming_assistant(&mut self) {
