@@ -3,7 +3,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nav_core::{AgentEvent, PendingInputMode};
-use nav_tui::bottom_pane::{BottomPane, ComposerEvent, MentionEntry, SlashEntry};
+use nav_tui::bottom_pane::{
+    AgentState, BottomPane, ComposerEvent, MentionEntry, SlashEntry, StatusBarState,
+};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use std::path::PathBuf;
@@ -323,4 +325,60 @@ fn bottom_pane_updates_pending_preview_for_edit_remove_and_clear() {
     render(&pane, &mut terminal);
     let rendered = rendered_text(&terminal);
     assert!(!rendered.contains("pending-1"), "{rendered}");
+}
+
+fn ready_status() -> StatusBarState {
+    StatusBarState {
+        model: "test-model".into(),
+        cwd_short: "~/proj".into(),
+        branch: Some("main".into()),
+        dirty: false,
+        agent_state: AgentState::Ready,
+        ..StatusBarState::default()
+    }
+}
+
+#[test]
+fn status_bar_renders_above_composer() {
+    let mut pane = BottomPane::new();
+    pane.update_status(ready_status());
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("terminal");
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+
+    // Layout order: row 0 = status bar, then composer below it. The status
+    // bar separator (`  ·  `) followed by the agent-state word is the
+    // canonical proof that the status row painted at all.
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert!(
+        lines[0].contains("·  Ready"),
+        "status row missing on first line:\n{rendered}"
+    );
+    assert!(
+        lines[0].contains("test-model") && lines[0].contains("main"),
+        "status row should carry model + branch:\n{rendered}"
+    );
+
+    // Composer prompt (`›`) must appear below the status row, never above.
+    let prompt_line = lines
+        .iter()
+        .position(|line| line.contains('›'))
+        .expect("composer prompt should render somewhere");
+    assert!(
+        prompt_line > 0,
+        "composer prompt should sit below the status row, found at line {prompt_line}:\n{rendered}"
+    );
+}
+
+#[test]
+fn desired_height_reserves_status_row_above_composer_floor() {
+    let pane = BottomPane::new();
+    // Status row (1) + composer floor (3) = 4. The pane should never report
+    // less than that; if it does, `draw_tui` will clip the status bar or the
+    // composer padding.
+    assert!(
+        pane.desired_height(80) >= 4,
+        "BottomPane minimum height must reserve the status row plus composer floor"
+    );
 }
