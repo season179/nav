@@ -86,6 +86,23 @@ impl BottomPane {
     /// Route a keystroke. Overlays see the key first; the composer only sees
     /// it when the overlay returns [`InputResult::Unhandled`].
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerEvent {
+        // Ctrl+P opens the file mention popup. Clears the composer and
+        // overlay state, sets the buffer to '@', and lets reconcile_popups
+        // open FileMentionPopup exactly as if the user had typed '@'.
+        // Modal overlays (approval, session picker) block Ctrl+P so the
+        // user can't accidentally discard a pending decision.
+        if is_ctrl_p(&key) {
+            if self.view.as_ref().is_some_and(|v| !v.is_text_driven()) {
+                return ComposerEvent::Nothing;
+            }
+            self.view = None;
+            self.slash_popup_suppressed = false;
+            self.mention_popup_suppressed = false;
+            self.composer.set_text("@");
+            self.reconcile_popups();
+            return ComposerEvent::Nothing;
+        }
+
         if let Some(view) = self.view.as_mut() {
             match view.handle_key(key, &mut self.composer) {
                 InputResult::Handled => {
@@ -226,4 +243,15 @@ fn is_composer_activity_key(key: KeyEvent) -> bool {
         KeyCode::Enter => key.modifiers.contains(KeyModifiers::SHIFT),
         _ => false,
     }
+}
+
+/// Check whether `key` is a Ctrl+P press (no Alt, to avoid colliding
+/// with Ctrl+Alt+P / AltGr combos that produce a literal character on
+/// some keyboard layouts). Ignores Release events so the handler fires
+/// exactly once per physical keypress.
+fn is_ctrl_p(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('p')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
