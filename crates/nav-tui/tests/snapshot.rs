@@ -75,13 +75,17 @@ fn wrapped_skill_prompt_renders_as_skill_then_user_request() {
 
     let rendered = render_widget(&mut widget, 90, 10);
 
-    assert!(rendered.contains("◆ skill  zoom-out"), "{rendered}");
+    assert!(rendered.contains("$ zoom-out"), "{rendered}");
     assert!(
         rendered.contains("› Inspect the TUI modules."),
         "{rendered}"
     );
     assert!(!rendered.contains("<skill"), "{rendered}");
     assert!(!rendered.contains("Skill body"), "{rendered}");
+    assert!(
+        !rendered.contains("applied to this turn"),
+        "skill activation context stays hidden until expand: {rendered}"
+    );
 }
 
 #[test]
@@ -96,7 +100,7 @@ fn wrapped_skill_prompt_uses_outer_closing_tag() {
 
     let rendered = render_widget(&mut widget, 90, 10);
 
-    assert!(rendered.contains("◆ skill  zoom-out"), "{rendered}");
+    assert!(rendered.contains("$ zoom-out"), "{rendered}");
     assert!(
         rendered.contains("› Inspect the TUI modules."),
         "{rendered}"
@@ -116,7 +120,7 @@ fn literal_skill_xml_without_nav_dir_attribute_stays_user_text() {
 
     let rendered = render_widget(&mut widget, 90, 10);
 
-    assert!(!rendered.contains("◆ skill"), "{rendered}");
+    assert!(!rendered.contains("$ literal"), "{rendered}");
     assert!(
         rendered.contains("› <skill name=\"literal\">"),
         "{rendered}"
@@ -1141,7 +1145,7 @@ fn local_helpers_mid_stream_flush_streaming_first() {
 
     let rendered = render_widget(&mut widget, 70, 12);
     let first_idx = rendered.find("first reply").expect("first assistant text");
-    let skill_idx = rendered.find("◆ skill").expect("skill row");
+    let skill_idx = rendered.find("$ zoom-out").expect("skill row");
     let second_idx = rendered
         .find("second reply")
         .expect("second assistant text");

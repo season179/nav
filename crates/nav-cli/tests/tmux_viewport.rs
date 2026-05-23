@@ -1501,6 +1501,65 @@ fn reasoning_content_lands_in_reasoning_cell_not_assistant() {
     );
 }
 
+fn write_mock_project_skill(workdir: &TempDir, name: &str) {
+    let skill_dir = workdir.path().join(".agents/skills").join(name);
+    fs::create_dir_all(&skill_dir).expect("create mock skill dir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: tmux viewport test skill\n---\n\nBody for {name}.\n"
+        ),
+    )
+    .expect("write mock SKILL.md");
+}
+
+/// Queuing a project skill via `/name` must land as a quiet `$ skill-name` chip
+/// in scrollback, not the old `◆ skill` callout with inline activation context.
+#[test]
+fn skill_invocation_renders_compact_chip_in_scrollback() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let workdir = tempdir().expect("tempdir for mock project skill");
+    write_mock_project_skill(&workdir, "tmux-demo");
+
+    let session = fresh_session("skill-chip");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && OPENAI_API_KEY={TEST_API_KEY} {nav} --auth api-key"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "skill chip test nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("/tmux-demo");
+
+    let pane = session.wait_for(
+        |pane| pane.contains("$ tmux-demo"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        pane.contains("$ tmux-demo"),
+        "skill invocation chip missing from scrollback:\n{pane}"
+    );
+    assert!(
+        !pane.contains("queued for the next prompt"),
+        "activation context must stay hidden until expand:\n{pane}"
+    );
+    assert!(
+        !pane.contains("◆ skill"),
+        "skill invocation must not use callout styling:\n{pane}"
+    );
+}
+
 /// `/sessions` opens the alt-screen resume picker; fuzzy filter narrows the
 /// list and Enter resumes the highlighted session.
 #[test]

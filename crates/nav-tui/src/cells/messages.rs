@@ -177,9 +177,14 @@ impl HistoryCell for AssistantStreamingCell {
 /// assistant rows should use [`AgentMarkdownCell`].
 pub type AssistantMessageCell = AssistantStreamingCell;
 
+const SKILL_CHIP_GLYPH: &str = "$";
+
+/// Quiet chip for a skill the user invoked. Collapsed by default (`$ skill-name`);
+/// expanded shows activation context in [`Self::detail`].
 pub struct SkillInvocationCell {
     name: String,
     detail: String,
+    expanded: bool,
 }
 
 impl SkillInvocationCell {
@@ -187,18 +192,27 @@ impl SkillInvocationCell {
         Self {
             name: name.into(),
             detail: detail.into(),
+            expanded: false,
         }
+    }
+
+    pub fn set_expanded(&mut self, expanded: bool) {
+        self.expanded = expanded;
+    }
+
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
     }
 }
 
 impl HistoryCell for SkillInvocationCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let body = if self.detail.is_empty() {
-            self.name.clone()
+        let body = if self.expanded && !self.detail.is_empty() {
+            format!("{}\n{}", self.name, self.detail)
         } else {
-            format!("{} — {}", self.name, self.detail)
+            self.name.clone()
         };
-        TranscriptRow::new(TranscriptRowKind::SkillInvocation, body).render(width)
+        TranscriptRow::quiet_chip(SKILL_CHIP_GLYPH, body).render(width)
     }
 }
 
@@ -373,6 +387,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn skill_invocation_quiet_chip_collapses_detail_until_expanded() {
+        let mut cell = SkillInvocationCell::new("zoom-out", "applied to this turn");
+
+        let collapsed = lines_text(&cell.display_lines(60));
+        assert!(collapsed.contains("$ zoom-out"), "{collapsed}");
+        assert!(!collapsed.contains("applied to this turn"), "{collapsed}");
+        assert!(!collapsed.contains('◆'), "{collapsed}");
+
+        cell.set_expanded(true);
+        let expanded = lines_text(&cell.display_lines(60));
+        assert!(expanded.contains("$ zoom-out"), "{expanded}");
+        assert!(expanded.contains("applied to this turn"), "{expanded}");
+        assert!(
+            !expanded.contains("zoom-out — applied"),
+            "expanded detail should wrap on its own line, not inline: {expanded}"
+        );
     }
 
     #[test]

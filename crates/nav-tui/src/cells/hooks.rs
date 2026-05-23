@@ -100,8 +100,7 @@ impl HistoryCell for HookCell {
         match self.visibility {
             HookVisibility::Hidden => Vec::new(),
             HookVisibility::Compact => {
-                let kind = TranscriptRowKind::HookCompact;
-                TranscriptRow::new(kind, self.compact_body()).render(width)
+                TranscriptRow::quiet_chip("✓", self.compact_body()).render(width)
             }
             HookVisibility::Full => {
                 let kind = if self.success {
