@@ -25,6 +25,7 @@ mod render;
 mod session_picker;
 mod slash_popup;
 mod status_bar;
+mod status_indicator;
 mod view;
 
 pub use approval::ApprovalOverlay;
@@ -37,6 +38,7 @@ pub use slash_popup::{
     build_slash_entries_with_extensions,
 };
 pub use status_bar::{AgentState, StatusBarState};
+pub use status_indicator::INDICATOR_SCREEN_FLOOR;
 pub use view::{BottomPaneView, InputResult};
 
 /// Width of the gutter column that renders the `›` prompt next to the
