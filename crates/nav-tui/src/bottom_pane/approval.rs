@@ -26,15 +26,18 @@ const CMD_PREFIX_LEN: u16 = 2;
 enum RiskTier {
     /// Destructive commands: `dangerous_pattern`, `protected_metadata`.
     High,
-    /// Everything else: `not_in_safelist`, `protected_read`,
-    /// `external_directory`, `model_requested`.
+    /// Moderate risk: `not_in_safelist`, `protected_read`,
+    /// `external_directory`.
     Warn,
+    /// The model asked for confirmation explicitly — informational.
+    Info,
 }
 
 impl RiskTier {
     fn from_reason(reason: &str) -> Self {
         match reason {
             "dangerous_pattern" | "protected_metadata" => RiskTier::High,
+            "model_requested" => RiskTier::Info,
             _ => RiskTier::Warn,
         }
     }
@@ -43,6 +46,7 @@ impl RiskTier {
         match self {
             RiskTier::High => Color::Red,
             RiskTier::Warn => Color::Yellow,
+            RiskTier::Info => Color::Cyan,
         }
     }
 }
@@ -304,8 +308,8 @@ impl ApprovalOverlay {
 }
 
 /// Word-wrap a command string to `max_width` columns. Returns at least
-/// one line. Simple char-based wrapping (good enough for shell commands
-/// which are mostly ASCII).
+/// one line. Char-based wrapping so multi-byte UTF-8 in URLs/paths
+/// doesn't panic.
 fn wrap_command(cmd: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![cmd.to_string()];
@@ -317,7 +321,8 @@ fn wrap_command(cmd: &str, max_width: usize) -> Vec<String> {
             lines.push(remaining.to_string());
             break;
         }
-        // Byte offset of the char just past the width limit.
+        // Char offset of the char just past the width limit — find its
+        // byte position so slicing is UTF-8 safe.
         let byte_limit = remaining
             .char_indices()
             .nth(max_width)
@@ -528,8 +533,8 @@ mod tests {
     #[test]
     fn renders_command_line() {
         let o = overlay();
-        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
-        o.render(Rect::new(0, 0, 80, 10), &mut buf);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 12));
+        o.render(Rect::new(0, 0, 80, 12), &mut buf);
         let dump = format!("{:?}", buf);
         // Smoke-check that the keybinding hint is present.
         assert!(dump.contains("[y]es"), "keybinding line missing");
@@ -564,9 +569,10 @@ mod tests {
     }
 
     #[test]
-    fn model_requested_gets_yellow_border() {
+    fn model_requested_gets_cyan_border() {
         let o = overlay_with_reason("model_requested");
-        assert_eq!(o.risk, RiskTier::Warn);
+        assert_eq!(o.risk, RiskTier::Info);
+        assert_eq!(o.risk.border_color(), Color::Cyan);
     }
 
     // --- Scroll tests ---
@@ -710,6 +716,16 @@ mod tests {
     fn wrap_hard_breaks_when_only_space_at_position_zero() {
         let lines = wrap_command(" aaaaa", 3);
         assert_eq!(lines, vec![" aa", "aaa"]);
+    }
+
+    #[test]
+    fn wrap_handles_multibyte_utf8() {
+        // Japanese URL — multi-byte chars should not panic.
+        let lines = wrap_command("$ curl https://例え.jp/very/long/path", 20);
+        assert!(!lines.is_empty());
+        // All content preserved when reassembled.
+        let rejoined = lines.join(" ");
+        assert!(rejoined.contains("例え.jp"));
     }
 
     #[test]
