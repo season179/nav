@@ -113,7 +113,7 @@ mod tests {
         let widget = StatusIndicatorWidget { state: &state };
         widget.render(*b.area(), &mut b);
         let text = row_text(&b);
-        assert!(text.contains("⠴ Working 5s"), "spinner+elapsed missing: {text:?}");
+        assert!(text.contains("⠴ Working    5s"), "spinner+elapsed missing: {text:?}");
         assert!(
             text.contains("Ctrl+C to interrupt"),
             "interrupt hint missing: {text:?}"
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn animated_dots_cycle_through_phases() {
         // tick / 4 % 4:  0 → "",  4 → ".",  8 → "..",  12 → "..."
-        let cases = [(0, "Working 5s"), (4, "Working. 5s"), (8, "Working.. 5s"), (12, "Working... 5s")];
+        let cases = [(0, "Working    5s"), (4, "Working.   5s"), (8, "Working..  5s"), (12, "Working... 5s")];
         for (tick, expected) in cases {
             let state = working_state_at_tick(true, tick);
             let mut b = buf(80);

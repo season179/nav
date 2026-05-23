@@ -81,9 +81,9 @@ pub enum AgentState {
 /// Cycles `""` → `"."` → `".."` → `"..."` at ~3 Hz (tick rate ~12.5 Hz).
 pub(super) fn working_dots(tick: u64) -> &'static str {
     match (tick / 4) % 4 {
-        0 => "",
-        1 => ".",
-        2 => "..",
+        0 => "   ",
+        1 => ".  ",
+        2 => ".. ",
         _ => "...",
     }
 }
