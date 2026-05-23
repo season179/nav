@@ -61,19 +61,7 @@ fn resolve_decision(
     snapshot: QueueSnapshot,
     now: Instant,
 ) -> ChunkingDecision {
-    let prior_mode = policy.mode();
-    let decision = policy.decide(snapshot, now);
-    if decision.mode != prior_mode {
-        tracing::trace!(
-            prior_mode = ?prior_mode,
-            new_mode = ?decision.mode,
-            queued_lines = snapshot.queued_lines,
-            oldest_queued_age_ms = snapshot.oldest_age.map(|age| age.as_millis() as u64),
-            entered_catch_up = decision.entered_catch_up,
-            "stream chunking mode transition"
-        );
-    }
-    decision
+    policy.decide(snapshot, now)
 }
 
 fn apply_decision(

@@ -14,7 +14,6 @@ use super::StreamState;
 /// Cached width used for queue refreshes and fallback line rendering.
 const DEFAULT_STREAM_WIDTH: u16 = 80;
 
-#[derive(Default)]
 pub(crate) struct StreamController {
     collector: MarkdownStreamCollector,
     stream_state: StreamState,

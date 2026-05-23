@@ -36,5 +36,5 @@ pub use cells::{
 };
 pub use history::HistoryCell;
 pub use commands::{SlashAction, classify_slash, prepend_pending_skill};
-pub use streaming::StreamController;
+pub(crate) use streaming::StreamController;
 pub use chat::ChatWidget;
