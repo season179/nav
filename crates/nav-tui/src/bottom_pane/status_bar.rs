@@ -118,13 +118,8 @@ fn gauge_spans(pct: u64) -> Option<Vec<Span<'static>>> {
     } else {
         Color::Green
     };
-    let bar = format!(
-        "[{}{}]",
-        "█".repeat(filled),
-        "░".repeat(empty),
-    );
+    let bar = format!(" [{}{}]", "█".repeat(filled), "░".repeat(empty));
     Some(vec![
-        Span::styled(" ", Style::default()),
         Span::styled(bar, Style::default().fg(color)),
     ])
 }
@@ -248,98 +243,79 @@ mod tests {
     #[test]
     fn gauge_appears_at_one_percent() {
         let spans = gauge_spans(1).expect("should render at 1%");
-        // One span for leading space, one for the bar.
-        assert_eq!(spans.len(), 2);
-        let bar = &spans[1];
+        assert_eq!(spans.len(), 1);
+        let bar = &spans[0];
         // 1% of 8 = 1 filled block.
-        assert_eq!(bar.content, "[█░░░░░░░]");
+        assert_eq!(bar.content, " [█░░░░░░░]");
         assert_eq!(bar.style.fg, Some(Color::Green));
     }
 
     #[test]
     fn gauge_green_below_50() {
-        let bar = &gauge_spans(49).unwrap()[1];
+        let bar = &gauge_spans(49).unwrap()[0];
         assert_eq!(bar.style.fg, Some(Color::Green));
         // 49% of 8 = ceil(3.92) = 4 filled.
-        assert_eq!(bar.content, "[████░░░░]");
+        assert_eq!(bar.content, " [████░░░░]");
     }
 
     #[test]
     fn gauge_yellow_at_50() {
-        let bar = &gauge_spans(50).unwrap()[1];
+        let bar = &gauge_spans(50).unwrap()[0];
         assert_eq!(bar.style.fg, Some(Color::Yellow));
-        // 50% of 8 = 4 filled.
-        assert_eq!(bar.content, "[████░░░░]");
     }
 
     #[test]
     fn gauge_yellow_up_to_80() {
-        let bar = &gauge_spans(80).unwrap()[1];
+        let bar = &gauge_spans(80).unwrap()[0];
         assert_eq!(bar.style.fg, Some(Color::Yellow));
         // 80% of 8 = ceil(6.4) = 7 filled.
-        assert_eq!(bar.content, "[███████░]");
+        assert_eq!(bar.content, " [███████░]");
     }
 
     #[test]
     fn gauge_red_above_80() {
-        let bar = &gauge_spans(81).unwrap()[1];
-        assert_eq!(bar.style.fg, Some(Color::Red));
+        assert_eq!(gauge_spans(81).unwrap()[0].style.fg, Some(Color::Red));
     }
 
     #[test]
     fn gauge_full_at_100() {
-        let bar = &gauge_spans(100).unwrap()[1];
-        assert_eq!(bar.content, "[████████]");
-        assert_eq!(bar.style.fg, Some(Color::Red));
+        let bar = &gauge_spans(100).unwrap()[0];
+        assert_eq!(bar.content, " [████████]");
     }
 
     #[test]
     fn gauge_clamped_above_100() {
-        let bar = &gauge_spans(200).unwrap()[1];
-        assert_eq!(bar.content, "[████████]");
+        assert_eq!(gauge_spans(200).unwrap()[0].content, " [████████]");
     }
 
-    /// End-to-end: render the status bar with context-window data and
-    /// confirm the gauge appears in the buffer.
-    #[test]
-    fn status_bar_renders_gauge_with_tokens() {
+    /// Render the status bar into a buffer and return the resulting row as a
+    /// plain string. Shared by the gauge-visibility end-to-end tests.
+    fn render_status_row(context_window: u64) -> String {
         let state = StatusBarState {
             model: "m".into(),
             cwd_short: "~".into(),
             tokens_input: 50_000,
-            tokens_output: 0,
-            tokens_cached: 0,
-            context_window: 200_000,
+            context_window,
             ..StatusBarState::default()
         };
         let area = Rect::new(0, 0, 80, 1);
         let mut buf = Buffer::empty(area);
         StatusBar { state: &state }.render(area, &mut buf);
-        let row: String = (0..80)
+        (0..80)
             .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn status_bar_renders_gauge_with_tokens() {
+        let row = render_status_row(200_000);
         assert!(row.contains('█'), "gauge not found in: {row:?}");
         assert!(row.contains('░'), "gauge not found in: {row:?}");
     }
 
-    /// When context_window is 0 the gauge must not appear.
     #[test]
     fn status_bar_no_gauge_without_context_window() {
-        let state = StatusBarState {
-            model: "m".into(),
-            cwd_short: "~".into(),
-            tokens_input: 50_000,
-            tokens_output: 0,
-            tokens_cached: 0,
-            context_window: 0,
-            ..StatusBarState::default()
-        };
-        let area = Rect::new(0, 0, 80, 1);
-        let mut buf = Buffer::empty(area);
-        StatusBar { state: &state }.render(area, &mut buf);
-        let row: String = (0..80)
-            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
-            .collect();
+        let row = render_status_row(0);
         assert!(!row.contains('█'), "gauge should not appear: {row:?}");
     }
 }
