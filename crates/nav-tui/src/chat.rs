@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use crate::cells::{
     AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
     CompactionPhase, ErrorCell, ExplorationOutputCell, ExploringSummaryCell, FileChangeCell,
-    GitCheckpointCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell, SessionListCell,
-    SessionNoticeCell, SessionTreeCell, SkillInvocationCell, SubagentCell, ToolCallCell,
-    ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell, TurnDiffCell,
-    UserMessageCell,
+    GitCheckpointCell, HookCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell,
+    SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell, SubagentCell,
+    ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell,
+    TurnDiffCell, UserMessageCell,
 };
 use crate::cells::ExplorationEntry;
 use crate::history::HistoryCell;
@@ -470,6 +470,23 @@ impl ChatWidget {
                     )
                 };
                 self.push_cell(SessionNoticeCell::new("rewind", detail));
+            }
+            AgentEvent::HookStarted { .. } => {
+                // Hooks are intentionally quiet — no in-progress indicator.
+                // The HookCompleted handler decides visibility.
+            }
+            AgentEvent::HookCompleted {
+                name,
+                duration_ms,
+                stdout,
+                stderr,
+                success,
+                ..
+            } => {
+                let cell = HookCell::new(name, duration_ms, stdout, stderr, success);
+                if cell.is_visible() {
+                    self.push_cell(cell);
+                }
             }
         }
     }

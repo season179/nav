@@ -340,6 +340,8 @@ fn export_events_markdown(events: &[AgentEvent]) -> Result<String> {
             | AgentEvent::GitCheckpoint { .. }
             | AgentEvent::CompactionStarted { .. }
             | AgentEvent::CompactionFailed { .. }
+            | AgentEvent::HookStarted { .. }
+            | AgentEvent::HookCompleted { .. }
             | AgentEvent::SessionRewound { .. } => {
                 start_turn(&mut out, &mut turn, &mut in_turn);
                 push_json_details(&mut out, &format!("Event: {}", event.kind()), event)?;

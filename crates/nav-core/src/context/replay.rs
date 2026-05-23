@@ -221,6 +221,8 @@ fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
         | AgentEvent::CompactionStarted { .. }
         | AgentEvent::CompactionCompleted { .. }
         | AgentEvent::CompactionFailed { .. }
+        | AgentEvent::HookStarted { .. }
+        | AgentEvent::HookCompleted { .. }
         | AgentEvent::Error { .. } => {}
     }
 }
