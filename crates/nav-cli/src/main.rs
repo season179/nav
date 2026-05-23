@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
             permissions,
         )
         .with_session(Some(&binding), initial_input)
+        .with_extensions(Some(extensions.as_ref()))
         .with_context(Some(project.as_ref())),
     );
     let drainer = async {

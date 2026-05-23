@@ -7,7 +7,10 @@ use crate::context::compaction::{SUMMARIZATION_PROMPT, SUMMARY_PREFIX, summary_m
 use crate::context::replay::{
     CLEARED_TOOL_OUTPUT_PLACEHOLDER, REDUCED_TOOL_OUTPUT_PREFIX, rebuild_responses_input,
 };
-use crate::context::{Catalog, ProjectContext, build_user_content};
+use crate::context::{
+    Catalog, ExtensionCatalog, ExtensionHook, ExtensionScope, HookCommand, HookEventType,
+    ProjectContext, build_user_content,
+};
 use crate::guardrails::approval::{ApprovalGate, ApprovalRequest};
 use crate::guardrails::{
     AskForApproval, PassthroughRunner, PermissionContext, ReviewDecision, SandboxPolicy,
@@ -1700,6 +1703,100 @@ async fn run_agent_emits_expected_sequence_with_usage() {
         events.last().unwrap(),
         AgentEvent::TurnComplete { .. }
     ));
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn run_agent_executes_pre_and_post_turn_hooks() {
+    let turn = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Done."}]
+            }
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {}
+        }),
+    ];
+    let transport = StubTransport::new(vec![turn]);
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    let extensions = ExtensionCatalog::with_hooks(
+        vec![],
+        vec![],
+        vec![],
+        vec![
+            test_hook("before", HookEventType::PreTurn, "printf pre", &cwd),
+            test_hook("after", HookEventType::PostTurn, "printf post", &cwd),
+        ],
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    super::run_agent(
+        AgentTurnRequest::new(
+            &transport,
+            &args,
+            &cwd,
+            "hello",
+            tx,
+            &Catalog::default(),
+            unchecked_permission_context(),
+        )
+        .with_extensions(Some(&extensions)),
+    )
+    .await
+    .expect("run_agent should succeed");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(matches!(events[0], AgentEvent::UserMessage { .. }));
+    assert!(matches!(
+        events[1],
+        AgentEvent::HookStarted {
+            ref name,
+            ref event_type
+        } if name == "before" && event_type == "pre_turn"
+    ));
+    assert!(matches!(
+        events[2],
+        AgentEvent::HookCompleted {
+            ref name,
+            ref event_type,
+            ref stdout,
+            success,
+            ..
+        } if name == "before" && event_type == "pre_turn" && stdout == "pre" && success
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HookCompleted {
+            name,
+            event_type,
+            stdout,
+            success,
+            ..
+        } if name == "after" && event_type == "post_turn" && stdout == "post" && *success
+    )));
+}
+
+#[cfg(unix)]
+fn test_hook(name: &str, event_type: HookEventType, command: &str, cwd: &Path) -> ExtensionHook {
+    ExtensionHook {
+        name: name.into(),
+        extension_name: "demo".into(),
+        extension_dir: cwd.to_path_buf(),
+        scope: ExtensionScope::Project,
+        event_type,
+        command: HookCommand::Shell(command.into()),
+        timeout: std::time::Duration::from_secs(5),
+    }
 }
 
 #[tokio::test]
