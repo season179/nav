@@ -450,11 +450,11 @@ fn request_is_complete(received: &[u8]) -> bool {
     let headers = String::from_utf8_lossy(&received[..header_end]);
     let content_length = headers
         .lines()
-        .find_map(|line| line.split_once(':'))
-        .and_then(|(name, value)| {
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| {
             name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
+                .then_some(value.trim())
+                .and_then(|value| value.parse::<usize>().ok())
         })
         .unwrap_or(0);
     received.len().saturating_sub(body_start) >= content_length
