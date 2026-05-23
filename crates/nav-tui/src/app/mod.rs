@@ -1016,7 +1016,10 @@ pub async fn run(
                             }
                             ctrl_c_count = 0;
                             // Ctrl+L — force a full redraw (readline convention).
+                            // Invalidate the diff base so flush() repaints every
+                            // cell, not just ones that differ from last frame.
                             if is_ctrl_l(&key) {
+                                term.terminal.invalidate_previous_buffer();
                                 needs_draw = true;
                                 continue;
                             }

@@ -511,6 +511,12 @@ where
         Ok(())
     }
 
+    /// Clear the previous (diff-base) buffer so the next [`Self::flush`]
+    /// treats every cell as changed and issues a full repaint.
+    pub fn invalidate_previous_buffer(&mut self) {
+        self.previous_buffer_mut().reset();
+    }
+
     /// Clears the inactive buffer and swaps it with the current buffer
     fn swap_buffers(&mut self) {
         self.previous_buffer_mut().reset();
