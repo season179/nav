@@ -98,14 +98,15 @@ pub(super) fn working_pulse_color(tick: u64) -> Color {
     }
 }
 
-/// Gauge width in characters (exclusive of the surrounding brackets).
+/// Gauge width in characters (exclusive of the leading space and brackets).
+/// Total rendered width: 1 (space) + 1 (`[`) + 8 (inner) + 1 (`]`) = 11 chars.
 const GAUGE_INNER: usize = 8;
 
-/// Build a coloured gauge string like `[████░░░░]` representing `pct`
+/// Build a coloured gauge span like ` [████░░░░]` representing `pct`
 /// percent fill. Returns `None` when `pct` is 0 (gauge hidden).
 ///
 /// Colour thresholds: green < 50%, yellow 50–80%, red > 80%.
-fn gauge_spans(pct: u64) -> Option<Vec<Span<'static>>> {
+fn gauge_span(pct: u64) -> Option<Span<'static>> {
     if pct == 0 {
         return None;
     }
@@ -118,10 +119,10 @@ fn gauge_spans(pct: u64) -> Option<Vec<Span<'static>>> {
     } else {
         Color::Green
     };
-    let bar = format!(" [{}{}]", "█".repeat(filled), "░".repeat(empty));
-    Some(vec![
-        Span::styled(bar, Style::default().fg(color)),
-    ])
+    Some(Span::styled(
+        format!(" [{}{}]", "█".repeat(filled), "░".repeat(empty)),
+        Style::default().fg(color),
+    ))
 }
 
 /// Format `tokens` as `<n.n>k` (one decimal). Caller must gate on
@@ -222,8 +223,8 @@ impl<'a> Widget for StatusBar<'a> {
             {
                 let denom_k = (s.context_window + 500) / 1_000;
                 spans.push(Span::styled(format!(" · {denom_k}k {pct}%"), dim));
-                if let Some(gauge) = gauge_spans(pct) {
-                    spans.extend(gauge);
+                if let Some(gauge) = gauge_span(pct) {
+                    spans.push(gauge);
                 }
             }
         }
@@ -237,14 +238,12 @@ mod tests {
 
     #[test]
     fn gauge_hidden_when_pct_zero() {
-        assert!(gauge_spans(0).is_none());
+        assert!(gauge_span(0).is_none());
     }
 
     #[test]
     fn gauge_appears_at_one_percent() {
-        let spans = gauge_spans(1).expect("should render at 1%");
-        assert_eq!(spans.len(), 1);
-        let bar = &spans[0];
+        let bar = gauge_span(1).expect("should render at 1%");
         // 1% of 8 = 1 filled block.
         assert_eq!(bar.content, " [█░░░░░░░]");
         assert_eq!(bar.style.fg, Some(Color::Green));
@@ -252,7 +251,7 @@ mod tests {
 
     #[test]
     fn gauge_green_below_50() {
-        let bar = &gauge_spans(49).unwrap()[0];
+        let bar = gauge_span(49).unwrap();
         assert_eq!(bar.style.fg, Some(Color::Green));
         // 49% of 8 = ceil(3.92) = 4 filled.
         assert_eq!(bar.content, " [████░░░░]");
@@ -260,13 +259,12 @@ mod tests {
 
     #[test]
     fn gauge_yellow_at_50() {
-        let bar = &gauge_spans(50).unwrap()[0];
-        assert_eq!(bar.style.fg, Some(Color::Yellow));
+        assert_eq!(gauge_span(50).unwrap().style.fg, Some(Color::Yellow));
     }
 
     #[test]
     fn gauge_yellow_up_to_80() {
-        let bar = &gauge_spans(80).unwrap()[0];
+        let bar = gauge_span(80).unwrap();
         assert_eq!(bar.style.fg, Some(Color::Yellow));
         // 80% of 8 = ceil(6.4) = 7 filled.
         assert_eq!(bar.content, " [███████░]");
@@ -274,18 +272,17 @@ mod tests {
 
     #[test]
     fn gauge_red_above_80() {
-        assert_eq!(gauge_spans(81).unwrap()[0].style.fg, Some(Color::Red));
+        assert_eq!(gauge_span(81).unwrap().style.fg, Some(Color::Red));
     }
 
     #[test]
     fn gauge_full_at_100() {
-        let bar = &gauge_spans(100).unwrap()[0];
-        assert_eq!(bar.content, " [████████]");
+        assert_eq!(gauge_span(100).unwrap().content, " [████████]");
     }
 
     #[test]
     fn gauge_clamped_above_100() {
-        assert_eq!(gauge_spans(200).unwrap()[0].content, " [████████]");
+        assert_eq!(gauge_span(200).unwrap().content, " [████████]");
     }
 
     /// Render the status bar into a buffer and return the resulting row as a
