@@ -302,6 +302,7 @@ impl Default for BottomPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -422,6 +423,140 @@ mod tests {
         assert!(pane.has_overlay());
         pane.handle_key(key(KeyCode::Enter));
         assert!(!pane.has_overlay());
+        assert_eq!(
+            pane.take_session_selection(),
+            Some("01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string())
+        );
+    }
+
+    fn ctrl_p() -> KeyEvent {
+        KeyEvent::new_with_kind(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        )
+    }
+
+    fn pane_with_entries() -> BottomPane {
+        let slash: Arc<[SlashEntry]> = vec![SlashEntry::builtin(BUILTIN_SLASH_COMMANDS[0])].into();
+        let mention: Arc<[MentionEntry]> = vec![
+            MentionEntry { display: "src/main.rs".into() },
+            MentionEntry { display: "src/composer.rs".into() },
+            MentionEntry { display: "Cargo.toml".into() },
+        ].into();
+        BottomPane::with_entries(slash, mention, PathBuf::from("."))
+    }
+
+    #[test]
+    fn ctrl_p_inserts_at_and_opens_mention_popup() {
+        let mut pane = pane_with_entries();
+        assert!(!pane.has_overlay());
+        pane.handle_key(ctrl_p());
+        assert_eq!(pane.composer().text(), "@");
+        assert!(has_mention_popup(&pane));
+    }
+
+    fn has_mention_popup(pane: &BottomPane) -> bool {
+        pane.view
+            .as_deref()
+            .and_then(|v| v.as_any().downcast_ref::<FileMentionPopup>())
+            .is_some()
+    }
+
+    #[test]
+    fn ctrl_p_then_typing_filters_popup() {
+        let mut pane = pane_with_entries();
+        pane.handle_key(ctrl_p());
+        type_str(&mut pane, "cargo");
+        assert_eq!(pane.composer().text(), "@cargo");
+        assert!(pane.has_overlay());
+    }
+
+    #[test]
+    fn ctrl_p_dismisses_existing_overlay() {
+        let mut pane = pane_with_entries();
+        type_str(&mut pane, "/help");
+        assert!(pane.has_overlay());
+        // Ctrl+P should dismiss the slash popup, clear composer, and open
+        // a fresh mention popup.
+        pane.handle_key(ctrl_p());
+        assert!(has_mention_popup(&pane));
+        assert_eq!(pane.composer().text(), "@");
+    }
+
+    fn type_str(pane: &mut BottomPane, s: &str) {
+        for ch in s.chars() {
+            pane.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    #[test]
+    fn ctrl_p_then_enter_selects_file() {
+        let mut pane = pane_with_entries();
+        pane.handle_key(ctrl_p());
+        // Press Enter to select the first match (src/main.rs)
+        let event = pane.handle_key(key(KeyCode::Enter));
+        assert!(matches!(event, ComposerEvent::Nothing));
+        // The @ should be replaced with the file path
+        assert!(pane.composer().text().contains("src/main.rs"));
+    }
+
+    #[test]
+    fn ctrl_p_then_esc_dismisses_popup() {
+        let mut pane = pane_with_entries();
+        pane.handle_key(ctrl_p());
+        pane.handle_key(key(KeyCode::Esc));
+        assert!(!pane.has_overlay());
+        // The @ remains in the composer
+        assert_eq!(pane.composer().text(), "@");
+    }
+
+    #[test]
+    fn ctrl_p_noop_when_mention_entries_empty() {
+        let mut pane = BottomPane::new();
+        pane.handle_key(ctrl_p());
+        // No popup because there are no entries to show
+        assert!(!pane.has_overlay());
+        // But @ is still inserted
+        assert_eq!(pane.composer().text(), "@");
+    }
+
+    #[test]
+    fn ctrl_p_does_not_dismiss_approval_overlay() {
+        let mut pane = pane_with_entries();
+        pane.enqueue_approval(approval("a1"));
+        assert!(pane.has_overlay());
+        // Ctrl+P must not destroy the approval modal
+        pane.handle_key(ctrl_p());
+        assert!(pane.has_overlay());
+        // Composer should be untouched
+        assert!(pane.composer().text().is_empty());
+        // The approval should still be responsive
+        pane.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(
+            pane.take_approval_decision(),
+            Some(("a1".to_string(), ReviewDecision::Approved))
+        );
+    }
+
+    #[test]
+    fn ctrl_p_does_not_dismiss_session_picker_overlay() {
+        let mut pane = pane_with_entries();
+        pane.open_session_picker(vec![SessionPickerEntry {
+            id: "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+            name: Some("release work".to_string()),
+            created_at: 100,
+            last_active: 250,
+            turn_count: 2,
+            title: Some("Implement picker".to_string()),
+        }]);
+        assert!(pane.has_overlay());
+        // Ctrl+P must not destroy the session picker modal
+        pane.handle_key(ctrl_p());
+        assert!(pane.has_overlay());
+        assert!(pane.composer().text().is_empty());
+        // The session picker should still be responsive
+        pane.handle_key(key(KeyCode::Enter));
         assert_eq!(
             pane.take_session_selection(),
             Some("01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string())
