@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+mod inline_region;
 mod permissions;
 mod render;
 mod session;
