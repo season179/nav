@@ -92,15 +92,13 @@ that implements `HistoryCell` — think of it as a component with a single
 | Cell | Web analogy | File | Purpose |
 |---|---|---|---|
 | `ErrorCell` | Error toast | `cells/system.rs` | Agent errors |
-| `NoticeCell` | Info / warning toast | `cells/system.rs` | Warnings and informational notices |
+| `NoticeCell` | Info / warning toast | `cells/system.rs` | Warnings, model-change confirmations, and other notices |
 | `ApprovalDecisionCell` | Inline prompt response | `cells/system.rs` | Approved / denied tool use |
 
 ### Session management cells
 
 | Cell | Web analogy | File | Purpose |
 |---|---|---|---|
-| `ModelListCell` | Dropdown list | `cells/model.rs` | Output of `/model` |
-| `ModelSetCell` | Confirmation toast | `cells/model.rs` | Output of `/model <name>` |
 | `SessionListCell` | List view | `cells/sessions.rs` | `/sessions` output |
 | `SessionTreeCell` | Tree view | `cells/sessions.rs` | `/tree` output |
 | `SessionNoticeCell` | Status toast | `cells/sessions.rs` | Session rename, export, etc. |
@@ -119,6 +117,7 @@ closer to traditional UI components — stateful, interactive, and always visibl
 | `Approval` | Confirmation modal | `bottom_pane/approval.rs` | Approve/deny tool execution |
 | `PendingPreview` | Queue preview sidebar | `bottom_pane/pending_preview.rs` | Shows queued prompts |
 | `SessionPicker` | Fuzzy finder modal | `bottom_pane/session_picker.rs` | Resume-session picker (`/resume`) |
+| `ModelPickerPopup` | Dropdown list | `bottom_pane/model_picker.rs` | Model picker (`/model`) |
 
 ## Status bar
 

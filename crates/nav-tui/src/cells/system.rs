@@ -11,11 +11,19 @@ pub struct NoticeCell {
 }
 
 enum NoticeSeverity {
+    Info,
     Warning,
     Error,
 }
 
 impl NoticeCell {
+    pub fn info(message: impl Into<String>) -> Self {
+        Self {
+            severity: NoticeSeverity::Info,
+            message: message.into(),
+        }
+    }
+
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
             severity: NoticeSeverity::Warning,
@@ -34,6 +42,7 @@ impl NoticeCell {
 impl HistoryCell for NoticeCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let kind = match self.severity {
+            NoticeSeverity::Info => TranscriptRowKind::Notice,
             NoticeSeverity::Warning => TranscriptRowKind::TurnWarning,
             NoticeSeverity::Error => TranscriptRowKind::Error,
         };

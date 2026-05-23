@@ -23,6 +23,7 @@ mod history_search;
 mod key_handling;
 mod list_picker;
 mod mention_popup;
+mod model_picker;
 mod pending_preview;
 mod render;
 mod session_picker;
@@ -38,6 +39,7 @@ pub use history_search::HistorySearch;
 pub use list_picker::{ListPicker, ListPickerItem};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
 use pending_preview::PendingPreview;
+pub use model_picker::{ModelPickerEntry, ModelPickerPopup};
 pub use session_picker::{SessionPickerEntry, SessionPickerPopup};
 pub use skill_popup::{SkillEntry, SkillPopup, build_skill_entries};
 pub use slash_popup::{
@@ -99,6 +101,8 @@ pub struct BottomPane {
     /// Captured session id from the picker, waiting to be drained by the app
     /// loop and routed through the same `/resume <id>` path.
     last_session_selection: Option<String>,
+    /// Captured model selector from the model picker, drained by the app loop.
+    last_model_selection: Option<String>,
     pending_inputs: Vec<PendingPreview>,
     /// Status-bar state pushed by the main loop via [`Self::update_status`].
     /// Rendered as the bottommost row of the pane, below the composer.
@@ -177,6 +181,7 @@ impl BottomPane {
             last_composer_keystroke_at: None,
             last_decision: None,
             last_session_selection: None,
+            last_model_selection: None,
             pending_inputs: Vec::new(),
             status: StatusBarState::default(),
         }
@@ -270,6 +275,22 @@ impl BottomPane {
 
     pub fn take_session_selection(&mut self) -> Option<String> {
         self.last_session_selection.take()
+    }
+
+    pub fn open_model_picker(
+        &mut self,
+        entries: Vec<ModelPickerEntry>,
+        current_model: Option<&str>,
+    ) {
+        self.view = Some(Box::new(ModelPickerPopup::new_with_theme(
+            entries,
+            current_model,
+            self.theme,
+        )));
+    }
+
+    pub fn take_model_selection(&mut self) -> Option<String> {
+        self.last_model_selection.take()
     }
 
     fn try_show_next_approval(&mut self) -> bool {
@@ -439,6 +460,33 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_selection_is_captured_before_overlay_drops() {
+        let mut pane = BottomPane::new();
+        pane.open_model_picker(
+            vec![
+                ModelPickerEntry {
+                    selector: "openai/gpt-5.5".to_string(),
+                    provider_display_name: "OpenAI".to_string(),
+                },
+                ModelPickerEntry {
+                    selector: "mock/alt".to_string(),
+                    provider_display_name: "Local Mock".to_string(),
+                },
+            ],
+            Some("openai/gpt-5.5"),
+        );
+
+        assert!(pane.has_overlay());
+        pane.handle_key(key(KeyCode::Down));
+        pane.handle_key(key(KeyCode::Enter));
+        assert!(!pane.has_overlay());
+        assert_eq!(
+            pane.take_model_selection(),
+            Some("mock/alt".to_string())
+        );
+    }
+
+    #[test]
     fn session_picker_selection_is_captured_before_overlay_drops() {
         let mut pane = BottomPane::new();
         pane.open_session_picker(vec![SessionPickerEntry {
@@ -566,6 +614,27 @@ mod tests {
         assert_eq!(
             pane.take_approval_decision(),
             Some(("a1".to_string(), ReviewDecision::Approved))
+        );
+    }
+
+    #[test]
+    fn ctrl_p_does_not_dismiss_model_picker_overlay() {
+        let mut pane = pane_with_entries();
+        pane.open_model_picker(
+            vec![ModelPickerEntry {
+                selector: "mock/smoke".to_string(),
+                provider_display_name: "Local Mock".to_string(),
+            }],
+            Some("mock/smoke"),
+        );
+        assert!(pane.has_overlay());
+        pane.handle_key(ctrl_p());
+        assert!(pane.has_overlay());
+        assert!(pane.composer().text().is_empty());
+        pane.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            pane.take_model_selection(),
+            Some("mock/smoke".to_string())
         );
     }
 

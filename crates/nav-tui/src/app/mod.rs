@@ -11,8 +11,8 @@ use nav_core::{
     AgentEvent, Catalog, ChatCompletionsTransport, ControlPlane, ExtensionCatalog, HandoffDraft,
     ModelSwapOutcome, ModelTransportHandle, NoticeLevel, PROVIDER_OPENAI_RESPONSES,
     PendingInputMode, PendingSkill, ProjectContext, ResolvedProvider, RetryPolicy, SessionId,
-    SessionStore, StartupNotices, WireFormat, build_handoff_draft,
-    cli::{Args, list_models, sandbox_policy_from_args},
+    SessionStore, StartupNotices, build_handoff_draft,
+    cli::{Args, sandbox_policy_from_args},
     git_checkpoint, shorten_home,
 };
 use ratatui::backend::CrosstermBackend;
@@ -44,8 +44,8 @@ use crate::chat::parse_rewind_skill_prompt;
 use permissions::build_tui_permissions;
 use render::draw_tui;
 use session::{
-    export_current_session, open_session_picker, push_context_report, resolve_tree_root,
-    resume_session,
+    export_current_session, open_model_picker, open_session_picker, push_context_report,
+    resolve_tree_root, resume_session, NO_PROVIDERS_CONFIGURED,
 };
 use terminal::{TerminalGuard, enter_tui, install_panic_teardown_hook};
 use turn_lifecycle::{
@@ -580,55 +580,32 @@ pub async fn run(
                             &mut chat,
                         );
                     }
-                    AppEvent::ListModels => {
-                        let lines = list_models(project.settings.providers.as_ref());
-                        chat.push_model_list(
-                            lines,
-                            args.model.clone(),
-                            project.settings.default_model.clone(),
+                    AppEvent::PickModel => {
+                        if active_turn.is_some() {
+                            chat.push_warning(
+                                "cannot change model while a turn is running — try again when ready",
+                            );
+                            continue;
+                        }
+                        open_model_picker(
+                            project.as_ref(),
+                            &mut pane,
+                            &args.model,
+                            &mut chat,
                         );
                     }
                     AppEvent::SetModel { selector } => {
-                        let catalog = project.settings.providers.as_ref();
-                        let Some(catalog) = catalog else {
-                            chat.push_model_set(
-                                "no providers configured — add providers.models to .nav/settings.json",
-                            );
-                            continue;
-                        };
-                        match match_model_selector(&selector, catalog) {
-                            ModelMatch::Exact(sel) | ModelMatch::BareUnique(sel) => {
-                                match resolve_model_swap(&sel, project.as_ref()) {
-                                    Ok(swap) if active_turn.is_some() => {
-                                        pending_model_swap = Some(swap);
-                                        chat.push_model_set(format!(
-                                            "Queued model swap to \"{sel}\" after the current turn."
-                                        ));
-                                    }
-                                    Ok(swap) => apply_model_swap(
-                                        swap,
-                                        &transport,
-                                        &mut args,
-                                        store.as_ref(),
-                                        &session_id,
-                                        &mut chat,
-                                    ),
-                                    Err(err) => chat.push_err(err),
-                                }
-                            }
-                            ModelMatch::Ambiguous(sels) => {
-                                let list = sels.join("\n  ");
-                                chat.push_model_set(format!(
-                                    "\"{selector}\" is ambiguous — matches:\n  {list}\n\
-                                    Use a qualified <provider>/<model> selector."
-                                ));
-                            }
-                            ModelMatch::NotFound => {
-                                chat.push_model_set(format!(
-                                    "No model matches \"{selector}\". Run /model to list."
-                                ));
-                            }
-                        }
+                        apply_model_selector(
+                            &selector,
+                            project.as_ref(),
+                            active_turn.is_some(),
+                            &mut pending_model_swap,
+                            &transport,
+                            &mut args,
+                            store.as_ref(),
+                            &session_id,
+                            &mut chat,
+                        );
                     }
                     AppEvent::Handoff { goal } => {
                         if active_turn.is_some() {
@@ -1073,6 +1050,11 @@ pub async fn run(
                             })
                             .ok();
                     }
+                    if let Some(selector) = pane.take_model_selection() {
+                        app_tx
+                            .send(AppEvent::SetModel { selector })
+                            .ok();
+                    }
                 }
                 if pane.promote_pending_approval_if_idle() {
                     needs_draw = true;
@@ -1168,9 +1150,9 @@ fn apply_model_swap(
     chat: &mut ChatWidget,
 ) {
     match swap_active_transport(&swap, transport, args, store, session_id) {
-        Ok(outcome) => {
+        Ok(_) => {
             args.model = swap.selector.clone();
-            chat.push_model_set(model_swap_message(&swap.selector, outcome.from, outcome.to));
+            chat.push_notice(format!("Model changed to \"{}\".", swap.selector));
         }
         Err(err) => chat.push_err(err),
     }
@@ -1199,15 +1181,50 @@ fn build_chat_completions_transport(
     )
 }
 
-fn model_swap_message(selector: &str, from: WireFormat, to: WireFormat) -> String {
-    if from == to {
-        return format!("Switched model to \"{selector}\".");
+fn apply_model_selector(
+    selector: &str,
+    project: &ProjectContext,
+    turn_active: bool,
+    pending_model_swap: &mut Option<PendingModelSwap>,
+    transport: &ModelTransportHandle,
+    args: &mut Args,
+    store: &SessionStore,
+    session_id: &SessionId,
+    chat: &mut ChatWidget,
+) {
+    let Some(catalog) = project.settings.providers.as_ref() else {
+        chat.push_notice(NO_PROVIDERS_CONFIGURED);
+        return;
+    };
+    match match_model_selector(selector, catalog) {
+        ModelMatch::Exact(sel) | ModelMatch::BareUnique(sel) => {
+            if sel == args.model {
+                return;
+            }
+            match resolve_model_swap(&sel, project) {
+                Ok(swap) if turn_active => {
+                    *pending_model_swap = Some(swap);
+                    chat.push_notice(format!(
+                        "Model change to \"{sel}\" queued until the current turn finishes."
+                    ));
+                }
+                Ok(swap) => apply_model_swap(swap, transport, args, store, session_id, chat),
+                Err(err) => chat.push_err(err),
+            }
+        }
+        ModelMatch::Ambiguous(sels) => {
+            let list = sels.join("\n  ");
+            chat.push_warning(format!(
+                "\"{selector}\" is ambiguous — matches:\n  {list}\n\
+                Use a qualified <provider>/<model> selector."
+            ));
+        }
+        ModelMatch::NotFound => {
+            chat.push_warning(format!(
+                "No model matches \"{selector}\". Run /model to pick one."
+            ));
+        }
     }
-    format!(
-        "Switched model to \"{selector}\" ({} -> {}).",
-        from.label(),
-        to.label()
-    )
 }
 
 fn handoff_session_name(goal: &str) -> String {
@@ -1281,7 +1298,7 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use nav_core::cli::{AuthMode, SandboxMode, Transport};
-    use nav_core::{AskForApproval, EventStream, ResponsesTransport};
+    use nav_core::{AskForApproval, EventStream, ResponsesTransport, WireFormat};
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::future::Future;

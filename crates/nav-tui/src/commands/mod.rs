@@ -335,13 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_submit_routes_model_list() {
+    fn dispatch_submit_routes_model_picker() {
         let dir = tempdir().unwrap();
         let catalog = catalog_with_skill(dir.path());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
 
         dispatch("/model", &catalog, &tx);
-        assert!(matches!(rx.try_recv().unwrap(), AppEvent::ListModels));
+        assert!(matches!(rx.try_recv().unwrap(), AppEvent::PickModel));
     }
 
     #[test]
