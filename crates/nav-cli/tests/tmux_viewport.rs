@@ -69,6 +69,32 @@ impl Session {
         assert!(status.success(), "tmux send-keys exited non-zero");
     }
 
+    /// Resize the tmux window so the running TUI sees a `SIGWINCH` /
+    /// resize event. Tests use this to verify rect math under varying
+    /// `area.height` / `area.width`.
+    ///
+    /// Returns `false` when `tmux resize-window` is unavailable (added
+    /// in tmux 2.9, May 2019) so callers can skip cleanly rather than
+    /// panic on hosts pinning an older tmux — matches the
+    /// "skip cleanly when tmux is absent" rule in CLAUDE.md.
+    fn try_resize(&self, width: u16, height: u16) -> bool {
+        let out = Command::new("tmux")
+            .args([
+                "resize-window",
+                "-t",
+                &self.name,
+                "-x",
+                &width.to_string(),
+                "-y",
+                &height.to_string(),
+            ])
+            .output();
+        match out {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+
     /// Live cursor coordinates as reported by tmux. `capture-pane` only
     /// reports glyph content, so we ask the pane for its `cursor_x` and
     /// `cursor_y` directly via `display-message`. Returns `(col, row)`
@@ -386,5 +412,97 @@ fn slash_popup_open_navigate_dismiss_via_trait_dispatch() {
     assert!(
         status_bar_present(&after_dismiss),
         "status bar missing after popup dismiss:\n{after_dismiss}"
+    );
+}
+
+/// Resize regression for the FlexRenderable-driven bottom-pane layout.
+///
+/// Before LAY-01, the pane split rows with `Layout::vertical([...])` and
+/// each helper (`desired_height`, `cursor_position`, `Widget::render`)
+/// recomputed the constraints inline. After LAY-01 they all share a
+/// `FlexRenderable` built from the same chunk wrappers. This test resizes
+/// the terminal between a tall and a short geometry and asserts the
+/// composer row + caret stay locked to the same flex slot — if the flex
+/// allocator returned a stale or off-by-one rect on resize, the composer
+/// would drift up or the caret would land on the wrong row.
+///
+/// Self-check: revert `bottom_pane/render.rs` to use `Layout::vertical`
+/// only in `Widget::render` (without updating `cursor_position`) and the
+/// caret-row assertion after the second resize will fire, because the
+/// two paths no longer agree on which row the composer occupies.
+#[test]
+fn bottom_pane_layout_survives_resize() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("layout-resize");
+    // Start tall so the initial composer paints well clear of any rows
+    // tmux might keep around from the surrounding shell prompt.
+    session.start(120, 30);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Composer must render before the first resize, otherwise the test
+    // would race the launch banner.
+    let initial = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        initial.contains("Ask nav to do anything"),
+        "composer placeholder did not render at 120x30:\n{initial}"
+    );
+
+    // Shrink. The pane absorbs less vertical space; FlexRenderable's
+    // flex-1 composer slot has to recompute against the new height.
+    if !session.try_resize(80, 18) {
+        eprintln!("tmux resize-window unsupported (needs tmux >= 2.9), skipping");
+        return;
+    }
+    let small = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(3),
+    );
+    let small_composer_row = last_row_with(&small, |line| {
+        line.contains("Ask nav to do anything")
+    })
+    .unwrap_or_else(|| panic!("composer missing after shrink:\n{small}"));
+    let (cx_small, cy_small) = session.cursor();
+    assert_eq!(
+        cy_small as usize, small_composer_row,
+        "after shrink the caret row drifted from the composer (\
+         composer_row={small_composer_row}, cursor=({cx_small},{cy_small}))\n{small}"
+    );
+    assert!(
+        cx_small >= 2,
+        "after shrink the caret should sit past the 2-col gutter, got cx={cx_small}\n{small}"
+    );
+
+    // Grow back. The flex slot must expand again without leaving the
+    // composer pinned at the smaller row — a sign of stale constraints.
+    assert!(
+        session.try_resize(120, 30),
+        "second resize-window failed after the first succeeded"
+    );
+    let big = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(3),
+    );
+    let big_composer_row =
+        last_row_with(&big, |line| line.contains("Ask nav to do anything"))
+            .unwrap_or_else(|| panic!("composer missing after regrow:\n{big}"));
+    let (cx_big, cy_big) = session.cursor();
+    assert_eq!(
+        cy_big as usize, big_composer_row,
+        "after regrow the caret row drifted from the composer (\
+         composer_row={big_composer_row}, cursor=({cx_big},{cy_big}))\n{big}"
+    );
+    assert!(
+        cx_big >= 2,
+        "after regrow the caret should sit past the 2-col gutter, got cx={cx_big}\n{big}"
     );
 }
