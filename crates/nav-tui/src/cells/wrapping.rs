@@ -18,12 +18,26 @@ pub(crate) fn render_body(text: &str, width: u16) -> Vec<Line<'static>> {
     let body_width = width.saturating_sub(2) as usize;
     let trimmed = text.strip_suffix('\n').unwrap_or(text);
     let mut out = Vec::new();
+    let mut in_fence = false;
     for raw_line in trimmed.split('\n') {
+        let fence = is_fence_line(raw_line);
+        if fence {
+            in_fence = !in_fence;
+        }
         for chunk in wrap_line(raw_line, body_width) {
-            out.push(body_line(chunk));
+            if in_fence || fence {
+                out.push(code_block_line(chunk));
+            } else {
+                out.push(body_line(chunk));
+            }
         }
     }
     out
+}
+
+/// A line that opens or closes a triple-backtick fenced code block.
+fn is_fence_line(line: &str) -> bool {
+    line.trim_start().starts_with("```")
 }
 
 fn body_line(text: &str) -> Line<'static> {
@@ -33,9 +47,22 @@ fn body_line(text: &str) -> Line<'static> {
     Line::from(line_spans)
 }
 
+/// Render a line inside a fenced code block — entire content is cyan and
+/// inline markers are not interpreted.
+fn code_block_line(text: &str) -> Line<'static> {
+    let mut line_spans = vec![Span::raw("  ")];
+    if !text.is_empty() {
+        line_spans.push(Span::styled(
+            text.to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    Line::from(line_spans)
+}
+
 /// Parse inline markdown markers in a single wrapped chunk:
-/// - `code` → colored yellow
-/// - *bold* → bold
+/// - `code` and ```code``` (any backtick run) → colored cyan
+/// - *bold* and **bold** → bold
 /// - _italic_ → italic
 ///
 /// Unmatched opening markers are emitted as plain text.
@@ -49,34 +76,46 @@ fn parse_inline_spans(text: &str) -> Vec<Span<'static>> {
     while i < chars.len() {
         let c = chars[i];
         if c == '`' {
-            if let Some(end) = chars[i + 1..].iter().position(|&ch| ch == '`') {
-                let close_abs = i + 1 + end;
-                flush_plain(&mut spans, &mut plain);
-                let code_text: String = chars[i + 1..close_abs].iter().collect();
-                spans.push(Span::styled(
-                    code_text,
-                    Style::default().fg(Color::Yellow),
-                ));
-                i = close_abs + 1;
+            let run = delim_run(&chars, i, '`');
+            if let Some(close) = find_run_close(&chars, i + run, run, '`') {
+                push_styled_span(
+                    &mut spans,
+                    &mut plain,
+                    &chars[i + run..close],
+                    Style::default().fg(Color::Cyan),
+                );
+                i = close + run;
                 continue;
             }
-        } else if let Some(modifier) = match c {
-            '*' => Some(Modifier::BOLD),
-            '_' if is_flanking_open(&chars, i) => Some(Modifier::ITALIC),
-            _ => None,
-        } {
-            if let Some(end) = find_closing(&chars, i, c)
-                && (c != '_' || is_flanking_close(&chars, end))
-            {
-                flush_plain(&mut spans, &mut plain);
-                let styled_text: String = chars[i + 1..end].iter().collect();
-                spans.push(Span::styled(
-                    styled_text,
-                    Style::default().add_modifier(modifier),
-                ));
-                i = end + 1;
+        } else if c == '*' {
+            let run = if i + 1 < chars.len() && chars[i + 1] == '*' {
+                2
+            } else {
+                1
+            };
+            if let Some(close) = find_run_close(&chars, i + run, run, '*') {
+                push_styled_span(
+                    &mut spans,
+                    &mut plain,
+                    &chars[i + run..close],
+                    Style::default().add_modifier(Modifier::BOLD),
+                );
+                i = close + run;
                 continue;
             }
+        } else if c == '_'
+            && is_flanking_open(&chars, i)
+            && let Some(end) = find_underscore_close(&chars, i)
+            && is_flanking_close(&chars, end)
+        {
+            push_styled_span(
+                &mut spans,
+                &mut plain,
+                &chars[i + 1..end],
+                Style::default().add_modifier(Modifier::ITALIC),
+            );
+            i = end + 1;
+            continue;
         }
         plain.push(c);
         i += 1;
@@ -85,27 +124,59 @@ fn parse_inline_spans(text: &str) -> Vec<Span<'static>> {
     spans
 }
 
-/// Find the closing delimiter for an inline marker, ensuring it's not
-/// immediately adjacent to the opener (empty pairs like `**` or `__`
-/// are skipped) and not part of a doubled run like `**bold**`.
-/// Returns the char index of the closing delimiter.
-fn find_closing(chars: &[char], open: usize, delim: char) -> Option<usize> {
-    // Empty pair check: opener at `open`, if next char is same delim, skip.
-    if open + 1 < chars.len() && chars[open + 1] == delim {
+fn push_styled_span(
+    spans: &mut Vec<Span<'static>>,
+    plain: &mut String,
+    chars: &[char],
+    style: Style,
+) {
+    flush_plain(spans, plain);
+    spans.push(Span::styled(chars.iter().collect::<String>(), style));
+}
+
+/// Length of the run of `delim` characters starting at `start`.
+fn delim_run(chars: &[char], start: usize, delim: char) -> usize {
+    chars[start..].iter().take_while(|&&c| c == delim).count()
+}
+
+/// Find the next run of exactly `len` `delim` chars starting at or after
+/// `from`. A run is "exact" when it isn't extended by another `delim`
+/// immediately to its right — so a length-2 search won't bind to the
+/// leading `**` inside a `***` run.
+fn find_run_close(chars: &[char], from: usize, len: usize, delim: char) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let mut j = from;
+    while j + len <= chars.len() {
+        if chars[j] == delim
+            && (0..len).all(|k| chars[j + k] == delim)
+            && !(j + len < chars.len() && chars[j + len] == delim)
+        {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+/// Find the closing `_` for an italic opener at `open`. Empty pairs and
+/// `__` doubled runs are skipped — bold/strong via `__` is not supported.
+fn find_underscore_close(chars: &[char], open: usize) -> Option<usize> {
+    if open + 1 < chars.len() && chars[open + 1] == '_' {
         return None;
     }
     for j in (open + 1)..chars.len() {
-        if chars[j] == delim && !is_doubled(chars, j, delim) {
+        if chars[j] == '_' && !is_doubled(chars, j, '_') {
             return Some(j);
         }
     }
     None
 }
 
-/// True when `chars[j]` is part of a doubled delimiter run (e.g. `**`).
+/// True when `chars[j]` is part of a doubled delimiter run (e.g. `__`).
 fn is_doubled(chars: &[char], j: usize, delim: char) -> bool {
-    (j + 1 < chars.len() && chars[j + 1] == delim)
-        || (j > 0 && chars[j - 1] == delim)
+    (j + 1 < chars.len() && chars[j + 1] == delim) || (j > 0 && chars[j - 1] == delim)
 }
 
 /// True when `chars[i]` is `_` at a word boundary suitable for opening italic.
@@ -217,6 +288,7 @@ fn wrap_line(raw_line: &str, body_width: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::{Color, Modifier};
 
     fn rendered(text: &str, width: u16) -> Vec<String> {
         render_body(text, width)
@@ -228,6 +300,23 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn cyan_span<'a, 'line>(line: &'a Line<'line>) -> Option<&'a Span<'line>> {
+        line.spans.iter().find(|s| s.style.fg == Some(Color::Cyan))
+    }
+
+    fn modifier_span<'a, 'line>(
+        line: &'a Line<'line>,
+        modifier: Modifier,
+    ) -> Option<&'a Span<'line>> {
+        line.spans
+            .iter()
+            .find(|s| s.style.add_modifier.contains(modifier))
     }
 
     #[test]
@@ -311,99 +400,103 @@ mod tests {
 
     // --- Inline markdown formatting tests ---
 
-    fn span_contents(text: &str) -> Vec<String> {
-        let lines = render_body(text, 80);
-        lines
-            .into_iter()
-            .flat_map(|line| {
-                line.spans
-                    .into_iter()
-                    .map(|s| s.content.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+    #[test]
+    fn backtick_code_is_colored_cyan() {
+        let lines = render_body("use `cargo test` to run", 80);
+        let code_span = cyan_span(&lines[0]).expect("no cyan span found");
+        assert_eq!(code_span.content, "cargo test");
+        // The backticks themselves are gone
+        assert_eq!(line_text(&lines[0]), "  use cargo test to run");
     }
 
     #[test]
-    fn backtick_code_is_colored_yellow() {
-        use ratatui::style::Color;
-        let lines = render_body("use `cargo test` to run", 80);
-        // Find a yellow span
-        let code_span = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.style.fg == Some(Color::Yellow));
-        assert!(code_span.is_some(), "no yellow span found");
-        assert_eq!(code_span.unwrap().content, "cargo test");
-        // The backticks themselves are gone
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "  use cargo test to run");
+    fn inline_triple_backtick_is_colored_cyan() {
+        let lines = render_body("see ```cargo run``` here", 80);
+        let code_span = cyan_span(&lines[0]).expect("no cyan span found");
+        assert_eq!(code_span.content, "cargo run");
+        assert_eq!(line_text(&lines[0]), "  see cargo run here");
+    }
+
+    #[test]
+    fn fenced_code_block_is_colored_cyan() {
+        let input = "before\n```rust\nfn foo() {}\nlet x = 1;\n```\nafter";
+        let lines = render_body(input, 80);
+        // Lines: "before", "```rust", "fn foo() {}", "let x = 1;", "```", "after".
+        let fenced_indices = [1usize, 2, 3, 4];
+        for &idx in &fenced_indices {
+            let has_cyan = cyan_span(&lines[idx]).is_some();
+            assert!(
+                has_cyan,
+                "expected cyan span on line {idx}: {:?}",
+                lines[idx]
+            );
+        }
+        // Surrounding prose lines stay un-cyan.
+        for &idx in &[0usize, 5] {
+            let any_cyan = cyan_span(&lines[idx]).is_some();
+            assert!(
+                !any_cyan,
+                "unexpected cyan on prose line {idx}: {:?}",
+                lines[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn double_asterisk_bold() {
+        let lines = render_body("this is **important** ok", 80);
+        let bold_span = modifier_span(&lines[0], Modifier::BOLD).expect("no bold span found");
+        assert_eq!(bold_span.content, "important");
+        assert_eq!(line_text(&lines[0]), "  this is important ok");
     }
 
     #[test]
     fn asterisk_bold() {
-        use ratatui::style::Modifier;
         let lines = render_body("this is *important* ok", 80);
-        let bold_span = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.style.add_modifier.contains(Modifier::BOLD));
-        assert!(bold_span.is_some(), "no bold span found");
-        assert_eq!(bold_span.unwrap().content, "important");
+        let bold_span = modifier_span(&lines[0], Modifier::BOLD).expect("no bold span found");
+        assert_eq!(bold_span.content, "important");
     }
 
     #[test]
     fn underscore_italic() {
-        use ratatui::style::Modifier;
         let lines = render_body("this is _emphasized_ ok", 80);
-        let italic_span = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.style.add_modifier.contains(Modifier::ITALIC));
-        assert!(italic_span.is_some(), "no italic span found");
-        assert_eq!(italic_span.unwrap().content, "emphasized");
+        let italic_span = modifier_span(&lines[0], Modifier::ITALIC).expect("no italic span found");
+        assert_eq!(italic_span.content, "emphasized");
     }
 
     #[test]
     fn unmatched_delimiter_is_plain_text() {
         let lines = render_body("price is $5 *each", 80);
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "  price is $5 *each");
+        assert_eq!(line_text(&lines[0]), "  price is $5 *each");
     }
 
     #[test]
-    fn empty_code_span_produces_nothing() {
+    fn unmatched_double_backticks_render_literally() {
+        // `` is a length-2 opener with no length-2 closer in the line, so
+        // the backticks fall through as plain text rather than producing
+        // an empty styled span.
         let lines = render_body("before `` after", 80);
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "  before  after");
+        assert_eq!(line_text(&lines[0]), "  before `` after");
     }
 
     #[test]
     fn adjacent_formats_dont_merge() {
-        use ratatui::style::{Color, Modifier};
         let lines = render_body("`code` and *bold*", 80);
-        let spans = &lines[0].spans;
-        assert!(spans.iter().any(|s| s.style.fg == Some(Color::Yellow)));
-        assert!(spans.iter().any(|s| s.style.add_modifier.contains(Modifier::BOLD)));
+        assert!(cyan_span(&lines[0]).is_some());
+        assert!(modifier_span(&lines[0], Modifier::BOLD).is_some());
     }
 
     #[test]
     fn underscore_mid_word_is_not_italic() {
         // CommonMark §6.2: _ only triggers at word boundaries
         let lines = render_body("use a_b_c here", 80);
-        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "  use a_b_c here");
+        assert_eq!(line_text(&lines[0]), "  use a_b_c here");
     }
 
     #[test]
     fn underscore_at_word_boundary_is_italic() {
-        use ratatui::style::Modifier;
         let lines = render_body("it is _really_ fine", 80);
-        let italic_span = lines[0]
-            .spans
-            .iter()
-            .find(|s| s.style.add_modifier.contains(Modifier::ITALIC));
-        assert!(italic_span.is_some(), "no italic span found");
-        assert_eq!(italic_span.unwrap().content, "really");
+        let italic_span = modifier_span(&lines[0], Modifier::ITALIC).expect("no italic span found");
+        assert_eq!(italic_span.content, "really");
     }
 }
