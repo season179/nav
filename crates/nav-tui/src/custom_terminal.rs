@@ -278,8 +278,9 @@ where
     /// buffer is reset to force a full redraw on the next [`Self::flush`]
     /// call. Without this, `diff_buffers` compares cell-by-cell at the same
     /// BUFFER INDEX while screen position has shifted — any row that holds
-    /// the same content in both buffers (e.g. a status bar at index 0 of
-    /// each pane) gets skipped, and the actual screen at the new position
+    /// the same content in both buffers (e.g. the status bar row, which
+    /// occupies the same buffer index across frames even when its on-screen
+    /// row moves) gets skipped, and the actual screen at the new position
     /// stays whatever was painted there before (often blank).
     pub fn set_viewport_area(&mut self, area: Rect) {
         let area_changed = area != self.viewport_area;

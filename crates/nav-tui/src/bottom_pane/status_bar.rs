@@ -5,8 +5,8 @@
 //!
 //! The widget reads from `StatusBarState` held by [`super::BottomPane`]; the
 //! main loop pushes new state in via [`super::BottomPane::update_status`] once
-//! per draw cycle, and `BottomPane::render` paints this widget as the topmost
-//! row of the pane.
+//! per draw cycle, and `BottomPane::render` paints this widget as the
+//! bottommost row of the pane (below the composer), matching codex's layout.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -35,7 +35,7 @@ pub struct StatusBarState {
     /// Effective context window used to compute the percentage. `0` hides the
     /// gauge entirely.
     pub context_window: u64,
-    /// Allocate a dedicated row below the status bar that shows the working
+    /// Allocate a dedicated row above the composer that shows the working
     /// spinner + interrupt hint. The main loop turns this on only when both
     /// the agent is in `Working` state AND `screen_h >=
     /// `super::status_indicator::INDICATOR_SCREEN_FLOOR``; the row stays

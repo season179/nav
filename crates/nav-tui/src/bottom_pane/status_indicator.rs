@@ -1,5 +1,5 @@
-//! Dedicated "Working …" status row rendered between the status bar and
-//! the overlay while a turn is active.
+//! Dedicated "Working …" status row rendered above the composer (and any
+//! overlay) while a turn is active.
 //!
 //! Codex shows this row instead of squeezing the spinner into the
 //! `Working Ns` segment of the status bar. We keep the inline spinner in

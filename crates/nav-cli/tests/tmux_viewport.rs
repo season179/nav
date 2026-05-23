@@ -119,6 +119,18 @@ fn status_bar_present(pane: &str) -> bool {
     pane.contains("·  Ready") || pane.contains("·  ⠴ Working")
 }
 
+/// Index of the last pane row matching `predicate`, or `None`. `tmux
+/// capture-pane -p` returns rows top-to-bottom; the "last" line lets the
+/// assertion pick the active status row when a previous frame still has
+/// stale text further up.
+fn last_row_with(pane: &str, predicate: impl Fn(&str) -> bool) -> Option<usize> {
+    pane.lines()
+        .enumerate()
+        .filter(|(_, line)| predicate(line))
+        .map(|(idx, _)| idx)
+        .last()
+}
+
 #[test]
 fn status_bar_stays_visible_when_slash_popup_opens_and_closes() {
     if !tmux_available() {
@@ -178,5 +190,52 @@ fn status_bar_stays_visible_when_slash_popup_opens_and_closes() {
     assert!(
         !after_close.contains("/exit"),
         "popup did not close:\n{after_close}"
+    );
+}
+
+/// The status bar must paint BELOW the composer (matches codex's layout).
+/// Pre-fix, the row order inside `BottomPane::render` placed status at the
+/// top of the pane, which left the composer placeholder underneath the
+/// status row. Revert the `Layout::vertical` reorder in
+/// `bottom_pane/render.rs` and this should fail with status_row < composer_row.
+#[test]
+fn status_bar_paints_below_composer() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("status-below-composer");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Wait for both the composer placeholder and the status row to render.
+    // The composer placeholder reads "Ask nav to do anything" (composer.rs).
+    let pane = session.wait_for(
+        |p| p.contains("Ask nav to do anything") && status_bar_present(p),
+        Duration::from_secs(5),
+    );
+    assert!(
+        pane.contains("Ask nav to do anything"),
+        "composer placeholder never appeared:\n{pane}"
+    );
+    assert!(
+        status_bar_present(&pane),
+        "status bar never appeared:\n{pane}"
+    );
+
+    let composer_row =
+        last_row_with(&pane, |line| line.contains("Ask nav to do anything"))
+            .expect("composer row found above");
+    let status_row =
+        last_row_with(&pane, status_bar_present).expect("status row found above");
+
+    assert!(
+        status_row > composer_row,
+        "status bar should paint below the composer (codex layout), \
+         but status_row={status_row} and composer_row={composer_row}\n{pane}"
     );
 }

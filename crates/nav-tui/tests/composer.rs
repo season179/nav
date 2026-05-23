@@ -339,7 +339,7 @@ fn ready_status() -> StatusBarState {
 }
 
 #[test]
-fn status_bar_renders_above_composer() {
+fn status_bar_renders_below_composer() {
     let mut pane = BottomPane::new();
     pane.update_status(ready_status());
 
@@ -347,32 +347,38 @@ fn status_bar_renders_above_composer() {
     render(&pane, &mut terminal);
     let rendered = rendered_text(&terminal);
 
-    // Layout order: row 0 = status bar, then composer below it. The status
-    // bar separator (`  ·  `) followed by the agent-state word is the
-    // canonical proof that the status row painted at all.
+    // Layout order: composer first, status bar on the last row (matches
+    // codex). The status bar separator (`  ·  `) followed by the
+    // agent-state word is the canonical proof that the status row painted
+    // at all.
     let lines: Vec<&str> = rendered.lines().collect();
-    assert!(
-        lines[0].contains("·  Ready"),
-        "status row missing on first line:\n{rendered}"
+    let status_line = lines
+        .iter()
+        .rposition(|line| line.contains("·  Ready"))
+        .expect("status row should render");
+    assert_eq!(
+        status_line,
+        lines.len() - 1,
+        "status bar should occupy the bottom row of the pane:\n{rendered}"
     );
     assert!(
-        lines[0].contains("test-model") && lines[0].contains("main"),
+        lines[status_line].contains("test-model") && lines[status_line].contains("main"),
         "status row should carry model + branch:\n{rendered}"
     );
 
-    // Composer prompt (`›`) must appear below the status row, never above.
+    // Composer prompt (`›`) must appear above the status row.
     let prompt_line = lines
         .iter()
         .position(|line| line.contains('›'))
         .expect("composer prompt should render somewhere");
     assert!(
-        prompt_line > 0,
-        "composer prompt should sit below the status row, found at line {prompt_line}:\n{rendered}"
+        prompt_line < status_line,
+        "composer prompt should sit above the status row (prompt={prompt_line}, status={status_line}):\n{rendered}"
     );
 }
 
 #[test]
-fn desired_height_reserves_status_row_above_composer_floor() {
+fn desired_height_includes_status_row_and_composer_floor() {
     let pane = BottomPane::new();
     // Status row (1) + composer floor (3) = 4. The pane should never report
     // less than that; if it does, `draw_tui` will clip the status bar or the
@@ -399,7 +405,7 @@ fn working_status(show_indicator: bool) -> StatusBarState {
 }
 
 #[test]
-fn working_indicator_row_renders_between_status_and_composer() {
+fn working_indicator_row_renders_above_composer_with_status_on_bottom() {
     let mut pane = BottomPane::new();
     pane.update_status(working_status(true));
 
@@ -408,19 +414,25 @@ fn working_indicator_row_renders_between_status_and_composer() {
     let rendered = rendered_text(&terminal);
     let lines: Vec<&str> = rendered.lines().collect();
 
-    // Status row stays on line 0; indicator row (with the interrupt hint)
-    // must land directly below it, above the composer prompt.
-    assert!(
-        lines[0].contains("·  ⠴ Working"),
-        "status bar should still show the inline Working segment:\n{rendered}"
-    );
+    // Indicator row sits at the top of the pane (above the composer);
+    // the status bar paints on the bottom row.
     let indicator_line = lines
         .iter()
         .position(|line| line.contains("Ctrl+C to interrupt"))
         .expect("indicator row should render somewhere");
     assert_eq!(
-        indicator_line, 1,
-        "indicator row should sit directly under the status bar:\n{rendered}"
+        indicator_line, 0,
+        "indicator row should sit at the top of the pane, above the composer:\n{rendered}"
+    );
+
+    let status_line = lines
+        .iter()
+        .rposition(|line| line.contains("·  ⠴ Working"))
+        .expect("status bar should still show the inline Working segment");
+    assert_eq!(
+        status_line,
+        lines.len() - 1,
+        "status bar should occupy the bottom row of the pane:\n{rendered}"
     );
 
     let prompt_line = lines
@@ -428,9 +440,9 @@ fn working_indicator_row_renders_between_status_and_composer() {
         .position(|line| line.contains('›'))
         .expect("composer prompt should render");
     assert!(
-        prompt_line > indicator_line,
-        "composer prompt must be below the indicator row (status={}, indicator={indicator_line}, prompt={prompt_line}):\n{rendered}",
-        0
+        prompt_line > indicator_line && prompt_line < status_line,
+        "composer prompt must sit between the indicator and the status row \
+         (indicator={indicator_line}, prompt={prompt_line}, status={status_line}):\n{rendered}",
     );
 }
 

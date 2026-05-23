@@ -85,7 +85,7 @@ pub struct BottomPane {
     last_session_selection: Option<String>,
     pending_inputs: Vec<PendingPreview>,
     /// Status-bar state pushed by the main loop via [`Self::update_status`].
-    /// Rendered as the topmost row of the pane.
+    /// Rendered as the bottommost row of the pane, below the composer.
     pub(super) status: StatusBarState,
 }
 

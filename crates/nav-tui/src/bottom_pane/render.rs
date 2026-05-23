@@ -3,11 +3,11 @@
 //! The pane stacks five chunks top-to-bottom:
 //!
 //! ```text
-//! [status bar]       — 1 row, always
 //! [status indicator] — 1 row, only while Working AND show_indicator
 //! [overlay]          — variable (popup, approval, etc.)
 //! [pending preview]  — variable (queued user inputs)
 //! [composer]         — min 3 rows
+//! [status bar]       — 1 row, always (bottom; matches codex)
 //! ```
 //!
 //! The indicator slot has zero height when the gating flag is off, so the
@@ -28,9 +28,10 @@ use super::status_bar::StatusBar;
 use super::status_indicator::StatusIndicatorWidget;
 use super::{BottomPane, GUTTER_WIDTH};
 
-/// Height of the status-bar row at the top of the pane. The status bar lives
-/// inside the pane (not as a peer chunk in `draw_tui`) so that all "always
-/// visible" UI concentrates in one place.
+/// Height of the status-bar row at the bottom of the pane. The status bar
+/// lives inside the pane (not as a peer chunk in `draw_tui`) so that all
+/// "always visible" UI concentrates in one place. Placed at the bottom to
+/// match codex's visual order (composer above, status below).
 pub(super) const STATUS_ROWS: u16 = 1;
 
 impl BottomPane {
@@ -66,22 +67,21 @@ impl BottomPane {
             .unwrap_or(0);
         let queue_h = self.pending_preview_height();
         let indicator_h = self.indicator_h();
-        // The status row sits at the top of the pane; the optional
-        // indicator row sits below it; everything else shifts down by
-        // both. Without these offsets the caret lands inside the status
-        // bar or the indicator strip instead of the composer.
+        // The status row sits at the BOTTOM of the pane (matches codex);
+        // the indicator/overlay/pending-preview rows sit above the
+        // composer. The caret shifts down past those three but not past
+        // the status row, which is below the composer.
         let composer_y = pane_area
             .y
-            .saturating_add(STATUS_ROWS)
             .saturating_add(indicator_h)
             .saturating_add(overlay_h)
             .saturating_add(queue_h);
         let composer_h = pane_area
             .height
-            .saturating_sub(STATUS_ROWS)
             .saturating_sub(indicator_h)
             .saturating_sub(overlay_h)
-            .saturating_sub(queue_h);
+            .saturating_sub(queue_h)
+            .saturating_sub(STATUS_ROWS);
         if composer_h <= 1 {
             return None;
         }
@@ -109,11 +109,7 @@ impl BottomPane {
     /// 0 or 1, depending on whether the dedicated working-state row should
     /// occupy a layout slot. Single source of truth for the chunk size.
     fn indicator_h(&self) -> u16 {
-        if StatusIndicatorWidget::is_visible(&self.status) {
-            1
-        } else {
-            0
-        }
+        u16::from(StatusIndicatorWidget::is_visible(&self.status))
     }
 }
 
@@ -129,23 +125,19 @@ impl Widget for &BottomPane {
             .unwrap_or(0);
         let queue_h = self.pending_preview_height();
         let indicator_h = self.indicator_h();
-        let [status_rect, indicator_rect, overlay_rect, queue_rect, composer_outer] =
+        let [indicator_rect, overlay_rect, queue_rect, composer_outer, status_rect] =
             Layout::vertical([
-                Constraint::Length(STATUS_ROWS),
                 Constraint::Length(indicator_h),
                 Constraint::Length(overlay_h),
                 Constraint::Length(queue_h),
                 Constraint::Min(1),
+                Constraint::Length(STATUS_ROWS),
             ])
             .areas(area);
 
-        if status_rect.height > 0 {
-            StatusBar {
-                state: &self.status,
-            }
-            .render(status_rect, buf);
-        }
-
+        // Render order is arbitrary — each section writes to its own
+        // non-overlapping rect. Listed in visual top-to-bottom order for
+        // readability.
         if indicator_rect.height > 0 {
             StatusIndicatorWidget {
                 state: &self.status,
@@ -196,6 +188,13 @@ impl Widget for &BottomPane {
             };
             prompt.render(gutter_first, buf);
             self.composer.render(content, buf, &self.theme);
+        }
+
+        if status_rect.height > 0 {
+            StatusBar {
+                state: &self.status,
+            }
+            .render(status_rect, buf);
         }
     }
 }
