@@ -166,12 +166,7 @@ fn find_underscore_close(chars: &[char], open: usize) -> Option<usize> {
     if open + 1 < chars.len() && chars[open + 1] == '_' {
         return None;
     }
-    for j in (open + 1)..chars.len() {
-        if chars[j] == '_' && !is_doubled(chars, j, '_') {
-            return Some(j);
-        }
-    }
-    None
+    ((open + 1)..chars.len()).find(|&j| chars[j] == '_' && !is_doubled(chars, j, '_'))
 }
 
 /// True when `chars[j]` is part of a doubled delimiter run (e.g. `__`).

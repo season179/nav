@@ -140,6 +140,11 @@ impl StreamController {
         self.stream_state.queued_len()
     }
 
+    /// Raw markdown source accumulated for this assistant reply.
+    pub(crate) fn source(&self) -> &str {
+        self.collector.content()
+    }
+
     /// Age of the oldest queued tick unit. Surfaces queue staleness so a
     /// lone source line that has been waiting too long triggers catch-up
     /// even without depth pressure.

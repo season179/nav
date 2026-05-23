@@ -187,7 +187,7 @@ mod tests {
 
         let decision = policy.decide(snapshot(8, 10), now);
         assert_eq!(decision.mode, ChunkingMode::CatchUp);
-        assert_eq!(decision.entered_catch_up, true);
+        assert!(decision.entered_catch_up);
         assert_eq!(decision.drain_plan, DrainPlan::Batch(8));
     }
 
@@ -198,7 +198,7 @@ mod tests {
 
         let decision = policy.decide(snapshot(2, 120), now);
         assert_eq!(decision.mode, ChunkingMode::CatchUp);
-        assert_eq!(decision.entered_catch_up, true);
+        assert!(decision.entered_catch_up);
         assert_eq!(decision.drain_plan, DrainPlan::Batch(2));
     }
 

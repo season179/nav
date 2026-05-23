@@ -68,11 +68,29 @@ fn attachment_label(attachment: &UserAttachment) -> String {
     }
 }
 
-pub struct AssistantMessageCell {
+pub struct AgentMarkdownCell {
+    source: String,
+}
+
+impl AgentMarkdownCell {
+    pub fn new(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+        }
+    }
+}
+
+impl HistoryCell for AgentMarkdownCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        TranscriptRow::new(TranscriptRowKind::AssistantMessage, self.source.as_str()).render(width)
+    }
+}
+
+pub struct AssistantStreamingCell {
     controller: StreamController,
 }
 
-impl AssistantMessageCell {
+impl AssistantStreamingCell {
     pub fn new(text: impl Into<String>) -> Self {
         let mut controller = StreamController::default();
         controller.push_delta(&text.into());
@@ -94,13 +112,19 @@ impl AssistantMessageCell {
         self.controller.finalize();
     }
 
+    pub fn into_finalized(mut self) -> AgentMarkdownCell {
+        self.finalize();
+        AgentMarkdownCell::new(self.controller.source().to_string())
+    }
+
     /// Replace the streamed buffer with the coalesced final `text` and
     /// finalize. Trusts the provider's `AssistantMessageDone` payload over
     /// the accumulated deltas — symmetric with the resume-path
-    /// [`AssistantMessageCell::new`].
-    pub fn finalize_with(&mut self, text: &str) {
+    /// [`AgentMarkdownCell::new`].
+    pub fn into_finalized_with(mut self, text: &str) -> AgentMarkdownCell {
         self.controller.replace_buffer(text);
         self.controller.finalize();
+        AgentMarkdownCell::new(text.to_string())
     }
 
     /// Run one commit-tick pass against `policy` and report whether any
@@ -123,7 +147,7 @@ impl AssistantMessageCell {
     }
 }
 
-impl HistoryCell for AssistantMessageCell {
+impl HistoryCell for AssistantStreamingCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let style = TranscriptRowKind::AssistantMessage.style();
         let render_width = style.body_width(width, style.label());
@@ -148,6 +172,10 @@ impl HistoryCell for AssistantMessageCell {
         u16::try_from(body + chrome).unwrap_or(u16::MAX)
     }
 }
+
+/// Backwards-compatible name for old streaming-only callers. New finalized
+/// assistant rows should use [`AgentMarkdownCell`].
+pub type AssistantMessageCell = AssistantStreamingCell;
 
 pub struct SkillInvocationCell {
     name: String,
@@ -193,7 +221,7 @@ mod tests {
 
     #[test]
     fn assistant_message_uses_codex_bullet_without_label() {
-        let cell = AssistantMessageCell::new(
+        let cell = AgentMarkdownCell::new(
             "This assistant reply wraps cleanly under the bullet marker.",
         );
 
@@ -280,13 +308,34 @@ mod tests {
         let mut streaming_cell = AssistantMessageCell::streaming();
         streaming_cell.push_delta("partial ");
         streaming_cell.push_delta("chunk\n");
-        streaming_cell.finalize_with("Finalized assistant reply text");
+        let finalized = streaming_cell.into_finalized_with("Finalized assistant reply text");
 
-        let final_cell = AssistantMessageCell::new("Finalized assistant reply text");
+        let final_cell = AgentMarkdownCell::new("Finalized assistant reply text");
         assert_eq!(
-            lines_text(&streaming_cell.display_lines(50)),
+            lines_text(&finalized.display_lines(50)),
             lines_text(&final_cell.display_lines(50))
         );
+    }
+
+    #[test]
+    fn finalized_agent_markdown_rerenders_from_source_at_new_width() {
+        let cell = AgentMarkdownCell::new(
+            "This finalized assistant message keeps raw markdown source so it can wrap again.",
+        );
+
+        let wide = lines_text(&cell.display_lines(80));
+        let narrow = lines_text(&cell.display_lines(32));
+
+        assert!(
+            wide.contains("• This finalized assistant message keeps raw markdown source"),
+            "wide render should keep most of the sentence on one row:\n{wide}"
+        );
+        insta::assert_snapshot!(narrow, @r"
+        • This finalized assistant
+          message keeps raw markdown
+          source so it can wrap again.
+
+        ");
     }
 
     #[test]

@@ -4,11 +4,12 @@ use ratatui::text::Line;
 use std::collections::HashMap;
 
 use crate::cells::{
-    ApprovalDecisionCell, AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell,
-    ExplorationOutputCell, ExploringSummaryCell, FileChangeCell, GitCheckpointCell, ModelListCell,
-    ModelSetCell, NoticeCell, PendingInputCell, SessionListCell, SessionNoticeCell,
-    SessionTreeCell, SkillInvocationCell, SubagentCell, ToolCallCell, ToolCallContext,
-    ToolOutputCell, TranscriptHitsCell, TurnAbortedCell, TurnDiffCell, UserMessageCell,
+    AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
+    CompactionPhase, ErrorCell, ExplorationOutputCell, ExploringSummaryCell, FileChangeCell,
+    GitCheckpointCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell, SessionListCell,
+    SessionNoticeCell, SessionTreeCell, SkillInvocationCell, SubagentCell, ToolCallCell,
+    ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell, TurnDiffCell,
+    UserMessageCell,
 };
 use crate::cells::ExplorationEntry;
 use crate::history::HistoryCell;
@@ -40,7 +41,7 @@ pub struct ChatWidget {
     /// In-flight streaming assistant cell. Rendered inside the viewport so
     /// deltas appear immediately; when the message finalizes it joins
     /// `finalized` and gets pushed to scrollback like everything else.
-    streaming_assistant: Option<AssistantMessageCell>,
+    streaming_assistant: Option<AssistantStreamingCell>,
     /// In-flight `Exploring`/`Running` placeholder rows, in arrival order
     /// keyed by `call_id`. Rendered inline (below the streaming cell) so the
     /// placeholder lives in the viewport only — when the matching
@@ -208,7 +209,7 @@ impl ChatWidget {
                     // text (or got deferred all the way to TurnComplete),
                     // misrepresenting causality in the transcript.
                     self.flush_explorations();
-                    self.streaming_assistant = Some(AssistantMessageCell::streaming());
+                    self.streaming_assistant = Some(AssistantStreamingCell::streaming());
                 }
                 if let Some(cell) = self.streaming_assistant.as_mut() {
                     cell.push_delta(&text);
@@ -222,12 +223,7 @@ impl ChatWidget {
                 // next round's Delta, the next non-summary tool, or
                 // TurnComplete. The else-branch (no prior Delta) still
                 // routes through push_cell, which flushes explicitly.
-                if let Some(mut cell) = self.streaming_assistant.take() {
-                    cell.finalize_with(&text);
-                    self.finalized.push(Box::new(cell));
-                } else {
-                    self.push_cell(AssistantMessageCell::new(text));
-                }
+                self.close_streaming_assistant_with(text);
             }
             AgentEvent::TurnComplete { usage: _ } => {
                 self.close_streaming_assistant();
@@ -301,13 +297,12 @@ impl ChatWidget {
                 // of order; failures and tools that don't have a summary
                 // verb (apply_patch, edit_file, …) go through the normal path
                 // so the user keeps seeing their full output.
-                if !is_error {
-                    if let Some(ctx) = &context {
-                        if let Some(entry) = ExplorationEntry::from_context(ctx) {
-                            self.buffer_exploration(entry);
-                            return;
-                        }
-                    }
+                if !is_error
+                    && let Some(ctx) = &context
+                    && let Some(entry) = ExplorationEntry::from_context(ctx)
+                {
+                    self.buffer_exploration(entry);
+                    return;
                 }
                 self.flush_explorations();
                 self.push_work_cell(ToolOutputCell::with_context(output, is_error, context));
@@ -612,9 +607,17 @@ impl ChatWidget {
     }
 
     fn close_streaming_assistant(&mut self) {
-        if let Some(mut cell) = self.streaming_assistant.take() {
-            cell.finalize();
-            self.finalized.push(Box::new(cell));
+        if let Some(cell) = self.streaming_assistant.take() {
+            self.finalized.push(Box::new(cell.into_finalized()));
+        }
+    }
+
+    fn close_streaming_assistant_with(&mut self, text: String) {
+        if let Some(cell) = self.streaming_assistant.take() {
+            self.finalized
+                .push(Box::new(cell.into_finalized_with(&text)));
+        } else {
+            self.push_cell(AgentMarkdownCell::new(text));
         }
     }
 

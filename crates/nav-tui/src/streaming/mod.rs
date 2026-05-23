@@ -28,18 +28,10 @@ struct QueuedLine {
 }
 
 /// Queue-backed stream state shared by commit animation and policy input.
+#[derive(Default)]
 pub(crate) struct StreamState {
     queued_lines: VecDeque<QueuedLine>,
     pub(crate) has_seen_delta: bool,
-}
-
-impl Default for StreamState {
-    fn default() -> Self {
-        Self {
-            queued_lines: VecDeque::new(),
-            has_seen_delta: false,
-        }
-    }
 }
 
 impl StreamState {
@@ -96,8 +88,10 @@ mod tests {
 
     #[test]
     fn stream_state_drain_n_clamps_to_queue_len() {
-        let mut state = StreamState::default();
-        state.has_seen_delta = true;
+        let mut state = StreamState {
+            has_seen_delta: true,
+            ..Default::default()
+        };
         state.enqueue(vec![Line::from("first"), Line::from("second")]);
 
         let drained = state.drain_n(8);

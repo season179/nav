@@ -22,7 +22,10 @@ pub(crate) use wrapping::{count_wrapped_body_lines, render_body};
 
 pub use changes::{FileChangeCell, GitCheckpointCell, TurnDiffCell};
 pub use compaction::{CompactionCell, CompactionPhase};
-pub use messages::{AssistantMessageCell, SkillInvocationCell, UserMessageCell};
+pub use messages::{
+    AgentMarkdownCell, AssistantMessageCell, AssistantStreamingCell, SkillInvocationCell,
+    UserMessageCell,
+};
 pub use model::{ModelListCell, ModelSetCell};
 pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use sessions::{SessionListCell, SessionNoticeCell, SessionTreeCell, TranscriptHitsCell};
