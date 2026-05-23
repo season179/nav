@@ -72,8 +72,9 @@ pub use context::{
 
 // Extension discovery, prompt templates, and theme metadata.
 pub use context::{
-    Extension, ExtensionCatalog, ExtensionScope, ExtensionTheme, PromptTemplate, ThemeColors,
-    discover_extensions, load_prompt_template,
+    DEFAULT_HOOK_TIMEOUT, Extension, ExtensionCatalog, ExtensionHook, ExtensionScope,
+    ExtensionTheme, HookCommand, HookEventType, PromptTemplate, ThemeColors, discover_extensions,
+    load_prompt_template,
 };
 
 // Git checkpoint/stash result types surfaced as durable agent events.

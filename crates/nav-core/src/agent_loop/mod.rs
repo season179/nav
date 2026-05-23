@@ -19,6 +19,7 @@ pub use runner::{AgentTurnRequest, SessionBinding, run_agent};
 pub(crate) mod compaction_turn;
 pub mod control;
 pub mod events;
+pub(crate) mod hooks;
 pub(crate) mod model_backend;
 pub mod protocol;
 pub(crate) mod prune;

@@ -202,12 +202,12 @@ fn tool_rows_collapse_skill_reads_into_summary_and_drop_output_preview() {
             "path": "/Users/season/.agents/skills/zoom-out/SKILL.md"
         }),
     });
-    // While the call is in flight the inline summary shows the friendly
+    // While the call is in flight the grouped row shows the friendly
     // `SKILL.md (<skill> skill)` form of the path as the current target.
     let started = render_widget(&mut widget, 90, 20);
     assert!(
-        started.contains("• Reading 1 file…"),
-        "in-flight summary must use present tense; got:\n{started}"
+        started.contains("Exploring (1 call)"),
+        "in-flight group must show call count; got:\n{started}"
     );
     assert!(
         started.contains("SKILL.md (zoom-out skill)"),
@@ -230,12 +230,8 @@ fn tool_rows_collapse_skill_reads_into_summary_and_drop_output_preview() {
     let rendered = lines_to_text(&widget.drain_pending(90));
 
     assert!(
-        !rendered.contains("• Reading"),
-        "in-flight summary must be gone once the output lands; got:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("• Read 1 file"),
-        "{rendered}"
+        rendered.contains("Exploring (1 call)"),
+        "scrollback must show the collapsed exploring group; got:\n{rendered}"
     );
     // The 20-line tool output is not surfaced — the summary is a count, not a preview.
     assert!(!rendered.contains("  └ 20 lines"), "{rendered}");
@@ -290,19 +286,18 @@ fn mixed_explorations_collapse_into_one_summary_row() {
     let rendered = lines_to_text(&widget.drain_pending(100));
 
     assert!(
-        rendered.contains("• Read 2 files, searched for 1 pattern"),
-        "all explorations must fold into a single comma-joined summary; got:\n{rendered}"
+        rendered.contains("Exploring (3 calls)"),
+        "all read-only calls must fold into one group; got:\n{rendered}"
     );
     assert_eq!(
-        rendered.matches("• Read 2 files, searched for 1 pattern").count(),
+        rendered.matches("Exploring (3 calls)").count(),
         1,
-        "expected exactly one summary row; got:\n{rendered}"
+        "expected exactly one group row; got:\n{rendered}"
     );
-    // Paths are not part of the summary anymore.
+    // Collapsed: only the most recent target is visible.
     assert!(!rendered.contains("docs/a.md"), "{rendered}");
-    assert!(!rendered.contains("inserthistory"), "{rendered}");
-    // No stats or preview for either.
-    assert!(!rendered.contains("  └"), "{rendered}");
+    assert!(rendered.contains("inserthistory"), "{rendered}");
+    assert!(!rendered.contains("  └ 1 line"), "{rendered}");
 }
 
 #[test]
@@ -375,16 +370,16 @@ fn explorations_dedupe_within_a_round_then_flush_per_assistant_segment() {
 
     let rendered = lines_to_text(&widget.drain_pending(100));
 
-    // Two summary rows, one per segment. Segment 1 dedupes within itself.
+    // Two group rows, one per segment (two reads each).
     assert_eq!(
-        rendered.matches("• Read 2 files").count(),
+        rendered.matches("Exploring (2 calls)").count(),
         2,
-        "expected one summary row per segment; got:\n{rendered}"
+        "expected one group row per segment; got:\n{rendered}"
     );
     // Segment 1's row must appear ABOVE the assistant text it preceded.
     let seg1_idx = rendered
-        .find("Read 2 files")
-        .expect("segment 1 summary present");
+        .find("Exploring (2 calls)")
+        .expect("segment 1 group present");
     let text_idx = rendered
         .find("let me read more")
         .expect("assistant text present");
@@ -395,11 +390,53 @@ fn explorations_dedupe_within_a_round_then_flush_per_assistant_segment() {
 }
 
 #[test]
-fn exploration_buffer_flushes_when_apply_patch_lands() {
-    // apply_patch (and other non-summary tools) is the canonical "this is
-    // a different kind of work" event — when it lands, the running
-    // exploration summary flushes to scrollback ahead of it so the order
-    // matches the user's mental model: explored → modified.
+fn consecutive_reads_group_breaks_on_write_tool() {
+    let mut widget = ChatWidget::new();
+
+    for (id, path) in [("r1", "a.rs"), ("r2", "b.rs")] {
+        widget.ingest(AgentEvent::ToolCallStarted {
+            call_id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": path }),
+        });
+        widget.ingest(AgentEvent::ToolCallOutput {
+            call_id: id.to_string(),
+            output: "ok".to_string(),
+            is_error: false,
+            truncation: None,
+        });
+    }
+
+    let inline_before_write = lines_to_text(&widget.inline_lines(100));
+    assert!(
+        inline_before_write.contains("Exploring (2 calls)"),
+        "buffered reads must show as one inline group; got:\n{inline_before_write}"
+    );
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "w1".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "*** Begin Patch\n*** Update File: b.rs\n@@\n-ok\n+done\n*** End Patch\n"
+        }),
+    });
+
+    let scrollback = lines_to_text(&widget.drain_pending(100));
+    assert!(
+        scrollback.contains("Exploring (2 calls)"),
+        "starting a write must flush the read group to scrollback; got:\n{scrollback}"
+    );
+    let inline = lines_to_text(&widget.inline_lines(100));
+    assert!(
+        inline.contains("apply_patch"),
+        "write tool must render outside the group; got:\n{inline}"
+    );
+}
+
+#[test]
+fn exploration_buffer_flushes_when_apply_patch_starts() {
+    // Non-read-only tool start breaks the group so scrollback reads
+    // explore → modify.
     let mut widget = ChatWidget::new();
 
     widget.ingest(AgentEvent::ToolCallStarted {
@@ -430,14 +467,14 @@ fn exploration_buffer_flushes_when_apply_patch_lands() {
     let rendered = lines_to_text(&widget.drain_pending(100));
 
     assert!(
-        rendered.contains("• Read 1 file"),
-        "exploration summary must appear before the patch row; got:\n{rendered}"
+        rendered.contains("Exploring (1 call)"),
+        "exploring group must appear before the patch row; got:\n{rendered}"
     );
     assert!(
         rendered.contains("• Ran  apply_patch M foo.rs"),
         "{rendered}"
     );
-    let summary_idx = rendered.find("• Read 1 file").expect("summary present");
+    let summary_idx = rendered.find("Exploring (1 call)").expect("group present");
     let patch_idx = rendered.find("• Ran  apply_patch").expect("patch present");
     assert!(
         summary_idx < patch_idx,
@@ -475,8 +512,8 @@ fn explorations_flush_before_next_streaming_assistant_cell() {
     let scrollback = lines_to_text(&widget.drain_pending(100));
 
     let summary_idx = scrollback
-        .find("Read 1 file")
-        .expect("summary present in scrollback");
+        .find("Exploring (1 call)")
+        .expect("group present in scrollback");
     let text_idx = scrollback
         .find("Based on config.toml")
         .expect("assistant text present");
@@ -487,11 +524,10 @@ fn explorations_flush_before_next_streaming_assistant_cell() {
 }
 
 #[test]
-fn same_file_read_twice_across_frame_drain_collapses_to_one_summary() {
+fn same_file_read_twice_across_frame_drain_stays_in_one_group() {
     // Regression: two `read_file` calls on the same path used to produce
-    // two `• Explored  Read foo.rs` rows because `drain_pending` flushed
-    // the buffered exploration between them. The agent re-reading the
-    // same file should appear as a single summary line — count, not paths.
+    // two separate rows because `drain_pending` flushed between them.
+    // Consecutive reads should stay in one exploring group with call count.
     let mut widget = ChatWidget::new();
 
     widget.ingest(AgentEvent::ToolCallStarted {
@@ -533,17 +569,13 @@ fn same_file_read_twice_across_frame_drain_collapses_to_one_summary() {
     let rendered = lines_to_text(&scrollback);
 
     assert!(
-        rendered.contains("• Read 1 file"),
-        "expected dedup'd summary; got:\n{rendered}"
+        rendered.contains("Exploring (2 calls)"),
+        "expected one group counting both reads; got:\n{rendered}"
     );
     assert_eq!(
-        rendered.matches("• Read 1 file").count(),
+        rendered.matches("Exploring (2 calls)").count(),
         1,
-        "expected exactly one summary row; got:\n{rendered}"
-    );
-    assert!(
-        !rendered.contains("wrapping.rs"),
-        "summary must not list paths; got:\n{rendered}"
+        "expected exactly one group row; got:\n{rendered}"
     );
 }
 
@@ -555,7 +587,7 @@ fn inline_running_summary_shows_present_tense_with_current_target() {
     // the most recently started target on the row below.
     let mut widget = ChatWidget::new();
 
-    // One search just completed — buffered into pending_explorations.
+    // One search just completed — buffered into exploring_buffer.
     widget.ingest(AgentEvent::ToolCallStarted {
         call_id: "s1".to_string(),
         name: "code_search".to_string(),
@@ -604,20 +636,16 @@ fn inline_running_summary_shows_present_tense_with_current_target() {
     let inline = lines_to_text(&widget.inline_lines(120));
 
     assert!(
-        inline.contains(
-            "Searching for 1 pattern, reading 3 files, listing 1 directory, running 1 shell command…"
-        ),
-        "inline summary must use present tense for the whole row (the cell \
-         is still live), capitalize the first phrase, and end with an ellipsis; \
-         got:\n{inline}"
+        inline.contains("Exploring (6 calls)"),
+        "inline group must count buffered and in-flight read-only calls; got:\n{inline}"
     );
     assert!(
         inline.contains("cargo build"),
         "most recently started in-flight target should appear under the summary; got:\n{inline}"
     );
     assert!(
-        !inline.contains("• Exploring"),
-        "individual `Exploring` placeholders must be collapsed into the summary; got:\n{inline}"
+        !inline.contains("• Exploring\n  Read"),
+        "individual read placeholders must be collapsed into the group; got:\n{inline}"
     );
     assert!(
         !inline.contains("• Running  cargo build"),
@@ -628,7 +656,7 @@ fn inline_running_summary_shows_present_tense_with_current_target() {
 #[test]
 fn inline_summary_switches_to_past_tense_when_no_tool_in_flight() {
     // Between two batches of tool calls (or between the last read and the
-    // next assistant message), pending_explorations is non-empty but no
+    // next assistant message), exploring_buffer is non-empty but no
     // summary tool is currently in flight. The inline cell must NOT claim
     // "Reading…" because nothing is being read right now.
     let mut widget = ChatWidget::new();
@@ -648,20 +676,12 @@ fn inline_summary_switches_to_past_tense_when_no_tool_in_flight() {
     let inline = lines_to_text(&widget.inline_lines(80));
 
     assert!(
-        !inline.contains("Reading"),
-        "summary must not lie about being mid-read; got:\n{inline}"
+        inline.contains("Exploring (1 call)"),
+        "buffered read must show as a grouped row; got:\n{inline}"
     );
     assert!(
-        !inline.contains('…'),
-        "no ellipsis when nothing is in-flight; got:\n{inline}"
-    );
-    assert!(
-        inline.contains("Read 1 file"),
-        "past-tense count must still be visible; got:\n{inline}"
-    );
-    assert!(
-        !inline.contains("└ "),
-        "no current_target line when nothing is in-flight; got:\n{inline}"
+        inline.contains("└ foo.rs"),
+        "collapsed group shows the most recent target; got:\n{inline}"
     );
 }
 
@@ -687,8 +707,8 @@ fn successful_bash_folds_into_summary_as_shell_command() {
     let rendered = lines_to_text(&widget.drain_pending(100));
 
     assert!(
-        rendered.contains("• Ran 1 shell command"),
-        "successful bash must join the rolled-up summary; got:\n{rendered}"
+        rendered.contains("Exploring (1 call)"),
+        "successful bash must join the exploring group; got:\n{rendered}"
     );
     assert!(
         !rendered.contains("• Ran  cargo test"),
@@ -725,6 +745,51 @@ fn failed_bash_still_shows_output_preview() {
         "failed bash must keep its dedicated row; got:\n{rendered}"
     );
     assert!(rendered.contains("boom"), "{rendered}");
+}
+
+#[test]
+fn failed_read_after_successful_reads_flushes_group_then_shows_error() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "ok".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "good.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "ok".to_string(),
+        output: "fine".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "bad".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "nope.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "bad".to_string(),
+        output: "permission denied".to_string(),
+        is_error: true,
+        truncation: None,
+    });
+
+    let rendered = lines_to_text(&widget.drain_pending(100));
+
+    assert!(
+        rendered.contains("Exploring (1 call)"),
+        "successful read must flush as a group before the failure row; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("■ Failed  Read nope.rs"),
+        "failed read must keep its own output row; got:\n{rendered}"
+    );
+    let group_idx = rendered.find("Exploring (1 call)").expect("group");
+    let fail_idx = rendered.find("■ Failed").expect("failed row");
+    assert!(
+        group_idx < fail_idx,
+        "group must precede the failure row; got:\n{rendered}"
+    );
 }
 
 #[test]
@@ -1205,6 +1270,38 @@ fn renders_session_management_cells() {
 }
 
 #[test]
+fn turn_complete_folds_unresolved_read_only_inflight_into_exploring_group() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "orphan.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r2".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "other.rs" }),
+    });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
+
+    let rendered = lines_to_text(&widget.drain_pending(80));
+    assert!(
+        rendered.contains("Exploring (2 calls)"),
+        "turn end must fold unresolved read-only placeholders into one group; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("other.rs"),
+        "collapsed group must show the most recently started target; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("orphan.rs"),
+        "collapsed group must not list earlier targets; got:\n{rendered}"
+    );
+}
+
+#[test]
 fn turn_aborted_flushes_inflight_tool_placeholder_to_scrollback() {
     // Regression: a tool call that started but never produced output used
     // to leak its `Exploring` placeholder into `inflight_tool_calls`
@@ -1310,8 +1407,8 @@ fn inflight_tool_placeholders_preserve_arrival_order() {
 
     let inline = lines_to_text(&widget.inline_lines(80));
     assert!(
-        inline.contains("Reading 2 files…"),
-        "summary counts both in-flight reads; got:\n{inline}"
+        inline.contains("Exploring (2 calls)"),
+        "group counts both in-flight reads; got:\n{inline}"
     );
     assert!(
         inline.contains("/second.txt"),
@@ -1472,15 +1569,15 @@ fn finalized_exploration_summary_uses_bullet_chrome_not_explored_label() {
         "summary row must drop the 'Explored' label; got:\n{scrollback}"
     );
     assert!(
-        scrollback.contains("• Read 1 file"),
-        "summary row must render as a plain bullet; got:\n{scrollback}"
+        scrollback.contains("Exploring (1 call)"),
+        "finalized group must use the exploring header; got:\n{scrollback}"
     );
 }
 
 #[test]
 fn flush_pending_for_shutdown_promotes_buffered_explorations() {
     // Regression: the AppEvent::Quit handler used to `break` out of the
-    // main loop while pending_explorations still held un-flushed groups,
+    // main loop while exploring_buffer still held un-flushed calls,
     // so the running summary never made it into scrollback. ChatWidget
     // exposes `flush_pending_for_shutdown` so the app can promote those
     // groups into a finalized cell that the final drain_pending picks up.
@@ -1501,7 +1598,7 @@ fn flush_pending_for_shutdown_promotes_buffered_explorations() {
     // Before flush: nothing finalized yet; the summary lives only inline.
     let before = lines_to_text(&widget.drain_pending(80));
     assert!(
-        !before.contains("Read 1 file"),
+        !before.contains("Exploring (1 call)"),
         "buffered exploration must not auto-flush via drain_pending; got:\n{before}"
     );
 
@@ -1509,8 +1606,8 @@ fn flush_pending_for_shutdown_promotes_buffered_explorations() {
 
     let after = lines_to_text(&widget.drain_pending(80));
     assert!(
-        after.contains("Read 1 file"),
-        "flush_pending_for_shutdown must surface the summary; got:\n{after}"
+        after.contains("Exploring (1 call)"),
+        "flush_pending_for_shutdown must surface the group; got:\n{after}"
     );
 }
 
@@ -1574,6 +1671,38 @@ fn reasoning_delta_then_done_builds_reasoning_cell() {
     assert!(
         finalized.contains("Reasoning (2 lines)"),
         "collapsed reasoning should show line count; got:\n{finalized}"
+    );
+}
+
+#[test]
+fn reasoning_delta_buffer_flushed_when_assistant_closes_without_done() {
+    let mut widget = ChatWidget::new();
+
+    widget.push_user("think");
+    widget.ingest(AgentEvent::ReasoningDelta {
+        text: "buffered only\nsecond line".to_string(),
+    });
+    // No ReasoningDone — provider may only stream deltas; assistant close
+    // must still materialize a ReasoningCell from the buffer.
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "answer".to_string(),
+    });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
+
+    let finalized = lines_to_text(&widget.drain_pending(60));
+    assert!(
+        finalized.contains("◆ reasoning"),
+        "delta-only reasoning should flush on assistant close; got:\n{finalized}"
+    );
+    assert!(
+        finalized.contains("Reasoning (2 lines)"),
+        "buffered reasoning should collapse with line count; got:\n{finalized}"
+    );
+    assert!(
+        !finalized.contains("• buffered only"),
+        "reasoning must not leak under assistant bullet; got:\n{finalized}"
     );
 }
 

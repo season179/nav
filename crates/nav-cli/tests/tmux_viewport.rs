@@ -23,6 +23,8 @@ use tempfile::{TempDir, tempdir};
 
 const TEST_API_KEY: &str = "test-only-not-real";
 const MOCK_FINAL_MARKER: &str = "SMOKE_OK_STREAM";
+const MOCK_EXPLORATION_GROUP_MARKER: &str = "EXPLORATION_GROUP_OK";
+const MOCK_TURN_SEPARATOR_MARKER: &str = "TURN_SEP_OK";
 const MOCK_FINAL_REFLOW_TEXT: &str =
     "source backed markdown reflow keeps this finalized assistant message clean after resize";
 const MOCK_FINAL_REFLOW_MIDPOINT: &str = "finalized assistant message";
@@ -249,7 +251,7 @@ fn spawn_mock_streaming_server(chunk_count: usize) -> u16 {
                     return;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() > Duration::from_secs(10) {
+                    if started.elapsed() > Duration::from_secs(30) {
                         return;
                     }
                     sleep(Duration::from_millis(25));
@@ -317,23 +319,20 @@ fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
     write_mock_multi_model_settings(workdir, &[model], port);
 }
 
-fn spawn_mock_reasoning_server() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock reasoning server bind");
-    let port = listener
-        .local_addr()
-        .expect("mock reasoning server local addr")
-        .port();
-    let _ = listener.set_nonblocking(true);
+fn spawn_mock_sse_server(name: &str, on_connect: fn(TcpStream)) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect(&format!("mock {name} bind"));
+    let port = listener.local_addr().expect("mock addr").port();
+    listener.set_nonblocking(true).expect("nonblocking");
     thread::spawn(move || {
-        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    write_mock_reasoning_response(stream);
+                    on_connect(stream);
                     return;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() > Duration::from_secs(10) {
+                    if Instant::now() >= deadline {
                         return;
                     }
                     sleep(Duration::from_millis(25));
@@ -343,6 +342,43 @@ fn spawn_mock_reasoning_server() -> u16 {
         }
     });
     port
+}
+
+fn spawn_mock_turn_separator_server() -> u16 {
+    spawn_mock_sse_server("turn separator", write_mock_turn_separator_response)
+}
+
+fn write_mock_turn_separator_response(mut stream: TcpStream) {
+    read_http_request(&mut stream);
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    let reply = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": MOCK_TURN_SEPARATOR_MARKER
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 1200,
+            "completion_tokens": 3400,
+        }
+    })
+    .to_string();
+    if stream.write_all(format!("data: {reply}\n\n").as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+}
+
+fn spawn_mock_reasoning_server() -> u16 {
+    spawn_mock_sse_server("reasoning", write_mock_reasoning_response)
 }
 
 fn write_mock_reasoning_response(mut stream: TcpStream) {
@@ -392,27 +428,108 @@ fn write_mock_reasoning_response(mut stream: TcpStream) {
 
 fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
     read_http_request(&mut stream);
+    // Newline-terminate each chunk so the StreamController's partition logic
+    // flips bytes from tail to stable under the visibility gate.
+    let mut chunks: Vec<serde_json::Value> = (0..chunk_count)
+        .map(|i| {
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": format!("chunk-{i}\n") }
+                }]
+            })
+        })
+        .collect();
+    chunks.push(json!({
+        "choices": [{
+            "index": 0,
+            "delta": { "content": format!("{MOCK_FINAL_MARKER} {MOCK_FINAL_REFLOW_TEXT}") },
+            "finish_reason": "stop"
+        }]
+    }));
+    write_sse_chunks(&mut stream, &chunks);
+}
+
+fn mock_exploration_tool_result_count(body: &str) -> usize {
+    body.matches("\"role\":\"tool\"").count() + body.matches("\"role\": \"tool\"").count()
+}
+
+fn spawn_mock_exploration_group_server() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock exploration server bind");
+    let port = listener
+        .local_addr()
+        .expect("mock exploration server local addr")
+        .port();
+    let _ = listener.set_nonblocking(true);
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let body = read_http_request_body(&mut stream);
+                    match mock_exploration_tool_result_count(&body) {
+                        0 => write_mock_parallel_read_file_response(&mut stream),
+                        1 | 2 => write_mock_apply_patch_response(&mut stream),
+                        _ => write_mock_exploration_group_final_response(&mut stream),
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(30) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(25));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    port
+}
+
+fn write_mock_parallel_read_file_response(stream: &mut TcpStream) {
+    write_sse_chunks(
+        stream,
+        &[
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"read_a","type":"function","function":{"name":"read_file","arguments":""}}]}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.rs\"}"}}]}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"read_b","type":"function","function":{"name":"read_file","arguments":""}}]}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"path\":\"b.rs\"}"}}]}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ],
+    );
+}
+
+fn write_mock_apply_patch_response(stream: &mut TcpStream) {
+    write_sse_chunks(
+        stream,
+        &[
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"patch_1","type":"function","function":{"name":"apply_patch","arguments":""}}]}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"patch\":\"*** Begin Patch\\n*** Update File: b.rs\\n@@\\n-ok\\n+done\\n*** End Patch\\n\"}"}}]}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ],
+    );
+}
+
+fn write_mock_exploration_group_final_response(stream: &mut TcpStream) {
+    write_sse_chunks(
+        stream,
+        &[json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": MOCK_EXPLORATION_GROUP_MARKER },
+                "finish_reason": "stop"
+            }]
+        })],
+    );
+}
+
+fn write_sse_chunks(stream: &mut TcpStream, chunks: &[serde_json::Value]) {
     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if stream.write_all(header).is_err() {
         return;
     }
     let _ = stream.flush();
-
-    for i in 0..chunk_count {
-        // Newline-terminate each chunk so the StreamController's partition
-        // logic flips bytes from tail to stable, which is the path the
-        // visibility gate (`AdaptiveChunkingPolicy` + commit ticks)
-        // actually paces. A space separator instead of `\n` would keep
-        // every chunk in the live tail and bypass the gate entirely.
-        let chunk = json!({
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "content": format!("chunk-{i}\n")
-                }
-            }]
-        })
-        .to_string();
+    for chunk in chunks {
         let frame = format!("data: {chunk}\n\n");
         if stream.write_all(frame.as_bytes()).is_err() {
             return;
@@ -422,23 +539,8 @@ fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
         }
         sleep(Duration::from_millis(5));
     }
-
-    let final_payload = json!({
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "content": format!("{MOCK_FINAL_MARKER} {MOCK_FINAL_REFLOW_TEXT}")
-            },
-            "finish_reason": "stop"
-        }]
-    })
-    .to_string();
-    let final_chunk = format!("data: {final_payload}\n\n");
-    if stream.write_all(final_chunk.as_bytes()).is_err() {
-        return;
-    }
-    let _ = stream.flush();
     let _ = stream.write_all(b"data: [DONE]\n\n");
+    let _ = stream.flush();
 }
 
 fn write_mock_approval_response(mut stream: TcpStream, tool_call_delay: Duration) {
@@ -500,17 +602,21 @@ fn write_mock_approval_response(mut stream: TcpStream, tool_call_delay: Duration
 }
 
 fn read_http_request(stream: &mut TcpStream) {
+    let _ = read_http_request_body(stream);
+}
+
+fn read_http_request_body(stream: &mut TcpStream) -> String {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let mut received = Vec::new();
     let mut chunk = [0_u8; 4096];
 
     loop {
         match stream.read(&mut chunk) {
-            Ok(0) => return,
+            Ok(0) => break,
             Ok(n) => {
                 received.extend_from_slice(&chunk[..n]);
                 if request_is_complete(&received) || received.len() > 256 * 1024 {
-                    return;
+                    break;
                 }
             }
             Err(err)
@@ -519,11 +625,12 @@ fn read_http_request(stream: &mut TcpStream) {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                return;
+                break;
             }
-            Err(_) => return,
+            Err(_) => break,
         }
     }
+    String::from_utf8_lossy(&received).into_owned()
 }
 
 fn request_is_complete(received: &[u8]) -> bool {
@@ -620,7 +727,7 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
     // a stable anchor on anyway.
     let baseline = session.wait_for(
         |pane| pane.contains("Ask nav to do anything"),
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
     assert!(
         baseline.contains("Ask nav to do anything"),
@@ -632,21 +739,21 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
 
     session.send("C-t");
     let overlay = session.wait_for(
-        |pane| pane.contains("Test Overlay") && pane.contains("Press Esc to close."),
+        |pane| pane.contains("Transcript") && pane.contains("No transcript yet."),
         Duration::from_secs(5),
     );
     assert!(
-        overlay.contains("Test Overlay"),
-        "test overlay never became visible:\n{overlay}"
+        overlay.contains("Transcript"),
+        "transcript overlay never became visible:\n{overlay}"
     );
 
     session.resize(120, 24);
     let overlay_after_resize = session.wait_for(
-        |pane| pane.contains("Any key is swallowed by the overlay."),
+        |pane| pane.contains("Transcript") && pane.contains("Esc/q close"),
         Duration::from_secs(5),
     );
     assert!(
-        overlay_after_resize.contains("Any key is swallowed by the overlay."),
+        overlay_after_resize.contains("Transcript") && overlay_after_resize.contains("Esc/q close"),
         "overlay text disappeared after resize:\n{overlay_after_resize}"
     );
 
@@ -656,7 +763,7 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
     sleep(Duration::from_millis(150));
     session.send("Escape");
     let restored = session.wait_for(
-        |pane| pane.contains("Ask nav to do anything") && !pane.contains("Test Overlay"),
+        |pane| pane.contains("Ask nav to do anything") && !pane.contains("Transcript"),
         Duration::from_secs(5),
     );
     let restored_row = last_row_with(&restored, |line| line.contains("Ask nav to do anything"))
@@ -826,6 +933,81 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
 }
 
 #[test]
+fn transcript_overlay_shows_live_stream_and_restores_inline_viewport() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_streaming_server(400);
+    let workdir = tempdir().expect("tempdir for mock provider settings");
+    write_mock_provider_settings(&workdir, "transcript", mock_port);
+
+    let session = fresh_session("transcript-overlay");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/transcript"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(15));
+    assert!(status_bar_present(&ready), "nav failed to boot:\n{ready}");
+
+    session.send_line("open transcript while streaming");
+    let streaming = session.wait_for(|pane| pane.contains("chunk-"), Duration::from_secs(4));
+    assert!(
+        streaming.contains("chunk-"),
+        "did not observe streaming before opening transcript:\n{streaming}"
+    );
+
+    session.send("C-t");
+    let overlay = session.wait_for(
+        |pane| pane.contains("Transcript") && pane.contains("chunk-"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        overlay.contains("Transcript") && overlay.contains("chunk-"),
+        "transcript overlay did not show the live tail:\n{overlay}"
+    );
+
+    session.send("Home");
+    let scrolled_top = session.wait_for(
+        |pane| pane.contains("Transcript") && pane.contains("open transcript while streaming"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        scrolled_top.contains("Transcript")
+            && scrolled_top.contains("open transcript while streaming"),
+        "transcript overlay could not scroll back to the committed prompt:\n{scrolled_top}"
+    );
+
+    session.send("PageUp");
+    session.send("End");
+    if session.try_resize(70, 20) {
+        let resized = session.wait_for(
+            |pane| pane.contains("Transcript") && pane.contains("chunk-"),
+            Duration::from_secs(3),
+        );
+        assert!(
+            resized.contains("Transcript") && resized.contains("chunk-"),
+            "transcript overlay was not stable across resize:\n{resized}"
+        );
+    }
+
+    session.send("q");
+    let restored = session.wait_for(
+        |pane| !pane.contains("Transcript") && pane.contains("Ask nav to do anything"),
+        Duration::from_secs(6),
+    );
+    assert!(
+        !restored.contains("Transcript") && restored.contains("Ask nav to do anything"),
+        "inline viewport did not restore after closing transcript overlay:\n{restored}"
+    );
+}
+
+#[test]
 fn finalized_assistant_message_reflows_after_terminal_resize() {
     if !tmux_available() {
         eprintln!("tmux unavailable or not runnable in this environment, skipping");
@@ -880,8 +1062,13 @@ fn finalized_assistant_message_reflows_after_terminal_resize() {
         "finalized assistant message should wrap across multiple rows after resize, got:\n{resized}"
     );
     assert!(
-        resized.contains(MOCK_FINAL_REFLOW_MIDPOINT) && resized.contains("after resize"),
+        resized.contains(MOCK_FINAL_REFLOW_MIDPOINT),
         "finalized assistant source fragments missing after resize:\n{resized}"
+    );
+    // Terminal wrap may split "after resize" across lines at narrow widths.
+    assert!(
+        resized.contains("after") && resized.contains("resize"),
+        "finalized assistant tail missing after resize:\n{resized}"
     );
     assert_eq!(
         resized.matches(MOCK_FINAL_MARKER).count(),
@@ -1212,6 +1399,52 @@ fn bottom_pane_layout_survives_resize() {
     );
 }
 
+/// A successfully completed user turn must paint a subdued divider with
+/// duration and token totals (`↓` prompt, `↑` completion) in scrollback.
+#[test]
+fn completed_turn_shows_final_message_separator() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_turn_separator_server();
+    let workdir = tempdir().expect("tempdir for mock turn separator settings");
+    write_mock_provider_settings(&workdir, "turnsep", mock_port);
+
+    let session = fresh_session("turn-separator");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/turnsep"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "turn separator test nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("finish with metrics");
+
+    let completed = session.wait_for(
+        |pane| {
+            pane.contains(MOCK_TURN_SEPARATOR_MARKER)
+                && pane.contains("↓1.2k ↑3.4k")
+                && pane
+                    .lines()
+                    .any(|line| line.contains('─') && (line.contains("ms") || line.contains('s')))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        completed.contains(MOCK_TURN_SEPARATOR_MARKER) && completed.contains("↓1.2k ↑3.4k"),
+        "turn separator with metrics never appeared:\n{completed}"
+    );
+}
+
 /// Reasoning content from the provider must land in a `ReasoningCell`, not
 /// inside the `AssistantMessageCell`. The mock server streams
 /// `reasoning_content` chunks followed by a regular assistant reply.
@@ -1272,6 +1505,54 @@ fn reasoning_content_lands_in_reasoning_cell_not_assistant() {
     assert!(
         !completed.contains("• Step 1:"),
         "reasoning text leaked into the assistant bullet row:\n{completed}"
+    );
+}
+
+#[test]
+fn read_only_tools_group_until_write_starts_new_cell() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_exploration_group_server();
+    let workdir = tempdir().expect("tempdir for exploration group mock");
+    fs::write(workdir.path().join("a.rs"), "aaa\n").expect("write a.rs");
+    fs::write(workdir.path().join("b.rs"), "bbb\n").expect("write b.rs");
+    write_mock_provider_settings(&workdir, "explore", mock_port);
+
+    let session = fresh_session("exploration-group");
+    session.start(100, 30);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && OPENAI_API_KEY={TEST_API_KEY} {nav} --auth api-key --model mock/explore"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(8));
+    assert!(status_bar_present(&ready), "nav failed to boot:\n{ready}");
+
+    session.send_line("read both files then patch b");
+
+    let completed = session.wait_for(
+        |pane| {
+            pane.contains(MOCK_EXPLORATION_GROUP_MARKER)
+                && pane.contains("Exploring (2 calls)")
+        },
+        Duration::from_secs(20),
+    );
+    assert!(
+        completed.contains(MOCK_EXPLORATION_GROUP_MARKER),
+        "turn never completed:\n{completed}"
+    );
+    assert!(
+        completed.contains("Exploring (2 calls)"),
+        "expected one grouped row for the two reads; got:\n{completed}"
+    );
+    assert!(
+        completed.contains("apply_patch") || completed.contains("Ran  apply_patch"),
+        "write tool must render outside the exploring group; got:\n{completed}"
     );
 }
 

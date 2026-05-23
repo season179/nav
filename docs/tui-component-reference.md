@@ -68,7 +68,7 @@ that implements `HistoryCell` — think of it as a component with a single
 |---|---|---|---|
 | `ToolCallCell` | Collapsible `<details>` | `cells/tools.rs` | Tool name + args the model requested |
 | `ToolOutputCell` | Collapsible result block | `cells/tools.rs` | Tool output shown back to the model |
-| `ExplorationOutputCell` | Tabbed preview panel | `cells/tools.rs` | Read-only file snippets the agent browsed |
+| `ToolCallCell` (exploring group) | Collapsible group row | `cells/tools.rs` | Consecutive read-only tool calls (`Exploring (N calls)`) |
 
 ### Agent structure cells
 

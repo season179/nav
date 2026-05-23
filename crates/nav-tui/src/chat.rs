@@ -1,16 +1,17 @@
-use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit};
+use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit, TurnUsage};
+use std::time::Duration;
 use ratatui::text::Line;
 use std::collections::HashMap;
 
+use crate::cells::ExplorationEntry;
 use crate::cells::{
     AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
-    CompactionPhase, ErrorCell, ExplorationOutputCell, ExploringSummaryCell, FileChangeCell,
+    CompactionPhase, ErrorCell, FileChangeCell,
     GitCheckpointCell, HookCell, NoticeCell, PendingInputCell,
     ReasoningCell, SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell,
     SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
-    TurnAbortedCell, TurnDiffCell, UserMessageCell,
+    FinalMessageSeparator, TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
-use crate::cells::ExplorationEntry;
 use crate::history::HistoryCell;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::theme::Theme;
@@ -45,20 +46,17 @@ pub struct ChatWidget {
     /// keyed by `call_id`. Rendered inline (below the streaming cell) so the
     /// placeholder lives in the viewport only — when the matching
     /// `ToolCallOutput` arrives the entry is dropped and a single
-    /// `Explored`/`Ran` row goes to scrollback. A `Vec` (not a map) so the
+    /// matching output buffers into the exploring group instead. A `Vec` (not a map) so the
     /// display order matches issuance order; the OpenAI Responses API hands
     /// out opaque random `call_id`s, so a hash- or btree-keyed container
     /// would shuffle parallel placeholders.
     inflight_tool_calls: Vec<(String, ToolCallCell)>,
-    /// Pending exploration outputs waiting to be collapsed. Successful
-    /// outputs from summarizable tools (Read, List, Search, Bash) merge
-    /// into per-action target lists; the final cell renders as a count
-    /// summary (`Read 3 files, ran 1 shell command`). Flushed to
-    /// scrollback when a non-summary cell is pushed or the turn ends —
-    /// `drain_pending` does NOT flush, so the same-file dedup survives
-    /// frame ticks. While buffered, this also feeds the inline
-    /// `ExploringSummaryCell` so the user sees the running summary live.
-    pending_explorations: Vec<(&'static str, Vec<String>)>,
+    /// Completed read-only tool calls waiting to be collapsed into one
+    /// [`ToolCallCell`] exploring group. Flushed when a non-read-only call
+    /// starts, any user-facing cell is pushed, or the turn ends.
+    /// `drain_pending` does NOT flush so consecutive reads across frame
+    /// ticks still merge.
+    exploring_buffer: Vec<ToolCallContext>,
     /// In-flight reasoning delta buffer. Accumulated silently while
     /// streaming; flushed to scrollback as a collapsed `ReasoningCell`
     /// when the streaming assistant closes.
@@ -69,6 +67,9 @@ pub struct ChatWidget {
     /// allow the next reply to immediately re-enter catch-up. Driven by
     /// [`Self::on_commit_tick`] from the app's frame loop.
     adaptive_chunking: AdaptiveChunkingPolicy,
+    /// Monotonic revision for overlay caches that render the full transcript
+    /// from finalized cells plus the in-flight live tail.
+    transcript_revision: u64,
 }
 
 impl ChatWidget {
@@ -87,8 +88,9 @@ impl ChatWidget {
             streaming_assistant: None,
             streaming_reasoning: None,
             inflight_tool_calls: Vec::new(),
-            pending_explorations: Vec::new(),
+            exploring_buffer: Vec::new(),
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
+            transcript_revision: 0,
         }
     }
 
@@ -100,7 +102,37 @@ impl ChatWidget {
         let Some(cell) = self.streaming_assistant.as_mut() else {
             return false;
         };
-        cell.on_commit_tick(&mut self.adaptive_chunking)
+        let changed = cell.on_commit_tick(&mut self.adaptive_chunking);
+        if changed {
+            self.bump_transcript_revision();
+        }
+        changed
+    }
+
+    pub(crate) fn transcript_revision(&self) -> u64 {
+        self.transcript_revision
+    }
+
+    pub(crate) fn has_live_tail(&self) -> bool {
+        self.streaming_assistant.is_some()
+            || !self.inflight_tool_calls.is_empty()
+            || !self.exploring_buffer.is_empty()
+    }
+
+    /// Render the full app-owned transcript: finalized history cells plus the
+    /// current inline-only live tail (streaming text and in-flight tools).
+    pub(crate) fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = width.max(1);
+        let mut out = Vec::new();
+        for cell in &self.finalized {
+            out.extend(cell.display_lines(width));
+        }
+        out.extend(self.inline_lines(width));
+        out
+    }
+
+    fn bump_transcript_revision(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
     }
 
     /// Append a user-authored message before the agent loop echoes the durable
@@ -155,15 +187,24 @@ impl ChatWidget {
         self.push_cell(TranscriptHitsCell::new(query, hits));
     }
 
+    /// Scrollback divider after a user turn finishes successfully.
+    ///
+    /// Not used for aborted or errored turns — those already have their own cells.
+    pub fn push_final_message_separator(&mut self, duration: Duration, usage: TurnUsage) {
+        self.end_active_turn_viewport();
+        self.finalized
+            .push(Box::new(FinalMessageSeparator::new(duration, usage)));
+    }
+
     /// Drain finalized cells that haven't been pushed to scrollback yet,
     /// rendering each at `width`. The main loop calls this once per tick
     /// before drawing the viewport. Cells stay in `finalized` so a later
     /// resize can reflow them.
     ///
-    /// Deliberately does NOT flush `pending_explorations` — same-file reads
+    /// Deliberately does NOT flush `exploring_buffer` — consecutive reads
     /// (and same-action runs in general) need to merge across frame ticks,
-    /// otherwise drain_pending splits one logical summary into N cells.
-    /// The running summary is surfaced inline via [`Self::inline_lines`]
+    /// otherwise drain_pending splits one logical group into N cells.
+    /// The running group is surfaced inline via [`Self::inline_lines`]
     /// until a non-exploration event or turn end flushes it to scrollback.
     pub fn drain_pending(&mut self, width: u16) -> Vec<Line<'static>> {
         if self.pending_start >= self.finalized.len() {
@@ -185,6 +226,7 @@ impl ChatWidget {
     /// through `push_cell`, which finalizes the streaming row and queues
     /// it before appending the new cell.
     pub fn ingest(&mut self, event: AgentEvent) {
+        self.bump_transcript_revision();
         match event {
             AgentEvent::UserMessage {
                 text,
@@ -215,7 +257,7 @@ impl ChatWidget {
                 // it doesn't double-flush, but the AssistantMessageDelta
                 // arm above already flushed explorations when this cell
                 // started — anything buffered since then will flush at the
-                // next round's Delta, the next non-summary tool, or
+                // next round's Delta, the next mutating tool, or
                 // TurnComplete. The else-branch (no prior Delta) still
                 // routes through push_cell, which flushes explicitly.
                 self.close_streaming_assistant_with(text);
@@ -226,18 +268,12 @@ impl ChatWidget {
                     .push_str(&text);
             }
             AgentEvent::ReasoningDone { text } => {
-                // Discard accumulated deltas — the coalesced `text` from
-                // `ReasoningDone` is authoritative, matching how
-                // `AssistantMessageDone` replaces streamed chunks.
+                // Coalesced `text` is authoritative over streamed deltas.
                 self.streaming_reasoning.take();
-                if !text.is_empty() {
-                    self.push_local_cell(ReasoningCell::new(text));
-                }
+                self.push_reasoning_cell(text);
             }
-            AgentEvent::TurnComplete { usage: _ } => {
-                self.close_streaming_assistant();
-                self.drain_inflight_tool_calls();
-                self.turn_has_work = false;
+            AgentEvent::TurnComplete { .. } => {
+                self.end_active_turn_viewport();
             }
             AgentEvent::ToolCallApprovalRequest { .. } => {
                 self.close_streaming_assistant();
@@ -277,13 +313,14 @@ impl ChatWidget {
                 // Close any streaming assistant (the model is moving on to a
                 // tool call) and mark the turn as having produced work, but
                 // hold the placeholder inline instead of pushing it to
-                // scrollback. The matching `ToolCallOutput` drops the inline
-                // entry and pushes a single `Explored`/`Ran` row to
-                // scrollback — without this, both `Exploring` and `Explored`
-                // would land separately in scrollback for every tool call.
+                // scrollback. The matching `ToolCallOutput` buffers read-only
+                // calls into one exploring group instead of a per-call row.
                 self.close_streaming_assistant();
                 self.turn_has_work = true;
                 let cell = ToolCallCell::new(name, arguments);
+                if !ExplorationEntry::is_read_only(&cell.context()) {
+                    self.flush_explorations();
+                }
                 self.tool_calls.insert(call_id.clone(), cell.context());
                 // Defensively dedupe by call_id — the provider shouldn't
                 // re-emit ToolCallStarted for the same id, but if it did, the
@@ -300,21 +337,17 @@ impl ChatWidget {
             } => {
                 let context = self.tool_calls.remove(&call_id);
                 self.inflight_tool_calls.retain(|(id, _)| id != &call_id);
-                // Summary tools (read_file, list_files, code_search, bash)
-                // are buffered into pending_explorations and collapsed into a
-                // single `Explored` row. Same-action calls merge regardless
-                // of order; failures and tools that don't have a summary
-                // verb (apply_patch, edit_file, …) go through the normal path
-                // so the user keeps seeing their full output.
-                if !is_error
-                    && let Some(ctx) = &context
-                    && let Some(entry) = ExplorationEntry::from_context(ctx)
-                {
-                    self.buffer_exploration(entry);
+                let Some(ctx) = context else {
+                    self.flush_explorations();
+                    self.push_work_cell(ToolOutputCell::with_context(output, is_error, None));
+                    return;
+                };
+                if !is_error && ExplorationEntry::is_read_only(&ctx) {
+                    self.exploring_buffer.push(ctx);
                     return;
                 }
                 self.flush_explorations();
-                self.push_work_cell(ToolOutputCell::with_context(output, is_error, context));
+                self.push_work_cell(ToolOutputCell::with_context(output, is_error, Some(ctx)));
             }
             AgentEvent::SubagentStarted { id, label, task } => {
                 if let Some(label) = label.clone() {
@@ -365,7 +398,7 @@ impl ChatWidget {
                 // that can leave a `ToolCallStarted` without a matching
                 // `ToolCallOutput`; without this drain the placeholder paints
                 // forever in the inline viewport across every later turn.
-                self.drain_inflight_tool_calls();
+                self.drain_inflight_tool_calls(false);
                 self.push_cell(ErrorCell::new(message));
             }
             AgentEvent::ToolCallBlocked {
@@ -418,7 +451,7 @@ impl ChatWidget {
                 // to scrollback so the user can see what was attempted, and
                 // so the inline viewport doesn't keep re-rendering them on
                 // every later frame.
-                self.drain_inflight_tool_calls();
+                self.drain_inflight_tool_calls(false);
                 self.push_cell(TurnAbortedCell::new(turn_id, reason));
             }
             AgentEvent::CompactionStarted {
@@ -469,7 +502,7 @@ impl ChatWidget {
                 // resurrected in scrollback (unlike `TurnAborted`/`Error`
                 // where the drain is informational).
                 self.clear_inflight_tool_calls();
-                self.pending_explorations.clear();
+                self.exploring_buffer.clear();
                 self.turn_has_work = false;
                 let detail = if preview.is_empty() {
                     format!("rewound to seq {target_seq}, removed {removed_events} event(s)")
@@ -526,52 +559,49 @@ impl ChatWidget {
 
     /// Combined inline-viewport lines: streaming assistant cell (if any),
     /// then any in-flight placeholders for tools that *aren't* part of the
-    /// running exploration summary (e.g. apply_patch), then a single
-    /// `ExploringSummaryCell` that aggregates buffered exploration outputs
-    /// and in-flight exploration/bash tools into one present-tense line.
+    /// running exploration group (e.g. apply_patch), then a single grouped
+    /// [`ToolCallCell`] for buffered and in-flight read-only tools.
     /// All of these live in the viewport, not in scrollback, so they vanish
-    /// when their matching outputs land or the summary flushes.
+    /// when their matching outputs land or the group flushes.
     pub fn inline_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut out = self.streaming_lines(width);
-        let (individual, summary) = self.inline_inflight_partitioned();
-        for cell in &individual {
-            out.extend(cell.display_lines(width));
-        }
-        if let Some(cell) = summary {
-            out.extend(cell.display_lines(width));
-        }
+        out.extend(self.inline_placeholder_lines(width));
         out
     }
 
-    /// Split the in-flight tool placeholders into the ones that render
-    /// individually (apply_patch, edit_file, …) and a single summary cell
-    /// that folds in every exploration/bash placeholder together with
-    /// `pending_explorations`. Returns `None` for the summary when neither
-    /// the buffer nor any in-flight summary tool exists.
-    fn inline_inflight_partitioned(&self) -> (Vec<&ToolCallCell>, Option<ExploringSummaryCell>) {
-        let mut individual: Vec<&ToolCallCell> = Vec::new();
-        let mut groups: Vec<(&'static str, Vec<String>)> = self.pending_explorations.clone();
-        let mut current_target: Option<String> = None;
+    fn inline_placeholder_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let (individual, summary) = self.inline_inflight_partitioned();
+        let mut lines = Vec::new();
+        for cell in &individual {
+            lines.extend(cell.display_lines(width));
+        }
+        if let Some(cell) = &summary {
+            lines.extend(cell.display_lines(width));
+        }
+        lines
+    }
+
+    /// In-flight mutating tools render individually; read-only tools merge
+    /// with `exploring_buffer` into one grouped [`ToolCallCell`].
+    fn inline_inflight_partitioned(&self) -> (Vec<&ToolCallCell>, Option<ToolCallCell>) {
+        let mut individual = Vec::new();
+        let mut calls = self.exploring_buffer.clone();
+        let mut live_target = None;
         for (_, cell) in &self.inflight_tool_calls {
             let context = cell.context();
-            match ExplorationEntry::from_context(&context) {
-                Some(entry) => {
-                    merge_exploration_entry(&mut groups, entry.action, entry.target.clone());
-                    current_target = Some(entry.target);
-                }
-                None => individual.push(cell),
+            if let Some(entry) = ExplorationEntry::from_context(&context) {
+                live_target = Some(entry.target);
+                calls.push(context);
+            } else {
+                individual.push(cell);
             }
         }
-        let summary = if groups.is_empty() {
-            None
-        } else {
-            Some(ExploringSummaryCell::new(groups, current_target))
-        };
+        let summary = (!calls.is_empty()).then(|| ToolCallCell::exploring_group(calls, live_target));
         (individual, summary)
     }
 
     /// `inline_lines` clamped to `max_rows`, with placeholders and the
-    /// running exploration summary prioritized over streaming-assistant
+    /// running exploration group prioritized over streaming-assistant
     /// text. When the combined height exceeds the cap, the streaming
     /// assistant is head-clipped (oldest tokens drop off the top) so the
     /// user keeps seeing newly streamed text AND every in-flight tool
@@ -584,14 +614,7 @@ impl ChatWidget {
             return Vec::new();
         }
         let streaming = self.streaming_lines(width);
-        let (individual, summary) = self.inline_inflight_partitioned();
-        let mut placeholders: Vec<Line<'static>> = Vec::new();
-        for cell in &individual {
-            placeholders.extend(cell.display_lines(width));
-        }
-        if let Some(cell) = &summary {
-            placeholders.extend(cell.display_lines(width));
-        }
+        let placeholders = self.inline_placeholder_lines(width);
         let total = streaming.len() + placeholders.len();
         if total <= max {
             let mut out = streaming;
@@ -632,6 +655,12 @@ impl ChatWidget {
         self.finalized.push(Box::new(cell));
     }
 
+    fn end_active_turn_viewport(&mut self) {
+        self.close_streaming_assistant();
+        self.drain_inflight_tool_calls(true);
+        self.turn_has_work = false;
+    }
+
     fn close_streaming_assistant(&mut self) {
         self.close_streaming_reasoning();
         if let Some(cell) = self.streaming_assistant.take() {
@@ -649,55 +678,41 @@ impl ChatWidget {
         }
     }
 
+    /// Push a collapsed reasoning row. Uses [`Self::push_local_cell`] so
+    /// pending exploration summaries flush first — same path as
+    /// [`AgentEvent::ReasoningDone`].
+    fn push_reasoning_cell(&mut self, text: String) {
+        if !text.is_empty() {
+            self.push_local_cell(ReasoningCell::new(text));
+        }
+    }
+
     /// Flush any in-flight reasoning buffer to scrollback as a collapsed
     /// `ReasoningCell`. Called when the streaming assistant closes.
     fn close_streaming_reasoning(&mut self) {
         if let Some(text) = self.streaming_reasoning.take() {
-            if !text.is_empty() {
-                self.finalized.push(Box::new(ReasoningCell::new(text)));
-            }
+            self.push_reasoning_cell(text);
         }
     }
 
-    /// Buffer an exploration entry for collapsing. Entries with a matching
-    /// action merge into the existing group regardless of position, so an
-    /// interleaved sequence (Read, Search, Read) still produces just two
-    /// groups in the summary. Targets are deduplicated — re-reading the
-    /// same path counts once.
-    fn buffer_exploration(&mut self, entry: ExplorationEntry) {
-        if let Some((_, targets)) = self
-            .pending_explorations
-            .iter_mut()
-            .find(|(action, _)| *action == entry.action)
-        {
-            if !targets.contains(&entry.target) {
-                targets.push(entry.target);
-            }
-            return;
-        }
-        self.pending_explorations
-            .push((entry.action, vec![entry.target]));
-    }
-
-    /// Promote any buffered exploration groups into a finalized cell so the
+    /// Promote any buffered read-only tool calls into a finalized cell so the
     /// next [`Self::drain_pending`] writes them to native scrollback. Called
     /// from `AppEvent::Quit` right before the main loop breaks; without
-    /// this, the running summary lives only in `pending_explorations` and
-    /// is discarded along with the widget.
+    /// this, the running group lives only in `exploring_buffer` and is
+    /// discarded along with the widget.
     pub fn flush_pending_for_shutdown(&mut self) {
         self.flush_explorations();
     }
 
-    /// Flush any buffered exploration groups to scrollback as a single
-    /// collapsed `ExplorationOutputCell` row. Called before pushing any
-    /// non-exploration cell and on turn end.
+    /// Flush buffered read-only calls to scrollback as one exploring group.
+    /// Called before pushing any cell that breaks the group and on turn end.
     fn flush_explorations(&mut self) {
-        if self.pending_explorations.is_empty() {
+        if self.exploring_buffer.is_empty() {
             return;
         }
-        let groups = std::mem::take(&mut self.pending_explorations);
+        let calls = std::mem::take(&mut self.exploring_buffer);
         self.finalized
-            .push(Box::new(ExplorationOutputCell::from_groups(groups)));
+            .push(Box::new(ToolCallCell::exploring_group(calls, None)));
     }
 
     /// Move any in-flight tool placeholders to scrollback on turn end.
@@ -706,9 +721,25 @@ impl ChatWidget {
     /// deserves to see what was attempted, so the placeholder is flushed.
     /// Also clears the parallel `tool_calls` context map for the drained
     /// ids — otherwise it would leak entries indefinitely.
-    fn drain_inflight_tool_calls(&mut self) {
-        if self.inflight_tool_calls.is_empty() && self.pending_explorations.is_empty() {
+    /// Drain in-flight tool placeholders to scrollback.
+    ///
+    /// When `fold_read_only_inflight` is true (turn complete), unresolved
+    /// read-only placeholders join `exploring_buffer` so the user sees one
+    /// exploring group instead of orphan per-call rows. Aborts and errors
+    /// pass `false` so each placeholder stays visible as its own row.
+    fn drain_inflight_tool_calls(&mut self, fold_read_only_inflight: bool) {
+        if self.inflight_tool_calls.is_empty() && self.exploring_buffer.is_empty() {
             return;
+        }
+        if fold_read_only_inflight {
+            self.inflight_tool_calls.retain(|(_, cell)| {
+                let ctx = cell.context();
+                if ExplorationEntry::is_read_only(&ctx) {
+                    self.exploring_buffer.push(ctx);
+                    return false;
+                }
+                true
+            });
         }
         self.flush_explorations();
         if self.inflight_tool_calls.is_empty() {
@@ -764,25 +795,6 @@ impl Default for ChatWidget {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Insert a target into the action group matching `action`, deduping
-/// against existing entries; create a new group at the tail if no
-/// matching action exists yet. Shared by [`ChatWidget::buffer_exploration`]
-/// (mutating `pending_explorations`) and the inline partitioning that
-/// folds in-flight summary tools on top of that buffer.
-fn merge_exploration_entry(
-    groups: &mut Vec<(&'static str, Vec<String>)>,
-    action: &'static str,
-    target: String,
-) {
-    if let Some((_, targets)) = groups.iter_mut().find(|(a, _)| *a == action) {
-        if !targets.contains(&target) {
-            targets.push(target);
-        }
-        return;
-    }
-    groups.push((action, vec![target]));
 }
 
 struct SkillPrompt {
