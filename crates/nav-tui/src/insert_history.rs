@@ -28,7 +28,7 @@ use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
-use ratatui::layout::{Rect, Size};
+use ratatui::layout::{Position, Rect, Size};
 use ratatui::prelude::Backend;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -292,6 +292,18 @@ where
     if space_below == 0 || area.width == 0 {
         return Ok(());
     }
+    // The previous frame's composer caret is wherever `draw_tui` last left
+    // the cursor; the scroll below moves the buffer's pixels down by
+    // `space_below`, so the caret's new row is shifted by the same amount.
+    // Compute this BEFORE `ResetScrollRegion` issues a `\x1b[r` (DECSTBM
+    // with no args), which homes the cursor to (0,0) and would otherwise
+    // leave the caret blinking in the top-left corner on the first frame.
+    let prev_cursor = terminal.last_known_cursor_pos;
+    let restored_y = prev_cursor
+        .y
+        .saturating_add(space_below)
+        .min(screen_size.height.saturating_sub(1));
+
     let writer = terminal.backend_mut();
     let top_1based = area.top() + 1;
     queue!(writer, SetScrollRegion(top_1based..screen_size.height))?;
@@ -300,12 +312,17 @@ where
         queue!(writer, Print("\x1bM"))?;
     }
     queue!(writer, ResetScrollRegion)?;
+    queue!(writer, MoveTo(prev_cursor.x, restored_y))?;
     terminal.set_viewport_area(Rect::new(
         0,
         area.y + space_below,
         area.width,
         area.height,
     ));
+    terminal.last_known_cursor_pos = Position {
+        x: prev_cursor.x,
+        y: restored_y,
+    };
     Ok(())
 }
 

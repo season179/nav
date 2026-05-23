@@ -69,6 +69,32 @@ impl Session {
         assert!(status.success(), "tmux send-keys exited non-zero");
     }
 
+    /// Live cursor coordinates as reported by tmux. `capture-pane` only
+    /// reports glyph content, so we ask the pane for its `cursor_x` and
+    /// `cursor_y` directly via `display-message`. Returns `(col, row)`
+    /// zero-indexed within the pane.
+    fn cursor(&self) -> (u16, u16) {
+        let out = Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &self.name,
+                "#{cursor_x},#{cursor_y}",
+            ])
+            .output()
+            .expect("tmux display-message failed");
+        let s = String::from_utf8_lossy(&out.stdout);
+        let s = s.trim();
+        let (x, y) = s.split_once(',').unwrap_or_else(|| {
+            panic!("tmux display-message returned unexpected format: {s:?}")
+        });
+        (
+            x.parse().expect("cursor_x not u16"),
+            y.parse().expect("cursor_y not u16"),
+        )
+    }
+
     fn capture(&self) -> String {
         let out = Command::new("tmux")
             .args(["capture-pane", "-t", &self.name, "-p"])
@@ -237,5 +263,51 @@ fn status_bar_paints_below_composer() {
         status_row > composer_row,
         "status bar should paint below the composer (codex layout), \
          but status_row={status_row} and composer_row={composer_row}\n{pane}"
+    );
+}
+
+/// On startup the blinking cursor must land at the composer prompt, not
+/// at (0,0). Pre-fix, `clamp_viewport_to_floor` ended with `\x1b[r`
+/// (DECSTBM reset), which homes the cursor — so until the user pressed a
+/// key (which triggers a redraw whose `clamp_viewport_to_floor` is a
+/// no-op), the caret blinked in the top-left corner of the terminal.
+/// Revert the cursor-restore in `clamp_viewport_to_floor` and this test
+/// fails with `cursor=(0,0)`.
+#[test]
+fn cursor_lands_inside_composer_on_startup() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("cursor-on-startup");
+    session.start(120, 40);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Wait for the composer to render so we know nav drew at least one
+    // frame and `clamp_viewport_to_floor` has had a chance to mis-place
+    // the cursor on the buggy path.
+    let pane = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(5),
+    );
+    let composer_row = last_row_with(&pane, |line| line.contains("Ask nav to do anything"))
+        .expect("composer placeholder must render before checking the cursor");
+
+    let (cx, cy) = session.cursor();
+    let cy_usize = cy as usize;
+    assert_eq!(
+        cy_usize, composer_row,
+        "cursor should land on the composer text row (composer_row={composer_row}, \
+         cursor=({cx},{cy}))\n{pane}"
+    );
+    // The prompt gutter is 2 columns wide; the caret sits at column 2 for
+    // an empty composer (immediately after `›`).
+    assert!(
+        cx >= 2,
+        "cursor column should be inside the composer content area, found {cx}\n{pane}"
     );
 }
