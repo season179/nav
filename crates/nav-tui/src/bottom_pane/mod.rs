@@ -24,6 +24,7 @@ mod pending_preview;
 mod render;
 mod session_picker;
 mod slash_popup;
+mod status_bar;
 mod view;
 
 pub use approval::ApprovalOverlay;
@@ -35,6 +36,7 @@ pub use slash_popup::{
     BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries,
     build_slash_entries_with_extensions,
 };
+pub use status_bar::{AgentState, StatusBarState};
 pub use view::{BottomPaneView, InputResult};
 
 /// Width of the gutter column that renders the `›` prompt next to the
@@ -80,6 +82,9 @@ pub struct BottomPane {
     /// loop and routed through the same `/resume <id>` path.
     last_session_selection: Option<String>,
     pending_inputs: Vec<PendingPreview>,
+    /// Status-bar state pushed by the main loop via [`Self::update_status`].
+    /// Rendered as the topmost row of the pane.
+    pub(super) status: StatusBarState,
 }
 
 impl BottomPane {
@@ -130,7 +135,15 @@ impl BottomPane {
             last_decision: None,
             last_session_selection: None,
             pending_inputs: Vec::new(),
+            status: StatusBarState::default(),
         }
+    }
+
+    /// Replace the snapshot the status bar paints from on the next frame.
+    /// Called by the main loop once per draw cycle alongside
+    /// [`Self::apply_agent_event`].
+    pub fn update_status(&mut self, status: StatusBarState) {
+        self.status = status;
     }
 
     pub fn apply_agent_event(&mut self, event: &AgentEvent) {

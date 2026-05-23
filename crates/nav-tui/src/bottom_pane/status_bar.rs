@@ -2,6 +2,11 @@
 //!
 //! Renders a single row showing model, working directory, git branch, and
 //! agent state (`Ready` or `Working …s`). Mirrors the codex CLI status row.
+//!
+//! The widget reads from `StatusBarState` held by [`super::BottomPane`]; the
+//! main loop pushes new state in via [`super::BottomPane::update_status`] once
+//! per draw cycle, and `BottomPane::render` paints this widget as the topmost
+//! row of the pane.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -10,14 +15,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use std::time::Duration;
 
-pub struct StatusBar<'a> {
-    pub model: &'a str,
-    pub cwd_short: &'a str,
-    pub branch: Option<&'a str>,
+/// Snapshot of what the status bar should show on the next draw. The main loop
+/// assembles this once per frame and hands it to
+/// [`super::BottomPane::update_status`]; the renderer reads from
+/// [`super::BottomPane`]'s stored copy when painting.
+#[derive(Debug, Clone)]
+pub struct StatusBarState {
+    pub model: String,
+    pub cwd_short: String,
+    pub branch: Option<String>,
     /// Append a yellow `✱` after the branch span when the worktree has
     /// uncommitted changes. False when not in a repo.
     pub dirty: bool,
-    pub state: AgentState,
+    pub agent_state: AgentState,
     /// Latest provider-reported token counts for the status bar.
     pub tokens_input: u64,
     pub tokens_output: u64,
@@ -25,6 +35,28 @@ pub struct StatusBar<'a> {
     /// Effective context window used to compute the percentage. `0` hides the
     /// gauge entirely.
     pub context_window: u64,
+}
+
+impl Default for StatusBarState {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            cwd_short: String::new(),
+            branch: None,
+            dirty: false,
+            agent_state: AgentState::Ready,
+            tokens_input: 0,
+            tokens_output: 0,
+            tokens_cached: 0,
+            context_window: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum AgentState {
+    Ready,
+    Working { elapsed: Duration, spinner: char },
 }
 
 /// Format `tokens` as `<n.n>k` (one decimal). Caller must gate on
@@ -41,9 +73,10 @@ fn format_tokens_k(tokens: u64) -> String {
     }
 }
 
-pub enum AgentState {
-    Ready,
-    Working { elapsed: Duration, spinner: char },
+/// Renderable view over a [`StatusBarState`]. Owned by the pane; constructed
+/// per-frame from the stored state.
+pub(super) struct StatusBar<'a> {
+    pub(super) state: &'a StatusBarState,
 }
 
 impl<'a> Widget for StatusBar<'a> {
@@ -51,24 +84,22 @@ impl<'a> Widget for StatusBar<'a> {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let s = self.state;
         let dim = Style::default().fg(Color::DarkGray);
         let sep = Span::styled("  ·  ", dim);
         let mut spans: Vec<Span<'static>> = vec![
             Span::styled("  ", dim),
-            Span::styled(self.model.to_string(), dim),
+            Span::styled(s.model.clone(), dim),
             sep.clone(),
-            Span::styled(
-                self.cwd_short.to_string(),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(s.cwd_short.clone(), Style::default().fg(Color::Yellow)),
         ];
-        if let Some(branch) = self.branch {
+        if let Some(branch) = &s.branch {
             spans.push(sep.clone());
             spans.push(Span::styled(
-                branch.to_string(),
+                branch.clone(),
                 Style::default().fg(Color::Green),
             ));
-            if self.dirty {
+            if s.dirty {
                 spans.push(Span::styled(
                     " ✱".to_string(),
                     Style::default().fg(Color::Yellow),
@@ -76,7 +107,7 @@ impl<'a> Widget for StatusBar<'a> {
             }
         }
         spans.push(sep);
-        match self.state {
+        match s.agent_state {
             AgentState::Ready => {
                 spans.push(Span::styled(
                     "Ready",
@@ -97,29 +128,26 @@ impl<'a> Widget for StatusBar<'a> {
         }
         // Token usage segment: show in/out/cached when we have data,
         // plus context-window percentage.
-        if self.tokens_input >= 1_000 {
+        if s.tokens_input >= 1_000 {
             spans.push(Span::styled("  ·  ", dim));
-            let in_k = format_tokens_k(self.tokens_input);
-            let out_display = if self.tokens_output >= 1_000 {
-                format!(" ↑{}", format_tokens_k(self.tokens_output))
+            let in_k = format_tokens_k(s.tokens_input);
+            let out_display = if s.tokens_output >= 1_000 {
+                format!(" ↑{}", format_tokens_k(s.tokens_output))
             } else {
                 String::new()
             };
             let mut usage = format!("↓{}{}", in_k, out_display);
-            if self.tokens_cached >= 1_000 {
-                usage.push_str(&format!(" 💥{}", format_tokens_k(self.tokens_cached)));
+            if s.tokens_cached >= 1_000 {
+                usage.push_str(&format!(" 💥{}", format_tokens_k(s.tokens_cached)));
             }
             spans.push(Span::styled(usage, dim));
-            if let Some(pct) = self
+            if let Some(pct) = s
                 .tokens_input
                 .saturating_mul(100)
-                .checked_div(self.context_window)
+                .checked_div(s.context_window)
             {
-                let denom_k = (self.context_window + 500) / 1_000;
-                spans.push(Span::styled(
-                    format!(" · {denom_k}k {pct}%"),
-                    dim,
-                ));
+                let denom_k = (s.context_window + 500) / 1_000;
+                spans.push(Span::styled(format!(" · {denom_k}k {pct}%"), dim));
             }
         }
         Paragraph::new(Line::from(spans)).render(area, buf);

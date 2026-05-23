@@ -1,4 +1,16 @@
 //! Layout math and rendering for the bottom pane.
+//!
+//! The pane stacks four chunks top-to-bottom:
+//!
+//! ```text
+//! [status bar]      — 1 row, always
+//! [overlay]         — variable (popup, approval, etc.)
+//! [pending preview] — variable (queued user inputs)
+//! [composer]        — min 3 rows
+//! ```
+//!
+//! Everything below `status` shifts down by `STATUS_ROWS` (= 1). The cursor
+//! math here mirrors the same split — if you change one, change the other.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -7,7 +19,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::pending_preview::render_pending_preview;
+use super::status_bar::StatusBar;
 use super::{BottomPane, GUTTER_WIDTH};
+
+/// Height of the status-bar row at the top of the pane. The status bar lives
+/// inside the pane (not as a peer chunk in `draw_tui`) so that all "always
+/// visible" UI concentrates in one place.
+pub(super) const STATUS_ROWS: u16 = 1;
 
 impl BottomPane {
     pub fn desired_height(&self, width: u16) -> u16 {
@@ -22,7 +40,8 @@ impl BottomPane {
             .as_ref()
             .map(|v| v.desired_height(width))
             .unwrap_or(0);
-        composer_h
+        STATUS_ROWS
+            .saturating_add(composer_h)
             .saturating_add(overlay_h)
             .saturating_add(self.pending_preview_height())
     }
@@ -39,12 +58,17 @@ impl BottomPane {
             .map(|v| v.desired_height(pane_area.width))
             .unwrap_or(0);
         let queue_h = self.pending_preview_height();
+        // The status row sits at the top of the pane; everything below shifts
+        // down by `STATUS_ROWS`. Without this offset the caret lands one row
+        // too high — inside the status bar instead of the composer.
         let composer_y = pane_area
             .y
+            .saturating_add(STATUS_ROWS)
             .saturating_add(overlay_h)
             .saturating_add(queue_h);
         let composer_h = pane_area
             .height
+            .saturating_sub(STATUS_ROWS)
             .saturating_sub(overlay_h)
             .saturating_sub(queue_h);
         if composer_h <= 1 {
@@ -83,12 +107,20 @@ impl Widget for &BottomPane {
             .map(|v| v.desired_height(area.width))
             .unwrap_or(0);
         let queue_h = self.pending_preview_height();
-        let [overlay_rect, queue_rect, composer_outer] = Layout::vertical([
+        let [status_rect, overlay_rect, queue_rect, composer_outer] = Layout::vertical([
+            Constraint::Length(STATUS_ROWS),
             Constraint::Length(overlay_h),
             Constraint::Length(queue_h),
             Constraint::Min(1),
         ])
         .areas(area);
+
+        if status_rect.height > 0 {
+            StatusBar {
+                state: &self.status,
+            }
+            .render(status_rect, buf);
+        }
 
         if let Some(view) = self.view.as_ref()
             && overlay_rect.height > 0

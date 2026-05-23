@@ -17,20 +17,17 @@ use std::io::Stdout;
 
 use crate::ChatWidget;
 use crate::bottom_pane;
+use crate::bottom_pane::AgentState;
 use crate::custom_terminal::Terminal;
-
-use super::status_bar::{AgentState, StatusBar};
 
 /// Cap the streaming preview at this many rows so a long in-flight reply
 /// can't shove the composer off-screen. Once the reply finalizes it goes
 /// to scrollback and the cap stops mattering.
 const MAX_STREAMING_ROWS: u16 = 16;
 
-/// Bottom-anchored status bar height.
-const STATUS_ROWS: u16 = 1;
-
-/// Composer minimum height — keeps at least one input row plus padding.
-const MIN_COMPOSER_ROWS: u16 = 3;
+/// Bottom-pane minimum height: status (1) + composer floor (3). Used as a
+/// budget when computing how much room is left for the streaming preview.
+const MIN_PANE_ROWS: u16 = 4;
 
 /// Reserve this many rows above the inline viewport for native scrollback
 /// insertion. `insert_history_lines` defines its upper scroll region as
@@ -43,6 +40,12 @@ const MIN_COMPOSER_ROWS: u16 = 3;
 /// frame.
 const SCROLLBACK_RESERVE: u16 = 2;
 
+/// State carried into [`draw_tui`] for the status bar. Retained until #151
+/// removes it entirely; the bottom pane now owns its own copy of this data
+/// (see [`bottom_pane::StatusBarState`] and `BottomPane::update_status`), and
+/// `draw_tui` no longer renders the status bar itself. Until #151 lands the
+/// arg stays as a passthrough so callers don't need to change.
+#[allow(dead_code)]
 pub(super) struct TuiStatus<'a> {
     pub model: &'a str,
     pub cwd_short: &'a str,
@@ -59,7 +62,7 @@ pub(super) fn draw_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     chat: &ChatWidget,
     pane: &bottom_pane::BottomPane,
-    status: TuiStatus<'_>,
+    _status: TuiStatus<'_>,
     screen_w: u16,
     screen_h: u16,
 ) -> Result<()> {
@@ -78,15 +81,14 @@ pub(super) fn draw_tui(
     // and they'd be invisibly clipped by ratatui's `Paragraph`. Tighten the
     // cap further on small terminals so composer + status still fit inside
     // `max_inline`.
-    let streaming_cap = MAX_STREAMING_ROWS
-        .min(max_inline.saturating_sub(STATUS_ROWS + MIN_COMPOSER_ROWS));
+    let streaming_cap = MAX_STREAMING_ROWS.min(max_inline.saturating_sub(MIN_PANE_ROWS));
     let streaming_lines = chat.inline_lines_capped(screen_w, streaming_cap);
     let streaming_h = streaming_lines.len() as u16;
-    let max_composer = max_inline.saturating_sub(STATUS_ROWS + streaming_h).max(1);
-    let composer_h = pane
+    let max_pane = max_inline.saturating_sub(streaming_h).max(1);
+    let pane_h = pane
         .desired_height(screen_w)
-        .max(MIN_COMPOSER_ROWS)
-        .min(max_composer);
+        .max(MIN_PANE_ROWS)
+        .min(max_pane);
 
     // Sticky-top viewport: preserve `viewport_area.top()` so the inline frame
     // doesn't slam against the bottom of the screen on every frame. On the
@@ -100,7 +102,7 @@ pub(super) fn draw_tui(
     // now-smaller viewport DOWN by the freed rows below it — re-anchoring
     // the composer at the screen floor without leaving a blank band above.
     let old_area = terminal.viewport_area;
-    let viewport_h = (streaming_h + composer_h + STATUS_ROWS).min(max_inline).max(1);
+    let viewport_h = (streaming_h + pane_h).min(max_inline).max(1);
     let mut viewport_area = Rect::new(0, old_area.y, screen_w, viewport_h);
 
     // Expansion-overflow: if growing the viewport would push it past the
@@ -143,8 +145,7 @@ pub(super) fn draw_tui(
         let area = f.area();
         let chunks = Layout::vertical([
             Constraint::Length(streaming_h),
-            Constraint::Length(composer_h),
-            Constraint::Length(STATUS_ROWS),
+            Constraint::Length(pane_h),
         ])
         .split(area);
 
@@ -155,20 +156,6 @@ pub(super) fn draw_tui(
         if let Some((cx, cy)) = pane.cursor_position(chunks[1]) {
             f.set_cursor_position((cx, cy));
         }
-        f.render_widget(
-            StatusBar {
-                model: status.model,
-                cwd_short: status.cwd_short,
-                branch: status.branch,
-                dirty: status.dirty,
-                state: status.state,
-                tokens_input: status.tokens_input,
-                tokens_output: status.tokens_output,
-                tokens_cached: status.tokens_cached,
-                context_window: status.context_window,
-            },
-            chunks[2],
-        );
     })?;
 
     Ok(())
