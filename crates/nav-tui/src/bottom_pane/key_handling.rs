@@ -10,7 +10,6 @@ use super::approval::ApprovalOverlay;
 use super::clipboard::{recognized_image_path, try_save_clipboard_image, workspace_relative_image};
 use super::history_search::HistorySearch;
 use super::model_picker::ModelPickerPopup;
-use super::session_picker::SessionPickerPopup;
 use super::{
     BottomPane, BottomPaneView, ComposerEvent, FileMentionPopup, InputResult, SkillPopup,
     SlashCommandPopup,
@@ -133,19 +132,10 @@ impl BottomPane {
                             // separate steps. Collapsing them with `&&` would
                             // make any approval whose `is_complete()` returns
                             // true but whose decision is absent (e.g. if those
-                            // ever decouple) silently fall through into the
-                            // SessionPicker branch below — meaning an
-                            // ApprovalOverlay would be tested for session-id
-                            // selection. The branches must be matched on
-                            // type, not on combined type+state.
+                            // ever decouple) silently drop the decision.
                             #[allow(clippy::collapsible_if)]
                             if let Some(decision) = o.take_decision() {
                                 self.last_decision = Some((o.approval_id.clone(), decision));
-                            }
-                        } else if let Some(p) = any.downcast_mut::<SessionPickerPopup>() {
-                            #[allow(clippy::collapsible_if)]
-                            if let Some(session_id) = p.take_selection() {
-                                self.last_session_selection = Some(session_id);
                             }
                         } else if let Some(p) = any.downcast_mut::<ModelPickerPopup>() {
                             #[allow(clippy::collapsible_if)]

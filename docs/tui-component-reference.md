@@ -116,8 +116,18 @@ closer to traditional UI components — stateful, interactive, and always visibl
 | `MentionPopup` | @-mention autocomplete | `bottom_pane/mention_popup.rs` | Autocomplete for skill mentions |
 | `Approval` | Confirmation modal | `bottom_pane/approval.rs` | Approve/deny tool execution |
 | `PendingPreview` | Queue preview sidebar | `bottom_pane/pending_preview.rs` | Shows queued prompts |
-| `SessionPicker` | Fuzzy finder modal | `bottom_pane/session_picker.rs` | Resume-session picker (`/resume`) |
 | `ModelPickerPopup` | Dropdown list | `bottom_pane/model_picker.rs` | Model picker (`/model`) |
+
+## Alt-screen overlays
+
+These take over the full terminal via alternate-screen mode (`app/overlay.rs`).
+Enter pushes overlay state and saves inline viewport position; dismiss
+(`leave_app_overlay`) restores scrollback and composer placement.
+
+| Component | Web analogy | File | Purpose |
+|---|---|---|---|
+| `TranscriptOverlay` | Full-page transcript viewer | `app/overlay.rs` | Ctrl+T scrollback + live tail viewer |
+| `ResumePicker` | Full-screen fuzzy finder | `app/resume_picker.rs` | Session picker (`/sessions`, `/resume`, `--pick-session`) |
 
 ## Status bar
 
@@ -155,6 +165,7 @@ The TUI never calls the model or runs tools directly — it's a pure consumer of
 | Area | File(s) |
 |---|---|
 | Main event loop & layout | `app/mod.rs`, `app/render.rs` |
+| Alt-screen overlays | `app/overlay.rs`, `app/resume_picker.rs` |
 | Chat widget (cell manager) | `widget.rs` |
 | All cell types | `cells/*.rs` |
 | Bottom pane components | `bottom_pane/*.rs` |

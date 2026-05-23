@@ -50,6 +50,32 @@ impl HistoryCell for NoticeCell {
     }
 }
 
+/// Labeled session/system notice (resume, export, name, etc.).
+pub struct LabeledNoticeCell {
+    label: String,
+    message: String,
+}
+
+impl LabeledNoticeCell {
+    pub fn new(label: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl HistoryCell for LabeledNoticeCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        TranscriptRow::with_label(
+            TranscriptRowKind::SessionNotice,
+            self.label.as_str(),
+            self.message.as_str(),
+        )
+        .render(width)
+    }
+}
+
 pub struct ErrorCell {
     notice: NoticeCell,
 }

@@ -1508,6 +1508,93 @@ fn reasoning_content_lands_in_reasoning_cell_not_assistant() {
     );
 }
 
+/// `/sessions` opens the alt-screen resume picker; fuzzy filter narrows the
+/// list and Enter resumes the highlighted session.
+#[test]
+fn resume_picker_overlay_filters_and_resumes_session() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let workdir = tempdir().expect("tempdir");
+    let db_path = workdir.path().join("nav.db");
+    let store = nav_core::SessionStore::open(Some(db_path.clone())).expect("open session db");
+    let other = store
+        .create_session(
+            workdir.path(),
+            nav_core::PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+        )
+        .expect("create other session");
+    store
+        .set_session_name(&other, "picker target")
+        .expect("name other session");
+    store
+        .append_event(
+            &other,
+            &nav_core::AgentEvent::UserMessage {
+                text: "resume picker tmux smoke".to_string(),
+                display_text: None,
+                attachments: Vec::new(),
+            },
+        )
+        .expect("append user event");
+    store
+        .create_session(
+            workdir.path(),
+            nav_core::PROVIDER_OPENAI_RESPONSES,
+            "gpt-test",
+            None,
+        )
+        .expect("create current session");
+
+    let session = fresh_session("resume-picker");
+    session.start(100, 24);
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!(
+        "cd {} && OPENAI_API_KEY={TEST_API_KEY} {nav} --auth api-key --db-path {} --pick-session",
+        workdir.path().display(),
+        db_path.display(),
+    );
+    session.send_line(&cmd);
+
+    let overlay = session.wait_for(
+        |pane| pane.contains("Sessions") && pane.contains("Press / to filter"),
+        Duration::from_secs(8),
+    );
+    assert!(
+        overlay.contains("picker tar") && overlay.contains("resume picker tmux smoke"),
+        "resume picker should list the named session and preview:\n{overlay}"
+    );
+
+    session.send("/");
+    session.send("pic");
+    let filtered = session.wait_for(
+        |pane| pane.contains("/pic") && pane.contains("picker tar"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        filtered.contains("/pic"),
+        "resume picker filter did not apply before Enter:\n{filtered}"
+    );
+    session.send_line("");
+
+    let resumed = session.wait_for(
+        |pane| pane.contains("Resumed session") && pane.contains("resume picker tmux smoke"),
+        Duration::from_secs(8),
+    );
+    assert!(
+        resumed.contains("Resumed session"),
+        "session resume notice missing after picker selection:\n{resumed}"
+    );
+    assert!(
+        !resumed.contains("Press / to filter"),
+        "resume picker overlay should close after Enter:\n{resumed}"
+    );
+}
+
 #[test]
 fn read_only_tools_group_until_write_starts_new_cell() {
     if !tmux_available() {

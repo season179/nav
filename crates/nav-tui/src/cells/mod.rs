@@ -32,8 +32,8 @@ pub use messages::{
 pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use reasoning::ReasoningCell;
 pub(crate) use separators::FinalMessageSeparator;
-pub use sessions::{SessionListCell, SessionNoticeCell, SessionTreeCell, TranscriptHitsCell};
+pub use sessions::{SessionTreeCell, TranscriptHitsCell};
 pub use subagents::SubagentCell;
-pub use system::{ApprovalDecisionCell, ErrorCell, NoticeCell};
+pub use system::{ApprovalDecisionCell, ErrorCell, LabeledNoticeCell, NoticeCell};
 pub use tools::{ToolCallCell, ToolOutputCell};
 pub(crate) use tools::ExplorationEntry;

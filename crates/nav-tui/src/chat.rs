@@ -1,4 +1,4 @@
-use nav_core::{AgentEvent, SessionSummary, SessionTreeNode, TranscriptHit, TurnUsage};
+use nav_core::{AgentEvent, SessionTreeNode, TranscriptHit, TurnUsage};
 use std::time::Duration;
 use ratatui::text::Line;
 use std::collections::HashMap;
@@ -7,8 +7,8 @@ use crate::cells::ExplorationEntry;
 use crate::cells::{
     AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
     CompactionPhase, ErrorCell, FileChangeCell,
-    GitCheckpointCell, HookCell, NoticeCell, PendingInputCell,
-    ReasoningCell, SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell,
+    GitCheckpointCell, HookCell, LabeledNoticeCell, NoticeCell, PendingInputCell,
+    ReasoningCell, SessionTreeCell, SkillInvocationCell,
     SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
     FinalMessageSeparator, TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
@@ -162,12 +162,8 @@ impl ChatWidget {
         self.push_cell(NoticeCell::info(message));
     }
 
-    pub fn push_session_list(&mut self, sessions: Vec<SessionSummary>) {
-        self.push_cell(SessionListCell::new(sessions));
-    }
-
     pub fn push_session_notice(&mut self, label: impl Into<String>, message: impl Into<String>) {
-        self.push_cell(SessionNoticeCell::new(label, message));
+        self.push_cell(LabeledNoticeCell::new(label, message));
     }
 
     /// Convenience for the (very common) "store call failed, surface it as an
@@ -511,7 +507,7 @@ impl ChatWidget {
                         "rewound to seq {target_seq}, removed {removed_events} event(s) — {preview}"
                     )
                 };
-                self.push_cell(SessionNoticeCell::new("rewind", detail));
+                self.push_cell(LabeledNoticeCell::new("rewind", detail));
             }
             AgentEvent::HookStarted { .. } => {
                 // Hooks are intentionally quiet — no in-progress indicator.
