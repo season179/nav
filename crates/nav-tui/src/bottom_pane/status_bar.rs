@@ -91,7 +91,7 @@ pub(super) fn working_dots(tick: u64) -> &'static str {
 /// Pulsing magenta colour driven by the spinner tick counter.
 /// Alternates between `Magenta` and `LightMagenta` at ~1.5 Hz.
 pub(super) fn working_pulse_color(tick: u64) -> Color {
-    if (tick / 8) % 2 == 0 {
+    if (tick / 8).is_multiple_of(2) {
         Color::Magenta
     } else {
         Color::LightMagenta

@@ -22,6 +22,10 @@ use std::time::{Duration, Instant};
 use tempfile::{TempDir, tempdir};
 
 const TEST_API_KEY: &str = "test-only-not-real";
+const MOCK_FINAL_MARKER: &str = "SMOKE_OK_STREAM";
+const MOCK_FINAL_REFLOW_TEXT: &str =
+    "source backed markdown reflow keeps this finalized assistant message clean after resize";
+const MOCK_FINAL_REFLOW_MIDPOINT: &str = "finalized assistant message";
 
 /// Unique session name per test so concurrent runs don't collide.
 fn fresh_session(name: &str) -> Session {
@@ -343,7 +347,7 @@ fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
         "choices": [{
             "index": 0,
             "delta": {
-                "content": "SMOKE_OK_STREAM"
+                "content": format!("{MOCK_FINAL_MARKER} {MOCK_FINAL_REFLOW_TEXT}")
             },
             "finish_reason": "stop"
         }]
@@ -723,11 +727,11 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
     );
 
     let completed = session.wait_for(
-        |pane| pane.contains("SMOKE_OK_STREAM"),
+        |pane| pane.contains(MOCK_FINAL_MARKER),
         Duration::from_secs(15),
     );
     assert!(
-        completed.contains("SMOKE_OK_STREAM"),
+        completed.contains(MOCK_FINAL_MARKER),
         "streaming final marker never landed:\n{completed}"
     );
     assert!(
@@ -735,9 +739,78 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
         "raw SSE payload leaked into the TUI:\n{completed}"
     );
     assert_eq!(
-        completed.matches("SMOKE_OK_STREAM").count(),
+        completed.matches(MOCK_FINAL_MARKER).count(),
         1,
         "expected the final marker once in the final frame, got:\n{completed}"
+    );
+}
+
+#[test]
+fn finalized_assistant_message_reflows_after_terminal_resize() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_streaming_server(4);
+    let workdir = tempdir().expect("tempdir for mock provider settings");
+    write_mock_provider_settings(&workdir, "reflow", mock_port);
+
+    let session = fresh_session("finalized-reflow");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/reflow"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(status_bar_present(&ready), "nav failed to boot:\n{ready}");
+
+    session.send_line("complete then resize");
+    let completed = session.wait_for(
+        |pane| pane.contains(MOCK_FINAL_MARKER),
+        Duration::from_secs(15),
+    );
+    assert!(
+        completed.contains(MOCK_FINAL_MARKER),
+        "streaming final marker never landed before resize:\n{completed}"
+    );
+
+    if !session.try_resize(54, 24) {
+        eprintln!("tmux resize-window unsupported (needs tmux >= 2.9), skipping");
+        return;
+    }
+    let resized = session.wait_for(
+        |pane| pane.contains(MOCK_FINAL_MARKER) && pane.contains("after resize"),
+        Duration::from_secs(5),
+    );
+
+    let final_rows: Vec<&str> = resized
+        .lines()
+        .filter(|line| {
+            line.contains(MOCK_FINAL_MARKER)
+                || line.contains(MOCK_FINAL_REFLOW_MIDPOINT)
+                || line.contains("after resize")
+        })
+        .collect();
+    assert!(
+        final_rows.len() >= 2,
+        "finalized assistant message should wrap across multiple rows after resize, got:\n{resized}"
+    );
+    assert!(
+        resized.contains(MOCK_FINAL_REFLOW_MIDPOINT) && resized.contains("after resize"),
+        "finalized assistant source fragments missing after resize:\n{resized}"
+    );
+    assert_eq!(
+        resized.matches(MOCK_FINAL_MARKER).count(),
+        1,
+        "finalized assistant message duplicated across resize:\n{resized}"
+    );
+    assert!(
+        !resized.contains("data:"),
+        "raw SSE payload leaked into the TUI after resize:\n{resized}"
     );
 }
 
