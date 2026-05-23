@@ -8,7 +8,6 @@ mod changes;
 mod compaction;
 mod hooks;
 mod messages;
-mod model;
 mod pending;
 mod preview;
 mod reasoning;
@@ -30,7 +29,6 @@ pub use messages::{
     AgentMarkdownCell, AssistantMessageCell, AssistantStreamingCell, SkillInvocationCell,
     UserMessageCell,
 };
-pub use model::{ModelListCell, ModelSetCell};
 pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use reasoning::ReasoningCell;
 pub(crate) use separators::FinalMessageSeparator;

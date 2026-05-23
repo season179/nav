@@ -81,7 +81,7 @@ pub(crate) enum AppEvent {
     SlashError {
         message: String,
     },
-    ListModels,
+    PickModel,
     SetModel {
         selector: String,
     },
@@ -191,7 +191,7 @@ pub(super) fn parse_builtin_command(text: &str) -> Option<AppEvent> {
     }
     if let Some(rest) = slash_rest(trimmed, "/model") {
         return if rest.is_empty() {
-            Some(AppEvent::ListModels)
+            Some(AppEvent::PickModel)
         } else {
             Some(AppEvent::SetModel {
                 selector: rest.to_string(),

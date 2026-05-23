@@ -291,7 +291,8 @@ fn spawn_mock_approval_server(tool_call_delay: Duration) -> u16 {
     port
 }
 
-fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
+fn write_mock_multi_model_settings(workdir: &TempDir, models: &[&str], port: u16) {
+    assert!(!models.is_empty(), "need at least one mock model");
     let settings_dir = workdir.path().join(".nav");
     fs::create_dir_all(&settings_dir).expect("create mock .nav settings dir");
     let mut settings = json!({
@@ -302,14 +303,20 @@ fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
                 "models": {}
             }
         },
-        "default_model": format!("mock/{model}"),
+        "default_model": format!("mock/{}", models[0]),
     });
-    settings["providers"]["mock"]["models"][model] = json!({});
+    for model in models {
+        settings["providers"]["mock"]["models"][*model] = json!({});
+    }
     fs::write(
         settings_dir.join("settings.json"),
         serde_json::to_string_pretty(&settings).expect("serialize mock settings"),
     )
     .expect("write mock settings file");
+}
+
+fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
+    write_mock_multi_model_settings(workdir, &[model], port);
 }
 
 fn spawn_mock_sse_server(name: &str, on_connect: fn(TcpStream)) -> u16 {
@@ -1692,5 +1699,65 @@ fn read_only_tools_group_until_write_starts_new_cell() {
     assert!(
         completed.contains("apply_patch") || completed.contains("Ran  apply_patch"),
         "write tool must render outside the exploring group; got:\n{completed}"
+    );
+}
+
+/// `/model` with no argument opens the bottom-pane model picker; choosing a
+/// row swaps the active model and records a brief notice in scrollback.
+#[test]
+fn model_picker_selects_model_and_records_notice() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_streaming_server(2);
+    let workdir = tempdir().expect("tempdir for model picker settings");
+    write_mock_multi_model_settings(&workdir, &["smoke", "alt"], mock_port);
+
+    let session = fresh_session("model-picker");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && OPENAI_API_KEY={TEST_API_KEY} {nav} --auth api-key --model mock/smoke"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "model-picker nav failed to boot:\n{ready}"
+    );
+    assert!(
+        ready.contains("mock/smoke"),
+        "status bar should show the starting model:\n{ready}"
+    );
+
+    session.send_line("/model");
+    let with_picker = session.wait_for(
+        |pane| pane.contains("mock/alt") && pane.contains("mock/smoke"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        with_picker.contains("mock/alt"),
+        "model picker did not list configured models:\n{with_picker}"
+    );
+
+    // Catalog order is `mock/alt` then `mock/smoke`; the picker starts on the
+    // active model (`mock/smoke`), so move up to `mock/alt`.
+    session.send("Up");
+    session.send("Enter");
+    let changed = session.wait_for(
+        |pane| pane.contains("Model changed to") && pane.contains("mock/alt"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        changed.contains("Model changed to"),
+        "model change notice missing after picker selection:\n{changed}"
+    );
+    assert!(
+        changed.contains("mock/alt"),
+        "status bar should show the newly selected model:\n{changed}"
     );
 }

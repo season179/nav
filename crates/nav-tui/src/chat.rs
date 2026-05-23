@@ -1,4 +1,3 @@
-use nav_core::cli::ModelLine;
 use nav_core::{AgentEvent, SessionTreeNode, TranscriptHit, TurnUsage};
 use std::time::Duration;
 use ratatui::text::Line;
@@ -8,8 +7,8 @@ use crate::cells::ExplorationEntry;
 use crate::cells::{
     AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
     CompactionPhase, ErrorCell, FileChangeCell,
-    GitCheckpointCell, HookCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell,
-    LabeledNoticeCell, ReasoningCell, SessionTreeCell, SkillInvocationCell,
+    GitCheckpointCell, HookCell, LabeledNoticeCell, NoticeCell, PendingInputCell,
+    ReasoningCell, SessionTreeCell, SkillInvocationCell,
     SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
     FinalMessageSeparator, TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
@@ -159,17 +158,8 @@ impl ChatWidget {
         self.push_cell(NoticeCell::error(message));
     }
 
-    pub fn push_model_list(
-        &mut self,
-        lines: Vec<ModelLine>,
-        current_model: String,
-        default_model: Option<String>,
-    ) {
-        self.push_cell(ModelListCell::new(lines, current_model, default_model));
-    }
-
-    pub fn push_model_set(&mut self, message: impl Into<String>) {
-        self.push_cell(ModelSetCell::new(message));
+    pub fn push_notice(&mut self, message: impl Into<String>) {
+        self.push_cell(NoticeCell::info(message));
     }
 
     pub fn push_session_notice(&mut self, label: impl Into<String>, message: impl Into<String>) {

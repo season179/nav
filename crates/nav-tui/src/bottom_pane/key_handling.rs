@@ -9,6 +9,7 @@ use nav_core::UserAttachment;
 use super::approval::ApprovalOverlay;
 use super::clipboard::{recognized_image_path, try_save_clipboard_image, workspace_relative_image};
 use super::history_search::HistorySearch;
+use super::model_picker::ModelPickerPopup;
 use super::{
     BottomPane, BottomPaneView, ComposerEvent, FileMentionPopup, InputResult, SkillPopup,
     SlashCommandPopup,
@@ -135,6 +136,11 @@ impl BottomPane {
                             #[allow(clippy::collapsible_if)]
                             if let Some(decision) = o.take_decision() {
                                 self.last_decision = Some((o.approval_id.clone(), decision));
+                            }
+                        } else if let Some(p) = any.downcast_mut::<ModelPickerPopup>() {
+                            #[allow(clippy::collapsible_if)]
+                            if let Some(selector) = p.take_selection() {
+                                self.last_model_selection = Some(selector);
                             }
                         }
                         // HistorySearch restores the buffer itself on

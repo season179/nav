@@ -1,7 +1,7 @@
 use anyhow::Result;
 use nav_core::{
     AgentEvent, Catalog, ProjectContext, SessionId, SessionStore,
-    build_context_report_with_replay_cwd, cli::Args,
+    build_context_report_with_replay_cwd, cli::{list_models, Args},
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::app::overlay::{Overlay, leave_app_overlay};
 use crate::app::resume_picker::build_resume_picker;
 use crate::app::terminal::TerminalGuard;
+use crate::bottom_pane::{self, ModelPickerEntry};
 use crate::custom_terminal::InlineViewportState;
 use crate::theme::Theme;
 use crate::ChatWidget;
@@ -118,6 +119,34 @@ pub(super) fn dismiss_app_overlay(
     leave_app_overlay(term, overlay_state);
     *app_overlay = None;
     resume_id
+}
+
+pub(super) const NO_PROVIDERS_CONFIGURED: &str =
+    "no providers configured — add providers.models to .nav/settings.json";
+
+pub(super) const NO_MODELS_CONFIGURED: &str =
+    "no models configured — add entries under providers.models in .nav/settings.json";
+
+pub(super) fn open_model_picker(
+    project: &ProjectContext,
+    pane: &mut bottom_pane::BottomPane,
+    current_model: &str,
+    chat: &mut ChatWidget,
+) {
+    let Some(catalog) = project.settings.providers.as_ref() else {
+        chat.push_notice(NO_PROVIDERS_CONFIGURED);
+        return;
+    };
+    let lines = list_models(Some(catalog));
+    if lines.is_empty() {
+        chat.push_notice(NO_MODELS_CONFIGURED);
+        return;
+    }
+    let entries = lines
+        .iter()
+        .map(ModelPickerEntry::from_line)
+        .collect();
+    pane.open_model_picker(entries, Some(current_model));
 }
 
 pub(super) fn resolve_tree_root(store: &SessionStore, session_id: &str) -> Result<String> {

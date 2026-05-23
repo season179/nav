@@ -117,6 +117,13 @@ impl<T: ListPickerItem> ListPicker<T> {
         self.selected
     }
 
+    pub fn set_selected_index(&mut self, index: usize) {
+        if self.items.is_empty() {
+            return;
+        }
+        self.selected = index.min(self.items.len() - 1);
+    }
+
     // ── Item management ───────────────────────────────────────────────
 
     /// Replace the visible items (e.g. after re-filtering). Resets
