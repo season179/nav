@@ -239,7 +239,8 @@ pub async fn run(
                 context_window: args.auto_compact_token_limit,
                 show_indicator,
             });
-            let overlay: Option<&dyn AppOverlay> = app_overlay.as_deref();
+            let overlay: Option<&dyn AppOverlay> =
+                app_overlay.as_ref().map(|o| o as &dyn AppOverlay);
             draw_tui(
                 &mut term.terminal,
                 &chat,
@@ -310,13 +311,14 @@ pub async fn run(
         }
 
         if quit_requested {
-            if app_overlay.is_some() {
-                if let Some(state) = overlay_state.take() {
-                    if let Err(err) = term.terminal.leave_alternate_screen(state) {
-                        eprintln!("nav-tui: failed to leave alternate screen: {err:#}");
-                    }
+            // Drop the alt-screen on the way out so the user's terminal
+            // returns to whatever inline state it had before the overlay.
+            // The `app_overlay = None` reset that would normally accompany
+            // this is elided — `break` exits the loop immediately.
+            if let Some(state) = overlay_state.take() {
+                if let Err(err) = term.terminal.leave_alternate_screen(state) {
+                    eprintln!("nav-tui: failed to leave alternate screen: {err:#}");
                 }
-                app_overlay = None;
             }
             break;
         }
@@ -981,9 +983,8 @@ pub async fn run(
                                         overlay_state = Some(state);
                                     }
                                     Err(err) => {
-                                        chat.push_err(format!(
-                                            "Failed to open overlay: {err:#}"
-                                        ));
+                                        chat.push_err(anyhow::anyhow!(err)
+                                            .context("Failed to open overlay"));
                                     }
                                 }
                                 continue;

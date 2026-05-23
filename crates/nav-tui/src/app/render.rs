@@ -78,7 +78,7 @@ pub(super) fn draw_tui(
     }
     if let Some(rows) = region.blank_rows.as_ref() {
         let backend = terminal.backend_mut();
-        for row in rows {
+        for row in rows.clone() {
             queue!(backend, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
         }
     }
