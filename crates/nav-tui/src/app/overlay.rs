@@ -7,8 +7,11 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 
-use crate::ChatWidget;
+use super::resume_picker::ResumePicker;
+use crate::app::terminal::TerminalGuard;
 use crate::bottom_pane::InputResult;
+use crate::custom_terminal::InlineViewportState;
+use crate::ChatWidget;
 
 /// Minimal full-screen overlay trait used by app-level overlay UIs.
 pub(crate) trait AppOverlay {
@@ -171,37 +174,63 @@ impl AppOverlay for TranscriptOverlay {
 /// behavior stays in one place.
 pub(crate) enum Overlay {
     Transcript(TranscriptOverlay),
+    Resume(ResumePicker),
 }
 
 impl Overlay {
     pub(crate) fn transcript() -> Self {
         Self::Transcript(TranscriptOverlay::new())
     }
+
+    pub(crate) fn take_resume_selection(&mut self) -> Option<String> {
+        match self {
+            Self::Resume(picker) => picker.take_selection(),
+            Self::Transcript(_) => None,
+        }
+    }
+
+    fn inner(&self) -> &dyn AppOverlay {
+        match self {
+            Self::Transcript(inner) => inner,
+            Self::Resume(inner) => inner,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn AppOverlay {
+        match self {
+            Self::Transcript(inner) => inner,
+            Self::Resume(inner) => inner,
+        }
+    }
 }
 
 impl AppOverlay for Overlay {
     fn prepare(&mut self, chat: &ChatWidget, width: u16, animation_tick: u64) {
-        match self {
-            Self::Transcript(inner) => inner.prepare(chat, width, animation_tick),
-        }
+        self.inner_mut().prepare(chat, width, animation_tick);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> InputResult {
-        match self {
-            Self::Transcript(inner) => inner.handle_key(key),
-        }
+        self.inner_mut().handle_key(key)
     }
 
     fn is_complete(&self) -> bool {
-        match self {
-            Self::Transcript(inner) => inner.is_complete(),
-        }
+        self.inner().is_complete()
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        match self {
-            Self::Transcript(inner) => inner.render(area, buf),
-        }
+        self.inner().render(area, buf);
+    }
+}
+
+/// Leave the alternate screen and restore inline viewport state.
+pub(super) fn leave_app_overlay(
+    term: &mut TerminalGuard,
+    overlay_state: &mut Option<InlineViewportState>,
+) {
+    if let Some(state) = overlay_state.take()
+        && let Err(err) = term.terminal.leave_alternate_screen(state)
+    {
+        eprintln!("nav-tui: failed to leave alternate screen: {err:#}");
     }
 }
 

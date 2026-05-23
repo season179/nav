@@ -1,13 +1,7 @@
 ---
 source: crates/nav-tui/tests/snapshot.rs
-assertion_line: 332
 expression: rendered
 ---
-◆ sessions  01HZZZZZZZZZZZZZZZZZZZZZZZ  release work  created=100  active=250  2 turns
-    Implement the resume picker
-  01HYYYYYYYYYYYYYYYYYYYYYYYY  (unnamed)  created=90  active=120  0 turns
-    (no prompt yet)
-
 ◆ name  Session name set to "release work"
 
 ◆ export  Wrote transcript to transcript.md

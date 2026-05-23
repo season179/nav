@@ -1,82 +1,9 @@
-use nav_core::{SessionSummary, SessionTreeNode, TranscriptHit, layout_session_tree};
+use nav_core::{SessionTreeNode, TranscriptHit};
 use ratatui::text::Line;
 
 use crate::history::HistoryCell;
 
 use super::row::{TranscriptRow, TranscriptRowKind};
-
-pub struct SessionListCell {
-    sessions: Vec<SessionSummary>,
-}
-
-impl SessionListCell {
-    pub fn new(sessions: Vec<SessionSummary>) -> Self {
-        Self { sessions }
-    }
-}
-
-impl HistoryCell for SessionListCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let body = if self.sessions.is_empty() {
-            "no stored sessions".to_string()
-        } else {
-            session_list_body(&self.sessions)
-        };
-        TranscriptRow::new(TranscriptRowKind::SessionList, body).render(width)
-    }
-}
-
-fn session_list_body(sessions: &[SessionSummary]) -> String {
-    let any_parent = sessions.iter().any(|s| s.parent_id.is_some());
-    let layout: Vec<(usize, &SessionSummary)> = if any_parent {
-        layout_session_tree(sessions)
-    } else {
-        sessions.iter().map(|s| (0usize, s)).collect()
-    };
-    let mut parts = Vec::new();
-    for (depth, session) in layout {
-        let indent = "  ".repeat(depth);
-        let name = session.name.as_deref().unwrap_or("(unnamed)");
-        let labels = labels_suffix(&session.labels);
-        let title = session_title(session);
-        let turn_word = if session.turn_count == 1 {
-            "turn"
-        } else {
-            "turns"
-        };
-        parts.push(format!(
-            "{indent}{}  {name}  created={}  active={}  {} {turn_word}{labels}",
-            session.id, session.created_at, session.last_active, session.turn_count
-        ));
-        parts.push(format!("{indent}  {title}"));
-    }
-    parts.join("\n")
-}
-
-pub struct SessionNoticeCell {
-    label: String,
-    message: String,
-}
-
-impl SessionNoticeCell {
-    pub fn new(label: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            label: label.into(),
-            message: message.into(),
-        }
-    }
-}
-
-impl HistoryCell for SessionNoticeCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        TranscriptRow::with_label(
-            TranscriptRowKind::SessionNotice,
-            self.label.as_str(),
-            self.message.as_str(),
-        )
-        .render(width)
-    }
-}
 
 pub struct SessionTreeCell {
     nodes: Vec<SessionTreeNode>,
@@ -119,14 +46,6 @@ fn labels_suffix(labels: &[String]) -> String {
     } else {
         format!(" [{}]", labels.join(","))
     }
-}
-
-fn session_title(session: &SessionSummary) -> &str {
-    session
-        .first_user_prompt
-        .as_deref()
-        .filter(|title| !title.trim().is_empty())
-        .unwrap_or("(no prompt yet)")
 }
 
 pub struct TranscriptHitsCell {
