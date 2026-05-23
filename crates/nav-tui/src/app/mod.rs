@@ -1016,10 +1016,7 @@ pub async fn run(
                             }
                             ctrl_c_count = 0;
                             // Ctrl+L — force a full redraw (readline convention).
-                            if key.code == KeyCode::Char('l')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                                && !key.modifiers.contains(KeyModifiers::ALT)
-                            {
+                            if is_ctrl_l(&key) {
                                 needs_draw = true;
                                 continue;
                             }
@@ -1107,6 +1104,17 @@ fn emit_local_event(
 
 fn is_ctrl_t(key: &crossterm::event::KeyEvent) -> bool {
     key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Check whether `key` is a Ctrl+L press (no Alt, to avoid colliding
+/// with Ctrl+Alt+L on international layouts). Ignores Release events so
+/// the handler fires exactly once per physical keypress.
+fn is_ctrl_l(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::KeyEventKind;
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('l')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 fn emit_pending_cleared(
