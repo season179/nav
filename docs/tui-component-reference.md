@@ -118,7 +118,7 @@ closer to traditional UI components — stateful, interactive, and always visibl
 | `MentionPopup` | @-mention autocomplete | `bottom_pane/mention_popup.rs` | Autocomplete for skill mentions |
 | `Approval` | Confirmation modal | `bottom_pane/approval.rs` | Approve/deny tool execution |
 | `PendingPreview` | Queue preview sidebar | `bottom_pane/pending_preview.rs` | Shows queued prompts |
-| `SessionPicker` | Fuzzy finder modal | `bottom_pane/session_picker.rs` | Resume-session picker (`/resume`) |
+| `ResumePicker` | Full-screen fuzzy finder | `app/resume_picker.rs` | Alt-screen session picker (`/sessions`, `/resume`) |
 
 ## Status bar
 

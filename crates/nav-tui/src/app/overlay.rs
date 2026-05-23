@@ -5,7 +5,10 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
+use super::resume_picker::ResumePicker;
+use crate::app::terminal::TerminalGuard;
 use crate::bottom_pane::InputResult;
+use crate::custom_terminal::InlineViewportState;
 
 /// Minimal full-screen overlay trait used by app-level overlay UIs.
 pub(crate) trait AppOverlay {
@@ -73,30 +76,58 @@ impl AppOverlay for TestOverlay {
 /// behavior stays in one place.
 pub(crate) enum Overlay {
     Test(TestOverlay),
+    Resume(ResumePicker),
 }
 
 impl Overlay {
     pub(crate) fn test() -> Self {
         Self::Test(TestOverlay::new())
     }
+
+    pub(crate) fn take_resume_selection(&mut self) -> Option<String> {
+        match self {
+            Self::Resume(picker) => picker.take_selection(),
+            Self::Test(_) => None,
+        }
+    }
+
+    fn inner(&self) -> &dyn AppOverlay {
+        match self {
+            Self::Test(inner) => inner,
+            Self::Resume(inner) => inner,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn AppOverlay {
+        match self {
+            Self::Test(inner) => inner,
+            Self::Resume(inner) => inner,
+        }
+    }
 }
 
 impl AppOverlay for Overlay {
     fn handle_key(&mut self, key: KeyEvent) -> InputResult {
-        match self {
-            Self::Test(inner) => inner.handle_key(key),
-        }
+        self.inner_mut().handle_key(key)
     }
 
     fn is_complete(&self) -> bool {
-        match self {
-            Self::Test(inner) => inner.is_complete(),
-        }
+        self.inner().is_complete()
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        match self {
-            Self::Test(inner) => inner.render(area, buf),
-        }
+        self.inner().render(area, buf)
+    }
+}
+
+/// Leave the alternate screen and restore inline viewport state.
+pub(super) fn leave_app_overlay(
+    term: &mut TerminalGuard,
+    overlay_state: &mut Option<InlineViewportState>,
+) {
+    if let Some(state) = overlay_state.take()
+        && let Err(err) = term.terminal.leave_alternate_screen(state)
+    {
+        eprintln!("nav-tui: failed to leave alternate screen: {err:#}");
     }
 }

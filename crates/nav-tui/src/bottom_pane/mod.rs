@@ -25,7 +25,6 @@ mod list_picker;
 mod mention_popup;
 mod pending_preview;
 mod render;
-mod session_picker;
 mod skill_popup;
 mod slash_popup;
 mod status_bar;
@@ -38,7 +37,6 @@ pub use history_search::HistorySearch;
 pub use list_picker::{ListPicker, ListPickerItem};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
 use pending_preview::PendingPreview;
-pub use session_picker::{SessionPickerEntry, SessionPickerPopup};
 pub use skill_popup::{SkillEntry, SkillPopup, build_skill_entries};
 pub use slash_popup::{
     BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries,
@@ -96,9 +94,6 @@ pub struct BottomPane {
     last_composer_keystroke_at: Option<Instant>,
     /// Captured decision waiting to be drained by the app loop.
     last_decision: Option<(String, ReviewDecision)>,
-    /// Captured session id from the picker, waiting to be drained by the app
-    /// loop and routed through the same `/resume <id>` path.
-    last_session_selection: Option<String>,
     pending_inputs: Vec<PendingPreview>,
     /// Status-bar state pushed by the main loop via [`Self::update_status`].
     /// Rendered as the bottommost row of the pane, below the composer.
@@ -176,7 +171,6 @@ impl BottomPane {
             pending_approvals: VecDeque::new(),
             last_composer_keystroke_at: None,
             last_decision: None,
-            last_session_selection: None,
             pending_inputs: Vec::new(),
             status: StatusBarState::default(),
         }
@@ -260,16 +254,6 @@ impl BottomPane {
     /// each key event and forwards the result to `PendingApprovals::respond`.
     pub fn take_approval_decision(&mut self) -> Option<(String, ReviewDecision)> {
         self.last_decision.take()
-    }
-
-    pub fn open_session_picker(&mut self, entries: Vec<SessionPickerEntry>) {
-        self.view = Some(Box::new(SessionPickerPopup::new_with_theme(
-            entries, self.theme,
-        )));
-    }
-
-    pub fn take_session_selection(&mut self) -> Option<String> {
-        self.last_session_selection.take()
     }
 
     fn try_show_next_approval(&mut self) -> bool {
@@ -438,27 +422,6 @@ mod tests {
         assert_eq!(second.queue_total, 1);
     }
 
-    #[test]
-    fn session_picker_selection_is_captured_before_overlay_drops() {
-        let mut pane = BottomPane::new();
-        pane.open_session_picker(vec![SessionPickerEntry {
-            id: "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
-            name: Some("release work".to_string()),
-            created_at: 100,
-            last_active: 250,
-            turn_count: 2,
-            title: Some("Implement picker".to_string()),
-        }]);
-
-        assert!(pane.has_overlay());
-        pane.handle_key(key(KeyCode::Enter));
-        assert!(!pane.has_overlay());
-        assert_eq!(
-            pane.take_session_selection(),
-            Some("01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string())
-        );
-    }
-
     fn ctrl_p() -> KeyEvent {
         KeyEvent::new_with_kind(
             KeyCode::Char('p'),
@@ -570,30 +533,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_does_not_dismiss_session_picker_overlay() {
-        let mut pane = pane_with_entries();
-        pane.open_session_picker(vec![SessionPickerEntry {
-            id: "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
-            name: Some("release work".to_string()),
-            created_at: 100,
-            last_active: 250,
-            turn_count: 2,
-            title: Some("Implement picker".to_string()),
-        }]);
-        assert!(pane.has_overlay());
-        // Ctrl+P must not destroy the session picker modal
-        pane.handle_key(ctrl_p());
-        assert!(pane.has_overlay());
-        assert!(pane.composer().text().is_empty());
-        // The session picker should still be responsive
-        pane.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            pane.take_session_selection(),
-            Some("01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string())
-        );
-    }
-
-    #[test]
     fn transcript_arrows_scroll_only_when_pane_is_idle() {
         let mut pane = BottomPane::new();
         assert!(pane.can_scroll_transcript_with_arrows());
@@ -605,17 +544,5 @@ mod tests {
         pane.handle_key(key(KeyCode::Char(' ')));
         assert!(!pane.can_scroll_transcript_with_arrows());
 
-        let mut pane = BottomPane::new();
-        assert!(pane.can_scroll_transcript_with_arrows());
-
-        pane.open_session_picker(vec![SessionPickerEntry {
-            id: "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
-            name: Some("release work".to_string()),
-            created_at: 100,
-            last_active: 250,
-            turn_count: 2,
-            title: Some("Implement picker".to_string()),
-        }]);
-        assert!(!pane.can_scroll_transcript_with_arrows());
     }
 }

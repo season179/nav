@@ -4,8 +4,14 @@ use nav_core::{
     build_context_report_with_replay_cwd, cli::Args,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::{ChatWidget, bottom_pane};
+use crate::app::overlay::{Overlay, leave_app_overlay};
+use crate::app::resume_picker::build_resume_picker;
+use crate::app::terminal::TerminalGuard;
+use crate::custom_terminal::InlineViewportState;
+use crate::theme::Theme;
+use crate::ChatWidget;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn push_context_report(
@@ -46,23 +52,72 @@ pub(super) fn resume_session(
     Ok((session_id, events))
 }
 
-pub(super) fn open_session_picker(
-    store: &SessionStore,
-    pane: &mut bottom_pane::BottomPane,
+pub(super) fn try_open_resume_picker(
+    store: Arc<SessionStore>,
     exclude_session_id: Option<&str>,
+    theme: Theme,
+    term: &mut TerminalGuard,
+    app_overlay: &mut Option<Overlay>,
+    overlay_state: &mut Option<InlineViewportState>,
     chat: &mut ChatWidget,
 ) {
-    match store.list_sessions(None) {
-        Ok(summaries) => {
-            let entries = summaries
-                .iter()
-                .filter(|summary| Some(summary.id.as_str()) != exclude_session_id)
-                .map(bottom_pane::SessionPickerEntry::from_summary)
-                .collect();
-            pane.open_session_picker(entries);
-        }
-        Err(err) => chat.push_err(err),
+    if app_overlay.is_some() {
+        return;
     }
+    let picker = match build_resume_picker(store, exclude_session_id, theme) {
+        Ok(picker) => picker,
+        Err(err) => return chat.push_err(err),
+    };
+    match term.terminal.enter_alternate_screen() {
+        Ok(state) => {
+            *app_overlay = Some(Overlay::Resume(picker));
+            *overlay_state = Some(state);
+        }
+        Err(err) => {
+            chat.push_err(anyhow::anyhow!(err).context("Failed to open resume picker"));
+        }
+    }
+}
+
+pub(super) fn try_open_resume_picker_unless_busy(
+    turn_running: bool,
+    busy_message: &str,
+    store: Arc<SessionStore>,
+    exclude_session_id: Option<&str>,
+    theme: Theme,
+    term: &mut TerminalGuard,
+    app_overlay: &mut Option<Overlay>,
+    overlay_state: &mut Option<InlineViewportState>,
+    chat: &mut ChatWidget,
+) {
+    if turn_running {
+        chat.ingest(AgentEvent::Error {
+            message: busy_message.to_string(),
+        });
+        return;
+    }
+    try_open_resume_picker(
+        store,
+        exclude_session_id,
+        theme,
+        term,
+        app_overlay,
+        overlay_state,
+        chat,
+    );
+}
+
+pub(super) fn dismiss_app_overlay(
+    term: &mut TerminalGuard,
+    app_overlay: &mut Option<Overlay>,
+    overlay_state: &mut Option<InlineViewportState>,
+) -> Option<String> {
+    let resume_id = app_overlay
+        .as_mut()
+        .and_then(Overlay::take_resume_selection);
+    leave_app_overlay(term, overlay_state);
+    *app_overlay = None;
+    resume_id
 }
 
 pub(super) fn resolve_tree_root(store: &SessionStore, session_id: &str) -> Result<String> {
@@ -97,43 +152,4 @@ pub(super) fn export_current_session(
     let rendered = nav_core::export_events(&events, format)?;
     std::fs::write(&write_path, rendered)?;
     Ok(display_path)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    #[test]
-    fn open_session_picker_can_exclude_current_empty_session() {
-        let (_dir, store) = {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("nav.db");
-            let store = SessionStore::open(Some(path)).unwrap();
-            (dir, store)
-        };
-        let current = store
-            .create_session(
-                Path::new("/repo"),
-                nav_core::PROVIDER_OPENAI_RESPONSES,
-                "gpt-test",
-                None,
-            )
-            .unwrap();
-        let other = store
-            .create_session(
-                Path::new("/repo"),
-                nav_core::PROVIDER_OPENAI_RESPONSES,
-                "gpt-test",
-                None,
-            )
-            .unwrap();
-        let mut pane = bottom_pane::BottomPane::new();
-        let mut chat = ChatWidget::new();
-
-        open_session_picker(&store, &mut pane, Some(&current), &mut chat);
-        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert_eq!(pane.take_session_selection(), Some(other));
-    }
 }
