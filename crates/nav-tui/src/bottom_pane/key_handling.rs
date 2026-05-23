@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use nav_core::UserAttachment;
 
 use super::approval::ApprovalOverlay;
@@ -44,6 +44,7 @@ impl BottomPane {
     /// inserted path lives inside the read sandbox (paths under `/tmp` would
     /// be rejected by `nav-core`'s fs sandbox, defeating the affordance).
     pub fn on_paste(&mut self, text: &str) {
+        self.last_composer_keystroke_at = Some(std::time::Instant::now());
         // 1) Clipboard image blob. If the OS clipboard holds an image and the
         //    bracketed-paste payload is empty (or junk), persist the image
         //    under `.nav/clipboard/` and insert the workspace-relative path
@@ -113,8 +114,7 @@ impl BottomPane {
                             // type, not on combined type+state.
                             #[allow(clippy::collapsible_if)]
                             if let Some(decision) = o.take_decision() {
-                                self.last_decision =
-                                    Some((o.approval_id.clone(), decision));
+                                self.last_decision = Some((o.approval_id.clone(), decision));
                             }
                         } else if let Some(p) = any.downcast_mut::<SessionPickerPopup>() {
                             #[allow(clippy::collapsible_if)]
@@ -133,6 +133,9 @@ impl BottomPane {
             }
         }
         let event = self.composer.handle_key(key);
+        if is_composer_activity_key(key) {
+            self.last_composer_keystroke_at = Some(std::time::Instant::now());
+        }
         self.reconcile_popups();
         event
     }
@@ -203,5 +206,24 @@ impl BottomPane {
         } else {
             self.view = None;
         }
+    }
+}
+
+fn is_composer_activity_key(key: KeyEvent) -> bool {
+    if key.kind == KeyEventKind::Release {
+        return false;
+    }
+    match key.code {
+        KeyCode::Char('u') | KeyCode::Char('w')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            true
+        }
+        KeyCode::Char(_) => !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER),
+        KeyCode::Backspace | KeyCode::Delete => true,
+        KeyCode::Enter => key.modifiers.contains(KeyModifiers::SHIFT),
+        _ => false,
     }
 }

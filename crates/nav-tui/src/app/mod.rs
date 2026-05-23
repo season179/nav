@@ -1013,6 +1013,9 @@ pub async fn run(
                             .ok();
                     }
                 }
+                if pane.promote_pending_approval_if_idle() {
+                    needs_draw = true;
+                }
             }
         }
     }

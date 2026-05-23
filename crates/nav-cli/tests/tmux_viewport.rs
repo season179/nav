@@ -14,12 +14,12 @@
 use serde_json::json;
 use std::fs;
 use std::io::Write;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
 use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use std::net::{TcpListener, TcpStream};
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 /// Unique session name per test so concurrent runs don't collide.
 fn fresh_session(name: &str) -> Session {
@@ -233,6 +233,55 @@ fn spawn_mock_streaming_server(chunk_count: usize) -> u16 {
     port
 }
 
+fn spawn_mock_approval_server(tool_call_delay: Duration) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock approval server bind");
+    let port = listener
+        .local_addr()
+        .expect("mock approval server local addr")
+        .port();
+    let _ = listener.set_nonblocking(true);
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    write_mock_approval_response(stream, tool_call_delay);
+                    return;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(10) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(25));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    port
+}
+
+fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
+    let settings_dir = workdir.path().join(".nav");
+    fs::create_dir_all(&settings_dir).expect("create mock .nav settings dir");
+    let mut settings = json!({
+        "providers": {
+            "mock": {
+                "name": "Local Mock",
+                "base_url": format!("http://127.0.0.1:{}/v1", port),
+                "models": {}
+            }
+        },
+        "default_model": format!("mock/{model}"),
+    });
+    settings["providers"]["mock"]["models"][model] = json!({});
+    fs::write(
+        settings_dir.join("settings.json"),
+        serde_json::to_string_pretty(&settings).expect("serialize mock settings"),
+    )
+    .expect("write mock settings file");
+}
+
 fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if stream.write_all(header).is_err() {
@@ -281,6 +330,64 @@ fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
     }
     let _ = stream.flush();
     let _ = stream.write_all(b"data: [DONE]\n\n");
+}
+
+fn write_mock_approval_response(mut stream: TcpStream, tool_call_delay: Duration) {
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    let marker = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "APPROVAL_STREAM_STARTED"
+            }
+        }]
+    })
+    .to_string();
+    if stream
+        .write_all(format!("data: {marker}\n\n").as_bytes())
+        .is_err()
+    {
+        return;
+    }
+    if stream.flush().is_err() {
+        return;
+    }
+    sleep(tool_call_delay);
+
+    let tool_call = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_approval",
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": "{\"command\":\"rm -rf build\"}"
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+    let finish = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls"
+        }]
+    })
+    .to_string();
+    let _ = stream.write_all(format!("data: {tool_call}\n\n").as_bytes());
+    let _ = stream.write_all(format!("data: {finish}\n\n").as_bytes());
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+    let _ = stream.flush();
 }
 
 #[test]
@@ -451,25 +558,7 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
     // visible when the final marker lands.
     let mock_port = spawn_mock_streaming_server(12);
     let workdir = tempdir().expect("tempdir for mock provider settings");
-    let settings_dir = workdir.path().join(".nav");
-    fs::create_dir_all(&settings_dir).expect("create mock .nav settings dir");
-    fs::write(
-        settings_dir.join("settings.json"),
-        serde_json::to_string_pretty(&json!({
-            "providers": {
-                "mock": {
-                    "name": "Local Mock",
-                    "base_url": format!("http://127.0.0.1:{}/v1", mock_port),
-                    "models": {
-                        "smoke": {}
-                    }
-                }
-            },
-            "default_model": "mock/smoke",
-        }))
-        .expect("serialize mock settings"),
-    )
-    .expect("write mock settings file");
+    write_mock_provider_settings(&workdir, "smoke", mock_port);
 
     let session = fresh_session("streaming-scrollback");
     session.start(100, 24);
@@ -511,6 +600,65 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
         completed.matches("SMOKE_OK_STREAM").count(),
         1,
         "expected the final marker once in the final frame, got:\n{completed}"
+    );
+}
+
+#[test]
+fn approval_prompt_waits_until_composer_goes_idle() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_approval_server(Duration::from_millis(250));
+    let workdir = tempdir().expect("tempdir for mock approval settings");
+    write_mock_provider_settings(&workdir, "approval", mock_port);
+
+    let session = fresh_session("approval-idle-delay");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/approval"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(status_bar_present(&ready), "nav failed to boot:\n{ready}");
+
+    session.send_line("ask for approval");
+    let stream_started = session.wait_for(
+        |pane| pane.contains("APPROVAL_STREAM_STARTED"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        stream_started.contains("APPROVAL_STREAM_STARTED"),
+        "mock approval stream did not start:\n{stream_started}"
+    );
+
+    session.send("drafting");
+    sleep(Duration::from_millis(350));
+    let while_active = session.capture();
+    assert!(
+        while_active.contains("APPROVAL_STREAM_STARTED"),
+        "mock approval stream marker disappeared before assertion:\n{while_active}"
+    );
+    assert!(
+        while_active.contains("drafting"),
+        "follow-up typing did not land in composer:\n{while_active}"
+    );
+    assert!(
+        !while_active.contains("approval required"),
+        "approval modal popped over active composer typing:\n{while_active}"
+    );
+
+    let after_idle = session.wait_for(
+        |pane| pane.contains("approval required") && pane.contains("rm -rf build"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        after_idle.contains("approval required") && after_idle.contains("rm -rf build"),
+        "approval modal did not promote after composer idle:\n{after_idle}"
     );
 }
 
