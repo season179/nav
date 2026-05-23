@@ -17,7 +17,6 @@ use std::io::Stdout;
 
 use crate::ChatWidget;
 use crate::bottom_pane;
-use crate::bottom_pane::AgentState;
 use crate::custom_terminal::Terminal;
 
 /// Cap the streaming preview at this many rows so a long in-flight reply
@@ -40,29 +39,10 @@ const MIN_PANE_ROWS: u16 = 4;
 /// frame.
 const SCROLLBACK_RESERVE: u16 = 2;
 
-/// State carried into [`draw_tui`] for the status bar. Retained until #151
-/// removes it entirely; the bottom pane now owns its own copy of this data
-/// (see [`bottom_pane::StatusBarState`] and `BottomPane::update_status`), and
-/// `draw_tui` no longer renders the status bar itself. Until #151 lands the
-/// arg stays as a passthrough so callers don't need to change.
-#[allow(dead_code)]
-pub(super) struct TuiStatus<'a> {
-    pub model: &'a str,
-    pub cwd_short: &'a str,
-    pub branch: Option<&'a str>,
-    pub dirty: bool,
-    pub state: AgentState,
-    pub tokens_input: u64,
-    pub tokens_output: u64,
-    pub tokens_cached: u64,
-    pub context_window: u64,
-}
-
 pub(super) fn draw_tui(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     chat: &ChatWidget,
     pane: &bottom_pane::BottomPane,
-    _status: TuiStatus<'_>,
     screen_w: u16,
     screen_h: u16,
 ) -> Result<()> {
