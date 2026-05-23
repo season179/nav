@@ -46,6 +46,7 @@ impl HistorySearch {
         search
     }
 
+    /// Rebuild the match list newest-first, capped at [`MAX_VISIBLE`].
     fn refilter(&mut self) {
         self.matches.clear();
         // Walk history newest-first so the most recent match appears first.
@@ -61,6 +62,9 @@ impl HistorySearch {
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
     }
 
+    /// Route a key while the search overlay is active. All keys are
+    /// swallowed; Enter selects, Esc restores, Up/Down navigates,
+    /// Ctrl+R cycles, and printable characters append to the query.
     fn handle_key_inner(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
         if key.kind == KeyEventKind::Release {
             return InputResult::Handled;
@@ -124,6 +128,8 @@ impl HistorySearch {
         }
     }
 
+    /// Paint the search prompt, matching entries, and optional "no
+    /// matches" hint into the popup area.
     fn render_inner(&self, area: Rect, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
