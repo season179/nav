@@ -98,6 +98,33 @@ pub(super) fn working_pulse_color(tick: u64) -> Color {
     }
 }
 
+/// Gauge width in characters (exclusive of the leading space and brackets).
+/// Total rendered width: 1 (space) + 1 (`[`) + 8 (inner) + 1 (`]`) = 11 chars.
+const GAUGE_INNER: usize = 8;
+
+/// Build a coloured gauge span like ` [████░░░░]` representing `pct`
+/// percent fill. Returns `None` when `pct` is 0 (gauge hidden).
+///
+/// Colour thresholds: green < 50%, yellow 50–80%, red > 80%.
+fn gauge_span(pct: u64) -> Option<Span<'static>> {
+    if pct == 0 {
+        return None;
+    }
+    let filled = ((pct.min(100) as usize * GAUGE_INNER).div_ceil(100)).min(GAUGE_INNER);
+    let empty = GAUGE_INNER - filled;
+    let color = if pct > 80 {
+        Color::Red
+    } else if pct >= 50 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    Some(Span::styled(
+        format!(" [{}{}]", "█".repeat(filled), "░".repeat(empty)),
+        Style::default().fg(color),
+    ))
+}
+
 /// Format `tokens` as `<n.n>k` (one decimal). Caller must gate on
 /// `>= 1_000`; below that the gauge is hidden entirely.
 fn format_tokens_k(tokens: u64) -> String {
@@ -196,8 +223,96 @@ impl<'a> Widget for StatusBar<'a> {
             {
                 let denom_k = (s.context_window + 500) / 1_000;
                 spans.push(Span::styled(format!(" · {denom_k}k {pct}%"), dim));
+                if let Some(gauge) = gauge_span(pct) {
+                    spans.push(gauge);
+                }
             }
         }
         Paragraph::new(Line::from(spans)).render(area, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gauge_hidden_when_pct_zero() {
+        assert!(gauge_span(0).is_none());
+    }
+
+    #[test]
+    fn gauge_appears_at_one_percent() {
+        let bar = gauge_span(1).expect("should render at 1%");
+        // 1% of 8 = 1 filled block.
+        assert_eq!(bar.content, " [█░░░░░░░]");
+        assert_eq!(bar.style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn gauge_green_below_50() {
+        let bar = gauge_span(49).unwrap();
+        assert_eq!(bar.style.fg, Some(Color::Green));
+        // 49% of 8 = ceil(3.92) = 4 filled.
+        assert_eq!(bar.content, " [████░░░░]");
+    }
+
+    #[test]
+    fn gauge_yellow_at_50() {
+        assert_eq!(gauge_span(50).unwrap().style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn gauge_yellow_up_to_80() {
+        let bar = gauge_span(80).unwrap();
+        assert_eq!(bar.style.fg, Some(Color::Yellow));
+        // 80% of 8 = ceil(6.4) = 7 filled.
+        assert_eq!(bar.content, " [███████░]");
+    }
+
+    #[test]
+    fn gauge_red_above_80() {
+        assert_eq!(gauge_span(81).unwrap().style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn gauge_full_at_100() {
+        assert_eq!(gauge_span(100).unwrap().content, " [████████]");
+    }
+
+    #[test]
+    fn gauge_clamped_above_100() {
+        assert_eq!(gauge_span(200).unwrap().content, " [████████]");
+    }
+
+    /// Render the status bar into a buffer and return the resulting row as a
+    /// plain string. Shared by the gauge-visibility end-to-end tests.
+    fn render_status_row(context_window: u64) -> String {
+        let state = StatusBarState {
+            model: "m".into(),
+            cwd_short: "~".into(),
+            tokens_input: 50_000,
+            context_window,
+            ..StatusBarState::default()
+        };
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        StatusBar { state: &state }.render(area, &mut buf);
+        (0..80)
+            .map(|x| buf[(x, 0)].symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    #[test]
+    fn status_bar_renders_gauge_with_tokens() {
+        let row = render_status_row(200_000);
+        assert!(row.contains('█'), "gauge not found in: {row:?}");
+        assert!(row.contains('░'), "gauge not found in: {row:?}");
+    }
+
+    #[test]
+    fn status_bar_no_gauge_without_context_window() {
+        let row = render_status_row(0);
+        assert!(!row.contains('█'), "gauge should not appear: {row:?}");
     }
 }
