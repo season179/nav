@@ -18,6 +18,7 @@
 //! - `streaming`: buffering rules for in-progress assistant text.
 
 mod ansi;
+mod color;
 mod app;
 pub mod bottom_pane;
 mod cells;
@@ -29,6 +30,9 @@ mod metrics;
 mod render;
 mod streaming;
 mod theme;
+#[cfg(unix)]
+mod terminal_probe;
+mod terminal_palette;
 mod chat;
 
 pub use app::run;
