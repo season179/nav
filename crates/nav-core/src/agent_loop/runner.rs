@@ -1019,41 +1019,27 @@ fn emit_text_delta(
     }
 }
 
-pub(crate) fn extract_message_text(item: &Value) -> Option<String> {
-    let content = item.get("content")?.as_array()?;
+fn extract_concatenated_text(item: &Value, array_key: &str, part_types: &[&str]) -> Option<String> {
+    let parts = item.get(array_key)?.as_array()?;
     let mut buffer = String::new();
-    for part in content {
+    for part in parts {
         let part_type = part.get("type").and_then(Value::as_str)?;
-        if (part_type == "output_text" || part_type == "text")
+        if part_types.contains(&part_type)
             && let Some(text) = part.get("text").and_then(Value::as_str)
         {
             buffer.push_str(text);
         }
     }
-    if buffer.is_empty() {
-        None
-    } else {
-        Some(buffer)
-    }
+    (!buffer.is_empty()).then_some(buffer)
+}
+
+pub(crate) fn extract_message_text(item: &Value) -> Option<String> {
+    extract_concatenated_text(item, "content", &["output_text", "text"])
 }
 
 /// Concatenated text from a reasoning item's `summary` array (each part
 /// is `type: "summary_text"`). Returns `None` when the item has no
 /// summary or all parts are empty. Symmetric with `extract_message_text`.
 pub(crate) fn extract_reasoning_text(item: &Value) -> Option<String> {
-    let summary = item.get("summary")?.as_array()?;
-    let mut buffer = String::new();
-    for part in summary {
-        let part_type = part.get("type").and_then(Value::as_str)?;
-        if part_type == "summary_text"
-            && let Some(text) = part.get("text").and_then(Value::as_str)
-        {
-            buffer.push_str(text);
-        }
-    }
-    if buffer.is_empty() {
-        None
-    } else {
-        Some(buffer)
-    }
+    extract_concatenated_text(item, "summary", &["summary_text"])
 }
