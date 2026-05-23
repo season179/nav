@@ -70,6 +70,7 @@ pub async fn run(
 ) -> Result<()> {
     let slash_entries =
         bottom_pane::build_slash_entries_with_extensions(skills.as_ref(), extensions.as_ref());
+    let skill_entries = bottom_pane::build_skill_entries(skills.as_ref());
     let theme = Theme::from_extensions(project.settings.theme.as_deref(), extensions.as_ref());
 
     // Enter raw mode + clear stale mouse capture BEFORE constructing the
@@ -104,9 +105,10 @@ pub async fn run(
     for ev in resume_events {
         chat.ingest(ev);
     }
-    let mut pane = bottom_pane::BottomPane::with_entries_and_theme(
+    let mut pane = bottom_pane::BottomPane::with_entries_and_skill(
         slash_entries,
         mention_entries,
+        skill_entries,
         cwd.clone(),
         theme,
     );
