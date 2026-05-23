@@ -2,9 +2,10 @@
 //!
 //! Finalized chat history lives in the terminal's native scrollback (see
 //! `crate::insert_history`), not inside ratatui. This module only paints
-//! the inline viewport: any in-flight streaming text, the composer, and
-//! the status bar. The viewport is sized per-frame and anchored to the
-//! bottom of the screen.
+//! the inline viewport: any in-flight streaming text and the bottom pane.
+//! The bottom pane owns its own status bar, overlays, pending-input queue,
+//! and composer (see `crate::bottom_pane`); this module just sizes the
+//! viewport per-frame and splits it into a streaming chunk + a pane chunk.
 
 use anyhow::Result;
 use crossterm::cursor::MoveTo;
