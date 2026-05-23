@@ -91,6 +91,7 @@ impl<T: ListPickerItem> ListPicker<T> {
 
     /// Dismiss without picking anything.
     pub fn cancel(&mut self) {
+        self.selection = None;
         self.completed = true;
     }
 
@@ -119,10 +120,12 @@ impl<T: ListPickerItem> ListPicker<T> {
     // ── Item management ───────────────────────────────────────────────
 
     /// Replace the visible items (e.g. after re-filtering). Resets
-    /// `selected` to 0 so the user lands on the top-ranked result.
+    /// `selected` to 0 and clears any prior selection so the user lands
+    /// on the top-ranked result.
     pub fn set_items(&mut self, items: Vec<T>) {
         self.items = items;
         self.selected = 0;
+        self.selection = None;
     }
 
     pub fn items(&self) -> &[T] {
