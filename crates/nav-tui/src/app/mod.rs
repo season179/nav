@@ -40,9 +40,9 @@ use crate::ChatWidget;
 use crate::bottom_pane::{
     self, AgentState, INDICATOR_SCREEN_FLOOR, PendingApproval, StatusBarState,
 };
+use crate::chat::parse_rewind_skill_prompt;
 use crate::commands::{AppEvent, ModelMatch, dispatch_submit, is_ctrl_c, match_model_selector};
 use crate::theme::Theme;
-use crate::chat::parse_rewind_skill_prompt;
 use permissions::build_tui_permissions;
 use render::draw_tui;
 use session::{
@@ -134,6 +134,7 @@ fn settle_terminal_turn(
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
     skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
     project: &Arc<ProjectContext>,
     permissions: &PermissionContext,
     chat: &mut ChatWidget,
@@ -175,6 +176,7 @@ fn settle_terminal_turn(
             session_id,
             agent_tx,
             skills,
+            extensions,
             project,
             permissions,
             chat,
@@ -195,6 +197,7 @@ fn reap_finished_turn(
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
     skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
     project: &Arc<ProjectContext>,
     permissions: &PermissionContext,
     chat: &mut ChatWidget,
@@ -226,6 +229,7 @@ fn reap_finished_turn(
             session_id,
             agent_tx,
             skills,
+            extensions,
             project,
             permissions,
             chat,
@@ -248,6 +252,7 @@ fn drain_agent_events_or_reap_finished_turn(
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
     skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
     project: &Arc<ProjectContext>,
     permissions: &PermissionContext,
     last_tokens_input: &mut u64,
@@ -288,6 +293,7 @@ fn drain_agent_events_or_reap_finished_turn(
                         session_id,
                         agent_tx,
                         skills,
+                        extensions,
                         project,
                         permissions,
                         chat,
@@ -308,6 +314,7 @@ fn drain_agent_events_or_reap_finished_turn(
                     session_id,
                     agent_tx,
                     skills,
+                    extensions,
                     project,
                     permissions,
                     chat,
@@ -328,6 +335,7 @@ fn drain_agent_events_or_reap_finished_turn(
                     session_id,
                     agent_tx,
                     skills,
+                    extensions,
                     project,
                     permissions,
                     chat,
@@ -496,6 +504,7 @@ pub async fn run(
                             &session_id,
                             &agent_tx,
                             &skills,
+                            &extensions,
                             &project,
                             &permissions,
                             &mut chat,
@@ -514,6 +523,7 @@ pub async fn run(
                             &session_id,
                             &agent_tx,
                             &skills,
+                            &extensions,
                             &project,
                             &permissions,
                             &mut last_tokens_input,
@@ -538,6 +548,7 @@ pub async fn run(
                     &session_id,
                     &agent_tx,
                     &skills,
+                    &extensions,
                     &project,
                     &permissions,
                     &mut chat,
@@ -556,6 +567,7 @@ pub async fn run(
                         &session_id,
                         &agent_tx,
                         &skills,
+                        &extensions,
                         &project,
                         &permissions,
                         &mut chat,
@@ -585,8 +597,8 @@ pub async fn run(
             // Dedicated indicator row only when the agent is actually
             // working AND there's vertical room. Below the floor the
             // spinner stays inline in the status bar.
-            let show_indicator = matches!(state, AgentState::Working { .. })
-                && screen_h >= INDICATOR_SCREEN_FLOOR;
+            let show_indicator =
+                matches!(state, AgentState::Working { .. }) && screen_h >= INDICATOR_SCREEN_FLOOR;
             pane.update_status(StatusBarState {
                 model: args.model.clone(),
                 cwd_short: cwd_short.clone(),
@@ -719,6 +731,7 @@ pub async fn run(
                         &session_id,
                         &agent_tx,
                         &skills,
+                        &extensions,
                         &project,
                         &permissions,
                         &mut chat,
@@ -740,6 +753,7 @@ pub async fn run(
                             &session_id,
                             &agent_tx,
                             &skills,
+                            &extensions,
                             &project,
                             &permissions,
                             &mut last_tokens_input,
@@ -791,6 +805,7 @@ pub async fn run(
                             &session_id,
                             &agent_tx,
                             &skills,
+                            &extensions,
                             &project,
                             &permissions,
                             &mut chat,
@@ -1252,6 +1267,7 @@ pub async fn run(
                             &session_id,
                             &agent_tx,
                             &skills,
+                            &extensions,
                             &project,
                             &permissions,
                             &mut chat,
@@ -1334,6 +1350,7 @@ pub async fn run(
                                         &session_id,
                                         &agent_tx,
                                         &skills,
+                                        &extensions,
                                         &project,
                                         &permissions,
                                         &mut chat,

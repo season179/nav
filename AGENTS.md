@@ -153,3 +153,6 @@ path, so verify the real local checkout before assuming one is absent.
   `cargo insta review` before committing.
 - Commit messages should sound human, with short imperative subjects. Do not
   include `Co-Authored-By` trailers.
+- Do not add generated attribution footers or badges to commits, PR
+  descriptions, docs, or comments. In particular, never add "Made with Cursor"
+  or similar tool-authorship marketing text.

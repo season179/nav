@@ -8,6 +8,7 @@ use super::events::{CompactionAnalyticsPhase, CompactionReason, CompactionTrigge
 use super::{AgentEvent, TurnUsage, UserAttachment};
 use crate::agent_loop::compaction_turn::{CompactionTurnRequest, run_compaction_turn};
 use crate::agent_loop::control::{PendingInput, PendingInputMode, TurnControls};
+use crate::agent_loop::hooks::run_hooks;
 use crate::agent_loop::model_backend;
 use crate::agent_loop::prune::prune_to_budget;
 use crate::agent_loop::subagent::{SubagentToolRequest, run_subagent_tool};
@@ -22,7 +23,8 @@ use crate::context::history::{
 };
 use crate::context::replay_policy::ReplayBudget;
 use crate::context::{
-    Catalog, ProjectContext, SessionId, SessionStore, build_user_content, push_ambient_context,
+    Catalog, ExtensionCatalog, HookEventType, ProjectContext, SessionId, SessionStore,
+    build_user_content, push_ambient_context,
 };
 use crate::git_checkpoint;
 use crate::guardrails::{self, PermissionContext};
@@ -54,6 +56,7 @@ pub struct AgentTurnRequest<'a> {
     pub session: Option<&'a SessionBinding<'a>>,
     pub initial_input: Option<Vec<Value>>,
     pub skills: &'a Catalog,
+    pub extensions: Option<&'a ExtensionCatalog>,
     pub context: Option<&'a ProjectContext>,
     pub permissions: PermissionContext,
     pub controls: TurnControls,
@@ -80,6 +83,7 @@ impl<'a> AgentTurnRequest<'a> {
             session: None,
             initial_input: None,
             skills,
+            extensions: None,
             context: None,
             permissions,
             controls: TurnControls::default(),
@@ -108,6 +112,11 @@ impl<'a> AgentTurnRequest<'a> {
 
     pub fn with_context(mut self, context: Option<&'a ProjectContext>) -> Self {
         self.context = context;
+        self
+    }
+
+    pub fn with_extensions(mut self, extensions: Option<&'a ExtensionCatalog>) -> Self {
+        self.extensions = extensions;
         self
     }
 
@@ -199,6 +208,7 @@ pub async fn run_agent(request: AgentTurnRequest<'_>) -> Result<()> {
         request.session.map(|binding| binding.store),
         request.initial_input,
         request.skills,
+        request.extensions,
         request.context,
         request.permissions,
         request.controls,
@@ -220,6 +230,7 @@ pub(super) async fn run_agent_inner(
     tool_session_store: Option<&SessionStore>,
     initial_input: Option<Vec<Value>>,
     skills: &Catalog,
+    extensions: Option<&ExtensionCatalog>,
     context: Option<&ProjectContext>,
     permissions: PermissionContext,
     mut controls: TurnControls,
@@ -286,6 +297,8 @@ pub(super) async fn run_agent_inner(
         session,
         user_message_event(prompt, display_prompt, attachments),
     );
+    let pre_turn_hooks_ran = run_hooks(extensions, HookEventType::PreTurn, &events, session).await;
+    let mut hook_verification_pending = pre_turn_hooks_ran;
     push_ambient_context(&mut input, cwd, context, args.ambient_context_token_budget);
     input.push(json!({
         "type": "message",
@@ -456,6 +469,9 @@ pub(super) async fn run_agent_inner(
                 )
                 .await;
                 if let Some(reason) = abort_reason {
+                    if hook_verification_pending {
+                        emit_verification_events(&events, session, cwd);
+                    }
                     emit_turn_aborted(&events, session, controls.turn_id.as_deref(), reason);
                     return Ok(());
                 }
@@ -471,7 +487,16 @@ pub(super) async fn run_agent_inner(
         }
 
         if calls.is_empty() {
-            if let Err(err) = finalize_turn(&events, session, cwd, false, &args.model, &usage) {
+            let post_turn_hooks_ran =
+                run_hooks(extensions, HookEventType::PostTurn, &events, session).await;
+            if let Err(err) = finalize_turn(
+                &events,
+                session,
+                cwd,
+                hook_verification_pending || post_turn_hooks_ran,
+                &args.model,
+                &usage,
+            ) {
                 return fail(&events, session, err);
             }
             return Ok(());
@@ -634,7 +659,7 @@ pub(super) async fn run_agent_inner(
             // exit the loop instead of feeding more tool calls or asking
             // the model for another turn.
             if aborted {
-                if turn_had_mutation {
+                if turn_had_mutation || hook_verification_pending {
                     emit_verification_events(&events, session, cwd);
                 }
                 emit_turn_aborted(
@@ -662,12 +687,13 @@ pub(super) async fn run_agent_inner(
             &events,
             session,
             cwd,
-            turn_had_mutation,
+            turn_had_mutation || hook_verification_pending,
             &args.model,
             &usage,
         ) {
             return fail(&events, session, err);
         }
+        hook_verification_pending = false;
 
         // Mid-turn auto-compact: the model still has tool calls to follow
         // up on (`calls` was non-empty above; the no-tools branch already
@@ -945,7 +971,7 @@ fn emit_verification_events(
 /// to the renderer but never written to disk. A persistence failure is
 /// logged but does not abort the conversation - losing one event is less
 /// disruptive than killing an in-progress model run.
-fn emit(
+pub(super) fn emit(
     events: &UnboundedSender<AgentEvent>,
     session: Option<&SessionBinding<'_>>,
     event: AgentEvent,
@@ -978,8 +1004,8 @@ pub(crate) fn emit_stream_events(
             });
         }
         "response.reasoning_summary_text.delta" => {
-            emit_text_delta(event, events, session, |text| {
-                AgentEvent::ReasoningDelta { text }
+            emit_text_delta(event, events, session, |text| AgentEvent::ReasoningDelta {
+                text,
             });
         }
         "response.output_item.done" => {
