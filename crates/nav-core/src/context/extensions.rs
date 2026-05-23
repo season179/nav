@@ -1,9 +1,9 @@
 //! Local extension discovery.
 //!
 //! Extensions are intentionally data-first for this slice. A manifest can
-//! register prompt templates and theme colors that nav uses today, while
-//! future-facing sections (`custom_tools`, `mcp_servers`, `hooks`, `packages`)
-//! are counted and surfaced but not executed yet.
+//! register prompt templates, theme colors, and local lifecycle hooks, while
+//! future-facing sections (`custom_tools`, `mcp_servers`, `packages`) are
+//! counted and surfaced but not executed yet.
 //!
 //! Discovery mirrors project settings: project extensions are scoped to
 //! `<launch_cwd>/.nav/extensions/` only, with user extensions under
@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use crate::startup_notices::StartupNotices;
 
@@ -23,6 +24,7 @@ pub struct ExtensionCatalog {
     extensions: Vec<Extension>,
     prompt_templates: Vec<PromptTemplate>,
     themes: Vec<ExtensionTheme>,
+    hooks: Vec<ExtensionHook>,
 }
 
 impl ExtensionCatalog {
@@ -35,6 +37,21 @@ impl ExtensionCatalog {
             extensions,
             prompt_templates,
             themes,
+            hooks: Vec::new(),
+        }
+    }
+
+    pub fn with_hooks(
+        extensions: Vec<Extension>,
+        prompt_templates: Vec<PromptTemplate>,
+        themes: Vec<ExtensionTheme>,
+        hooks: Vec<ExtensionHook>,
+    ) -> Self {
+        Self {
+            extensions,
+            prompt_templates,
+            themes,
+            hooks,
         }
     }
 
@@ -52,6 +69,10 @@ impl ExtensionCatalog {
 
     pub fn themes(&self) -> &[ExtensionTheme] {
         &self.themes
+    }
+
+    pub fn hooks(&self) -> &[ExtensionHook] {
+        &self.hooks
     }
 
     pub fn get_prompt_template(&self, name: &str) -> Option<&PromptTemplate> {
@@ -132,6 +153,49 @@ pub struct ExtensionTheme {
     pub scope: ExtensionScope,
 }
 
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookEventType {
+    PreTurn,
+    PostTurn,
+}
+
+impl HookEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookEventType::PreTurn => "pre_turn",
+            HookEventType::PostTurn => "post_turn",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pre_turn" => Some(HookEventType::PreTurn),
+            "post_turn" => Some(HookEventType::PostTurn),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookCommand {
+    Shell(String),
+    Argv(Vec<String>),
+    Path(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionHook {
+    pub name: String,
+    pub extension_name: String,
+    pub extension_dir: PathBuf,
+    pub scope: ExtensionScope,
+    pub event_type: HookEventType,
+    pub command: HookCommand,
+    pub timeout: Duration,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ExtensionManifest {
@@ -143,6 +207,16 @@ struct ExtensionManifest {
     mcp_servers: Value,
     hooks: Value,
     packages: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct HookManifest {
+    name: Option<String>,
+    event: Option<String>,
+    command: Option<Value>,
+    path: Option<String>,
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +238,7 @@ struct LoadedExtension {
     extension: Extension,
     prompt_templates: Vec<PromptTemplate>,
     themes: Vec<ExtensionTheme>,
+    hooks: Vec<ExtensionHook>,
 }
 
 pub fn discover_extensions(launch_cwd: &Path, notices: &mut StartupNotices) -> ExtensionCatalog {
@@ -208,6 +283,7 @@ struct ExtensionAccumulator {
     extensions: Vec<Extension>,
     prompt_templates: Vec<PromptTemplate>,
     themes: Vec<ExtensionTheme>,
+    hooks: Vec<ExtensionHook>,
     seen_prompts: HashSet<String>,
     seen_themes: HashSet<String>,
 }
@@ -284,11 +360,18 @@ impl ExtensionAccumulator {
         }
         loaded.extension.prompt_template_count = prompt_template_count;
         loaded.extension.theme_count = theme_count;
+        loaded.extension.hook_count = loaded.hooks.len();
+        self.hooks.extend(loaded.hooks);
         self.extensions.push(loaded.extension);
     }
 
     fn into_catalog(self) -> ExtensionCatalog {
-        ExtensionCatalog::new(self.extensions, self.prompt_templates, self.themes)
+        ExtensionCatalog::with_hooks(
+            self.extensions,
+            self.prompt_templates,
+            self.themes,
+            self.hooks,
+        )
     }
 }
 
@@ -327,8 +410,22 @@ fn load_extension(
             Err(err) => notices.warning(format!("skipping theme in extension `{name}`: {err}")),
         }
     }
+    let mut hooks = Vec::new();
+    for hook in hook_manifest_entries(&manifest.hooks) {
+        match hook.and_then(|hook| load_hook_manifest(&hook, &name, &extension_dir, scope)) {
+            Ok(hook) => hooks.push(hook),
+            Err(err) => {
+                notices.warning(format!(
+                    "skipping hook in extension `{name}` at {} ({}): {err}",
+                    extension_dir.display(),
+                    scope.as_str()
+                ));
+            }
+        }
+    }
     let prompt_template_count = prompt_templates.len();
     let theme_count = themes.len();
+    let hook_count = hooks.len();
 
     Ok(LoadedExtension {
         extension: Extension {
@@ -341,11 +438,12 @@ fn load_extension(
             theme_count,
             custom_tool_count: counted_entries(&manifest.custom_tools),
             mcp_server_count: counted_entries(&manifest.mcp_servers),
-            hook_count: counted_entries(&manifest.hooks),
+            hook_count,
             package_count: counted_entries(&manifest.packages),
         },
         prompt_templates,
         themes,
+        hooks,
     })
 }
 
@@ -399,6 +497,113 @@ fn load_theme_manifest(
         extension_name: extension_name.to_string(),
         scope,
     })
+}
+
+fn load_hook_manifest(
+    hook: &HookManifest,
+    extension_name: &str,
+    extension_dir: &Path,
+    scope: ExtensionScope,
+) -> Result<ExtensionHook, String> {
+    let event = hook
+        .event
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "hook is missing `event`".to_string())?;
+    let event_type =
+        HookEventType::parse(event).ok_or_else(|| format!("unsupported hook event `{event}`"))?;
+    let name = hook
+        .name
+        .as_deref()
+        .map(|value| cleaned_token(Some(value), "hook name"))
+        .transpose()?
+        .unwrap_or_else(|| format!("{}:{}", extension_name, event_type.as_str()));
+    let command = match (&hook.command, hook.path.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "hook `{name}` must specify only one of `command` or `path`"
+            ));
+        }
+        (Some(value), None) => parse_hook_command(value, &name)?,
+        (None, Some(path)) => HookCommand::Path(resolve_extension_file(extension_dir, path)?),
+        (None, None) => return Err(format!("hook `{name}` is missing `command` or `path`")),
+    };
+    let timeout = hook
+        .timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_HOOK_TIMEOUT);
+    if timeout.is_zero() {
+        return Err(format!("hook `{name}` timeout must be greater than zero"));
+    }
+    Ok(ExtensionHook {
+        name,
+        extension_name: extension_name.to_string(),
+        extension_dir: extension_dir.to_path_buf(),
+        scope,
+        event_type,
+        command,
+        timeout,
+    })
+}
+
+fn hook_manifest_entries(value: &Value) -> Vec<Result<HookManifest, String>> {
+    match value {
+        Value::Null => Vec::new(),
+        Value::Array(items) => items.iter().map(hook_manifest_from_value).collect(),
+        Value::Object(map) if has_hook_manifest_fields(map) => {
+            vec![hook_manifest_from_value(value)]
+        }
+        Value::Object(_) => vec![Err(
+            "`hooks` object must be a single hook definition; use an array for multiple hooks"
+                .to_string(),
+        )],
+        _ => vec![Err("`hooks` must be an array or object".to_string())],
+    }
+}
+
+fn has_hook_manifest_fields(map: &serde_json::Map<String, Value>) -> bool {
+    map.contains_key("event")
+        || map.contains_key("command")
+        || map.contains_key("path")
+        || map.contains_key("name")
+}
+
+fn hook_manifest_from_value(value: &Value) -> Result<HookManifest, String> {
+    serde_json::from_value(value.clone()).map_err(|err| format!("invalid hook definition: {err}"))
+}
+
+fn parse_hook_command(value: &Value, name: &str) -> Result<HookCommand, String> {
+    match value {
+        Value::String(command) => {
+            let command = command.trim();
+            if command.is_empty() {
+                Err(format!("hook `{name}` command must not be empty"))
+            } else {
+                Ok(HookCommand::Shell(command.to_string()))
+            }
+        }
+        Value::Array(items) => {
+            let argv: Vec<String> = items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+                .collect::<Option<_>>()
+                .ok_or_else(|| format!("hook `{name}` command array must contain strings"))?;
+            if argv.is_empty() {
+                Err(format!("hook `{name}` command array must not be empty"))
+            } else {
+                Ok(HookCommand::Argv(argv))
+            }
+        }
+        _ => Err(format!(
+            "hook `{name}` command must be a string or string array"
+        )),
+    }
 }
 
 fn cleaned_token(value: Option<&str>, label: &str) -> Result<String, String> {
@@ -489,7 +694,7 @@ mod tests {
   ],
   "custom_tools": [{{ "name": "future" }}],
   "mcp_servers": [{{ "name": "future-mcp" }}],
-  "hooks": [{{ "event": "pre_turn" }}],
+  "hooks": [{{ "name": "before", "event": "pre_turn", "command": "printf hook" }}],
   "packages": [{{ "name": "future-package" }}]
 }}"##
         )
@@ -518,6 +723,9 @@ mod tests {
         assert_eq!(extension.mcp_server_count, 1);
         assert_eq!(extension.hook_count, 1);
         assert_eq!(extension.package_count, 1);
+        assert_eq!(catalog.hooks().len(), 1);
+        assert_eq!(catalog.hooks()[0].name, "before");
+        assert_eq!(catalog.hooks()[0].event_type, HookEventType::PreTurn);
 
         let template = catalog.get_prompt_template("review").unwrap();
         assert_eq!(template.scope, ExtensionScope::Project);
@@ -600,5 +808,116 @@ mod tests {
         assert!(catalog.prompt_templates().is_empty());
         assert_eq!(catalog.extensions().len(), 1);
         assert_eq!(catalog.extensions()[0].prompt_template_count, 0);
+    }
+
+    #[test]
+    fn parses_hook_commands_and_paths() {
+        let cwd = tempdir().unwrap();
+        let ext = cwd.path().join(".nav/extensions/demo");
+        write(&ext.join("hooks/post.sh"), "#!/bin/sh\nprintf post");
+        write(
+            &ext.join("extension.json"),
+            r#"{
+              "name": "demo",
+              "hooks": [
+                { "name": "before", "event": "pre_turn", "command": ["printf", "pre"], "timeout_secs": 3 },
+                { "name": "after", "event": "post_turn", "path": "hooks/post.sh" }
+              ]
+            }"#,
+        );
+
+        let catalog = discover_extensions_with_roots(cwd.path(), None, &mut StartupNotices::new());
+
+        assert_eq!(catalog.extensions()[0].hook_count, 2);
+        assert_eq!(catalog.hooks().len(), 2);
+        assert_eq!(catalog.hooks()[0].event_type, HookEventType::PreTurn);
+        assert_eq!(
+            catalog.hooks()[0].command,
+            HookCommand::Argv(vec!["printf".into(), "pre".into()])
+        );
+        assert_eq!(catalog.hooks()[0].timeout, Duration::from_secs(3));
+        assert_eq!(catalog.hooks()[1].event_type, HookEventType::PostTurn);
+        assert!(matches!(catalog.hooks()[1].command, HookCommand::Path(_)));
+    }
+
+    #[test]
+    fn invalid_hooks_are_skipped() {
+        let cwd = tempdir().unwrap();
+        let ext = cwd.path().join(".nav/extensions/demo");
+        write(
+            &ext.join("extension.json"),
+            r#"{
+              "name": "demo",
+              "hooks": [
+                { "name": "bad-event", "event": "pre_commit", "command": "printf no" },
+                { "name": "missing-command", "event": "pre_turn" },
+                { "name": "good", "event": "post_turn", "command": "printf yes" }
+              ]
+            }"#,
+        );
+
+        let mut notices = StartupNotices::new();
+        let catalog = discover_extensions_with_roots(cwd.path(), None, &mut notices);
+
+        assert_eq!(catalog.extensions()[0].hook_count, 1);
+        assert_eq!(catalog.hooks().len(), 1);
+        assert_eq!(catalog.hooks()[0].name, "good");
+        assert_eq!(notices.iter().count(), 2);
+    }
+
+    #[test]
+    fn malformed_hook_entries_do_not_skip_valid_entries() {
+        let cwd = tempdir().unwrap();
+        let ext = cwd.path().join(".nav/extensions/demo");
+        write(
+            &ext.join("extension.json"),
+            r#"{
+              "name": "demo",
+              "hooks": [
+                { "name": "before", "event": "pre_turn", "command": "printf before" },
+                42,
+                { "name": "after", "event": "post_turn", "command": "printf after" }
+              ]
+            }"#,
+        );
+
+        let mut notices = StartupNotices::new();
+        let catalog = discover_extensions_with_roots(cwd.path(), None, &mut notices);
+
+        assert_eq!(catalog.extensions()[0].hook_count, 2);
+        assert_eq!(catalog.hooks().len(), 2);
+        assert_eq!(catalog.hooks()[0].name, "before");
+        assert_eq!(catalog.hooks()[1].name, "after");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.message.contains("invalid hook definition"))
+        );
+    }
+
+    #[test]
+    fn keyed_hook_objects_are_rejected_with_clear_warning() {
+        let cwd = tempdir().unwrap();
+        let ext = cwd.path().join(".nav/extensions/demo");
+        write(
+            &ext.join("extension.json"),
+            r#"{
+              "name": "demo",
+              "hooks": {
+                "pre_turn": { "command": "printf no" }
+              }
+            }"#,
+        );
+
+        let mut notices = StartupNotices::new();
+        let catalog = discover_extensions_with_roots(cwd.path(), None, &mut notices);
+
+        assert_eq!(catalog.extensions()[0].hook_count, 0);
+        assert!(catalog.hooks().is_empty());
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.message.contains("use an array for multiple hooks"))
+        );
     }
 }

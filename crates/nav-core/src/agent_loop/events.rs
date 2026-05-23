@@ -442,6 +442,8 @@ pub enum AgentEvent {
         duration_ms: u64,
         stdout: String,
         stderr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_status: Option<i32>,
         success: bool,
     },
     Error {
@@ -958,6 +960,7 @@ mod tests {
             duration_ms: 350,
             stdout: String::new(),
             stderr: String::new(),
+            exit_status: Some(0),
             success: true,
         };
         assert_eq!(
@@ -969,6 +972,7 @@ mod tests {
                 "duration_ms": 350,
                 "stdout": "",
                 "stderr": "",
+                "exit_status": 0,
                 "success": true
             })
         );
@@ -987,6 +991,7 @@ mod tests {
             duration_ms: 1200,
             stdout: "3 warnings".into(),
             stderr: "type mismatch".into(),
+            exit_status: Some(1),
             success: false,
         };
         let json = serde_json::to_value(&failed).unwrap();

@@ -76,6 +76,7 @@ pub(crate) async fn run_subagent_tool(request: SubagentToolRequest<'_, '_>) -> T
         request.parent_session.map(|binding| binding.store),
         None,
         request.skills,
+        None,
         request.context,
         subagent_permissions(request.permissions),
         TurnControls::default(),
