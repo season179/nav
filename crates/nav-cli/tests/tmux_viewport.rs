@@ -215,11 +215,16 @@ fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
     let _ = stream.flush();
 
     for i in 0..chunk_count {
+        // Newline-terminate each chunk so the StreamController's partition
+        // logic flips bytes from tail to stable, which is the path the
+        // visibility gate (`AdaptiveChunkingPolicy` + commit ticks)
+        // actually paces. A space separator instead of `\n` would keep
+        // every chunk in the live tail and bypass the gate entirely.
         let chunk = json!({
             "choices": [{
                 "index": 0,
                 "delta": {
-                    "content": format!("chunk-{i} ")
+                    "content": format!("chunk-{i}\n")
                 }
             }]
         })
@@ -414,7 +419,11 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
         return;
     }
 
-    let mock_port = spawn_mock_streaming_server(150);
+    // 12 chunks: large enough to cross the catch-up threshold
+    // (ENTER_QUEUE_DEPTH_LINES = 8 in `streaming::chunking`), small
+    // enough to fit on the 24-row viewport so `chunk-0` is still
+    // visible when the final marker lands.
+    let mock_port = spawn_mock_streaming_server(12);
     let workdir = tempdir().expect("tempdir for mock provider settings");
     let settings_dir = workdir.path().join(".nav");
     fs::create_dir_all(&settings_dir).expect("create mock .nav settings dir");

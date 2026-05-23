@@ -72,9 +72,10 @@ impl StreamController {
             return;
         }
 
+        let prev_content_len = self.collector.content().len();
         self.collector.push(text);
         self.stream_state.has_seen_delta = true;
-        self.requeue_stable();
+        self.requeue_stable(prev_content_len);
     }
 
     /// Replace the streamed source with `text`, preserving finalize semantics.
@@ -85,7 +86,9 @@ impl StreamController {
         self.enqueued_stable_offset = 0;
         self.visible_stable_lines = 0;
         self.finalized = false;
-        self.requeue_stable();
+        // Treat the entire replaced buffer as freshly-arrived: no bytes were
+        // previously visible to the user.
+        self.requeue_stable(0);
     }
 
     /// Mark stream complete and snap visibility to the entire body. After
@@ -99,7 +102,12 @@ impl StreamController {
     /// final segment renders.
     pub(crate) fn finalize(&mut self) {
         self.finalized = true;
-        self.requeue_stable();
+        // Treat all content as "previously visible" so requeue_stable snaps
+        // through it without enqueueing — finalize then sets vsl explicitly
+        // and wipes the queue, so this is just bookkeeping for
+        // `enqueued_stable_offset`.
+        let len = self.collector.content().len();
+        self.requeue_stable(len);
         self.visible_stable_lines =
             count_newlines(self.collector.content()).saturating_add(1);
         self.stream_state.clear_queue();
@@ -178,7 +186,19 @@ impl StreamController {
         stable + tail
     }
 
-    fn requeue_stable(&mut self) {
+    /// Bring `enqueued_stable_offset` up to the current partition, splitting
+    /// the newly-stable region into a "snap" portion (bytes that were
+    /// already visible in tail before this delta) and a "gate" portion
+    /// (bytes that arrived in this delta and are stable on arrival).
+    ///
+    /// `prev_content_len` is `collector.content().len()` *before* the
+    /// current delta was appended. Anything in `[0..prev_content_len]` was
+    /// on the user's screen the previous frame — either in the rendered
+    /// stable prefix or in the live tail. When partition_offset advances
+    /// over that range we must keep showing it; otherwise the user
+    /// perceives a flash as content briefly disappears and re-emerges over
+    /// the next few commit ticks.
+    fn requeue_stable(&mut self, prev_content_len: usize) {
         if !self.stream_state.has_seen_delta {
             self.stream_state.clear_queue();
             self.enqueued_stable_offset = 0;
@@ -190,17 +210,46 @@ impl StreamController {
             return;
         }
 
-        // Each new newline in the stable region becomes one tick unit so
-        // the chunking policy can pace per-source-line. We use placeholder
-        // `Line::default()` entries because the display path renders fresh
-        // from `collector.content()` — the queued Line values are never
-        // read for paint, only counted and timed.
-        let new_stable = &self.collector.content()[self.enqueued_stable_offset..partition_end];
-        let new_newlines = count_newlines(new_stable);
-        if new_newlines > 0 {
-            let placeholders: Vec<Line<'static>> =
-                std::iter::repeat_with(Line::default).take(new_newlines).collect();
-            self.stream_state.enqueue(placeholders);
+        let content = self.collector.content();
+
+        // Compute the snap boundary: the highest byte position such that
+        // everything before it was visible in the previous frame.
+        //
+        // - `snap_target = min(prev_content_len, partition_end)` is the
+        //   bytes that newly entered the stable region but were *also* part
+        //   of the previously-rendered content (either stable prefix or
+        //   live tail).
+        //
+        // - If `snap_target` lands mid-line (the byte just before it is
+        //   not a newline), the partial line that was in tail extends past
+        //   `snap_target`. Snap forward through the next `\n` so the line
+        //   the user was already reading stays on screen unbroken.
+        let snap_target = prev_content_len.min(partition_end);
+        let snap_byte_boundary = compute_snap_boundary(content, snap_target, partition_end);
+
+        if snap_byte_boundary > self.enqueued_stable_offset {
+            let target_vsl = count_newlines(&content[..snap_byte_boundary]);
+            // Only ever move visibility forward — never reveal less than
+            // the user already saw.
+            self.visible_stable_lines = self.visible_stable_lines.max(target_vsl);
+        }
+
+        // Bytes past the snap boundary are content that arrived in this
+        // delta and entered the stable region without ever being shown in
+        // tail. Gate them through the chunking policy so the user sees a
+        // smooth reveal instead of a wall of text.
+        //
+        // Placeholder `Line::default()` entries are used because the
+        // display path renders fresh from `collector.content()` — queued
+        // Lines are never read for paint, only counted and timed.
+        let queue_start = snap_byte_boundary.max(self.enqueued_stable_offset);
+        if queue_start < partition_end {
+            let new_newlines = count_newlines(&content[queue_start..partition_end]);
+            if new_newlines > 0 {
+                let placeholders: Vec<Line<'static>> =
+                    std::iter::repeat_with(Line::default).take(new_newlines).collect();
+                self.stream_state.enqueue(placeholders);
+            }
         }
         self.enqueued_stable_offset = partition_end;
     }
@@ -266,6 +315,36 @@ impl StreamController {
 /// single ASCII byte that can't appear inside a multi-byte sequence.
 fn count_newlines(text: &str) -> usize {
     text.as_bytes().iter().filter(|b| **b == b'\n').count()
+}
+
+/// Compute the snap boundary for `requeue_stable`. Returns the smallest byte
+/// position `b` in `[snap_target..=partition_end]` such that `content[..b]`
+/// covers all source lines that were visible to the user in the previous
+/// frame.
+///
+/// When `snap_target` is right after a newline (or is `0`), the previous
+/// line ended exactly there and no extension is needed. When it lands
+/// mid-line, the partial line that was already rendered in tail continues
+/// past `snap_target`; the boundary extends through the next `\n` (or to
+/// `partition_end` if no newline exists in the remainder) so the line the
+/// user was reading stays visible after the partition advances.
+fn compute_snap_boundary(content: &str, snap_target: usize, partition_end: usize) -> usize {
+    if snap_target == 0 {
+        return 0;
+    }
+    let bytes = content.as_bytes();
+    if bytes[snap_target - 1] == b'\n' {
+        return snap_target;
+    }
+    let mut i = snap_target;
+    while i < partition_end && bytes[i] != b'\n' {
+        i += 1;
+    }
+    if i < partition_end {
+        i + 1
+    } else {
+        partition_end
+    }
 }
 
 /// Byte offset *after* the `n`-th newline in `text`. Returns 0 for `n == 0`
@@ -475,6 +554,65 @@ mod tests {
         c.finalize();
 
         insta::assert_snapshot!("post_finalize", snapshot_body(&c, 40));
+    }
+
+    #[test]
+    fn newline_completing_visible_tail_does_not_shrink_display() {
+        // The flash regression scenario: stream "hello world" — visible
+        // in the live tail — then push "\n". The newline reclassifies
+        // "hello world" from tail to stable. Without the snap-on-advance
+        // fix, visible_stable_lines stays at 0 and the row briefly
+        // disappears until the next commit tick. With the fix, the row
+        // remains visible across the delta.
+        let mut c = StreamController::default();
+        c.push_delta("hello world");
+
+        let before = lines_text(&c.visible_lines(40).1);
+        assert!(
+            before.contains("hello world"),
+            "partial line must render in tail; got tail:\n{before}"
+        );
+
+        c.push_delta("\n");
+
+        let (stable_after, tail_after) = c.visible_lines(40);
+        let combined = format!("{}{}", lines_text(&stable_after), lines_text(&tail_after));
+        assert!(
+            combined.contains("hello world"),
+            "completing newline must not erase the previously-visible line; got:\n{combined}"
+        );
+    }
+
+    #[test]
+    fn fence_close_does_not_shrink_previously_visible_code_block() {
+        // Stream an opening fence and a body line — those rows render in
+        // the live tail. Then push the closing fence: partition_offset
+        // jumps past the entire fenced region. Pre-fix, every code line
+        // briefly disappears and replays one-per-tick. Post-fix, the
+        // already-visible code stays on screen.
+        let mut c = StreamController::default();
+        c.push_delta("intro\n");
+        // Drive a smooth tick so "intro" is also released for display —
+        // mirrors the real frame loop where ticks run between deltas.
+        let _ = c.on_commit_tick();
+
+        c.push_delta("```rust\n");
+        c.push_delta("fn main() {\n");
+
+        let (stable_pre, tail_pre) = c.visible_lines(80);
+        let pre_close = format!("{}{}", lines_text(&stable_pre), lines_text(&tail_pre));
+        assert!(pre_close.contains("```rust") && pre_close.contains("fn main() {"));
+
+        c.push_delta("}\n```\n");
+
+        let (stable_post, tail_post) = c.visible_lines(80);
+        let post_close = format!("{}{}", lines_text(&stable_post), lines_text(&tail_post));
+        assert!(
+            post_close.contains("intro")
+                && post_close.contains("```rust")
+                && post_close.contains("fn main() {"),
+            "fence-close must keep previously-visible code rows on screen; got:\n{post_close}"
+        );
     }
 
     #[test]

@@ -14,6 +14,11 @@ pub(crate) enum CommitTickScope {
 }
 
 pub(crate) struct CommitTickOutput {
+    /// One `Line<'static>` per source line drained from the queue this
+    /// tick. The values are placeholders (`Line::default()`) — the queue
+    /// only tracks tick pacing, and the display path renders fresh from
+    /// `StreamController`'s collector content. Treat this vec as a *count*
+    /// of newly-released lines; do not paint its contents directly.
     pub(crate) lines: Vec<Line<'static>>,
     pub(crate) has_controller: bool,
     pub(crate) all_idle: bool,

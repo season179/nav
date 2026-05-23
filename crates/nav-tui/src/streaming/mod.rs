@@ -1,10 +1,17 @@
 //! Streaming primitives used by the TUI transcript pipeline.
 //!
-//! `StreamState` owns commit line queueing and FIFO timing metadata.
-//! `StreamController` owns stream-source accumulation, partitioning, and
-//! queue-driving for row emission.
-//! `AdaptiveChunkingPolicy` and `run_commit_tick` keep emission smooth under
-//! bursty token flow.
+//! `StreamState` owns a FIFO of placeholder tick units and their arrival
+//! timestamps — the queue is a pacing counter, not a row buffer.
+//! `StreamController` owns stream-source accumulation, markdown-aware
+//! partitioning into stable vs tail regions, and the visibility gate that
+//! releases stable lines one tick at a time.
+//! `AdaptiveChunkingPolicy` and `run_commit_tick` decide how many queued
+//! units to drain per tick so emission stays smooth under bursty token
+//! flow.
+//!
+//! The display path renders fresh from `StreamController`'s collector
+//! content on every frame, slicing at the visibility boundary. Queued
+//! `Line` values are never read for paint — only counted and timed.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
