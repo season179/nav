@@ -10,6 +10,7 @@ mod messages;
 mod model;
 mod pending;
 mod preview;
+mod reasoning;
 mod row;
 mod sessions;
 mod subagents;
@@ -28,6 +29,7 @@ pub use messages::{
 };
 pub use model::{ModelListCell, ModelSetCell};
 pub use pending::{PendingInputCell, TurnAbortedCell};
+pub use reasoning::ReasoningCell;
 pub use sessions::{SessionListCell, SessionNoticeCell, SessionTreeCell, TranscriptHitsCell};
 pub use subagents::SubagentCell;
 pub use system::{ApprovalDecisionCell, ErrorCell, NoticeCell};

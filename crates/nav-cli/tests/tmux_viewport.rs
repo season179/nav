@@ -310,6 +310,78 @@ fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
     .expect("write mock settings file");
 }
 
+fn spawn_mock_reasoning_server() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock reasoning server bind");
+    let port = listener
+        .local_addr()
+        .expect("mock reasoning server local addr")
+        .port();
+    let _ = listener.set_nonblocking(true);
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    write_mock_reasoning_response(stream);
+                    return;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(10) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(25));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    port
+}
+
+fn write_mock_reasoning_response(mut stream: TcpStream) {
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    // Stream reasoning deltas.
+    for chunk in ["Step 1: ", "analyze\n", "Step 2: decide"] {
+        let payload = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning_content": chunk
+                }
+            }]
+        })
+        .to_string();
+        let frame = format!("data: {payload}\n\n");
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
+        if stream.flush().is_err() {
+            return;
+        }
+        sleep(Duration::from_millis(5));
+    }
+
+    // Then stream the assistant message.
+    let reply = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "REASONING_TEST_OK"
+            },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let _ = stream.write_all(format!("data: {reply}\n\n").as_bytes());
+    let _ = stream.flush();
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+}
+
 fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
     read_http_request(&mut stream);
     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
@@ -1129,5 +1201,68 @@ fn bottom_pane_layout_survives_resize() {
     assert!(
         cx_big >= 2,
         "after regrow the caret should sit past the 2-col gutter, got cx={cx_big}\n{big}"
+    );
+}
+
+/// Reasoning content from the provider must land in a `ReasoningCell`, not
+/// inside the `AssistantMessageCell`. The mock server streams
+/// `reasoning_content` chunks followed by a regular assistant reply.
+/// The captured pane must show the reasoning label (`◆ reasoning`) and
+/// the final assistant text — but the reasoning text must NOT appear under
+/// the assistant bullet.
+///
+/// Self-check: revert `ChatWidget::ingest` so `ReasoningDone` falls
+/// through to the catch-all `_` arm (or gets treated as assistant text)
+/// and this test will fail with the reasoning content leaking into the
+/// assistant message.
+#[test]
+fn reasoning_content_lands_in_reasoning_cell_not_assistant() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_reasoning_server();
+    let workdir = tempdir().expect("tempdir for mock reasoning provider");
+    write_mock_provider_settings(&workdir, "reason", mock_port);
+
+    let session = fresh_session("reasoning-cell");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/reason"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "reasoning test nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("think about this problem");
+
+    // Wait for the final assistant reply to land — proves the full stream
+    // completed.
+    let completed = session.wait_for(
+        |pane| pane.contains("REASONING_TEST_OK"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        completed.contains("REASONING_TEST_OK"),
+        "reasoning test final marker never landed:\n{completed}"
+    );
+
+    // The pane must contain the reasoning label (collapsed ReasoningCell).
+    assert!(
+        completed.contains("◆ reasoning"),
+        "reasoning cell label missing from pane — reasoning may have leaked into assistant:\n{completed}"
+    );
+
+    // The reasoning body must NOT appear under the assistant bullet.
+    assert!(
+        !completed.contains("• Step 1:"),
+        "reasoning text leaked into the assistant bullet row:\n{completed}"
     );
 }

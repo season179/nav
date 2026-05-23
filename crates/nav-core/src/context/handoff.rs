@@ -279,6 +279,8 @@ fn candidates_from_events(
                 );
             }
             AgentEvent::AssistantMessageDelta { .. }
+            | AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::ReasoningDone { .. }
             | AgentEvent::ResponseContinuation { .. }
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentCompleted { .. }

@@ -28,6 +28,12 @@ const MAX_STREAMING_TOOL_CALLS: usize = 128;
 pub(super) struct ChatCompletionsAccumulator {
     content_buffer: String,
     content_finalized: bool,
+    /// Reasoning / chain-of-thought text accumulated from
+    /// `delta.reasoning_content` fields. Flushed as a single
+    /// `response.output_item.done` with `type: "reasoning"` alongside
+    /// (or instead of) the regular message item at `finish_reason`.
+    reasoning_buffer: String,
+    reasoning_finalized: bool,
     tool_calls: Vec<ToolCallState>,
     tool_calls_finalized: bool,
     usage: Option<Value>,
@@ -115,6 +121,20 @@ impl ChatCompletionsAccumulator {
                 events.push(json!({
                     "type": "response.output_text.delta",
                     "delta": content,
+                }));
+            }
+
+            // Reasoning-capable models (o-series, etc.) stream thinking
+            // tokens in `delta.reasoning_content`. Normalized to the
+            // Responses-shaped `response.reasoning_summary_text.delta` so
+            // the shared emit path can translate them uniformly.
+            if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
+                && !reasoning.is_empty()
+            {
+                self.reasoning_buffer.push_str(reasoning);
+                events.push(json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": reasoning,
                 }));
             }
 
@@ -209,6 +229,20 @@ impl ChatCompletionsAccumulator {
                     "type": "message",
                     "content": [{
                         "type": "output_text",
+                        "text": text,
+                    }],
+                },
+            }));
+        }
+        if !self.reasoning_finalized && !self.reasoning_buffer.is_empty() {
+            self.reasoning_finalized = true;
+            let text = std::mem::take(&mut self.reasoning_buffer);
+            events.push(json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
                         "text": text,
                     }],
                 },
@@ -589,5 +623,53 @@ mod tests {
                 "response.completed",
             ]
         );
+    }
+
+    #[test]
+    fn reasoning_content_normalizes_to_summary_delta_and_done_item() {
+        let chunks = vec![
+            json!({"choices":[{"index":0,"delta":{"reasoning_content":"step 1: "}}]}),
+            json!({"choices":[{"index":0,"delta":{"reasoning_content":"analyze\n"}}]}),
+            json!({"choices":[{"index":0,"delta":{"content":"result"}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+        ];
+        let (events, err) = run_chunks(&chunks);
+        assert!(err.is_none());
+
+        let kinds: Vec<&str> = events.iter().map(type_of).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.delta",
+                "response.output_text.delta",
+                "response.output_item.done",       // message
+                "response.output_item.done",       // reasoning
+                "response.completed",
+            ]
+        );
+
+        // Verify the reasoning done item carries the coalesced summary.
+        let reasoning_done = events
+            .iter()
+            .find(|e| {
+                type_of(e) == "response.output_item.done"
+                    && e.get("item").and_then(|i| i.get("type")).and_then(Value::as_str)
+                        == Some("reasoning")
+            })
+            .expect("reasoning done item");
+        let summary_text: Vec<&str> = reasoning_done["item"]["summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| {
+                if p["type"] == "summary_text" {
+                    p.get("text").and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(summary_text, vec!["step 1: analyze\n"]);
     }
 }

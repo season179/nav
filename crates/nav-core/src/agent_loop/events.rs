@@ -168,6 +168,19 @@ pub enum AgentEvent {
     AssistantMessageDone {
         text: String,
     },
+    /// Streaming reasoning / chain-of-thought text delta. Emitted by
+    /// reasoning-capable models (o-series, etc.) alongside the regular
+    /// assistant message. Transient — not persisted to the session log,
+    /// matching `AssistantMessageDelta` semantics.
+    ReasoningDelta {
+        text: String,
+    },
+    /// Durable reasoning text emitted once per reasoning item when the
+    /// provider finishes it. Carries the coalesced summary text so the
+    /// TUI can render a collapsible `ReasoningCell` in scrollback.
+    ReasoningDone {
+        text: String,
+    },
     /// Provider response items nav needs to replay a `store: false` tool turn
     /// across separate `run_agent` invocations. Carries the model's
     /// `function_call` items verbatim, plus any reasoning items reduced to the
@@ -387,6 +400,8 @@ impl AgentEvent {
             AgentEvent::UserMessage { .. } => "user_message",
             AgentEvent::AssistantMessageDelta { .. } => "assistant_message_delta",
             AgentEvent::AssistantMessageDone { .. } => "assistant_message_done",
+            AgentEvent::ReasoningDelta { .. } => "reasoning_delta",
+            AgentEvent::ReasoningDone { .. } => "reasoning_done",
             AgentEvent::ResponseContinuation { .. } => "response_continuation",
             AgentEvent::ToolCallStarted { .. } => "tool_call_started",
             AgentEvent::ToolCallOutput { .. } => "tool_call_output",
@@ -424,7 +439,10 @@ impl AgentEvent {
     pub fn is_durable(&self) -> bool {
         !matches!(
             self,
-            AgentEvent::AssistantMessageDelta { .. } | AgentEvent::ProviderRetry { .. }
+            AgentEvent::AssistantMessageDelta { .. }
+            | AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::ReasoningDone { .. }
+            | AgentEvent::ProviderRetry { .. }
         )
     }
 }
@@ -907,9 +925,29 @@ mod tests {
                 },
                 "error",
             ),
+            (
+                AgentEvent::ReasoningDelta { text: "x".into() },
+                "reasoning_delta",
+            ),
+            (
+                AgentEvent::ReasoningDone { text: "x".into() },
+                "reasoning_done",
+            ),
         ];
         for (event, expected) in cases {
             assert_eq!(event.kind(), expected);
         }
+    }
+
+    #[test]
+    fn reasoning_events_are_transient() {
+        assert!(
+            !AgentEvent::ReasoningDelta { text: "x".into() }.is_durable(),
+            "ReasoningDelta must be transient so it does not bloat the session log"
+        );
+        assert!(
+            !AgentEvent::ReasoningDone { text: "x".into() }.is_durable(),
+            "ReasoningDone must be transient — the encrypted handle in ResponseContinuation \n             is the durable record; the plaintext summary is TUI-only"
+        );
     }
 }

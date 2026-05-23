@@ -1,0 +1,11 @@
+---
+source: crates/nav-tui/tests/snapshot.rs
+expression: rendered
+---
+
+› think about this
+
+
+◆ reasoning  Reasoning (2 lines)
+
+• I recommend option A.
