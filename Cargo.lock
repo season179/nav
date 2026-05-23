@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "nav-cli"
-version = "26.5.9"
+version = "26.5.10"
 dependencies = [
  "anyhow",
  "clap",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "nav-core"
-version = "26.5.9"
+version = "26.5.10"
 dependencies = [
  "anyhow",
  "base64",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "nav-tui"
-version = "26.5.9"
+version = "26.5.10"
 dependencies = [
  "anyhow",
  "arboard",
