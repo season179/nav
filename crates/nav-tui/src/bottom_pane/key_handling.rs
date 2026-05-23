@@ -99,6 +99,7 @@ impl BottomPane {
             self.slash_popup_suppressed = false;
             self.mention_popup_suppressed = false;
             self.composer.set_text("@");
+            self.last_composer_keystroke_at = Some(std::time::Instant::now());
             self.reconcile_popups();
             return ComposerEvent::Nothing;
         }

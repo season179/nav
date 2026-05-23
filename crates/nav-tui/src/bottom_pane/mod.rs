@@ -536,6 +536,30 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_p_does_not_dismiss_session_picker_overlay() {
+        let mut pane = pane_with_entries();
+        pane.open_session_picker(vec![SessionPickerEntry {
+            id: "01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+            name: Some("release work".to_string()),
+            created_at: 100,
+            last_active: 250,
+            turn_count: 2,
+            title: Some("Implement picker".to_string()),
+        }]);
+        assert!(pane.has_overlay());
+        // Ctrl+P must not destroy the session picker modal
+        pane.handle_key(ctrl_p());
+        assert!(pane.has_overlay());
+        assert!(pane.composer().text().is_empty());
+        // The session picker should still be responsive
+        pane.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            pane.take_session_selection(),
+            Some("01HZZZZZZZZZZZZZZZZZZZZZZZ".to_string())
+        );
+    }
+
+    #[test]
     fn transcript_arrows_scroll_only_when_pane_is_idle() {
         let mut pane = BottomPane::new();
         assert!(pane.can_scroll_transcript_with_arrows());
