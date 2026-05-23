@@ -50,6 +50,7 @@ pub(crate) enum TranscriptRowKind {
     HookOutput,
     HookFailed,
     Error,
+    Reasoning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,9 @@ impl TranscriptRowKind {
             Self::HookOutput => TranscriptRowStyle::labeled("◆", "hook", Color::Cyan),
             Self::HookFailed => TranscriptRowStyle::labeled("■", "hook", Color::Red),
             Self::Error => TranscriptRowStyle::bullet("■", Color::Red),
+            Self::Reasoning => {
+                TranscriptRowStyle::labeled("◆", "reasoning", Color::DarkGray)
+            }
         }
     }
 }

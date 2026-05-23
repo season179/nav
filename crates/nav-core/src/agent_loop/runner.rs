@@ -973,25 +973,49 @@ pub(crate) fn emit_stream_events(
     };
     match event_type {
         "response.output_text.delta" => {
-            if let Some(text) = event.get("delta").and_then(Value::as_str) {
-                emit(
-                    events,
-                    session,
-                    AgentEvent::AssistantMessageDelta {
-                        text: text.to_string(),
-                    },
-                );
-            }
+            emit_text_delta(event, events, session, |text| {
+                AgentEvent::AssistantMessageDelta { text }
+            });
+        }
+        "response.reasoning_summary_text.delta" => {
+            emit_text_delta(event, events, session, |text| {
+                AgentEvent::ReasoningDelta { text }
+            });
         }
         "response.output_item.done" => {
-            if let Some(item) = event.get("item")
-                && item.get("type").and_then(Value::as_str) == Some("message")
-                && let Some(text) = extract_message_text(item)
-            {
-                emit(events, session, AgentEvent::AssistantMessageDone { text });
+            if let Some(item) = event.get("item") {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("message") => {
+                        if let Some(text) = extract_message_text(item) {
+                            emit(events, session, AgentEvent::AssistantMessageDone { text });
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(text) = extract_reasoning_text(item) {
+                            emit(events, session, AgentEvent::ReasoningDone { text });
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         _ => {}
+    }
+}
+
+/// Emit a delta event when the JSON event carries a non-empty `"delta"` string.
+fn emit_text_delta(
+    event: &Value,
+    events: &UnboundedSender<AgentEvent>,
+    session: Option<&SessionBinding<'_>>,
+    make_event: impl FnOnce(String) -> AgentEvent,
+) {
+    if let Some(text) = event
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        emit(events, session, make_event(text.to_string()));
     }
 }
 
@@ -1001,6 +1025,27 @@ pub(crate) fn extract_message_text(item: &Value) -> Option<String> {
     for part in content {
         let part_type = part.get("type").and_then(Value::as_str)?;
         if (part_type == "output_text" || part_type == "text")
+            && let Some(text) = part.get("text").and_then(Value::as_str)
+        {
+            buffer.push_str(text);
+        }
+    }
+    if buffer.is_empty() {
+        None
+    } else {
+        Some(buffer)
+    }
+}
+
+/// Concatenated text from a reasoning item's `summary` array (each part
+/// is `type: "summary_text"`). Returns `None` when the item has no
+/// summary or all parts are empty. Symmetric with `extract_message_text`.
+pub(crate) fn extract_reasoning_text(item: &Value) -> Option<String> {
+    let summary = item.get("summary")?.as_array()?;
+    let mut buffer = String::new();
+    for part in summary {
+        let part_type = part.get("type").and_then(Value::as_str)?;
+        if part_type == "summary_text"
             && let Some(text) = part.get("text").and_then(Value::as_str)
         {
             buffer.push_str(text);

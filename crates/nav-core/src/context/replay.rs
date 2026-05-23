@@ -195,6 +195,8 @@ fn push_replay_event(input: &mut Vec<Value>, event: &AgentEvent, cwd: &Path) {
             }));
         }
         AgentEvent::AssistantMessageDelta { .. }
+        | AgentEvent::ReasoningDelta { .. }
+        | AgentEvent::ReasoningDone { .. }
         | AgentEvent::ResponseContinuation { .. }
         | AgentEvent::ToolCallStarted { .. }
         | AgentEvent::ToolCallOutput { .. }

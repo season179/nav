@@ -7,9 +7,9 @@ use crate::cells::{
     AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
     CompactionPhase, ErrorCell, ExplorationOutputCell, ExploringSummaryCell, FileChangeCell,
     GitCheckpointCell, HookCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell,
-    SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell, SubagentCell,
-    ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell,
-    TurnDiffCell, UserMessageCell,
+    ReasoningCell, SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell,
+    SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
+    TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
 use crate::cells::ExplorationEntry;
 use crate::history::HistoryCell;
@@ -60,6 +60,10 @@ pub struct ChatWidget {
     /// frame ticks. While buffered, this also feeds the inline
     /// `ExploringSummaryCell` so the user sees the running summary live.
     pending_explorations: Vec<(&'static str, Vec<String>)>,
+    /// In-flight reasoning delta buffer. Accumulated silently while
+    /// streaming; flushed to scrollback as a collapsed `ReasoningCell`
+    /// when the streaming assistant closes.
+    streaming_reasoning: Option<String>,
     /// Adaptive chunking state shared across streaming sessions. Held on
     /// the widget (not the cell) so the catch-up cooldown carries between
     /// the user's prompts — a burst near the end of one reply shouldn't
@@ -82,6 +86,7 @@ impl ChatWidget {
             subagent_labels: HashMap::new(),
             turn_has_work: false,
             streaming_assistant: None,
+            streaming_reasoning: None,
             inflight_tool_calls: Vec::new(),
             pending_explorations: Vec::new(),
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
@@ -224,6 +229,20 @@ impl ChatWidget {
                 // TurnComplete. The else-branch (no prior Delta) still
                 // routes through push_cell, which flushes explicitly.
                 self.close_streaming_assistant_with(text);
+            }
+            AgentEvent::ReasoningDelta { text } => {
+                self.streaming_reasoning
+                    .get_or_insert_with(String::new)
+                    .push_str(&text);
+            }
+            AgentEvent::ReasoningDone { text } => {
+                // Discard accumulated deltas — the coalesced `text` from
+                // `ReasoningDone` is authoritative, matching how
+                // `AssistantMessageDone` replaces streamed chunks.
+                self.streaming_reasoning.take();
+                if !text.is_empty() {
+                    self.push_local_cell(ReasoningCell::new(text));
+                }
             }
             AgentEvent::TurnComplete { usage: _ } => {
                 self.close_streaming_assistant();
@@ -624,17 +643,29 @@ impl ChatWidget {
     }
 
     fn close_streaming_assistant(&mut self) {
+        self.close_streaming_reasoning();
         if let Some(cell) = self.streaming_assistant.take() {
             self.finalized.push(Box::new(cell.into_finalized()));
         }
     }
 
     fn close_streaming_assistant_with(&mut self, text: String) {
+        self.close_streaming_reasoning();
         if let Some(cell) = self.streaming_assistant.take() {
             self.finalized
                 .push(Box::new(cell.into_finalized_with(&text)));
         } else {
             self.push_cell(AgentMarkdownCell::new(text));
+        }
+    }
+
+    /// Flush any in-flight reasoning buffer to scrollback as a collapsed
+    /// `ReasoningCell`. Called when the streaming assistant closes.
+    fn close_streaming_reasoning(&mut self) {
+        if let Some(text) = self.streaming_reasoning.take() {
+            if !text.is_empty() {
+                self.finalized.push(Box::new(ReasoningCell::new(text)));
+            }
         }
     }
 

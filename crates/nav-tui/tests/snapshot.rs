@@ -1513,3 +1513,104 @@ fn flush_pending_for_shutdown_promotes_buffered_explorations() {
         "flush_pending_for_shutdown must surface the summary; got:\n{after}"
     );
 }
+
+// ── Reasoning events ──────────────────────────────────────
+
+#[test]
+fn reasoning_done_renders_collapsed_reasoning_cell() {
+    let mut widget = ChatWidget::new();
+
+    widget.push_user("think about this");
+    widget.ingest(AgentEvent::ReasoningDone {
+        text: "I need to consider the trade-offs between option A and option B.\n\
+               Option A is faster but less reliable.".to_string(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "I recommend option A.".to_string(),
+    });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
+
+    let rendered = render_widget(&mut widget, 60, 20);
+    insta::assert_snapshot!("reasoning_done_collapsed", rendered);
+}
+
+#[test]
+fn reasoning_delta_then_done_builds_reasoning_cell() {
+    let mut widget = ChatWidget::new();
+
+    widget.push_user("solve this puzzle");
+
+    // Streaming reasoning deltas arrive first.
+    widget.ingest(AgentEvent::ReasoningDelta {
+        text: "step 1: ".to_string(),
+    });
+    widget.ingest(AgentEvent::ReasoningDelta {
+        text: "analyze the constraints\n".to_string(),
+    });
+    widget.ingest(AgentEvent::ReasoningDelta {
+        text: "step 2: find solution".to_string(),
+    });
+
+    // Then the final coalesced reasoning text.
+    widget.ingest(AgentEvent::ReasoningDone {
+        text: "step 1: analyze the constraints\nstep 2: find solution".to_string(),
+    });
+
+    // Then the assistant reply.
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "The answer is 42.".to_string(),
+    });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
+
+    let finalized = lines_to_text(&widget.drain_pending(60));
+    assert!(
+        finalized.contains("◆ reasoning"),
+        "reasoning cell should carry the reasoning label; got:\n{finalized}"
+    );
+    assert!(
+        finalized.contains("Reasoning (2 lines)"),
+        "collapsed reasoning should show line count; got:\n{finalized}"
+    );
+}
+
+#[test]
+fn reasoning_cell_distinct_from_assistant_message() {
+    let mut widget = ChatWidget::new();
+
+    widget.push_user("test");
+    widget.ingest(AgentEvent::ReasoningDone {
+        text: "internal reasoning".to_string(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "public reply".to_string(),
+    });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
+
+    let finalized = lines_to_text(&widget.drain_pending(60));
+
+    // Reasoning should appear with its own label, not as the assistant bullet.
+    assert!(
+        finalized.contains("◆ reasoning"),
+        "reasoning must use its own label; got:\n{finalized}"
+    );
+    assert!(
+        finalized.contains("internal reasoning") || finalized.contains("Reasoning (1 line)"),
+        "reasoning content or collapsed header must be present; got:\n{finalized}"
+    );
+    // Assistant message must use the bullet, not the reasoning label.
+    assert!(
+        finalized.contains("• public reply"),
+        "assistant must use bullet glyph; got:\n{finalized}"
+    );
+    // Reasoning cell must NOT use the bullet glyph for its content.
+    assert!(
+        !finalized.contains("• internal reasoning"),
+        "reasoning text must not appear under a bullet glyph; got:\n{finalized}"
+    );
+}

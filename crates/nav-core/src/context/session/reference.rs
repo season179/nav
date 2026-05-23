@@ -380,6 +380,8 @@ fn event_label_and_body(event: &AgentEvent) -> (&'static str, String) {
             ("response continuation", format!("{} item(s)", items.len()))
         }
         AgentEvent::AssistantMessageDelta { text } => ("assistant delta", text.clone()),
+        AgentEvent::ReasoningDelta { text } => ("reasoning delta", text.clone()),
+        AgentEvent::ReasoningDone { text } => ("reasoning", text.clone()),
         AgentEvent::ProviderRetry {
             attempt,
             max_attempts,

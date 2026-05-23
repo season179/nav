@@ -1,6 +1,6 @@
 use super::compaction_turn::{drop_oldest_tool_pair, trim_for_compaction};
 use super::control::{PendingInput, PendingInputMode, TurnControls};
-use super::runner::{emit_stream_events, extract_message_text};
+use super::runner::{emit_stream_events, extract_message_text, extract_reasoning_text};
 use super::*;
 use crate::cli::Args;
 use crate::context::compaction::{SUMMARIZATION_PROMPT, SUMMARY_PREFIX, summary_message};
@@ -476,6 +476,47 @@ fn extract_message_text_concatenates_output_text_parts() {
 fn extract_message_text_returns_none_for_empty_content() {
     let item = json!({"type": "message", "content": []});
     assert!(extract_message_text(&item).is_none());
+}
+
+// ── extract_reasoning_text ──────────────────────────────────
+
+#[test]
+fn extract_reasoning_text_concatenates_summary_parts() {
+    let item = json!({
+        "type": "reasoning",
+        "summary": [
+            {"type": "summary_text", "text": "step one: "},
+            {"type": "summary_text", "text": "step two"}
+        ]
+    });
+    assert_eq!(
+        extract_reasoning_text(&item).as_deref(),
+        Some("step one: step two")
+    );
+}
+
+#[test]
+fn extract_reasoning_text_returns_none_for_empty_summary() {
+    let item = json!({"type": "reasoning", "summary": []});
+    assert!(extract_reasoning_text(&item).is_none());
+}
+
+#[test]
+fn extract_reasoning_text_returns_none_when_missing_summary() {
+    let item = json!({"type": "reasoning"});
+    assert!(extract_reasoning_text(&item).is_none());
+}
+
+#[test]
+fn extract_reasoning_text_ignores_non_summary_parts() {
+    let item = json!({
+        "type": "reasoning",
+        "summary": [
+            {"type": "summary_text", "text": "visible"},
+            {"type": "other_thing", "text": "ignored"}
+        ]
+    });
+    assert_eq!(extract_reasoning_text(&item).as_deref(), Some("visible"));
 }
 
 #[test]
@@ -1304,6 +1345,36 @@ fn emit_stream_events_ignores_function_call_items() {
     emit_stream_events(&event, &tx, None);
     drop(tx);
     assert!(rx.blocking_recv().is_none());
+}
+
+#[test]
+fn emit_stream_events_emits_reasoning_delta() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let event = json!({"type": "response.reasoning_summary_text.delta", "delta": "thinking"});
+    emit_stream_events(&event, &tx, None);
+    drop(tx);
+    let received = rx.blocking_recv().unwrap();
+    assert!(
+        matches!(received, AgentEvent::ReasoningDelta { ref text } if text == "thinking")
+    );
+}
+
+#[test]
+fn emit_stream_events_emits_done_for_reasoning_item() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let event = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "I reasoned about it"}]
+        }
+    });
+    emit_stream_events(&event, &tx, None);
+    drop(tx);
+    let received = rx.blocking_recv().unwrap();
+    assert!(
+        matches!(received, AgentEvent::ReasoningDone { ref text } if text == "I reasoned about it")
+    );
 }
 
 // ── run_agent end-to-end ──────────────────────────────────────
