@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use nav_core::ReviewDecision;
 use nav_core::{AgentEvent, PendingInputMode};
@@ -42,6 +43,8 @@ pub use slash_popup::{
 pub use status_bar::{AgentState, StatusBarState};
 pub use status_indicator::INDICATOR_SCREEN_FLOOR;
 pub use view::{BottomPaneView, InputResult};
+
+const APPROVAL_PROMPT_IDLE_DELAY: Duration = Duration::from_millis(500);
 
 /// Width of the gutter column that renders the `›` prompt next to the
 /// composer. Used in three lockstep places: pane-height math, cursor
@@ -80,6 +83,9 @@ pub struct BottomPane {
     cwd: PathBuf,
     /// Approvals that arrived while another modal was already up.
     pending_approvals: VecDeque<PendingApproval>,
+    /// Last user keystroke that edited the composer. Used to avoid popping
+    /// an approval modal over active typing.
+    last_composer_keystroke_at: Option<Instant>,
     /// Captured decision waiting to be drained by the app loop.
     last_decision: Option<(String, ReviewDecision)>,
     /// Captured session id from the picker, waiting to be drained by the app
@@ -136,6 +142,7 @@ impl BottomPane {
             theme,
             cwd,
             pending_approvals: VecDeque::new(),
+            last_composer_keystroke_at: None,
             last_decision: None,
             last_session_selection: None,
             pending_inputs: Vec::new(),
@@ -197,9 +204,10 @@ impl BottomPane {
     }
 
     /// Enqueue an approval request. Promotes to the active overlay if no
-    /// modal is already up. A misbehaving agent that fires faster than the
-    /// user can respond would otherwise grow memory unboundedly — cap the
-    /// queue and drop the oldest pending request if we hit it.
+    /// modal is already up and the composer is idle. A misbehaving agent
+    /// that fires faster than the user can respond would otherwise grow
+    /// memory unboundedly — cap the queue and drop the oldest pending
+    /// request if we hit it.
     pub fn enqueue_approval(&mut self, pending: PendingApproval) {
         const MAX_PENDING_APPROVALS: usize = 100;
         if self.pending_approvals.len() >= MAX_PENDING_APPROVALS {
@@ -207,6 +215,13 @@ impl BottomPane {
         }
         self.pending_approvals.push_back(pending);
         self.try_show_next_approval();
+    }
+
+    /// Promote a queued approval once the composer has been idle long enough.
+    /// The app loop calls this from its tick so queued approvals appear even
+    /// when the user simply stops typing.
+    pub fn promote_pending_approval_if_idle(&mut self) -> bool {
+        self.try_show_next_approval()
     }
 
     /// Drain the most recent decision, if any. The app loop calls this after
@@ -225,24 +240,32 @@ impl BottomPane {
         self.last_session_selection.take()
     }
 
-    fn try_show_next_approval(&mut self) {
-        if self.view.is_some() {
-            return;
+    fn try_show_next_approval(&mut self) -> bool {
+        if self.view.is_some() || !self.composer_idle_for_approval_prompt() {
+            return false;
         }
-        if let Some(next) = self.pending_approvals.pop_front() {
-            let total = self.pending_approvals.len() + 1;
-            let overlay = ApprovalOverlay::new(
-                next.approval_id,
-                next.tool,
-                next.command,
-                next.path,
-                next.cwd,
-                next.reason,
-                0,
-                total,
-            );
-            self.view = Some(Box::new(overlay));
-        }
+        let Some(next) = self.pending_approvals.pop_front() else {
+            return false;
+        };
+
+        let total = self.pending_approvals.len() + 1;
+        let overlay = ApprovalOverlay::new(
+            next.approval_id,
+            next.tool,
+            next.command,
+            next.path,
+            next.cwd,
+            next.reason,
+            0,
+            total,
+        );
+        self.view = Some(Box::new(overlay));
+        true
+    }
+
+    fn composer_idle_for_approval_prompt(&self) -> bool {
+        self.last_composer_keystroke_at
+            .is_none_or(|last| last.elapsed() >= APPROVAL_PROMPT_IDLE_DELAY)
     }
 
     pub fn composer(&self) -> &Composer {
@@ -294,6 +317,18 @@ mod tests {
         }
     }
 
+    fn active_approval(pane: &BottomPane) -> &ApprovalOverlay {
+        pane.view
+            .as_deref()
+            .and_then(|v| v.as_any().downcast_ref::<ApprovalOverlay>())
+            .expect("approval overlay should be active")
+    }
+
+    fn age_composer_past_idle_delay(pane: &mut BottomPane) {
+        pane.last_composer_keystroke_at =
+            Some(Instant::now() - APPROVAL_PROMPT_IDLE_DELAY - Duration::from_millis(1));
+    }
+
     #[test]
     fn approval_decision_is_captured_before_overlay_drops() {
         let mut pane = BottomPane::new();
@@ -319,6 +354,55 @@ mod tests {
         );
         // a2 should now be on screen.
         assert!(pane.has_overlay());
+    }
+
+    #[test]
+    fn approval_prompt_waits_for_composer_idle_window() {
+        let mut pane = BottomPane::new();
+        pane.handle_key(key(KeyCode::Char('h')));
+
+        pane.enqueue_approval(approval("a1"));
+
+        assert!(
+            !pane.has_overlay(),
+            "approval should stay queued while composer is active"
+        );
+        assert_eq!(pane.pending_approvals.len(), 1);
+
+        age_composer_past_idle_delay(&mut pane);
+
+        assert!(pane.promote_pending_approval_if_idle());
+        assert_eq!(active_approval(&pane).approval_id, "a1");
+        assert!(pane.pending_approvals.is_empty());
+    }
+
+    #[test]
+    fn delayed_approvals_keep_queue_order_and_total() {
+        let mut pane = BottomPane::new();
+        pane.handle_key(key(KeyCode::Char('h')));
+
+        pane.enqueue_approval(approval("a1"));
+        pane.enqueue_approval(approval("a2"));
+
+        assert!(!pane.has_overlay());
+        age_composer_past_idle_delay(&mut pane);
+
+        assert!(pane.promote_pending_approval_if_idle());
+        let first = active_approval(&pane);
+        assert_eq!(first.approval_id, "a1");
+        assert_eq!(first.queue_index, 0);
+        assert_eq!(first.queue_total, 2);
+
+        pane.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(
+            pane.take_approval_decision(),
+            Some(("a1".to_string(), ReviewDecision::Denied))
+        );
+
+        let second = active_approval(&pane);
+        assert_eq!(second.approval_id, "a2");
+        assert_eq!(second.queue_index, 0);
+        assert_eq!(second.queue_total, 1);
     }
 
     #[test]
