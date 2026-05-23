@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 mod inline_region;
 mod overlay;
@@ -59,6 +60,11 @@ use turn_lifecycle::{
 /// `true` when the caller should skip the rest of the current `select!` arm
 /// (e.g. replayed `UserMessage` is handled elsewhere).
 type AgentEventSkip = bool;
+
+enum AgentDrainOutcome {
+    Done,
+    ContinueLoop,
+}
 
 #[allow(clippy::too_many_arguments)]
 fn process_agent_event(
@@ -232,6 +238,115 @@ fn reap_finished_turn(
     }
 }
 
+/// Drain queued agent events for a finished task, then reap once the channel is empty.
+#[allow(clippy::too_many_arguments)]
+fn drain_agent_events_or_reap_finished_turn(
+    agent_rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
+    active_turn: &mut Option<ActiveTurnHandle>,
+    control: &mut ControlPlane,
+    pending_model_swap: &mut Option<PendingModelSwap>,
+    transport: &ModelTransportHandle,
+    args: &mut Args,
+    cwd: &Path,
+    store: &Arc<SessionStore>,
+    session_id: &SessionId,
+    agent_tx: &mpsc::UnboundedSender<AgentEvent>,
+    skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
+    project: &Arc<ProjectContext>,
+    permissions: &PermissionContext,
+    last_tokens_input: &mut u64,
+    last_tokens_output: &mut u64,
+    last_tokens_cached: &mut u64,
+    chat: &mut ChatWidget,
+    pane: &mut bottom_pane::BottomPane,
+) -> AgentDrainOutcome {
+    loop {
+        match agent_rx.try_recv() {
+            Ok(ev) => {
+                let terminal = turn_is_terminal(&ev);
+                let is_abort = matches!(&ev, AgentEvent::TurnAborted { .. });
+                if process_agent_event(
+                    ev,
+                    control,
+                    active_turn,
+                    last_tokens_input,
+                    last_tokens_output,
+                    last_tokens_cached,
+                    store.as_ref(),
+                    session_id,
+                    chat,
+                    pane,
+                ) {
+                    return AgentDrainOutcome::ContinueLoop;
+                }
+                if terminal {
+                    settle_terminal_turn(
+                        is_abort,
+                        active_turn,
+                        control,
+                        pending_model_swap,
+                        transport,
+                        args,
+                        cwd,
+                        store,
+                        session_id,
+                        agent_tx,
+                        skills,
+                        extensions,
+                        project,
+                        permissions,
+                        chat,
+                        pane,
+                    );
+                    return AgentDrainOutcome::Done;
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                reap_finished_turn(
+                    active_turn,
+                    control,
+                    pending_model_swap,
+                    transport,
+                    args,
+                    cwd,
+                    store,
+                    session_id,
+                    agent_tx,
+                    skills,
+                    extensions,
+                    project,
+                    permissions,
+                    chat,
+                    pane,
+                );
+                return AgentDrainOutcome::Done;
+            }
+            Err(TryRecvError::Disconnected) => {
+                eprintln!("nav-tui: agent event channel disconnected");
+                reap_finished_turn(
+                    active_turn,
+                    control,
+                    pending_model_swap,
+                    transport,
+                    args,
+                    cwd,
+                    store,
+                    session_id,
+                    agent_tx,
+                    skills,
+                    extensions,
+                    project,
+                    permissions,
+                    chat,
+                    pane,
+                );
+                return AgentDrainOutcome::Done;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     transport: ModelTransportHandle,
@@ -358,43 +473,89 @@ pub async fn run(
             .is_some_and(ActiveTurnHandle::is_finished)
         {
             needs_draw = true;
-            if let Ok(ev) = agent_rx.try_recv() {
-                let terminal = turn_is_terminal(&ev);
-                let is_abort = matches!(&ev, AgentEvent::TurnAborted { .. });
-                if process_agent_event(
-                    ev,
-                    &mut control,
-                    &mut active_turn,
-                    &mut last_tokens_input,
-                    &mut last_tokens_output,
-                    &mut last_tokens_cached,
-                    store.as_ref(),
-                    &session_id,
-                    &mut chat,
-                    &mut pane,
-                ) {
-                    continue;
-                }
-                if terminal {
-                    settle_terminal_turn(
-                        is_abort,
-                        &mut active_turn,
+            match agent_rx.try_recv() {
+                Ok(ev) => {
+                    let terminal = turn_is_terminal(&ev);
+                    let is_abort = matches!(&ev, AgentEvent::TurnAborted { .. });
+                    if process_agent_event(
+                        ev,
                         &mut control,
-                        &mut pending_model_swap,
-                        &transport,
-                        &mut args,
-                        &cwd,
-                        &store,
+                        &mut active_turn,
+                        &mut last_tokens_input,
+                        &mut last_tokens_output,
+                        &mut last_tokens_cached,
+                        store.as_ref(),
                         &session_id,
-                        &agent_tx,
-                        &skills,
-                        &extensions,
-                        &project,
-                        &permissions,
                         &mut chat,
                         &mut pane,
-                    );
-                } else if agent_rx.try_recv().is_err() {
+                    ) {
+                        continue;
+                    }
+                    if terminal {
+                        settle_terminal_turn(
+                            is_abort,
+                            &mut active_turn,
+                            &mut control,
+                            &mut pending_model_swap,
+                            &transport,
+                            &mut args,
+                            &cwd,
+                            &store,
+                            &session_id,
+                            &agent_tx,
+                            &skills,
+                            &extensions,
+                            &project,
+                            &permissions,
+                            &mut chat,
+                            &mut pane,
+                        );
+                    } else if matches!(
+                        drain_agent_events_or_reap_finished_turn(
+                            &mut agent_rx,
+                            &mut active_turn,
+                            &mut control,
+                            &mut pending_model_swap,
+                            &transport,
+                            &mut args,
+                            &cwd,
+                            &store,
+                            &session_id,
+                            &agent_tx,
+                            &skills,
+                            &extensions,
+                            &project,
+                            &permissions,
+                            &mut last_tokens_input,
+                            &mut last_tokens_output,
+                            &mut last_tokens_cached,
+                            &mut chat,
+                            &mut pane,
+                        ),
+                        AgentDrainOutcome::ContinueLoop
+                    ) {
+                        continue;
+                    }
+                }
+                Err(TryRecvError::Empty) => reap_finished_turn(
+                    &mut active_turn,
+                    &mut control,
+                    &mut pending_model_swap,
+                    &transport,
+                    &mut args,
+                    &cwd,
+                    &store,
+                    &session_id,
+                    &agent_tx,
+                    &skills,
+                    &extensions,
+                    &project,
+                    &permissions,
+                    &mut chat,
+                    &mut pane,
+                ),
+                Err(TryRecvError::Disconnected) => {
+                    eprintln!("nav-tui: agent event channel disconnected");
                     reap_finished_turn(
                         &mut active_turn,
                         &mut control,
@@ -413,24 +574,6 @@ pub async fn run(
                         &mut pane,
                     );
                 }
-            } else {
-                reap_finished_turn(
-                    &mut active_turn,
-                    &mut control,
-                    &mut pending_model_swap,
-                    &transport,
-                    &mut args,
-                    &cwd,
-                    &store,
-                    &session_id,
-                    &agent_tx,
-                    &skills,
-                    &extensions,
-                    &project,
-                    &permissions,
-                    &mut chat,
-                    &mut pane,
-                );
             }
         }
 
@@ -597,25 +740,32 @@ pub async fn run(
                 } else if active_turn
                     .as_ref()
                     .is_some_and(ActiveTurnHandle::is_finished)
-                    && agent_rx.try_recv().is_err()
+                    && matches!(
+                        drain_agent_events_or_reap_finished_turn(
+                            &mut agent_rx,
+                            &mut active_turn,
+                            &mut control,
+                            &mut pending_model_swap,
+                            &transport,
+                            &mut args,
+                            &cwd,
+                            &store,
+                            &session_id,
+                            &agent_tx,
+                            &skills,
+                            &extensions,
+                            &project,
+                            &permissions,
+                            &mut last_tokens_input,
+                            &mut last_tokens_output,
+                            &mut last_tokens_cached,
+                            &mut chat,
+                            &mut pane,
+                        ),
+                        AgentDrainOutcome::ContinueLoop
+                    )
                 {
-                    reap_finished_turn(
-                        &mut active_turn,
-                        &mut control,
-                        &mut pending_model_swap,
-                        &transport,
-                        &mut args,
-                        &cwd,
-                        &store,
-                        &session_id,
-                        &agent_tx,
-                        &skills,
-                        &extensions,
-                        &project,
-                        &permissions,
-                        &mut chat,
-                        &mut pane,
-                    );
+                    continue;
                 }
             }
             Some(app) = app_rx.recv() => {

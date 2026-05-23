@@ -511,6 +511,22 @@ fn extract_reasoning_text_returns_none_when_missing_summary() {
 }
 
 #[test]
+fn extract_concatenated_text_skips_parts_missing_type() {
+    let item = json!({
+        "type": "message",
+        "content": [
+            {"type": "text", "text": "kept"},
+            {"text": "no type field"},
+            {"type": "text", "text": "also kept"}
+        ]
+    });
+    assert_eq!(
+        extract_message_text(&item).as_deref(),
+        Some("keptalso kept")
+    );
+}
+
+#[test]
 fn extract_reasoning_text_ignores_non_summary_parts() {
     let item = json!({
         "type": "reasoning",
