@@ -7,15 +7,15 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-mod commands;
-mod slash;
+mod classify;
+mod dispatch;
 
 #[cfg(test)]
-use commands::parse_builtin_command;
-pub(crate) use commands::{AppEvent, ModelMatch, dispatch_submit, match_model_selector};
+use dispatch::parse_builtin_command;
+pub(crate) use dispatch::{AppEvent, ModelMatch, dispatch_submit, match_model_selector};
 #[cfg(test)]
-use slash::classify_slash_with_extensions;
-pub use slash::{SlashAction, classify_slash, prepend_pending_skill};
+use classify::classify_slash_with_extensions;
+pub use classify::{SlashAction, classify_slash, prepend_pending_skill};
 
 pub(crate) fn is_ctrl_c(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)

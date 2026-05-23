@@ -36,9 +36,9 @@ use crate::ChatWidget;
 use crate::bottom_pane::{
     self, AgentState, INDICATOR_SCREEN_FLOOR, PendingApproval, StatusBarState,
 };
-use crate::input::{AppEvent, ModelMatch, dispatch_submit, is_ctrl_c, match_model_selector};
+use crate::commands::{AppEvent, ModelMatch, dispatch_submit, is_ctrl_c, match_model_selector};
 use crate::theme::Theme;
-use crate::widget::parse_rewind_skill_prompt;
+use crate::chat::parse_rewind_skill_prompt;
 use permissions::build_tui_permissions;
 use render::draw_tui;
 use session::{

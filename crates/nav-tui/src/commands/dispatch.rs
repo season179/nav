@@ -6,7 +6,7 @@ use nav_core::{
 };
 use tokio::sync::mpsc;
 
-use super::slash::{ControlCommand, SlashAction, classify_slash_with_extensions};
+use super::classify::{ControlCommand, SlashAction, classify_slash_with_extensions};
 
 #[derive(Debug)]
 pub(crate) enum AppEvent {

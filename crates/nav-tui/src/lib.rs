@@ -14,7 +14,7 @@
 //! - `bottom_pane`: composer input plus overlays like slash, mention, approval,
 //!   and session picker popups.
 //! - `cells`: transcript rows rendered by [`ChatWidget`].
-//! - `input`: slash-command parsing.
+//! - `commands`: slash-command parsing.
 //! - `streaming`: buffering rules for in-progress assistant text.
 
 mod ansi;
@@ -23,11 +23,11 @@ pub mod bottom_pane;
 mod cells;
 mod custom_terminal;
 mod history;
-mod input;
+mod commands;
 mod insert_history;
 mod streaming;
 mod theme;
-mod widget;
+mod chat;
 
 pub use app::run;
 pub use cells::{
@@ -35,6 +35,6 @@ pub use cells::{
     UserMessageCell,
 };
 pub use history::HistoryCell;
-pub use input::{SlashAction, classify_slash, prepend_pending_skill};
+pub use commands::{SlashAction, classify_slash, prepend_pending_skill};
 pub use streaming::StreamController;
-pub use widget::ChatWidget;
+pub use chat::ChatWidget;

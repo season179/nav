@@ -18,7 +18,7 @@ use crate::theme::Theme;
 mod approval;
 mod clipboard;
 mod composer;
-mod input;
+mod key_handling;
 mod mention_popup;
 mod pending_preview;
 mod render;
