@@ -176,6 +176,25 @@ impl BottomPane {
         event
     }
 
+    /// Apply the bottom-pane Ctrl+C priority layers.
+    ///
+    /// Returns `true` when the pane consumed the key, meaning the app loop
+    /// must not treat it as an agent interrupt.
+    pub fn handle_ctrl_c(&mut self) -> bool {
+        if self.view.is_some() {
+            self.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            return true;
+        }
+
+        if !self.composer.is_empty() {
+            self.last_composer_keystroke_at = Some(std::time::Instant::now());
+            self.set_composer_text("");
+            return true;
+        }
+
+        false
+    }
+
     /// Pick the overlay that fits the composer's current state. Slash wins
     /// when the buffer starts with `/`; @file wins when the cursor is inside
     /// an `@token`; otherwise no popup. Either popup can be temporarily

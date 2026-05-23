@@ -49,9 +49,10 @@ use session::{
 };
 use terminal::{TerminalGuard, enter_tui, install_panic_teardown_hook};
 use turn_lifecycle::{
-    ActiveTurnHandle, clear_pending_inputs, pending_draft, pending_input_for_immediate,
-    queue_active_steering, remove_active_steering, replace_active_steering, spinner_frame,
-    start_next_follow_up, start_pending_turn, turn_is_terminal,
+    ActiveTurnHandle, abort_active_turn, clear_pending_inputs, pending_draft,
+    pending_input_for_immediate, queue_active_steering, remove_active_steering,
+    replace_active_steering, spinner_frame, start_next_follow_up, start_pending_turn,
+    turn_is_terminal,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -128,6 +129,8 @@ pub async fn run(
     let mut last_tokens_input: u64 = 0;
     let mut last_tokens_output: u64 = 0;
     let mut last_tokens_cached: u64 = 0;
+    let mut input_tick = tokio::time::interval(Duration::from_millis(80));
+    input_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let cwd_short = shorten_home(&cwd);
     let branch = project.workspace.branch.clone();
     let dirty = project.workspace.dirty;
@@ -138,7 +141,7 @@ pub async fn run(
     // auto-approves through `AutoGate::approving()`; explicit `Never` policy
     // refuses via the in-band short-circuit; otherwise the live TUI gates
     // through `ChannelGate` so the operator can approve interactively.
-    let pending_approvals = PendingApprovals::default();
+    let mut pending_approvals = PendingApprovals::default();
     let sandbox_policy = sandbox_policy_from_args(&args, &cwd);
     let mut permissions = build_tui_permissions(
         &args,
@@ -315,10 +318,10 @@ pub async fn run(
             // returns to whatever inline state it had before the overlay.
             // The `app_overlay = None` reset that would normally accompany
             // this is elided — `break` exits the loop immediately.
-            if let Some(state) = overlay_state.take() {
-                if let Err(err) = term.terminal.leave_alternate_screen(state) {
-                    eprintln!("nav-tui: failed to leave alternate screen: {err:#}");
-                }
+            if let Some(state) = overlay_state.take()
+                && let Err(err) = term.terminal.leave_alternate_screen(state)
+            {
+                eprintln!("nav-tui: failed to leave alternate screen: {err:#}");
             }
             break;
         }
@@ -433,51 +436,22 @@ pub async fn run(
                         );
                     }
                     AppEvent::AbortTurn => {
-                        if let Some(active) = control.active().cloned() {
-                            let turn_id = active.id().to_string();
-                            let abort = control.abort_turn(&turn_id, "user interrupt").ok();
-                            pending_approvals.abort_pending();
-                            if let Some(handle) = active_turn.take() {
-                                handle.abort();
-                            }
-                            if let Some(abort) = abort {
-                                emit_pending_cleared(
-                                    abort.cleared_steering_ids,
-                                    store.as_ref(),
-                                    &session_id,
-                                    &mut chat,
-                                    &mut pane,
-                                );
-                            }
-                            emit_local_event(
-                                AgentEvent::TurnAborted {
-                                    turn_id: turn_id.clone(),
-                                    reason: "user interrupt".into(),
-                                },
-                                store.as_ref(),
-                                &session_id,
-                                &mut chat,
-                                &mut pane,
-                            );
-                            if let Ok(settled) = control.finish_turn(&turn_id) {
-                                start_next_follow_up(
-                                    settled.next_follow_up,
-                                    &mut control,
-                                    &mut active_turn,
-                                    &transport,
-                                    &args,
-                                    &cwd,
-                                    &store,
-                                    &session_id,
-                                    &agent_tx,
-                                    &skills,
-                                    &project,
-                                    &permissions,
-                                    &mut chat,
-                                    &mut pane,
-                                );
-                            }
-                        }
+                        abort_active_turn(
+                            &mut control,
+                            &mut active_turn,
+                            &mut pending_approvals,
+                            &transport,
+                            &args,
+                            &cwd,
+                            &store,
+                            &session_id,
+                            &agent_tx,
+                            &skills,
+                            &project,
+                            &permissions,
+                            &mut chat,
+                            &mut pane,
+                        );
                     }
                     AppEvent::EditPending { id, text } => {
                         if let Some(item) = control.edit_pending(&id, text) {
@@ -943,7 +917,7 @@ pub async fn run(
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(80)) => {
+            _ = input_tick.tick() => {
                 // 80 ms = ~12 Hz: fast enough that the braille spinner reads as
                 // motion while a turn is active. When idle we still wake up to
                 // poll crossterm, but avoid repainting unchanged frames so
@@ -970,14 +944,13 @@ pub async fn run(
                             if let Some(overlay) = app_overlay.as_mut() {
                                 let overlay_result = overlay.handle_key(key);
                                 if overlay.is_complete() {
-                                    if let Some(state) = overlay_state.take() {
-                                        if let Err(err) =
+                                    if let Some(state) = overlay_state.take()
+                                        && let Err(err) =
                                             term.terminal.leave_alternate_screen(state)
-                                        {
-                                            eprintln!(
-                                                "nav-tui: failed to leave alternate screen: {err:#}"
-                                            );
-                                        }
+                                    {
+                                        eprintln!(
+                                            "nav-tui: failed to leave alternate screen: {err:#}"
+                                        );
                                     }
                                     app_overlay = None;
                                     continue;
@@ -1000,9 +973,28 @@ pub async fn run(
                             }
 
                             if is_ctrl_c(&key) {
+                                if pane.handle_ctrl_c() {
+                                    ctrl_c_count = 0;
+                                    continue;
+                                }
                                 if control.active().is_some() {
                                     ctrl_c_count = 0;
-                                    app_tx.send(AppEvent::AbortTurn).ok();
+                                    abort_active_turn(
+                                        &mut control,
+                                        &mut active_turn,
+                                        &mut pending_approvals,
+                                        &transport,
+                                        &args,
+                                        &cwd,
+                                        &store,
+                                        &session_id,
+                                        &agent_tx,
+                                        &skills,
+                                        &project,
+                                        &permissions,
+                                        &mut chat,
+                                        &mut pane,
+                                    );
                                     continue;
                                 }
                                 ctrl_c_count += 1;

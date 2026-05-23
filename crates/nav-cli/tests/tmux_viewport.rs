@@ -13,7 +13,7 @@
 
 use serde_json::json;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
 use std::thread;
@@ -307,6 +307,7 @@ fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
 }
 
 fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
+    read_http_request(&mut stream);
     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if stream.write_all(header).is_err() {
         return;
@@ -357,12 +358,7 @@ fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
 }
 
 fn write_mock_approval_response(mut stream: TcpStream, tool_call_delay: Duration) {
-    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-    if stream.write_all(header).is_err() {
-        return;
-    }
-    let _ = stream.flush();
-
+    read_http_request(&mut stream);
     let marker = json!({
         "choices": [{
             "index": 0,
@@ -372,17 +368,6 @@ fn write_mock_approval_response(mut stream: TcpStream, tool_call_delay: Duration
         }]
     })
     .to_string();
-    if stream
-        .write_all(format!("data: {marker}\n\n").as_bytes())
-        .is_err()
-    {
-        return;
-    }
-    if stream.flush().is_err() {
-        return;
-    }
-    sleep(tool_call_delay);
-
     let tool_call = json!({
         "choices": [{
             "index": 0,
@@ -408,10 +393,71 @@ fn write_mock_approval_response(mut stream: TcpStream, tool_call_delay: Duration
         }]
     })
     .to_string();
-    let _ = stream.write_all(format!("data: {tool_call}\n\n").as_bytes());
-    let _ = stream.write_all(format!("data: {finish}\n\n").as_bytes());
-    let _ = stream.write_all(b"data: [DONE]\n\n");
+
+    let marker_frame = format!("data: {marker}\n\n");
+    let remaining = format!("data: {tool_call}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+    let content_length = marker_frame.len() + remaining.len();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nContent-Length: {content_length}\r\n\r\n"
+    );
+    if stream.write_all(header.as_bytes()).is_err() {
+        return;
+    }
+    if stream.write_all(marker_frame.as_bytes()).is_err() {
+        return;
+    }
+    if stream.flush().is_err() {
+        return;
+    }
+    sleep(tool_call_delay);
+
+    let _ = stream.write_all(remaining.as_bytes());
     let _ = stream.flush();
+}
+
+fn read_http_request(stream: &mut TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut received = Vec::new();
+    let mut chunk = [0_u8; 4096];
+
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                received.extend_from_slice(&chunk[..n]);
+                if request_is_complete(&received) || received.len() > 256 * 1024 {
+                    return;
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn request_is_complete(received: &[u8]) -> bool {
+    let Some(header_end) = received.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let body_start = header_end + 4;
+    let headers = String::from_utf8_lossy(&received[..header_end]);
+    let content_length = headers
+        .lines()
+        .find_map(|line| line.split_once(':'))
+        .and_then(|(name, value)| {
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    received.len().saturating_sub(body_start) >= content_length
 }
 
 #[test]
@@ -828,6 +874,96 @@ fn slash_popup_open_navigate_dismiss_via_trait_dispatch() {
     assert!(
         status_bar_present(&after_dismiss),
         "status bar missing after popup dismiss:\n{after_dismiss}"
+    );
+}
+
+#[test]
+fn ctrl_c_layers_popup_draft_then_interrupt() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("ctrl-c-layers");
+    session.start(100, 24);
+
+    let mock_port = spawn_mock_streaming_server(2_000);
+    let workdir = tempdir().expect("tempdir for mock provider settings");
+    write_mock_provider_settings(&workdir, "ctrlc", mock_port);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/ctrlc"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(status_bar_present(&ready), "nav failed to boot:\n{ready}");
+
+    session.send_line("start a long turn");
+    let working = session.wait_for(
+        |pane| pane.contains("chunk-0") || pane.contains("Working"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        working.contains("chunk-0") || working.contains("Working"),
+        "long turn did not start:\n{working}"
+    );
+
+    // Layer 1: an active popup consumes Ctrl+C before the active turn can.
+    // The popup closes, the draft text remains, and no local abort marker
+    // should be emitted.
+    session.send("/");
+    let with_popup = session.wait_for(
+        |pane| pane.contains("/exit") || pane.contains("/find"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        with_popup.contains("/exit") || with_popup.contains("/find"),
+        "slash popup did not open:\n{with_popup}"
+    );
+
+    session.send("C-c");
+    let after_popup_ctrl_c = session.wait_for(
+        |pane| {
+            !pane.contains("/exit")
+                && !pane.contains("/find")
+                && pane.contains("› /")
+                && (pane.contains("chunk-") || pane.contains("Working"))
+        },
+        Duration::from_secs(3),
+    );
+    assert!(
+        !after_popup_ctrl_c.contains("user interrupt") && !after_popup_ctrl_c.contains("aborted"),
+        "Ctrl+C on popup should not send an interrupt:\n{after_popup_ctrl_c}"
+    );
+
+    // Layer 3: with the popup gone, the leftover slash draft is now the
+    // highest-priority consumer. Ctrl+C clears it and still does not abort.
+    session.send("C-c");
+    let after_draft_ctrl_c = session.wait_for(
+        |pane| pane.contains("Ask nav to do anything") && !pane.contains("user interrupt"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        after_draft_ctrl_c.contains("Ask nav to do anything"),
+        "Ctrl+C on populated composer did not clear the draft:\n{after_draft_ctrl_c}"
+    );
+    assert!(
+        !after_draft_ctrl_c.contains("aborted"),
+        "Ctrl+C on populated composer should not abort the turn:\n{after_draft_ctrl_c}"
+    );
+
+    // Layer 4: now that composer is empty while the turn is still active,
+    // Ctrl+C reaches the app loop and aborts the turn.
+    session.send("C-c");
+    let aborted = session.wait_for(
+        |pane| pane.contains("user interrupt") || pane.contains("aborted"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        aborted.contains("user interrupt") || aborted.contains("aborted"),
+        "Ctrl+C on empty composer during active turn did not abort:\n{aborted}"
     );
 }
 
