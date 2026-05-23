@@ -68,22 +68,23 @@ where
         .flat_map(|line| simple_wrap_line(line, wrap_width))
         .collect();
     let wrapped_rows = wrapped.len() as u16;
+    let mut viewport_scroll = 0u16;
 
     let cursor_top = if area.bottom() < screen_size.height {
         // Viewport isn't at the bottom of the screen — scroll it down to make
         // room. Don't scroll past the bottom of the screen.
-        let scroll_amount = wrapped_rows.min(screen_size.height - area.bottom());
+        viewport_scroll = wrapped_rows.min(screen_size.height - area.bottom());
 
         let top_1based = area.top() + 1;
         queue!(writer, SetScrollRegion(top_1based..screen_size.height))?;
         queue!(writer, MoveTo(0, area.top()))?;
-        for _ in 0..scroll_amount {
+        for _ in 0..viewport_scroll {
             queue!(writer, Print("\x1bM"))?;
         }
         queue!(writer, ResetScrollRegion)?;
 
         let top = area.top().saturating_sub(1);
-        area.y += scroll_amount;
+        area.y += viewport_scroll;
         should_update_area = true;
         top
     } else {
@@ -101,11 +102,21 @@ where
     }
     queue!(writer, ResetScrollRegion)?;
 
-    // Restore the cursor to where it was before insertion.
-    queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+    // Restore the cursor to where it was before insertion. When the viewport
+    // slid down to make room, the composer row moved with it — keep the
+    // hardware caret on that row until the next `draw_tui` reframes.
+    let restored_y = last_cursor_pos
+        .y
+        .saturating_add(viewport_scroll)
+        .min(screen_size.height.saturating_sub(1));
+    queue!(writer, MoveTo(last_cursor_pos.x, restored_y))?;
 
     if should_update_area {
         terminal.set_viewport_area(area);
+        terminal.last_known_cursor_pos = Position {
+            x: last_cursor_pos.x,
+            y: restored_y,
+        };
     }
 
     Ok(())
@@ -365,5 +376,33 @@ impl Command for ResetScrollRegion {
     #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn restored_cursor_y_after_viewport_slide(
+        last_y: u16,
+        viewport_scroll: u16,
+        screen_height: u16,
+    ) -> u16 {
+        last_y
+            .saturating_add(viewport_scroll)
+            .min(screen_height.saturating_sub(1))
+    }
+
+    #[test]
+    fn viewport_slide_offsets_restored_cursor_row() {
+        assert_eq!(restored_cursor_y_after_viewport_slide(12, 4, 40), 16);
+    }
+
+    #[test]
+    fn viewport_slide_clamps_cursor_to_screen_floor() {
+        assert_eq!(restored_cursor_y_after_viewport_slide(38, 4, 40), 39);
+    }
+
+    #[test]
+    fn no_viewport_slide_keeps_cursor_row() {
+        assert_eq!(restored_cursor_y_after_viewport_slide(12, 0, 40), 12);
     }
 }

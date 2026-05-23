@@ -8,6 +8,9 @@ use nav_tui::bottom_pane::{
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::widgets::Widget;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,6 +48,31 @@ fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
         out.push('\n');
     }
     out
+}
+
+#[test]
+fn empty_composer_cursor_aligns_with_placeholder_row() {
+    let pane = BottomPane::new();
+    let area = Rect::new(0, 0, 80, 8);
+    let mut buf = Buffer::empty(area);
+    Widget::render(&pane, area, &mut buf);
+    let (cx, cy) = pane.cursor_position(area).expect("composer cursor");
+    let placeholder_row = (area.y..area.y + area.height)
+        .find(|&y| {
+            let row: String = (area.x..area.x + area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            row.contains("Ask nav")
+        })
+        .expect("placeholder text");
+    assert_eq!(
+        cy, placeholder_row,
+        "cursor row {cy} should match placeholder row {placeholder_row}"
+    );
+    assert!(
+        cx >= area.x + 2,
+        "cursor should sit in the content column after the gutter, got col {cx}"
+    );
 }
 
 #[test]
