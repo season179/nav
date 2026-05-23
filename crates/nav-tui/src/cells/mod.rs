@@ -28,5 +28,5 @@ pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use sessions::{SessionListCell, SessionNoticeCell, SessionTreeCell, TranscriptHitsCell};
 pub use subagents::SubagentCell;
 pub use system::{ApprovalDecisionCell, ErrorCell, NoticeCell};
-pub use tools::{ExplorationOutputCell, ToolCallCell, ToolOutputCell};
+pub use tools::{ExplorationOutputCell, ExploringSummaryCell, ToolCallCell, ToolOutputCell};
 pub(crate) use tools::ExplorationEntry;

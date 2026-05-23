@@ -7,7 +7,19 @@ use nav_tui::ChatWidget;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::text::Line;
 use serde_json::json;
+
+fn lines_to_text(lines: &[Line<'_>]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        for span in &line.spans {
+            out.push_str(&span.content);
+        }
+        out.push('\n');
+    }
+    out
+}
 
 fn buffer_to_text(buf: &Buffer) -> String {
     let area = buf.area();
@@ -180,7 +192,7 @@ fn pure_conversation_turn_complete_does_not_render_separator() {
 }
 
 #[test]
-fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
+fn tool_rows_collapse_skill_reads_into_summary_and_drop_output_preview() {
     let mut widget = ChatWidget::new();
 
     widget.ingest(AgentEvent::ToolCallStarted {
@@ -190,14 +202,18 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
             "path": "/Users/season/.agents/skills/zoom-out/SKILL.md"
         }),
     });
-    // While the call is in flight, the placeholder lives inline and
-    // shows the `Exploring` label — that row will be dropped (not
-    // duplicated) the moment `ToolCallOutput` arrives.
+    // While the call is in flight the inline summary shows the friendly
+    // `SKILL.md (<skill> skill)` form of the path as the current target.
     let started = render_widget(&mut widget, 90, 20);
     assert!(
-        started.contains("• Exploring\n  Read SKILL.md (zoom-out skill)"),
-        "{started}"
+        started.contains("• Reading 1 file…"),
+        "in-flight summary must use present tense; got:\n{started}"
     );
+    assert!(
+        started.contains("SKILL.md (zoom-out skill)"),
+        "current target must surface the skill-aware display path; got:\n{started}"
+    );
+
     widget.ingest(AgentEvent::ToolCallOutput {
         call_id: "call_1".to_string(),
         output: (0..20)
@@ -207,28 +223,33 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
         is_error: false,
         truncation: None,
     });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
 
-    let rendered = render_widget(&mut widget, 90, 20);
+    let rendered = lines_to_text(&widget.drain_pending(90));
 
     assert!(
-        !rendered.contains("• Exploring"),
-        "in-flight placeholder must be replaced once the output lands; got:\n{rendered}"
+        !rendered.contains("• Reading"),
+        "in-flight summary must be gone once the output lands; got:\n{rendered}"
     );
     assert!(
-        rendered.contains("• Explored  Read SKILL.md (zoom-out skill)"),
+        rendered.contains("• Read 1 file"),
         "{rendered}"
     );
+    // The 20-line tool output is not surfaced — the summary is a count, not a preview.
     assert!(!rendered.contains("  └ 20 lines"), "{rendered}");
     assert!(!rendered.contains("line 03"), "{rendered}");
-    assert!(!rendered.contains("… 16 more lines hidden"), "{rendered}");
     assert!(!rendered.contains("line 19"), "{rendered}");
 }
 
 #[test]
-fn consecutive_same_action_explorations_collapse_into_one_line() {
+fn mixed_explorations_collapse_into_one_summary_row() {
     let mut widget = ChatWidget::new();
 
-    // Two consecutive reads
+    // Two reads and a search across the same turn. All of them — regardless
+    // of action — fold into a single past-tense summary row when the turn
+    // completes.
     widget.ingest(AgentEvent::ToolCallStarted {
         call_id: "call_1".to_string(),
         name: "read_file".to_string(),
@@ -251,8 +272,6 @@ fn consecutive_same_action_explorations_collapse_into_one_line() {
         is_error: false,
         truncation: None,
     });
-
-    // A search (different action) stays separate
     widget.ingest(AgentEvent::ToolCallStarted {
         call_id: "call_3".to_string(),
         name: "code_search".to_string(),
@@ -264,29 +283,38 @@ fn consecutive_same_action_explorations_collapse_into_one_line() {
         is_error: false,
         truncation: None,
     });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
 
-    let rendered = render_widget(&mut widget, 100, 20);
+    let rendered = lines_to_text(&widget.drain_pending(100));
 
-    // Two reads collapsed into one line
     assert!(
-        rendered.contains("• Explored  Read docs/a.md, docs/b.md"),
-        "{rendered}"
+        rendered.contains("• Read 2 files, searched for 1 pattern"),
+        "all explorations must fold into a single comma-joined summary; got:\n{rendered}"
     );
-    // Search stays as its own line
-    assert!(
-        rendered.contains("• Explored  Search \"inserthistory\" in src"),
-        "{rendered}"
+    assert_eq!(
+        rendered.matches("• Read 2 files, searched for 1 pattern").count(),
+        1,
+        "expected exactly one summary row; got:\n{rendered}"
     );
-    // No stats or preview for either
+    // Paths are not part of the summary anymore.
+    assert!(!rendered.contains("docs/a.md"), "{rendered}");
+    assert!(!rendered.contains("inserthistory"), "{rendered}");
+    // No stats or preview for either.
     assert!(!rendered.contains("  └"), "{rendered}");
-    assert!(!rendered.contains("lines"), "{rendered}");
 }
 
 #[test]
-fn explorations_merge_across_model_rounds_and_dedup_targets() {
+fn explorations_dedupe_within_a_round_then_flush_per_assistant_segment() {
+    // A round's reads dedupe and collapse into one summary. When the model
+    // starts a new streaming text segment, the buffered summary flushes
+    // first so each segment's tool work appears immediately above the
+    // text that follows it. Re-reads of the same path in a later segment
+    // count separately because they belong to a different chunk of work.
     let mut widget = ChatWidget::new();
 
-    // Round 1: read a.md and b.md
+    // Segment 1: read a.md and b.md
     widget.ingest(AgentEvent::ToolCallStarted {
         call_id: "r1".to_string(),
         name: "read_file".to_string(),
@@ -298,6 +326,17 @@ fn explorations_merge_across_model_rounds_and_dedup_targets() {
         is_error: false,
         truncation: None,
     });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1b".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "b.md" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r1b".to_string(),
+        output: "bbb".to_string(),
+        is_error: false,
+        truncation: None,
+    });
     widget.ingest(AgentEvent::AssistantMessageDelta {
         text: "let me read more".to_string(),
     });
@@ -305,7 +344,8 @@ fn explorations_merge_across_model_rounds_and_dedup_targets() {
         text: "let me read more".to_string(),
     });
 
-    // Round 2: read b.md again (dedup) and c.md
+    // Segment 2: read b.md again (different segment — counts separately)
+    // plus c.md.
     widget.ingest(AgentEvent::ToolCallStarted {
         call_id: "r2".to_string(),
         name: "read_file".to_string(),
@@ -329,23 +369,37 @@ fn explorations_merge_across_model_rounds_and_dedup_targets() {
         truncation: None,
     });
 
-    let rendered = render_widget(&mut widget, 100, 20);
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
 
-    // All three reads merged; b.md appears only once
-    assert!(
-        rendered.contains("• Explored  Read a.md, b.md, c.md"),
-        "expected merged reads with dedup; got:\n{rendered}"
-    );
-    // Only one Explored line, not three
+    let rendered = lines_to_text(&widget.drain_pending(100));
+
+    // Two summary rows, one per segment. Segment 1 dedupes within itself.
     assert_eq!(
-        rendered.matches("• Explored").count(),
-        1,
-        "expected exactly one Explored line; got:\n{rendered}"
+        rendered.matches("• Read 2 files").count(),
+        2,
+        "expected one summary row per segment; got:\n{rendered}"
+    );
+    // Segment 1's row must appear ABOVE the assistant text it preceded.
+    let seg1_idx = rendered
+        .find("Read 2 files")
+        .expect("segment 1 summary present");
+    let text_idx = rendered
+        .find("let me read more")
+        .expect("assistant text present");
+    assert!(
+        seg1_idx < text_idx,
+        "segment 1 summary must land before the streaming text; got:\n{rendered}"
     );
 }
 
 #[test]
-fn exploration_collapse_flushes_on_bash_output() {
+fn exploration_buffer_flushes_when_apply_patch_lands() {
+    // apply_patch (and other non-summary tools) is the canonical "this is
+    // a different kind of work" event — when it lands, the running
+    // exploration summary flushes to scrollback ahead of it so the order
+    // matches the user's mental model: explored → modified.
     let mut widget = ChatWidget::new();
 
     widget.ingest(AgentEvent::ToolCallStarted {
@@ -359,7 +413,262 @@ fn exploration_collapse_flushes_on_bash_output() {
         is_error: false,
         truncation: None,
     });
-    // Non-exploration tool flushes the buffered exploration
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "p1".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "*** Begin Patch\n*** Update File: foo.rs\n@@\n-a\n+b\n*** End Patch\n"
+        }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "p1".to_string(),
+        output: "updated 1 file".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    let rendered = lines_to_text(&widget.drain_pending(100));
+
+    assert!(
+        rendered.contains("• Read 1 file"),
+        "exploration summary must appear before the patch row; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("• Ran  apply_patch M foo.rs"),
+        "{rendered}"
+    );
+    let summary_idx = rendered.find("• Read 1 file").expect("summary present");
+    let patch_idx = rendered.find("• Ran  apply_patch").expect("patch present");
+    assert!(
+        summary_idx < patch_idx,
+        "summary must flush ahead of the patch row; got:\n{rendered}"
+    );
+}
+
+#[test]
+fn explorations_flush_before_next_streaming_assistant_cell() {
+    // Regression: with drain_pending no longer flushing, a buffered Read
+    // could survive across a streaming assistant message and land BELOW
+    // it in scrollback (or worse, at TurnComplete). When a new streaming
+    // cell starts, the previous round's exploration summary must already
+    // be in scrollback so causality is preserved.
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "config.toml" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r1".to_string(),
+        output: "ok".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "Based on config.toml, ".to_string(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "Based on config.toml, …".to_string(),
+    });
+
+    let scrollback = lines_to_text(&widget.drain_pending(100));
+
+    let summary_idx = scrollback
+        .find("Read 1 file")
+        .expect("summary present in scrollback");
+    let text_idx = scrollback
+        .find("Based on config.toml")
+        .expect("assistant text present");
+    assert!(
+        summary_idx < text_idx,
+        "exploration summary must precede the next streaming text; got:\n{scrollback}"
+    );
+}
+
+#[test]
+fn same_file_read_twice_across_frame_drain_collapses_to_one_summary() {
+    // Regression: two `read_file` calls on the same path used to produce
+    // two `• Explored  Read foo.rs` rows because `drain_pending` flushed
+    // the buffered exploration between them. The agent re-reading the
+    // same file should appear as a single summary line — count, not paths.
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "c1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "crates/nav-tui/src/cells/wrapping.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "c1".to_string(),
+        output: "first content".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    // Simulate the runtime draining frames between the two reads — this is
+    // what currently produces the duplicate Explored row.
+    let mut scrollback: Vec<Line<'static>> = widget.drain_pending(100);
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "c2".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "crates/nav-tui/src/cells/wrapping.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "c2".to_string(),
+        output: "second content".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    scrollback.extend(widget.drain_pending(100));
+
+    // End-of-turn flushes whatever's still buffered into scrollback.
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
+    scrollback.extend(widget.drain_pending(100));
+
+    let rendered = lines_to_text(&scrollback);
+
+    assert!(
+        rendered.contains("• Read 1 file"),
+        "expected dedup'd summary; got:\n{rendered}"
+    );
+    assert_eq!(
+        rendered.matches("• Read 1 file").count(),
+        1,
+        "expected exactly one summary row; got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("wrapping.rs"),
+        "summary must not list paths; got:\n{rendered}"
+    );
+}
+
+#[test]
+fn inline_running_summary_shows_present_tense_with_current_target() {
+    // Mirrors image 3 in the design note: while exploration tools are
+    // still in flight (or buffered, post-output, pre-flush), the inline
+    // viewport shows a single comma-joined present-tense summary and
+    // the most recently started target on the row below.
+    let mut widget = ChatWidget::new();
+
+    // One search just completed — buffered into pending_explorations.
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "s1".to_string(),
+        name: "code_search".to_string(),
+        arguments: json!({ "pattern": "TODO", "path": "src" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "s1".to_string(),
+        output: "match".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    // Three different files being read; the second one is the most
+    // recently started in-flight tool and should be the displayed target.
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "a.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r1".to_string(),
+        output: "x".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r2".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "b.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r3".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "crates/nav-tui/tests/snapshot.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "l1".to_string(),
+        name: "list_files".to_string(),
+        arguments: json!({ "path": "src" }),
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "b1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({ "command": "cargo build" }),
+    });
+
+    let inline = lines_to_text(&widget.inline_lines(120));
+
+    assert!(
+        inline.contains(
+            "Searching for 1 pattern, reading 3 files, listing 1 directory, running 1 shell command…"
+        ),
+        "inline summary must use present tense for the whole row (the cell \
+         is still live), capitalize the first phrase, and end with an ellipsis; \
+         got:\n{inline}"
+    );
+    assert!(
+        inline.contains("cargo build"),
+        "most recently started in-flight target should appear under the summary; got:\n{inline}"
+    );
+    assert!(
+        !inline.contains("• Exploring"),
+        "individual `Exploring` placeholders must be collapsed into the summary; got:\n{inline}"
+    );
+    assert!(
+        !inline.contains("• Running  cargo build"),
+        "individual `Running` placeholder for bash must be collapsed into the summary; got:\n{inline}"
+    );
+}
+
+#[test]
+fn inline_summary_switches_to_past_tense_when_no_tool_in_flight() {
+    // Between two batches of tool calls (or between the last read and the
+    // next assistant message), pending_explorations is non-empty but no
+    // summary tool is currently in flight. The inline cell must NOT claim
+    // "Reading…" because nothing is being read right now.
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "foo.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r1".to_string(),
+        output: "ok".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    let inline = lines_to_text(&widget.inline_lines(80));
+
+    assert!(
+        !inline.contains("Reading"),
+        "summary must not lie about being mid-read; got:\n{inline}"
+    );
+    assert!(
+        !inline.contains('…'),
+        "no ellipsis when nothing is in-flight; got:\n{inline}"
+    );
+    assert!(
+        inline.contains("Read 1 file"),
+        "past-tense count must still be visible; got:\n{inline}"
+    );
+    assert!(
+        !inline.contains("└ "),
+        "no current_target line when nothing is in-flight; got:\n{inline}"
+    );
+}
+
+#[test]
+fn successful_bash_folds_into_summary_as_shell_command() {
+    let mut widget = ChatWidget::new();
+
     widget.ingest(AgentEvent::ToolCallStarted {
         call_id: "b1".to_string(),
         name: "bash".to_string(),
@@ -367,22 +676,55 @@ fn exploration_collapse_flushes_on_bash_output() {
     });
     widget.ingest(AgentEvent::ToolCallOutput {
         call_id: "b1".to_string(),
-        output: "all tests passed".to_string(),
+        output: "test result: ok".to_string(),
         is_error: false,
         truncation: None,
     });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
 
-    let rendered = render_widget(&mut widget, 100, 20);
+    let rendered = lines_to_text(&widget.drain_pending(100));
 
     assert!(
-        rendered.contains("• Explored  Read foo.rs"),
-        "exploration must appear before bash output; got:\n{rendered}"
+        rendered.contains("• Ran 1 shell command"),
+        "successful bash must join the rolled-up summary; got:\n{rendered}"
     );
     assert!(
-        rendered.contains("• Ran  cargo test"),
-        "{rendered}"
+        !rendered.contains("• Ran  cargo test"),
+        "successful bash must not produce its own Ran row; got:\n{rendered}"
     );
-    assert!(rendered.contains("  └ 1 line, 16 chars"), "{rendered}");
+    assert!(
+        !rendered.contains("test result: ok"),
+        "successful bash output preview must be hidden; got:\n{rendered}"
+    );
+}
+
+#[test]
+fn failed_bash_still_shows_output_preview() {
+    // Failure paths bypass the summary so the user keeps seeing the actual
+    // command and the error output — same as failed exploration tools.
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "b1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({ "command": "exit 1" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "b1".to_string(),
+        output: "boom".to_string(),
+        is_error: true,
+        truncation: None,
+    });
+
+    let rendered = lines_to_text(&widget.drain_pending(100));
+
+    assert!(
+        rendered.contains("■ Failed  exit 1"),
+        "failed bash must keep its dedicated row; got:\n{rendered}"
+    );
+    assert!(rendered.contains("boom"), "{rendered}");
 }
 
 #[test]
@@ -948,8 +1290,12 @@ fn session_rewound_drops_inflight_placeholder_silently() {
 fn inflight_tool_placeholders_preserve_arrival_order() {
     // Regression: with `BTreeMap<String, _>` the placeholders rendered in
     // lexicographic call-id order. OpenAI Responses call_ids are opaque
-    // random strings, so lex order is effectively random. With a Vec the
-    // display order matches issuance order.
+    // random strings, so lex order is effectively random. With a Vec, two
+    // observables tell us the order is preserved:
+    //   1. Inline: the most-recently-started target is the one shown
+    //      under the running summary.
+    //   2. Scrollback: when an abort drains the in-flight placeholders to
+    //      finalized cells, they land in arrival order.
     let mut widget = ChatWidget::new();
     widget.ingest(AgentEvent::ToolCallStarted {
         call_id: "z_first".to_string(),
@@ -962,12 +1308,34 @@ fn inflight_tool_placeholders_preserve_arrival_order() {
         arguments: json!({ "path": "/second.txt" }),
     });
 
-    let rendered = render_widget(&mut widget, 80, 8);
-    let first_idx = rendered.find("first.txt").expect("first placeholder");
-    let second_idx = rendered.find("second.txt").expect("second placeholder");
+    let inline = lines_to_text(&widget.inline_lines(80));
+    assert!(
+        inline.contains("Reading 2 files…"),
+        "summary counts both in-flight reads; got:\n{inline}"
+    );
+    assert!(
+        inline.contains("/second.txt"),
+        "most recently started target (a_second → /second.txt) drives the \
+         current_target line; with BTreeMap ordering this would be \
+         /first.txt instead. Got:\n{inline}"
+    );
+    assert!(
+        !inline.contains("/first.txt"),
+        "only the most recent target is surfaced inline; got:\n{inline}"
+    );
+
+    // Abort drains the placeholders to scrollback in arrival order.
+    widget.ingest(AgentEvent::TurnAborted {
+        turn_id: "t1".to_string(),
+        reason: "stop".to_string(),
+    });
+    let scrollback = lines_to_text(&widget.drain_pending(80));
+    let first_idx = scrollback.find("first.txt").expect("first placeholder");
+    let second_idx = scrollback.find("second.txt").expect("second placeholder");
     assert!(
         first_idx < second_idx,
-        "arrival order (z_first, a_second) must beat lex order; got:\n{rendered}"
+        "arrival order (z_first, a_second) must beat lex order in \
+         scrollback; got:\n{scrollback}"
     );
 }
 
@@ -1024,5 +1392,75 @@ fn inline_lines_capped_preserves_placeholders_over_long_stream() {
     assert!(
         !rendered.contains("line 00"),
         "streaming head should be clipped, not the tail; got:\n{rendered}"
+    );
+}
+
+#[test]
+fn finalized_exploration_summary_uses_bullet_chrome_not_explored_label() {
+    // The inline running summary already renders as a bare bullet
+    // ("• reading 3 files…"). When it transitions to scrollback the user
+    // should perceive it as the same row, not a re-labeled "Explored" row
+    // with double-space chrome — that broke visual continuity and made
+    // the same data look like two different cells.
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "foo.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r1".to_string(),
+        output: "ok".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    widget.flush_pending_for_shutdown();
+
+    let scrollback = lines_to_text(&widget.drain_pending(80));
+
+    assert!(
+        !scrollback.contains("Explored"),
+        "summary row must drop the 'Explored' label; got:\n{scrollback}"
+    );
+    assert!(
+        scrollback.contains("• Read 1 file"),
+        "summary row must render as a plain bullet; got:\n{scrollback}"
+    );
+}
+
+#[test]
+fn flush_pending_for_shutdown_promotes_buffered_explorations() {
+    // Regression: the AppEvent::Quit handler used to `break` out of the
+    // main loop while pending_explorations still held un-flushed groups,
+    // so the running summary never made it into scrollback. ChatWidget
+    // exposes `flush_pending_for_shutdown` so the app can promote those
+    // groups into a finalized cell that the final drain_pending picks up.
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "foo.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r1".to_string(),
+        output: "ok".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    // Before flush: nothing finalized yet; the summary lives only inline.
+    let before = lines_to_text(&widget.drain_pending(80));
+    assert!(
+        !before.contains("Read 1 file"),
+        "buffered exploration must not auto-flush via drain_pending; got:\n{before}"
+    );
+
+    widget.flush_pending_for_shutdown();
+
+    let after = lines_to_text(&widget.drain_pending(80));
+    assert!(
+        after.contains("Read 1 file"),
+        "flush_pending_for_shutdown must surface the summary; got:\n{after}"
     );
 }

@@ -317,43 +317,162 @@ pub(crate) struct ExplorationEntry {
 
 impl ExplorationEntry {
     pub(crate) fn from_context(context: &ToolCallContext) -> Option<Self> {
-        let visual = context.visual();
-        if let ToolVisual::Exploration { action, target } = visual {
-            Some(ExplorationEntry { action, target })
-        } else {
-            None
+        match context.visual() {
+            ToolVisual::Exploration { action, target } => {
+                Some(ExplorationEntry { action, target })
+            }
+            // Successful bash runs join the same `Explored` summary as
+            // read/list/search so the user sees `ran 1 shell command` instead
+            // of a noisy per-command `Ran` row. Failed bash still flows
+            // through `ToolOutputCell` (the `is_error` branch in
+            // `widget::ingest`) so the preview stays visible.
+            ToolVisual::Command { target } => Some(ExplorationEntry {
+                action: "Bash",
+                target,
+            }),
+            ToolVisual::Other { .. } => None,
         }
     }
 }
 
-/// A collapsed exploration cell. Renders as a single line:
-/// `• Explored  Read path1, path2, path3`
+/// A collapsed exploration cell. Renders as a single line summarizing the
+/// turn's exploration work by count, e.g.:
+/// `• Read 3 files, searched for 2 patterns, ran 1 shell command`.
 ///
-/// No stats, no preview — just the action and the targets.
+/// Paths are deduped per action group before counting so re-reading the same
+/// file shows as `1 file`, not `2`. The first phrase is capitalized. Shares
+/// the [`TranscriptRowKind::ExploringSummary`] bullet chrome with the inline
+/// running preview so the transition from in-flight ("reading 3 files…") to
+/// scrollback ("read 3 files") reads as the same row, not a re-labeled cell.
 pub struct ExplorationOutputCell {
-    action: &'static str,
-    targets: Vec<String>,
+    groups: Vec<(&'static str, Vec<String>)>,
 }
 
 impl ExplorationOutputCell {
-    pub(crate) fn new(action: &'static str, targets: Vec<String>) -> Self {
-        Self { action, targets }
+    pub(crate) fn from_groups(groups: Vec<(&'static str, Vec<String>)>) -> Self {
+        Self { groups }
     }
 }
 
 impl HistoryCell for ExplorationOutputCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        const VISIBLE_LIMIT: usize = 6;
-        let visible: Vec<&str> =
-            self.targets.iter().take(VISIBLE_LIMIT).map(String::as_str).collect();
-        let mut joined = visible.join(", ");
-        let hidden = self.targets.len().saturating_sub(VISIBLE_LIMIT);
-        if hidden > 0 {
-            joined.push_str(&format!(", … {hidden} more"));
+        let body = format_summary(&self.groups, Tense::Past);
+        TranscriptRow::new(TranscriptRowKind::ExploringSummary, body).render(width)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Tense {
+    Past,
+    Present,
+}
+
+/// Render the running summary phrase shared by [`ExplorationOutputCell`]
+/// (past tense, in scrollback) and [`ExploringSummaryCell`] (present tense,
+/// inline). Counts come from the per-action target lists so the caller can
+/// dedup paths before handing them in.
+pub(crate) fn format_summary(groups: &[(&'static str, Vec<String>)], tense: Tense) -> String {
+    let mut phrases: Vec<String> = Vec::with_capacity(groups.len());
+    for (i, (action, targets)) in groups.iter().enumerate() {
+        let phrase = action_phrase(action, targets.len(), tense);
+        phrases.push(if i == 0 {
+            capitalize_first(&phrase)
+        } else {
+            phrase
+        });
+    }
+    phrases.join(", ")
+}
+
+fn action_phrase(action: &str, count: usize, tense: Tense) -> String {
+    match (action, tense) {
+        ("Read", Tense::Past) => format!("read {count} {}", pluralize(count, "file", "files")),
+        ("Read", Tense::Present) => {
+            format!("reading {count} {}", pluralize(count, "file", "files"))
         }
-        let body = format!("{} {joined}", self.action);
-        TranscriptRow::with_label(TranscriptRowKind::ToolOutput, "Explored", body)
-            .render(width)
+        ("List", Tense::Past) => format!(
+            "listed {count} {}",
+            pluralize(count, "directory", "directories")
+        ),
+        ("List", Tense::Present) => format!(
+            "listing {count} {}",
+            pluralize(count, "directory", "directories")
+        ),
+        ("Search", Tense::Past) => format!(
+            "searched for {count} {}",
+            pluralize(count, "pattern", "patterns")
+        ),
+        ("Search", Tense::Present) => format!(
+            "searching for {count} {}",
+            pluralize(count, "pattern", "patterns")
+        ),
+        ("Bash", Tense::Past) => format!(
+            "ran {count} shell {}",
+            pluralize(count, "command", "commands")
+        ),
+        ("Bash", Tense::Present) => format!(
+            "running {count} shell {}",
+            pluralize(count, "command", "commands")
+        ),
+        (other, _) => format!("{} {count}", other.to_lowercase()),
+    }
+}
+
+fn pluralize(count: usize, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
+}
+
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Inline-only running summary used while exploration tools are still in
+/// flight or buffered. Renders with present-tense verbs, an ellipsis, and the
+/// most recently active target underneath (e.g. the path of the read currently
+/// in flight) so the user can see what's actually happening right now.
+pub struct ExploringSummaryCell {
+    groups: Vec<(&'static str, Vec<String>)>,
+    current_target: Option<String>,
+}
+
+impl ExploringSummaryCell {
+    pub(crate) fn new(
+        groups: Vec<(&'static str, Vec<String>)>,
+        current_target: Option<String>,
+    ) -> Self {
+        Self {
+            groups,
+            current_target,
+        }
+    }
+}
+
+impl HistoryCell for ExploringSummaryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        // Present-tense + ellipsis + current-target line only while something
+        // is actually in flight. With nothing live (between batches of tool
+        // calls, while pending_explorations waits for its next flush trigger)
+        // past tense reads honestly and matches the shape of the eventual
+        // scrollback row.
+        let body = match &self.current_target {
+            Some(target) => {
+                let mut body = format_summary(&self.groups, Tense::Present);
+                body.push('…');
+                body.push_str("\n└ ");
+                body.push_str(target);
+                body
+            }
+            None => format_summary(&self.groups, Tense::Past),
+        };
+        TranscriptRow::new(TranscriptRowKind::ExploringSummary, body).render(width)
     }
 }
 

@@ -144,6 +144,7 @@ pub async fn run(
         &sandbox_policy,
     );
     let mut needs_draw = true;
+    let mut quit_requested = false;
 
     if let Some(prompt) = initial_prompt {
         app_tx
@@ -291,6 +292,10 @@ pub async fn run(
             needs_draw = false;
         }
 
+        if quit_requested {
+            break;
+        }
+
         tokio::select! {
             Some(ev) = agent_rx.recv() => {
                 needs_draw = true;
@@ -378,7 +383,16 @@ pub async fn run(
             Some(app) = app_rx.recv() => {
                 needs_draw = true;
                 match app {
-                    AppEvent::Quit => break,
+                    AppEvent::Quit => {
+                        // Promote any in-flight exploration summary into a
+                        // finalized cell so the next iteration's draw block
+                        // (already armed by `needs_draw = true` above) writes
+                        // it to scrollback. The actual exit happens after
+                        // that draw via the `quit_requested` check at the
+                        // top of the loop.
+                        chat.flush_pending_for_shutdown();
+                        quit_requested = true;
+                    }
                     AppEvent::Clear => {
                         chat = ChatWidget::with_theme(theme);
                         pending_skill = None;
