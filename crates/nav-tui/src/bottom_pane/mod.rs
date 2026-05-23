@@ -18,6 +18,7 @@ use crate::theme::Theme;
 mod approval;
 mod clipboard;
 mod composer;
+mod history_search;
 mod key_handling;
 mod mention_popup;
 mod pending_preview;
@@ -30,6 +31,7 @@ mod view;
 
 pub use approval::ApprovalOverlay;
 pub use composer::{Composer, ComposerEvent};
+pub use history_search::HistorySearch;
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
 use pending_preview::PendingPreview;
 pub use session_picker::{SessionPickerEntry, SessionPickerPopup};
