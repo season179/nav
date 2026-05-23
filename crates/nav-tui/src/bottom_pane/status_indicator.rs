@@ -2,10 +2,12 @@
 //! overlay) while a turn is active.
 //!
 //! Codex shows this row instead of squeezing the spinner into the
-//! `Working Ns` segment of the status bar. We keep the inline spinner in
-//! the status bar too — the dedicated row only adds the interrupt hint —
-//! so when the row gets suppressed on small screens the user still sees
-//! the agent is busy.
+//! `Working Ns` segment of the status bar. While this row is visible the
+//! status bar drops its inline `Working Ns` span so the working state
+//! doesn't render twice — see [`super::status_bar::StatusBar::render`].
+//! On small screens (below [`INDICATOR_SCREEN_FLOOR`]) this row is hidden
+//! and the inline spinner reappears in the status bar as the fallback
+//! busy signal.
 //!
 //! ## Small-screen floor
 //!

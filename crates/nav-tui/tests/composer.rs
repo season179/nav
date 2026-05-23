@@ -425,14 +425,22 @@ fn working_indicator_row_renders_above_composer_with_status_on_bottom() {
         "indicator row should sit at the top of the pane, above the composer:\n{rendered}"
     );
 
+    // When the indicator is visible the status bar must NOT also paint a
+    // "Working Ns" segment — that would duplicate the busy signal. The
+    // bottom row should still carry the rest of the bar (model + cwd +
+    // branch); look for `test-model` to confirm it rendered.
     let status_line = lines
         .iter()
-        .rposition(|line| line.contains("·  ⠴ Working"))
-        .expect("status bar should still show the inline Working segment");
+        .rposition(|line| line.contains("test-model"))
+        .expect("status bar should still render on the bottom row");
     assert_eq!(
         status_line,
         lines.len() - 1,
         "status bar should occupy the bottom row of the pane:\n{rendered}"
+    );
+    assert!(
+        !lines[status_line].contains("Working"),
+        "status bar must drop the inline `Working Ns` segment when the indicator is visible:\n{rendered}"
     );
 
     let prompt_line = lines
@@ -443,6 +451,34 @@ fn working_indicator_row_renders_above_composer_with_status_on_bottom() {
         prompt_line > indicator_line && prompt_line < status_line,
         "composer prompt must sit between the indicator and the status row \
          (indicator={indicator_line}, prompt={prompt_line}, status={status_line}):\n{rendered}",
+    );
+}
+
+#[test]
+fn working_inline_segment_is_kept_when_indicator_is_suppressed() {
+    // Small-screen fallback: when show_indicator=false (e.g. terminal
+    // below INDICATOR_SCREEN_FLOOR), the status bar must keep the inline
+    // `⠴ Working Ns` spinner so the user still sees a busy signal.
+    let mut pane = BottomPane::new();
+    pane.update_status(working_status(false));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("terminal");
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+    let lines: Vec<&str> = rendered.lines().collect();
+
+    assert!(
+        !rendered.contains("Ctrl+C to interrupt"),
+        "indicator row must stay suppressed in this scenario:\n{rendered}"
+    );
+    let status_line = lines
+        .iter()
+        .rposition(|line| line.contains("·  ⠴ Working"))
+        .expect("status bar inline spinner should fall back when the indicator is hidden");
+    assert_eq!(
+        status_line,
+        lines.len() - 1,
+        "status bar should still occupy the bottom row:\n{rendered}"
     );
 }
 

@@ -40,6 +40,11 @@ pub struct StatusBarState {
     /// the agent is in `Working` state AND `screen_h >=
     /// `super::status_indicator::INDICATOR_SCREEN_FLOOR``; the row stays
     /// hidden otherwise so small tmux splits don't lose composer space.
+    ///
+    /// When this is `true` the status bar suppresses its own
+    /// `⠴ Working Ns` segment — the indicator row above is the canonical
+    /// busy signal. The status bar's inline spinner is the fallback that
+    /// kicks in when this flag is `false`.
     pub show_indicator: bool,
 }
 
@@ -113,9 +118,15 @@ impl<'a> Widget for StatusBar<'a> {
                 ));
             }
         }
-        spans.push(sep);
+        // Agent-state segment. Suppressed when the dedicated indicator
+        // row above the composer is carrying the working state — otherwise
+        // "Working Ns" would render twice on screen. The inline spinner
+        // still appears here when the indicator is hidden (small screens
+        // below `INDICATOR_SCREEN_FLOOR`) so the user always has a busy
+        // signal.
         match s.agent_state {
             AgentState::Ready => {
+                spans.push(sep.clone());
                 spans.push(Span::styled(
                     "Ready",
                     Style::default()
@@ -123,14 +134,19 @@ impl<'a> Widget for StatusBar<'a> {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            AgentState::Working { elapsed, spinner } => {
+            AgentState::Working { elapsed, spinner } if !s.show_indicator => {
                 let secs = elapsed.as_secs();
+                spans.push(sep.clone());
                 spans.push(Span::styled(
                     format!("{spinner} Working {secs}s"),
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
                 ));
+            }
+            AgentState::Working { .. } => {
+                // Indicator row carries the working state; skip the inline
+                // segment so it isn't shown twice.
             }
         }
         // Token usage segment: show in/out/cached when we have data,
