@@ -33,7 +33,7 @@ use crossterm::style::SetAttribute;
 use crossterm::style::SetBackgroundColor;
 use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
-use crossterm::terminal::Clear;
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::Backend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
@@ -93,6 +93,13 @@ pub struct Frame<'a> {
     pub(crate) buffer: &'a mut Buffer,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InlineViewportState {
+    pub(crate) visible_history_rows: u16,
+    pub(crate) cursor_position: Position,
+    pub(crate) viewport_area: Rect,
+}
+
 impl Frame<'_> {
     /// The area of the current frame
     ///
@@ -150,6 +157,8 @@ where
     /// Last known position of the cursor. Used to find the new area when the viewport is inlined
     /// and the terminal resized.
     pub(crate) last_known_cursor_pos: Position,
+    /// Whether the alternate screen is currently active.
+    in_alternate_screen: bool,
 }
 
 impl<B> Drop for Terminal<B>
@@ -209,6 +218,61 @@ where
             ),
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
+            in_alternate_screen: false,
+        }
+    }
+
+    /// Enter alternate screen while saving enough state to restore the inline
+    /// viewport and cursor exactly as it was.
+    pub(crate) fn enter_alternate_screen(&mut self) -> io::Result<InlineViewportState> {
+        let state = self.current_inline_viewport_state();
+
+        if !self.in_alternate_screen {
+            queue!(self.backend, EnterAlternateScreen, Clear(ClearType::All))?;
+            self.in_alternate_screen = true;
+        }
+        Ok(state)
+    }
+
+    /// Leave alternate screen and restore the inline viewport/cursor
+    /// state saved at entry.
+    pub(crate) fn leave_alternate_screen(
+        &mut self,
+        state: InlineViewportState,
+    ) -> io::Result<()> {
+        if !self.in_alternate_screen {
+            return Ok(());
+        }
+
+        queue!(self.backend, LeaveAlternateScreen)?;
+        self.in_alternate_screen = false;
+
+        let screen_size = self.size()?;
+        let width = screen_size.width.max(1);
+        let height = screen_size.height.max(1);
+        let mut viewport_area = state.viewport_area;
+        viewport_area.width = width;
+        viewport_area.height = viewport_area.height.max(1).min(height);
+        let max_top = height.saturating_sub(viewport_area.height);
+        viewport_area.y = state.visible_history_rows.min(max_top);
+        viewport_area.x = 0;
+
+        let cursor_x = state.cursor_position.x.min(width.saturating_sub(1));
+        let cursor_y = state.cursor_position.y.min(height.saturating_sub(1));
+
+        self.set_viewport_area(viewport_area);
+        self.last_known_screen_size = screen_size;
+        self.last_known_cursor_pos = Position { x: cursor_x, y: cursor_y };
+        self.set_cursor_position(self.last_known_cursor_pos)?;
+
+        Ok(())
+    }
+
+    fn current_inline_viewport_state(&self) -> InlineViewportState {
+        InlineViewportState {
+            visible_history_rows: self.viewport_area.y,
+            cursor_position: self.last_known_cursor_pos,
+            viewport_area: self.viewport_area,
         }
     }
 

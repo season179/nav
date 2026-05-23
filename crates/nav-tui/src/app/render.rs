@@ -18,12 +18,13 @@ use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::terminal::{Clear, ClearType};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Paragraph;
 use std::io::Stdout;
 
 use super::inline_region::{InlineRegion, streaming_cap};
 use crate::ChatWidget;
+use crate::app::overlay::AppOverlay;
 use crate::bottom_pane;
 use crate::custom_terminal::Terminal;
 
@@ -33,7 +34,19 @@ pub(super) fn draw_tui(
     pane: &bottom_pane::BottomPane,
     screen_w: u16,
     screen_h: u16,
+    overlay: Option<&dyn AppOverlay>,
 ) -> Result<()> {
+    let screen_w = screen_w.max(1);
+    let screen_h = screen_h.max(1);
+
+    if let Some(overlay) = overlay {
+        terminal.set_viewport_area(Rect::new(0, 0, screen_w, screen_h));
+        terminal.draw(|f| {
+            overlay.render(f.area(), f.buffer);
+        })?;
+        return Ok(());
+    }
+
     // Materialize streaming lines first — the cap depends on the screen
     // budget, and `inline_lines_capped` already prioritizes tool-call
     // placeholders over streaming-assistant tokens so a long reply can't
@@ -63,9 +76,9 @@ pub(super) fn draw_tui(
             terminal, scroll.top, scroll.by,
         )?;
     }
-    if let Some(rows) = region.blank_rows.clone() {
+    if let Some(rows) = region.blank_rows.as_ref() {
         let backend = terminal.backend_mut();
-        for row in rows {
+        for row in rows.clone() {
             queue!(backend, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
         }
     }

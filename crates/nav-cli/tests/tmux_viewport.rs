@@ -21,6 +21,8 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tempfile::{TempDir, tempdir};
 
+const TEST_API_KEY: &str = "test-only-not-real";
+
 /// Unique session name per test so concurrent runs don't collide.
 fn fresh_session(name: &str) -> Session {
     let session = Session {
@@ -135,6 +137,22 @@ impl Session {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    fn resize(&self, width: u16, height: u16) {
+        let status = Command::new("tmux")
+            .args([
+                "resize-window",
+                "-t",
+                &self.name,
+                "-x",
+                &width.to_string(),
+                "-y",
+                &height.to_string(),
+            ])
+            .status()
+            .expect("tmux resize-window failed");
+        assert!(status.success(), "tmux resize-window exited non-zero");
+    }
+
     /// Poll `capture()` until `predicate` returns true or the timeout
     /// elapses. Returns the final pane content (whether or not the
     /// predicate matched) so the caller can assert on it.
@@ -203,6 +221,12 @@ fn last_row_with(pane: &str, predicate: impl Fn(&str) -> bool) -> Option<usize> 
         .filter(|(_, line)| predicate(line))
         .map(|(idx, _)| idx)
         .last()
+}
+
+fn launch_nav(session: &Session) {
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY={TEST_API_KEY} {nav} --auth api-key");
+    session.send_line(&cmd);
 }
 
 fn spawn_mock_streaming_server(chunk_count: usize) -> u16 {
@@ -400,12 +424,7 @@ fn status_bar_stays_visible_when_slash_popup_opens_and_closes() {
     let session = fresh_session("status-popup");
     session.start(100, 24);
 
-    // Launch nav with a throwaway API key. `--auth api-key` skips the
-    // ~/.codex/auth.json read; the bearer string is only used when a
-    // prompt is submitted, and this test never submits one.
-    let nav = env!("CARGO_BIN_EXE_nav");
-    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
-    session.send_line(&cmd);
+    launch_nav(&session);
 
     // Initial frame: wait up to 5s for the status bar to render.
     let initial = session.wait_for(status_bar_present, Duration::from_secs(5));
@@ -452,6 +471,81 @@ fn status_bar_stays_visible_when_slash_popup_opens_and_closes() {
     );
 }
 
+#[test]
+fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("overlay-roundtrip");
+    session.start(100, 24);
+
+    launch_nav(&session);
+
+    // Wait directly on the composer placeholder rather than
+    // `status_bar_present`, because the status bar's `Ready` segment can
+    // be truncated off the right edge by a long branch name + cwd at
+    // 100-col width. The composer row is what this test actually needs
+    // a stable anchor on anyway.
+    let baseline = session.wait_for(
+        |pane| pane.contains("Ask nav to do anything"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        baseline.contains("Ask nav to do anything"),
+        "composer placeholder never appeared on launch:\n{baseline}"
+    );
+    let baseline_cursor = session.cursor();
+    let baseline_row = last_row_with(&baseline, |line| line.contains("Ask nav to do anything"))
+        .expect("composer placeholder row should be visible");
+
+    session.send("C-t");
+    let overlay = session.wait_for(
+        |pane| pane.contains("Test Overlay") && pane.contains("Press Esc to close."),
+        Duration::from_secs(5),
+    );
+    assert!(
+        overlay.contains("Test Overlay"),
+        "test overlay never became visible:\n{overlay}"
+    );
+
+    session.resize(120, 24);
+    let overlay_after_resize = session.wait_for(
+        |pane| pane.contains("Any key is swallowed by the overlay."),
+        Duration::from_secs(5),
+    );
+    assert!(
+        overlay_after_resize.contains("Any key is swallowed by the overlay."),
+        "overlay text disappeared after resize:\n{overlay_after_resize}"
+    );
+
+    // Let nav settle on the resize event before sending Escape — otherwise
+    // the resize and the Escape can land in the same crossterm poll tick
+    // and one of them gets swallowed by the partial-redraw race.
+    sleep(Duration::from_millis(150));
+    session.send("Escape");
+    let restored = session.wait_for(
+        |pane| pane.contains("Ask nav to do anything") && !pane.contains("Test Overlay"),
+        Duration::from_secs(5),
+    );
+    let restored_row = last_row_with(&restored, |line| line.contains("Ask nav to do anything"))
+        .unwrap_or_else(|| {
+            panic!("composer placeholder row should return after overlay close, pane was:\n{restored}")
+        });
+    let (cursor_x, cursor_y) = session.cursor();
+
+    assert_eq!(
+        restored_row, baseline_row,
+        "composer should return to same inline row after overlay resize+close \
+         (before={baseline_row}, after={restored_row})\n{restored}"
+    );
+    assert!(
+        cursor_y == baseline_cursor.1 && cursor_x >= 2,
+        "cursor should return to the same composer row and valid input column ({cursor_x},{cursor_y})\n{restored}"
+    );
+}
+
 /// The status bar must paint BELOW the composer (matches codex's layout).
 /// Pre-fix, the row order inside `BottomPane::render` placed status at the
 /// top of the pane, which left the composer placeholder underneath the
@@ -467,9 +561,7 @@ fn status_bar_paints_below_composer() {
     let session = fresh_session("status-below-composer");
     session.start(100, 24);
 
-    let nav = env!("CARGO_BIN_EXE_nav");
-    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
-    session.send_line(&cmd);
+    launch_nav(&session);
 
     // Wait for both the composer placeholder and the status row to render.
     // The composer placeholder reads "Ask nav to do anything" (composer.rs).
