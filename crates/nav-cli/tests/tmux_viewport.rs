@@ -1,0 +1,182 @@
+//! Visual regression tests for the inline TUI viewport.
+//!
+//! Drives the real `nav` binary inside a tmux session and inspects the
+//! captured pane to confirm what the terminal actually painted. These
+//! tests cover viewport/buffer-diff bugs the in-process snapshot tests
+//! cannot reach — notably the status-bar-vanishes-when-popup-opens
+//! regression fixed in commit 8684e25, where `diff_buffers` skipped
+//! writes for cells whose content matched by buffer index even though
+//! their screen position had shifted.
+//!
+//! Skips cleanly when tmux is not on `PATH` so CI environments without
+//! it still pass.
+
+use std::process::{Command, Output};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+
+/// Unique session name per test so concurrent runs don't collide.
+fn fresh_session(name: &str) -> Session {
+    let session = Session {
+        name: format!("nav-tmux-{name}-{}", std::process::id()),
+    };
+    // Best-effort kill in case a previous failed run left a stale session.
+    let _ = run_tmux(&["kill-session", "-t", &session.name]);
+    session
+}
+
+struct Session {
+    name: String,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = run_tmux(&["kill-session", "-t", &self.name]);
+    }
+}
+
+impl Session {
+    fn start(&self, width: u16, height: u16) {
+        let status = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &self.name,
+                "-x",
+                &width.to_string(),
+                "-y",
+                &height.to_string(),
+            ])
+            .status()
+            .expect("tmux new-session failed");
+        assert!(status.success(), "tmux new-session exited non-zero");
+    }
+
+    fn send(&self, keys: &str) {
+        let status = Command::new("tmux")
+            .args(["send-keys", "-t", &self.name, keys])
+            .status()
+            .expect("tmux send-keys failed");
+        assert!(status.success(), "tmux send-keys exited non-zero");
+    }
+
+    fn send_line(&self, keys: &str) {
+        let status = Command::new("tmux")
+            .args(["send-keys", "-t", &self.name, keys, "Enter"])
+            .status()
+            .expect("tmux send-keys (with Enter) failed");
+        assert!(status.success(), "tmux send-keys exited non-zero");
+    }
+
+    fn capture(&self) -> String {
+        let out = Command::new("tmux")
+            .args(["capture-pane", "-t", &self.name, "-p"])
+            .output()
+            .expect("tmux capture-pane failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// Poll `capture()` until `predicate` returns true or the timeout
+    /// elapses. Returns the final pane content (whether or not the
+    /// predicate matched) so the caller can assert on it.
+    fn wait_for(&self, predicate: impl Fn(&str) -> bool, timeout: Duration) -> String {
+        let start = Instant::now();
+        loop {
+            let pane = self.capture();
+            if predicate(&pane) {
+                return pane;
+            }
+            if start.elapsed() >= timeout {
+                return pane;
+            }
+            sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn run_tmux(args: &[&str]) -> Output {
+    Command::new("tmux")
+        .args(args)
+        .output()
+        .expect("tmux invocation failed")
+}
+
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Substring that proves the status bar's render path ran. The bar uses
+/// `  ·  ` as the inter-segment separator and ends with a state word
+/// ("Ready" while idle, "Working …s" mid-turn). Looking for the separator
+/// next to the state word keeps the check robust against model-name or
+/// branch changes that vary per environment.
+fn status_bar_present(pane: &str) -> bool {
+    pane.contains("·  Ready") || pane.contains("·  ⠴ Working")
+}
+
+#[test]
+fn status_bar_stays_visible_when_slash_popup_opens_and_closes() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("status-popup");
+    session.start(100, 24);
+
+    // Launch nav with a throwaway API key. `--auth api-key` skips the
+    // ~/.codex/auth.json read; the bearer string is only used when a
+    // prompt is submitted, and this test never submits one.
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Initial frame: wait up to 5s for the status bar to render.
+    let initial = session.wait_for(status_bar_present, Duration::from_secs(5));
+    assert!(
+        status_bar_present(&initial),
+        "status bar never appeared on launch:\n{initial}"
+    );
+
+    // Open the slash popup. The popup grows the bottom pane, which
+    // shifts viewport.y upward — exactly the buffer-diff edge case the
+    // 8684e25 fix targeted. Status bar must remain visible.
+    session.send("/");
+    let with_popup = session.wait_for(
+        |pane| pane.contains("/exit") || pane.contains("/find"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        with_popup.contains("/exit") || with_popup.contains("/find"),
+        "slash popup did not open within 3s:\n{with_popup}"
+    );
+    assert!(
+        status_bar_present(&with_popup),
+        "status bar vanished when slash popup opened (regression of 8684e25 — \
+         diff_buffers skipping writes after viewport.y shift):\n{with_popup}"
+    );
+
+    // Close the popup. Viewport.y shifts back down. Status must still
+    // be painted — the buffer reset must fire in both directions.
+    session.send("Escape");
+    // Esc alone doesn't always force a redraw the way a character does;
+    // a Backspace clears the leftover `/` and guarantees a fresh frame.
+    session.send("BSpace");
+    let after_close = session.wait_for(
+        |pane| status_bar_present(pane) && !pane.contains("/exit"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        status_bar_present(&after_close),
+        "status bar missing after popup close:\n{after_close}"
+    );
+    assert!(
+        !after_close.contains("/exit"),
+        "popup did not close:\n{after_close}"
+    );
+}
