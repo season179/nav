@@ -1,8 +1,26 @@
 //! Stream-controller layer for assistant reply rendering.
 //!
 //! The controller keeps the raw streamed source, derives stable vs tail ranges
-//! based on markdown fences/table rules, and pushes newly emitted lines into a
-//! FIFO queue consumed by commit-tick scheduling.
+//! based on markdown fences/table rules, and pushes one tick unit into the
+//! FIFO queue for each newly-stable *source line* (newline-terminated segment
+//! in the model's output). The tail is rendered live — the user always sees
+//! the partial line that's currently growing.
+//!
+//! ## Visibility gate
+//!
+//! `visible_stable_lines` counts source-text lines (not rendered lines)
+//! released for display. [`visible_lines`] returns the rendered body for
+//! `content` up to the *Nth* newline plus the live tail, where N is
+//! `visible_stable_lines`. The commit-tick policy advances the counter one
+//! line at a time in smooth mode and in bulk during catch-up, which is what
+//! paces the perceived stream rate. Without the gate (or without anything
+//! driving the tick) the entire stable region appears the moment the model
+//! emits it, defeating the smoothing layer.
+//!
+//! Tracking by *source* lines (not rendered lines) makes the cap
+//! width-independent: a resize re-wraps the rendered output but the source
+//! line count is invariant, so visibility never drifts when the user
+//! resizes mid-stream.
 
 use std::time::{Duration, Instant};
 
@@ -11,15 +29,20 @@ use ratatui::text::Line;
 
 use super::StreamState;
 
-/// Cached width used for queue refreshes and fallback line rendering.
-const DEFAULT_STREAM_WIDTH: u16 = 80;
-
+#[derive(Default)]
 pub(crate) struct StreamController {
     collector: MarkdownStreamCollector,
     stream_state: StreamState,
     finalized: bool,
-    render_width: u16,
-    rendered_cache: Vec<Line<'static>>,
+    /// Highest byte offset in `collector.content()` we've already enqueued
+    /// tick units for. Each delta extends this by counting newly-completed
+    /// source lines in `content[enqueued_stable_offset..partition_offset]`
+    /// and enqueueing one placeholder per newline.
+    enqueued_stable_offset: usize,
+    /// How many source-text lines in the stable region have been released
+    /// for display. The visible body is the rendered body of content up to
+    /// the Nth newline plus the live tail. Width-independent.
+    visible_stable_lines: usize,
 }
 
 #[derive(Default)]
@@ -43,11 +66,6 @@ impl MarkdownStreamCollector {
 }
 
 impl StreamController {
-    pub(crate) fn set_width(&mut self, width: u16) {
-        self.render_width = width.max(1);
-        self.requeue_lines();
-    }
-
     /// Append `text` to the running stream source.
     pub(crate) fn push_delta(&mut self, text: &str) {
         if self.finalized {
@@ -56,7 +74,7 @@ impl StreamController {
 
         self.collector.push(text);
         self.stream_state.has_seen_delta = true;
-        self.requeue_lines();
+        self.requeue_stable();
     }
 
     /// Replace the streamed source with `text`, preserving finalize semantics.
@@ -64,25 +82,43 @@ impl StreamController {
         self.collector.replace(text);
         self.stream_state.clear_queue();
         self.stream_state.has_seen_delta = true;
-        self.rendered_cache.clear();
+        self.enqueued_stable_offset = 0;
+        self.visible_stable_lines = 0;
         self.finalized = false;
-        self.requeue_lines();
+        self.requeue_stable();
     }
 
-    /// Mark stream complete and flush whatever remains stable-aware.
+    /// Mark stream complete and snap visibility to the entire body. After
+    /// finalize the partition includes everything (no held-back tail), so we
+    /// release every source line at once — pending commit ticks would
+    /// otherwise leave the final reply half-revealed.
+    ///
+    /// `count_newlines + 1` covers a trailing partial line that has no
+    /// newline of its own (replies that don't end with `\n`); the extra
+    /// slot makes `nth_newline_offset` clamp to `content.len()` so the
+    /// final segment renders.
     pub(crate) fn finalize(&mut self) {
         self.finalized = true;
-        self.requeue_lines();
+        self.requeue_stable();
+        self.visible_stable_lines =
+            count_newlines(self.collector.content()).saturating_add(1);
+        self.stream_state.clear_queue();
     }
 
-    /// Consume one queued render line.
+    /// Drain one queued unit and release one more source line for display.
+    /// Called by [`super::commit_tick::run_commit_tick`] under smooth mode.
     pub(crate) fn on_commit_tick(&mut self) -> Vec<Line<'static>> {
-        self.stream_state.step()
+        let drained = self.stream_state.step();
+        self.visible_stable_lines = self.visible_stable_lines.saturating_add(drained.len());
+        drained
     }
 
-    /// Consume up to `max_lines` queued render lines.
+    /// Drain up to `max_lines` queued units and release that many source
+    /// lines for display. Used by catch-up mode when queue pressure builds.
     pub(crate) fn on_commit_tick_batch(&mut self, max_lines: usize) -> Vec<Line<'static>> {
-        self.stream_state.drain_n(max_lines)
+        let drained = self.stream_state.drain_n(max_lines);
+        self.visible_stable_lines = self.visible_stable_lines.saturating_add(drained.len());
+        drained
     }
 
     /// Returns `true` when no lines are queued for commit.
@@ -90,67 +126,83 @@ impl StreamController {
         self.stream_state.is_idle()
     }
 
-    /// Number of queued lines pending commit.
+    /// Number of queued tick units pending commit. Surfaces queue pressure
+    /// to the chunking policy in units of source lines.
     pub(crate) fn queued_lines(&self) -> usize {
         self.stream_state.queued_len()
     }
 
-    /// Age of oldest queued line.
+    /// Age of the oldest queued tick unit. Surfaces queue staleness so a
+    /// lone source line that has been waiting too long triggers catch-up
+    /// even without depth pressure.
     pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
         self.stream_state.oldest_queued_age(now)
     }
 
+    /// Render the *entire* stable region (no visibility gate). Used by
+    /// partition tests; the display path goes through [`visible_lines`].
+    #[cfg(test)]
     pub(crate) fn stable_lines(&self, width: u16) -> Vec<Line<'static>> {
         let partition_end = self.partition_offset();
         render_body(&self.collector.content()[..partition_end], width)
     }
 
+    #[cfg(test)]
     pub(crate) fn tail_lines(&self, width: u16) -> Vec<Line<'static>> {
         let partition_end = self.partition_offset();
         render_body(&self.collector.content()[partition_end..], width)
     }
 
-    /// Render both stable + tail in one pass.
-    pub(crate) fn partitioned_lines(&self, width: u16) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    /// Visible body for display: the rendered prefix of stable content up
+    /// to `visible_stable_lines` newlines, plus the live tail. The tail is
+    /// always shown — only the stable region is gated, so partial input
+    /// keeps flowing while the chunking policy paces the release of
+    /// completed lines.
+    pub(crate) fn visible_lines(&self, width: u16) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
         let partition_end = self.partition_offset();
-        (
-            render_body(&self.collector.content()[..partition_end], width),
-            render_body(&self.collector.content()[partition_end..], width),
-        )
+        let visible_end =
+            nth_newline_offset(&self.collector.content()[..partition_end], self.visible_stable_lines);
+        let stable = render_body(&self.collector.content()[..visible_end], width);
+        let tail = render_body(&self.collector.content()[partition_end..], width);
+        (stable, tail)
     }
 
-    /// Count partitioned line count without extra allocations.
-    pub(crate) fn partitioned_line_count(&self, width: u16) -> usize {
+    /// Visible body height without materializing `Vec<Line>`. The streaming
+    /// cell calls this on the scroll hot path.
+    pub(crate) fn visible_line_count(&self, width: u16) -> usize {
         let partition_end = self.partition_offset();
-        count_wrapped_body_lines(&self.collector.content()[..partition_end], width)
-            + count_wrapped_body_lines(&self.collector.content()[partition_end..], width)
+        let visible_end =
+            nth_newline_offset(&self.collector.content()[..partition_end], self.visible_stable_lines);
+        let stable = count_wrapped_body_lines(&self.collector.content()[..visible_end], width);
+        let tail = count_wrapped_body_lines(&self.collector.content()[partition_end..], width);
+        stable + tail
     }
 
-    fn rendered_lines_at(&self, width: u16) -> Vec<Line<'static>> {
-        let partition_end = self.partition_offset();
-        let stable = render_body(&self.collector.content()[..partition_end], width);
-        let mut lines = stable;
-        lines.extend(render_body(&self.collector.content()[partition_end..], width));
-        lines
-    }
-
-    fn requeue_lines(&mut self) {
+    fn requeue_stable(&mut self) {
         if !self.stream_state.has_seen_delta {
             self.stream_state.clear_queue();
-            self.rendered_cache.clear();
+            self.enqueued_stable_offset = 0;
             return;
         }
 
-        let current = self.rendered_lines_at(self.render_width);
-
-        let divergence = first_diverging_line(&self.rendered_cache, &current);
-        let should_reset_queue = divergence < self.rendered_cache.len() || self.rendered_cache.is_empty();
-        if should_reset_queue {
-            self.stream_state.clear_queue();
+        let partition_end = self.partition_offset();
+        if self.enqueued_stable_offset >= partition_end {
+            return;
         }
-        self.stream_state.enqueue(current[divergence..].to_vec());
 
-        self.rendered_cache = current;
+        // Each new newline in the stable region becomes one tick unit so
+        // the chunking policy can pace per-source-line. We use placeholder
+        // `Line::default()` entries because the display path renders fresh
+        // from `collector.content()` — the queued Line values are never
+        // read for paint, only counted and timed.
+        let new_stable = &self.collector.content()[self.enqueued_stable_offset..partition_end];
+        let new_newlines = count_newlines(new_stable);
+        if new_newlines > 0 {
+            let placeholders: Vec<Line<'static>> =
+                std::iter::repeat_with(Line::default).take(new_newlines).collect();
+            self.stream_state.enqueue(placeholders);
+        }
+        self.enqueued_stable_offset = partition_end;
     }
 
     fn partition_offset(&self) -> usize {
@@ -209,16 +261,30 @@ impl StreamController {
     }
 }
 
-impl Default for StreamController {
-    fn default() -> Self {
-        Self {
-            collector: MarkdownStreamCollector::default(),
-            stream_state: StreamState::default(),
-            finalized: false,
-            render_width: DEFAULT_STREAM_WIDTH,
-            rendered_cache: Vec::new(),
+/// Count `\n` bytes in `text`. Used for both queue-population sizing and
+/// the final snap-to-total in `finalize`. UTF-8-safe because `\n` is a
+/// single ASCII byte that can't appear inside a multi-byte sequence.
+fn count_newlines(text: &str) -> usize {
+    text.as_bytes().iter().filter(|b| **b == b'\n').count()
+}
+
+/// Byte offset *after* the `n`-th newline in `text`. Returns 0 for `n == 0`
+/// and `text.len()` if fewer than `n` newlines exist. Used by the display
+/// path to slice the stable region at the visibility boundary.
+fn nth_newline_offset(text: &str, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut count = 0;
+    for (i, b) in text.as_bytes().iter().enumerate() {
+        if *b == b'\n' {
+            count += 1;
+            if count == n {
+                return i + 1;
+            }
         }
     }
+    text.len()
 }
 
 enum State {
@@ -247,14 +313,6 @@ struct LineSpan<'a> {
     start: usize,
     end: usize,
     has_newline: bool,
-}
-
-fn first_diverging_line(lhs: &[Line<'_>], rhs: &[Line<'_>]) -> usize {
-    let mut i = 0;
-    while i < lhs.len() && i < rhs.len() && lhs[i] == rhs[i] {
-        i += 1;
-    }
-    i
 }
 
 fn line_spans(s: &str) -> Vec<LineSpan<'_>> {
@@ -323,10 +381,6 @@ mod tests {
             s.push('\n');
         }
         s
-    }
-
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans.iter().map(|span| span.content.to_string()).collect()
     }
 
     fn snapshot_body(c: &StreamController, width: u16) -> String {
@@ -424,20 +478,36 @@ mod tests {
     }
 
     #[test]
-    fn queue_drains_fifo() {
+    fn queue_drains_fifo_and_advances_visibility() {
+        // Two source lines push two tick units onto the queue. Each
+        // smooth-mode tick drains one and advances visible_stable_lines
+        // by one; after both ticks the queue is idle. We check the
+        // visible body (not the drained Lines themselves, which are
+        // placeholders) — that's the contract the display path uses.
         let mut c = StreamController::default();
         c.push_delta("alpha\n");
         c.push_delta("beta\n");
 
-        let first = c.on_commit_tick();
-        let second = c.on_commit_tick();
-        let third = c.on_commit_tick();
+        assert_eq!(c.queued_lines(), 2);
 
+        let first = c.on_commit_tick();
+        let visible_after_first = lines_text(&c.visible_lines(40).0);
         assert_eq!(first.len(), 1);
+        assert!(
+            visible_after_first.contains("alpha") && !visible_after_first.contains("beta"),
+            "smooth tick 1 must reveal only the first source line; got:\n{visible_after_first}"
+        );
+
+        let second = c.on_commit_tick();
+        let visible_after_second = lines_text(&c.visible_lines(40).0);
         assert_eq!(second.len(), 1);
-        assert!(third.is_empty());
-        assert_eq!(line_text(&first[0]), "  alpha");
-        assert_eq!(line_text(&second[0]), "  beta");
+        assert!(
+            visible_after_second.contains("alpha") && visible_after_second.contains("beta"),
+            "smooth tick 2 must reveal the second source line; got:\n{visible_after_second}"
+        );
+
+        let third = c.on_commit_tick();
+        assert!(third.is_empty(), "no more queued units to drain");
         assert!(c.is_idle());
     }
 

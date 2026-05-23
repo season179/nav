@@ -1,9 +1,13 @@
+use std::time::Instant;
+
 use nav_core::UserAttachment;
 use ratatui::style::Color;
 use ratatui::text::Line;
 
 use crate::history::HistoryCell;
-use crate::streaming::StreamController;
+use crate::streaming::commit_tick::{CommitTickScope, run_commit_tick};
+use crate::streaming::controller::StreamController;
+use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::theme::Theme;
 
 use super::row::{TranscriptRow, TranscriptRowKind, finish_row_lines};
@@ -98,13 +102,32 @@ impl AssistantMessageCell {
         self.controller.replace_buffer(text);
         self.controller.finalize();
     }
+
+    /// Run one commit-tick pass against `policy` and report whether any
+    /// source lines became newly visible. Returns `true` when the caller
+    /// should mark the frame dirty so the freshly-released lines paint.
+    ///
+    /// `false` covers both "no queued lines" (idle stream) and "policy held
+    /// the line back this tick" (smooth mode just spent its budget). The
+    /// caller is expected to call this on every frame tick while the cell
+    /// is still in-flight; once `controller.is_idle()` returns true *and*
+    /// `finalize` has fired, ticks become a no-op.
+    pub(crate) fn on_commit_tick(&mut self, policy: &mut AdaptiveChunkingPolicy) -> bool {
+        let outcome = run_commit_tick(
+            policy,
+            Some(&mut self.controller),
+            CommitTickScope::AnyMode,
+            Instant::now(),
+        );
+        !outcome.lines.is_empty()
+    }
 }
 
 impl HistoryCell for AssistantMessageCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let style = TranscriptRowKind::AssistantMessage.style();
         let render_width = style.body_width(width, style.label());
-        let (stable, tail) = self.controller.partitioned_lines(render_width);
+        let (stable, tail) = self.controller.visible_lines(render_width);
         let mut out: Vec<Line<'static>> = Vec::with_capacity(stable.len() + tail.len() + 1);
         out.extend(stable);
         out.extend(tail);
@@ -120,7 +143,7 @@ impl HistoryCell for AssistantMessageCell {
         // single placeholder row before the blank.
         let style = TranscriptRowKind::AssistantMessage.style();
         let render_width = style.body_width(width, style.label());
-        let body = self.controller.partitioned_line_count(render_width);
+        let body = self.controller.visible_line_count(render_width);
         let chrome = if body == 0 { 2 } else { 1 };
         u16::try_from(body + chrome).unwrap_or(u16::MAX)
     }
@@ -188,12 +211,68 @@ mod tests {
         cell.push_delta("| a | b |\n");
         cell.push_delta("|---|---|\n");
 
+        // Drive one commit tick so the "Quick summary:" stable line is
+        // released for display. Without this the chunking gate keeps the
+        // entire stable region hidden and only the (live) tail renders —
+        // by design, since the smoothing layer paces line reveal.
+        let mut policy = AdaptiveChunkingPolicy::default();
+        cell.on_commit_tick(&mut policy);
+
         insta::assert_snapshot!(lines_text(&cell.display_lines(40)), @r"
         • Quick summary:
           | a | b |
           |---|---|
 
         ");
+    }
+
+    #[test]
+    fn streaming_stable_lines_hidden_until_commit_tick() {
+        // Companion to the test above: with no commit tick driven, only
+        // the live tail (still-growing source lines past the partition)
+        // renders. The stable "Quick summary:" line is queued but not
+        // yet released — a smooth-mode tick would let it through.
+        let mut cell = AssistantMessageCell::streaming();
+        cell.push_delta("Quick summary:\n");
+        cell.push_delta("| a | b |\n");
+        cell.push_delta("|---|---|\n");
+
+        let rendered = lines_text(&cell.display_lines(40));
+        assert!(
+            !rendered.contains("Quick summary"),
+            "stable line leaked before commit-tick released it; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("| a | b |"),
+            "live tail must still render; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn catch_up_mode_batches_multiple_stable_lines() {
+        // Push enough source lines to exceed the catch-up depth threshold
+        // (ENTER_QUEUE_DEPTH_LINES = 8). One commit tick under the
+        // resulting catch-up mode should release them all at once,
+        // proving the chunking layer is actually wired through to the
+        // visibility gate. Without catch-up, smooth mode would only
+        // release a single line per tick.
+        let mut cell = AssistantMessageCell::streaming();
+        for i in 0..10 {
+            cell.push_delta(&format!("line {i}\n"));
+        }
+
+        let mut policy = AdaptiveChunkingPolicy::default();
+        cell.on_commit_tick(&mut policy);
+
+        let rendered = lines_text(&cell.display_lines(60));
+        // All ten lines should now be present; if smooth mode were
+        // gating, we'd only see line 0.
+        for i in 0..10 {
+            assert!(
+                rendered.contains(&format!("line {i}")),
+                "catch-up tick did not release line {i}; got:\n{rendered}"
+            );
+        }
     }
 
     #[test]

@@ -1340,6 +1340,49 @@ fn inflight_tool_placeholders_preserve_arrival_order() {
 }
 
 #[test]
+fn chat_widget_commit_tick_releases_stable_lines() {
+    // The wiring contract: ChatWidget::on_commit_tick must propagate to the
+    // streaming cell's chunking policy, otherwise stable lines stay hidden
+    // forever and the user sees only the live tail. If a future refactor
+    // drops the call from the app loop *or* breaks the delegation from
+    // ChatWidget to AssistantMessageCell, this test catches it — without
+    // ticks, "hello" stays gated; with one tick under smooth mode, it
+    // becomes visible.
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "hello\nworld\n".to_string(),
+    });
+
+    let pre_tick = render_lines(&widget.inline_lines(80));
+    assert!(
+        !pre_tick.contains("hello"),
+        "stable line leaked before commit-tick ran; got:\n{pre_tick}"
+    );
+
+    let advanced = widget.on_commit_tick();
+    assert!(advanced, "commit tick must report progress when queue has units");
+
+    let post_tick = render_lines(&widget.inline_lines(80));
+    assert!(
+        post_tick.contains("hello"),
+        "commit tick failed to release the first stable line; got:\n{post_tick}"
+    );
+}
+
+fn render_lines(lines: &[ratatui::text::Line<'static>]) -> String {
+    lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
 fn inline_lines_capped_preserves_placeholders_over_long_stream() {
     // Regression: ratatui's `Paragraph` silently clips rows beyond its
     // chunk height. When `inline_lines` returned (streaming + placeholders)
@@ -1354,6 +1397,12 @@ fn inline_lines_capped_preserves_placeholders_over_long_stream() {
         .map(|i| format!("line {i:02}\n"))
         .collect::<String>();
     widget.ingest(AgentEvent::AssistantMessageDelta { text: long_stream });
+    // Drive a commit tick so the chunking layer releases the stable lines.
+    // 40 queued source lines is well over ENTER_QUEUE_DEPTH_LINES (8), so
+    // the policy enters catch-up and batches the whole reveal in one tick.
+    // Without this the stable region stays hidden behind the smoothing
+    // gate and the cell would only show its (empty) tail.
+    widget.on_commit_tick();
     // `inline_lines` (uncapped) materializes everything — by construction
     // it must exceed the cap we'll pass below, otherwise the test exercises
     // the wrong branch.

@@ -64,16 +64,6 @@ pub(crate) struct AdaptiveChunkingPolicy {
 }
 
 impl AdaptiveChunkingPolicy {
-    pub(crate) fn mode(&self) -> ChunkingMode {
-        self.mode
-    }
-
-    pub(crate) fn reset(&mut self) {
-        self.mode = ChunkingMode::Smooth;
-        self.below_exit_threshold_since = None;
-        self.last_catch_up_exit_at = None;
-    }
-
     pub(crate) fn decide(&mut self, snapshot: QueueSnapshot, now: Instant) -> ChunkingDecision {
         if snapshot.queued_lines == 0 {
             self.note_catch_up_exit(now);

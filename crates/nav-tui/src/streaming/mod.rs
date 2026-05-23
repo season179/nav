@@ -15,10 +15,6 @@ pub(crate) mod chunking;
 pub(crate) mod commit_tick;
 pub(crate) mod controller;
 
-pub(crate) use chunking::{AdaptiveChunkingPolicy, ChunkingDecision, ChunkingMode};
-pub(crate) use commit_tick::{run_commit_tick, CommitTickOutput, CommitTickScope};
-pub(crate) use controller::StreamController;
-
 struct QueuedLine {
     line: Line<'static>,
     enqueued_at: Instant,

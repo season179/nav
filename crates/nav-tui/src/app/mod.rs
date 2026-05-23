@@ -928,6 +928,15 @@ pub async fn run(
                     spinner_tick = spinner_tick.wrapping_add(1);
                     needs_draw = true;
                 }
+                // Drive the streaming chunking policy on the same tick. The
+                // policy advances `visible_stable_lines` by 1 in smooth mode
+                // and in bulk during catch-up; without this call the
+                // streaming cell paints the entire stable region the moment
+                // it lands, defeating the smoothing layer. Outside an active
+                // turn there's no streaming cell, so this is a cheap no-op.
+                if chat.on_commit_tick() {
+                    needs_draw = true;
+                }
                 while event::poll(Duration::from_millis(0))? {
                     match event::read()? {
                         CtEvent::Key(key) => {
