@@ -167,11 +167,11 @@ impl SlashCommandPopup {
             (KeyCode::Enter, m) if !m.contains(KeyModifiers::SHIFT) => {
                 self.try_submit_or_complete(composer)
             }
-            // Up / Down / Esc are the only navigation keys the slash popup
-            // intercepts. j / k are deliberately NOT handled here — they
-            // are typeable characters and must reach the composer so the
+            // Up / Down / Shift+Tab / Esc are the only navigation keys the
+            // slash popup intercepts. j / k are deliberately NOT handled here —
+            // they are typeable characters and must reach the composer so the
             // user can type commands like `/json` or `/kill`.
-            (KeyCode::Up, _) => {
+            (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
                 self.picker.move_up();
                 InputResult::Handled
             }

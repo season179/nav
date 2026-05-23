@@ -1007,6 +1007,14 @@ pub async fn run(
                                 continue;
                             }
                             ctrl_c_count = 0;
+                            // Ctrl+L — force a full redraw (readline convention).
+                            // Invalidate the diff base so flush() repaints every
+                            // cell, not just ones that differ from last frame.
+                            if is_ctrl_l(&key) {
+                                term.terminal.invalidate_previous_buffer();
+                                needs_draw = true;
+                                continue;
+                            }
                             // Scrollback navigation is owned by the terminal
                             // (mouse wheel, PgUp/PgDn) — no in-app scroll keys.
                             match pane.handle_key(key) {
@@ -1091,6 +1099,17 @@ fn emit_local_event(
 
 fn is_ctrl_t(key: &crossterm::event::KeyEvent) -> bool {
     key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Check whether `key` is a Ctrl+L press (no Alt, to avoid colliding
+/// with Ctrl+Alt+L on international layouts). Ignores Release events so
+/// the handler fires exactly once per physical keypress.
+fn is_ctrl_l(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::KeyEventKind;
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('l')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
 fn emit_pending_cleared(
