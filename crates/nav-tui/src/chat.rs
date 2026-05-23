@@ -281,13 +281,9 @@ impl ChatWidget {
                     .push_str(&text);
             }
             AgentEvent::ReasoningDone { text } => {
-                // Discard accumulated deltas — the coalesced `text` from
-                // `ReasoningDone` is authoritative, matching how
-                // `AssistantMessageDone` replaces streamed chunks.
+                // Coalesced `text` is authoritative over streamed deltas.
                 self.streaming_reasoning.take();
-                if !text.is_empty() {
-                    self.push_local_cell(ReasoningCell::new(text));
-                }
+                self.push_reasoning_cell(text);
             }
             AgentEvent::TurnComplete { .. } => {
                 self.end_active_turn_viewport();
@@ -708,13 +704,20 @@ impl ChatWidget {
         }
     }
 
+    /// Push a collapsed reasoning row. Uses [`Self::push_local_cell`] so
+    /// pending exploration summaries flush first — same path as
+    /// [`AgentEvent::ReasoningDone`].
+    fn push_reasoning_cell(&mut self, text: String) {
+        if !text.is_empty() {
+            self.push_local_cell(ReasoningCell::new(text));
+        }
+    }
+
     /// Flush any in-flight reasoning buffer to scrollback as a collapsed
     /// `ReasoningCell`. Called when the streaming assistant closes.
     fn close_streaming_reasoning(&mut self) {
         if let Some(text) = self.streaming_reasoning.take() {
-            if !text.is_empty() {
-                self.finalized.push(Box::new(ReasoningCell::new(text)));
-            }
+            self.push_reasoning_cell(text);
         }
     }
 
