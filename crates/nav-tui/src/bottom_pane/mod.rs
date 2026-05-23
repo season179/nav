@@ -60,7 +60,7 @@ pub struct PendingApproval {
 
 pub struct BottomPane {
     composer: Composer,
-    view: Option<BottomPaneView>,
+    view: Option<Box<dyn BottomPaneView>>,
     /// Set when the user dismisses the slash popup (Esc). Suppresses
     /// auto-reopen on the same `/…` text so the user can press Enter to
     /// submit the slash command as a plain prompt. Cleared once the
@@ -214,9 +214,9 @@ impl BottomPane {
     }
 
     pub fn open_session_picker(&mut self, entries: Vec<SessionPickerEntry>) {
-        self.view = Some(BottomPaneView::SessionPicker(
-            SessionPickerPopup::new_with_theme(entries, self.theme),
-        ));
+        self.view = Some(Box::new(SessionPickerPopup::new_with_theme(
+            entries, self.theme,
+        )));
     }
 
     pub fn take_session_selection(&mut self) -> Option<String> {
@@ -239,7 +239,7 @@ impl BottomPane {
                 0,
                 total,
             );
-            self.view = Some(BottomPaneView::Approval(overlay));
+            self.view = Some(Box::new(overlay));
         }
     }
 
@@ -255,12 +255,14 @@ impl BottomPane {
         self.view.is_none() && self.composer.text().is_empty()
     }
 
-    /// Returns the slash-command popup if it is the active overlay.
+    /// Returns the slash-command popup if it is the active overlay. The
+    /// downcast is the price of routing all overlays through the
+    /// `BottomPaneView` trait — keeps `view.rs` and `key_handling.rs` free of
+    /// per-popup enum arms.
     pub fn slash_popup(&self) -> Option<&SlashCommandPopup> {
-        match &self.view {
-            Some(BottomPaneView::SlashCommand(p)) => Some(p),
-            _ => None,
-        }
+        self.view
+            .as_deref()
+            .and_then(|v| v.as_any().downcast_ref::<SlashCommandPopup>())
     }
 }
 

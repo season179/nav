@@ -25,6 +25,7 @@ mod custom_terminal;
 mod history;
 mod commands;
 mod insert_history;
+mod render;
 mod streaming;
 mod theme;
 mod chat;
@@ -36,5 +37,4 @@ pub use cells::{
 };
 pub use history::HistoryCell;
 pub use commands::{SlashAction, classify_slash, prepend_pending_skill};
-pub use streaming::StreamController;
 pub use chat::ChatWidget;

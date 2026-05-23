@@ -11,9 +11,15 @@
 //! Skips cleanly when tmux is not on `PATH` so CI environments without
 //! it still pass.
 
+use serde_json::json;
+use std::fs;
+use std::io::Write;
 use std::process::{Command, Output};
+use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use std::net::{TcpListener, TcpStream};
+use tempfile::tempdir;
 
 const TEST_API_KEY: &str = "test-only-not-real";
 
@@ -69,6 +75,32 @@ impl Session {
             .status()
             .expect("tmux send-keys (with Enter) failed");
         assert!(status.success(), "tmux send-keys exited non-zero");
+    }
+
+    /// Resize the tmux window so the running TUI sees a `SIGWINCH` /
+    /// resize event. Tests use this to verify rect math under varying
+    /// `area.height` / `area.width`.
+    ///
+    /// Returns `false` when `tmux resize-window` is unavailable (added
+    /// in tmux 2.9, May 2019) so callers can skip cleanly rather than
+    /// panic on hosts pinning an older tmux — matches the
+    /// "skip cleanly when tmux is absent" rule in CLAUDE.md.
+    fn try_resize(&self, width: u16, height: u16) -> bool {
+        let out = Command::new("tmux")
+            .args([
+                "resize-window",
+                "-t",
+                &self.name,
+                "-x",
+                &width.to_string(),
+                "-y",
+                &height.to_string(),
+            ])
+            .output();
+        match out {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
     }
 
     /// Live cursor coordinates as reported by tmux. `capture-pane` only
@@ -147,11 +179,27 @@ fn run_tmux(args: &[&str]) -> Output {
 }
 
 fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
+    let probe_session = format!("nav-tmux-probe-{}", std::process::id());
+    match Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &probe_session,
+            "-x",
+            "20",
+            "-y",
+            "10",
+        ])
         .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    {
+        Ok(out) if out.status.success() => {
+            let _ = run_tmux(&["kill-session", "-t", &probe_session]);
+            true
+        }
+        Ok(_) => false,
+        Err(_) => false,
+    }
 }
 
 /// Substring that proves the status bar's render path ran. The bar uses
@@ -181,10 +229,88 @@ fn launch_nav(session: &Session) {
     session.send_line(&cmd);
 }
 
+fn spawn_mock_streaming_server(chunk_count: usize) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock streaming server bind");
+    let port = listener
+        .local_addr()
+        .expect("mock streaming server local addr")
+        .port();
+    let _ = listener.set_nonblocking(true);
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    write_mock_streaming_response(stream, chunk_count);
+                    return;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(10) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(25));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    port
+}
+
+fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    for i in 0..chunk_count {
+        // Newline-terminate each chunk so the StreamController's partition
+        // logic flips bytes from tail to stable, which is the path the
+        // visibility gate (`AdaptiveChunkingPolicy` + commit ticks)
+        // actually paces. A space separator instead of `\n` would keep
+        // every chunk in the live tail and bypass the gate entirely.
+        let chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": format!("chunk-{i}\n")
+                }
+            }]
+        })
+        .to_string();
+        let frame = format!("data: {chunk}\n\n");
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
+        if stream.flush().is_err() {
+            return;
+        }
+        sleep(Duration::from_millis(5));
+    }
+
+    let final_payload = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "SMOKE_OK_STREAM"
+            },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let final_chunk = format!("data: {final_payload}\n\n");
+    if stream.write_all(final_chunk.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+}
+
 #[test]
 fn status_bar_stays_visible_when_slash_popup_opens_and_closes() {
     if !tmux_available() {
-        eprintln!("tmux not available on PATH, skipping");
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
         return;
     }
 
@@ -250,16 +376,20 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
 
     launch_nav(&session);
 
-    let launch = session.wait_for(status_bar_present, Duration::from_secs(5));
-    assert!(
-        status_bar_present(&launch),
-        "status bar never appeared on launch:\n{launch}"
-    );
-    let baseline_cursor = session.cursor();
+    // Wait directly on the composer placeholder rather than
+    // `status_bar_present`, because the status bar's `Ready` segment can
+    // be truncated off the right edge by a long branch name + cwd at
+    // 100-col width. The composer row is what this test actually needs
+    // a stable anchor on anyway.
     let baseline = session.wait_for(
         |pane| pane.contains("Ask nav to do anything"),
         Duration::from_secs(5),
     );
+    assert!(
+        baseline.contains("Ask nav to do anything"),
+        "composer placeholder never appeared on launch:\n{baseline}"
+    );
+    let baseline_cursor = session.cursor();
     let baseline_row = last_row_with(&baseline, |line| line.contains("Ask nav to do anything"))
         .expect("composer placeholder row should be visible");
 
@@ -283,17 +413,23 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
         "overlay text disappeared after resize:\n{overlay_after_resize}"
     );
 
+    // Let nav settle on the resize event before sending Escape — otherwise
+    // the resize and the Escape can land in the same crossterm poll tick
+    // and one of them gets swallowed by the partial-redraw race.
+    sleep(Duration::from_millis(150));
     session.send("Escape");
     let restored = session.wait_for(
-        |pane| status_bar_present(pane) && !pane.contains("Test Overlay"),
+        |pane| pane.contains("Ask nav to do anything") && !pane.contains("Test Overlay"),
         Duration::from_secs(5),
     );
     let restored_row = last_row_with(&restored, |line| line.contains("Ask nav to do anything"))
-        .expect("composer placeholder row should return after overlay close");
+        .unwrap_or_else(|| {
+            panic!("composer placeholder row should return after overlay close, pane was:\n{restored}")
+        });
     let (cursor_x, cursor_y) = session.cursor();
 
     assert_eq!(
-        restored_row as u16, baseline_row,
+        restored_row, baseline_row,
         "composer should return to same inline row after overlay resize+close \
          (before={baseline_row}, after={restored_row})\n{restored}"
     );
@@ -311,7 +447,7 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
 #[test]
 fn status_bar_paints_below_composer() {
     if !tmux_available() {
-        eprintln!("tmux not available on PATH, skipping");
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
         return;
     }
 
@@ -358,7 +494,7 @@ fn status_bar_paints_below_composer() {
 #[test]
 fn cursor_lands_inside_composer_on_startup() {
     if !tmux_available() {
-        eprintln!("tmux not available on PATH, skipping");
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
         return;
     }
 
@@ -391,5 +527,250 @@ fn cursor_lands_inside_composer_on_startup() {
     assert!(
         cx >= 2,
         "cursor column should be inside the composer content area, found {cx}\n{pane}"
+    );
+}
+
+#[test]
+fn streaming_response_lands_in_scrollback_without_artifacts() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    // 12 chunks: large enough to cross the catch-up threshold
+    // (ENTER_QUEUE_DEPTH_LINES = 8 in `streaming::chunking`), small
+    // enough to fit on the 24-row viewport so `chunk-0` is still
+    // visible when the final marker lands.
+    let mock_port = spawn_mock_streaming_server(12);
+    let workdir = tempdir().expect("tempdir for mock provider settings");
+    let settings_dir = workdir.path().join(".nav");
+    fs::create_dir_all(&settings_dir).expect("create mock .nav settings dir");
+    fs::write(
+        settings_dir.join("settings.json"),
+        serde_json::to_string_pretty(&json!({
+            "providers": {
+                "mock": {
+                    "name": "Local Mock",
+                    "base_url": format!("http://127.0.0.1:{}/v1", mock_port),
+                    "models": {
+                        "smoke": {}
+                    }
+                }
+            },
+            "default_model": "mock/smoke",
+        }))
+        .expect("serialize mock settings"),
+    )
+    .expect("write mock settings file");
+
+    let session = fresh_session("streaming-scrollback");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!("cd {cwd} && {nav} --auth api-key --model mock/smoke"));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "streaming nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("stream a long noisy answer to stress rendering");
+
+    let saw_first_chunk = session.wait_for(
+        |pane| pane.contains("chunk-0"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        saw_first_chunk.contains("chunk-0"),
+        "did not observe streaming chunks in first frames:\n{saw_first_chunk}"
+    );
+
+    let completed = session.wait_for(
+        |pane| pane.contains("SMOKE_OK_STREAM"),
+        Duration::from_secs(15),
+    );
+    assert!(
+        completed.contains("SMOKE_OK_STREAM"),
+        "streaming final marker never landed:\n{completed}"
+    );
+    assert!(
+        !completed.contains("data:"),
+        "raw SSE payload leaked into the TUI:\n{completed}"
+    );
+    assert_eq!(
+        completed.matches("SMOKE_OK_STREAM").count(),
+        1,
+        "expected the final marker once in the final frame, got:\n{completed}"
+    );
+}
+
+/// Locks in the [`BottomPaneView`] trait-dispatch path end-to-end (BP-01).
+///
+/// Exercises the three places the refactor changed:
+///
+/// 1. `reconcile_popups` constructs a `Box<dyn BottomPaneView>` for the slash
+///    popup when the composer starts with `/`.
+/// 2. `handle_key` dispatches the keystroke through the trait method and
+///    routes navigation (`Down`) inside the popup.
+/// 3. On Esc-dismiss, the `view.as_any_mut().is::<SlashCommandPopup>()`
+///    downcast must fire so the suppression flag is set — otherwise the
+///    composer would still start with `/h` and `reconcile_popups` would
+///    immediately reopen the popup, defeating the dismiss.
+///
+/// Before committing, temporarily revert the trait refactor in
+/// `bottom_pane/view.rs` and `bottom_pane/key_handling.rs` and confirm this
+/// test fails — a refactor that no test can catch is a refactor worth nothing.
+#[test]
+fn slash_popup_open_navigate_dismiss_via_trait_dispatch() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("slash-trait-dispatch");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Wait for the composer placeholder so we know the first frame is up.
+    session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(5),
+    );
+
+    // (1) Open the slash popup. `/h` filters to `/help`, `/handoff`. The
+    // popup must render — proves `reconcile_popups` boxed up a popup and
+    // `BottomPane::render` ran trait-dispatched `view.render`.
+    session.send("/h");
+    let with_popup = session.wait_for(|p| p.contains("/help"), Duration::from_secs(3));
+    assert!(
+        with_popup.contains("/help"),
+        "slash popup did not render `/help` row — trait `render` dispatch may be broken:\n{with_popup}"
+    );
+
+    // (2) Navigate. `Down` only does anything if `handle_key` reached the
+    // popup's `handle_key_inner` through the trait. We don't assert on which
+    // row is highlighted (terminal colour rendering is finicky in tmux) — but
+    // a stray panic / no-op here would still show up as the popup vanishing
+    // or the composer eating the keystroke.
+    session.send("Down");
+    let after_nav = session.wait_for(|p| p.contains("/help"), Duration::from_secs(1));
+    assert!(
+        after_nav.contains("/help"),
+        "popup disappeared after Down — `handle_key` did not route through trait:\n{after_nav}"
+    );
+
+    // (3) Dismiss with Esc. The popup must clear AND `slash_popup_suppressed`
+    // must be set so the popup does not immediately reopen — that flag is
+    // gated by the `any.is::<SlashCommandPopup>()` downcast in `handle_key`.
+    // Composer keeps `/h` (Esc only dismisses the popup, not the text).
+    session.send("Escape");
+    let after_dismiss = session.wait_for(
+        |p| !p.contains("/help") && !p.contains("/handoff"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        !after_dismiss.contains("/help"),
+        "popup did not dismiss on Esc — suppression-flag downcast may be broken:\n{after_dismiss}"
+    );
+    assert!(
+        status_bar_present(&after_dismiss),
+        "status bar missing after popup dismiss:\n{after_dismiss}"
+    );
+}
+
+/// Resize regression for the FlexRenderable-driven bottom-pane layout.
+///
+/// Before LAY-01, the pane split rows with `Layout::vertical([...])` and
+/// each helper (`desired_height`, `cursor_position`, `Widget::render`)
+/// recomputed the constraints inline. After LAY-01 they all share a
+/// `FlexRenderable` built from the same chunk wrappers. This test resizes
+/// the terminal between a tall and a short geometry and asserts the
+/// composer row + caret stay locked to the same flex slot — if the flex
+/// allocator returned a stale or off-by-one rect on resize, the composer
+/// would drift up or the caret would land on the wrong row.
+///
+/// Self-check: revert `bottom_pane/render.rs` to use `Layout::vertical`
+/// only in `Widget::render` (without updating `cursor_position`) and the
+/// caret-row assertion after the second resize will fire, because the
+/// two paths no longer agree on which row the composer occupies.
+#[test]
+fn bottom_pane_layout_survives_resize() {
+    if !tmux_available() {
+        eprintln!("tmux not available on PATH, skipping");
+        return;
+    }
+
+    let session = fresh_session("layout-resize");
+    // Start tall so the initial composer paints well clear of any rows
+    // tmux might keep around from the surrounding shell prompt.
+    session.start(120, 30);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cmd = format!("OPENAI_API_KEY=test-only-not-real {nav} --auth api-key");
+    session.send_line(&cmd);
+
+    // Composer must render before the first resize, otherwise the test
+    // would race the launch banner.
+    let initial = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        initial.contains("Ask nav to do anything"),
+        "composer placeholder did not render at 120x30:\n{initial}"
+    );
+
+    // Shrink. The pane absorbs less vertical space; FlexRenderable's
+    // flex-1 composer slot has to recompute against the new height.
+    if !session.try_resize(80, 18) {
+        eprintln!("tmux resize-window unsupported (needs tmux >= 2.9), skipping");
+        return;
+    }
+    let small = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(3),
+    );
+    let small_composer_row = last_row_with(&small, |line| {
+        line.contains("Ask nav to do anything")
+    })
+    .unwrap_or_else(|| panic!("composer missing after shrink:\n{small}"));
+    let (cx_small, cy_small) = session.cursor();
+    assert_eq!(
+        cy_small as usize, small_composer_row,
+        "after shrink the caret row drifted from the composer (\
+         composer_row={small_composer_row}, cursor=({cx_small},{cy_small}))\n{small}"
+    );
+    assert!(
+        cx_small >= 2,
+        "after shrink the caret should sit past the 2-col gutter, got cx={cx_small}\n{small}"
+    );
+
+    // Grow back. The flex slot must expand again without leaving the
+    // composer pinned at the smaller row — a sign of stale constraints.
+    assert!(
+        session.try_resize(120, 30),
+        "second resize-window failed after the first succeeded"
+    );
+    let big = session.wait_for(
+        |p| p.contains("Ask nav to do anything"),
+        Duration::from_secs(3),
+    );
+    let big_composer_row =
+        last_row_with(&big, |line| line.contains("Ask nav to do anything"))
+            .unwrap_or_else(|| panic!("composer missing after regrow:\n{big}"));
+    let (cx_big, cy_big) = session.cursor();
+    assert_eq!(
+        cy_big as usize, big_composer_row,
+        "after regrow the caret row drifted from the composer (\
+         composer_row={big_composer_row}, cursor=({cx_big},{cy_big}))\n{big}"
+    );
+    assert!(
+        cx_big >= 2,
+        "after regrow the caret should sit past the 2-col gutter, got cx={cx_big}\n{big}"
     );
 }

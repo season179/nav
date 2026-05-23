@@ -12,6 +12,7 @@ use crate::cells::{
 };
 use crate::cells::ExplorationEntry;
 use crate::history::HistoryCell;
+use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::theme::Theme;
 
 /// Scrollback-first chat widget. Finalized cells get rendered and queued
@@ -58,6 +59,12 @@ pub struct ChatWidget {
     /// frame ticks. While buffered, this also feeds the inline
     /// `ExploringSummaryCell` so the user sees the running summary live.
     pending_explorations: Vec<(&'static str, Vec<String>)>,
+    /// Adaptive chunking state shared across streaming sessions. Held on
+    /// the widget (not the cell) so the catch-up cooldown carries between
+    /// the user's prompts — a burst near the end of one reply shouldn't
+    /// allow the next reply to immediately re-enter catch-up. Driven by
+    /// [`Self::on_commit_tick`] from the app's frame loop.
+    adaptive_chunking: AdaptiveChunkingPolicy,
 }
 
 impl ChatWidget {
@@ -76,7 +83,19 @@ impl ChatWidget {
             streaming_assistant: None,
             inflight_tool_calls: Vec::new(),
             pending_explorations: Vec::new(),
+            adaptive_chunking: AdaptiveChunkingPolicy::default(),
         }
+    }
+
+    /// Run one commit-tick pass against the in-flight streaming assistant
+    /// cell, if any, and report whether any source lines became visible.
+    /// `true` means the caller should request a redraw — fresh lines need
+    /// painting. Called from the app's frame timer arm.
+    pub fn on_commit_tick(&mut self) -> bool {
+        let Some(cell) = self.streaming_assistant.as_mut() else {
+            return false;
+        };
+        cell.on_commit_tick(&mut self.adaptive_chunking)
     }
 
     /// Append a user-authored message before the agent loop echoes the durable

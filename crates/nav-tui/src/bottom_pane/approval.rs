@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use super::composer::Composer;
-use super::view::InputResult;
+use super::view::{BottomPaneView, InputResult};
 
 pub struct ApprovalOverlay {
     pub approval_id: String,
@@ -57,10 +57,11 @@ impl ApprovalOverlay {
         }
     }
 
-    /// Map a keystroke to a decision. Returns `Handled` for any key we
-    /// recognized (including decision keys); the caller marks the overlay
-    /// complete and pops it via `take_decision()`.
-    pub fn handle_key(&mut self, key: KeyEvent, _composer: &mut Composer) -> InputResult {
+    pub fn take_decision(&mut self) -> Option<ReviewDecision> {
+        self.decision.take()
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> InputResult {
         let d = match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                 Some(ReviewDecision::Approved)
@@ -72,28 +73,11 @@ impl ApprovalOverlay {
         };
         if let Some(d) = d {
             self.decision = Some(d);
-            InputResult::Handled
-        } else {
-            // Swallow other keys so the composer doesn't pick them up while
-            // a modal approval is on screen.
-            InputResult::Handled
         }
+        InputResult::Handled
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.decision.is_some()
-    }
-
-    pub fn take_decision(&mut self) -> Option<ReviewDecision> {
-        self.decision.take()
-    }
-
-    pub fn desired_height(&self, _width: u16) -> u16 {
-        // header + ~3 body lines + keybindings + border
-        8
-    }
-
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    fn render_inner(&self, area: Rect, buf: &mut Buffer) {
         let mut lines: Vec<Line> = Vec::new();
         let header = if self.queue_total > 1 {
             format!(
@@ -144,6 +128,28 @@ impl ApprovalOverlay {
                     .border_style(Style::default().fg(Color::Yellow)),
             )
             .render(area, buf);
+    }
+}
+
+impl BottomPaneView for ApprovalOverlay {
+    /// Map a keystroke to a decision. Returns `Handled` for any key while a
+    /// modal approval is on screen — including keys we ignore — so the
+    /// composer doesn't pick them up underneath.
+    fn handle_key(&mut self, key: KeyEvent, _composer: &mut Composer) -> InputResult {
+        self.handle_key_inner(key)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.decision.is_some()
+    }
+
+    fn desired_height(&self, _width: u16) -> u16 {
+        // header + ~3 body lines + keybindings + border
+        8
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_inner(area, buf);
     }
 }
 
