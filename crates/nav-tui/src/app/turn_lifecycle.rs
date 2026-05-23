@@ -10,7 +10,7 @@ use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
     AgentEvent, Catalog, ControlPlane, ModelTransportHandle, PendingInput, PendingInputDraft,
     PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
-    TurnControls, UserAttachment, cli::Args,
+    TurnControls, TurnUsage, UserAttachment, cli::Args,
 };
 use std::collections::VecDeque;
 use std::path::Path;
@@ -36,6 +36,8 @@ pub(super) struct ActiveTurnHandle {
     task: JoinHandle<()>,
     steering: PendingSteeringQueue,
     started_at: Instant,
+    /// Summed across per-iteration [`AgentEvent::TurnComplete`] events.
+    pub(super) usage: TurnUsage,
 }
 
 impl ActiveTurnHandle {
@@ -44,6 +46,7 @@ impl ActiveTurnHandle {
             task,
             steering,
             started_at: Instant::now(),
+            usage: TurnUsage::default(),
         }
     }
 

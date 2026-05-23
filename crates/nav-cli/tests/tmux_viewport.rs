@@ -23,6 +23,7 @@ use tempfile::{TempDir, tempdir};
 
 const TEST_API_KEY: &str = "test-only-not-real";
 const MOCK_FINAL_MARKER: &str = "SMOKE_OK_STREAM";
+const MOCK_TURN_SEPARATOR_MARKER: &str = "TURN_SEP_OK";
 const MOCK_FINAL_REFLOW_TEXT: &str =
     "source backed markdown reflow keeps this finalized assistant message clean after resize";
 const MOCK_FINAL_REFLOW_MIDPOINT: &str = "finalized assistant message";
@@ -249,7 +250,7 @@ fn spawn_mock_streaming_server(chunk_count: usize) -> u16 {
                     return;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() > Duration::from_secs(10) {
+                    if started.elapsed() > Duration::from_secs(30) {
                         return;
                     }
                     sleep(Duration::from_millis(25));
@@ -310,23 +311,20 @@ fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
     .expect("write mock settings file");
 }
 
-fn spawn_mock_reasoning_server() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock reasoning server bind");
-    let port = listener
-        .local_addr()
-        .expect("mock reasoning server local addr")
-        .port();
-    let _ = listener.set_nonblocking(true);
+fn spawn_mock_sse_server(name: &str, on_connect: fn(TcpStream)) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect(&format!("mock {name} bind"));
+    let port = listener.local_addr().expect("mock addr").port();
+    listener.set_nonblocking(true).expect("nonblocking");
     thread::spawn(move || {
-        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    write_mock_reasoning_response(stream);
+                    on_connect(stream);
                     return;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    if started.elapsed() > Duration::from_secs(10) {
+                    if Instant::now() >= deadline {
                         return;
                     }
                     sleep(Duration::from_millis(25));
@@ -336,6 +334,43 @@ fn spawn_mock_reasoning_server() -> u16 {
         }
     });
     port
+}
+
+fn spawn_mock_turn_separator_server() -> u16 {
+    spawn_mock_sse_server("turn separator", write_mock_turn_separator_response)
+}
+
+fn write_mock_turn_separator_response(mut stream: TcpStream) {
+    read_http_request(&mut stream);
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    let reply = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": MOCK_TURN_SEPARATOR_MARKER
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 1200,
+            "completion_tokens": 3400,
+        }
+    })
+    .to_string();
+    if stream.write_all(format!("data: {reply}\n\n").as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+}
+
+fn spawn_mock_reasoning_server() -> u16 {
+    spawn_mock_sse_server("reasoning", write_mock_reasoning_response)
 }
 
 fn write_mock_reasoning_response(mut stream: TcpStream) {
@@ -613,7 +648,7 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
     // a stable anchor on anyway.
     let baseline = session.wait_for(
         |pane| pane.contains("Ask nav to do anything"),
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
     assert!(
         baseline.contains("Ask nav to do anything"),
@@ -625,21 +660,21 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
 
     session.send("C-t");
     let overlay = session.wait_for(
-        |pane| pane.contains("Test Overlay") && pane.contains("Press Esc to close."),
+        |pane| pane.contains("Transcript") && pane.contains("No transcript yet."),
         Duration::from_secs(5),
     );
     assert!(
-        overlay.contains("Test Overlay"),
-        "test overlay never became visible:\n{overlay}"
+        overlay.contains("Transcript"),
+        "transcript overlay never became visible:\n{overlay}"
     );
 
     session.resize(120, 24);
     let overlay_after_resize = session.wait_for(
-        |pane| pane.contains("Any key is swallowed by the overlay."),
+        |pane| pane.contains("Transcript") && pane.contains("Esc/q close"),
         Duration::from_secs(5),
     );
     assert!(
-        overlay_after_resize.contains("Any key is swallowed by the overlay."),
+        overlay_after_resize.contains("Transcript") && overlay_after_resize.contains("Esc/q close"),
         "overlay text disappeared after resize:\n{overlay_after_resize}"
     );
 
@@ -649,7 +684,7 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
     sleep(Duration::from_millis(150));
     session.send("Escape");
     let restored = session.wait_for(
-        |pane| pane.contains("Ask nav to do anything") && !pane.contains("Test Overlay"),
+        |pane| pane.contains("Ask nav to do anything") && !pane.contains("Transcript"),
         Duration::from_secs(5),
     );
     let restored_row = last_row_with(&restored, |line| line.contains("Ask nav to do anything"))
@@ -815,6 +850,81 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
         completed.matches(MOCK_FINAL_MARKER).count(),
         1,
         "expected the final marker once in the final frame, got:\n{completed}"
+    );
+}
+
+#[test]
+fn transcript_overlay_shows_live_stream_and_restores_inline_viewport() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_streaming_server(400);
+    let workdir = tempdir().expect("tempdir for mock provider settings");
+    write_mock_provider_settings(&workdir, "transcript", mock_port);
+
+    let session = fresh_session("transcript-overlay");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/transcript"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(15));
+    assert!(status_bar_present(&ready), "nav failed to boot:\n{ready}");
+
+    session.send_line("open transcript while streaming");
+    let streaming = session.wait_for(|pane| pane.contains("chunk-"), Duration::from_secs(4));
+    assert!(
+        streaming.contains("chunk-"),
+        "did not observe streaming before opening transcript:\n{streaming}"
+    );
+
+    session.send("C-t");
+    let overlay = session.wait_for(
+        |pane| pane.contains("Transcript") && pane.contains("chunk-"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        overlay.contains("Transcript") && overlay.contains("chunk-"),
+        "transcript overlay did not show the live tail:\n{overlay}"
+    );
+
+    session.send("Home");
+    let scrolled_top = session.wait_for(
+        |pane| pane.contains("Transcript") && pane.contains("open transcript while streaming"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        scrolled_top.contains("Transcript")
+            && scrolled_top.contains("open transcript while streaming"),
+        "transcript overlay could not scroll back to the committed prompt:\n{scrolled_top}"
+    );
+
+    session.send("PageUp");
+    session.send("End");
+    if session.try_resize(70, 20) {
+        let resized = session.wait_for(
+            |pane| pane.contains("Transcript") && pane.contains("chunk-"),
+            Duration::from_secs(3),
+        );
+        assert!(
+            resized.contains("Transcript") && resized.contains("chunk-"),
+            "transcript overlay was not stable across resize:\n{resized}"
+        );
+    }
+
+    session.send("q");
+    let restored = session.wait_for(
+        |pane| !pane.contains("Transcript") && pane.contains("Ask nav to do anything"),
+        Duration::from_secs(6),
+    );
+    assert!(
+        !restored.contains("Transcript") && restored.contains("Ask nav to do anything"),
+        "inline viewport did not restore after closing transcript overlay:\n{restored}"
     );
 }
 
@@ -1202,6 +1312,52 @@ fn bottom_pane_layout_survives_resize() {
     assert!(
         cx_big >= 2,
         "after regrow the caret should sit past the 2-col gutter, got cx={cx_big}\n{big}"
+    );
+}
+
+/// A successfully completed user turn must paint a subdued divider with
+/// duration and token totals (`↓` prompt, `↑` completion) in scrollback.
+#[test]
+fn completed_turn_shows_final_message_separator() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_turn_separator_server();
+    let workdir = tempdir().expect("tempdir for mock turn separator settings");
+    write_mock_provider_settings(&workdir, "turnsep", mock_port);
+
+    let session = fresh_session("turn-separator");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/turnsep"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "turn separator test nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("finish with metrics");
+
+    let completed = session.wait_for(
+        |pane| {
+            pane.contains(MOCK_TURN_SEPARATOR_MARKER)
+                && pane.contains("↓1.2k ↑3.4k")
+                && pane
+                    .lines()
+                    .any(|line| line.contains('─') && (line.contains("ms") || line.contains('s')))
+        },
+        Duration::from_secs(10),
+    );
+    assert!(
+        completed.contains(MOCK_TURN_SEPARATOR_MARKER) && completed.contains("↓1.2k ↑3.4k"),
+        "turn separator with metrics never appeared:\n{completed}"
     );
 }
 

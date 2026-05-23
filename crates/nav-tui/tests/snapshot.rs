@@ -1530,6 +1530,38 @@ fn reasoning_delta_then_done_builds_reasoning_cell() {
 }
 
 #[test]
+fn reasoning_delta_buffer_flushed_when_assistant_closes_without_done() {
+    let mut widget = ChatWidget::new();
+
+    widget.push_user("think");
+    widget.ingest(AgentEvent::ReasoningDelta {
+        text: "buffered only\nsecond line".to_string(),
+    });
+    // No ReasoningDone — provider may only stream deltas; assistant close
+    // must still materialize a ReasoningCell from the buffer.
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "answer".to_string(),
+    });
+    widget.ingest(AgentEvent::TurnComplete {
+        usage: TurnUsage::default(),
+    });
+
+    let finalized = lines_to_text(&widget.drain_pending(60));
+    assert!(
+        finalized.contains("◆ reasoning"),
+        "delta-only reasoning should flush on assistant close; got:\n{finalized}"
+    );
+    assert!(
+        finalized.contains("Reasoning (2 lines)"),
+        "buffered reasoning should collapse with line count; got:\n{finalized}"
+    );
+    assert!(
+        !finalized.contains("• buffered only"),
+        "reasoning must not leak under assistant bullet; got:\n{finalized}"
+    );
+}
+
+#[test]
 fn reasoning_cell_distinct_from_assistant_message() {
     let mut widget = ChatWidget::new();
 
