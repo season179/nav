@@ -134,44 +134,65 @@ impl Composer {
     /// Workspace path mention currently under the cursor, if any. Returns
     /// `(at_position, token)` where `at_position` is the byte offset of the
     /// `@` on the current line and `token` is the text typed after it (may be
-    /// empty). The `@` must sit at line start or after whitespace, and no
-    /// whitespace may appear between the `@` and the cursor — that disqualifies
-    /// `email@example.com` and reopens the popup only after a space is typed.
+    /// empty).
     pub fn current_at_token(&self) -> Option<(usize, &str)> {
+        self.current_prefix_token('@')
+    }
+
+    /// `$`-prefixed skill token currently under the cursor, if any.
+    /// Same whitespace rules as [`current_at_token`](Self::current_at_token).
+    pub fn current_dollar_token(&self) -> Option<(usize, &str)> {
+        self.current_prefix_token('$')
+    }
+
+    /// Token under cursor prefixed by `prefix`. The prefix must sit at line
+    /// start or after whitespace; no whitespace may appear between the prefix
+    /// and the cursor. Defensive against `self.col` landing inside a multibyte
+    /// char — this runs on every keystroke.
+    fn current_prefix_token(&self, prefix: char) -> Option<(usize, &str)> {
         let line = &self.lines[self.row];
-        // Defensive: any path that left `self.col` inside a multibyte char or
-        // past the end of the line must not panic — this runs on every key.
         if self.col > line.len() || !line.is_char_boundary(self.col) {
             return None;
         }
         let before = &line[..self.col];
-        let at_pos = before.rfind('@')?;
-        let between = &line[at_pos + 1..self.col];
+        let pos = before.rfind(prefix)?;
+        let between = &line[pos + 1..self.col];
         if between.chars().any(char::is_whitespace) {
             return None;
         }
-        if at_pos > 0 {
-            let prev = line[..at_pos].chars().next_back();
+        if pos > 0 {
+            let prev = line[..pos].chars().next_back();
             if let Some(c) = prev
                 && !c.is_whitespace()
             {
                 return None;
             }
         }
-        Some((at_pos, between))
+        Some((pos, between))
+    }
+
+    /// Replace the `$token` under the cursor with `replacement` plus a
+    /// trailing space, moving the cursor to the end of the inserted text.
+    /// Returns `false` if no `$token` is under the cursor.
+    pub fn replace_active_dollar_token(&mut self, replacement: &str) -> bool {
+        self.replace_active_prefix_token('$', replacement)
     }
 
     /// Replace the `@token` under the cursor with `replacement` plus a
     /// trailing space, moving the cursor to the end of the inserted text.
     /// Returns `false` if no `@token` is under the cursor.
     pub fn replace_active_at_token(&mut self, replacement: &str) -> bool {
-        let Some((at_pos, _)) = self.current_at_token() else {
+        self.replace_active_prefix_token('@', replacement)
+    }
+
+    fn replace_active_prefix_token(&mut self, prefix: char, replacement: &str) -> bool {
+        let Some((pos, _)) = self.current_prefix_token(prefix) else {
             return false;
         };
         let inserted = format!("{replacement} ");
         let end = self.col;
-        self.lines[self.row].replace_range(at_pos..end, &inserted);
-        self.col = at_pos + inserted.len();
+        self.lines[self.row].replace_range(pos..end, &inserted);
+        self.col = pos + inserted.len();
         self.history_idx = None;
         true
     }
@@ -1141,5 +1162,47 @@ mod tests {
 
         c.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER));
         assert_eq!(c.col, "hello world".len());
+    }
+
+    #[test]
+    fn dollar_token_detected_at_line_start() {
+        let c = typed("$code");
+        let (pos, tok) = c.current_dollar_token().expect("should detect");
+        assert_eq!(pos, 0);
+        assert_eq!(tok, "code");
+    }
+
+    #[test]
+    fn dollar_token_detected_after_whitespace() {
+        let c = typed("use $");
+        let (pos, tok) = c.current_dollar_token().expect("should detect");
+        assert_eq!(pos, "use ".len());
+        assert_eq!(tok, "");
+    }
+
+    #[test]
+    fn dollar_token_rejected_when_preceded_by_non_whitespace() {
+        let c = typed("foo$bar");
+        assert!(c.current_dollar_token().is_none());
+    }
+
+    #[test]
+    fn dollar_token_closes_when_whitespace_after() {
+        let c = typed("$code foo");
+        assert!(c.current_dollar_token().is_none());
+    }
+
+    #[test]
+    fn replace_dollar_token_inserts_name_and_trailing_space() {
+        let mut c = typed("use $co");
+        assert!(c.replace_active_dollar_token("code-reviewer"));
+        assert_eq!(c.text(), "use code-reviewer ");
+    }
+
+    #[test]
+    fn replace_dollar_token_at_line_start() {
+        let mut c = typed("$");
+        assert!(c.replace_active_dollar_token("code-reviewer"));
+        assert_eq!(c.text(), "code-reviewer ");
     }
 }

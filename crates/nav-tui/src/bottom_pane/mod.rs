@@ -26,6 +26,7 @@ mod mention_popup;
 mod pending_preview;
 mod render;
 mod session_picker;
+mod skill_popup;
 mod slash_popup;
 mod status_bar;
 mod status_indicator;
@@ -38,6 +39,7 @@ pub use list_picker::{ListPicker, ListPickerItem};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
 use pending_preview::PendingPreview;
 pub use session_picker::{SessionPickerEntry, SessionPickerPopup};
+pub use skill_popup::{SkillEntry, SkillPopup, build_skill_entries};
 pub use slash_popup::{
     BUILTIN_SLASH_COMMANDS, SlashCommandPopup, SlashEntry, build_slash_entries,
     build_slash_entries_with_extensions,
@@ -76,8 +78,12 @@ pub struct BottomPane {
     /// Mirror of `slash_popup_suppressed` for `@file` mentions. Cleared once
     /// the cursor leaves the active `@token`.
     mention_popup_suppressed: bool,
+    /// Mirror of `slash_popup_suppressed` for `$skill` invocations. Cleared
+    /// once the cursor leaves the active `$token`.
+    skill_popup_suppressed: bool,
     slash_entries: Arc<[SlashEntry]>,
     mention_entries: Arc<[MentionEntry]>,
+    skill_entries: Arc<[SkillEntry]>,
     theme: Theme,
     /// Workspace root. Held so clipboard images can persist under
     /// `<cwd>/.nav/clipboard/` without the event loop re-passing the path on
@@ -125,7 +131,13 @@ impl BottomPane {
         mention_entries: Arc<[MentionEntry]>,
         cwd: PathBuf,
     ) -> Self {
-        Self::with_entries_and_theme(slash_entries, mention_entries, cwd, Theme::default())
+        Self::with_entries_and_skill(
+            slash_entries,
+            mention_entries,
+            Arc::from(Vec::<SkillEntry>::new()),
+            cwd,
+            Theme::default(),
+        )
     }
 
     pub fn with_entries_and_theme(
@@ -134,13 +146,31 @@ impl BottomPane {
         cwd: PathBuf,
         theme: Theme,
     ) -> Self {
+        Self::with_entries_and_skill(
+            slash_entries,
+            mention_entries,
+            Arc::from(Vec::<SkillEntry>::new()),
+            cwd,
+            theme,
+        )
+    }
+
+    pub fn with_entries_and_skill(
+        slash_entries: Arc<[SlashEntry]>,
+        mention_entries: Arc<[MentionEntry]>,
+        skill_entries: Arc<[SkillEntry]>,
+        cwd: PathBuf,
+        theme: Theme,
+    ) -> Self {
         Self {
             composer: Composer::new(),
             view: None,
             slash_popup_suppressed: false,
             mention_popup_suppressed: false,
+            skill_popup_suppressed: false,
             slash_entries,
             mention_entries,
+            skill_entries,
             theme,
             cwd,
             pending_approvals: VecDeque::new(),

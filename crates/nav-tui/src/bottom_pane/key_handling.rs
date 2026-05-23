@@ -11,7 +11,8 @@ use super::clipboard::{recognized_image_path, try_save_clipboard_image, workspac
 use super::history_search::HistorySearch;
 use super::session_picker::SessionPickerPopup;
 use super::{
-    BottomPane, BottomPaneView, ComposerEvent, FileMentionPopup, InputResult, SlashCommandPopup,
+    BottomPane, BottomPaneView, ComposerEvent, FileMentionPopup, InputResult, SkillPopup,
+    SlashCommandPopup,
 };
 
 impl BottomPane {
@@ -20,6 +21,7 @@ impl BottomPane {
         self.composer.set_text(text);
         self.slash_popup_suppressed = false;
         self.mention_popup_suppressed = false;
+        self.skill_popup_suppressed = false;
         self.reconcile_popups();
     }
 
@@ -34,6 +36,7 @@ impl BottomPane {
         self.composer.set_text_with_attachments(text, attachments);
         self.slash_popup_suppressed = false;
         self.mention_popup_suppressed = false;
+        self.skill_popup_suppressed = false;
         self.reconcile_popups();
     }
 
@@ -99,6 +102,7 @@ impl BottomPane {
             self.view = None;
             self.slash_popup_suppressed = false;
             self.mention_popup_suppressed = false;
+            self.skill_popup_suppressed = false;
             self.composer.set_text("@");
             self.last_composer_keystroke_at = Some(std::time::Instant::now());
             self.reconcile_popups();
@@ -121,6 +125,8 @@ impl BottomPane {
                             self.slash_popup_suppressed = true;
                         } else if any.is::<FileMentionPopup>() {
                             self.mention_popup_suppressed = true;
+                        } else if any.is::<SkillPopup>() {
+                            self.skill_popup_suppressed = true;
                         } else if let Some(o) = any.downcast_mut::<ApprovalOverlay>() {
                             // Keep the downcast and `take_decision()` as
                             // separate steps. Collapsing them with `&&` would
@@ -178,9 +184,10 @@ impl BottomPane {
 
     /// Pick the overlay that fits the composer's current state. Slash wins
     /// when the buffer starts with `/`; @file wins when the cursor is inside
-    /// an `@token`; otherwise no popup. Either popup can be temporarily
-    /// suppressed by an Esc that closed it — the suppression clears as soon
-    /// as the user moves out of that context.
+    /// an `@token`; $skill wins when the cursor is inside a `$token`;
+    /// otherwise no popup. Each popup can be temporarily suppressed by an
+    /// Esc that closed it — the suppression clears as soon as the user moves
+    /// out of that context.
     fn reconcile_popups(&mut self) {
         let single_line = self.composer.line_count() == 1;
         let first_owned = self.composer.first_line().to_string();
@@ -191,6 +198,14 @@ impl BottomPane {
             self.composer.current_at_token().map(|(_, t)| t.to_string())
         };
         let mention_active = mention_token.is_some() && !self.mention_entries.is_empty();
+        let skill_token = if slash_active || mention_active {
+            None
+        } else {
+            self.composer
+                .current_dollar_token()
+                .map(|(_, t)| t.to_string())
+        };
+        let skill_active = skill_token.is_some() && !self.skill_entries.is_empty();
 
         if !slash_active {
             self.slash_popup_suppressed = false;
@@ -198,9 +213,14 @@ impl BottomPane {
         if !mention_active {
             self.mention_popup_suppressed = false;
         }
+        if !skill_active {
+            self.skill_popup_suppressed = false;
+        }
 
         let want_slash = slash_active && !self.slash_popup_suppressed;
         let want_mention = !want_slash && mention_active && !self.mention_popup_suppressed;
+        let want_skill =
+            !want_slash && !want_mention && skill_active && !self.skill_popup_suppressed;
 
         // Fast path: the active popup already matches the desired target —
         // just refresh its filter and bail. Avoids reconstructing the popup
@@ -225,6 +245,10 @@ impl BottomPane {
                 p.set_query(mention_token.as_deref().unwrap_or(""));
                 return;
             }
+            if want_skill && let Some(p) = any.downcast_mut::<SkillPopup>() {
+                p.set_query(skill_token.as_deref().unwrap_or(""));
+                return;
+            }
         }
 
         // Slow path: open the right popup, or close whatever is open.
@@ -236,6 +260,13 @@ impl BottomPane {
             let popup = FileMentionPopup::new(
                 Arc::clone(&self.mention_entries),
                 mention_token.as_deref().unwrap_or(""),
+                self.theme,
+            );
+            self.view = Some(Box::new(popup));
+        } else if want_skill {
+            let popup = SkillPopup::new(
+                Arc::clone(&self.skill_entries),
+                skill_token.as_deref().unwrap_or(""),
                 self.theme,
             );
             self.view = Some(Box::new(popup));
