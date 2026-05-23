@@ -2439,6 +2439,91 @@ async fn run_agent_records_abort_from_approval_as_aborted_turn() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
+async fn approval_abort_emits_turn_diff_for_pre_turn_hook_mutation() {
+    let turn_one = vec![
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"rm -rf build\"}"
+            }
+        }),
+        json!({"type": "response.completed", "response": {}}),
+    ];
+    let transport = StubTransport::new(vec![turn_one]);
+    let args = Args::test_default();
+    let cwd_dir = tempdir().unwrap();
+    let cwd = cwd_dir.path().canonicalize().unwrap();
+    fs::write(cwd.join("note.txt"), "old\n").unwrap();
+    git(&cwd, &["init"]);
+    git(&cwd, &["add", "note.txt"]);
+    git(
+        &cwd,
+        &[
+            "-c",
+            "user.name=Nav Test",
+            "-c",
+            "user.email=nav@example.test",
+            "commit",
+            "-m",
+            "init",
+        ],
+    );
+    let extensions = ExtensionCatalog::with_hooks(
+        vec![],
+        vec![],
+        vec![],
+        vec![test_hook(
+            "before",
+            HookEventType::PreTurn,
+            "printf hook > note.txt",
+            &cwd,
+        )],
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+
+    super::run_agent(
+        AgentTurnRequest::new(
+            &transport,
+            &args,
+            &cwd,
+            "clean build output",
+            tx,
+            &Catalog::default(),
+            aborting_permission_context(),
+        )
+        .with_extensions(Some(&extensions)),
+    )
+    .await
+    .expect("approval abort exits cleanly");
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnDiff { files, unified_diff, .. }
+                if files.iter().any(|file| file.path == "note.txt")
+                    && unified_diff.contains("-old")
+                    && unified_diff.contains("+hook")
+        )),
+        "expected TurnDiff for pre_turn hook mutation before approval abort: {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnAborted { reason, .. } if reason.contains("approval"))),
+        "expected TurnAborted from approval abort: {events:#?}"
+    );
+}
+
+#[tokio::test]
 async fn run_agent_emits_file_change_and_turn_diff_for_patch_tool() {
     let turn_one = vec![
         json!({

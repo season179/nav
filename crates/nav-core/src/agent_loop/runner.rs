@@ -298,6 +298,7 @@ pub(super) async fn run_agent_inner(
         user_message_event(prompt, display_prompt, attachments),
     );
     let pre_turn_hooks_ran = run_hooks(extensions, HookEventType::PreTurn, &events, session).await;
+    let mut hook_verification_pending = pre_turn_hooks_ran;
     push_ambient_context(&mut input, cwd, context, args.ambient_context_token_budget);
     input.push(json!({
         "type": "message",
@@ -468,6 +469,9 @@ pub(super) async fn run_agent_inner(
                 )
                 .await;
                 if let Some(reason) = abort_reason {
+                    if hook_verification_pending {
+                        emit_verification_events(&events, session, cwd);
+                    }
                     emit_turn_aborted(&events, session, controls.turn_id.as_deref(), reason);
                     return Ok(());
                 }
@@ -489,7 +493,7 @@ pub(super) async fn run_agent_inner(
                 &events,
                 session,
                 cwd,
-                pre_turn_hooks_ran || post_turn_hooks_ran,
+                hook_verification_pending || post_turn_hooks_ran,
                 &args.model,
                 &usage,
             ) {
@@ -655,7 +659,7 @@ pub(super) async fn run_agent_inner(
             // exit the loop instead of feeding more tool calls or asking
             // the model for another turn.
             if aborted {
-                if turn_had_mutation {
+                if turn_had_mutation || hook_verification_pending {
                     emit_verification_events(&events, session, cwd);
                 }
                 emit_turn_aborted(
@@ -683,12 +687,13 @@ pub(super) async fn run_agent_inner(
             &events,
             session,
             cwd,
-            turn_had_mutation,
+            turn_had_mutation || hook_verification_pending,
             &args.model,
             &usage,
         ) {
             return fail(&events, session, err);
         }
+        hook_verification_pending = false;
 
         // Mid-turn auto-compact: the model still has tool calls to follow
         // up on (`calls` was non-empty above; the no-tools branch already

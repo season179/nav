@@ -411,19 +411,16 @@ fn load_extension(
         }
     }
     let mut hooks = Vec::new();
-    match hook_manifest_entries(&manifest.hooks) {
-        Ok(entries) => {
-            for hook in entries {
-                match load_hook_manifest(&hook, &name, &extension_dir, scope) {
-                    Ok(hook) => hooks.push(hook),
-                    Err(err) => {
-                        notices.warning(format!("skipping hook in extension `{name}`: {err}"))
-                    }
-                }
+    for hook in hook_manifest_entries(&manifest.hooks) {
+        match hook.and_then(|hook| load_hook_manifest(&hook, &name, &extension_dir, scope)) {
+            Ok(hook) => hooks.push(hook),
+            Err(err) => {
+                notices.warning(format!(
+                    "skipping hook in extension `{name}` at {} ({}): {err}",
+                    extension_dir.display(),
+                    scope.as_str()
+                ));
             }
-        }
-        Err(err) => {
-            notices.warning(format!("skipping hooks in extension `{name}`: {err}"));
         }
     }
     let prompt_template_count = prompt_templates.len();
@@ -550,18 +547,18 @@ fn load_hook_manifest(
     })
 }
 
-fn hook_manifest_entries(value: &Value) -> Result<Vec<HookManifest>, String> {
+fn hook_manifest_entries(value: &Value) -> Vec<Result<HookManifest, String>> {
     match value {
-        Value::Null => Ok(Vec::new()),
+        Value::Null => Vec::new(),
         Value::Array(items) => items.iter().map(hook_manifest_from_value).collect(),
         Value::Object(map) if has_hook_manifest_fields(map) => {
-            hook_manifest_from_value(value).map(|hook| vec![hook])
+            vec![hook_manifest_from_value(value)]
         }
-        Value::Object(_) => Err(
+        Value::Object(_) => vec![Err(
             "`hooks` object must be a single hook definition; use an array for multiple hooks"
                 .to_string(),
-        ),
-        _ => Err("`hooks` must be an array or object".to_string()),
+        )],
+        _ => vec![Err("`hooks` must be an array or object".to_string())],
     }
 }
 
@@ -866,6 +863,36 @@ mod tests {
         assert_eq!(catalog.hooks().len(), 1);
         assert_eq!(catalog.hooks()[0].name, "good");
         assert_eq!(notices.iter().count(), 2);
+    }
+
+    #[test]
+    fn malformed_hook_entries_do_not_skip_valid_entries() {
+        let cwd = tempdir().unwrap();
+        let ext = cwd.path().join(".nav/extensions/demo");
+        write(
+            &ext.join("extension.json"),
+            r#"{
+              "name": "demo",
+              "hooks": [
+                { "name": "before", "event": "pre_turn", "command": "printf before" },
+                42,
+                { "name": "after", "event": "post_turn", "command": "printf after" }
+              ]
+            }"#,
+        );
+
+        let mut notices = StartupNotices::new();
+        let catalog = discover_extensions_with_roots(cwd.path(), None, &mut notices);
+
+        assert_eq!(catalog.extensions()[0].hook_count, 2);
+        assert_eq!(catalog.hooks().len(), 2);
+        assert_eq!(catalog.hooks()[0].name, "before");
+        assert_eq!(catalog.hooks()[1].name, "after");
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.message.contains("invalid hook definition"))
+        );
     }
 
     #[test]
