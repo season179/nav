@@ -10,6 +10,9 @@ use super::wrapping::render_body;
 const BODY_INDENT: &str = "  ";
 const BODY_INDENT_WIDTH: usize = 2;
 
+/// Foreground for quiet-by-default chips (HookCell compact, SkillInvocationCell).
+const QUIET_CHIP_COLOR: Color = Color::DarkGray;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TranscriptRowKind {
     UserMessage,
@@ -46,7 +49,6 @@ pub(crate) enum TranscriptRowKind {
     CompactionStarted,
     CompactionCompleted,
     CompactionFailed,
-    HookCompact,
     HookOutput,
     HookFailed,
     Error,
@@ -111,7 +113,6 @@ impl TranscriptRowKind {
                 TranscriptRowStyle::labeled("◆", "compacted", Color::Magenta)
             }
             Self::CompactionFailed => TranscriptRowStyle::labeled("◆", "compact!", Color::Red),
-            Self::HookCompact => TranscriptRowStyle::bullet("✓", Color::DarkGray),
             Self::HookOutput => TranscriptRowStyle::labeled("◆", "hook", Color::Cyan),
             Self::HookFailed => TranscriptRowStyle::labeled("■", "hook", Color::Red),
             Self::Error => TranscriptRowStyle::bullet("■", Color::Red),
@@ -212,6 +213,15 @@ impl<'a> TranscriptRow<'a> {
             .with_user_surface(surface);
         Self {
             style,
+            label: Cow::Borrowed(""),
+            body: body.into(),
+        }
+    }
+
+    /// Subdued single-line chip (HookCell compact, SkillInvocationCell).
+    pub(crate) fn quiet_chip(glyph: &'static str, body: impl Into<Cow<'a, str>>) -> Self {
+        Self {
+            style: TranscriptRowStyle::bullet(glyph, QUIET_CHIP_COLOR),
             label: Cow::Borrowed(""),
             body: body.into(),
         }
