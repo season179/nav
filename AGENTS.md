@@ -77,6 +77,9 @@ path, so verify the real local checkout before assuming one is absent.
     0), the diff would otherwise skip writing it and the new screen row
     would stay blank. If you touch viewport sizing or buffer flushing,
     keep this reset in place.
+- Theme surfaces (`theme.rs`) adapt to the terminal default background via
+  OSC 10/11 probing (`terminal_probe.rs`, 100ms timeout). When probing fails
+  (tmux emulated PTY, unsupported terminal), nav falls back to fixed dark RGBs.
 - **TUI changes require a tmux-backed regression test.** The in-process
   snapshot suite paints into a virtual `Buffer` and never exercises the
   diff/flush path that produces the actual terminal output, so visual

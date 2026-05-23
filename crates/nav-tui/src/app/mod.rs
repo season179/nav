@@ -72,7 +72,6 @@ pub async fn run(
     let slash_entries =
         bottom_pane::build_slash_entries_with_extensions(skills.as_ref(), extensions.as_ref());
     let skill_entries = bottom_pane::build_skill_entries(skills.as_ref());
-    let theme = Theme::from_extensions(project.settings.theme.as_deref(), extensions.as_ref());
 
     // Enter raw mode + clear stale mouse capture BEFORE constructing the
     // custom Terminal: `Terminal::with_options` issues a CPR query
@@ -80,6 +79,9 @@ pub async fn run(
     // captured in raw mode.
     let mut stdout = io::stdout();
     enter_tui(&mut stdout)?;
+    #[cfg(unix)]
+    crate::terminal_palette::probe_default_colors_at_startup();
+    let theme = Theme::from_extensions(project.settings.theme.as_deref(), extensions.as_ref());
     install_panic_teardown_hook();
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::with_options(backend)?;
