@@ -20,6 +20,7 @@ mod approval;
 mod clipboard;
 mod composer;
 mod key_handling;
+mod list_picker;
 mod mention_popup;
 mod pending_preview;
 mod render;
@@ -31,6 +32,7 @@ mod view;
 
 pub use approval::ApprovalOverlay;
 pub use composer::{Composer, ComposerEvent};
+pub use list_picker::{ListPicker, ListPickerItem};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
 use pending_preview::PendingPreview;
 pub use session_picker::{SessionPickerEntry, SessionPickerPopup};

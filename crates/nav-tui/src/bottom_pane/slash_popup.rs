@@ -3,11 +3,11 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::composer::Composer;
+use super::list_picker::{ListPicker, ListPickerItem};
 use super::view::{BottomPaneView, InputResult};
 use crate::theme::Theme;
 
@@ -59,6 +59,29 @@ impl SlashEntry {
     }
 }
 
+impl ListPickerItem for SlashEntry {
+    fn render_line(&self, selected: bool, theme: &Theme) -> Line<'static> {
+        let bg = Style::default().bg(theme.popup_bg);
+        let row_style = if selected {
+            bg.fg(ratatui::style::Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            bg.fg(ratatui::style::Color::Gray)
+        };
+        let mut spans = vec![
+            Span::styled("  ", row_style),
+            Span::styled(self.command.clone(), row_style),
+        ];
+        if let Some(desc) = self.description.as_deref() {
+            spans.push(Span::styled("  ", row_style));
+            spans.push(Span::styled(
+                desc.to_string(),
+                bg.fg(ratatui::style::Color::DarkGray),
+            ));
+        }
+        Line::from(spans)
+    }
+}
+
 fn builtin_description(command: &str) -> Option<&'static str> {
     match command {
         "/help" => Some("show available commands"),
@@ -85,75 +108,46 @@ fn builtin_description(command: &str) -> Option<&'static str> {
 }
 
 /// Overlay that filters [`SlashEntry`] entries by composer-buffer prefix and
-/// lets the user pick one with Tab / Enter. Entries are shared via `Arc` so
-/// opening the popup is a refcount bump, and matches are tracked as indices
-/// into that shared slice — keystroke filtering and the ~12 Hz render path
-/// never clone an entry.
+/// lets the user pick one with Tab / Enter. The full entry list is shared via
+/// `Arc` so opening the popup is a refcount bump. Navigation and rendering
+/// are delegated to a [`ListPicker<SlashEntry>`]; this wrapper owns the
+/// filter logic and the Tab / submit-or-complete Enter behaviour.
 pub struct SlashCommandPopup {
     entries: Arc<[SlashEntry]>,
-    theme: Theme,
     filter: String,
-    matches: Vec<usize>,
-    selected: usize,
-    completed: bool,
+    /// Indices into `entries` that match the current filter (capped to
+    /// [`MAX_VISIBLE_SLASH_OPTIONS`]). Kept as indices so the popup can
+    /// compare against the shared slice without cloning on every keystroke.
+    match_indices: Vec<usize>,
+    picker: ListPicker<SlashEntry>,
 }
 
 impl SlashCommandPopup {
     pub fn new(entries: Arc<[SlashEntry]>, theme: Theme) -> Self {
         let mut popup = Self {
             entries,
-            theme,
             filter: String::from("/"),
-            matches: Vec::new(),
-            selected: 0,
-            completed: false,
+            match_indices: Vec::new(),
+            picker: ListPicker::new(Vec::new(), MAX_VISIBLE_SLASH_OPTIONS, theme),
         };
         popup.refilter();
         popup
     }
 
     pub fn matches(&self) -> Vec<&SlashEntry> {
-        self.matches.iter().map(|&i| &self.entries[i]).collect()
+        self.match_indices
+            .iter()
+            .map(|&i| &self.entries[i])
+            .collect()
     }
 
     pub fn filter(&self) -> &str {
         &self.filter
     }
 
-    fn render_inner(&self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 {
-            return;
-        }
-        let bg = Style::default().bg(self.theme.popup_bg);
-        Block::default().style(bg).render(area, buf);
-        let lines: Vec<Line<'_>> = self
-            .matches
-            .iter()
-            .enumerate()
-            .map(|(row, &entry_idx)| {
-                let entry = &self.entries[entry_idx];
-                let row_style = if row == self.selected {
-                    bg.fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    bg.fg(Color::Gray)
-                };
-                let mut spans = vec![
-                    Span::styled("  ", row_style),
-                    Span::styled(entry.command.as_str(), row_style),
-                ];
-                if let Some(desc) = entry.description.as_deref() {
-                    spans.push(Span::styled("  ", row_style));
-                    spans.push(Span::styled(desc, bg.fg(Color::DarkGray)));
-                }
-                Line::from(spans)
-            })
-            .collect();
-        Paragraph::new(lines).style(bg).render(area, buf);
-    }
-
-    fn on_composer_text_changed_inner(&mut self, first_line: &str) {
+    fn on_text_changed(&mut self, first_line: &str) {
         if !first_line.starts_with('/') {
-            self.completed = true;
+            self.picker.cancel();
             return;
         }
         if first_line == self.filter {
@@ -164,7 +158,7 @@ impl SlashCommandPopup {
         self.refilter();
     }
 
-    fn handle_key_inner(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
+    fn dispatch_key(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
         if key.kind == KeyEventKind::Release {
             return InputResult::Unhandled;
         }
@@ -173,18 +167,20 @@ impl SlashCommandPopup {
             (KeyCode::Enter, m) if !m.contains(KeyModifiers::SHIFT) => {
                 self.try_submit_or_complete(composer)
             }
+            // Up / Down / Esc are the only navigation keys the slash popup
+            // intercepts. j / k are deliberately NOT handled here — they
+            // are typeable characters and must reach the composer so the
+            // user can type commands like `/json` or `/kill`.
             (KeyCode::Up, _) => {
-                self.selected = self.selected.saturating_sub(1);
+                self.picker.move_up();
                 InputResult::Handled
             }
             (KeyCode::Down, _) => {
-                if self.selected + 1 < self.matches.len() {
-                    self.selected += 1;
-                }
+                self.picker.move_down();
                 InputResult::Handled
             }
             (KeyCode::Esc, _) => {
-                self.completed = true;
+                self.picker.cancel();
                 InputResult::Handled
             }
             _ => InputResult::Unhandled,
@@ -192,11 +188,11 @@ impl SlashCommandPopup {
     }
 
     fn try_complete(&mut self, composer: &mut Composer) -> InputResult {
-        let Some(&entry_idx) = self.matches.get(self.selected) else {
+        let Some(&entry_idx) = self.match_indices.get(self.picker.selected_index()) else {
             return InputResult::Unhandled;
         };
         composer.set_text(&self.entries[entry_idx].command);
-        self.completed = true;
+        self.picker.cancel(); // mark completed
         InputResult::Handled
     }
 
@@ -204,22 +200,22 @@ impl SlashCommandPopup {
         if self.has_exact_match() {
             return InputResult::Unhandled;
         }
-        let Some(&entry_idx) = self.matches.get(self.selected) else {
+        let Some(&entry_idx) = self.match_indices.get(self.picker.selected_index()) else {
             return InputResult::Unhandled;
         };
         composer.set_text(&self.entries[entry_idx].command);
-        self.completed = true;
+        self.picker.cancel(); // mark completed
         InputResult::Unhandled
     }
 
     fn has_exact_match(&self) -> bool {
-        self.matches
+        self.match_indices
             .iter()
             .any(|&entry_idx| self.entries[entry_idx].command == self.filter)
     }
 
     fn refilter(&mut self) {
-        self.matches.clear();
+        self.match_indices.clear();
         let mut matching_indices: Vec<usize> = self
             .entries
             .iter()
@@ -236,33 +232,40 @@ impl SlashCommandPopup {
                 .then_with(|| left.cmp(right))
         });
 
-        self.matches
+        self.match_indices
             .extend(matching_indices.into_iter().take(MAX_VISIBLE_SLASH_OPTIONS));
-        if self.selected >= self.matches.len() {
-            self.selected = 0;
-        }
+
+        // Push the filtered (owned) items into the picker so it can render
+        // and track selection. Cloning is cheap — SlashEntry is just two
+        // Strings and we cap at MAX_VISIBLE_SLASH_OPTIONS (3).
+        let filtered: Vec<SlashEntry> = self
+            .match_indices
+            .iter()
+            .map(|&idx| self.entries[idx].clone())
+            .collect();
+        self.picker.set_items(filtered);
     }
 }
 
 impl BottomPaneView for SlashCommandPopup {
     fn handle_key(&mut self, key: KeyEvent, composer: &mut Composer) -> InputResult {
-        self.handle_key_inner(key, composer)
+        self.dispatch_key(key, composer)
     }
 
     fn is_complete(&self) -> bool {
-        self.completed
+        self.picker.is_complete()
     }
 
-    fn desired_height(&self, _width: u16) -> u16 {
-        self.matches.len().max(1) as u16
+    fn desired_height(&self, width: u16) -> u16 {
+        self.picker.desired_height(width)
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        self.render_inner(area, buf);
+        self.picker.render(area, buf);
     }
 
     fn on_composer_text_changed(&mut self, first_line: &str) {
-        self.on_composer_text_changed_inner(first_line);
+        self.on_text_changed(first_line);
     }
 
     fn is_text_driven(&self) -> bool {
