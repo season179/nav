@@ -273,9 +273,21 @@ where
     }
 
     /// Sets the viewport area.
+    ///
+    /// When `area` differs from the previous viewport rect, the previous
+    /// buffer is reset to force a full redraw on the next [`Self::flush`]
+    /// call. Without this, `diff_buffers` compares cell-by-cell at the same
+    /// BUFFER INDEX while screen position has shifted — any row that holds
+    /// the same content in both buffers (e.g. a status bar at index 0 of
+    /// each pane) gets skipped, and the actual screen at the new position
+    /// stays whatever was painted there before (often blank).
     pub fn set_viewport_area(&mut self, area: Rect) {
+        let area_changed = area != self.viewport_area;
         self.current_buffer_mut().resize(area);
         self.previous_buffer_mut().resize(area);
+        if area_changed {
+            self.previous_buffer_mut().reset();
+        }
         self.viewport_area = area;
     }
 

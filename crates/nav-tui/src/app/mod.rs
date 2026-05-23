@@ -27,13 +27,12 @@ use tokio::sync::mpsc;
 mod permissions;
 mod render;
 mod session;
-mod status_bar;
 mod terminal;
 mod turn_lifecycle;
 mod turn_task;
 
 use crate::ChatWidget;
-use crate::bottom_pane::{self, PendingApproval};
+use crate::bottom_pane::{self, AgentState, PendingApproval, StatusBarState};
 use crate::input::{AppEvent, ModelMatch, dispatch_submit, is_ctrl_c, match_model_selector};
 use crate::theme::Theme;
 use crate::widget::parse_rewind_skill_prompt;
@@ -43,7 +42,6 @@ use session::{
     export_current_session, open_session_picker, push_context_report, resolve_tree_root,
     resume_session,
 };
-use status_bar::AgentState;
 use terminal::{TerminalGuard, enter_tui, install_panic_teardown_hook};
 use turn_lifecycle::{
     ActiveTurnHandle, clear_pending_inputs, pending_draft, pending_input_for_immediate,
@@ -239,6 +237,17 @@ pub async fn run(
                 },
                 None => AgentState::Ready,
             };
+            pane.update_status(StatusBarState {
+                model: args.model.clone(),
+                cwd_short: cwd_short.clone(),
+                branch: branch.clone(),
+                dirty,
+                agent_state: state,
+                tokens_input: last_tokens_input,
+                tokens_output: last_tokens_output,
+                tokens_cached: last_tokens_cached,
+                context_window: args.auto_compact_token_limit,
+            });
             draw_tui(
                 &mut term.terminal,
                 &chat,

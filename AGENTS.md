@@ -70,6 +70,19 @@ path, so verify the real local checkout before assuming one is absent.
     re-emitted rows landed above identical old-width copies the terminal
     had already kept. A visible width seam at the resize point is by
     design.
+  - `Terminal::set_viewport_area` resets the previous buffer whenever the
+    viewport rect changes. `diff_buffers` compares cells by buffer index,
+    not screen position — when the viewport's `y` shifts and a row holds
+    the same content in both frames (e.g. the status bar at buffer index
+    0), the diff would otherwise skip writing it and the new screen row
+    would stay blank. If you touch viewport sizing or buffer flushing,
+    keep this reset in place.
+- **Test TUI changes with `tmux`.** The integration tests don't exercise
+  the actual viewport/scrollback path; run `nav` inside a sized tmux
+  session and use `tmux capture-pane -p | nl -ba` to inspect what the
+  terminal actually painted. Resize between transitions (popup open /
+  close, smaller/larger window) to surface buffer-diff bugs that
+  identical-content cells can hide.
 - `rg` must be on `PATH`; `code_search` shells out to it even though
   `Cargo.toml` does not mention it.
 - `nav update` / `nav upgrade` downloads the latest tarball from GitHub
