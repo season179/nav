@@ -382,3 +382,114 @@ fn desired_height_reserves_status_row_above_composer_floor() {
         "BottomPane minimum height must reserve the status row plus composer floor"
     );
 }
+
+fn working_status(show_indicator: bool) -> StatusBarState {
+    StatusBarState {
+        model: "test-model".into(),
+        cwd_short: "~/proj".into(),
+        branch: Some("main".into()),
+        dirty: false,
+        agent_state: AgentState::Working {
+            elapsed: std::time::Duration::from_secs(7),
+            spinner: '⠴',
+        },
+        show_indicator,
+        ..StatusBarState::default()
+    }
+}
+
+#[test]
+fn working_indicator_row_renders_between_status_and_composer() {
+    let mut pane = BottomPane::new();
+    pane.update_status(working_status(true));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 7)).expect("terminal");
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+    let lines: Vec<&str> = rendered.lines().collect();
+
+    // Status row stays on line 0; indicator row (with the interrupt hint)
+    // must land directly below it, above the composer prompt.
+    assert!(
+        lines[0].contains("·  ⠴ Working"),
+        "status bar should still show the inline Working segment:\n{rendered}"
+    );
+    let indicator_line = lines
+        .iter()
+        .position(|line| line.contains("Ctrl+C to interrupt"))
+        .expect("indicator row should render somewhere");
+    assert_eq!(
+        indicator_line, 1,
+        "indicator row should sit directly under the status bar:\n{rendered}"
+    );
+
+    let prompt_line = lines
+        .iter()
+        .position(|line| line.contains('›'))
+        .expect("composer prompt should render");
+    assert!(
+        prompt_line > indicator_line,
+        "composer prompt must be below the indicator row (status={}, indicator={indicator_line}, prompt={prompt_line}):\n{rendered}",
+        0
+    );
+}
+
+#[test]
+fn indicator_row_is_suppressed_when_show_flag_is_off() {
+    // Working state, but the main loop refused to allocate the row
+    // (e.g. small screen). The row must not paint and must not steal a
+    // layout slot — otherwise the composer would shift down.
+    let mut ready_pane = BottomPane::new();
+    ready_pane.update_status(ready_status());
+    let mut ready_terminal = Terminal::new(TestBackend::new(80, 6)).expect("terminal");
+    render(&ready_pane, &mut ready_terminal);
+    let ready_prompt_line = rendered_text(&ready_terminal)
+        .lines()
+        .position(|line| line.contains('›'))
+        .expect("baseline composer prompt should render");
+
+    let mut pane = BottomPane::new();
+    pane.update_status(working_status(false));
+    let mut terminal = Terminal::new(TestBackend::new(80, 6)).expect("terminal");
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+    assert!(
+        !rendered.contains("Ctrl+C to interrupt"),
+        "indicator row should be suppressed when show_indicator=false:\n{rendered}"
+    );
+
+    // Composer prompt must land in the same row as the Ready baseline —
+    // a suppressed indicator slot cannot shift the composer downward.
+    let prompt_line = rendered
+        .lines()
+        .position(|line| line.contains('›'))
+        .expect("composer prompt should render");
+    assert_eq!(
+        prompt_line, ready_prompt_line,
+        "composer position must match the Ready case when indicator is hidden:\n{rendered}"
+    );
+}
+
+#[test]
+fn desired_height_grows_by_one_when_indicator_row_is_active() {
+    let mut pane = BottomPane::new();
+    pane.update_status(ready_status());
+    let baseline = pane.desired_height(80);
+
+    pane.update_status(working_status(true));
+    let with_indicator = pane.desired_height(80);
+
+    assert_eq!(
+        with_indicator,
+        baseline + 1,
+        "indicator row must contribute exactly one row to desired_height"
+    );
+
+    // Hidden indicator must not contribute anything.
+    pane.update_status(working_status(false));
+    assert_eq!(
+        pane.desired_height(80),
+        baseline,
+        "suppressed indicator must not occupy a layout slot"
+    );
+}

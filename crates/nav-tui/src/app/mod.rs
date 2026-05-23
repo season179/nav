@@ -33,7 +33,9 @@ mod turn_lifecycle;
 mod turn_task;
 
 use crate::ChatWidget;
-use crate::bottom_pane::{self, AgentState, PendingApproval, StatusBarState};
+use crate::bottom_pane::{
+    self, AgentState, INDICATOR_SCREEN_FLOOR, PendingApproval, StatusBarState,
+};
 use crate::input::{AppEvent, ModelMatch, dispatch_submit, is_ctrl_c, match_model_selector};
 use crate::theme::Theme;
 use crate::widget::parse_rewind_skill_prompt;
@@ -238,6 +240,11 @@ pub async fn run(
                 },
                 None => AgentState::Ready,
             };
+            // Dedicated indicator row only when the agent is actually
+            // working AND there's vertical room. Below the floor the
+            // spinner stays inline in the status bar.
+            let show_indicator = matches!(state, AgentState::Working { .. })
+                && screen_h >= INDICATOR_SCREEN_FLOOR;
             pane.update_status(StatusBarState {
                 model: args.model.clone(),
                 cwd_short: cwd_short.clone(),
@@ -248,6 +255,7 @@ pub async fn run(
                 tokens_output: last_tokens_output,
                 tokens_cached: last_tokens_cached,
                 context_window: args.auto_compact_token_limit,
+                show_indicator,
             });
             draw_tui(&mut term.terminal, &chat, &pane, screen_w, screen_h)?;
 

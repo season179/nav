@@ -35,6 +35,12 @@ pub struct StatusBarState {
     /// Effective context window used to compute the percentage. `0` hides the
     /// gauge entirely.
     pub context_window: u64,
+    /// Allocate a dedicated row below the status bar that shows the working
+    /// spinner + interrupt hint. The main loop turns this on only when both
+    /// the agent is in `Working` state AND `screen_h >=
+    /// `super::status_indicator::INDICATOR_SCREEN_FLOOR``; the row stays
+    /// hidden otherwise so small tmux splits don't lose composer space.
+    pub show_indicator: bool,
 }
 
 impl Default for StatusBarState {
@@ -49,6 +55,7 @@ impl Default for StatusBarState {
             tokens_output: 0,
             tokens_cached: 0,
             context_window: 0,
+            show_indicator: false,
         }
     }
 }

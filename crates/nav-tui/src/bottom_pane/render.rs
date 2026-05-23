@@ -1,16 +1,21 @@
 //! Layout math and rendering for the bottom pane.
 //!
-//! The pane stacks four chunks top-to-bottom:
+//! The pane stacks five chunks top-to-bottom:
 //!
 //! ```text
-//! [status bar]      — 1 row, always
-//! [overlay]         — variable (popup, approval, etc.)
-//! [pending preview] — variable (queued user inputs)
-//! [composer]        — min 3 rows
+//! [status bar]       — 1 row, always
+//! [status indicator] — 1 row, only while Working AND show_indicator
+//! [overlay]          — variable (popup, approval, etc.)
+//! [pending preview]  — variable (queued user inputs)
+//! [composer]         — min 3 rows
 //! ```
 //!
-//! Everything below `status` shifts down by `STATUS_ROWS` (= 1). The cursor
-//! math here mirrors the same split — if you change one, change the other.
+//! The indicator slot has zero height when the gating flag is off, so the
+//! row collapses cleanly without leaving a blank strip. `desired_height`,
+//! `cursor_position`, and the render-time `Layout::vertical` use the same
+//! `indicator_h()` helper — keeping them lockstep prevents drift between
+//! "how tall the pane wants to be" and "where the composer caret actually
+//! lands."
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -20,6 +25,7 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 
 use super::pending_preview::render_pending_preview;
 use super::status_bar::StatusBar;
+use super::status_indicator::StatusIndicatorWidget;
 use super::{BottomPane, GUTTER_WIDTH};
 
 /// Height of the status-bar row at the top of the pane. The status bar lives
@@ -41,6 +47,7 @@ impl BottomPane {
             .map(|v| v.desired_height(width))
             .unwrap_or(0);
         STATUS_ROWS
+            .saturating_add(self.indicator_h())
             .saturating_add(composer_h)
             .saturating_add(overlay_h)
             .saturating_add(self.pending_preview_height())
@@ -58,17 +65,21 @@ impl BottomPane {
             .map(|v| v.desired_height(pane_area.width))
             .unwrap_or(0);
         let queue_h = self.pending_preview_height();
-        // The status row sits at the top of the pane; everything below shifts
-        // down by `STATUS_ROWS`. Without this offset the caret lands one row
-        // too high — inside the status bar instead of the composer.
+        let indicator_h = self.indicator_h();
+        // The status row sits at the top of the pane; the optional
+        // indicator row sits below it; everything else shifts down by
+        // both. Without these offsets the caret lands inside the status
+        // bar or the indicator strip instead of the composer.
         let composer_y = pane_area
             .y
             .saturating_add(STATUS_ROWS)
+            .saturating_add(indicator_h)
             .saturating_add(overlay_h)
             .saturating_add(queue_h);
         let composer_h = pane_area
             .height
             .saturating_sub(STATUS_ROWS)
+            .saturating_sub(indicator_h)
             .saturating_sub(overlay_h)
             .saturating_sub(queue_h);
         if composer_h <= 1 {
@@ -94,6 +105,16 @@ impl BottomPane {
             1 + self.pending_inputs.len().min(4) as u16
         }
     }
+
+    /// 0 or 1, depending on whether the dedicated working-state row should
+    /// occupy a layout slot. Single source of truth for the chunk size.
+    fn indicator_h(&self) -> u16 {
+        if StatusIndicatorWidget::is_visible(&self.status) {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 impl Widget for &BottomPane {
@@ -107,19 +128,29 @@ impl Widget for &BottomPane {
             .map(|v| v.desired_height(area.width))
             .unwrap_or(0);
         let queue_h = self.pending_preview_height();
-        let [status_rect, overlay_rect, queue_rect, composer_outer] = Layout::vertical([
-            Constraint::Length(STATUS_ROWS),
-            Constraint::Length(overlay_h),
-            Constraint::Length(queue_h),
-            Constraint::Min(1),
-        ])
-        .areas(area);
+        let indicator_h = self.indicator_h();
+        let [status_rect, indicator_rect, overlay_rect, queue_rect, composer_outer] =
+            Layout::vertical([
+                Constraint::Length(STATUS_ROWS),
+                Constraint::Length(indicator_h),
+                Constraint::Length(overlay_h),
+                Constraint::Length(queue_h),
+                Constraint::Min(1),
+            ])
+            .areas(area);
 
         if status_rect.height > 0 {
             StatusBar {
                 state: &self.status,
             }
             .render(status_rect, buf);
+        }
+
+        if indicator_rect.height > 0 {
+            StatusIndicatorWidget {
+                state: &self.status,
+            }
+            .render(indicator_rect, buf);
         }
 
         if let Some(view) = self.view.as_ref()
