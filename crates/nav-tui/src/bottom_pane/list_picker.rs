@@ -180,7 +180,7 @@ impl<T: ListPickerItem> ListPicker<T> {
 
     /// Handle standard list-navigation keys:
     ///
-    /// - **Up** / **k** — move selection up
+    /// - **Up** / **k** / **Shift+Tab** — move selection up
     /// - **Down** / **j** — move selection down
     /// - **Enter** — confirm selection
     /// - **Esc** — cancel
@@ -194,7 +194,7 @@ impl<T: ListPickerItem> ListPicker<T> {
             return InputResult::Unhandled;
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+            (KeyCode::Up, _) | (KeyCode::BackTab, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
                 self.move_up();
                 InputResult::Handled
             }
@@ -370,5 +370,28 @@ mod tests {
         p.confirm();
         assert!(p.take_selection().is_some());
         assert!(p.take_selection().is_none());
+    }
+
+    #[test]
+    fn backtab_moves_selection_up() {
+        let mut p = picker(&["a", "b", "c"]);
+        p.move_down();
+        assert_eq!(p.selected_index(), 1);
+        assert_eq!(
+            p.handle_navigation_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+            InputResult::Handled
+        );
+        assert_eq!(p.selected_index(), 0);
+    }
+
+    #[test]
+    fn backtab_clamps_at_zero() {
+        let mut p = picker(&["a"]);
+        assert_eq!(p.selected_index(), 0);
+        assert_eq!(
+            p.handle_navigation_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+            InputResult::Handled
+        );
+        assert_eq!(p.selected_index(), 0);
     }
 }

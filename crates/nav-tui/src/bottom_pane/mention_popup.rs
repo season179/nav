@@ -130,7 +130,7 @@ impl FileMentionPopup {
         match (key.code, key.modifiers) {
             (KeyCode::Tab, _) => self.try_complete(composer),
             (KeyCode::Enter, m) if !m.contains(KeyModifiers::SHIFT) => self.try_complete(composer),
-            (KeyCode::Up, _) => {
+            (KeyCode::Up, _) | (KeyCode::BackTab, _) => {
                 self.selected = self.selected.saturating_sub(1);
                 InputResult::Handled
             }

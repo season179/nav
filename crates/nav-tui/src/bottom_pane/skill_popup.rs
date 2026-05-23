@@ -136,6 +136,10 @@ impl SkillPopup {
         }
         match (key.code, key.modifiers) {
             (KeyCode::Tab, _) => self.try_complete(composer),
+            (KeyCode::BackTab, _) => {
+                self.picker.move_up();
+                InputResult::Handled
+            }
             (KeyCode::Enter, m) if !m.contains(KeyModifiers::SHIFT) => {
                 self.try_complete(composer)
             }

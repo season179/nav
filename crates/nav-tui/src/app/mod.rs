@@ -1015,6 +1015,14 @@ pub async fn run(
                                 continue;
                             }
                             ctrl_c_count = 0;
+                            // Ctrl+L — force a full redraw (readline convention).
+                            if key.code == KeyCode::Char('l')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key.modifiers.contains(KeyModifiers::ALT)
+                            {
+                                needs_draw = true;
+                                continue;
+                            }
                             // Scrollback navigation is owned by the terminal
                             // (mouse wheel, PgUp/PgDn) — no in-app scroll keys.
                             match pane.handle_key(key) {

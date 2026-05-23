@@ -285,6 +285,18 @@ impl Composer {
                 None => ComposerEvent::Nothing,
             },
             (KeyCode::Esc, _) => ComposerEvent::Cancelled,
+            (KeyCode::Char('a'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.col = 0;
+                ComposerEvent::Nothing
+            }
+            (KeyCode::Char('e'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.col = self.lines[self.row].len();
+                ComposerEvent::Nothing
+            }
+            (KeyCode::Char('k'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.kill_to_line_end();
+                ComposerEvent::Nothing
+            }
             (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.clear_to_line_start();
                 ComposerEvent::Nothing
@@ -452,6 +464,14 @@ impl Composer {
         } else if self.row + 1 < self.lines.len() {
             let next = self.lines.remove(self.row + 1);
             self.lines[self.row].push_str(&next);
+        }
+        self.history_idx = None;
+    }
+
+    fn kill_to_line_end(&mut self) {
+        let line_len = self.lines[self.row].len();
+        if self.col < line_len {
+            self.lines[self.row].replace_range(self.col.., "");
         }
         self.history_idx = None;
     }
@@ -1204,5 +1224,59 @@ mod tests {
         let mut c = typed("$");
         assert!(c.replace_active_dollar_token("code-reviewer"));
         assert_eq!(c.text(), "code-reviewer ");
+    }
+
+    // ── Ctrl+A / Ctrl+E / Ctrl+K keybinding tests ─────────────────
+
+    #[test]
+    fn ctrl_a_moves_cursor_to_line_start() {
+        let mut c = typed("hello world");
+        // Cursor is at end; Ctrl+A should jump to column 0.
+        assert_eq!(c.col, "hello world".len());
+        c.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(c.col, 0);
+        // Text unchanged.
+        assert_eq!(c.text(), "hello world");
+    }
+
+    #[test]
+    fn ctrl_e_moves_cursor_to_line_end() {
+        let mut c = typed("hello world");
+        // Move to start, then Ctrl+E to end.
+        c.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(c.col, 0);
+        c.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(c.col, "hello world".len());
+    }
+
+    #[test]
+    fn ctrl_k_kills_to_end_of_line() {
+        let mut c = typed("hello world");
+        // Move to after "hello" (col 5). 11 − 6 = 5.
+        for _ in 0..6 {
+            c.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        assert_eq!(c.col, 5);
+        c.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(c.text(), "hello");
+        assert_eq!(c.col, 5);
+    }
+
+    #[test]
+    fn ctrl_k_at_end_of_line_is_noop() {
+        let mut c = typed("hello");
+        assert_eq!(c.col, 5);
+        c.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(c.text(), "hello");
+    }
+
+    #[test]
+    fn ctrl_k_at_start_kills_entire_line() {
+        let mut c = typed("hello");
+        c.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(c.col, 0);
+        c.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(c.text(), "");
+        assert_eq!(c.col, 0);
     }
 }
