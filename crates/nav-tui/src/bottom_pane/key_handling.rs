@@ -8,6 +8,7 @@ use nav_core::UserAttachment;
 
 use super::approval::ApprovalOverlay;
 use super::clipboard::{recognized_image_path, try_save_clipboard_image, workspace_relative_image};
+use super::history_search::HistorySearch;
 use super::session_picker::SessionPickerPopup;
 use super::{
     BottomPane, BottomPaneView, ComposerEvent, FileMentionPopup, InputResult, SlashCommandPopup,
@@ -122,6 +123,8 @@ impl BottomPane {
                                 self.last_session_selection = Some(session_id);
                             }
                         }
+                        // HistorySearch restores the buffer itself on
+                        // cancel; nothing else to capture.
                         self.view = None;
                         // Promote the next queued approval, if any.
                         self.try_show_next_approval();
@@ -132,6 +135,21 @@ impl BottomPane {
                 InputResult::Unhandled => {}
             }
         }
+
+        // Ctrl+R opens history search when no overlay is active and there is
+        // at least one history entry.
+        if key.code == KeyCode::Char('r')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !self.composer.history().is_empty()
+        {
+            let initial = self.composer.text();
+            let history = self.composer.history().to_vec();
+            let search = HistorySearch::new(history, &initial, self.theme);
+            self.view = Some(Box::new(search));
+            self.reconcile_popups();
+            return ComposerEvent::Nothing;
+        }
+
         let event = self.composer.handle_key(key);
         if is_composer_activity_key(key) {
             self.last_composer_keystroke_at = Some(std::time::Instant::now());

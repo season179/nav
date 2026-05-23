@@ -19,6 +19,7 @@ use crate::theme::Theme;
 mod approval;
 mod clipboard;
 mod composer;
+mod history_search;
 mod key_handling;
 mod list_picker;
 mod mention_popup;
@@ -32,6 +33,7 @@ mod view;
 
 pub use approval::ApprovalOverlay;
 pub use composer::{Composer, ComposerEvent};
+pub use history_search::HistorySearch;
 pub use list_picker::{ListPicker, ListPickerItem};
 pub use mention_popup::{FileMentionPopup, MentionEntry, build_mention_entries};
 use pending_preview::PendingPreview;

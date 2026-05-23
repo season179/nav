@@ -541,3 +541,134 @@ fn desired_height_grows_by_one_when_indicator_row_is_active() {
         "suppressed indicator must not occupy a layout slot"
     );
 }
+
+// --- History search (Ctrl+R) integration tests ---
+
+#[test]
+fn ctrl_r_opens_history_search_when_history_nonempty() {
+    let mut pane = BottomPane::new();
+
+    // Submit a prompt to populate history.
+    type_text(&mut pane, "first prompt");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(pane.composer().history(), &["first prompt".to_string()]);
+
+    // Ctrl+R should open the search overlay.
+    let event = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert_eq!(event, ComposerEvent::Nothing);
+    assert!(pane.has_overlay(), "history search overlay should be open");
+}
+
+#[test]
+fn ctrl_r_is_noop_on_empty_history() {
+    let mut pane = BottomPane::new();
+
+    let event = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert_eq!(event, ComposerEvent::Nothing);
+    assert!(!pane.has_overlay(), "no overlay on empty history");
+}
+
+#[test]
+fn history_search_enter_selects_match_and_fills_composer() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "hello");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut pane, "world");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+
+    // Open history search — initial query is empty (composer is empty).
+    let _ = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert!(pane.has_overlay());
+
+    // Type to filter.
+    press(&mut pane, KeyCode::Char('h'), KeyModifiers::NONE);
+
+    // Select the match and confirm.
+    let event = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(event, ComposerEvent::Nothing);
+    assert!(!pane.has_overlay(), "overlay should close on Enter");
+    assert_eq!(pane.composer().text(), "hello");
+}
+
+#[test]
+fn history_search_esc_restores_pre_search_buffer() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "saved");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+
+    // Type something before opening search.
+    type_text(&mut pane, "draft");
+
+    // Open search.
+    let _ = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert!(pane.has_overlay());
+
+    // Esc should restore the pre-search buffer.
+    let event = press(&mut pane, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(event, ComposerEvent::Nothing);
+    assert!(!pane.has_overlay());
+    assert_eq!(pane.composer().text(), "draft");
+}
+
+#[test]
+fn history_search_up_down_navigate_matches() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "fix bug");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut pane, "fix tests");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut pane, "run tests");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+
+    // Open search and filter.
+    let _ = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    type_text(&mut pane, "fix");
+
+    // Newest match ("fix tests") should be selected first.
+    press(&mut pane, KeyCode::Down, KeyModifiers::NONE);
+
+    // Select the older match.
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(pane.composer().text(), "fix bug");
+}
+
+#[test]
+fn history_search_ctrl_r_cycles_to_older_match() {
+    let mut pane = BottomPane::new();
+
+    type_text(&mut pane, "alpha");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut pane, "alpha beta");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+
+    // Open search, initial query is empty → all history matches.
+    let _ = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+
+    // Ctrl+R again should cycle to the next (older) match.
+    let _ = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(pane.composer().text(), "alpha");
+}
+
+#[test]
+fn history_search_renders_matching_entries() {
+    let mut pane = BottomPane::new();
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+
+    type_text(&mut pane, "first");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+    type_text(&mut pane, "second");
+    let _ = press(&mut pane, KeyCode::Enter, KeyModifiers::NONE);
+
+    // Open search.
+    let _ = press(&mut pane, KeyCode::Char('r'), KeyModifiers::CONTROL);
+    render(&pane, &mut terminal);
+    let rendered = rendered_text(&terminal);
+
+    assert!(rendered.contains("bck-i-search"), "search prompt should render");
+    assert!(rendered.contains("second"), "newest match should render: {rendered}");
+    assert!(rendered.contains("first"), "oldest match should render: {rendered}");
+}
