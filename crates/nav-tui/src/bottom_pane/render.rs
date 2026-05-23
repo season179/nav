@@ -77,7 +77,7 @@ impl BottomPane {
         if self.pending_inputs.is_empty() {
             0
         } else {
-            1 + self.pending_inputs.len().min(4) as u16
+            1 + self.pending_inputs.len().min(super::pending_preview::VISIBLE_CAP) as u16
         }
     }
 

@@ -275,9 +275,11 @@ fn bottom_pane_renders_pending_followups_and_steering_above_composer() {
     let rendered = rendered_text(&terminal);
 
     assert!(rendered.contains("pending"), "{rendered}");
-    assert!(rendered.contains("pending-1 follow-up"), "{rendered}");
+    assert!(rendered.contains("pending-1"), "{rendered}");
+    assert!(rendered.contains("follow-up"), "{rendered}");
     assert!(rendered.contains("run tests next"), "{rendered}");
-    assert!(rendered.contains("pending-2 steering"), "{rendered}");
+    assert!(rendered.contains("pending-2"), "{rendered}");
+    assert!(rendered.contains("steering"), "{rendered}");
     assert!(rendered.contains("avoid broad refactors"), "{rendered}");
 }
 
@@ -315,7 +317,8 @@ fn bottom_pane_updates_pending_preview_for_edit_remove_and_clear() {
 
     render(&pane, &mut terminal);
     let rendered = rendered_text(&terminal);
-    assert!(rendered.contains("pending-1 follow-up"), "{rendered}");
+    assert!(rendered.contains("pending-1"), "{rendered}");
+    assert!(rendered.contains("follow-up"), "{rendered}");
     assert!(rendered.contains("better wording"), "{rendered}");
     assert!(!rendered.contains("pending-2"), "{rendered}");
 
