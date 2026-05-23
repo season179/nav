@@ -13,6 +13,7 @@ mod pending;
 mod preview;
 mod reasoning;
 mod row;
+mod separators;
 mod sessions;
 mod subagents;
 mod system;
@@ -32,8 +33,9 @@ pub use messages::{
 pub use model::{ModelListCell, ModelSetCell};
 pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use reasoning::ReasoningCell;
+pub(crate) use separators::FinalMessageSeparator;
 pub use sessions::{SessionListCell, SessionNoticeCell, SessionTreeCell, TranscriptHitsCell};
 pub use subagents::SubagentCell;
 pub use system::{ApprovalDecisionCell, ErrorCell, NoticeCell};
-pub use tools::{ExplorationOutputCell, ExploringSummaryCell, ToolCallCell, ToolOutputCell};
+pub use tools::{ToolCallCell, ToolOutputCell};
 pub(crate) use tools::ExplorationEntry;

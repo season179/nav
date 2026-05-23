@@ -33,26 +33,18 @@ impl ReasoningCell {
         }
     }
 
-    pub fn with_expanded(mut self, expanded: bool) -> Self {
-        self.expanded = expanded;
-        self
-    }
-
+    /// Toggle expanded rendering (for a future scrollback keybinding).
+    #[expect(dead_code, reason = "expand/collapse keybinding not wired yet")]
     pub fn set_expanded(&mut self, expanded: bool) {
         self.expanded = expanded;
     }
+}
 
-    pub fn is_expanded(&self) -> bool {
-        self.expanded
-    }
-
-    /// Number of content lines (before wrapping) for the header summary.
-    fn content_line_count(&self) -> usize {
-        if self.text.is_empty() {
-            0
-        } else {
-            self.text.lines().count()
-        }
+fn collapsed_summary(text: &str) -> String {
+    match text.lines().count() {
+        0 => "Reasoning".into(),
+        1 => "Reasoning (1 line)".into(),
+        n => format!("Reasoning ({n} lines)"),
     }
 }
 
@@ -61,13 +53,7 @@ impl HistoryCell for ReasoningCell {
         let body = if self.expanded {
             self.text.clone()
         } else {
-            let count = self.content_line_count();
-            if count == 0 {
-                "Reasoning".to_string()
-            } else {
-                let noun = if count == 1 { "line" } else { "lines" };
-                format!("Reasoning ({count} {noun})")
-            }
+            collapsed_summary(&self.text)
         };
         TranscriptRow::new(TranscriptRowKind::Reasoning, body).render(width)
     }
@@ -91,8 +77,6 @@ mod tests {
     #[test]
     fn collapsed_shows_line_count_header() {
         let cell = ReasoningCell::new("line one\nline two\nline three");
-        assert!(!cell.is_expanded());
-
         let rendered = lines_text(&cell.display_lines(60));
         assert!(
             rendered.contains("Reasoning (3 lines)"),
@@ -106,10 +90,9 @@ mod tests {
     }
 
     #[test]
-    fn expanded_shows_full_text() {
-        let cell = ReasoningCell::new("thinking step 1\nthinking step 2").with_expanded(true);
-        assert!(cell.is_expanded());
-
+    fn expanded_shows_full_text_and_toggle() {
+        let mut cell = ReasoningCell::new("thinking step 1\nthinking step 2");
+        cell.set_expanded(true);
         let rendered = lines_text(&cell.display_lines(60));
         assert!(
             rendered.contains("thinking step 1"),
@@ -132,25 +115,12 @@ mod tests {
     }
 
     #[test]
-    fn toggle_expanded_flips_state() {
-        let mut cell = ReasoningCell::new("some reasoning");
-        assert!(!cell.is_expanded());
-        cell.set_expanded(true);
-        assert!(cell.is_expanded());
-
-        let rendered = lines_text(&cell.display_lines(60));
-        assert!(
-            rendered.contains("some reasoning"),
-            "toggling expanded should show body; got:\n{rendered}"
-        );
-    }
-
-    #[test]
     fn reasoning_cell_distinct_from_assistant() {
         use super::super::messages::AssistantMessageCell;
 
         let text = "This is some content that could be either reasoning or a reply.";
-        let reasoning = ReasoningCell::new(text).with_expanded(true);
+        let mut reasoning = ReasoningCell::new(text);
+        reasoning.set_expanded(true);
         let assistant = AssistantMessageCell::new(text);
 
         let reasoning_rendered = lines_text(&reasoning.display_lines(60));

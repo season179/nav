@@ -362,9 +362,13 @@ fn event_label_and_body(event: &AgentEvent) -> (&'static str, String) {
             duration_ms,
             stdout,
             stderr,
+            exit_status,
             success,
         } => {
             let status = if *success { "ok" } else { "failed" };
+            let exit = exit_status
+                .map(|code| format!(" exit={code}"))
+                .unwrap_or_default();
             let output = match (stdout.is_empty(), stderr.is_empty()) {
                 (true, true) => String::new(),
                 (false, true) => stdout.clone(),
@@ -373,7 +377,7 @@ fn event_label_and_body(event: &AgentEvent) -> (&'static str, String) {
             };
             (
                 "hook completed",
-                format!("{name} ({event_type}) {status} {duration_ms}ms\n{output}"),
+                format!("{name} ({event_type}) {status}{exit} {duration_ms}ms\n{output}"),
             )
         }
         AgentEvent::ResponseContinuation { items } => {

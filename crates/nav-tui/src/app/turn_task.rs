@@ -7,9 +7,9 @@
 use anyhow::{Context, Result};
 use nav_core::guardrails::PermissionContext;
 use nav_core::{
-    AgentEvent, AgentTurnRequest, Catalog, ModelTransportHandle, ProjectContext, SessionBinding,
-    SessionId, SessionStore, TurnControls, UserAttachment, cli::Args, rebuild_responses_input,
-    run_agent,
+    AgentEvent, AgentTurnRequest, Catalog, ExtensionCatalog, ModelTransportHandle, ProjectContext,
+    SessionBinding, SessionId, SessionStore, TurnControls, UserAttachment, cli::Args,
+    rebuild_responses_input, run_agent,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ pub(crate) struct TurnSpawn {
     pub attachments: Vec<UserAttachment>,
     pub agent_tx: mpsc::UnboundedSender<AgentEvent>,
     pub skills: Arc<Catalog>,
+    pub extensions: Arc<ExtensionCatalog>,
     pub project: Arc<ProjectContext>,
     pub permissions: PermissionContext,
     pub controls: TurnControls,
@@ -55,6 +56,7 @@ pub(crate) fn spawn_turn(request: TurnSpawn) -> Result<tokio::task::JoinHandle<(
         attachments,
         agent_tx,
         skills,
+        extensions,
         project,
         permissions,
         controls,
@@ -79,6 +81,7 @@ pub(crate) fn spawn_turn(request: TurnSpawn) -> Result<tokio::task::JoinHandle<(
             .with_display_prompt(display_prompt.as_deref())
             .with_attachments(attachments)
             .with_session(Some(&binding), history_input)
+            .with_extensions(Some(extensions.as_ref()))
             .with_context(Some(project.as_ref()))
             .with_controls(controls),
         )

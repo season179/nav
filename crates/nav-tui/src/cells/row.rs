@@ -26,7 +26,6 @@ pub(crate) enum TranscriptRowKind {
     SessionNotice,
     SessionTree,
     TranscriptHits,
-    ExploringSummary,
     SubagentStarted,
     SubagentCompleted,
     SubagentFailed,
@@ -84,11 +83,6 @@ impl TranscriptRowKind {
             Self::SessionNotice => TranscriptRowStyle::labeled("◆", "notice", Color::Cyan),
             Self::SessionTree => TranscriptRowStyle::labeled("◆", "tree", Color::Cyan),
             Self::TranscriptHits => TranscriptRowStyle::labeled("◆", "find", Color::Cyan),
-            // No label: the body itself ("reading 3 files…") already says what
-            // is happening. Same green as the eventual `Explored` summary so
-            // the inline preview and the scrollback row read as the same row
-            // when one transitions into the other.
-            Self::ExploringSummary => TranscriptRowStyle::bullet("•", Color::Green),
             Self::SubagentStarted => TranscriptRowStyle::labeled("*", "subagent", Color::Blue),
             Self::SubagentCompleted => TranscriptRowStyle::labeled("*", "subagent", Color::Green),
             Self::SubagentFailed => TranscriptRowStyle::labeled("*", "subagent", Color::Red),

@@ -15,6 +15,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use std::time::Duration;
 
+use crate::metrics::format_tokens_k;
+
 /// Snapshot of what the status bar should show on the next draw. The main loop
 /// assembles this once per frame and hands it to
 /// [`super::BottomPane::update_status`]; the renderer reads from
@@ -123,20 +125,6 @@ fn gauge_span(pct: u64) -> Option<Span<'static>> {
         format!(" [{}{}]", "█".repeat(filled), "░".repeat(empty)),
         Style::default().fg(color),
     ))
-}
-
-/// Format `tokens` as `<n.n>k` (one decimal). Caller must gate on
-/// `>= 1_000`; below that the gauge is hidden entirely.
-fn format_tokens_k(tokens: u64) -> String {
-    debug_assert!(tokens >= 1_000);
-    let tenths = (tokens + 50) / 100;
-    let whole = tenths / 10;
-    let frac = tenths % 10;
-    if frac == 0 {
-        format!("{whole}k")
-    } else {
-        format!("{whole}.{frac}k")
-    }
 }
 
 /// Renderable view over a [`StatusBarState`]. Owned by the pane; constructed

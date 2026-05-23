@@ -144,6 +144,40 @@ pub struct TurnUsage {
     pub tokens_reasoning: u64,
 }
 
+impl TurnUsage {
+    pub fn accumulate(&mut self, other: &Self) {
+        self.tokens_input += other.tokens_input;
+        self.tokens_output += other.tokens_output;
+        self.tokens_input_cached += other.tokens_input_cached;
+        self.tokens_reasoning += other.tokens_reasoning;
+    }
+}
+
+#[cfg(test)]
+mod turn_usage_tests {
+    use super::TurnUsage;
+
+    #[test]
+    fn accumulate_sums_all_fields() {
+        let mut total = TurnUsage {
+            tokens_input: 100,
+            tokens_output: 50,
+            tokens_input_cached: 10,
+            tokens_reasoning: 5,
+        };
+        total.accumulate(&TurnUsage {
+            tokens_input: 400,
+            tokens_output: 30,
+            tokens_input_cached: 20,
+            tokens_reasoning: 15,
+        });
+        assert_eq!(total.tokens_input, 500);
+        assert_eq!(total.tokens_output, 80);
+        assert_eq!(total.tokens_input_cached, 30);
+        assert_eq!(total.tokens_reasoning, 20);
+    }
+}
+
 /// Single, ordered events produced by [`crate::agent_loop::run_agent`].
 ///
 /// `UserMessage` records the exact model-facing prompt for replay and an
@@ -408,6 +442,8 @@ pub enum AgentEvent {
         duration_ms: u64,
         stdout: String,
         stderr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_status: Option<i32>,
         success: bool,
     },
     Error {
@@ -924,6 +960,7 @@ mod tests {
             duration_ms: 350,
             stdout: String::new(),
             stderr: String::new(),
+            exit_status: Some(0),
             success: true,
         };
         assert_eq!(
@@ -935,6 +972,7 @@ mod tests {
                 "duration_ms": 350,
                 "stdout": "",
                 "stderr": "",
+                "exit_status": 0,
                 "success": true
             })
         );
@@ -953,6 +991,7 @@ mod tests {
             duration_ms: 1200,
             stdout: "3 warnings".into(),
             stderr: "type mismatch".into(),
+            exit_status: Some(1),
             success: false,
         };
         let json = serde_json::to_value(&failed).unwrap();

@@ -14,8 +14,9 @@ pub use compaction::{
     should_auto_compact, summary_message,
 };
 pub use extensions::{
-    Extension, ExtensionCatalog, ExtensionScope, ExtensionTheme, PromptTemplate, ThemeColors,
-    discover_extensions, load_prompt_template,
+    DEFAULT_HOOK_TIMEOUT, Extension, ExtensionCatalog, ExtensionHook, ExtensionScope,
+    ExtensionTheme, HookCommand, HookEventType, PromptTemplate, ThemeColors, discover_extensions,
+    load_prompt_template,
 };
 pub use handoff::{HANDOFF_SLASH, HandoffBudget, HandoffDraft, build_handoff_draft};
 pub use project::{

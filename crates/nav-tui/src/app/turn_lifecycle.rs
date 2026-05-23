@@ -8,9 +8,9 @@ use anyhow::Result;
 use nav_core::guardrails::PermissionContext;
 use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
-    AgentEvent, Catalog, ControlPlane, ModelTransportHandle, PendingInput, PendingInputDraft,
-    PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext, SessionId, SessionStore,
-    TurnControls, UserAttachment, cli::Args,
+    AgentEvent, Catalog, ControlPlane, ExtensionCatalog, ModelTransportHandle, PendingInput,
+    PendingInputDraft, PendingInputMode, PendingSkill, PendingSteeringQueue, ProjectContext,
+    SessionId, SessionStore, TurnControls, TurnUsage, UserAttachment, cli::Args,
 };
 use std::collections::VecDeque;
 use std::path::Path;
@@ -36,6 +36,8 @@ pub(super) struct ActiveTurnHandle {
     task: JoinHandle<()>,
     steering: PendingSteeringQueue,
     started_at: Instant,
+    /// Summed across per-iteration [`AgentEvent::TurnComplete`] events.
+    pub(super) usage: TurnUsage,
 }
 
 impl ActiveTurnHandle {
@@ -44,6 +46,7 @@ impl ActiveTurnHandle {
             task,
             steering,
             started_at: Instant::now(),
+            usage: TurnUsage::default(),
         }
     }
 
@@ -77,6 +80,7 @@ pub(super) fn start_next_follow_up(
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
     skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
     project: &Arc<ProjectContext>,
     permissions: &PermissionContext,
     chat: &mut ChatWidget,
@@ -106,6 +110,7 @@ pub(super) fn start_next_follow_up(
         session_id,
         agent_tx,
         skills,
+        extensions,
         project,
         permissions,
         chat,
@@ -148,6 +153,7 @@ pub(super) fn abort_active_turn(
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
     skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
     project: &Arc<ProjectContext>,
     permissions: &PermissionContext,
     chat: &mut ChatWidget,
@@ -193,6 +199,7 @@ pub(super) fn abort_active_turn(
             session_id,
             agent_tx,
             skills,
+            extensions,
             project,
             permissions,
             chat,
@@ -304,6 +311,7 @@ pub(super) fn start_pending_turn(
     session_id: &SessionId,
     agent_tx: &mpsc::UnboundedSender<AgentEvent>,
     skills: &Arc<Catalog>,
+    extensions: &Arc<ExtensionCatalog>,
     project: &Arc<ProjectContext>,
     permissions: &PermissionContext,
     chat: &mut ChatWidget,
@@ -321,6 +329,7 @@ pub(super) fn start_pending_turn(
         attachments: item.attachments.clone(),
         agent_tx: agent_tx.clone(),
         skills: Arc::clone(skills),
+        extensions: Arc::clone(extensions),
         project: Arc::clone(project),
         permissions: permissions.clone(),
         controls: TurnControls {
