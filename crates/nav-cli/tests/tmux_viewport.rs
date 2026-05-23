@@ -11,9 +11,15 @@
 //! Skips cleanly when tmux is not on `PATH` so CI environments without
 //! it still pass.
 
+use serde_json::json;
+use std::fs;
+use std::io::Write;
 use std::process::{Command, Output};
+use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use std::net::{TcpListener, TcpStream};
+use tempfile::tempdir;
 
 /// Unique session name per test so concurrent runs don't collide.
 fn fresh_session(name: &str) -> Session {
@@ -155,11 +161,27 @@ fn run_tmux(args: &[&str]) -> Output {
 }
 
 fn tmux_available() -> bool {
-    Command::new("tmux")
-        .arg("-V")
+    let probe_session = format!("nav-tmux-probe-{}", std::process::id());
+    match Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &probe_session,
+            "-x",
+            "20",
+            "-y",
+            "10",
+        ])
         .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    {
+        Ok(out) if out.status.success() => {
+            let _ = run_tmux(&["kill-session", "-t", &probe_session]);
+            true
+        }
+        Ok(_) => false,
+        Err(_) => false,
+    }
 }
 
 /// Substring that proves the status bar's render path ran. The bar uses
@@ -183,10 +205,88 @@ fn last_row_with(pane: &str, predicate: impl Fn(&str) -> bool) -> Option<usize> 
         .last()
 }
 
+fn spawn_mock_streaming_server(chunk_count: usize) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock streaming server bind");
+    let port = listener
+        .local_addr()
+        .expect("mock streaming server local addr")
+        .port();
+    let _ = listener.set_nonblocking(true);
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    write_mock_streaming_response(stream, chunk_count);
+                    return;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(10) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(25));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    port
+}
+
+fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    for i in 0..chunk_count {
+        // Newline-terminate each chunk so the StreamController's partition
+        // logic flips bytes from tail to stable, which is the path the
+        // visibility gate (`AdaptiveChunkingPolicy` + commit ticks)
+        // actually paces. A space separator instead of `\n` would keep
+        // every chunk in the live tail and bypass the gate entirely.
+        let chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": format!("chunk-{i}\n")
+                }
+            }]
+        })
+        .to_string();
+        let frame = format!("data: {chunk}\n\n");
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return;
+        }
+        if stream.flush().is_err() {
+            return;
+        }
+        sleep(Duration::from_millis(5));
+    }
+
+    let final_payload = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "SMOKE_OK_STREAM"
+            },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let final_chunk = format!("data: {final_payload}\n\n");
+    if stream.write_all(final_chunk.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+}
+
 #[test]
 fn status_bar_stays_visible_when_slash_popup_opens_and_closes() {
     if !tmux_available() {
-        eprintln!("tmux not available on PATH, skipping");
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
         return;
     }
 
@@ -253,7 +353,7 @@ fn status_bar_stays_visible_when_slash_popup_opens_and_closes() {
 #[test]
 fn status_bar_paints_below_composer() {
     if !tmux_available() {
-        eprintln!("tmux not available on PATH, skipping");
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
         return;
     }
 
@@ -302,7 +402,7 @@ fn status_bar_paints_below_composer() {
 #[test]
 fn cursor_lands_inside_composer_on_startup() {
     if !tmux_available() {
-        eprintln!("tmux not available on PATH, skipping");
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
         return;
     }
 
@@ -335,6 +435,82 @@ fn cursor_lands_inside_composer_on_startup() {
     assert!(
         cx >= 2,
         "cursor column should be inside the composer content area, found {cx}\n{pane}"
+    );
+}
+
+#[test]
+fn streaming_response_lands_in_scrollback_without_artifacts() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    // 12 chunks: large enough to cross the catch-up threshold
+    // (ENTER_QUEUE_DEPTH_LINES = 8 in `streaming::chunking`), small
+    // enough to fit on the 24-row viewport so `chunk-0` is still
+    // visible when the final marker lands.
+    let mock_port = spawn_mock_streaming_server(12);
+    let workdir = tempdir().expect("tempdir for mock provider settings");
+    let settings_dir = workdir.path().join(".nav");
+    fs::create_dir_all(&settings_dir).expect("create mock .nav settings dir");
+    fs::write(
+        settings_dir.join("settings.json"),
+        serde_json::to_string_pretty(&json!({
+            "providers": {
+                "mock": {
+                    "name": "Local Mock",
+                    "base_url": format!("http://127.0.0.1:{}/v1", mock_port),
+                    "models": {
+                        "smoke": {}
+                    }
+                }
+            },
+            "default_model": "mock/smoke",
+        }))
+        .expect("serialize mock settings"),
+    )
+    .expect("write mock settings file");
+
+    let session = fresh_session("streaming-scrollback");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!("cd {cwd} && {nav} --auth api-key --model mock/smoke"));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "streaming nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("stream a long noisy answer to stress rendering");
+
+    let saw_first_chunk = session.wait_for(
+        |pane| pane.contains("chunk-0"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        saw_first_chunk.contains("chunk-0"),
+        "did not observe streaming chunks in first frames:\n{saw_first_chunk}"
+    );
+
+    let completed = session.wait_for(
+        |pane| pane.contains("SMOKE_OK_STREAM"),
+        Duration::from_secs(15),
+    );
+    assert!(
+        completed.contains("SMOKE_OK_STREAM"),
+        "streaming final marker never landed:\n{completed}"
+    );
+    assert!(
+        !completed.contains("data:"),
+        "raw SSE payload leaked into the TUI:\n{completed}"
+    );
+    assert_eq!(
+        completed.matches("SMOKE_OK_STREAM").count(),
+        1,
+        "expected the final marker once in the final frame, got:\n{completed}"
     );
 }
 
