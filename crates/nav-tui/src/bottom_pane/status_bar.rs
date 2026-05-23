@@ -68,7 +68,34 @@ impl Default for StatusBarState {
 #[derive(Debug, Clone, Copy)]
 pub enum AgentState {
     Ready,
-    Working { elapsed: Duration, spinner: char },
+    Working {
+        elapsed: Duration,
+        spinner: char,
+        /// Raw spinner tick counter (~12 Hz). Used to derive animated dots
+        /// and colour pulse without storing extra state in the enum.
+        tick: u64,
+    },
+}
+
+/// Animated dots suffix driven by the spinner tick counter.
+/// Cycles `""` → `"."` → `".."` → `"..."` at ~3 Hz (tick rate ~12.5 Hz).
+pub(super) fn working_dots(tick: u64) -> &'static str {
+    match (tick / 4) % 4 {
+        0 => "   ",
+        1 => ".  ",
+        2 => ".. ",
+        _ => "...",
+    }
+}
+
+/// Pulsing magenta colour driven by the spinner tick counter.
+/// Alternates between `Magenta` and `LightMagenta` at ~1.5 Hz.
+pub(super) fn working_pulse_color(tick: u64) -> Color {
+    if (tick / 8) % 2 == 0 {
+        Color::Magenta
+    } else {
+        Color::LightMagenta
+    }
 }
 
 /// Format `tokens` as `<n.n>k` (one decimal). Caller must gate on
@@ -134,14 +161,12 @@ impl<'a> Widget for StatusBar<'a> {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            AgentState::Working { elapsed, spinner } if !s.show_indicator => {
+            AgentState::Working { elapsed, spinner, tick } if !s.show_indicator => {
                 let secs = elapsed.as_secs();
                 spans.push(sep.clone());
                 spans.push(Span::styled(
-                    format!("{spinner} Working {secs}s"),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    format!("{spinner} Working{} {secs}s", working_dots(tick)),
+                    Style::default().fg(working_pulse_color(tick)).add_modifier(Modifier::BOLD),
                 ));
             }
             AgentState::Working { .. } => {
