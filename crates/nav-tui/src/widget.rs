@@ -5,11 +5,12 @@ use std::collections::HashMap;
 
 use crate::cells::{
     ApprovalDecisionCell, AssistantMessageCell, CompactionCell, CompactionPhase, ErrorCell,
-    FileChangeCell, GitCheckpointCell, ModelListCell, ModelSetCell, NoticeCell, PendingInputCell,
-    SessionListCell, SessionNoticeCell, SessionTreeCell, SkillInvocationCell, SubagentCell,
-    ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell, TurnAbortedCell,
-    TurnDiffCell, UserMessageCell,
+    ExplorationOutputCell, FileChangeCell, GitCheckpointCell, ModelListCell, ModelSetCell,
+    NoticeCell, PendingInputCell, SessionListCell, SessionNoticeCell, SessionTreeCell,
+    SkillInvocationCell, SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell,
+    TranscriptHitsCell, TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
+use crate::cells::ExplorationEntry;
 use crate::history::HistoryCell;
 use crate::theme::Theme;
 
@@ -48,6 +49,11 @@ pub struct ChatWidget {
     /// out opaque random `call_id`s, so a hash- or btree-keyed container
     /// would shuffle parallel placeholders.
     inflight_tool_calls: Vec<(String, ToolCallCell)>,
+    /// Pending exploration outputs waiting to be collapsed. Consecutive
+    /// exploration tool outputs with the same action (Read, List, Search)
+    /// are merged into a single `• Explored` line. Flushed when a
+    /// non-exploration event arrives or the turn ends.
+    pending_explorations: Vec<(&'static str, Vec<String>)>,
 }
 
 impl ChatWidget {
@@ -65,6 +71,7 @@ impl ChatWidget {
             turn_has_work: false,
             streaming_assistant: None,
             inflight_tool_calls: Vec::new(),
+            pending_explorations: Vec::new(),
         }
     }
 
@@ -134,6 +141,7 @@ impl ChatWidget {
     /// before drawing the viewport. Cells stay in `finalized` so a later
     /// resize can reflow them.
     pub fn drain_pending(&mut self, width: u16) -> Vec<Line<'static>> {
+        self.flush_explorations();
         if self.pending_start >= self.finalized.len() {
             return Vec::new();
         }
@@ -172,6 +180,11 @@ impl ChatWidget {
                 }
             }
             AgentEvent::AssistantMessageDone { text } => {
+                // Deliberately do NOT flush explorations here. Exploration
+                // outputs accumulate across model rounds within a turn so
+                // same-action reads/searches can merge into one collapsed
+                // line. They flush on drain_pending (every frame) or when
+                // a non-exploration event arrives.
                 if let Some(mut cell) = self.streaming_assistant.take() {
                     cell.finalize_with(&text);
                     self.finalized.push(Box::new(cell));
@@ -245,6 +258,19 @@ impl ChatWidget {
             } => {
                 let context = self.tool_calls.remove(&call_id);
                 self.inflight_tool_calls.retain(|(id, _)| id != &call_id);
+                // Exploration tools (read_file, list_files, code_search) are
+                // buffered and collapsed. Same-action consecutive calls merge
+                // into one line; error explorations and non-exploration tools
+                // go through the normal path.
+                if !is_error {
+                    if let Some(ctx) = &context {
+                        if let Some(entry) = ExplorationEntry::from_context(ctx) {
+                            self.buffer_exploration(entry);
+                            return;
+                        }
+                    }
+                }
+                self.flush_explorations();
                 self.push_work_cell(ToolOutputCell::with_context(output, is_error, context));
             }
             AgentEvent::SubagentStarted { id, label, task } => {
@@ -400,6 +426,7 @@ impl ChatWidget {
                 // resurrected in scrollback (unlike `TurnAborted`/`Error`
                 // where the drain is informational).
                 self.clear_inflight_tool_calls();
+                self.pending_explorations.clear();
                 self.turn_has_work = false;
                 let detail = if preview.is_empty() {
                     format!("rewound to seq {target_seq}, removed {removed_events} event(s)")
@@ -491,6 +518,7 @@ impl ChatWidget {
     /// streaming row first so it lands in scrollback before this cell.
     fn push_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
         self.close_streaming_assistant();
+        self.flush_explorations();
         self.finalized.push(Box::new(cell));
     }
 
@@ -503,6 +531,7 @@ impl ChatWidget {
     /// end the assistant's in-flight message. It still goes to scrollback,
     /// but the streaming cell stays live so the message keeps growing.
     fn push_local_cell<C: HistoryCell + 'static>(&mut self, cell: C) {
+        self.flush_explorations();
         self.finalized.push(Box::new(cell));
     }
 
@@ -513,6 +542,37 @@ impl ChatWidget {
         }
     }
 
+    /// Buffer an exploration entry for collapsing. Same-action consecutive
+    /// entries merge into one group; a different action starts a new group.
+    /// Targets are deduplicated — if the same path appears twice it's only
+    /// listed once.
+    fn buffer_exploration(&mut self, entry: ExplorationEntry) {
+        if let Some((action, targets)) = self.pending_explorations.last_mut() {
+            if *action == entry.action {
+                if !targets.contains(&entry.target) {
+                    targets.push(entry.target);
+                }
+                return;
+            }
+        }
+        self.pending_explorations
+            .push((entry.action, vec![entry.target]));
+    }
+
+    /// Flush any buffered exploration groups to scrollback as collapsed
+    /// `ExplorationOutputCell` rows. Called before pushing any non-exploration
+    /// cell and on turn end.
+    fn flush_explorations(&mut self) {
+        if self.pending_explorations.is_empty() {
+            return;
+        }
+        let groups = std::mem::take(&mut self.pending_explorations);
+        for (action, targets) in groups {
+            self.finalized
+                .push(Box::new(ExplorationOutputCell::new(action, targets)));
+        }
+    }
+
     /// Move any in-flight tool placeholders to scrollback on turn end.
     /// Reached when a tool call started but its output never arrived
     /// (model aborted mid-call, transport dropped, etc.); the user still
@@ -520,6 +580,10 @@ impl ChatWidget {
     /// Also clears the parallel `tool_calls` context map for the drained
     /// ids — otherwise it would leak entries indefinitely.
     fn drain_inflight_tool_calls(&mut self) {
+        if self.inflight_tool_calls.is_empty() && self.pending_explorations.is_empty() {
+            return;
+        }
+        self.flush_explorations();
         if self.inflight_tool_calls.is_empty() {
             return;
         }

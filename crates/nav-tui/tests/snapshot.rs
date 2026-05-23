@@ -218,10 +218,197 @@ fn tool_rows_label_skill_reads_and_truncate_known_outputs() {
         rendered.contains("• Explored  Read SKILL.md (zoom-out skill)"),
         "{rendered}"
     );
-    assert!(rendered.contains("  └ 20 lines"), "{rendered}");
-    assert!(rendered.contains("line 03"), "{rendered}");
-    assert!(rendered.contains("… 16 more lines hidden"), "{rendered}");
+    assert!(!rendered.contains("  └ 20 lines"), "{rendered}");
+    assert!(!rendered.contains("line 03"), "{rendered}");
+    assert!(!rendered.contains("… 16 more lines hidden"), "{rendered}");
     assert!(!rendered.contains("line 19"), "{rendered}");
+}
+
+#[test]
+fn consecutive_same_action_explorations_collapse_into_one_line() {
+    let mut widget = ChatWidget::new();
+
+    // Two consecutive reads
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "docs/a.md" }),
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_2".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "docs/b.md" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "call_1".to_string(),
+        output: "content a".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "call_2".to_string(),
+        output: "content b".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    // A search (different action) stays separate
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_3".to_string(),
+        name: "code_search".to_string(),
+        arguments: json!({ "pattern": "inserthistory", "path": "src" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "call_3".to_string(),
+        output: "match".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    let rendered = render_widget(&mut widget, 100, 20);
+
+    // Two reads collapsed into one line
+    assert!(
+        rendered.contains("• Explored  Read docs/a.md, docs/b.md"),
+        "{rendered}"
+    );
+    // Search stays as its own line
+    assert!(
+        rendered.contains("• Explored  Search \"inserthistory\" in src"),
+        "{rendered}"
+    );
+    // No stats or preview for either
+    assert!(!rendered.contains("  └"), "{rendered}");
+    assert!(!rendered.contains("lines"), "{rendered}");
+}
+
+#[test]
+fn explorations_merge_across_model_rounds_and_dedup_targets() {
+    let mut widget = ChatWidget::new();
+
+    // Round 1: read a.md and b.md
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "a.md" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r1".to_string(),
+        output: "aaa".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "let me read more".to_string(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "let me read more".to_string(),
+    });
+
+    // Round 2: read b.md again (dedup) and c.md
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r2".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "b.md" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r2".to_string(),
+        output: "bbb".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r3".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "c.md" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r3".to_string(),
+        output: "ccc".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    let rendered = render_widget(&mut widget, 100, 20);
+
+    // All three reads merged; b.md appears only once
+    assert!(
+        rendered.contains("• Explored  Read a.md, b.md, c.md"),
+        "expected merged reads with dedup; got:\n{rendered}"
+    );
+    // Only one Explored line, not three
+    assert_eq!(
+        rendered.matches("• Explored").count(),
+        1,
+        "expected exactly one Explored line; got:\n{rendered}"
+    );
+}
+
+#[test]
+fn exploration_collapse_flushes_on_bash_output() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "r1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "foo.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "r1".to_string(),
+        output: "fn main()".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+    // Non-exploration tool flushes the buffered exploration
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "b1".to_string(),
+        name: "bash".to_string(),
+        arguments: json!({ "command": "cargo test" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "b1".to_string(),
+        output: "all tests passed".to_string(),
+        is_error: false,
+        truncation: None,
+    });
+
+    let rendered = render_widget(&mut widget, 100, 20);
+
+    assert!(
+        rendered.contains("• Explored  Read foo.rs"),
+        "exploration must appear before bash output; got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("• Ran  cargo test"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("  └ 1 line, 16 chars"), "{rendered}");
+}
+
+#[test]
+fn failed_exploration_does_not_collapse() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "f1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({ "path": "nope.rs" }),
+    });
+    widget.ingest(AgentEvent::ToolCallOutput {
+        call_id: "f1".to_string(),
+        output: "permission denied".to_string(),
+        is_error: true,
+        truncation: None,
+    });
+
+    let rendered = render_widget(&mut widget, 100, 20);
+
+    // Failed exploration goes through ToolOutputCell, not the collapsed path
+    assert!(
+        rendered.contains("■ Failed  Read nope.rs"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("  └ 1 line"), "{rendered}");
 }
 
 #[test]

@@ -309,6 +309,54 @@ fn preview_char_limit(context: Option<&ToolCallContext>) -> usize {
     }
 }
 
+/// An exploration action/target pair extracted from a tool-call context.
+pub(crate) struct ExplorationEntry {
+    pub(crate) action: &'static str,
+    pub(crate) target: String,
+}
+
+impl ExplorationEntry {
+    pub(crate) fn from_context(context: &ToolCallContext) -> Option<Self> {
+        let visual = context.visual();
+        if let ToolVisual::Exploration { action, target } = visual {
+            Some(ExplorationEntry { action, target })
+        } else {
+            None
+        }
+    }
+}
+
+/// A collapsed exploration cell. Renders as a single line:
+/// `• Explored  Read path1, path2, path3`
+///
+/// No stats, no preview — just the action and the targets.
+pub struct ExplorationOutputCell {
+    action: &'static str,
+    targets: Vec<String>,
+}
+
+impl ExplorationOutputCell {
+    pub(crate) fn new(action: &'static str, targets: Vec<String>) -> Self {
+        Self { action, targets }
+    }
+}
+
+impl HistoryCell for ExplorationOutputCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        const VISIBLE_LIMIT: usize = 6;
+        let visible: Vec<&str> =
+            self.targets.iter().take(VISIBLE_LIMIT).map(String::as_str).collect();
+        let mut joined = visible.join(", ");
+        let hidden = self.targets.len().saturating_sub(VISIBLE_LIMIT);
+        if hidden > 0 {
+            joined.push_str(&format!(", … {hidden} more"));
+        }
+        let body = format!("{} {joined}", self.action);
+        TranscriptRow::with_label(TranscriptRowKind::ToolOutput, "Explored", body)
+            .render(width)
+    }
+}
+
 fn is_skill_file_read(context: &ToolCallContext) -> bool {
     context.name == "read_file"
         && string_arg(&context.arguments, "path")

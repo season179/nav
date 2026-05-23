@@ -274,6 +274,14 @@ pub async fn run(
                 eprintln!("nav-tui: failed to insert pending history rows: {err:#}");
             }
 
+            // Collapsed exploration cells produce fewer scrollback rows
+            // than the inline placeholders they replace, so the normal
+            // slide in insert_history_lines may not reach the screen floor.
+            // Clamp the viewport down to close the gap.
+            if let Err(err) = crate::insert_history::clamp_viewport_to_floor(&mut term.terminal) {
+                eprintln!("nav-tui: failed to clamp viewport to floor: {err:#}");
+            }
+
             // Close the synchronized update; pair this with the Begin
             // above. Use execute! so the terminal commits the queued
             // bytes immediately. Failing here is benign for the same

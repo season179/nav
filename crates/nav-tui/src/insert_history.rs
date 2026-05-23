@@ -28,7 +28,7 @@ use crossterm::style::SetColors;
 use crossterm::style::SetForegroundColor;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
-use ratatui::layout::Size;
+use ratatui::layout::{Rect, Size};
 use ratatui::prelude::Backend;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
@@ -270,6 +270,42 @@ where
     }
     queue!(writer, ResetScrollRegion)?;
     queue!(writer, MoveTo(last_cursor_pos.x, last_cursor_pos.y))?;
+    Ok(())
+}
+
+/// Slide the inline viewport down to the screen floor.
+///
+/// Normally `insert_history_lines` handles this — it slides the viewport
+/// down by the number of scrollback rows just inserted. But collapsed
+/// exploration cells produce far fewer rows than the inline placeholders
+/// they replace, so the slide can fall short. This function closes the
+/// remaining gap so the composer always sits at the screen bottom.
+///
+/// Safe to call as a no-op when the viewport is already at the floor.
+pub fn clamp_viewport_to_floor<B>(terminal: &mut Terminal<B>) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + Write,
+{
+    let screen_size = terminal.backend().size().unwrap_or(Size::new(0, 0));
+    let area = terminal.viewport_area;
+    let space_below = screen_size.height.saturating_sub(area.bottom());
+    if space_below == 0 || area.width == 0 {
+        return Ok(());
+    }
+    let writer = terminal.backend_mut();
+    let top_1based = area.top() + 1;
+    queue!(writer, SetScrollRegion(top_1based..screen_size.height))?;
+    queue!(writer, MoveTo(0, area.top()))?;
+    for _ in 0..space_below {
+        queue!(writer, Print("\x1bM"))?;
+    }
+    queue!(writer, ResetScrollRegion)?;
+    terminal.set_viewport_area(Rect::new(
+        0,
+        area.y + space_below,
+        area.width,
+        area.height,
+    ));
     Ok(())
 }
 
