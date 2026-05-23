@@ -1023,12 +1023,16 @@ fn extract_concatenated_text(item: &Value, array_key: &str, part_types: &[&str])
     let parts = item.get(array_key)?.as_array()?;
     let mut buffer = String::new();
     for part in parts {
-        let part_type = part.get("type").and_then(Value::as_str)?;
-        if part_types.contains(&part_type)
-            && let Some(text) = part.get("text").and_then(Value::as_str)
-        {
-            buffer.push_str(text);
+        let Some(part_type) = part.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !part_types.contains(&part_type) {
+            continue;
         }
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        buffer.push_str(text);
     }
     (!buffer.is_empty()).then_some(buffer)
 }
