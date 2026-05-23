@@ -77,12 +77,31 @@ path, so verify the real local checkout before assuming one is absent.
     0), the diff would otherwise skip writing it and the new screen row
     would stay blank. If you touch viewport sizing or buffer flushing,
     keep this reset in place.
-- **Test TUI changes with `tmux`.** The integration tests don't exercise
-  the actual viewport/scrollback path; run `nav` inside a sized tmux
-  session and use `tmux capture-pane -p | nl -ba` to inspect what the
-  terminal actually painted. Resize between transitions (popup open /
-  close, smaller/larger window) to surface buffer-diff bugs that
-  identical-content cells can hide.
+- **TUI changes require a tmux-backed regression test.** The in-process
+  snapshot suite paints into a virtual `Buffer` and never exercises the
+  diff/flush path that produces the actual terminal output, so visual
+  regressions (status bar vanishes, cursor drifts, popup overpaints
+  composer) slip past every other test. Any change that touches
+  `app/render.rs`, `bottom_pane/`, `insert_history.rs`, or
+  `custom_terminal.rs` must come with a test in
+  `crates/nav-cli/tests/tmux_viewport.rs` (or a sibling file) that
+  spawns the real `nav` binary in tmux, drives it through the
+  scenario, and asserts on `tmux capture-pane -p` output.
+  - **Pattern:** see `tmux_viewport.rs` — `Session` drop-guard for
+    cleanup, `wait_for(predicate, timeout)` for polling instead of
+    fixed sleeps, `env!("CARGO_BIN_EXE_nav")` to locate the built
+    binary, `--auth api-key` + a throwaway `OPENAI_API_KEY` to bypass
+    the `~/.codex/auth.json` read.
+  - **Self-check:** before committing, temporarily revert the
+    underlying fix and confirm the test fails with a useful diagnostic.
+    A test that doesn't fail when the bug returns is worth nothing.
+  - **Skip cleanly when tmux is absent** so CI hosts without it pass:
+    `if !tmux_available() { eprintln!("..."); return; }`.
+  - During development, also drive the TUI interactively in tmux and
+    use `tmux capture-pane -p | nl -ba` to inspect what was painted.
+    Resize between transitions (popup open/close, smaller/larger
+    window) to surface buffer-diff bugs that identical-content cells
+    can hide.
 - `rg` must be on `PATH`; `code_search` shells out to it even though
   `Cargo.toml` does not mention it.
 - `nav update` / `nav upgrade` downloads the latest tarball from GitHub
