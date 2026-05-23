@@ -912,7 +912,7 @@ pub async fn run(
                             active_turn.is_some(),
                             "cannot resume while a turn is running",
                             Arc::clone(&store),
-                            None,
+                            Some(&session_id),
                             theme,
                             &mut term,
                             &mut app_overlay,

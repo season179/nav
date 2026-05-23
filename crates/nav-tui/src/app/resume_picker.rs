@@ -125,9 +125,9 @@ impl ResumePicker {
         }
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0).then_with(|| {
-                self.entries[a.1]
+                self.entries[b.1]
                     .last_active
-                    .cmp(&self.entries[b.1].last_active)
+                    .cmp(&self.entries[a.1].last_active)
             })
         });
         self.matches = scored.into_iter().map(|(_, idx)| idx).collect();
@@ -196,16 +196,16 @@ impl ResumePicker {
         self.apply_filter();
     }
 
-    fn list_window(&self, visible: usize) -> (usize, usize) {
-        if self.matches.is_empty() || visible == 0 {
+    fn list_window(&self, visible_slots: usize) -> (usize, usize) {
+        if self.matches.is_empty() || visible_slots == 0 {
             return (0, 0);
         }
         let len = self.matches.len();
         let start = self
             .selected
-            .saturating_sub(visible / 2)
-            .min(len.saturating_sub(visible));
-        (start, (start + visible).min(len))
+            .saturating_sub(visible_slots / 2)
+            .min(len.saturating_sub(visible_slots));
+        (start, (start + visible_slots).min(len))
     }
 
     fn list_row_style(&self, selected: bool) -> Style {
@@ -252,8 +252,8 @@ impl ResumePicker {
                     .add_modifier(Modifier::ITALIC),
             )));
         } else {
-            let visible = inner.height.saturating_sub(2) as usize;
-            let (start, end) = self.list_window(visible);
+            let visible_slots = (inner.height.saturating_sub(2) as usize + 1) / 2;
+            let (start, end) = self.list_window(visible_slots);
             for (row, &entry_idx) in self.matches[start..end].iter().enumerate() {
                 let entry = &self.entries[entry_idx];
                 let selected = start + row == self.selected;

@@ -1563,8 +1563,15 @@ fn resume_picker_overlay_filters_and_resumes_session() {
     );
 
     session.send("/");
-    session.send("pick");
-    sleep(Duration::from_millis(100));
+    session.send("pic");
+    let filtered = session.wait_for(
+        |pane| pane.contains("/pic") && pane.contains("picker tar"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        filtered.contains("/pic"),
+        "resume picker filter did not apply before Enter:\n{filtered}"
+    );
     session.send_line("");
 
     let resumed = session.wait_for(
