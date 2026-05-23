@@ -1,87 +1,174 @@
-//! Streaming partition for live assistant output.
+//! Stream-controller layer for assistant reply rendering.
 //!
-//! Partition rule: lines that end with a hard newline AND aren't inside an
-//! unterminated markdown block (fenced code, table) move to stable; the rest
-//! stay in tail and re-render each delta. [`StreamController::finalize`]
-//! flushes whatever is still in tail into stable.
+//! The controller keeps the raw streamed source, derives stable vs tail ranges
+//! based on markdown fences/table rules, and pushes newly emitted lines into a
+//! FIFO queue consumed by commit-tick scheduling.
 
-use ratatui::text::Line;
+use std::time::{Duration, Instant};
 
 use crate::cells::{count_wrapped_body_lines, render_body};
+use ratatui::text::Line;
+
+use super::StreamState;
+
+/// Cached width used for queue refreshes and fallback line rendering.
+const DEFAULT_STREAM_WIDTH: u16 = 80;
 
 #[derive(Default)]
-pub struct StreamController {
-    buffer: String,
+pub(crate) struct StreamController {
+    collector: MarkdownStreamCollector,
+    stream_state: StreamState,
     finalized: bool,
+    render_width: u16,
+    rendered_cache: Vec<Line<'static>>,
+}
+
+#[derive(Default)]
+struct MarkdownStreamCollector {
+    text: String,
+}
+
+impl MarkdownStreamCollector {
+    fn push(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    fn replace(&mut self, text: &str) {
+        self.text.clear();
+        self.text.push_str(text);
+    }
+
+    fn content(&self) -> &str {
+        &self.text
+    }
 }
 
 impl StreamController {
-    pub fn push_delta(&mut self, text: &str) {
+    pub(crate) fn set_width(&mut self, width: u16) {
+        self.render_width = width.max(1);
+        self.requeue_lines();
+    }
+
+    /// Append `text` to the running stream source.
+    pub(crate) fn push_delta(&mut self, text: &str) {
         if self.finalized {
             return;
         }
-        self.buffer.push_str(text);
+
+        self.collector.push(text);
+        self.stream_state.has_seen_delta = true;
+        self.requeue_lines();
     }
 
-    /// Replace the streamed buffer with `text`. Used on `AssistantMessageDone`
-    /// so the authoritative coalesced final from the provider wins over the
-    /// delta accumulator (which can drift on reconnect or whitespace
-    /// normalization).
-    pub fn replace_buffer(&mut self, text: &str) {
-        self.buffer.clear();
-        self.buffer.push_str(text);
+    /// Replace the streamed source with `text`, preserving finalize semantics.
+    pub(crate) fn replace_buffer(&mut self, text: &str) {
+        self.collector.replace(text);
+        self.stream_state.clear_queue();
+        self.stream_state.has_seen_delta = true;
+        self.rendered_cache.clear();
+        self.finalized = false;
+        self.requeue_lines();
     }
 
-    /// Mark the stream as complete. After this call the whole buffer is
-    /// treated as stable, regardless of any open markdown block.
-    pub fn finalize(&mut self) {
+    /// Mark stream complete and flush whatever remains stable-aware.
+    pub(crate) fn finalize(&mut self) {
         self.finalized = true;
+        self.requeue_lines();
     }
 
-    pub fn stable_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let end = self.partition_offset();
-        render_body(&self.buffer[..end], width)
+    /// Consume one queued render line.
+    pub(crate) fn on_commit_tick(&mut self) -> Vec<Line<'static>> {
+        self.stream_state.step()
     }
 
-    pub fn tail_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let end = self.partition_offset();
-        render_body(&self.buffer[end..], width)
+    /// Consume up to `max_lines` queued render lines.
+    pub(crate) fn on_commit_tick_batch(&mut self, max_lines: usize) -> Vec<Line<'static>> {
+        self.stream_state.drain_n(max_lines)
     }
 
-    /// Render both halves in a single buffer scan — used on the render hot
-    /// path so callers don't pay for two `partition_offset` walks per frame.
-    pub fn partitioned_lines(&self, width: u16) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
-        let end = self.partition_offset();
+    /// Returns `true` when no lines are queued for commit.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.stream_state.is_idle()
+    }
+
+    /// Number of queued lines pending commit.
+    pub(crate) fn queued_lines(&self) -> usize {
+        self.stream_state.queued_len()
+    }
+
+    /// Age of oldest queued line.
+    pub(crate) fn oldest_queued_age(&self, now: Instant) -> Option<Duration> {
+        self.stream_state.oldest_queued_age(now)
+    }
+
+    pub(crate) fn stable_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let partition_end = self.partition_offset();
+        render_body(&self.collector.content()[..partition_end], width)
+    }
+
+    pub(crate) fn tail_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let partition_end = self.partition_offset();
+        render_body(&self.collector.content()[partition_end..], width)
+    }
+
+    /// Render both stable + tail in one pass.
+    pub(crate) fn partitioned_lines(&self, width: u16) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+        let partition_end = self.partition_offset();
         (
-            render_body(&self.buffer[..end], width),
-            render_body(&self.buffer[end..], width),
+            render_body(&self.collector.content()[..partition_end], width),
+            render_body(&self.collector.content()[partition_end..], width),
         )
     }
 
-    /// Count the wrapped body lines without allocating any. Equivalent to
-    /// `partitioned_lines(width).0.len() + ...1.len()` but skips the
-    /// `Vec<Line>` materialization, which is the dominant cost when the
-    /// streaming buffer is large.
-    pub fn partitioned_line_count(&self, width: u16) -> usize {
-        let end = self.partition_offset();
-        count_wrapped_body_lines(&self.buffer[..end], width)
-            + count_wrapped_body_lines(&self.buffer[end..], width)
+    /// Count partitioned line count without extra allocations.
+    pub(crate) fn partitioned_line_count(&self, width: u16) -> usize {
+        let partition_end = self.partition_offset();
+        count_wrapped_body_lines(&self.collector.content()[..partition_end], width)
+            + count_wrapped_body_lines(&self.collector.content()[partition_end..], width)
+    }
+
+    fn rendered_lines_at(&self, width: u16) -> Vec<Line<'static>> {
+        let partition_end = self.partition_offset();
+        let stable = render_body(&self.collector.content()[..partition_end], width);
+        let mut lines = stable;
+        lines.extend(render_body(&self.collector.content()[partition_end..], width));
+        lines
+    }
+
+    fn requeue_lines(&mut self) {
+        if !self.stream_state.has_seen_delta {
+            self.stream_state.clear_queue();
+            self.rendered_cache.clear();
+            return;
+        }
+
+        let current = self.rendered_lines_at(self.render_width);
+
+        let divergence = first_diverging_line(&self.rendered_cache, &current);
+        let should_reset_queue = divergence < self.rendered_cache.len() || self.rendered_cache.is_empty();
+        if should_reset_queue {
+            self.stream_state.clear_queue();
+        }
+        self.stream_state.enqueue(current[divergence..].to_vec());
+
+        self.rendered_cache = current;
     }
 
     fn partition_offset(&self) -> usize {
         if self.finalized {
-            return self.buffer.len();
+            return self.collector.content().len();
         }
 
         let mut state = State::Outside;
         let mut last_safe: usize = 0;
 
-        for span in line_spans(&self.buffer) {
+        for span in line_spans(self.collector.content()) {
             match state {
                 State::Outside => {
                     if !span.has_newline {
                         break;
                     }
+
                     if let Some(delim) = fence_delim(span.text) {
                         state = State::Fence(delim);
                     } else if is_table_row(span.text) {
@@ -103,11 +190,11 @@ impl StreamController {
                     if !span.has_newline {
                         break;
                     }
+
                     if is_table_row(span.text) {
                         continue;
                     }
-                    // First non-table-row terminates the table; commit the
-                    // table's bytes, then handle this line in `Outside`.
+
                     if let Some(delim) = fence_delim(span.text) {
                         last_safe = span.start;
                         state = State::Fence(delim);
@@ -120,6 +207,18 @@ impl StreamController {
         }
 
         last_safe
+    }
+}
+
+impl Default for StreamController {
+    fn default() -> Self {
+        Self {
+            collector: MarkdownStreamCollector::default(),
+            stream_state: StreamState::default(),
+            finalized: false,
+            render_width: DEFAULT_STREAM_WIDTH,
+            rendered_cache: Vec::new(),
+        }
     }
 }
 
@@ -151,6 +250,14 @@ struct LineSpan<'a> {
     has_newline: bool,
 }
 
+fn first_diverging_line(lhs: &[Line<'_>], rhs: &[Line<'_>]) -> usize {
+    let mut i = 0;
+    while i < lhs.len() && i < rhs.len() && lhs[i] == rhs[i] {
+        i += 1;
+    }
+    i
+}
+
 fn line_spans(s: &str) -> Vec<LineSpan<'_>> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -165,6 +272,7 @@ fn line_spans(s: &str) -> Vec<LineSpan<'_>> {
             start = i + 1;
         }
     }
+
     if start < s.len() {
         out.push(LineSpan {
             text: &s[start..],
@@ -189,11 +297,11 @@ fn fence_delim(line: &str) -> Option<FenceDelim> {
 
 fn is_fence_close(line: &str, delim: FenceDelim) -> bool {
     let t = line.trim_start();
-    let d = delim.as_str();
-    if !t.starts_with(d) {
+    let prefix = delim.as_str();
+    if !t.starts_with(prefix) {
         return false;
     }
-    t[d.len()..].trim().is_empty()
+    t[prefix.len()..].trim().is_empty()
 }
 
 fn is_table_row(line: &str) -> bool {
@@ -203,6 +311,9 @@ fn is_table_row(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::text::Line;
+    use std::time::Instant;
+    use super::super::chunking::QueueSnapshot;
 
     fn lines_text(lines: &[Line<'_>]) -> String {
         let mut s = String::new();
@@ -213,6 +324,10 @@ mod tests {
             s.push('\n');
         }
         s
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.to_string()).collect()
     }
 
     fn snapshot_body(c: &StreamController, width: u16) -> String {
@@ -307,5 +422,36 @@ mod tests {
         c.finalize();
 
         insta::assert_snapshot!("post_finalize", snapshot_body(&c, 40));
+    }
+
+    #[test]
+    fn queue_drains_fifo() {
+        let mut c = StreamController::default();
+        c.push_delta("alpha\n");
+        c.push_delta("beta\n");
+
+        let first = c.on_commit_tick();
+        let second = c.on_commit_tick();
+        let third = c.on_commit_tick();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(third.is_empty());
+        assert_eq!(line_text(&first[0]), "  alpha");
+        assert_eq!(line_text(&second[0]), "  beta");
+        assert!(c.is_idle());
+    }
+
+    #[test]
+    fn queue_snapshot_uses_oldest_age() {
+        let mut c = StreamController::default();
+        c.push_delta("alpha\n");
+
+        let snapshot = QueueSnapshot {
+            queued_lines: c.queued_lines(),
+            oldest_age: c.oldest_queued_age(Instant::now()),
+        };
+        assert_eq!(snapshot.queued_lines, 1);
+        assert!(snapshot.oldest_age.is_some());
     }
 }

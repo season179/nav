@@ -197,6 +197,20 @@ mod tests {
     }
 
     #[test]
+    fn streaming_finalize_with_replaces_coalesced_message() {
+        let mut streaming_cell = AssistantMessageCell::streaming();
+        streaming_cell.push_delta("partial ");
+        streaming_cell.push_delta("chunk\n");
+        streaming_cell.finalize_with("Finalized assistant reply text");
+
+        let final_cell = AssistantMessageCell::new("Finalized assistant reply text");
+        assert_eq!(
+            lines_text(&streaming_cell.display_lines(50)),
+            lines_text(&final_cell.display_lines(50))
+        );
+    }
+
+    #[test]
     fn assistant_desired_height_matches_display_lines_len() {
         // `desired_height` skips the `Vec<Line>` allocation on the scroll hot
         // path. Its result must stay in lockstep with `display_lines().len()`
