@@ -5,7 +5,7 @@
 //! reads as the high-level lifecycle.
 
 use anyhow::Result;
-use crossterm::event::{self, Event as CtEvent};
+use crossterm::event::{self, Event as CtEvent, KeyCode, KeyModifiers};
 use nav_core::guardrails::approval::PendingApprovals;
 use nav_core::{
     AgentEvent, Catalog, ChatCompletionsTransport, ControlPlane, ExtensionCatalog, HandoffDraft,
@@ -18,13 +18,15 @@ use nav_core::{
 use ratatui::backend::CrosstermBackend;
 use std::io;
 
-use crate::custom_terminal::Terminal;
+use crate::app::overlay::{AppOverlay, Overlay};
+use crate::custom_terminal::{InlineViewportState, Terminal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 mod inline_region;
+mod overlay;
 mod permissions;
 mod render;
 mod session;
@@ -119,6 +121,8 @@ pub async fn run(
     let mut active_turn: Option<ActiveTurnHandle> = None;
     let mut pending_model_swap: Option<PendingModelSwap> = None;
     let mut spinner_tick: u64 = 0;
+    let mut app_overlay: Option<Overlay> = None;
+    let mut overlay_state: Option<InlineViewportState> = None;
     // Latest provider-reported token usage for the status bar.
     // Updated on `TurnComplete`; pre-first-turn value of `0` hides the gauge.
     let mut last_tokens_input: u64 = 0;
@@ -209,28 +213,6 @@ pub async fn run(
             let screen_size = term.terminal.size().ok();
             let screen_w = screen_size.map(|s| s.width).unwrap_or(80);
             let screen_h = screen_size.map(|s| s.height).unwrap_or(40);
-            let scroll_width = if term.terminal.viewport_area.width > 0 {
-                term.terminal.viewport_area.width
-            } else {
-                screen_w
-            };
-
-            // Pull newly-finalized cells out of the chat ahead of the
-            // viewport resize so the resize sees the in-flight cells
-            // (streaming, tool placeholders) only — and the flush below
-            // pushes the finalized scrollback rows into the now-smaller
-            // viewport's slide room.
-            let pending = chat.drain_pending(scroll_width);
-
-            // Bracket the viewport redraw + scrollback insertion in a
-            // synchronized update so terminals that support it commit
-            // both operations atomically — no tearing between the
-            // inline viewport repaint and the history rows landing
-            // above it. The Begin/End pair is best-effort: terminals
-            // without DECSET 2026 support silently ignore it, so a
-            // failure here is not actionable.
-            use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
-            let _ = crossterm::queue!(term.terminal.backend_mut(), BeginSynchronizedUpdate);
 
             let spinner = spinner_frame(spinner_tick);
             let state = match active_turn.as_ref() {
@@ -257,7 +239,41 @@ pub async fn run(
                 context_window: args.auto_compact_token_limit,
                 show_indicator,
             });
-            draw_tui(&mut term.terminal, &chat, &pane, screen_w, screen_h)?;
+            let overlay: Option<&dyn AppOverlay> = app_overlay.as_deref();
+            draw_tui(
+                &mut term.terminal,
+                &chat,
+                &pane,
+                screen_w,
+                screen_h,
+                overlay,
+            )?;
+
+            if app_overlay.is_some() {
+                needs_draw = false;
+                continue;
+            }
+
+            // Bracket the inline viewport redraw + scrollback insertion in a
+            // synchronized update so terminals that support it commit
+            // both operations atomically — no tearing between the
+            // inline viewport repaint and the history rows landing
+            // above it. The Begin/End pair is best-effort: terminals
+            // without DECSET 2026 support silently ignore it, so a
+            // failure here is not actionable.
+            use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+            let _ = crossterm::queue!(term.terminal.backend_mut(), BeginSynchronizedUpdate);
+
+            let scroll_width = if term.terminal.viewport_area.width > 0 {
+                term.terminal.viewport_area.width
+            } else {
+                screen_w
+            };
+            // Pull newly-finalized cells out of the chat ahead of the
+            // viewport resize so the resize sees the in-flight cells
+            // (streaming, tool placeholders) only — and the final flush
+            // then clears the inline frame.
+            let pending = chat.drain_pending(scroll_width);
 
             // Flush finalized rows into native scrollback AFTER the resize.
             // When the viewport just shrank (e.g. a streaming cell
@@ -294,6 +310,14 @@ pub async fn run(
         }
 
         if quit_requested {
+            if app_overlay.is_some() {
+                if let Some(state) = overlay_state.take() {
+                    if let Err(err) = term.terminal.leave_alternate_screen(state) {
+                        eprintln!("nav-tui: failed to leave alternate screen: {err:#}");
+                    }
+                }
+                app_overlay = None;
+            }
             break;
         }
 
@@ -932,6 +956,39 @@ pub async fn run(
                     match event::read()? {
                         CtEvent::Key(key) => {
                             needs_draw = true;
+                            if let Some(overlay) = app_overlay.as_mut() {
+                                let overlay_result = overlay.handle_key(key);
+                                if overlay.is_complete() {
+                                    if let Some(state) = overlay_state.take() {
+                                        if let Err(err) =
+                                            term.terminal.leave_alternate_screen(state)
+                                        {
+                                            eprintln!(
+                                                "nav-tui: failed to leave alternate screen: {err:#}"
+                                            );
+                                        }
+                                    }
+                                    app_overlay = None;
+                                    continue;
+                                }
+                                if matches!(overlay_result, bottom_pane::InputResult::Handled) {
+                                    continue;
+                                }
+                            } else if is_ctrl_t(&key) {
+                                match term.terminal.enter_alternate_screen() {
+                                    Ok(state) => {
+                                        app_overlay = Some(Overlay::test());
+                                        overlay_state = Some(state);
+                                    }
+                                    Err(err) => {
+                                        chat.push_err(format!(
+                                            "Failed to open overlay: {err:#}"
+                                        ));
+                                    }
+                                }
+                                continue;
+                            }
+
                             if is_ctrl_c(&key) {
                                 if control.active().is_some() {
                                     ctrl_c_count = 0;
@@ -1022,6 +1079,10 @@ fn emit_local_event(
     }
     pane.apply_agent_event(&event);
     chat.ingest(event);
+}
+
+fn is_ctrl_t(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 fn emit_pending_cleared(
