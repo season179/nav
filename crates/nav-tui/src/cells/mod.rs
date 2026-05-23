@@ -24,7 +24,7 @@ pub(crate) use wrapping::{count_wrapped_body_lines, render_body};
 
 pub use changes::{FileChangeCell, GitCheckpointCell, TurnDiffCell};
 pub use compaction::{CompactionCell, CompactionPhase};
-pub use hooks::{HookCell, HookVisibility};
+pub use hooks::HookCell;
 pub use messages::{
     AgentMarkdownCell, AssistantMessageCell, AssistantStreamingCell, SkillInvocationCell,
     UserMessageCell,

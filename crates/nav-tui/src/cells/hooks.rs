@@ -74,6 +74,7 @@ impl HookCell {
         self.visibility != HookVisibility::Hidden
     }
 
+    #[cfg(test)]
     pub fn visibility(&self) -> HookVisibility {
         self.visibility
     }
