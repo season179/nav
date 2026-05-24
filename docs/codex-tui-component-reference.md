@@ -407,6 +407,9 @@ streaming — the cell types, the controller, the chatwidget glue, and the
 consolidation pass. This is reference material for the nav AgentMessageCell
 migration (issues AM-00 through AM-08).
 
+For nav's exact target lifecycle and follow-up issue sequence, see
+[agent-message-lifecycle.md](agent-message-lifecycle.md).
+
 ### Cell types (`history_cell/messages.rs`)
 
 Three structs handle the lifecycle of an assistant message:
@@ -429,7 +432,7 @@ markdown into two regions:
 **Table holdback.** When pipe-table patterns (header + delimiter pair) are
 detected in the accumulated source, the controller keeps the table region as
 mutable tail until the stream finalizes — because adding a row can reshape all
-columnn widths. Pre-table prose still flows to stable normally.
+column widths. Pre-table prose still flows to stable normally.
 
 **Key methods:**
 
