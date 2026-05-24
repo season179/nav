@@ -121,6 +121,24 @@ impl HistoryCell for AgentMessageCell {
     }
 }
 
+struct FinalAgentMessageChunkCell {
+    chunk: AgentMessageCell,
+}
+
+impl FinalAgentMessageChunkCell {
+    fn new(chunk: AgentMessageCell) -> Self {
+        Self { chunk }
+    }
+}
+
+impl HistoryCell for FinalAgentMessageChunkCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.chunk.display_lines(width);
+        lines.push(Line::default());
+        lines
+    }
+}
+
 /// Mutable active tail for an in-flight assistant stream.
 ///
 /// These lines remain in the nav-owned redraw viewport and are replaced as new
@@ -297,6 +315,10 @@ impl AssistantStreamingCell {
         StreamingAgentTailCell::new(lines, is_first).display_lines(width)
     }
 
+    pub(crate) fn tail_desired_height(&self, width: u16) -> u16 {
+        u16::try_from(self.tail_display_lines(width).len()).unwrap_or(u16::MAX)
+    }
+
     pub(crate) fn finalize_for_history(&mut self, width: u16) -> Option<Box<dyn HistoryCell>> {
         let render_width = assistant_body_width(width);
         let (chunk, source) = self.controller.finalize_chunk(render_width);
@@ -324,7 +346,7 @@ fn finalized_stream_cell(
 ) -> Option<Box<dyn HistoryCell>> {
     match chunk {
         Some(chunk) if chunk.is_first_line() => Some(Box::new(AgentMarkdownCell::new(source))),
-        Some(chunk) => Some(Box::new(chunk)),
+        Some(chunk) => Some(Box::new(FinalAgentMessageChunkCell::new(chunk))),
         None => None,
     }
 }

@@ -201,6 +201,40 @@ fn done_before_any_commit_tick_stays_source_backed_for_reflow() {
 }
 
 #[test]
+fn done_after_commit_tick_finishes_remaining_chunk_without_duplicate_source() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "first\nsecond".to_string(),
+    });
+
+    assert!(widget.on_commit_tick(80), "first stable line should emit");
+    let emitted = lines_text(&widget.drain_pending(80));
+    assert!(
+        emitted.contains("• first"),
+        "first chunk should enter scrollback before finalization; got:\n{emitted}"
+    );
+
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "first\nsecond".to_string(),
+    });
+
+    let finalized = lines_text(&widget.drain_pending(80));
+    assert!(
+        finalized.contains("  second"),
+        "final chunk should finish the assistant message; got:\n{finalized}"
+    );
+    assert!(
+        !finalized.contains("first"),
+        "final chunk must not duplicate already-emitted source; got:\n{finalized}"
+    );
+    assert!(
+        finalized.ends_with("\n\n"),
+        "final chunk should preserve the finalized assistant separator; got:\n{finalized:?}"
+    );
+}
+
+#[test]
 fn done_without_any_prior_delta_creates_markdown_cell_directly() {
     // Resume path: the session store replays AssistantMessageDone without
     // ever seeing a Delta. The widget must still produce a finalized cell.

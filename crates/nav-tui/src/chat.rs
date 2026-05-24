@@ -552,7 +552,7 @@ impl ChatWidget {
     pub fn streaming_height(&self, width: u16) -> u16 {
         self.streaming_assistant
             .as_ref()
-            .map(|cell| cell.desired_height(width))
+            .map(|cell| cell.tail_desired_height(width))
             .unwrap_or(0)
     }
 

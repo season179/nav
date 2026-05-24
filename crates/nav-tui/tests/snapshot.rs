@@ -1471,6 +1471,11 @@ fn chat_widget_commit_tick_does_not_leave_empty_live_tail() {
         inline.is_empty(),
         "empty mutable tail should not leave a live viewport row; got:\n{inline:?}"
     );
+    assert_eq!(
+        widget.streaming_height(80),
+        0,
+        "streaming height should match the empty live tail"
+    );
 }
 
 fn render_lines(lines: &[ratatui::text::Line<'static>]) -> String {
