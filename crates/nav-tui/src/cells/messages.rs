@@ -1,16 +1,18 @@
 use std::time::Instant;
 
 use nav_core::UserAttachment;
-use ratatui::style::Color;
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 use crate::history::HistoryCell;
+use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::streaming::commit_tick::{CommitTickScope, run_commit_tick};
 use crate::streaming::controller::StreamController;
-use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::theme::Theme;
 
 use super::row::{TranscriptRow, TranscriptRowKind, finish_row_lines};
+
+const ASSISTANT_BODY_INDENT: &str = "  ";
 
 pub struct UserMessageCell {
     text: String,
@@ -86,6 +88,145 @@ impl HistoryCell for AgentMarkdownCell {
     }
 }
 
+/// Transient stable chunk emitted while an assistant message streams.
+///
+/// This mirrors Codex's `AgentMessageCell`: it owns already-rendered markdown
+/// lines that have become stable enough to leave the live viewport and enter
+/// scrollback. The first chunk carries the assistant bullet; continuation
+/// chunks keep the body indent so multiple chunks visually join into one
+/// assistant message.
+pub struct AgentMessageCell {
+    lines: Vec<Line<'static>>,
+    is_first_line: bool,
+}
+
+impl AgentMessageCell {
+    /// Build a stable assistant chunk from lines rendered by the stream controller.
+    pub fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
+        Self {
+            lines,
+            is_first_line,
+        }
+    }
+
+    /// Whether this chunk begins the assistant message and should carry the bullet.
+    pub fn is_first_line(&self) -> bool {
+        self.is_first_line
+    }
+}
+
+impl HistoryCell for AgentMessageCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        finish_agent_stream_lines(self.lines.clone(), self.is_first_line)
+    }
+}
+
+/// Mutable active tail for an in-flight assistant stream.
+///
+/// These lines remain in the nav-owned redraw viewport and are replaced as new
+/// deltas arrive. Like Codex's `StreamingAgentTailCell`, the lines are already
+/// rendered at the controller's stream width; rewrapping here would make live
+/// tables and fenced blocks unstable.
+pub struct StreamingAgentTailCell {
+    lines: Vec<Line<'static>>,
+    is_first_line: bool,
+}
+
+impl StreamingAgentTailCell {
+    /// Build the mutable assistant tail from lines rendered at the active stream width.
+    pub fn new(lines: Vec<Line<'static>>, is_first_line: bool) -> Self {
+        Self {
+            lines,
+            is_first_line,
+        }
+    }
+
+    /// Whether this tail begins the assistant message and should carry the bullet.
+    pub fn is_first_line(&self) -> bool {
+        self.is_first_line
+    }
+}
+
+impl HistoryCell for StreamingAgentTailCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        finish_agent_stream_lines(self.lines.clone(), self.is_first_line)
+    }
+}
+
+/// Apply assistant stream chrome without adding the finalized-row trailing blank.
+fn finish_agent_stream_lines(lines: Vec<Line<'static>>, is_first_line: bool) -> Vec<Line<'static>> {
+    let first_prefix = if is_first_line {
+        "• "
+    } else {
+        ASSISTANT_BODY_INDENT
+    };
+    prefix_agent_stream_lines(lines, first_prefix)
+}
+
+/// Prefix every line in a chunk, using a distinct prefix for the first row.
+fn prefix_agent_stream_lines(
+    lines: Vec<Line<'static>>,
+    first_prefix: &'static str,
+) -> Vec<Line<'static>> {
+    if lines.is_empty() {
+        return vec![Line::from(first_prefix)];
+    }
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                first_prefix
+            } else {
+                ASSISTANT_BODY_INDENT
+            };
+            prepend_stream_prefix(line, prefix)
+        })
+        .collect()
+}
+
+/// Prepend the stream prefix, replacing an existing body gutter when present.
+fn prepend_stream_prefix(mut line: Line<'static>, prefix: &'static str) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(stream_prefix_span(prefix));
+
+    let mut existing = line.spans.into_iter();
+    if let Some(first) = existing.next() {
+        if let Some(rest) = first.content.strip_prefix(ASSISTANT_BODY_INDENT) {
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest.to_string(), first.style));
+            }
+        } else {
+            spans.push(first);
+        }
+    }
+    spans.extend(existing);
+
+    line.spans = spans;
+    line
+}
+
+/// Style the assistant bullet like nav's finalized assistant row chrome.
+fn stream_prefix_span(prefix: &'static str) -> Span<'static> {
+    if prefix == "• " {
+        Span::styled(
+            prefix,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw(prefix)
+    }
+}
+
+/// Legacy whole-stream assistant cell.
+///
+/// AM-02 introduces Codex-style `AgentMessageCell` and
+/// `StreamingAgentTailCell`, but the widget/controller rewiring lives in the
+/// follow-up AM-03/AM-04 issues. Keep this type temporarily so current runtime
+/// behavior stays unchanged until stable chunks are emitted by the controller.
 pub struct AssistantStreamingCell {
     controller: StreamController,
 }
@@ -173,8 +314,10 @@ impl HistoryCell for AssistantStreamingCell {
     }
 }
 
-/// Backwards-compatible name for old streaming-only callers. New finalized
-/// assistant rows should use [`AgentMarkdownCell`].
+/// Backwards-compatible name for old streaming-only callers. New stable
+/// streaming chunks should use [`AgentMessageCell`], mutable live tails should
+/// use [`StreamingAgentTailCell`], and finalized assistant rows should use
+/// [`AgentMarkdownCell`].
 pub type AssistantMessageCell = AssistantStreamingCell;
 
 const SKILL_CHIP_GLYPH: &str = "$";
@@ -233,11 +376,100 @@ mod tests {
         out
     }
 
+    fn single_display_line(text: &str) -> String {
+        format!("{text}\n")
+    }
+
+    #[test]
+    fn agent_message_cell_first_chunk_uses_assistant_bullet() {
+        let cell = AgentMessageCell::new(vec![Line::from("stable chunk")], true);
+        let lines = cell.display_lines(40);
+
+        insta::assert_snapshot!(lines_text(&lines), @r"
+        • stable chunk
+
+        ");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::White));
+        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(cell.is_first_line());
+    }
+
+    #[test]
+    fn agent_message_cell_continuation_keeps_body_indent_without_blank() {
+        let cell = AgentMessageCell::new(vec![Line::from("continuation chunk")], false);
+
+        insta::assert_snapshot!(lines_text(&cell.display_lines(40)), @"  continuation chunk
+");
+        assert!(!cell.is_first_line());
+    }
+
+    #[test]
+    fn agent_message_cell_prefixes_every_line_in_chunk() {
+        let cell = AgentMessageCell::new(
+            vec![Line::from("first stable line"), Line::from("second stable line")],
+            true,
+        );
+
+        insta::assert_snapshot!(lines_text(&cell.display_lines(40)), @r"
+        • first stable line
+          second stable line
+        ");
+    }
+
+    #[test]
+    fn agent_message_cell_replaces_rendered_body_indent() {
+        let cell = AgentMessageCell::new(
+            crate::cells::render_body("rendered stable line\nsecond rendered line", 40),
+            true,
+        );
+
+        insta::assert_snapshot!(lines_text(&cell.display_lines(40)), @r"
+        • rendered stable line
+          second rendered line
+        ");
+    }
+
+    #[test]
+    fn streaming_agent_tail_cell_first_tail_uses_assistant_bullet() {
+        let cell = StreamingAgentTailCell::new(vec![Line::from("mutable tail")], true);
+
+        insta::assert_snapshot!(lines_text(&cell.display_lines(40)), @r"
+        • mutable tail
+
+        ");
+        assert!(cell.is_first_line());
+    }
+
+    #[test]
+    fn streaming_agent_tail_cell_continuation_does_not_rewrap_or_append_blank() {
+        let cell = StreamingAgentTailCell::new(
+            crate::cells::render_body("| column | value |\n|---|---|", 40),
+            false,
+        );
+
+        insta::assert_snapshot!(lines_text(&cell.display_lines(12)), @r"
+          | column | value |
+          |---|---|
+        ");
+        assert!(!cell.is_first_line());
+    }
+
+    #[test]
+    fn stream_chunk_cells_render_empty_bodies_predictably() {
+        let first = AgentMessageCell::new(Vec::new(), true);
+        let continuation = StreamingAgentTailCell::new(Vec::new(), false);
+
+        assert_eq!(lines_text(&first.display_lines(40)), single_display_line("• "));
+        assert_eq!(
+            lines_text(&continuation.display_lines(40)),
+            single_display_line(ASSISTANT_BODY_INDENT)
+        );
+    }
+
     #[test]
     fn assistant_message_uses_codex_bullet_without_label() {
-        let cell = AgentMarkdownCell::new(
-            "This assistant reply wraps cleanly under the bullet marker.",
-        );
+        let cell =
+            AgentMarkdownCell::new("This assistant reply wraps cleanly under the bullet marker.");
 
         insta::assert_snapshot!(lines_text(&cell.display_lines(36)), @r"
         • This assistant reply wraps cleanly

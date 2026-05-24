@@ -26,8 +26,8 @@ pub use changes::{FileChangeCell, GitCheckpointCell, TurnDiffCell};
 pub use compaction::{CompactionCell, CompactionPhase};
 pub use hooks::HookCell;
 pub use messages::{
-    AgentMarkdownCell, AssistantMessageCell, AssistantStreamingCell, SkillInvocationCell,
-    UserMessageCell,
+    AgentMarkdownCell, AgentMessageCell, AssistantMessageCell, AssistantStreamingCell,
+    SkillInvocationCell, StreamingAgentTailCell, UserMessageCell,
 };
 pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use reasoning::ReasoningCell;
