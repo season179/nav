@@ -5,6 +5,12 @@ current simpler behavior conflicts with Codex's behavior, follow Codex.
 
 Tracked in [issue #219](https://github.com/season179/nav/issues/219).
 
+> **Status**: AM-01 (design) and AM-02 (cell types) are **complete**.
+> `AgentMessageCell`, `StreamingAgentTailCell`, and `AgentMarkdownCell` exist
+> in `cells/messages.rs`. The controller rewiring (AM-03/AM-04) is pending.
+> `AssistantStreamingCell` and the deprecated `AssistantMessageCell` alias
+> remain until the widget migrates.
+
 ## Current nav shape
 
 Today nav keeps the live assistant reply in one `AssistantStreamingCell`.

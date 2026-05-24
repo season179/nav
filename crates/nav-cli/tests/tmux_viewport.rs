@@ -1446,7 +1446,7 @@ fn completed_turn_shows_final_message_separator() {
 }
 
 /// Reasoning content from the provider must land in a `ReasoningCell`, not
-/// inside the `AssistantMessageCell`. The mock server streams
+/// inside the streaming assistant cell. The mock server streams
 /// `reasoning_content` chunks followed by a regular assistant reply.
 /// The captured pane must show the reasoning label (`◆ reasoning`) and
 /// the final assistant text — but the reasoning text must NOT appear under

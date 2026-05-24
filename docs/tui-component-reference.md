@@ -59,7 +59,10 @@ that implements `HistoryCell` — think of it as a component with a single
 | Cell | Web analogy | File | Purpose |
 |---|---|---|---|
 | `UserMessageCell` | User chat bubble | `cells/messages.rs` | The prompt you typed, with attachments |
-| `AssistantMessageCell` | Assistant chat bubble | `cells/messages.rs` | Streaming text from the model (finalized once done) |
+| `AssistantStreamingCell` | Streaming chat bubble (pre-Codex-split) | `cells/messages.rs` | Whole live assistant reply in the viewport. **Deprecated** — will be replaced by the Codex-style trio below once AM-03/AM-04 land. |
+| `AgentMessageCell` | Stable streaming chunk | `cells/messages.rs` | Codex-style stable chunk emitted to scrollback during streaming |
+| `StreamingAgentTailCell` | Live preview tail | `cells/messages.rs` | Codex-style mutable tail kept in the viewport while streaming |
+| `AgentMarkdownCell` | Finalized assistant bubble | `cells/messages.rs` | Source-backed finalized assistant message (resize-safe) |
 | `SkillInvocationCell` | Collapsible callout | `cells/messages.rs` | Shows which skill was activated |
 
 ### Tool cells
@@ -99,9 +102,7 @@ that implements `HistoryCell` — think of it as a component with a single
 
 | Cell | Web analogy | File | Purpose |
 |---|---|---|---|
-| `SessionListCell` | List view | `cells/sessions.rs` | `/sessions` output |
 | `SessionTreeCell` | Tree view | `cells/sessions.rs` | `/tree` output |
-| `SessionNoticeCell` | Status toast | `cells/sessions.rs` | Session rename, export, etc. |
 | `TranscriptHitsCell` | Search results | `cells/sessions.rs` | `/find` matches |
 
 ## Bottom pane components
@@ -166,13 +167,13 @@ The TUI never calls the model or runs tools directly — it's a pure consumer of
 |---|---|
 | Main event loop & layout | `app/mod.rs`, `app/render.rs` |
 | Alt-screen overlays | `app/overlay.rs`, `app/resume_picker.rs` |
-| Chat widget (cell manager) | `widget.rs` |
+| Chat widget (cell manager) | `chat.rs` |
 | All cell types | `cells/*.rs` |
 | Bottom pane components | `bottom_pane/*.rs` |
-| Input parsing & slash commands | `input/commands.rs`, `input/mod.rs` |
+| Input parsing & slash commands | `commands/mod.rs` |
 | Status bar | `app/status_bar.rs` |
 | Scrollback insertion | `insert_history.rs` |
-| Streaming text handling | `streaming.rs` |
+| Streaming text handling | `streaming/mod.rs` |
 | Theme / colors | `theme.rs` |
 | Terminal setup | `app/terminal.rs`, `custom_terminal.rs` |
 | Turn lifecycle | `app/turn_lifecycle.rs`, `app/turn_task.rs` |

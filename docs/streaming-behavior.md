@@ -6,6 +6,12 @@ changing it toward Codex parity.
 > **Scope**: read-only documentation and focused tests. No behavior changes.
 > Tracked in [issue #217](https://github.com/season179/nav/issues/217).
 
+> **Note (AM-02 landed)**: The Codex-style cell types (`AgentMessageCell`,
+> `StreamingAgentTailCell`) now exist in `cells/messages.rs`, but they are not
+> yet wired into `ChatWidget` — the widget still uses `AssistantStreamingCell`
+> for the whole live reply. The controller rewiring is tracked in AM-03/AM-04.
+> The `AssistantMessageCell` alias for `AssistantStreamingCell` is deprecated.
+
 ## Event Flow
 
 ```

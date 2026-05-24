@@ -1195,7 +1195,7 @@
 
       <ul>
         <li><strong>Scrollback</strong> — owned by the terminal. <code>ChatWidget</code> in <code>widget.rs</code> keeps a ledger of finalized cells (<code>Vec&lt;Box&lt;dyn HistoryCell&gt;&gt;</code>) so a resize can re-render the tail at a new width; the main loop drains new cells each tick and pushes their rendered lines into native scrollback via <code>insert_history::insert_history_lines</code> (DECSTBM scroll region + reverse linefeed).</li>
-        <li><strong>Streaming row</strong> — an in-flight <code>AssistantMessageCell</code> lives inside the ratatui frame so deltas paint immediately; when <code>AssistantMessageDone</code> arrives it joins the ledger and gets pushed to scrollback like everything else.</li>
+        <li><strong>Streaming row</strong> — an in-flight <code>AssistantStreamingCell</code> (deprecated alias: <code>AssistantMessageCell</code>) lives inside the ratatui frame so deltas paint immediately; when <code>AssistantMessageDone</code> arrives it joins the ledger and gets pushed to scrollback like everything else.</li>
         <li><strong>Composer</strong> — <code>BottomPane</code> in <code>bottom_pane/mod.rs</code>. Owns a <code>Composer</code> and an optional overlay for slash commands, file mentions, approvals, or session picking.</li>
         <li><strong>Status bar</strong> — <code>StatusBar</code> in <code>app/status_bar.rs</code>. One row: model · cwd · branch · <em>Ready</em> or <em>Working 4s</em>.</li>
       </ul>
@@ -1226,11 +1226,11 @@
 
       <div class="full flow">
         <div class="row"><div class="who">UserMessage</div><div class="what"><code>UserMessageCell</code>, gutter glyph <span style="color:var(--g-user);font-weight:700">›</span>, bold cyan. The live TUI draws the typed prompt immediately and skips the echoed live event; resumed sessions ingest it normally.</div></div>
-        <div class="row"><div class="who">AssistantMessageDone</div><div class="what"><code>AssistantMessageCell</code>, gutter glyph <span style="color:var(--g-asst);font-weight:700">•</span>, green.</div></div>
+        <div class="row"><div class="who">AssistantMessageDone</div><div class="what"><code>AgentMarkdownCell</code>, gutter glyph <span style="color:var(--g-asst);font-weight:700">•</span>, green.</div></div>
         <div class="row"><div class="who">ToolCallStarted</div><div class="what"><code>ToolCallCell</code>, gutter glyph <span style="color:var(--g-tool);font-weight:700">•</span>, yellow. Shows <code>name {json args}</code>.</div></div>
         <div class="row"><div class="who">ToolCallOutput</div><div class="what"><code>ToolOutputCell</code>, gutter glyph <code>└</code>, dim grey (red if <code>is_error</code>).</div></div>
         <div class="row"><div class="who">Error</div><div class="what"><code>ErrorCell</code>, red.</div></div>
-        <div class="row"><div class="who">AssistantMessageDelta</div><div class="what">Appended to the in-flight <code>AssistantMessageCell</code> in the viewport so the user sees text grow as it streams. <code>AssistantMessageDone</code> finalizes the cell and pushes it to scrollback.</div></div>
+        <div class="row"><div class="who">AssistantMessageDelta</div><div class="what">Appended to the in-flight <code>AssistantStreamingCell</code> in the viewport so the user sees text grow as it streams. <code>AssistantMessageDone</code> finalizes the cell and pushes it to scrollback.</div></div>
         <div class="row"><div class="who">TurnComplete</div><div class="what">Flips the status bar back to <em>Ready</em>, closes the streaming assistant cell, drains inflight tool-call placeholders, and updates the status-bar token gauge (input, output, cached).</div></div>
       </div>
     </section>
@@ -1247,7 +1247,7 @@
         <code>crates/nav-tui/src/streaming.rs</code>.
       </aside>
 
-      <p class="drop">Models stream text. <code>ChatWidget</code> opens an <code>AssistantMessageCell::streaming()</code> on the first <code>AssistantMessageDelta</code> and keeps appending; the cell is painted inside the inline viewport so the user watches the reply grow in place. <code>AssistantMessageDone</code> finalizes the cell and pushes it to scrollback.</p>
+      <p class="drop">Models stream text. <code>ChatWidget</code> opens an <code>AssistantStreamingCell::streaming()</code> on the first <code>AssistantMessageDelta</code> and keeps appending; the cell is painted inside the inline viewport so the user watches the reply grow in place. <code>AssistantMessageDone</code> finalizes the cell and pushes it to scrollback.</p>
 
       <p>Just appending every delta and re-rendering would be readable but jumpy: a half-written table row reflows as cells widen, code fences appear before their closing backticks, and so on. <code>StreamController</code> is the helper that keeps the live text stable.</p>
 
