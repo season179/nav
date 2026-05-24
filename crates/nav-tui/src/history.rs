@@ -15,4 +15,16 @@ pub trait HistoryCell {
     fn desired_height(&self, width: u16) -> u16 {
         self.display_lines(width).len() as u16
     }
+
+    /// True for transient assistant stream chunks that should be replaced by
+    /// one source-backed assistant markdown cell after the stream finalizes.
+    fn is_transient_agent_message(&self) -> bool {
+        false
+    }
+
+    /// True when this transient stream chunk continues a previously-emitted
+    /// assistant chunk instead of starting a new assistant message.
+    fn is_stream_continuation(&self) -> bool {
+        false
+    }
 }

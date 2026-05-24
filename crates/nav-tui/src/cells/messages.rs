@@ -119,6 +119,14 @@ impl HistoryCell for AgentMessageCell {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
         finish_agent_stream_lines(self.lines.clone(), self.is_first_line)
     }
+
+    fn is_transient_agent_message(&self) -> bool {
+        true
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        !self.is_first_line
+    }
 }
 
 struct FinalAgentMessageChunkCell {
@@ -136,6 +144,14 @@ impl HistoryCell for FinalAgentMessageChunkCell {
         let mut lines = self.chunk.display_lines(width);
         lines.push(Line::default());
         lines
+    }
+
+    fn is_transient_agent_message(&self) -> bool {
+        true
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        !self.chunk.is_first_line()
     }
 }
 
@@ -319,10 +335,14 @@ impl AssistantStreamingCell {
         u16::try_from(self.tail_display_lines(width).len()).unwrap_or(u16::MAX)
     }
 
-    pub(crate) fn finalize_for_history(&mut self, width: u16) -> Option<Box<dyn HistoryCell>> {
+    pub(crate) fn finalize_for_history_and_source(
+        &mut self,
+        width: u16,
+    ) -> (Option<Box<dyn HistoryCell>>, String) {
         let render_width = assistant_body_width(width);
         let (chunk, source) = self.controller.finalize_chunk(render_width);
-        finalized_stream_cell(chunk, source)
+        let cell = finalized_stream_cell(chunk, &source);
+        (cell, source)
     }
 
     pub(crate) fn finalize_for_history_with(
@@ -331,7 +351,7 @@ impl AssistantStreamingCell {
         width: u16,
     ) -> Option<Box<dyn HistoryCell>> {
         self.controller.replace_buffer(text);
-        self.finalize_for_history(width)
+        self.finalize_for_history_and_source(width).0
     }
 }
 
@@ -342,10 +362,12 @@ fn assistant_body_width(width: u16) -> u16 {
 
 fn finalized_stream_cell(
     chunk: Option<AgentMessageCell>,
-    source: String,
+    source: &str,
 ) -> Option<Box<dyn HistoryCell>> {
     match chunk {
-        Some(chunk) if chunk.is_first_line() => Some(Box::new(AgentMarkdownCell::new(source))),
+        Some(chunk) if chunk.is_first_line() => {
+            Some(Box::new(AgentMarkdownCell::new(source.to_string())))
+        }
         Some(chunk) => Some(Box::new(FinalAgentMessageChunkCell::new(chunk))),
         None => None,
     }

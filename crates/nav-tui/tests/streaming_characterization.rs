@@ -33,7 +33,10 @@ fn lines_text(lines: &[Line<'_>]) -> String {
 fn first_delta_creates_streaming_cell_and_has_streaming_is_true() {
     let mut widget = ChatWidget::new();
 
-    assert!(!widget.has_streaming(), "no streaming cell before any delta");
+    assert!(
+        !widget.has_streaming(),
+        "no streaming cell before any delta"
+    );
 
     widget.ingest(AgentEvent::AssistantMessageDelta {
         text: "hello".to_string(),
@@ -235,6 +238,121 @@ fn done_after_commit_tick_finishes_remaining_chunk_without_duplicate_source() {
 }
 
 #[test]
+fn done_after_multiple_commit_ticks_consolidates_transcript_from_raw_source() {
+    let mut widget = ChatWidget::new();
+    let source = "alpha beta gamma delta epsilon zeta eta theta\nsecond line survives".to_string();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: source.clone(),
+    });
+    assert!(widget.on_commit_tick(80), "first stable line should emit");
+    let emitted = lines_text(&widget.drain_pending(80));
+    assert!(
+        emitted.contains("alpha beta gamma delta epsilon zeta eta theta"),
+        "stable chunk should enter scrollback before finalization; got:\n{emitted}"
+    );
+
+    widget.ingest(AgentEvent::AssistantMessageDone { text: source });
+
+    let transcript = lines_text(&widget.transcript_lines(32));
+    assert_eq!(
+        transcript.matches("alpha beta").count(),
+        1,
+        "consolidated transcript must contain one assistant message; got:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("  zeta eta theta"),
+        "consolidated transcript must re-render from raw source at the requested width; got:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("  second line survives"),
+        "final tail content must be folded into the consolidated message; got:\n{transcript}"
+    );
+}
+
+#[test]
+fn done_after_two_emitted_chunks_consolidates_the_whole_trailing_run() {
+    let mut widget = ChatWidget::new();
+    let source = "first stable line\nsecond stable line\nfinal tail".to_string();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: source.clone(),
+    });
+    assert!(widget.on_commit_tick(80), "first stable line should emit");
+    let first = lines_text(&widget.drain_pending(80));
+    assert!(
+        first.contains("• first stable line"),
+        "first emitted chunk should start the assistant message; got:\n{first}"
+    );
+    assert!(widget.on_commit_tick(80), "second stable line should emit");
+    let second = lines_text(&widget.drain_pending(80));
+    assert!(
+        second.contains("  second stable line"),
+        "second emitted chunk should continue the assistant message; got:\n{second}"
+    );
+
+    widget.ingest(AgentEvent::AssistantMessageDone { text: source });
+
+    let transcript = lines_text(&widget.transcript_lines(80));
+    assert_eq!(
+        transcript.matches("• first stable line").count(),
+        1,
+        "consolidated transcript should keep one assistant row start; got:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("  second stable line"),
+        "middle emitted chunk must remain in the consolidated message; got:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("  final tail"),
+        "final tail must be folded into the same consolidated message; got:\n{transcript}"
+    );
+}
+
+#[test]
+fn reasoning_buffer_does_not_split_stream_consolidation() {
+    let mut widget = ChatWidget::new();
+    let source = "alpha beta gamma delta epsilon zeta eta theta\nfinal answer tail".to_string();
+
+    widget.ingest(AgentEvent::ReasoningDelta {
+        text: "hidden reasoning".to_string(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: source.clone(),
+    });
+    assert!(
+        widget.on_commit_tick(80),
+        "stable assistant line should emit"
+    );
+    let emitted = lines_text(&widget.drain_pending(80));
+    assert!(
+        emitted.contains("• alpha beta gamma delta epsilon zeta eta theta"),
+        "stable assistant chunk should enter scrollback before finalization; got:\n{emitted}"
+    );
+
+    widget.ingest(AgentEvent::AssistantMessageDone { text: source });
+
+    let transcript = lines_text(&widget.transcript_lines(32));
+    assert_eq!(
+        transcript.matches("alpha beta").count(),
+        1,
+        "reasoning flush must not leave a pre-consolidation assistant chunk in transcript; got:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("◆ reasoning"),
+        "buffered reasoning should still materialize; got:\n{transcript}"
+    );
+    assert!(
+        transcript.find("◆ reasoning").unwrap() < transcript.find("alpha beta").unwrap(),
+        "reasoning should stay before the assistant answer; got:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("  zeta eta theta"),
+        "assistant message should re-render from raw source after consolidation; got:\n{transcript}"
+    );
+}
+
+#[test]
 fn done_without_any_prior_delta_creates_markdown_cell_directly() {
     // Resume path: the session store replays AssistantMessageDone without
     // ever seeing a Delta. The widget must still produce a finalized cell.
@@ -290,6 +408,46 @@ fn tool_call_started_finalizes_open_streaming_cell() {
     assert!(
         inline.contains("bash") || inline.contains("ls"),
         "tool placeholder must render inline; got:\n{inline}"
+    );
+}
+
+#[test]
+fn tool_call_started_consolidates_prior_stream_chunks() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "alpha beta gamma delta epsilon zeta eta theta\nlive before tool".to_string(),
+    });
+    assert!(widget.on_commit_tick(80), "stable line should emit");
+    let emitted = lines_text(&widget.drain_pending(80));
+    assert!(
+        emitted.contains("• alpha beta gamma delta epsilon zeta eta theta"),
+        "stable chunk should enter scrollback before the tool starts; got:\n{emitted}"
+    );
+
+    widget.ingest(AgentEvent::ToolCallStarted {
+        call_id: "call_1".to_string(),
+        name: "bash".to_string(),
+        arguments: serde_json::json!({ "command": "ls" }),
+    });
+
+    let transcript = lines_text(&widget.transcript_lines(32));
+    assert_eq!(
+        transcript.matches("alpha beta").count(),
+        1,
+        "tool-start finalization should consolidate the assistant stream once; got:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("  zeta eta theta"),
+        "tool-start finalization should re-render assistant chunks from raw source; got:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("  live before tool"),
+        "live tail should be folded into the consolidated assistant message before the tool row; got:\n{transcript}"
+    );
+    assert!(
+        transcript.find("live before tool").unwrap() < transcript.find("ls").unwrap(),
+        "assistant message must stay before the tool placeholder; got:\n{transcript}"
     );
 }
 
@@ -388,9 +546,7 @@ fn inline_lines_capped_head_clips_streaming_to_preserve_tool_placeholders() {
     let mut widget = ChatWidget::new();
 
     // Build a large streaming cell then finalize it with a tool call.
-    let long_text: String = (0..40)
-        .map(|i| format!("line {:02}\n", i))
-        .collect();
+    let long_text: String = (0..40).map(|i| format!("line {:02}\n", i)).collect();
     widget.ingest(AgentEvent::AssistantMessageDelta { text: long_text });
     widget.on_commit_tick(80); // catch-up: release all stable lines
 
@@ -404,7 +560,10 @@ fn inline_lines_capped_head_clips_streaming_to_preserve_tool_placeholders() {
 
     // At this point the streaming cell is finalized; only the placeholder
     // is inline. The cap must not clip it.
-    assert!(!widget.has_streaming(), "tool call must close streaming cell");
+    assert!(
+        !widget.has_streaming(),
+        "tool call must close streaming cell"
+    );
 
     let cap = 8u16;
     let capped = widget.inline_lines_capped(80, cap);
@@ -442,9 +601,7 @@ fn inline_lines_capped_clamps_long_streaming_to_cap() {
     // Stable chunks leave the live viewport as commit ticks run, so a long
     // stream must not make inline rendering grow past the cap.
     let mut widget = ChatWidget::new();
-    let long_text: String = (0..30)
-        .map(|i| format!("line {:02}\n", i))
-        .collect();
+    let long_text: String = (0..30).map(|i| format!("line {:02}\n", i)).collect();
     widget.ingest(AgentEvent::AssistantMessageDelta { text: long_text });
     widget.on_commit_tick(80); // catch-up: release all stable lines
 
@@ -490,7 +647,10 @@ fn turn_complete_closes_streaming_cell_and_drains_inflight() {
         usage: TurnUsage::default(),
     });
 
-    assert!(!widget.has_streaming(), "TurnComplete must close the streaming cell");
+    assert!(
+        !widget.has_streaming(),
+        "TurnComplete must close the streaming cell"
+    );
     let scrollback = lines_text(&widget.drain_pending(80));
     assert!(
         scrollback.contains("streaming"),
