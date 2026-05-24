@@ -37,8 +37,8 @@ mod chat;
 
 pub use app::run;
 pub use cells::{
-    AgentMarkdownCell, AssistantMessageCell, AssistantStreamingCell, ErrorCell,
-    SkillInvocationCell, ToolCallCell, ToolOutputCell, UserMessageCell,
+    AgentMarkdownCell, AgentMessageCell, AssistantMessageCell, AssistantStreamingCell, ErrorCell,
+    SkillInvocationCell, StreamingAgentTailCell, ToolCallCell, ToolOutputCell, UserMessageCell,
 };
 pub use history::HistoryCell;
 pub use commands::{SlashAction, classify_slash, prepend_pending_skill};

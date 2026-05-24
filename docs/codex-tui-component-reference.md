@@ -79,7 +79,7 @@ ratatui viewport to terminal scrollback.
 
 | Rank | Cell / surface | Why it matters first |
 |---:|---|---|
-| 1 | `AgentMessageCell` | Live assistant text while the model is streaming; this is the core nav-owned redraw-each-frame cell. |
+| 1 | `AgentMessageCell` | Stable assistant chunks emitted during streaming; this is the first step in moving live replies out of the redraw viewport. |
 | 2 | `ExecCell` / active tool-call cell | Makes agent work legible while commands and tools are running. |
 | 3 | `AgentMarkdownCell` | Final assistant message after streaming; proves live text finalizes cleanly into scrollback. |
 | 4 | `ReasoningCell` | Shows reasoning summaries, but should stay quiet and not dominate the transcript. |
