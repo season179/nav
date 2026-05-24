@@ -107,10 +107,10 @@ fn commit_tick_releases_stable_lines_one_at_a_time_in_smooth_mode() {
         "live tail must always render; got:\n{pre}"
     );
 
-    // First tick releases "alpha" (one source line).
-    let advanced = widget.on_commit_tick();
+    // First tick releases "alpha" (one source line) into pending history.
+    let advanced = widget.on_commit_tick(80);
     assert!(advanced, "tick must report progress");
-    let after_one = lines_text(&widget.inline_lines(80));
+    let after_one = lines_text(&widget.drain_pending(80));
     assert!(
         after_one.contains("alpha"),
         "first tick must release the first stable line; got:\n{after_one}"
@@ -121,8 +121,8 @@ fn commit_tick_releases_stable_lines_one_at_a_time_in_smooth_mode() {
     );
 
     // Second tick releases "beta".
-    widget.on_commit_tick();
-    let after_two = lines_text(&widget.inline_lines(80));
+    widget.on_commit_tick(80);
+    let after_two = lines_text(&widget.drain_pending(80));
     assert!(
         after_two.contains("beta"),
         "second tick must release the second stable line; got:\n{after_two}"
@@ -175,6 +175,62 @@ fn done_after_deltas_replaces_buffer_and_moves_to_scrollback() {
         widget.inline_lines(80).len(),
         0,
         "no live tail after finalization"
+    );
+}
+
+#[test]
+fn done_before_any_commit_tick_stays_source_backed_for_reflow() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "partial text".to_string(),
+    });
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "Finalized assistant reply text wraps after completion".to_string(),
+    });
+
+    let scrollback = lines_text(&widget.drain_pending(24));
+    assert!(
+        scrollback.contains("• Finalized assistant"),
+        "finalized source should render with assistant chrome; got:\n{scrollback}"
+    );
+    assert!(
+        scrollback.contains("  reply text wraps"),
+        "finalized source should rewrap at drain width; got:\n{scrollback}"
+    );
+}
+
+#[test]
+fn done_after_commit_tick_finishes_remaining_chunk_without_duplicate_source() {
+    let mut widget = ChatWidget::new();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "first\nsecond".to_string(),
+    });
+
+    assert!(widget.on_commit_tick(80), "first stable line should emit");
+    let emitted = lines_text(&widget.drain_pending(80));
+    assert!(
+        emitted.contains("• first"),
+        "first chunk should enter scrollback before finalization; got:\n{emitted}"
+    );
+
+    widget.ingest(AgentEvent::AssistantMessageDone {
+        text: "first\nsecond".to_string(),
+    });
+
+    let finalized = lines_text(&widget.drain_pending(80));
+    assert!(
+        finalized.contains("  second"),
+        "final chunk should finish the assistant message; got:\n{finalized}"
+    );
+    assert!(
+        !finalized.contains("first"),
+        "final chunk must not duplicate already-emitted source; got:\n{finalized}"
+    );
+    assert!(
+        finalized.ends_with("\n\n"),
+        "final chunk should preserve the finalized assistant separator; got:\n{finalized:?}"
     );
 }
 
@@ -336,7 +392,7 @@ fn inline_lines_capped_head_clips_streaming_to_preserve_tool_placeholders() {
         .map(|i| format!("line {:02}\n", i))
         .collect();
     widget.ingest(AgentEvent::AssistantMessageDelta { text: long_text });
-    widget.on_commit_tick(); // catch-up: release all stable lines
+    widget.on_commit_tick(80); // catch-up: release all stable lines
 
     // ToolCallStarted closes the streaming cell (it goes to scrollback)
     // and the placeholder renders inline instead.
@@ -383,33 +439,32 @@ fn inline_lines_capped_returns_everything_when_under_cap() {
 
 #[test]
 fn inline_lines_capped_clamps_long_streaming_to_cap() {
-    // A streaming cell with many source lines produces many rendered
-    // rows. The cap must head-clip (drop oldest rows) so the output
-    // fits within `max_rows`.
+    // Stable chunks leave the live viewport as commit ticks run, so a long
+    // stream must not make inline rendering grow past the cap.
     let mut widget = ChatWidget::new();
     let long_text: String = (0..30)
         .map(|i| format!("line {:02}\n", i))
         .collect();
     widget.ingest(AgentEvent::AssistantMessageDelta { text: long_text });
-    widget.on_commit_tick(); // catch-up: release all stable lines
+    widget.on_commit_tick(80); // catch-up: release all stable lines
 
     let cap = 6u16;
     let capped = widget.inline_lines_capped(80, cap);
-    assert_eq!(
-        capped.len(),
-        cap as usize,
-        "long streaming must be head-clipped to the cap; got {}",
+    assert!(
+        capped.len() <= cap as usize,
+        "long streaming must stay within the cap; got {}",
         capped.len()
     );
 
     let capped_text = lines_text(&capped);
     assert!(
         !capped_text.contains("line 00"),
-        "oldest streaming lines must be clipped; got:\n{capped_text}"
+        "stable scrollback chunks must not remain in the live viewport; got:\n{capped_text}"
     );
+    let scrollback = lines_text(&widget.drain_pending(80));
     assert!(
-        capped_text.contains("line 29"),
-        "newest streaming lines must survive; got:\n{capped_text}"
+        scrollback.contains("line 29"),
+        "newest stable lines should drain to pending history; got:\n{scrollback}"
     );
 }
 

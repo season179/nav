@@ -1281,12 +1281,16 @@ pub async fn run(
                     needs_draw = true;
                 }
                 // Drive the streaming chunking policy on the same tick. The
-                // policy advances `visible_stable_lines` by 1 in smooth mode
-                // and in bulk during catch-up; without this call the
-                // streaming cell paints the entire stable region the moment
-                // it lands, defeating the smoothing layer. Outside an active
+                // policy emits stable chunks one line at a time in smooth mode
+                // and in bulk during catch-up; without this call stable text
+                // would stay queued behind the live tail. Outside an active
                 // turn there's no streaming cell, so this is a cheap no-op.
-                if chat.on_commit_tick() {
+                let stream_width = if term.terminal.viewport_area.width > 0 {
+                    term.terminal.viewport_area.width
+                } else {
+                    term.terminal.size().map(|s| s.width).unwrap_or(80)
+                };
+                if chat.on_commit_tick(stream_width) {
                     needs_draw = true;
                 }
                 while event::poll(Duration::from_millis(0))? {

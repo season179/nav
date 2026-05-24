@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 
 use crate::history::HistoryCell;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
-use crate::streaming::commit_tick::{CommitTickScope, run_commit_tick};
+use crate::streaming::commit_tick::{CommitTickScope, run_commit_tick_chunk};
 use crate::streaming::controller::StreamController;
 use crate::theme::Theme;
 
@@ -121,6 +121,24 @@ impl HistoryCell for AgentMessageCell {
     }
 }
 
+struct FinalAgentMessageChunkCell {
+    chunk: AgentMessageCell,
+}
+
+impl FinalAgentMessageChunkCell {
+    fn new(chunk: AgentMessageCell) -> Self {
+        Self { chunk }
+    }
+}
+
+impl HistoryCell for FinalAgentMessageChunkCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = self.chunk.display_lines(width);
+        lines.push(Line::default());
+        lines
+    }
+}
+
 /// Mutable active tail for an in-flight assistant stream.
 ///
 /// These lines remain in the nav-owned redraw viewport and are replaced as new
@@ -221,19 +239,16 @@ fn stream_prefix_span(prefix: &'static str) -> Span<'static> {
     }
 }
 
-/// Whole-stream assistant cell (pre-Codex-split).
+/// Stream-controller wrapper for an in-flight assistant reply.
 ///
-/// Owns one `StreamController` and renders the *entire* live assistant reply
-/// in the inline viewport — stable text and mutable tail together. This is
-/// the cell type `ChatWidget` uses today while AM-03/AM-04 (controller
-/// rewiring) haven't landed yet.
+/// Owns one `StreamController` while `ChatWidget` is still the lifecycle
+/// owner. Commit ticks emit stable chunks through [`AgentMessageCell`], and
+/// the inline viewport renders only the mutable [`StreamingAgentTailCell`].
 ///
-/// **Do not use for new code.** Once the widget emits stable chunks via
-/// [`AgentMessageCell`] and keeps only the mutable tail as
-/// [`StreamingAgentTailCell`], this type will be removed. The transitional
-/// alias [`AssistantMessageCell`] is also deprecated in favor of the
-/// Codex-style trio (`AgentMessageCell`, `StreamingAgentTailCell`,
-/// `AgentMarkdownCell`).
+/// **Do not use for new code.** Once `ChatWidget` owns the controller
+/// directly, this wrapper and the transitional alias [`AssistantMessageCell`]
+/// will be removed in favor of the Codex-style trio (`AgentMessageCell`,
+/// `StreamingAgentTailCell`, `AgentMarkdownCell`).
 pub struct AssistantStreamingCell {
     controller: StreamController,
 }
@@ -275,23 +290,64 @@ impl AssistantStreamingCell {
         AgentMarkdownCell::new(text.to_string())
     }
 
-    /// Run one commit-tick pass against `policy` and report whether any
-    /// source lines became newly visible. Returns `true` when the caller
-    /// should mark the frame dirty so the freshly-released lines paint.
-    ///
-    /// `false` covers both "no queued lines" (idle stream) and "policy held
-    /// the line back this tick" (smooth mode just spent its budget). The
-    /// caller is expected to call this on every frame tick while the cell
-    /// is still in-flight; once `controller.is_idle()` returns true *and*
-    /// `finalize` has fired, ticks become a no-op.
-    pub(crate) fn on_commit_tick(&mut self, policy: &mut AdaptiveChunkingPolicy) -> bool {
-        let outcome = run_commit_tick(
+    pub(crate) fn on_commit_tick_chunk(
+        &mut self,
+        policy: &mut AdaptiveChunkingPolicy,
+        width: u16,
+    ) -> Option<AgentMessageCell> {
+        let render_width = assistant_body_width(width);
+        run_commit_tick_chunk(
             policy,
             Some(&mut self.controller),
             CommitTickScope::AnyMode,
             Instant::now(),
-        );
-        !outcome.lines.is_empty()
+            render_width,
+        )
+    }
+
+    pub(crate) fn tail_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let render_width = assistant_body_width(width);
+        let lines = self.controller.current_tail_lines(render_width);
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        let is_first = self.controller.tail_starts_stream();
+        StreamingAgentTailCell::new(lines, is_first).display_lines(width)
+    }
+
+    pub(crate) fn tail_desired_height(&self, width: u16) -> u16 {
+        u16::try_from(self.tail_display_lines(width).len()).unwrap_or(u16::MAX)
+    }
+
+    pub(crate) fn finalize_for_history(&mut self, width: u16) -> Option<Box<dyn HistoryCell>> {
+        let render_width = assistant_body_width(width);
+        let (chunk, source) = self.controller.finalize_chunk(render_width);
+        finalized_stream_cell(chunk, source)
+    }
+
+    pub(crate) fn finalize_for_history_with(
+        &mut self,
+        text: &str,
+        width: u16,
+    ) -> Option<Box<dyn HistoryCell>> {
+        self.controller.replace_buffer(text);
+        self.finalize_for_history(width)
+    }
+}
+
+fn assistant_body_width(width: u16) -> u16 {
+    let style = TranscriptRowKind::AssistantMessage.style();
+    style.body_width(width, style.label())
+}
+
+fn finalized_stream_cell(
+    chunk: Option<AgentMessageCell>,
+    source: String,
+) -> Option<Box<dyn HistoryCell>> {
+    match chunk {
+        Some(chunk) if chunk.is_first_line() => Some(Box::new(AgentMarkdownCell::new(source))),
+        Some(chunk) => Some(Box::new(FinalAgentMessageChunkCell::new(chunk))),
+        None => None,
     }
 }
 
@@ -406,7 +462,12 @@ mod tests {
 
         ");
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::White));
-        assert!(lines[0].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
         assert!(cell.is_first_line());
     }
 
@@ -422,7 +483,10 @@ mod tests {
     #[test]
     fn agent_message_cell_prefixes_every_line_in_chunk() {
         let cell = AgentMessageCell::new(
-            vec![Line::from("first stable line"), Line::from("second stable line")],
+            vec![
+                Line::from("first stable line"),
+                Line::from("second stable line"),
+            ],
             true,
         );
 
@@ -475,7 +539,10 @@ mod tests {
         let first = AgentMessageCell::new(Vec::new(), true);
         let continuation = StreamingAgentTailCell::new(Vec::new(), false);
 
-        assert_eq!(lines_text(&first.display_lines(40)), single_display_line("• "));
+        assert_eq!(
+            lines_text(&first.display_lines(40)),
+            single_display_line("• ")
+        );
         assert_eq!(
             lines_text(&continuation.display_lines(40)),
             single_display_line(ASSISTANT_BODY_INDENT)
@@ -547,13 +614,16 @@ mod tests {
         // entire stable region hidden and only the (live) tail renders —
         // by design, since the smoothing layer paces line reveal.
         let mut policy = AdaptiveChunkingPolicy::default();
-        cell.on_commit_tick(&mut policy);
+        let chunk = cell
+            .on_commit_tick_chunk(&mut policy, 40)
+            .expect("stable chunk");
 
-        insta::assert_snapshot!(lines_text(&cell.display_lines(40)), @r"
+        let mut lines = chunk.display_lines(40);
+        lines.extend(cell.tail_display_lines(40));
+        insta::assert_snapshot!(lines_text(&lines), @r"
         • Quick summary:
           | a | b |
           |---|---|
-
         ");
     }
 
@@ -593,9 +663,11 @@ mod tests {
         }
 
         let mut policy = AdaptiveChunkingPolicy::default();
-        cell.on_commit_tick(&mut policy);
+        let chunk = cell
+            .on_commit_tick_chunk(&mut policy, 60)
+            .expect("stable chunk");
 
-        let rendered = lines_text(&cell.display_lines(60));
+        let rendered = lines_text(&chunk.display_lines(60));
         // All ten lines should now be present; if smooth mode were
         // gating, we'd only see line 0.
         for i in 0..10 {
