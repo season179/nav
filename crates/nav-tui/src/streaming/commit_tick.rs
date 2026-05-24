@@ -4,9 +4,7 @@ use std::time::Instant;
 
 use crate::cells::AgentMessageCell;
 
-use super::chunking::{
-    AdaptiveChunkingPolicy, ChunkingDecision, ChunkingMode, DrainPlan, QueueSnapshot,
-};
+use super::chunking::{AdaptiveChunkingPolicy, ChunkingMode, DrainPlan, QueueSnapshot};
 use super::controller::StreamController;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,11 +21,16 @@ pub(crate) fn run_commit_tick_chunk(
     width: u16,
 ) -> Option<AgentMessageCell> {
     let snapshot = stream_queue_snapshot(stream_controller.as_deref(), now);
-    let decision = resolve_decision(policy, snapshot, now);
+    let decision = policy.decide(snapshot, now);
     if scope == CommitTickScope::CatchUpOnly && decision.mode != ChunkingMode::CatchUp {
         return None;
     }
-    apply_decision_chunk(decision.drain_plan, stream_controller, width)
+    let controller = stream_controller?;
+    let (chunk, _) = match decision.drain_plan {
+        DrainPlan::Single => controller.commit_tick_chunk(width),
+        DrainPlan::Batch(max_lines) => controller.commit_tick_batch_chunk(width, max_lines),
+    };
+    chunk
 }
 
 fn stream_queue_snapshot(
@@ -38,27 +41,6 @@ fn stream_queue_snapshot(
         queued_lines: controller.queued_lines(),
         oldest_age: controller.oldest_queued_age(now),
     })
-}
-
-fn resolve_decision(
-    policy: &mut AdaptiveChunkingPolicy,
-    snapshot: QueueSnapshot,
-    now: Instant,
-) -> ChunkingDecision {
-    policy.decide(snapshot, now)
-}
-
-fn apply_decision_chunk(
-    drain_plan: DrainPlan,
-    stream_controller: Option<&mut StreamController>,
-    width: u16,
-) -> Option<AgentMessageCell> {
-    let controller = stream_controller?;
-    let (chunk, _) = match drain_plan {
-        DrainPlan::Single => controller.commit_tick_chunk(width),
-        DrainPlan::Batch(max_lines) => controller.commit_tick_batch_chunk(width, max_lines),
-    };
-    chunk
 }
 
 #[cfg(test)]

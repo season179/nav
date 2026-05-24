@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use crate::cells::ExplorationEntry;
 use crate::cells::{
-    AgentMarkdownCell, AgentMessageCell, ApprovalDecisionCell, AssistantStreamingCell,
-    CompactionCell, CompactionPhase, ErrorCell, FileChangeCell, FinalMessageSeparator,
-    GitCheckpointCell, HookCell, LabeledNoticeCell, NoticeCell, PendingInputCell, ReasoningCell,
-    SessionTreeCell, SkillInvocationCell, SubagentCell, ToolCallCell, ToolCallContext,
-    ToolOutputCell, TranscriptHitsCell, TurnAbortedCell, TurnDiffCell, UserMessageCell,
+    AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
+    CompactionPhase, ErrorCell, FileChangeCell, FinalMessageSeparator, GitCheckpointCell, HookCell,
+    LabeledNoticeCell, NoticeCell, PendingInputCell, ReasoningCell, SessionTreeCell,
+    SkillInvocationCell, SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell,
+    TranscriptHitsCell, TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
 use crate::history::HistoryCell;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
@@ -118,13 +118,13 @@ impl ChatWidget {
         let Some(cell) = self.streaming_assistant.as_mut() else {
             return false;
         };
-        let chunk = cell.on_commit_tick_chunk(&mut self.adaptive_chunking, self.stream_width);
-        let changed = chunk.is_some();
-        self.push_stream_chunk(chunk);
-        if changed {
-            self.bump_transcript_revision();
-        }
-        changed
+        let Some(chunk) = cell.on_commit_tick_chunk(&mut self.adaptive_chunking, self.stream_width)
+        else {
+            return false;
+        };
+        self.finalized.push(Box::new(chunk));
+        self.bump_transcript_revision();
+        true
     }
 
     pub(crate) fn transcript_revision(&self) -> u64 {
@@ -691,12 +691,6 @@ impl ChatWidget {
             self.push_optional_cell(cell);
         } else {
             self.push_cell(AgentMarkdownCell::new(text));
-        }
-    }
-
-    fn push_stream_chunk(&mut self, chunk: Option<AgentMessageCell>) {
-        if let Some(chunk) = chunk {
-            self.finalized.push(Box::new(chunk));
         }
     }
 
