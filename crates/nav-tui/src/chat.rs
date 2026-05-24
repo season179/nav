@@ -46,6 +46,9 @@ pub struct ChatWidget {
     /// Index of the first cell that has NOT yet been written to scrollback.
     /// Advances as `drain_pending` runs.
     pending_start: usize,
+    /// Transient cells that were removed from `finalized` by assistant
+    /// consolidation but still need to be written to native scrollback.
+    pending_scrollback_carry: Vec<Box<dyn HistoryCell>>,
     theme: Theme,
     tool_calls: HashMap<String, ToolCallContext>,
     subagent_labels: HashMap<String, String>,
@@ -94,6 +97,7 @@ impl ChatWidget {
         Self {
             finalized: Vec::new(),
             pending_start: 0,
+            pending_scrollback_carry: Vec::new(),
             theme,
             tool_calls: HashMap::new(),
             subagent_labels: HashMap::new(),
@@ -139,7 +143,7 @@ impl ChatWidget {
 
     /// Render the full app-owned transcript: finalized history cells plus the
     /// current inline-only live tail (streaming text and in-flight tools).
-    pub(crate) fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+    pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
         let width = width.max(1);
         let mut out = Vec::new();
         for cell in &self.finalized {
@@ -221,10 +225,13 @@ impl ChatWidget {
     /// The running group is surfaced inline via [`Self::inline_lines`]
     /// until a non-exploration event or turn end flushes it to scrollback.
     pub fn drain_pending(&mut self, width: u16) -> Vec<Line<'static>> {
-        if self.pending_start >= self.finalized.len() {
+        if self.pending_scrollback_carry.is_empty() && self.pending_start >= self.finalized.len() {
             return Vec::new();
         }
         let mut out = Vec::new();
+        for cell in self.pending_scrollback_carry.drain(..) {
+            out.extend(cell.display_lines(width));
+        }
         for cell in &self.finalized[self.pending_start..] {
             out.extend(cell.display_lines(width));
         }
@@ -253,6 +260,11 @@ impl ChatWidget {
             }
             AgentEvent::AssistantMessageDelta { text } => {
                 if self.streaming_assistant.is_none() {
+                    // Reasoning normally precedes the public assistant text.
+                    // Flush any delta-only reasoning before the first answer
+                    // chunk so it cannot split the transient AgentMessageCell
+                    // run that consolidation replaces when the stream ends.
+                    self.close_streaming_reasoning();
                     // A new streaming cell starts here. Flush any buffered
                     // explorations so they land in scrollback BEFORE this
                     // round's text begins. Without this, the previous
@@ -679,8 +691,9 @@ impl ChatWidget {
     fn close_streaming_assistant(&mut self) {
         self.close_streaming_reasoning();
         if let Some(mut cell) = self.streaming_assistant.take() {
-            let cell = cell.finalize_for_history(self.stream_width);
+            let (cell, source) = cell.finalize_for_history_and_source(self.stream_width);
             self.push_optional_cell(cell);
+            self.consolidate_trailing_agent_message(source);
         }
     }
 
@@ -689,6 +702,7 @@ impl ChatWidget {
         if let Some(mut cell) = self.streaming_assistant.take() {
             let cell = cell.finalize_for_history_with(&text, self.stream_width);
             self.push_optional_cell(cell);
+            self.consolidate_trailing_agent_message(text);
         } else {
             self.push_cell(AgentMarkdownCell::new(text));
         }
@@ -698,6 +712,49 @@ impl ChatWidget {
         if let Some(cell) = cell {
             self.finalized.push(cell);
         }
+    }
+
+    fn consolidate_trailing_agent_message(&mut self, source: String) {
+        let end = self.finalized.len();
+        let start = self.trailing_agent_message_run_start();
+        if start >= end {
+            return;
+        }
+
+        let pending_start = self.pending_start;
+        let removed: Vec<_> = self.finalized.drain(start..end).collect();
+        if pending_start > start {
+            let already_drained = (pending_start - start).min(removed.len());
+            self.pending_scrollback_carry
+                .extend(removed.into_iter().skip(already_drained));
+            self.pending_start = start;
+        }
+
+        self.finalized
+            .insert(start, Box::new(AgentMarkdownCell::new(source)));
+
+        if pending_start > start {
+            self.pending_start = start + 1;
+        }
+    }
+
+    fn trailing_agent_message_run_start(&self) -> usize {
+        let mut start = self.finalized.len();
+        while start > 0
+            && self.finalized[start - 1].is_transient_agent_message()
+            && self.finalized[start - 1].is_stream_continuation()
+        {
+            start -= 1;
+        }
+
+        if start > 0
+            && self.finalized[start - 1].is_transient_agent_message()
+            && !self.finalized[start - 1].is_stream_continuation()
+        {
+            start -= 1;
+        }
+
+        start
     }
 
     /// Push a collapsed reasoning row. Uses [`Self::push_local_cell`] so
