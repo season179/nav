@@ -467,6 +467,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_cell_narrow_width_does_not_rewrap_pre_rendered_lines() {
+        // Pre-render lines at a wide width, then display at a narrow width.
+        // AgentMessageCell ignores the display width (lines are already rendered)
+        // so long lines must pass through without rewrapping.
+        let rendered = crate::cells::render_body(
+            "this is a fairly long stable chunk that was rendered at a wide stream width",
+            80,
+        );
+        let cell = AgentMessageCell::new(rendered, true);
+
+        // At narrow width (20 cols), a finalized AgentMarkdownCell would rewrap.
+        // AgentMessageCell must NOT — the lines are pre-committed.
+        let lines = cell.display_lines(20);
+        assert_eq!(lines.len(), 1, "should be exactly 1 line, not rewrapped");
+        insta::assert_snapshot!(lines_text(&lines), @r"
+        • this is a fairly long stable chunk that was rendered at a wide stream width
+        ");
+    }
+
+    #[test]
+    fn stream_chunk_cells_whitespace_only_lines_get_prefix() {
+        // Whitespace-only spans are not the same as Vec::new().
+        // They should still receive the bullet or indent prefix.
+        let first = AgentMessageCell::new(vec![Line::from("   ")], true);
+        let cont = AgentMessageCell::new(vec![Line::from("   ")], false);
+        let tail = StreamingAgentTailCell::new(vec![Line::from("   ")], true);
+
+        let first_text = lines_text(&first.display_lines(40));
+        let cont_text = lines_text(&cont.display_lines(40));
+        let tail_text = lines_text(&tail.display_lines(40));
+
+        // First and tail carry the bullet prefix; prepend_stream_prefix strips
+        // the 2-char body indent from the input, so "   " (3 spaces) becomes
+        // "• " + " " = "•  " (bullet, space, one remaining space).
+        assert_eq!(first_text, "•  \n", "first: {first_text:?}");
+        assert_eq!(tail_text, "•  \n", "tail: {tail_text:?}");
+        // Continuation: body indent "  " + remaining " " = "   ".
+        assert_eq!(cont_text, "   \n", "cont: {cont_text:?}");
+    }
+
+    #[test]
     fn assistant_message_uses_codex_bullet_without_label() {
         let cell =
             AgentMarkdownCell::new("This assistant reply wraps cleanly under the bullet marker.");
