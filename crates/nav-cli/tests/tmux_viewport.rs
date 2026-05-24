@@ -263,6 +263,40 @@ fn spawn_mock_streaming_server(chunk_count: usize) -> u16 {
     port
 }
 
+/// Like [`spawn_mock_streaming_server`] but with a configurable inter-chunk
+/// delay so tests can reliably catch the stream mid-flight for resize or
+/// timing-sensitive assertions.
+///
+/// Uses a longer accept timeout (60s vs 30s) because slow-delay tests
+/// involve more setup (resize round-trips) before the stream finishes.
+fn spawn_mock_streaming_server_with_delay(chunk_count: usize, delay: Duration) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock slow streaming server bind");
+    let port = listener
+        .local_addr()
+        .expect("mock slow streaming server local addr")
+        .port();
+    let _ = listener.set_nonblocking(true);
+    thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    write_mock_streaming_response_with_delay(stream, chunk_count, delay);
+                    return;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() > Duration::from_secs(60) {
+                        return;
+                    }
+                    sleep(Duration::from_millis(25));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    port
+}
+
 fn spawn_mock_approval_server(tool_call_delay: Duration) -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock approval server bind");
     let port = listener
@@ -426,7 +460,15 @@ fn write_mock_reasoning_response(mut stream: TcpStream) {
     let _ = stream.write_all(b"data: [DONE]\n\n");
 }
 
-fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
+fn write_mock_streaming_response(stream: TcpStream, chunk_count: usize) {
+    write_mock_streaming_response_with_delay(stream, chunk_count, Duration::from_millis(5));
+}
+
+fn write_mock_streaming_response_with_delay(
+    mut stream: TcpStream,
+    chunk_count: usize,
+    delay: Duration,
+) {
     read_http_request(&mut stream);
     // Newline-terminate each chunk so the StreamController's partition logic
     // flips bytes from tail to stable under the visibility gate.
@@ -447,7 +489,7 @@ fn write_mock_streaming_response(mut stream: TcpStream, chunk_count: usize) {
             "finish_reason": "stop"
         }]
     }));
-    write_sse_chunks(&mut stream, &chunks);
+    write_sse_chunks_with_delay(&mut stream, &chunks, delay);
 }
 
 fn mock_exploration_tool_result_count(body: &str) -> usize {
@@ -524,6 +566,14 @@ fn write_mock_exploration_group_final_response(stream: &mut TcpStream) {
 }
 
 fn write_sse_chunks(stream: &mut TcpStream, chunks: &[serde_json::Value]) {
+    write_sse_chunks_with_delay(stream, chunks, Duration::from_millis(5));
+}
+
+fn write_sse_chunks_with_delay(
+    stream: &mut TcpStream,
+    chunks: &[serde_json::Value],
+    delay: Duration,
+) {
     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     if stream.write_all(header).is_err() {
         return;
@@ -537,7 +587,7 @@ fn write_sse_chunks(stream: &mut TcpStream, chunks: &[serde_json::Value]) {
         if stream.flush().is_err() {
             return;
         }
-        sleep(Duration::from_millis(5));
+        sleep(delay);
     }
     let _ = stream.write_all(b"data: [DONE]\n\n");
     let _ = stream.flush();
@@ -1759,5 +1809,194 @@ fn model_picker_selects_model_and_records_notice() {
     assert!(
         changed.contains("mock/alt"),
         "status bar should show the newly selected model:\n{changed}"
+    );
+}
+
+/// AM-07 (#225): Prove stable assistant chunks move into terminal scrollback
+/// instead of making the viewport grow forever.
+///
+/// Streams 400 chunks through a mock provider into a 24-row terminal.
+/// After the stream completes, the terminal's visible area shows only the
+/// tail of the output (late chunks + final marker). Early chunks like
+/// `chunk-0` must be above the visible area — promoted to native scrollback
+/// by the inline viewport's insert-history path.
+///
+/// If the viewport grew unboundedly (the bug this test prevents),
+/// `chunk-0` would still be visible in the captured pane because no lines
+/// would have been promoted to scrollback.
+#[test]
+fn stable_chunks_leave_viewport_during_long_stream() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_streaming_server(400);
+    let workdir = tempdir().expect("tempdir for stable-chunk test");
+    write_mock_provider_settings(&workdir, "stable", mock_port);
+
+    let session = fresh_session("stable-chunk-handoff");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/stable"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "stable-chunk nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("stream a very long answer");
+
+    // Wait for the entire stream to complete. The mock sends 400 chunks
+    // at ~5ms each (~2s total) followed by the final marker.
+    let completed = session.wait_for(
+        |pane| pane.contains(MOCK_FINAL_MARKER),
+        Duration::from_secs(20),
+    );
+    assert!(
+        completed.contains(MOCK_FINAL_MARKER),
+        "final marker never landed:\n{completed}"
+    );
+
+    // The visible pane (24 rows) cannot contain all 400+ output lines.
+    // Early chunks must have been promoted to native scrollback and
+    // scrolled out of view. If the viewport grew unboundedly, chunk-0
+    // would still be in the captured pane.
+    assert!(
+        !completed.contains("chunk-0"),
+        "chunk-0 should have been promoted to scrollback — the visible pane \
+         should only show the tail end of a 400-chunk stream:\n{completed}"
+    );
+
+    // Late chunks should be visible — they form the tail that stays in
+    // the viewport before the final marker arrives. Use "chunk-398"
+    // (unambiguous — no other chunk index contains it as a prefix).
+    assert!(
+        completed.contains("chunk-398"),
+        "late chunks (e.g. chunk-398) should be visible in the tail:\n{completed}"
+    );
+
+    // Final marker appears exactly once — no duplicate transcript rows.
+    assert_eq!(
+        completed.matches(MOCK_FINAL_MARKER).count(),
+        1,
+        "final marker must appear exactly once (no duplicate transcript rows):\n{completed}"
+    );
+
+    // Status bar must still be present after a long stream.
+    assert!(
+        status_bar_present(&completed),
+        "status bar missing after long stream:\n{completed}"
+    );
+
+    assert!(
+        !completed.contains("data:"),
+        "raw SSE payload leaked into the TUI:\n{completed}"
+    );
+}
+
+/// AM-07 (#225): Prove resize during streaming does not blank or corrupt
+/// the status/composer area.
+///
+/// Starts a long stream, resizes the terminal mid-stream, then checks
+/// that the status bar and composer row remain intact. Without the
+/// inline-viewport buffer-reset fix, a SIGWINCH during streaming would
+/// leave the status bar row blank because `diff_buffers` skipped writes
+/// for cells whose content matched by buffer index after the viewport
+/// rect shifted.
+#[test]
+fn resize_during_streaming_preserves_status_and_composer() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_streaming_server_with_delay(100, Duration::from_millis(50));
+    let workdir = tempdir().expect("tempdir for resize-during-stream");
+    write_mock_provider_settings(&workdir, "resize", mock_port);
+
+    let session = fresh_session("resize-during-stream");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/resize"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "resize-during-stream nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("stream while I resize the terminal");
+
+    // Wait for streaming to start.
+    let streaming = session.wait_for(
+        |pane| pane.contains("chunk-0"),
+        Duration::from_secs(4),
+    );
+    assert!(
+        streaming.contains("chunk-0"),
+        "streaming did not start before resize:\n{streaming}"
+    );
+
+    // Resize mid-stream. If `try_resize` fails (old tmux), skip cleanly.
+    if !session.try_resize(80, 20) {
+        eprintln!("tmux resize-window unsupported (needs tmux >= 2.9), skipping");
+        return;
+    }
+
+    // After resize, the bottom pane must still paint. We check the
+    // composer placeholder is intact (the status bar is not checked
+    // here because the tempdir path pushes `· Ready` off the right
+    // edge at 80-col width — it is checked in the final frame below).
+    let after_resize = session.wait_for(
+        |pane| pane.contains("Ask nav to do anything") && pane.contains("chunk-"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        after_resize.contains("Ask nav to do anything"),
+        "composer placeholder vanished after resize during streaming:\n{after_resize}"
+    );
+    assert!(
+        after_resize.contains("chunk-"),
+        "streaming content disappeared after resize:\n{after_resize}"
+    );
+
+    // Grow back and wait for the stream to complete. Tests both resize
+    // directions — shrink and grow — to catch buffer-diff bugs that only
+    // surface in one direction.
+    assert!(
+        session.try_resize(100, 24),
+        "second resize-window failed after the first succeeded"
+    );
+    let completed = session.wait_for(
+        |pane| pane.contains(MOCK_FINAL_MARKER),
+        Duration::from_secs(20),
+    );
+    assert!(
+        completed.contains(MOCK_FINAL_MARKER),
+        "final marker never landed after resize:\n{completed}"
+    );
+    assert_eq!(
+        completed.matches(MOCK_FINAL_MARKER).count(),
+        1,
+        "final marker must appear exactly once after resize:\n{completed}"
+    );
+    // Status bar must still be present in the final frame.
+    assert!(
+        status_bar_present(&completed),
+        "status bar missing in final frame after resize:\n{completed}"
+    );
+    assert!(
+        !completed.contains("data:"),
+        "raw SSE payload leaked into the TUI after resize:\n{completed}"
     );
 }
