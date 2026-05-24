@@ -1,7 +1,7 @@
 use nav_core::{
     AgentEvent, FileChangeKind, FileChangeSummary, FileDiffSummary, GitCheckpointAction,
-    GitCheckpointStatus, PatchApplyStatus, PendingInputMode, ReviewDecision, SessionSummary,
-    TurnUsage, UserAttachment,
+    GitCheckpointStatus, PatchApplyStatus, PendingInputMode, ReviewDecision, TurnUsage,
+    UserAttachment,
 };
 use nav_tui::ChatWidget;
 use ratatui::Terminal;
@@ -1396,11 +1396,9 @@ fn inflight_tool_placeholders_preserve_arrival_order() {
 fn chat_widget_commit_tick_releases_stable_lines() {
     // The wiring contract: ChatWidget::on_commit_tick must propagate to the
     // streaming cell's chunking policy, otherwise stable lines stay hidden
-    // forever and the user sees only the live tail. If a future refactor
-    // drops the call from the app loop *or* breaks the delegation from
-    // ChatWidget to the streaming cell, this test catches it — without
-    // ticks, "hello" stays gated; with one tick under smooth mode, it
-    // becomes visible.
+    // forever and the user sees only the live tail. With the Codex-style
+    // split, released stable lines enter pending history instead of the live
+    // viewport.
     let mut widget = ChatWidget::new();
     widget.ingest(AgentEvent::AssistantMessageDelta {
         text: "hello\nworld\n".to_string(),
@@ -1412,13 +1410,66 @@ fn chat_widget_commit_tick_releases_stable_lines() {
         "stable line leaked before commit-tick ran; got:\n{pre_tick}"
     );
 
-    let advanced = widget.on_commit_tick();
-    assert!(advanced, "commit tick must report progress when queue has units");
+    let advanced = widget.on_commit_tick(80);
+    assert!(
+        advanced,
+        "commit tick must report progress when queue has units"
+    );
 
-    let post_tick = render_lines(&widget.inline_lines(80));
+    let post_tick = lines_to_text(&widget.drain_pending(80));
     assert!(
         post_tick.contains("hello"),
         "commit tick failed to release the first stable line; got:\n{post_tick}"
+    );
+}
+
+#[test]
+fn chat_widget_commit_tick_moves_stable_chunks_to_pending_history() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "stable line\nmutable tail".to_string(),
+    });
+
+    let advanced = widget.on_commit_tick(80);
+    assert!(advanced, "commit tick must report a newly stable chunk");
+
+    let scrollback = lines_to_text(&widget.drain_pending(80));
+    assert!(
+        scrollback.contains("• stable line"),
+        "stable chunk should drain to scrollback; got:\n{scrollback}"
+    );
+
+    let inline = render_lines(&widget.inline_lines(80));
+    assert!(
+        !inline.contains("stable line"),
+        "stable chunk should leave the live viewport; got:\n{inline}"
+    );
+    assert!(
+        inline.contains("mutable tail"),
+        "mutable tail should remain live; got:\n{inline}"
+    );
+}
+
+#[test]
+fn chat_widget_commit_tick_does_not_leave_empty_live_tail() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "stable only\n".to_string(),
+    });
+
+    let advanced = widget.on_commit_tick(80);
+    assert!(advanced, "commit tick must emit the complete stable line");
+
+    let scrollback = lines_to_text(&widget.drain_pending(80));
+    assert!(
+        scrollback.contains("• stable only"),
+        "stable line should drain to scrollback; got:\n{scrollback}"
+    );
+
+    let inline = render_lines(&widget.inline_lines(80));
+    assert!(
+        inline.is_empty(),
+        "empty mutable tail should not leave a live viewport row; got:\n{inline:?}"
     );
 }
 
@@ -1443,19 +1494,13 @@ fn inline_lines_capped_preserves_placeholders_over_long_stream() {
     // the tail of the Vec were invisibly clipped. The capped variant must
     // keep them visible by head-clipping the streaming cell instead.
     let mut widget = ChatWidget::new();
-    // Each line ends with `\n` so the StreamController flushes it to the
-    // stable half (otherwise it sits in the tail and the cell collapses to
-    // one row).
-    let long_stream = (0..40)
-        .map(|i| format!("line {i:02}\n"))
+    // No newline: this remains a mutable live tail, which is the only
+    // assistant content that should still compete for inline viewport rows
+    // after stable chunks have moved to scrollback.
+    let long_stream = (0..120)
+        .map(|i| format!("token{i:02} "))
         .collect::<String>();
     widget.ingest(AgentEvent::AssistantMessageDelta { text: long_stream });
-    // Drive a commit tick so the chunking layer releases the stable lines.
-    // 40 queued source lines is well over ENTER_QUEUE_DEPTH_LINES (8), so
-    // the policy enters catch-up and batches the whole reveal in one tick.
-    // Without this the stable region stays hidden behind the smoothing
-    // gate and the cell would only show its (empty) tail.
-    widget.on_commit_tick();
     // `inline_lines` (uncapped) materializes everything — by construction
     // it must exceed the cap we'll pass below, otherwise the test exercises
     // the wrong branch.
@@ -1492,7 +1537,7 @@ fn inline_lines_capped_preserves_placeholders_over_long_stream() {
         "tool-call placeholder must survive the cap; got:\n{rendered}"
     );
     assert!(
-        !rendered.contains("line 00"),
+        !rendered.contains("token00"),
         "streaming head should be clipped, not the tail; got:\n{rendered}"
     );
 }

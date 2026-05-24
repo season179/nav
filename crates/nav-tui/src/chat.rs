@@ -1,16 +1,15 @@
 use nav_core::{AgentEvent, SessionTreeNode, TranscriptHit, TurnUsage};
-use std::time::Duration;
 use ratatui::text::Line;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use crate::cells::ExplorationEntry;
 use crate::cells::{
-    AgentMarkdownCell, ApprovalDecisionCell, AssistantStreamingCell, CompactionCell,
-    CompactionPhase, ErrorCell, FileChangeCell,
-    GitCheckpointCell, HookCell, LabeledNoticeCell, NoticeCell, PendingInputCell,
-    ReasoningCell, SessionTreeCell, SkillInvocationCell,
-    SubagentCell, ToolCallCell, ToolCallContext, ToolOutputCell, TranscriptHitsCell,
-    FinalMessageSeparator, TurnAbortedCell, TurnDiffCell, UserMessageCell,
+    AgentMarkdownCell, AgentMessageCell, ApprovalDecisionCell, AssistantStreamingCell,
+    CompactionCell, CompactionPhase, ErrorCell, FileChangeCell, FinalMessageSeparator,
+    GitCheckpointCell, HookCell, LabeledNoticeCell, NoticeCell, PendingInputCell, ReasoningCell,
+    SessionTreeCell, SkillInvocationCell, SubagentCell, ToolCallCell, ToolCallContext,
+    ToolOutputCell, TranscriptHitsCell, TurnAbortedCell, TurnDiffCell, UserMessageCell,
 };
 use crate::history::HistoryCell;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
@@ -19,8 +18,9 @@ use crate::theme::Theme;
 /// Scrollback-first chat widget. Finalized cells get rendered and queued
 /// in `pending_finalized`, which the main loop drains before each frame and
 /// writes into the terminal's native scrollback via `insert_history_lines`.
-/// Only the in-flight streaming assistant cell still renders inside the
-/// ratatui viewport, so the user sees text grow as the model emits it.
+/// Only the in-flight mutable assistant tail still renders inside the
+/// ratatui viewport, so stable chunks can leave the redraw surface while
+/// the currently-growing text remains live.
 ///
 /// The transcript above the viewport is owned by the terminal itself; nav
 /// doesn't keep a transcript ledger here. Reflow on resize is handled
@@ -28,14 +28,13 @@ use crate::theme::Theme;
 ///
 /// ## Assistant message lifecycle (in progress)
 ///
-/// Today the whole live assistant reply lives in one `AssistantStreamingCell`
-/// held in `streaming_assistant`. The target Codex-style lifecycle splits this
-/// into three cell types:
+/// The assistant reply lifecycle is split across three cell types:
 /// - `AgentMessageCell` — stable chunk emitted to scrollback during streaming
 /// - `StreamingAgentTailCell` — mutable tail kept in the viewport
 /// - `AgentMarkdownCell` — finalized source-backed cell after consolidation
 ///
-/// The migration is tracked in AM-03 through AM-07. Once complete,
+/// The migration is tracked in AM-03 through AM-07. Once complete, the
+/// remaining controller wrapper
 /// `AssistantStreamingCell` and the `AssistantMessageCell` alias will be
 /// removed.
 pub struct ChatWidget {
@@ -51,12 +50,9 @@ pub struct ChatWidget {
     tool_calls: HashMap<String, ToolCallContext>,
     subagent_labels: HashMap<String, String>,
     turn_has_work: bool,
-    /// In-flight streaming assistant cell (pre-Codex-split). Rendered inside
-    /// the viewport so deltas appear immediately; when the message finalizes it
-    /// joins `finalized` as an `AgentMarkdownCell` and gets pushed to scrollback.
-    ///
-    /// Will be replaced by the Codex-style split (`AgentMessageCell` stable
-    /// chunks + `StreamingAgentTailCell` mutable tail) when AM-03/AM-04 land.
+    /// In-flight assistant stream controller wrapper. Commit ticks emit
+    /// stable chunks into `finalized`; `inline_lines` renders only the
+    /// mutable tail.
     streaming_assistant: Option<AssistantStreamingCell>,
     /// In-flight `Exploring`/`Running` placeholder rows, in arrival order
     /// keyed by `call_id`. Rendered inline (below the streaming cell) so the
@@ -83,6 +79,7 @@ pub struct ChatWidget {
     /// allow the next reply to immediately re-enter catch-up. Driven by
     /// [`Self::on_commit_tick`] from the app's frame loop.
     adaptive_chunking: AdaptiveChunkingPolicy,
+    stream_width: u16,
     /// Monotonic revision for overlay caches that render the full transcript
     /// from finalized cells plus the in-flight live tail.
     transcript_revision: u64,
@@ -106,19 +103,24 @@ impl ChatWidget {
             inflight_tool_calls: Vec::new(),
             exploring_buffer: Vec::new(),
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
+            stream_width: 80,
             transcript_revision: 0,
         }
     }
 
     /// Run one commit-tick pass against the in-flight streaming assistant
-    /// cell, if any, and report whether any source lines became visible.
-    /// `true` means the caller should request a redraw — fresh lines need
-    /// painting. Called from the app's frame timer arm.
-    pub fn on_commit_tick(&mut self) -> bool {
+    /// cell, if any, and report whether a stable chunk was queued for
+    /// scrollback. `true` means the caller should request a redraw so the
+    /// newly-drained history and current tail paint together. Called from
+    /// the app's frame timer arm.
+    pub fn on_commit_tick(&mut self, width: u16) -> bool {
+        self.stream_width = width.max(1);
         let Some(cell) = self.streaming_assistant.as_mut() else {
             return false;
         };
-        let changed = cell.on_commit_tick(&mut self.adaptive_chunking);
+        let chunk = cell.on_commit_tick_chunk(&mut self.adaptive_chunking, self.stream_width);
+        let changed = chunk.is_some();
+        self.push_stream_chunk(chunk);
         if changed {
             self.bump_transcript_revision();
         }
@@ -565,7 +567,7 @@ impl ChatWidget {
     pub fn streaming_lines(&self, width: u16) -> Vec<Line<'static>> {
         self.streaming_assistant
             .as_ref()
-            .map(|cell| cell.display_lines(width))
+            .map(|cell| cell.tail_display_lines(width))
             .unwrap_or_default()
     }
 
@@ -608,7 +610,8 @@ impl ChatWidget {
                 individual.push(cell);
             }
         }
-        let summary = (!calls.is_empty()).then(|| ToolCallCell::exploring_group(calls, live_target));
+        let summary =
+            (!calls.is_empty()).then(|| ToolCallCell::exploring_group(calls, live_target));
         (individual, summary)
     }
 
@@ -675,18 +678,31 @@ impl ChatWidget {
 
     fn close_streaming_assistant(&mut self) {
         self.close_streaming_reasoning();
-        if let Some(cell) = self.streaming_assistant.take() {
-            self.finalized.push(Box::new(cell.into_finalized()));
+        if let Some(mut cell) = self.streaming_assistant.take() {
+            let cell = cell.finalize_for_history(self.stream_width);
+            self.push_optional_cell(cell);
         }
     }
 
     fn close_streaming_assistant_with(&mut self, text: String) {
         self.close_streaming_reasoning();
-        if let Some(cell) = self.streaming_assistant.take() {
-            self.finalized
-                .push(Box::new(cell.into_finalized_with(&text)));
+        if let Some(mut cell) = self.streaming_assistant.take() {
+            let cell = cell.finalize_for_history_with(&text, self.stream_width);
+            self.push_optional_cell(cell);
         } else {
             self.push_cell(AgentMarkdownCell::new(text));
+        }
+    }
+
+    fn push_stream_chunk(&mut self, chunk: Option<AgentMessageCell>) {
+        if let Some(chunk) = chunk {
+            self.finalized.push(Box::new(chunk));
+        }
+    }
+
+    fn push_optional_cell(&mut self, cell: Option<Box<dyn HistoryCell>>) {
+        if let Some(cell) = cell {
+            self.finalized.push(cell);
         }
     }
 

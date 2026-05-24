@@ -8,11 +8,10 @@
 //!
 //! ## Current role in the migration
 //!
-//! Today `AssistantStreamingCell` owns one `StreamController` and renders the
-//! entire live reply. Once AM-03/AM-04 land, `ChatWidget` will own the
-//! controller directly and use it to emit `AgentMessageCell` stable chunks to
-//! scrollback while keeping the mutable tail as a `StreamingAgentTailCell` in
-//! the viewport.
+//! `AssistantStreamingCell` owns one `StreamController` while the migration is
+//! in progress. `ChatWidget` uses it to emit `AgentMessageCell` stable chunks
+//! to scrollback while keeping the mutable tail as a `StreamingAgentTailCell`
+//! in the viewport.
 //!
 //! ## Visibility gate
 //!
