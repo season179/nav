@@ -71,6 +71,40 @@ They also support a **transcript** representation (`transcript_lines`) used by
 the `Ctrl+T` overlay, which can differ from the main viewport rendering (e.g.
 `ExecCell` shows all calls with `$`-prefixed commands in transcript mode).
 
+## Cell implementation priority
+
+For `nav`, do not chase every Codex cell at once. Work cell-by-cell, starting
+with the blocks that most affect the live redraw layer and the handoff from
+ratatui viewport to terminal scrollback.
+
+| Rank | Cell / surface | Why it matters first |
+|---:|---|---|
+| 1 | `AgentMessageCell` | Live assistant text while the model is streaming; this is the core nav-owned redraw-each-frame cell. |
+| 2 | `ExecCell` / active tool-call cell | Makes agent work legible while commands and tools are running. |
+| 3 | `AgentMarkdownCell` | Final assistant message after streaming; proves live text finalizes cleanly into scrollback. |
+| 4 | `ReasoningCell` | Shows reasoning summaries, but should stay quiet and not dominate the transcript. |
+| 5 | `HookCell` | Shows pre/post hook activity; important for the harness, but should remain subtle. |
+| 6 | `UserHistoryCell` | Shows the submitted prompt; important, but simpler than assistant/tool cells. |
+| 7 | `PatchHistoryCell` / file-change cell | Shows edit and diff summaries once verify/edit workflows are central. |
+| 8 | `McpToolCallCell` | Useful if MCP/app tools become first-class in nav. |
+| 9 | `PlanUpdateCell` | Useful for checklist updates when nav leans on explicit plans. |
+| 10 | `ProposedPlanStreamCell` / `StreamingPlanTailCell` | Nice live-plan polish, but not core redraw infrastructure. |
+| 11 | `ProposedPlanCell` | Final proposed-plan display; useful after streaming/message basics are solid. |
+| 12 | `ApprovalDecisionCell` | Audit trail for approval outcomes; visually straightforward. |
+| 13 | `ReviewDecisionCell` | Valuable once guardian/review workflows are active. |
+| 14 | `RequestUserInputResultCell` | Useful after richer request-user-input support exists. |
+| 15 | Warning / notice cells | Important, but generally straightforward banners. |
+| 16 | `FinalMessageSeparator` | Turn divider and metrics polish; low architectural risk. |
+| 17 | `UpdateAvailableHistoryCell` | Low-priority update notice. |
+| 18 | Session header cells | Welcome/session context; not part of the main live redraw path. |
+| 19 | Image-related cells | Useful later if image tools matter. |
+| 20 | `WebSearchCell` | Only urgent if web search is a first-class nav workflow. |
+| 21 | `UnifiedExecInteractionCell` | Powerful background-process interaction, but advanced; do not start here. |
+
+Recommended first pass: `AgentMessageCell` → `ExecCell` →
+`AgentMarkdownCell`. That covers the core lifecycle of live assistant text,
+live tool activity, and finalized scrollback.
+
 ### Conversation cells
 
 | Cell | Web analogy | File | Purpose |
