@@ -32,7 +32,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::cells::{count_wrapped_body_lines, render_body};
+use crate::cells::{count_wrapped_body_lines, render_body, AgentMessageCell};
 use ratatui::text::Line;
 
 use super::StreamState;
@@ -51,6 +51,19 @@ pub(crate) struct StreamController {
     /// for display. The visible body is the rendered body of content up to
     /// the Nth newline plus the live tail. Width-independent.
     visible_stable_lines: usize,
+    /// How many source-text lines have been emitted as
+    /// [`AgentMessageCell`] chunks via [`commit_tick_chunk`] /
+    /// [`finalize_chunk`]. Lags behind `visible_stable_lines` whenever
+    /// `requeue_stable` snaps over previously-visible tail content: the
+    /// snap advances `visible_stable_lines` to keep the legacy display
+    /// path stable, but the chunk-emission path still owes those lines
+    /// to scrollback. Next emission covers the gap.
+    emitted_stable_lines: usize,
+    /// Set once the first stable chunk has been emitted via
+    /// [`commit_tick_chunk`] (or [`finalize_chunk`]). Drives the
+    /// `is_first_line` flag on emitted `AgentMessageCell`s and the
+    /// `tail_starts_stream` hint used by the live tail cell.
+    header_emitted: bool,
 }
 
 #[derive(Default)]
@@ -87,6 +100,15 @@ impl StreamController {
     }
 
     /// Replace the streamed source with `text`, preserving finalize semantics.
+    ///
+    /// `header_emitted` and `emitted_stable_lines` are intentionally
+    /// preserved: by the time a caller replaces the buffer (typically the
+    /// resume-with-coalesced-text path mirrored from `into_finalized_with`)
+    /// any chunks already pushed to scrollback can't be unsent. Resetting
+    /// the header flag would let the chunk-emission path stamp a second
+    /// `is_first_line=true` cell, putting two assistant bullets in the
+    /// transcript for one logical reply. Resetting the emitted counter
+    /// would re-emit content already in scrollback as a fresh chunk.
     pub(crate) fn replace_buffer(&mut self, text: &str) {
         self.collector.replace(text);
         self.stream_state.clear_queue();
@@ -116,8 +138,7 @@ impl StreamController {
         // `enqueued_stable_offset`.
         let len = self.collector.content().len();
         self.requeue_stable(len);
-        self.visible_stable_lines =
-            count_newlines(self.collector.content()).saturating_add(1);
+        self.visible_stable_lines = count_newlines(self.collector.content()).saturating_add(1);
         self.stream_state.clear_queue();
     }
 
@@ -135,6 +156,135 @@ impl StreamController {
         let drained = self.stream_state.drain_n(max_lines);
         self.visible_stable_lines = self.visible_stable_lines.saturating_add(drained.len());
         drained
+    }
+
+    /// Smooth-mode tick that emits the newly-stable source range as an
+    /// [`AgentMessageCell`] rendered at `width`. Mirrors Codex's
+    /// `StreamController::on_commit_tick` contract: the cell is the stable
+    /// chunk destined for scrollback, and the bool is `idle` (queue empty).
+    ///
+    /// Holdback and adaptive chunking semantics are unchanged — the chunk
+    /// covers source between [`Self::emitted_stable_lines`] and the
+    /// post-tick visibility boundary, so snap-on-advance jumps over
+    /// previously-tailed content still flow into scrollback on the next
+    /// tick instead of being lost.
+    #[cfg_attr(not(test), allow(dead_code))] // wired by AM-04 (issue #222) ChatWidget rewire
+    pub(crate) fn commit_tick_chunk(&mut self, width: u16) -> (Option<AgentMessageCell>, bool) {
+        let before = self.unemitted_source_offset();
+        let _ = self.on_commit_tick();
+        let after = self.visible_source_offset();
+        let cell = self.emit_chunk_between(before, after, width);
+        self.emitted_stable_lines = self.visible_stable_lines;
+        (cell, self.is_idle())
+    }
+
+    /// Catch-up variant of [`Self::commit_tick_chunk`] that drains up to
+    /// `max_lines` queued tick units in a single batch. The emitted chunk
+    /// covers the entire newly-released source range so the caller never
+    /// has to stitch successive batch outputs together.
+    #[cfg_attr(not(test), allow(dead_code))] // wired by AM-04 (issue #222) ChatWidget rewire
+    pub(crate) fn commit_tick_batch_chunk(
+        &mut self,
+        width: u16,
+        max_lines: usize,
+    ) -> (Option<AgentMessageCell>, bool) {
+        let before = self.unemitted_source_offset();
+        let _ = self.on_commit_tick_batch(max_lines);
+        let after = self.visible_source_offset();
+        let cell = self.emit_chunk_between(before, after, width);
+        self.emitted_stable_lines = self.visible_stable_lines;
+        (cell, self.is_idle())
+    }
+
+    /// Render the mutable tail at `width` for the
+    /// [`crate::cells::StreamingAgentTailCell`]. The tail is the source past
+    /// the holdback partition (open fences, table rows, partial lines) —
+    /// content that may still be reshaped by subsequent deltas.
+    #[cfg_attr(not(test), allow(dead_code))] // wired by AM-04 (issue #222) ChatWidget rewire
+    pub(crate) fn current_tail_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let partition_end = self.partition_offset();
+        render_body(&self.collector.content()[partition_end..], width)
+    }
+
+    /// Whether the live tail should carry the assistant bullet prefix.
+    /// False once a stable chunk has either emitted the header or is
+    /// queued to become the header. This keeps AM-04's live tail from
+    /// momentarily painting a second bullet while stable content is
+    /// waiting for its commit tick.
+    #[cfg_attr(not(test), allow(dead_code))] // wired by AM-04 (issue #222) ChatWidget rewire
+    pub(crate) fn tail_starts_stream(&self) -> bool {
+        !self.header_emitted && self.visible_stable_lines == 0 && self.stream_state.is_idle()
+    }
+
+    /// Finalize the stream and emit any source that hasn't been released
+    /// yet (the entire remaining stable region plus the just-snapped tail)
+    /// as a single [`AgentMessageCell`]. Returns the raw markdown source
+    /// alongside the cell so the consolidation pass in AM-07 can replace
+    /// the emitted chunk run with one source-backed [`crate::cells::AgentMarkdownCell`].
+    #[cfg_attr(not(test), allow(dead_code))] // wired by AM-04 (issue #222) ChatWidget rewire
+    pub(crate) fn finalize_chunk(&mut self, width: u16) -> (Option<AgentMessageCell>, String) {
+        let before = self.unemitted_source_offset();
+        let source = self.collector.content().to_string();
+        self.finalize();
+        let after = self.collector.content().len();
+        let cell = self.emit_chunk_between(before, after, width);
+        self.emitted_stable_lines = self.visible_stable_lines;
+        (cell, source)
+    }
+
+    /// Byte offset of the next chunk's starting boundary — end of the Nth
+    /// newline within the current stable partition, where N is
+    /// [`Self::emitted_stable_lines`]. Lags behind
+    /// [`Self::visible_source_offset`] whenever `requeue_stable` snaps
+    /// over a previously-visible tail.
+    fn unemitted_source_offset(&self) -> usize {
+        let partition_end = self.partition_offset();
+        nth_newline_offset(
+            &self.collector.content()[..partition_end],
+            self.emitted_stable_lines,
+        )
+    }
+
+    /// Byte offset of the visibility boundary — end of the Nth newline
+    /// within the current stable partition, where N is
+    /// [`Self::visible_stable_lines`]. The boundary the legacy display
+    /// path slices the rendered body at.
+    fn visible_source_offset(&self) -> usize {
+        let partition_end = self.partition_offset();
+        nth_newline_offset(
+            &self.collector.content()[..partition_end],
+            self.visible_stable_lines,
+        )
+    }
+
+    /// Render the source range `[start..end]` as an [`AgentMessageCell`]
+    /// when non-empty. Drives the `header_emitted` flag forward so the
+    /// next chunk renders without the assistant bullet.
+    ///
+    /// Both the prefix `[..start]` and the full `[..end]` are rendered so
+    /// the chunk inherits the correct in-fence state at `start`. Rendering
+    /// `[start..end]` in isolation would reset `render_body`'s local
+    /// `in_fence` flag and re-style code-block bodies as prose whenever a
+    /// fence's opener and body land on different commit ticks.
+    fn emit_chunk_between(
+        &mut self,
+        start: usize,
+        end: usize,
+        width: u16,
+    ) -> Option<AgentMessageCell> {
+        if end <= start {
+            return None;
+        }
+        let content = self.collector.content();
+        let prefix_lines = render_body(&content[..start], width).len();
+        let full = render_body(&content[..end], width);
+        if full.len() <= prefix_lines {
+            return None;
+        }
+        let lines = full[prefix_lines..].to_vec();
+        let is_first = !self.header_emitted;
+        self.header_emitted = true;
+        Some(AgentMessageCell::new(lines, is_first))
     }
 
     /// Returns `true` when no lines are queued for commit.
@@ -181,8 +331,10 @@ impl StreamController {
     /// completed lines.
     pub(crate) fn visible_lines(&self, width: u16) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
         let partition_end = self.partition_offset();
-        let visible_end =
-            nth_newline_offset(&self.collector.content()[..partition_end], self.visible_stable_lines);
+        let visible_end = nth_newline_offset(
+            &self.collector.content()[..partition_end],
+            self.visible_stable_lines,
+        );
         let stable = render_body(&self.collector.content()[..visible_end], width);
         let tail = render_body(&self.collector.content()[partition_end..], width);
         (stable, tail)
@@ -192,8 +344,10 @@ impl StreamController {
     /// cell calls this on the scroll hot path.
     pub(crate) fn visible_line_count(&self, width: u16) -> usize {
         let partition_end = self.partition_offset();
-        let visible_end =
-            nth_newline_offset(&self.collector.content()[..partition_end], self.visible_stable_lines);
+        let visible_end = nth_newline_offset(
+            &self.collector.content()[..partition_end],
+            self.visible_stable_lines,
+        );
         let stable = count_wrapped_body_lines(&self.collector.content()[..visible_end], width);
         let tail = count_wrapped_body_lines(&self.collector.content()[partition_end..], width);
         stable + tail
@@ -259,8 +413,9 @@ impl StreamController {
         if queue_start < partition_end {
             let new_newlines = count_newlines(&content[queue_start..partition_end]);
             if new_newlines > 0 {
-                let placeholders: Vec<Line<'static>> =
-                    std::iter::repeat_with(Line::default).take(new_newlines).collect();
+                let placeholders: Vec<Line<'static>> = std::iter::repeat_with(Line::default)
+                    .take(new_newlines)
+                    .collect();
                 self.stream_state.enqueue(placeholders);
             }
         }
@@ -459,10 +614,11 @@ fn is_table_row(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::chunking::QueueSnapshot;
     use super::*;
+    use crate::history::HistoryCell;
     use ratatui::text::Line;
     use std::time::Instant;
-    use super::super::chunking::QueueSnapshot;
 
     fn lines_text(lines: &[Line<'_>]) -> String {
         let mut s = String::new();
@@ -673,5 +829,380 @@ mod tests {
         };
         assert_eq!(snapshot.queued_lines, 1);
         assert!(snapshot.oldest_age.is_some());
+    }
+
+    #[test]
+    fn replace_buffer_preserves_header_state_after_chunk_emission() {
+        // Once a stable chunk has been pushed to scrollback, the
+        // assistant bullet is already committed to the user's terminal.
+        // A subsequent replace_buffer (e.g. the resume-with-coalesced-
+        // text path mirrored from `into_finalized_with`) must NOT reset
+        // header_emitted, or the follow-up finalize_chunk will emit a
+        // second is_first_line=true cell and the user sees two
+        // assistant bullets for one logical reply.
+        let mut c = StreamController::default();
+        c.push_delta("Hello\n");
+        let first = c.commit_tick_chunk(40).0.expect("first chunk should emit");
+        assert!(first.is_first_line());
+        assert!(!c.tail_starts_stream());
+
+        c.replace_buffer("Hello world\n");
+        assert!(
+            !c.tail_starts_stream(),
+            "replace_buffer must NOT reset header_emitted once chunks are in scrollback"
+        );
+
+        if let (Some(cell), _) = c.finalize_chunk(40) {
+            assert!(
+                !cell.is_first_line(),
+                "finalize_chunk after replace_buffer must mark continuation, not a fresh bullet"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_fence_drained_per_tick_keeps_code_styling_inside_body() {
+        // render_body tracks `in_fence` locally per call. Slicing the
+        // source per smooth tick and rendering each slice independently
+        // resets in_fence between chunks, so code-block body lines fall
+        // through to body_line + parse_inline_spans and lose cyan
+        // styling (worse, literal `*` / `_` get interpreted as markdown).
+        // emit_chunk_between must render with prior fence context so
+        // body chunks render as code regardless of how lines drain.
+        use ratatui::style::Color;
+
+        let mut c = StreamController::default();
+        c.push_delta("```\nfn *bold* main() {}\n```\nafter\n");
+
+        let mut all_lines: Vec<Line<'static>> = Vec::new();
+        for _ in 0..6 {
+            if let Some(cell) = c.commit_tick_chunk(40).0 {
+                all_lines.extend(cell.display_lines(40));
+            }
+        }
+
+        fn line_text(line: &Line<'_>) -> String {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        }
+
+        let body_line = all_lines
+            .iter()
+            .find(|line| {
+                let text = line_text(line);
+                text.contains("fn") && text.contains("main")
+            })
+            .unwrap_or_else(|| {
+                let rendered: Vec<String> = all_lines.iter().map(line_text).collect();
+                panic!(
+                    "rendered output should include the code-block body line; got: {rendered:?}"
+                );
+            });
+        let has_cyan_span = body_line
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(Color::Cyan));
+        assert!(
+            has_cyan_span,
+            "fenced-code body must stay cyan when drained per-tick; got line spans: {:?}",
+            body_line.spans
+        );
+        let combined = line_text(body_line);
+        assert!(
+            combined.contains("*bold*"),
+            "code-block body must preserve literal markdown markers (no inline parsing); got: {combined:?}"
+        );
+    }
+
+    #[test]
+    fn open_fence_body_stays_in_tail_until_close_or_finalize() {
+        // The holdback rule must survive the chunk-emission rewrite: an
+        // unterminated fenced block keeps its body in `current_tail_lines`
+        // and out of every emitted AgentMessageCell. Once the fence
+        // closes, the previously-tailed lines move into the stable
+        // partition and are released by commit ticks normally.
+        let mut c = StreamController::default();
+        c.push_delta("intro\n```rust\nfn main() {\n");
+
+        let first = c.commit_tick_chunk(80).0.expect("intro line should emit");
+        let first_rendered = lines_text(&first.display_lines(80));
+        assert!(
+            first_rendered.contains("intro"),
+            "intro line is stable and must emit; got:\n{first_rendered}"
+        );
+        assert!(
+            !first_rendered.contains("```rust") && !first_rendered.contains("fn main"),
+            "open fence must hold its body back from the stable chunk; got:\n{first_rendered}"
+        );
+
+        let tail = lines_text(&c.current_tail_lines(80));
+        assert!(
+            tail.contains("```rust") && tail.contains("fn main"),
+            "fenced body must render via current_tail_lines while the fence is open; got:\n{tail}"
+        );
+
+        c.push_delta("}\n```\n");
+
+        let mut combined = String::new();
+        while let (Some(chunk), idle) = c.commit_tick_batch_chunk(80, 16) {
+            combined.push_str(&lines_text(&chunk.display_lines(80)));
+            if idle {
+                break;
+            }
+        }
+        let (final_cell, source) = c.finalize_chunk(80);
+        if let Some(cell) = final_cell {
+            combined.push_str(&lines_text(&cell.display_lines(80)));
+        }
+        assert!(
+            combined.contains("```rust") && combined.contains("fn main") && combined.contains('}'),
+            "after fence close + finalize, the body must land in emitted chunks; got:\n{combined}"
+        );
+        assert_eq!(
+            source, "intro\n```rust\nfn main() {\n}\n```\n",
+            "raw source must contain the full markdown for consolidation"
+        );
+    }
+
+    #[test]
+    fn commit_tick_batch_chunk_emits_all_drained_lines_in_order() {
+        // Catch-up mode (depth >= 8 or stale oldest entry) drains many
+        // queued ticks in one call. The emitted chunk must contain every
+        // newly-released source line, preserving their original order, so
+        // bursty model output doesn't show up out of sequence.
+        let mut c = StreamController::default();
+        for i in 0..10 {
+            c.push_delta(&format!("line {i}\n"));
+        }
+        assert_eq!(c.queued_lines(), 10);
+
+        let (cell, idle) = c.commit_tick_batch_chunk(60, 10);
+        let cell = cell.expect("batch tick should emit a chunk");
+        assert!(
+            idle,
+            "10 queued lines drained in one batch leaves queue empty"
+        );
+        let rendered = lines_text(&cell.display_lines(60));
+        for i in 0..10 {
+            assert!(
+                rendered.contains(&format!("line {i}")),
+                "batch chunk missing line {i}; got:\n{rendered}"
+            );
+        }
+        let pos_line0 = rendered.find("line 0").unwrap();
+        let pos_line9 = rendered.find("line 9").unwrap();
+        assert!(
+            pos_line0 < pos_line9,
+            "batch must preserve original source order; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn finalize_chunk_emits_remaining_and_returns_raw_source() {
+        // After streaming partial content with held-back lines, finalize
+        // must drain everything left as a single AgentMessageCell *and*
+        // hand back the full markdown source. The source feeds the
+        // consolidation pass (AM-07) that replaces the emitted chunk run
+        // with one AgentMarkdownCell, so losing it would break resize
+        // reflow on finalized scrollback.
+        let mut c = StreamController::default();
+        c.push_delta("intro\n");
+        c.push_delta("```rust\nfn main() {}\n");
+
+        let (cell, source) = c.finalize_chunk(60);
+        let cell = cell.expect("finalize must emit remaining source as a chunk");
+        assert_eq!(
+            source, "intro\n```rust\nfn main() {}\n",
+            "raw markdown source must be preserved verbatim for consolidation"
+        );
+        let rendered = lines_text(&cell.display_lines(60));
+        assert!(
+            rendered.contains("intro")
+                && rendered.contains("```rust")
+                && rendered.contains("fn main"),
+            "remaining stable + held-back tail must appear in finalize chunk; got:\n{rendered}"
+        );
+        assert!(
+            cell.is_first_line(),
+            "finalize without prior chunks owns the assistant bullet"
+        );
+    }
+
+    #[test]
+    fn finalize_chunk_after_prior_chunks_marks_continuation() {
+        // When commit_tick_chunk has already emitted the assistant
+        // header, finalize must NOT re-set is_first_line; the bullet
+        // belongs to the very first chunk only.
+        let mut c = StreamController::default();
+        c.push_delta("alpha\n");
+        c.push_delta("beta\n");
+
+        let first = c.commit_tick_chunk(40).0.expect("first chunk should emit");
+        assert!(first.is_first_line());
+
+        let (final_cell, _) = c.finalize_chunk(40);
+        let final_cell = final_cell.expect("finalize should emit the remaining beta line");
+        assert!(
+            !final_cell.is_first_line(),
+            "finalize after a chunk run is a continuation, not a header"
+        );
+    }
+
+    #[test]
+    fn tail_starts_stream_is_false_while_header_chunk_is_queued() {
+        // Mirrors Codex's contract: once stable content is queued, that
+        // stable chunk owns the assistant bullet even before the commit
+        // tick moves it into scrollback. The mutable live tail should
+        // already render as a continuation so AM-04 never shows two
+        // bullets for one assistant response.
+        let mut c = StreamController::default();
+        c.push_delta("alpha\nbeta");
+
+        assert!(
+            !c.tail_starts_stream(),
+            "queued stable content will own the stream header"
+        );
+        let tail = lines_text(&c.current_tail_lines(40));
+        assert!(
+            tail.contains("beta"),
+            "partial tail remains visible; got:\n{tail}"
+        );
+
+        let first = c
+            .commit_tick_chunk(40)
+            .0
+            .expect("queued header chunk should emit");
+        assert!(first.is_first_line());
+        assert!(!c.tail_starts_stream());
+    }
+
+    #[test]
+    fn tail_starts_stream_flips_after_first_chunk() {
+        // ChatWidget reads this hint to decide whether the next
+        // StreamingAgentTailCell should carry the assistant bullet. Once
+        // the controller has emitted any chunk (or finalize cell), the
+        // tail is a continuation of the message and must keep the body
+        // indent.
+        let mut c = StreamController::default();
+        c.push_delta("alpha");
+        assert!(
+            c.tail_starts_stream(),
+            "no chunk emitted yet — next tail starts the stream"
+        );
+
+        c.push_delta("\n");
+        let _ = c.commit_tick_chunk(40);
+        assert!(
+            !c.tail_starts_stream(),
+            "first chunk consumed the stream header"
+        );
+    }
+
+    #[test]
+    fn current_tail_lines_exposes_only_mutable_tail() {
+        // Push a stable line plus content that the holdback rule keeps in
+        // the live tail (an unterminated fence). `current_tail_lines`
+        // must render the tail at the requested width and skip the
+        // already-stable prose so the StreamingAgentTailCell never
+        // double-paints scrollback content.
+        let mut c = StreamController::default();
+        c.push_delta("intro line\n");
+        c.push_delta("```rust\nfn main() {\n");
+
+        let tail = lines_text(&c.current_tail_lines(60));
+        assert!(
+            tail.contains("```rust") && tail.contains("fn main"),
+            "live tail must include the unterminated fence body; got:\n{tail}"
+        );
+        assert!(
+            !tail.contains("intro line"),
+            "stable content must not leak into the tail; got:\n{tail}"
+        );
+    }
+
+    #[test]
+    fn commit_tick_chunk_marks_first_chunk_and_continuations_separately() {
+        // The first emitted chunk in a stream carries the assistant
+        // bullet; later chunks must keep the body indent so the rendered
+        // transcript reads as one continuous assistant message. The
+        // controller owns this state — callers should never have to
+        // track "is this the first chunk?" themselves.
+        let mut c = StreamController::default();
+        c.push_delta("alpha\n");
+        c.push_delta("beta\n");
+
+        let first = c
+            .commit_tick_chunk(40)
+            .0
+            .expect("first smooth tick should emit a chunk");
+        assert!(first.is_first_line(), "first chunk must mark is_first_line");
+
+        let second = c
+            .commit_tick_chunk(40)
+            .0
+            .expect("second smooth tick should emit a chunk");
+        assert!(
+            !second.is_first_line(),
+            "subsequent chunk must not re-mark is_first_line"
+        );
+    }
+
+    #[test]
+    fn commit_tick_chunk_emits_newly_stable_line_only() {
+        // Two source lines stable → one queued tick unit per line. A
+        // single smooth-mode commit tick must dequeue only the first line
+        // and emit it as an AgentMessageCell; the second line stays
+        // queued. This is the contract the AM-04 ChatWidget wiring relies
+        // on: each tick produces one stable chunk for scrollback.
+        let mut c = StreamController::default();
+        c.push_delta("alpha\n");
+        c.push_delta("beta\n");
+
+        let (cell, idle) = c.commit_tick_chunk(40);
+        let cell = cell.expect("smooth tick should emit one chunk");
+        assert!(!idle, "second source line is still queued");
+        let rendered = lines_text(&cell.display_lines(40));
+        assert!(
+            rendered.contains("alpha") && !rendered.contains("beta"),
+            "smooth tick must release only the first source line; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn commit_tick_chunk_emits_snapped_tail_once() {
+        // Nav keeps partial lines visible in the live tail. When the
+        // newline arrives, `requeue_stable` snaps that already-visible
+        // tail into the stable partition without queueing a drain unit.
+        // The chunk-emission path must still produce one stable
+        // AgentMessageCell for scrollback, then remember that it has
+        // emitted the snapped line.
+        let mut c = StreamController::default();
+        c.push_delta("hello world");
+        assert!(!c.current_tail_lines(40).is_empty());
+
+        c.push_delta("\n");
+        assert_eq!(
+            c.queued_lines(),
+            0,
+            "snapped tail was already visible, so it should not be queued"
+        );
+
+        let (cell, idle) = c.commit_tick_chunk(40);
+        assert!(idle);
+        let cell = cell.expect("snapped stable tail still needs a scrollback chunk");
+        let rendered = lines_text(&cell.display_lines(40));
+        assert!(
+            rendered.contains("hello world"),
+            "snapped tail must emit as a stable chunk; got:\n{rendered}"
+        );
+
+        let (duplicate, duplicate_idle) = c.commit_tick_chunk(40);
+        assert!(duplicate_idle);
+        assert!(
+            duplicate.is_none(),
+            "snapped tail must not emit twice after the emitted counter advances"
+        );
     }
 }
