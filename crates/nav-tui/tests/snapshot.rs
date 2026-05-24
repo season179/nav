@@ -1398,7 +1398,7 @@ fn chat_widget_commit_tick_releases_stable_lines() {
     // streaming cell's chunking policy, otherwise stable lines stay hidden
     // forever and the user sees only the live tail. If a future refactor
     // drops the call from the app loop *or* breaks the delegation from
-    // ChatWidget to AssistantMessageCell, this test catches it — without
+    // ChatWidget to the streaming cell, this test catches it — without
     // ticks, "hello" stays gated; with one tick under smooth mode, it
     // becomes visible.
     let mut widget = ChatWidget::new();

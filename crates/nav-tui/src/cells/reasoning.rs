@@ -1,6 +1,6 @@
 //! Collapsible chain-of-thought block for model reasoning output.
 //!
-//! Renders distinctly from [`super::AssistantMessageCell`]: dim foreground,
+//! Renders distinctly from [`super::AssistantStreamingCell`]: dim foreground,
 //! no border, header-prefixed with a `◆` glyph. When collapsed the cell
 //! shows a one-line header (`Reasoning (N lines)`); expanded shows the
 //! full reasoning text.
@@ -116,12 +116,12 @@ mod tests {
 
     #[test]
     fn reasoning_cell_distinct_from_assistant() {
-        use super::super::messages::AssistantMessageCell;
+        use super::super::messages::AssistantStreamingCell;
 
         let text = "This is some content that could be either reasoning or a reply.";
         let mut reasoning = ReasoningCell::new(text);
         reasoning.set_expanded(true);
-        let assistant = AssistantMessageCell::new(text);
+        let assistant = AssistantStreamingCell::new(text);
 
         let reasoning_rendered = lines_text(&reasoning.display_lines(60));
         let assistant_rendered = lines_text(&assistant.display_lines(60));

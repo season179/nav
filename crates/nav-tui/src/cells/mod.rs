@@ -1,7 +1,8 @@
 //! Transcript cell widgets.
 //!
 //! Each child module owns one family of rows. This root stays as an index and
-//! re-export layer so callers can use stable names like [`AssistantMessageCell`]
+//! re-export layer so callers can use the Codex-style cell names
+//! (`AgentMessageCell`, `StreamingAgentTailCell`, `AgentMarkdownCell`)
 //! without caring which file renders that row.
 
 mod changes;
@@ -26,9 +27,11 @@ pub use changes::{FileChangeCell, GitCheckpointCell, TurnDiffCell};
 pub use compaction::{CompactionCell, CompactionPhase};
 pub use hooks::HookCell;
 pub use messages::{
-    AgentMarkdownCell, AgentMessageCell, AssistantMessageCell, AssistantStreamingCell,
+    AgentMarkdownCell, AgentMessageCell, AssistantStreamingCell,
     SkillInvocationCell, StreamingAgentTailCell, UserMessageCell,
 };
+#[allow(deprecated)]
+pub use messages::AssistantMessageCell;
 pub use pending::{PendingInputCell, TurnAbortedCell};
 pub use reasoning::ReasoningCell;
 pub(crate) use separators::FinalMessageSeparator;

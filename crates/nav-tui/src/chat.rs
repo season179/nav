@@ -25,6 +25,19 @@ use crate::theme::Theme;
 /// The transcript above the viewport is owned by the terminal itself; nav
 /// doesn't keep a transcript ledger here. Reflow on resize is handled
 /// outside the widget (see Phase 3 of the migration plan).
+///
+/// ## Assistant message lifecycle (in progress)
+///
+/// Today the whole live assistant reply lives in one `AssistantStreamingCell`
+/// held in `streaming_assistant`. The target Codex-style lifecycle splits this
+/// into three cell types:
+/// - `AgentMessageCell` — stable chunk emitted to scrollback during streaming
+/// - `StreamingAgentTailCell` — mutable tail kept in the viewport
+/// - `AgentMarkdownCell` — finalized source-backed cell after consolidation
+///
+/// The migration is tracked in AM-03 through AM-07. Once complete,
+/// `AssistantStreamingCell` and the `AssistantMessageCell` alias will be
+/// removed.
 pub struct ChatWidget {
     /// All cells ever finalized in this session.
     /// `finalized[pending_start..]` is the slice that hasn't been pushed
@@ -38,9 +51,12 @@ pub struct ChatWidget {
     tool_calls: HashMap<String, ToolCallContext>,
     subagent_labels: HashMap<String, String>,
     turn_has_work: bool,
-    /// In-flight streaming assistant cell. Rendered inside the viewport so
-    /// deltas appear immediately; when the message finalizes it joins
-    /// `finalized` and gets pushed to scrollback like everything else.
+    /// In-flight streaming assistant cell (pre-Codex-split). Rendered inside
+    /// the viewport so deltas appear immediately; when the message finalizes it
+    /// joins `finalized` as an `AgentMarkdownCell` and gets pushed to scrollback.
+    ///
+    /// Will be replaced by the Codex-style split (`AgentMessageCell` stable
+    /// chunks + `StreamingAgentTailCell` mutable tail) when AM-03/AM-04 land.
     streaming_assistant: Option<AssistantStreamingCell>,
     /// In-flight `Exploring`/`Running` placeholder rows, in arrival order
     /// keyed by `call_id`. Rendered inline (below the streaming cell) so the

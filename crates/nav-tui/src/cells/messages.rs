@@ -221,12 +221,19 @@ fn stream_prefix_span(prefix: &'static str) -> Span<'static> {
     }
 }
 
-/// Legacy whole-stream assistant cell.
+/// Whole-stream assistant cell (pre-Codex-split).
 ///
-/// AM-02 introduces Codex-style `AgentMessageCell` and
-/// `StreamingAgentTailCell`, but the widget/controller rewiring lives in the
-/// follow-up AM-03/AM-04 issues. Keep this type temporarily so current runtime
-/// behavior stays unchanged until stable chunks are emitted by the controller.
+/// Owns one `StreamController` and renders the *entire* live assistant reply
+/// in the inline viewport — stable text and mutable tail together. This is
+/// the cell type `ChatWidget` uses today while AM-03/AM-04 (controller
+/// rewiring) haven't landed yet.
+///
+/// **Do not use for new code.** Once the widget emits stable chunks via
+/// [`AgentMessageCell`] and keeps only the mutable tail as
+/// [`StreamingAgentTailCell`], this type will be removed. The transitional
+/// alias [`AssistantMessageCell`] is also deprecated in favor of the
+/// Codex-style trio (`AgentMessageCell`, `StreamingAgentTailCell`,
+/// `AgentMarkdownCell`).
 pub struct AssistantStreamingCell {
     controller: StreamController,
 }
@@ -314,10 +321,19 @@ impl HistoryCell for AssistantStreamingCell {
     }
 }
 
-/// Backwards-compatible name for old streaming-only callers. New stable
-/// streaming chunks should use [`AgentMessageCell`], mutable live tails should
-/// use [`StreamingAgentTailCell`], and finalized assistant rows should use
-/// [`AgentMarkdownCell`].
+/// **Deprecated.** Transitional alias kept so existing call sites compile
+/// while AM-03/AM-04 (controller rewiring) land.
+///
+/// This alias is *not* the Codex-style stable streaming chunk — that is
+/// [`AgentMessageCell`]. It aliases [`AssistantStreamingCell`], the
+/// pre-split whole-live-reply cell. Prefer the Codex-style trio:
+/// - [`AgentMessageCell`] — stable chunk emitted during streaming
+/// - [`StreamingAgentTailCell`] — mutable active tail in the viewport
+/// - [`AgentMarkdownCell`] — finalized source-backed cell
+#[deprecated(
+    since = "26.5.11",
+    note = "use AgentMessageCell (stable chunk), StreamingAgentTailCell (live tail), or AgentMarkdownCell (finalized)"
+)]
 pub type AssistantMessageCell = AssistantStreamingCell;
 
 const SKILL_CHIP_GLYPH: &str = "$";
@@ -480,7 +496,7 @@ mod tests {
 
     #[test]
     fn streaming_assistant_keeps_table_tail_under_same_bullet_shape() {
-        let mut cell = AssistantMessageCell::streaming();
+        let mut cell = AssistantStreamingCell::streaming();
         cell.push_delta("Quick summary:\n");
         cell.push_delta("| a | b |\n");
         cell.push_delta("|---|---|\n");
@@ -506,7 +522,7 @@ mod tests {
         // the live tail (still-growing source lines past the partition)
         // renders. The stable "Quick summary:" line is queued but not
         // yet released — a smooth-mode tick would let it through.
-        let mut cell = AssistantMessageCell::streaming();
+        let mut cell = AssistantStreamingCell::streaming();
         cell.push_delta("Quick summary:\n");
         cell.push_delta("| a | b |\n");
         cell.push_delta("|---|---|\n");
@@ -530,7 +546,7 @@ mod tests {
         // proving the chunking layer is actually wired through to the
         // visibility gate. Without catch-up, smooth mode would only
         // release a single line per tick.
-        let mut cell = AssistantMessageCell::streaming();
+        let mut cell = AssistantStreamingCell::streaming();
         for i in 0..10 {
             cell.push_delta(&format!("line {i}\n"));
         }
@@ -551,7 +567,7 @@ mod tests {
 
     #[test]
     fn streaming_finalize_with_replaces_coalesced_message() {
-        let mut streaming_cell = AssistantMessageCell::streaming();
+        let mut streaming_cell = AssistantStreamingCell::streaming();
         streaming_cell.push_delta("partial ");
         streaming_cell.push_delta("chunk\n");
         let finalized = streaming_cell.into_finalized_with("Finalized assistant reply text");
@@ -605,7 +621,7 @@ mod tests {
 
         for (text, finalize) in cases {
             for width in [12u16, 24, 40, 80, 120] {
-                let mut cell = AssistantMessageCell::streaming();
+                let mut cell = AssistantStreamingCell::streaming();
                 cell.push_delta(text);
                 if *finalize {
                     cell.finalize();

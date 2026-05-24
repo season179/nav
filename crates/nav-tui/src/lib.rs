@@ -37,9 +37,11 @@ mod chat;
 
 pub use app::run;
 pub use cells::{
-    AgentMarkdownCell, AgentMessageCell, AssistantMessageCell, AssistantStreamingCell, ErrorCell,
+    AgentMarkdownCell, AgentMessageCell, AssistantStreamingCell, ErrorCell,
     SkillInvocationCell, StreamingAgentTailCell, ToolCallCell, ToolOutputCell, UserMessageCell,
 };
+#[allow(deprecated)]
+pub use cells::AssistantMessageCell;
 pub use history::HistoryCell;
 pub use commands::{SlashAction, classify_slash, prepend_pending_skill};
 pub use chat::ChatWidget;
