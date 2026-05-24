@@ -399,3 +399,81 @@ ratatui's `Terminal` with key modifications:
 | Notifications | `notifications/*.rs` |
 | Transcript reflow | `transcript_reflow.rs`, `resize_reflow_cap.rs` |
 | Terminal title | `terminal_title.rs` |
+
+## Agent message streaming internals
+
+Deep dive into the four source modules that power assistant message
+streaming — the cell types, the controller, the chatwidget glue, and the
+consolidation pass. This is reference material for the nav AgentMessageCell
+migration (issues AM-00 through AM-08).
+
+### Cell types (`history_cell/messages.rs`)
+
+Three structs handle the lifecycle of an assistant message:
+
+| Struct | Role | Key detail |
+|---|---|---|
+| `AgentMessageCell` | Ephemeral line batch emitted during streaming | Wraps pre-rendered `Line` vectors; `is_first_line` flag controls bullet prefix (`"• "` vs `"  "`) |
+| `StreamingAgentTailCell` | Transient mutable tail in the active-cell slot | Does NOT re-wrap on display — lines are already rendered at the controller's stream width. Replaced on every delta, cleared on finalize |
+| `AgentMarkdownCell` | Finalized source-backed cell | Stores raw markdown + `cwd`; re-renders from source on every `display_lines(width)` call so resize produces correct table borders. Created during consolidation |
+
+### Stream controller (`streaming/controller.rs`)
+
+`StreamController` wraps a shared `StreamCore` that partitions rendered
+markdown into two regions:
+
+- **Stable region** — committed to scrollback via an animation FIFO queue.
+- **Tail region** — mutable, displayed in the active-cell slot as a
+  `StreamingAgentTailCell`.
+
+**Table holdback.** When pipe-table patterns (header + delimiter pair) are
+detected in the accumulated source, the controller keeps the table region as
+mutable tail until the stream finalizes — because adding a row can reshape all
+columnn widths. Pre-table prose still flows to stable normally.
+
+**Key methods:**
+
+| Method | What it does |
+|---|---|
+| `push(delta)` | Accumulates source, re-renders, enqueues newly-stable lines |
+| `finalize()` | Drains the collector, re-renders from full source, returns remaining lines + raw source for consolidation |
+| `emit(lines)` | Wraps lines into `AgentMessageCell` with correct first-line tracking |
+| `set_width(w)` | Re-renders at new width, rebuilds stable queue from current emitted count |
+| `current_tail_lines()` | Returns the mutable tail slice (from `enqueued_stable_len` onward) |
+| `tick()` / `tick_batch(n)` | Dequeue 1 or N lines from the animation queue, advance emitted count |
+
+**Invariants:**
+- `emitted_stable_len ≤ enqueued_stable_len ≤ rendered_lines.len()`
+- `raw_source` is append-only until `reset()`
+- Tail starts exactly at `enqueued_stable_len`
+
+### ChatWidget glue (`chatwidget/streaming.rs`)
+
+`ChatWidget` owns the controller lifecycle and connects it to the cell system:
+
+| Function | Role |
+|---|---|
+| `handle_streaming_delta(delta)` | Creates `StreamController` on first delta; pushes subsequent deltas; triggers catch-up commit ticks; calls `sync_active_stream_tail` |
+| `sync_active_stream_tail()` | Reads controller's current tail lines and installs a `StreamingAgentTailCell` as the active cell; clears it when tail is empty |
+| `flush_answer_stream_with_separator()` | Called when the answer stream ends. Finalizes the controller, emits any deferred cells, sends `ConsolidateAgentMessage` event to replace the streaming cell run with a single `AgentMarkdownCell` |
+| `run_commit_tick_with_scope(scope)` | Periodic tick that drains queued lines into `AgentMessageCell`s and pushes them to scrollback; hides status row while streaming, restores it after |
+
+Interrupt deferral: if a `StreamController` is active (or an interrupt queue
+is non-empty), new interrupts are deferred into a FIFO queue rather than
+handled immediately. This preserves deterministic ordering.
+
+### Consolidation pass (`app/agent_message_consolidation.rs`)
+
+Triggered by the `ConsolidateAgentMessage` app event after stream finalization:
+
+1. Walks backward through `transcript_cells` to find the contiguous trailing
+   run of `AgentMessageCell`s from the just-finalized stream.
+2. Replaces that run with a single `AgentMarkdownCell` (source-backed,
+   resize-safe).
+3. Updates the transcript overlay.
+4. Triggers scrollback reflow if the stream had a live tail.
+5. If a deferred history cell was provided by the finalize path (for queue
+   ordering), it is inserted first before consolidation runs.
+
+This is the mechanism that makes the transcript the canonical owner of raw
+markdown source for future resize re-renders.
