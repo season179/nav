@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nav-types = { path = "../nav-types" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -16,9 +16,10 @@ pub use openai_completions::{
     ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessageRole,
     ChatCompletionRequestMessage, ChatCompletionRequestPlan, ChatCompletionResponse,
     ChatCompletionStreamChoice, ChatCompletionStreamChunk, ChatCompletionStreamEvent,
-    ChatCompletionUsage, OpenAiCompletionsClient, OpenAiCompletionsError,
-    OpenAiCompletionsProviderError, OpenAiCompletionsRequest, OpenAiCompletionsResponseParser,
-    ReasoningEffort,
+    ChatCompletionToolCallDelta, ChatCompletionToolCallFunctionDelta, ChatCompletionUsage,
+    OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsProviderError,
+    OpenAiCompletionsRequest, OpenAiCompletionsResponseParser,
+    OpenAiCompletionsStreamProviderError, ReasoningEffort,
 };
 pub use provider::{ApiKeyConfig, ProviderConfig};
 pub use resolver::{ModelResolver, ResolveModelError, ResolvedApiKey, ResolvedModelConfig};
