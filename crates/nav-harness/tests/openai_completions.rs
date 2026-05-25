@@ -338,6 +338,10 @@ fn parses_openai_compatible_sse_stream_events() {
                 delta: nav_harness::models::ChatCompletionDelta {
                     role: None,
                     content: Some("hel".to_string()),
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_text: None,
+                    tool_calls: Vec::new(),
                 },
                 finish_reason: None,
             }],

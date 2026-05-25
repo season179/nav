@@ -139,6 +139,47 @@ pub struct ChatCompletionDelta {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    #[serde(default)]
+    pub reasoning_text: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ChatCompletionToolCallDelta>,
+}
+
+impl ChatCompletionDelta {
+    pub fn reasoning_delta(&self) -> Option<&str> {
+        [
+            self.reasoning_content.as_deref(),
+            self.reasoning.as_deref(),
+            self.reasoning_text.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|delta| !delta.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ChatCompletionToolCallDelta {
+    #[serde(default)]
+    pub index: Option<u32>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, rename = "type")]
+    pub tool_type: Option<String>,
+    #[serde(default)]
+    pub function: Option<ChatCompletionToolCallFunctionDelta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ChatCompletionToolCallFunctionDelta {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -154,6 +195,13 @@ pub struct ChatCompletionUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiCompletionsProviderError {
     pub status: u16,
+    pub message: String,
+    pub error_type: Option<String>,
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAiCompletionsStreamProviderError {
     pub message: String,
     pub error_type: Option<String>,
     pub code: Option<String>,
@@ -181,6 +229,7 @@ pub enum OpenAiCompletionsError {
         body: String,
     },
     Provider(OpenAiCompletionsProviderError),
+    ProviderStream(OpenAiCompletionsStreamProviderError),
     ModelResolution {
         error: ResolveModelError,
     },
@@ -227,6 +276,13 @@ impl fmt::Display for OpenAiCompletionsError {
                 "provider returned HTTP {}: {}",
                 error.status, error.message
             ),
+            Self::ProviderStream(error) => {
+                write!(
+                    formatter,
+                    "provider stream returned error: {}",
+                    error.message
+                )
+            }
             Self::ModelResolution { error } => {
                 write!(formatter, "failed to resolve model config: {error:?}")
             }
@@ -618,6 +674,13 @@ fn parse_stream_event(
         return Ok(Some(ChatCompletionStreamEvent::Done));
     }
 
+    let redacted_data = redact_secret(&data, api_key);
+    if let Ok(value) = serde_json::from_str::<Value>(&redacted_data)
+        && let Some(error) = provider_stream_error_from_value(&value)
+    {
+        return Err(OpenAiCompletionsError::ProviderStream(error));
+    }
+
     OpenAiCompletionsResponseParser::parse_stream_chunk(&data, api_key)
         .map(ChatCompletionStreamEvent::Chunk)
         .map(Some)
@@ -647,14 +710,30 @@ fn stream_event_data(event: &str) -> Option<String> {
 }
 
 fn provider_error_from_value(status: u16, value: &Value) -> Option<OpenAiCompletionsProviderError> {
+    let (message, error_type, code) = provider_error_fields_from_value(value)?;
+    Some(OpenAiCompletionsProviderError {
+        status,
+        message,
+        error_type,
+        code,
+    })
+}
+
+fn provider_stream_error_from_value(value: &Value) -> Option<OpenAiCompletionsStreamProviderError> {
+    let (message, error_type, code) = provider_error_fields_from_value(value)?;
+    Some(OpenAiCompletionsStreamProviderError {
+        message,
+        error_type,
+        code,
+    })
+}
+
+fn provider_error_fields_from_value(
+    value: &Value,
+) -> Option<(String, Option<String>, Option<String>)> {
     let error = value.get("error")?;
     match error {
-        Value::String(message) if !message.is_empty() => Some(OpenAiCompletionsProviderError {
-            status,
-            message: message.clone(),
-            error_type: None,
-            code: None,
-        }),
+        Value::String(message) if !message.is_empty() => Some((message.clone(), None, None)),
         Value::Object(error) => {
             let message = error
                 .get("message")
@@ -665,15 +744,14 @@ fn provider_error_from_value(status: u16, value: &Value) -> Option<OpenAiComplet
                 return None;
             }
 
-            Some(OpenAiCompletionsProviderError {
-                status,
+            Some((
                 message,
-                error_type: error
+                error
                     .get("type")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
-                code: error.get("code").and_then(value_to_error_code),
-            })
+                error.get("code").and_then(value_to_error_code),
+            ))
         }
         _ => None,
     }
