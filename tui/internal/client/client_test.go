@@ -21,6 +21,7 @@ func TestClientSendMessageUsesJSONRPCAndParsesAssistantDeltas(t *testing.T) {
 	)
 
 	var rpcMethods []string
+	var createSource string
 	var sendMessageText string
 	var sawLastEventID string
 
@@ -35,6 +36,8 @@ func TestClientSendMessageUsesJSONRPCAndParsesAssistantDeltas(t *testing.T) {
 
 			switch request.Method {
 			case "session.create":
+				params := request.Params.(map[string]any)
+				createSource = params["source"].(string)
 				return jsonResponse(t, map[string]any{
 					"jsonrpc": "2.0",
 					"id":      request.ID,
@@ -100,6 +103,9 @@ func TestClientSendMessageUsesJSONRPCAndParsesAssistantDeltas(t *testing.T) {
 	client.httpClient = &http.Client{Transport: transport}
 	if _, err := client.Connect(context.Background()); err != nil {
 		t.Fatalf("connect client: %v", err)
+	}
+	if createSource != "tui" {
+		t.Fatalf("session.create source = %q, want tui", createSource)
 	}
 
 	events, err := client.SendMessage(context.Background(), "hello backend")
