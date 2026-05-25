@@ -47,15 +47,25 @@ navd
 `navd update` builds `target/debug/nav-backend`, `target/debug/nav`, and
 `target/debug/navd`, then installs only the launcher to `~/.local/bin/navd`.
 
-Current prototype note: until the HTTP/SSE backend lands, the TUI still starts
-the backend over stdio and only performs a hello check. By default it finds the
-Rust workspace and runs:
+The TUI starts the backend in the minimal local HTTP/SSE mode. By default it
+finds the Rust workspace and runs:
 
 ```sh
-cargo run --quiet --manifest-path Cargo.toml -p nav-backend -- serve
+cargo run --quiet --manifest-path Cargo.toml -p nav-backend -- serve-http
 ```
 
 Set `NAV_BACKEND=/path/to/nav-backend` to point the TUI at a prebuilt backend.
+
+Manual OR-06 check:
+
+```sh
+make navd-update
+navd
+```
+
+Type one prompt and press Enter. The TUI should connect to the local backend,
+send the prompt through `session.sendMessage`, and render typed SSE events as
+assistant output or a visible backend/model error.
 
 ## License
 
