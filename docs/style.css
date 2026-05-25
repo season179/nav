@@ -10,15 +10,12 @@
   --bg: #0f1a17;
   --surface: #152019;
   --surface-raised: #1a2a23;
-  --surface-hover: #213530;
   --text: #c8d6ce;
   --text-dim: #8fa898;
   --text-bright: #e8f0ea;
   --accent: #34d399;
-  --accent-deep: #059669;
   --accent-soft: rgba(52, 211, 153, 0.12);
   --accent-glow: rgba(52, 211, 153, 0.05);
-  --accent-dim: rgba(52, 211, 153, 0.06);
   --gold: #f0c060;
   --gold-dim: rgba(240, 192, 96, 0.08);
   --border: #1e3028;
@@ -261,7 +258,7 @@ pre code {
 
 .cards-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
   gap: var(--grid-gap);
 }
 
