@@ -12,3 +12,4 @@ path = "src/main.rs"
 anyhow.workspace = true
 nav-harness = { path = "../nav-harness" }
 nav-server = { path = "../nav-server" }
+serde_json.workspace = true

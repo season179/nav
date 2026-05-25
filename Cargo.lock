@@ -419,6 +419,7 @@ dependencies = [
  "anyhow",
  "nav-harness",
  "nav-server",
+ "serde_json",
 ]
 
 [[package]]

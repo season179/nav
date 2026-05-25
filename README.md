@@ -56,6 +56,19 @@ cargo run --quiet --manifest-path Cargo.toml -p nav-backend -- serve-http
 
 Set `NAV_BACKEND=/path/to/nav-backend` to point the TUI at a prebuilt backend.
 
+### Model configuration
+
+`nav-backend serve-http` reads model settings before handling TUI prompts:
+
+- By default, nav reads `~/.nav/settings.json`.
+- `NAV_MODEL_SETTINGS=/path/to/settings.json` points nav at a different nav
+  settings file.
+- `NAV_MODEL_PROVIDER=<provider>` and `NAV_MODEL=<model>` override the default
+  model selection.
+
+The config shape follows Pi's `models.json`; see
+`crates/nav-harness/examples/model-settings-*.json`.
+
 Manual OR-06 check:
 
 ```sh
