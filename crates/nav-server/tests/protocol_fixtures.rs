@@ -54,9 +54,8 @@ fn json_rpc_fixtures_are_valid_protocol_envelopes() {
 
         assert_eq!(value["jsonrpc"].as_str(), Some("2.0"), "{fixture}");
         assert_uuid_v7(response.id.as_str());
-        assert_ne!(
-            response.result.is_some(),
-            response.error.is_some(),
+        assert!(
+            response.result.is_some() ^ response.error.is_some(),
             "{fixture} should contain exactly one of result or error"
         );
     }
