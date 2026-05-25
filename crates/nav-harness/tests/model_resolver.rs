@@ -1,32 +1,33 @@
 use std::collections::BTreeMap;
 
 use nav_harness::models::{
-    ApiKeyConfig, ApiKind, MaxTokensField, ModelCapabilities, ModelConfig, ModelResolver,
+    ApiKeyConfig, ApiKind, MaxTokensField, ModelConfig, ModelInput, ModelRef, ModelResolver,
     ModelSettings, ProviderCompat, ProviderConfig, ProviderRoutingCompat, ResolveModelError,
     ThinkingFormat,
 };
 
 #[test]
 fn resolves_configured_default_model_without_http() {
-    let settings = openrouter_settings(ApiKeyConfig::Inline("sk-test".to_string()));
+    let settings = compatible_settings(ApiKeyConfig::Inline {
+        inline: "sk-test".to_string(),
+    });
 
     let resolved = ModelResolver::new(settings)
         .resolve_default()
         .expect("default model should resolve");
 
-    assert_eq!(resolved.provider_id, "openrouter");
-    assert_eq!(resolved.model.id, "daily-driver");
-    assert_eq!(resolved.model.model_id, "openai/gpt-4.1");
-    assert_eq!(resolved.provider.api_kind, ApiKind::OpenAiChatCompletions);
-    assert_eq!(resolved.provider.base_url, "https://openrouter.ai/api/v1");
+    assert_eq!(resolved.provider_id, "compatible-gateway");
+    assert_eq!(resolved.model.id, "vendor/model-large");
+    assert_eq!(resolved.api, ApiKind::OpenAiCompletions);
+    assert_eq!(resolved.base_url, "https://llm.example.com/v1");
     assert_eq!(resolved.api_key.expose_secret(), "sk-test");
 }
 
 #[test]
-fn resolves_api_key_from_configured_env_var() {
-    let env_var = "OPENROUTER_API_KEY";
+fn resolves_api_key_from_pi_style_env_var_string() {
+    let env_var = "NAV_COMPATIBLE_API_KEY";
 
-    let resolved = ModelResolver::new(openrouter_settings(ApiKeyConfig::EnvVar(
+    let resolved = ModelResolver::new(compatible_settings(ApiKeyConfig::Value(
         env_var.to_string(),
     )))
     .resolve_default_with_env(|name| (name == env_var).then(|| "sk-env".to_string()))
@@ -36,19 +37,45 @@ fn resolves_api_key_from_configured_env_var() {
 }
 
 #[test]
-fn reports_missing_configured_env_var_api_key() {
-    let env_var = "OPENROUTER_API_KEY";
+fn falls_back_to_literal_for_pi_style_api_key_string() {
+    let env_var = "NAV_COMPATIBLE_API_KEY";
 
-    let error = ModelResolver::new(openrouter_settings(ApiKeyConfig::EnvVar(
+    let resolved = ModelResolver::new(compatible_settings(ApiKeyConfig::Value(
         env_var.to_string(),
     )))
     .resolve_default_with_env(|_| None)
-    .expect_err("missing env-var API key should fail");
+    .expect("Pi-style string API key should fall back to the literal value");
+
+    assert_eq!(resolved.api_key.expose_secret(), env_var);
+}
+
+#[test]
+fn falls_back_to_literal_for_empty_pi_style_env_var() {
+    let env_var = "NAV_COMPATIBLE_API_KEY";
+
+    let resolved = ModelResolver::new(compatible_settings(ApiKeyConfig::Value(
+        env_var.to_string(),
+    )))
+    .resolve_default_with_env(|name| (name == env_var).then(String::new))
+    .expect("empty env values should fall back to Pi-style literal value");
+
+    assert_eq!(resolved.api_key.expose_secret(), env_var);
+}
+
+#[test]
+fn reports_missing_api_key_for_explicit_env_var_config() {
+    let env_var = "NAV_COMPATIBLE_API_KEY";
+
+    let error = ModelResolver::new(compatible_settings(ApiKeyConfig::EnvVar {
+        env_var: env_var.to_string(),
+    }))
+    .resolve_default_with_env(|_| None)
+    .expect_err("missing explicit env-var API key should fail");
 
     assert_eq!(
         error,
         ResolveModelError::MissingApiKey {
-            provider_id: "openrouter".to_string(),
+            provider_id: "compatible-gateway".to_string(),
             env_var: Some(env_var.to_string()),
         }
     );
@@ -56,25 +83,38 @@ fn reports_missing_configured_env_var_api_key() {
 }
 
 #[test]
+fn resolves_explicit_inline_api_key() {
+    let resolved = ModelResolver::new(compatible_settings(ApiKeyConfig::Inline {
+        inline: "sk-inline".to_string(),
+    }))
+    .resolve_default()
+    .expect("inline API key should resolve");
+
+    assert_eq!(resolved.api_key.expose_secret(), "sk-inline");
+}
+
+#[test]
 fn reports_empty_inline_api_key_as_missing() {
-    let error = ModelResolver::new(openrouter_settings(ApiKeyConfig::Inline(String::new())))
-        .resolve_default()
-        .expect_err("empty inline API key should fail");
+    let error = ModelResolver::new(compatible_settings(ApiKeyConfig::Inline {
+        inline: String::new(),
+    }))
+    .resolve_default()
+    .expect_err("empty inline API key should fail");
 
     assert_eq!(
         error,
         ResolveModelError::MissingApiKey {
-            provider_id: "openrouter".to_string(),
+            provider_id: "compatible-gateway".to_string(),
             env_var: None,
         }
     );
 }
 
 #[test]
-fn redacts_inline_api_key_from_debug_output() {
-    let resolved = ModelResolver::new(openrouter_settings(ApiKeyConfig::Inline(
-        "sk-inline-secret".to_string(),
-    )))
+fn redacts_api_keys_from_debug_output() {
+    let resolved = ModelResolver::new(compatible_settings(ApiKeyConfig::Inline {
+        inline: "sk-inline-secret".to_string(),
+    }))
     .resolve_default()
     .expect("inline API key should resolve");
 
@@ -85,95 +125,122 @@ fn redacts_inline_api_key_from_debug_output() {
 }
 
 #[test]
-fn preserves_configured_openrouter_base_url_override() {
-    let mut settings = openrouter_settings(ApiKeyConfig::Inline("sk-proxy".to_string()));
+fn preserves_configured_provider_base_url_override() {
+    let mut settings = compatible_settings(ApiKeyConfig::Inline {
+        inline: "sk-proxy".to_string(),
+    });
     settings
         .providers
-        .get_mut("openrouter")
+        .get_mut("compatible-gateway")
         .expect("fixture provider exists")
-        .base_url = "http://localhost:8787/openrouter/v1".to_string();
+        .base_url = "http://localhost:8787/v1".to_string();
 
     let resolved = ModelResolver::new(settings)
         .resolve_default()
-        .expect("OpenRouter provider with overridden base URL should resolve");
+        .expect("provider with overridden base URL should resolve");
 
-    assert_eq!(
-        resolved.provider.base_url,
-        "http://localhost:8787/openrouter/v1"
-    );
+    assert_eq!(resolved.base_url, "http://localhost:8787/v1");
 }
 
 #[test]
-fn resolves_custom_compatible_endpoint_with_generic_compat() {
-    let compat = ProviderCompat {
-        thinking_format: Some(ThinkingFormat::Zai),
-        supports_usage_in_streaming: Some(false),
-        max_tokens_field: Some(MaxTokensField::MaxTokens),
-        routing: Some(ProviderRoutingCompat {
-            only: Some(vec!["local-zai".to_string()]),
-            order: Some(vec!["local-zai".to_string(), "backup-zai".to_string()]),
-            ..Default::default()
-        }),
-    };
+fn resolves_provider_and_model_pair_without_global_model_aliases() {
     let settings = ModelSettings {
-        default_model: Some("glm".to_string()),
-        providers: BTreeMap::from([(
-            "zai".to_string(),
-            ProviderConfig {
-                display_name: "Z.ai".to_string(),
-                api_kind: ApiKind::OpenAiChatCompletions,
-                base_url: "http://localhost:8787/proxy/zai/v1".to_string(),
-                api_key: ApiKeyConfig::Inline("zai-local-secret".to_string()),
-                models: vec![ModelConfig {
-                    id: "glm".to_string(),
-                    model_id: "glm-4.5".to_string(),
-                    capabilities: ModelCapabilities {
-                        supports_tools: true,
-                        supports_reasoning: true,
-                        supports_images: true,
+        default_model: Some(ModelRef {
+            provider: "primary".to_string(),
+            model: "assistant".to_string(),
+        }),
+        providers: BTreeMap::from([
+            (
+                "primary".to_string(),
+                ProviderConfig {
+                    name: Some("Primary".to_string()),
+                    api: ApiKind::OpenAiCompletions,
+                    base_url: "https://primary.example.com/v1".to_string(),
+                    api_key: ApiKeyConfig::Inline {
+                        inline: "sk-primary".to_string(),
                     },
-                    compat: compat.clone(),
+                    models: vec![minimal_model("assistant")],
+                    compat: Default::default(),
+                },
+            ),
+            (
+                "backup".to_string(),
+                ProviderConfig {
+                    name: Some("Backup".to_string()),
+                    api: ApiKind::OpenAiCompletions,
+                    base_url: "https://backup.example.com/v1".to_string(),
+                    api_key: ApiKeyConfig::Inline {
+                        inline: "sk-backup".to_string(),
+                    },
+                    models: vec![minimal_model("assistant")],
+                    compat: Default::default(),
+                },
+            ),
+        ]),
+    };
+
+    let resolved = ModelResolver::new(settings)
+        .resolve("backup", "assistant")
+        .expect("provider/model pair should resolve even when model ids repeat");
+
+    assert_eq!(resolved.provider_id, "backup");
+    assert_eq!(resolved.base_url, "https://backup.example.com/v1");
+    assert_eq!(resolved.api_key.expose_secret(), "sk-backup");
+}
+
+#[test]
+fn resolves_model_level_api_and_base_url_overrides() {
+    let settings = ModelSettings {
+        default_model: Some(ModelRef {
+            provider: "gateway".to_string(),
+            model: "special-model".to_string(),
+        }),
+        providers: BTreeMap::from([(
+            "gateway".to_string(),
+            ProviderConfig {
+                name: Some("Gateway".to_string()),
+                api: ApiKind::OpenAiCompletions,
+                base_url: "https://gateway.example.com/v1".to_string(),
+                api_key: ApiKeyConfig::Inline {
+                    inline: "sk-gateway".to_string(),
+                },
+                models: vec![ModelConfig {
+                    id: "special-model".to_string(),
+                    base_url: Some("https://model-endpoint.example.com/v1".to_string()),
+                    ..minimal_model("special-model")
                 }],
-                compat: compat.clone(),
+                compat: Default::default(),
             },
         )]),
     };
 
     let resolved = ModelResolver::new(settings)
         .resolve_default()
-        .expect("custom compatible endpoint should resolve");
+        .expect("model-level overrides should resolve");
 
-    assert_eq!(resolved.provider_id, "zai");
-    assert_eq!(
-        resolved.provider.base_url,
-        "http://localhost:8787/proxy/zai/v1"
-    );
-    assert_eq!(
-        resolved.provider.compat.thinking_format,
-        Some(ThinkingFormat::Zai)
-    );
-    assert_eq!(
-        resolved.provider.compat.supports_usage_in_streaming,
-        Some(false)
-    );
-    assert_eq!(
-        resolved.compat.max_tokens_field,
-        Some(MaxTokensField::MaxTokens)
-    );
+    assert_eq!(resolved.api, ApiKind::OpenAiCompletions);
+    assert_eq!(resolved.base_url, "https://model-endpoint.example.com/v1");
 }
 
 #[test]
 fn merges_provider_compat_defaults_with_model_overrides() {
     let settings = ModelSettings {
-        default_model: Some("daily-driver".to_string()),
+        default_model: Some(ModelRef {
+            provider: "gateway".to_string(),
+            model: "vendor/model-large".to_string(),
+        }),
         providers: BTreeMap::from([(
             "gateway".to_string(),
             ProviderConfig {
-                display_name: "Gateway".to_string(),
-                api_kind: ApiKind::OpenAiChatCompletions,
-                base_url: "http://localhost:8787/openai/v1".to_string(),
-                api_key: ApiKeyConfig::Inline("sk-gateway".to_string()),
+                name: Some("Gateway".to_string()),
+                api: ApiKind::OpenAiCompletions,
+                base_url: "http://localhost:8787/v1".to_string(),
+                api_key: ApiKeyConfig::Inline {
+                    inline: "sk-gateway".to_string(),
+                },
                 compat: ProviderCompat {
+                    supports_developer_role: Some(false),
+                    supports_reasoning_effort: Some(false),
                     supports_usage_in_streaming: Some(false),
                     max_tokens_field: Some(MaxTokensField::MaxTokens),
                     routing: Some(ProviderRoutingCompat {
@@ -184,9 +251,7 @@ fn merges_provider_compat_defaults_with_model_overrides() {
                     ..Default::default()
                 },
                 models: vec![ModelConfig {
-                    id: "daily-driver".to_string(),
-                    model_id: "gateway/model".to_string(),
-                    capabilities: Default::default(),
+                    id: "vendor/model-large".to_string(),
                     compat: ProviderCompat {
                         thinking_format: Some(ThinkingFormat::QwenChatTemplate),
                         routing: Some(ProviderRoutingCompat {
@@ -195,6 +260,7 @@ fn merges_provider_compat_defaults_with_model_overrides() {
                         }),
                         ..Default::default()
                     },
+                    ..minimal_model("vendor/model-large")
                 }],
             },
         )]),
@@ -208,6 +274,8 @@ fn merges_provider_compat_defaults_with_model_overrides() {
         resolved.compat.thinking_format,
         Some(ThinkingFormat::QwenChatTemplate)
     );
+    assert_eq!(resolved.compat.supports_developer_role, Some(false));
+    assert_eq!(resolved.compat.supports_reasoning_effort, Some(false));
     assert_eq!(
         resolved.compat.max_tokens_field,
         Some(MaxTokensField::MaxTokens)
@@ -227,32 +295,30 @@ fn merges_provider_compat_defaults_with_model_overrides() {
 fn deserializes_pi_like_model_settings_shape() {
     let settings: ModelSettings = serde_json::from_str(
         r#"{
-            "default_model": "daily-driver",
+            "defaultModel": {
+                "provider": "local-gateway",
+                "model": "local-coder:7b"
+            },
             "providers": {
-                "openrouter": {
-                    "display_name": "OpenRouter",
-                    "api_kind": "openai_chat_completions",
-                    "base_url": "https://openrouter.ai/api/v1",
-                    "api_key": { "env_var": "OPENROUTER_API_KEY" },
+                "local-gateway": {
+                    "name": "Local Gateway",
+                    "api": "openai-completions",
+                    "baseUrl": "http://localhost:11434/v1",
+                    "apiKey": "LOCAL_GATEWAY_API_KEY",
                     "compat": {
-                        "thinking_format": "openrouter",
-                        "supports_usage_in_streaming": true,
-                        "max_tokens_field": "max_completion_tokens",
-                        "routing": {
-                            "allow_fallbacks": true,
-                            "only": ["anthropic"],
-                            "order": ["anthropic", "amazon-bedrock"]
-                        }
+                        "supportsDeveloperRole": false,
+                        "supportsReasoningEffort": false,
+                        "supportsUsageInStreaming": true,
+                        "maxTokensField": "max_tokens"
                     },
                     "models": [
                         {
-                            "id": "daily-driver",
-                            "model_id": "openai/gpt-4.1",
-                            "capabilities": {
-                                "supports_tools": true,
-                                "supports_reasoning": true,
-                                "supports_images": false
-                            }
+                            "id": "local-coder:7b",
+                            "name": "Local Coder 7B",
+                            "reasoning": true,
+                            "input": ["text"],
+                            "contextWindow": 128000,
+                            "maxTokens": 32000
                         }
                     ]
                 }
@@ -263,47 +329,64 @@ fn deserializes_pi_like_model_settings_shape() {
 
     let provider = settings
         .providers
-        .get("openrouter")
+        .get("local-gateway")
         .expect("provider id should be the providers map key");
+    let model = provider.models.first().expect("model should parse");
 
-    assert_eq!(settings.default_model.as_deref(), Some("daily-driver"));
     assert_eq!(
-        provider.api_key,
-        ApiKeyConfig::EnvVar("OPENROUTER_API_KEY".to_string())
-    );
-    assert_eq!(
-        provider.compat.routing,
-        Some(ProviderRoutingCompat {
-            allow_fallbacks: Some(true),
-            only: Some(vec!["anthropic".to_string()]),
-            order: Some(vec!["anthropic".to_string(), "amazon-bedrock".to_string()]),
-            ..Default::default()
+        settings.default_model,
+        Some(ModelRef {
+            provider: "local-gateway".to_string(),
+            model: "local-coder:7b".to_string(),
         })
     );
+    assert_eq!(provider.api, ApiKind::OpenAiCompletions);
+    assert_eq!(
+        provider.api_key,
+        ApiKeyConfig::Value("LOCAL_GATEWAY_API_KEY".to_string())
+    );
+    assert_eq!(provider.compat.supports_developer_role, Some(false));
+    assert_eq!(model.context_window, Some(128000));
+    assert_eq!(model.max_tokens, Some(32000));
+    assert_eq!(model.input, vec![ModelInput::Text]);
 }
 
-fn openrouter_settings(api_key: ApiKeyConfig) -> ModelSettings {
+fn compatible_settings(api_key: ApiKeyConfig) -> ModelSettings {
     ModelSettings {
-        default_model: Some("daily-driver".to_string()),
+        default_model: Some(ModelRef {
+            provider: "compatible-gateway".to_string(),
+            model: "vendor/model-large".to_string(),
+        }),
         providers: BTreeMap::from([(
-            "openrouter".to_string(),
+            "compatible-gateway".to_string(),
             ProviderConfig {
-                display_name: "OpenRouter".to_string(),
-                api_kind: ApiKind::OpenAiChatCompletions,
-                base_url: "https://openrouter.ai/api/v1".to_string(),
+                name: Some("Compatible Gateway".to_string()),
+                api: ApiKind::OpenAiCompletions,
+                base_url: "https://llm.example.com/v1".to_string(),
                 api_key,
                 models: vec![ModelConfig {
-                    id: "daily-driver".to_string(),
-                    model_id: "openai/gpt-4.1".to_string(),
-                    capabilities: ModelCapabilities {
-                        supports_tools: true,
-                        supports_reasoning: true,
-                        supports_images: false,
-                    },
-                    compat: Default::default(),
+                    reasoning: true,
+                    input: vec![ModelInput::Text],
+                    context_window: Some(200000),
+                    max_tokens: Some(64000),
+                    ..minimal_model("vendor/model-large")
                 }],
                 compat: Default::default(),
             },
         )]),
+    }
+}
+
+fn minimal_model(id: &str) -> ModelConfig {
+    ModelConfig {
+        id: id.to_string(),
+        name: None,
+        api: None,
+        base_url: None,
+        reasoning: false,
+        input: Vec::new(),
+        context_window: None,
+        max_tokens: None,
+        compat: Default::default(),
     }
 }

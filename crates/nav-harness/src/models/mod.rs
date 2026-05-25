@@ -9,8 +9,8 @@ pub mod resolver;
 
 pub use api::ApiKind;
 pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
-pub use config::ModelSettings;
-pub use model::{ModelCapabilities, ModelConfig};
+pub use config::{ModelRef, ModelSettings};
+pub use model::{ModelConfig, ModelInput};
 pub use provider::{ApiKeyConfig, ProviderConfig};
 pub use resolver::{ModelResolver, ResolveModelError, ResolvedApiKey, ResolvedModelConfig};
 

@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ApiKind {
-    #[serde(rename = "openai_chat_completions")]
-    OpenAiChatCompletions,
+    #[serde(rename = "openai-completions", alias = "openai_chat_completions")]
+    OpenAiCompletions,
 }

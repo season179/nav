@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt;
 
-use super::{ApiKeyConfig, ModelConfig, ModelSettings, ProviderCompat, ProviderConfig};
+use super::{ApiKind, ModelConfig, ModelRef, ModelSettings, ProviderCompat, ProviderConfig};
 
 #[derive(Debug, Clone)]
 pub struct ModelResolver {
@@ -21,29 +21,54 @@ impl ModelResolver {
         &self,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<ResolvedModelConfig, ResolveModelError> {
-        let model_id = self
+        let model_ref = self
             .settings
             .default_model
-            .as_deref()
+            .as_ref()
             .ok_or(ResolveModelError::MissingDefaultModel)?;
 
-        self.resolve_with_env(model_id, env)
+        self.resolve_ref_with_env(model_ref, env)
     }
 
-    pub fn resolve(&self, id: &str) -> Result<ResolvedModelConfig, ResolveModelError> {
-        self.resolve_with_env(id, process_env)
+    pub fn resolve(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<ResolvedModelConfig, ResolveModelError> {
+        self.resolve_with_env(provider_id, model_id, process_env)
     }
 
     pub fn resolve_with_env(
         &self,
-        id: &str,
+        provider_id: &str,
+        model_id: &str,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<ResolvedModelConfig, ResolveModelError> {
-        let (provider_id, provider, model) = self.find_model(id)?;
+        let model_ref = ModelRef {
+            provider: provider_id.to_string(),
+            model: model_id.to_string(),
+        };
+
+        self.resolve_ref_with_env(&model_ref, env)
+    }
+
+    pub fn resolve_ref_with_env(
+        &self,
+        model_ref: &ModelRef,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<ResolvedModelConfig, ResolveModelError> {
+        let (provider_id, provider, model) = self.find_model(model_ref)?;
         let api_key = resolve_api_key(&provider_id, &provider, &env)?;
+        let api = model.api.unwrap_or(provider.api);
+        let base_url = model
+            .base_url
+            .clone()
+            .unwrap_or_else(|| provider.base_url.clone());
 
         Ok(ResolvedModelConfig {
             compat: provider.compat.merged_with(&model.compat),
+            api,
+            base_url,
             provider_id,
             provider,
             model,
@@ -53,33 +78,27 @@ impl ModelResolver {
 
     fn find_model(
         &self,
-        id: &str,
+        model_ref: &ModelRef,
     ) -> Result<(String, ProviderConfig, ModelConfig), ResolveModelError> {
-        let mut matches = self
+        let provider = self
             .settings
             .providers
-            .iter()
-            .filter_map(|(provider_id, provider)| {
-                provider
-                    .models
-                    .iter()
-                    .find(|model| model.id == id)
-                    .map(|model| (provider_id.clone(), provider.clone(), model.clone()))
-            });
-
-        let resolved = matches
-            .next()
-            .ok_or_else(|| ResolveModelError::UnknownModel {
-                model_id: id.to_string(),
+            .get(&model_ref.provider)
+            .ok_or_else(|| ResolveModelError::UnknownProvider {
+                provider_id: model_ref.provider.clone(),
             })?;
 
-        if matches.next().is_some() {
-            return Err(ResolveModelError::AmbiguousModel {
-                model_id: id.to_string(),
-            });
-        }
+        let model = provider
+            .models
+            .iter()
+            .find(|model| model.id == model_ref.model)
+            .cloned()
+            .ok_or_else(|| ResolveModelError::UnknownModel {
+                provider_id: model_ref.provider.clone(),
+                model_id: model_ref.model.clone(),
+            })?;
 
-        Ok(resolved)
+        Ok((model_ref.provider.clone(), provider.clone(), model))
     }
 }
 
@@ -106,6 +125,8 @@ impl fmt::Debug for ResolvedApiKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedModelConfig {
     pub compat: ProviderCompat,
+    pub api: ApiKind,
+    pub base_url: String,
     pub provider_id: String,
     pub provider: ProviderConfig,
     pub model: ModelConfig,
@@ -115,10 +136,11 @@ pub struct ResolvedModelConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveModelError {
     MissingDefaultModel,
-    UnknownModel {
-        model_id: String,
+    UnknownProvider {
+        provider_id: String,
     },
-    AmbiguousModel {
+    UnknownModel {
+        provider_id: String,
         model_id: String,
     },
     MissingApiKey {
@@ -132,21 +154,12 @@ fn resolve_api_key(
     provider: &ProviderConfig,
     env: &impl Fn(&str) -> Option<String>,
 ) -> Result<ResolvedApiKey, ResolveModelError> {
-    match &provider.api_key {
-        ApiKeyConfig::Inline(secret) if !secret.trim().is_empty() => Ok(ResolvedApiKey {
-            secret: secret.clone(),
-        }),
-        ApiKeyConfig::Inline(_) => Err(ResolveModelError::MissingApiKey {
+    match provider.api_key.resolve(env) {
+        Some(secret) if !secret.trim().is_empty() => Ok(ResolvedApiKey { secret }),
+        _ => Err(ResolveModelError::MissingApiKey {
             provider_id: provider_id.to_string(),
-            env_var: None,
+            env_var: provider.api_key.missing_env_var(),
         }),
-        ApiKeyConfig::EnvVar(name) => match env(name) {
-            Some(secret) if !secret.trim().is_empty() => Ok(ResolvedApiKey { secret }),
-            Some(_) | None => Err(ResolveModelError::MissingApiKey {
-                provider_id: provider_id.to_string(),
-                env_var: Some(name.clone()),
-            }),
-        },
     }
 }
 

@@ -1,10 +1,17 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ProviderCompat {
+    #[serde(alias = "thinking_format")]
     pub thinking_format: Option<ThinkingFormat>,
+    #[serde(alias = "supports_developer_role")]
+    pub supports_developer_role: Option<bool>,
+    #[serde(alias = "supports_reasoning_effort")]
+    pub supports_reasoning_effort: Option<bool>,
+    #[serde(alias = "supports_usage_in_streaming")]
     pub supports_usage_in_streaming: Option<bool>,
+    #[serde(alias = "max_tokens_field")]
     pub max_tokens_field: Option<MaxTokensField>,
     pub routing: Option<ProviderRoutingCompat>,
 }
@@ -13,6 +20,12 @@ impl ProviderCompat {
     pub fn merged_with(&self, override_compat: &Self) -> Self {
         Self {
             thinking_format: override_compat.thinking_format.or(self.thinking_format),
+            supports_developer_role: override_compat
+                .supports_developer_role
+                .or(self.supports_developer_role),
+            supports_reasoning_effort: override_compat
+                .supports_reasoning_effort
+                .or(self.supports_reasoning_effort),
             supports_usage_in_streaming: override_compat
                 .supports_usage_in_streaming
                 .or(self.supports_usage_in_streaming),
