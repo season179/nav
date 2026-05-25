@@ -767,7 +767,10 @@ mod tests {
         // `nav update` works without this path, so a missing manifest dir
         // must not be ship-blocking.
         assert!(matches!(row.status, DoctorStatus::Warn));
-        assert!(row.detail.contains("only relevant for rebuilding from source"));
+        assert!(
+            row.detail
+                .contains("only relevant for rebuilding from source")
+        );
     }
 
     #[test]

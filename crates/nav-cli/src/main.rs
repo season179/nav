@@ -63,11 +63,7 @@ async fn main() -> Result<()> {
         return run_cli_command(&args, &cwd, project.as_ref(), extensions.as_ref(), command);
     }
 
-    if should_show_typo_nudge(
-        &args,
-        provided.was_provided("model"),
-        &project.settings,
-    ) {
+    if should_show_typo_nudge(&args, provided.was_provided("model"), &project.settings) {
         // Warn (not error) — a brand-new model the provider supports but
         // nav's prefix list hasn't learned about yet should still work.
         let hint = names::did_you_mean(&args.model)
@@ -303,11 +299,7 @@ fn provider_catalog_contains_bare_model(settings: &Settings, model: &str) -> boo
 /// no settings default exists, a bare name that happens to appear in the
 /// catalog still goes through OpenAI Responses and should still get the
 /// nudge.
-fn should_show_typo_nudge(
-    args: &Args,
-    model_was_provided: bool,
-    settings: &Settings,
-) -> bool {
+fn should_show_typo_nudge(args: &Args, model_was_provided: bool, settings: &Settings) -> bool {
     if args.model.contains('/') {
         return false;
     }

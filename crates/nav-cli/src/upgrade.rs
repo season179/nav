@@ -147,8 +147,7 @@ async fn download(url: &str, dest: &Path) -> Result<()> {
         .bytes()
         .await
         .with_context(|| format!("could not read response from {url}"))?;
-    std::fs::write(dest, &bytes)
-        .with_context(|| format!("could not write {}", dest.display()))?;
+    std::fs::write(dest, &bytes).with_context(|| format!("could not write {}", dest.display()))?;
     Ok(())
 }
 
@@ -182,8 +181,8 @@ fn parse_checksum_line(raw: &str) -> Option<String> {
 
 fn hash_file(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("could not open {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("could not open {}", path.display()))?;
     std::io::copy(&mut file, &mut hasher)
         .with_context(|| format!("could not hash {}", path.display()))?;
     Ok(format!("{:x}", hasher.finalize()))
@@ -224,7 +223,10 @@ fn find_extracted_nav(dir: &Path) -> Result<PathBuf> {
             }
         }
     }
-    bail!("nav binary not found in extracted archive at {}", dir.display());
+    bail!(
+        "nav binary not found in extracted archive at {}",
+        dir.display()
+    );
 }
 
 /// Atomically swap the running binary for the freshly downloaded one.
@@ -246,12 +248,10 @@ fn replace_binary(current_exe: &Path, new_binary: &Path) -> Result<()> {
     let _ = std::fs::remove_file(&staged);
     let _ = std::fs::remove_file(&backup);
 
-    std::fs::copy(new_binary, &staged)
-        .with_context(|| replace_error_message(current_exe))?;
+    std::fs::copy(new_binary, &staged).with_context(|| replace_error_message(current_exe))?;
     set_executable(&staged).with_context(|| replace_error_message(current_exe))?;
 
-    std::fs::rename(current_exe, &backup)
-        .with_context(|| replace_error_message(current_exe))?;
+    std::fs::rename(current_exe, &backup).with_context(|| replace_error_message(current_exe))?;
     if let Err(err) = std::fs::rename(&staged, current_exe) {
         // Restore the previous binary so the user isn't stranded.
         let _ = std::fs::rename(&backup, current_exe);
@@ -310,9 +310,8 @@ fn replace_error_message(current_exe: &Path) -> String {
 /// can fall back to a conservative strategy (e.g. proceed but never
 /// downgrade-by-assumption).
 fn compare_versions(latest: &str, current: &str) -> Option<Ordering> {
-    let parse = |v: &str| -> Option<Vec<u64>> {
-        v.split('.').map(|s| s.parse::<u64>().ok()).collect()
-    };
+    let parse =
+        |v: &str| -> Option<Vec<u64>> { v.split('.').map(|s| s.parse::<u64>().ok()).collect() };
     Some(parse(latest)?.cmp(&parse(current)?))
 }
 

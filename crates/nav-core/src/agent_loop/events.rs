@@ -501,9 +501,9 @@ impl AgentEvent {
         !matches!(
             self,
             AgentEvent::AssistantMessageDelta { .. }
-            | AgentEvent::ReasoningDelta { .. }
-            | AgentEvent::ReasoningDone { .. }
-            | AgentEvent::ProviderRetry { .. }
+                | AgentEvent::ReasoningDelta { .. }
+                | AgentEvent::ReasoningDone { .. }
+                | AgentEvent::ProviderRetry { .. }
         )
     }
 }

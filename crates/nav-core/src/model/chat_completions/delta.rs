@@ -643,8 +643,8 @@ mod tests {
                 "response.reasoning_summary_text.delta",
                 "response.reasoning_summary_text.delta",
                 "response.output_text.delta",
-                "response.output_item.done",       // message
-                "response.output_item.done",       // reasoning
+                "response.output_item.done", // message
+                "response.output_item.done", // reasoning
                 "response.completed",
             ]
         );
@@ -654,7 +654,9 @@ mod tests {
             .iter()
             .find(|e| {
                 type_of(e) == "response.output_item.done"
-                    && e.get("item").and_then(|i| i.get("type")).and_then(Value::as_str)
+                    && e.get("item")
+                        .and_then(|i| i.get("type"))
+                        .and_then(Value::as_str)
                         == Some("reasoning")
             })
             .expect("reasoning done item");

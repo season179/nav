@@ -230,11 +230,7 @@ struct Frontmatter {
     description: Option<String>,
 }
 
-fn load_skill(
-    skill_dir: &Path,
-    skill_md_path: &Path,
-    scope: SkillScope,
-) -> Result<Skill, String> {
+fn load_skill(skill_dir: &Path, skill_md_path: &Path, scope: SkillScope) -> Result<Skill, String> {
     let contents = fs::read_to_string(skill_md_path)
         .map_err(|err| format!("failed to read SKILL.md: {err}"))?;
     let frontmatter_str = extract_frontmatter(&contents)
