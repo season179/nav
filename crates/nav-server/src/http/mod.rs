@@ -16,6 +16,7 @@ use serde_json::Value;
 pub mod auth;
 mod event_mapping;
 mod ids;
+pub mod live;
 pub mod rpc;
 pub mod sse;
 

@@ -80,8 +80,8 @@ sequenceDiagram
       <h2>Current status</h2>
       <div class="detail-body narrow">
         <div>
-          <p>The prototype currently uses <strong>stdio</strong> between TUI and backend with a simple hello check — not the full HTTP + JSON-RPC + SSE protocol described above.</p>
-          <p>The next backend milestone is replacing that stdio path with the architecture shown here. The docs describe the <em>target state</em>.</p>
+          <p>The prototype now uses the minimal local <strong>HTTP + JSON-RPC + SSE</strong> path for TUI prompts.</p>
+          <p>The backend run loop is still intentionally narrow, but user input now travels through <code>session.sendMessage</code> and typed SSE events drive assistant output or visible model errors.</p>
         </div>
       </div>
     </div>
