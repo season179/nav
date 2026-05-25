@@ -15,6 +15,19 @@ use crate::history::HistoryCell;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::theme::Theme;
 
+/// Minimal cell that renders as a single blank line. Used by
+/// [`ChatWidget::consolidate_trailing_agent_message`] to ensure
+/// the scrollback trailing separator is written when all
+/// `AgentMessageCell` chunks were already drained before
+/// consolidation replaced them with `AgentMarkdownCell`.
+struct TrailingBlankCell;
+
+impl HistoryCell for TrailingBlankCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        vec![Line::from(String::new())]
+    }
+}
+
 /// Scrollback-first chat widget. Finalized cells get rendered and queued
 /// in `pending_finalized`, which the main loop drains before each frame and
 /// writes into the terminal's native scrollback via `insert_history_lines`.
@@ -723,7 +736,8 @@ impl ChatWidget {
 
         let pending_start = self.pending_start;
         let removed: Vec<_> = self.finalized.drain(start..end).collect();
-        if pending_start > start {
+        let any_already_drained = pending_start > start;
+        if any_already_drained {
             let already_drained = (pending_start - start).min(removed.len());
             self.pending_scrollback_carry
                 .extend(removed.into_iter().skip(already_drained));
@@ -733,8 +747,17 @@ impl ChatWidget {
         self.finalized
             .insert(start, Box::new(AgentMarkdownCell::new(source)));
 
-        if pending_start > start {
+        if any_already_drained {
             self.pending_start = start + 1;
+            // The already-drained AgentMessageCell chunks in scrollback
+            // have no trailing blank (they're mid-message cells that join
+            // into one continuous block). The AgentMarkdownCell that
+            // replaces them *does* produce a trailing blank via
+            // finish_bullet_row_lines, but pending_start skips it above.
+            // Add a trailing blank to the carry so the scrollback
+            // separator matches what AgentMarkdownCell would render.
+            self.pending_scrollback_carry
+                .push(Box::new(TrailingBlankCell));
         }
     }
 

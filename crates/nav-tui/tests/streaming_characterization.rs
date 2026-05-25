@@ -626,6 +626,106 @@ fn inline_lines_capped_clamps_long_streaming_to_cap() {
 }
 
 // ---------------------------------------------------------------------------
+// Line-spacing regression: blank lines in streamed markdown content
+//
+// The bug: when streaming content contains blank lines (paragraph breaks,
+// list separators), the transition from AgentMessageCell chunks to the
+// consolidated AgentMarkdownCell can produce duplicate rows or skip rows.
+// This section characterizes the expected behavior.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn blank_lines_in_stream_content_are_preserved_in_scrollback_chunks() {
+    let mut widget = ChatWidget::new();
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: "First paragraph.\n\nSecond paragraph.\n".to_string(),
+    });
+    // Drive all commit ticks so all stable lines are released.
+    while widget.on_commit_tick(80) {}
+    let scrollback = lines_text(&widget.drain_pending(80));
+    eprintln!("=== scrollback after ticks: ===\n{scrollback}");
+    // The scrollback must contain both paragraphs with a blank line between.
+    assert!(
+        scrollback.contains("• First paragraph."),
+        "first paragraph missing from scrollback; got:\n{scrollback}"
+    );
+    assert!(
+        scrollback.contains("Second paragraph."),
+        "second paragraph missing from scrollback; got:\n{scrollback}"
+    );
+}
+
+#[test]
+fn blank_lines_survive_consolidation_without_duplication() {
+    let mut widget = ChatWidget::new();
+    let source = "First paragraph.\n\nSecond paragraph.\n".to_string();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: source.clone(),
+    });
+    // Drive all commit ticks.
+    while widget.on_commit_tick(80) {}
+    let _pre_drain = lines_text(&widget.drain_pending(80));
+
+    widget.ingest(AgentEvent::AssistantMessageDone { text: source });
+
+    let final_drain = lines_text(&widget.drain_pending(80));
+    eprintln!("=== final drain: ===\n{final_drain}");
+    let transcript = lines_text(&widget.transcript_lines(80));
+    eprintln!("=== transcript: ===\n{transcript}");
+
+    // The consolidated transcript must contain exactly one assistant message
+    // with one blank line between the two paragraphs.
+    let bullet_count = transcript.matches("• First paragraph.").count();
+    assert_eq!(
+        bullet_count, 1,
+        "consolidated transcript must have exactly one assistant bullet; got {bullet_count}:\n{transcript}"
+    );
+    // Count lines in the assistant message area.
+    let para2_count = transcript.matches("Second paragraph.").count();
+    assert_eq!(
+        para2_count, 1,
+        "consolidated transcript must have exactly one 'Second paragraph.'; got {para2_count}:\n{transcript}"
+    );
+}
+
+#[test]
+fn scrollback_matches_transcript_after_consolidation_with_blank_lines() {
+    let mut widget = ChatWidget::new();
+    let source = "First paragraph.\n\nSecond paragraph.\n".to_string();
+
+    widget.ingest(AgentEvent::AssistantMessageDelta {
+        text: source.clone(),
+    });
+    // Simulate the real frame loop: tick then drain, repeated.
+    let mut all_scrollback = String::new();
+    loop {
+        let ticked = widget.on_commit_tick(80);
+        let drained = lines_text(&widget.drain_pending(80));
+        all_scrollback.push_str(&drained);
+        if !ticked && drained.is_empty() {
+            break;
+        }
+    }
+    eprintln!("=== all scrollback before done: ===\n{all_scrollback}");
+
+    widget.ingest(AgentEvent::AssistantMessageDone { text: source });
+    let final_drain = lines_text(&widget.drain_pending(80));
+    all_scrollback.push_str(&final_drain);
+    eprintln!("=== all scrollback after done: ===\n{all_scrollback}");
+
+    let transcript = lines_text(&widget.transcript_lines(80));
+    eprintln!("=== transcript: ===\n{transcript}");
+
+    // The total scrollback output must match the transcript (the
+    // consolidated source-backed rendering) — no extra or missing rows.
+    assert_eq!(
+        all_scrollback, transcript,
+        "scrollback must match transcript after consolidation; got:\nscrollback:\n{all_scrollback}\ntranscript:\n{transcript}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // AC-6 (supplementary): TurnComplete and end-of-turn semantics
 //
 // Event durability (Delta=transient, Done=durable) is already covered by
