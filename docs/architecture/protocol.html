@@ -3,27 +3,26 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Protocol — nav</title>
+  <title>Protocol - nav</title>
   <link rel="stylesheet" href="../style.css">
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
   <script src="../mermaid.js"></script>
 </head>
 <body>
   <div class="page">
-    <div class="page-inner animate">
+    <div class="page-inner">
       <nav class="crumb">
         <a href="../index.html">nav</a><span class="sep">/</span><a href="index.html">architecture</a><span class="sep">/</span><span class="current">protocol</span>
       </nav>
 
       <div class="detail-header">
-        <h1>Protocol<em>.</em></h1>
+        <h1>Protocol</h1>
       </div>
     </div>
 
-    <!-- ===== PROTOCOL OVERVIEW DIAGRAM ===== -->
-    <div class="page-inner diagram-section animate">
+    <div class="page-inner diagram-section">
       <h2>Two channels</h2>
-      <p class="lead">Commands go in via JSON-RPC. Events stream out via SSE. The frontend never polls.</p>
+      <p class="lead">Commands enter through JSON-RPC. Events are encoded as SSE so frontends can replay from <code>Last-Event-ID</code>.</p>
       <div class="mermaid">
 flowchart LR
   subgraph frontend["Frontend (TUI / Electron / Web)"]
@@ -34,25 +33,22 @@ flowchart LR
     sse["GET /sessions/{id}/events\nServer-Sent Events"]
   end
 
-  f -->|"commands:\ninitialize, sendMessage,\ntool.approve, …"| rpc
-  sse -->|"events:\nmessage.delta, run.completed,\ntool.approval_requested, …"| f
+  f -->|"commands:\nsession.create,\nsession.sendMessage,\nrun.cancel"| rpc
+  sse -->|"events:\nmodel.text_delta, message.completed,\nprovider.error, run.completed"| f
       </div>
     </div>
 
-    <!-- ===== METHODS & EVENTS ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <div class="detail-body">
         <div>
           <h2>JSON-RPC methods</h2>
-          <p>Frontend commands hit <code>POST /rpc</code>. Responses acknowledge state immediately.</p>
+          <p>Frontend commands hit <code>POST /rpc</code>. The current HTTP server handles the session and run methods first.</p>
           <ul>
-            <li><code>initialize</code> — handshake</li>
-            <li><code>session.create</code> — start a session</li>
-            <li><code>session.sendMessage</code> — user input</li>
-            <li><code>run.cancel</code> — abort a running agent loop</li>
-            <li><code>tool.approve</code> / <code>tool.reject</code> — tool permission</li>
-            <li><code>session.close</code> — end a session</li>
+            <li><code>session.create</code>: start a session</li>
+            <li><code>session.sendMessage</code>: user input</li>
+            <li><code>run.cancel</code>: abort a running agent loop</li>
           </ul>
+          <p class="note">The protocol crate already names <code>initialize</code>, <code>tool.approve</code>, <code>tool.reject</code>, and <code>session.close</code>. Those are not wired through the local HTTP handler yet.</p>
         </div>
         <div>
           <h2>SSE event types</h2>
@@ -60,22 +56,23 @@ flowchart LR
           <ul>
             <li><code>session.created</code></li>
             <li><code>run.started</code> / <code>run.completed</code> / <code>run.failed</code></li>
+            <li><code>model.text_delta</code> / <code>model.reasoning_delta</code></li>
             <li><code>message.delta</code> / <code>message.completed</code></li>
-            <li><code>tool.call_requested</code> / <code>tool.approval_requested</code></li>
-            <li><code>tool.call_started</code> / <code>tool.call_completed</code></li>
+            <li><code>tool.call_requested</code> / <code>tool.call_started</code> / <code>tool.call_completed</code></li>
+            <li><code>tool.call_delta</code> / <code>tool.approval_requested</code></li>
+            <li><code>provider.error</code> / <code>error</code></li>
             <li><code>file.changed</code></li>
           </ul>
         </div>
       </div>
     </div>
 
-    <!-- ===== TRANSPORT ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>Transport</h2>
       <div class="detail-body narrow">
         <div>
-          <p>Local HTTP on <code>127.0.0.1</code>, random port, random local auth token. Frontend launchers may spawn the backend and discover its URL/token through a small bootstrap mechanism.</p>
-          <p>All protocol IDs are canonical lowercase <strong>UUIDv7</strong> strings — they're not secrets, but they do leak approximate creation time, so authentication uses separate random tokens.</p>
+          <p>The current local backend binds to <code>127.0.0.1</code> on a random port and writes a <code>backend.ready</code> JSON line with its base URL. The Go client can spawn that backend or connect to an endpoint passed by tests.</p>
+          <p>All protocol IDs are canonical lowercase <strong>UUIDv7</strong> strings. They are not secrets; they can reveal approximate creation time, so future auth must use separate random tokens.</p>
         </div>
       </div>
     </div>
@@ -84,7 +81,7 @@ flowchart LR
       <div class="footer-inner">
         <span class="footer-left">nav v26.5.12</span>
         <div class="footer-right">
-          <a href="index.html">↑ Architecture</a>
+          <a href="index.html">Architecture</a>
           <a href="../index.html">Index</a>
         </div>
       </div>

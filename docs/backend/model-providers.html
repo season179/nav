@@ -3,27 +3,47 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Model providers — nav</title>
+  <title>Model providers - nav</title>
   <link rel="stylesheet" href="../style.css">
 </head>
 <body>
   <div class="page">
-    <div class="page-inner animate">
+    <div class="page-inner">
       <nav class="crumb">
         <a href="../index.html">nav</a><span class="sep">/</span><a href="index.html">backend</a><span class="sep">/</span><span class="current">model providers</span>
       </nav>
 
       <div class="detail-header">
-        <h1>Model providers<em>.</em></h1>
+        <h1>Model providers</h1>
       </div>
     </div>
 
-    <div class="page-inner animate">
-      <div class="detail-body narrow">
+    <div class="page-inner">
+      <div class="detail-body">
         <div>
-          <p><code>nav-harness</code> resolves providers from a Pi-style <code>models.json</code>: keyed <code>providers</code>, each with <code>baseUrl</code>, <code>api</code>, models list, and <code>compat</code> overrides.</p>
-          <p>Prefer environment variables for API keys; inline secrets are allowed for local use but must never appear in logs or errors.</p>
-          <p class="note">Full examples: <a href="../model-provider-settings.md">model-provider-settings.md</a></p>
+          <h2>Settings file</h2>
+          <p><code>nav-backend serve-http</code> reads <code>~/.nav/settings.json</code> by default. Set <code>NAV_MODEL_SETTINGS</code> to point at another file.</p>
+          <p>The shape follows Pi's model settings: a <code>defaultModel</code> plus keyed <code>providers</code>. Each provider names a <code>baseUrl</code>, <code>api</code>, API-key source, compatibility overrides, and available models.</p>
+          <pre><code>{
+  "defaultModel": {
+    "provider": "local-gateway",
+    "model": "local-coder:7b"
+  },
+  "providers": {
+    "local-gateway": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": { "envVar": "LOCAL_GATEWAY_API_KEY" },
+      "models": [{ "id": "local-coder:7b" }]
+    }
+  }
+}</code></pre>
+        </div>
+        <div>
+          <h2>Runtime overrides</h2>
+          <p>Use <code>NAV_MODEL_PROVIDER</code> and <code>NAV_MODEL</code> together to override the default model without editing the settings file. Supplying only one is a configuration error.</p>
+          <p>Prefer environment variables for API keys. Inline keys are accepted for local testing, but they must never appear in logs, errors, fixtures, or docs examples with real values.</p>
+          <p class="note">Concrete examples live in <code>crates/nav-harness/examples/model-settings-*.json</code>.</p>
         </div>
       </div>
     </div>
@@ -32,7 +52,7 @@
       <div class="footer-inner">
         <span class="footer-left">nav v26.5.12</span>
         <div class="footer-right">
-          <a href="index.html">↑ Backend</a>
+          <a href="index.html">Backend</a>
           <a href="../index.html">Index</a>
         </div>
       </div>
