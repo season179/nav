@@ -126,9 +126,9 @@ impl Session {
             .expect("tmux display-message failed");
         let s = String::from_utf8_lossy(&out.stdout);
         let s = s.trim();
-        let (x, y) = s.split_once(',').unwrap_or_else(|| {
-            panic!("tmux display-message returned unexpected format: {s:?}")
-        });
+        let (x, y) = s
+            .split_once(',')
+            .unwrap_or_else(|| panic!("tmux display-message returned unexpected format: {s:?}"));
         (
             x.parse().expect("cursor_x not u16"),
             y.parse().expect("cursor_y not u16"),
@@ -354,7 +354,8 @@ fn write_mock_provider_settings(workdir: &TempDir, model: &str, port: u16) {
 }
 
 fn spawn_mock_sse_server(name: &str, on_connect: fn(TcpStream)) -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect(&format!("mock {name} bind"));
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|_| panic!("mock {name} bind"));
     let port = listener.local_addr().expect("mock addr").port();
     listener.set_nonblocking(true).expect("nonblocking");
     thread::spawn(move || {
@@ -404,7 +405,10 @@ fn write_mock_turn_separator_response(mut stream: TcpStream) {
         }
     })
     .to_string();
-    if stream.write_all(format!("data: {reply}\n\n").as_bytes()).is_err() {
+    if stream
+        .write_all(format!("data: {reply}\n\n").as_bytes())
+        .is_err()
+    {
         return;
     }
     let _ = stream.flush();
@@ -818,7 +822,9 @@ fn alt_screen_overlay_round_trip_restores_inline_position_after_resize() {
     );
     let restored_row = last_row_with(&restored, |line| line.contains("Ask nav to do anything"))
         .unwrap_or_else(|| {
-            panic!("composer placeholder row should return after overlay close, pane was:\n{restored}")
+            panic!(
+                "composer placeholder row should return after overlay close, pane was:\n{restored}"
+            )
         });
     let (cursor_x, cursor_y) = session.cursor();
 
@@ -865,11 +871,9 @@ fn status_bar_paints_below_composer() {
         "status bar never appeared:\n{pane}"
     );
 
-    let composer_row =
-        last_row_with(&pane, |line| line.contains("Ask nav to do anything"))
-            .expect("composer row found above");
-    let status_row =
-        last_row_with(&pane, status_bar_present).expect("status row found above");
+    let composer_row = last_row_with(&pane, |line| line.contains("Ask nav to do anything"))
+        .expect("composer row found above");
+    let status_row = last_row_with(&pane, status_bar_present).expect("status row found above");
 
     assert!(
         status_row > composer_row,
@@ -944,7 +948,9 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
 
     let nav = env!("CARGO_BIN_EXE_nav");
     let cwd = workdir.path().display();
-    session.send_line(&format!("cd {cwd} && {nav} --auth api-key --model mock/smoke"));
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/smoke"
+    ));
 
     let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
     assert!(
@@ -954,10 +960,7 @@ fn streaming_response_lands_in_scrollback_without_artifacts() {
 
     session.send_line("stream a long noisy answer to stress rendering");
 
-    let saw_first_chunk = session.wait_for(
-        |pane| pane.contains("chunk-0"),
-        Duration::from_secs(4),
-    );
+    let saw_first_chunk = session.wait_for(|pane| pane.contains("chunk-0"), Duration::from_secs(4));
     assert!(
         saw_first_chunk.contains("chunk-0"),
         "did not observe streaming chunks in first frames:\n{saw_first_chunk}"
@@ -1409,10 +1412,8 @@ fn bottom_pane_layout_survives_resize() {
         |p| p.contains("Ask nav to do anything"),
         Duration::from_secs(3),
     );
-    let small_composer_row = last_row_with(&small, |line| {
-        line.contains("Ask nav to do anything")
-    })
-    .unwrap_or_else(|| panic!("composer missing after shrink:\n{small}"));
+    let small_composer_row = last_row_with(&small, |line| line.contains("Ask nav to do anything"))
+        .unwrap_or_else(|| panic!("composer missing after shrink:\n{small}"));
     let (cx_small, cy_small) = session.cursor();
     assert_eq!(
         cy_small as usize, small_composer_row,
@@ -1434,9 +1435,8 @@ fn bottom_pane_layout_survives_resize() {
         |p| p.contains("Ask nav to do anything"),
         Duration::from_secs(3),
     );
-    let big_composer_row =
-        last_row_with(&big, |line| line.contains("Ask nav to do anything"))
-            .unwrap_or_else(|| panic!("composer missing after regrow:\n{big}"));
+    let big_composer_row = last_row_with(&big, |line| line.contains("Ask nav to do anything"))
+        .unwrap_or_else(|| panic!("composer missing after regrow:\n{big}"));
     let (cx_big, cy_big) = session.cursor();
     assert_eq!(
         cy_big as usize, big_composer_row,
@@ -1599,10 +1599,7 @@ fn skill_invocation_renders_compact_chip_in_scrollback() {
 
     session.send_line("/tmux-demo");
 
-    let pane = session.wait_for(
-        |pane| pane.contains("$ tmux-demo"),
-        Duration::from_secs(3),
-    );
+    let pane = session.wait_for(|pane| pane.contains("$ tmux-demo"), Duration::from_secs(3));
     assert!(
         pane.contains("$ tmux-demo"),
         "skill invocation chip missing from scrollback:\n{pane}"
@@ -1732,10 +1729,7 @@ fn read_only_tools_group_until_write_starts_new_cell() {
     session.send_line("read both files then patch b");
 
     let completed = session.wait_for(
-        |pane| {
-            pane.contains(MOCK_EXPLORATION_GROUP_MARKER)
-                && pane.contains("Exploring (2 calls)")
-        },
+        |pane| pane.contains(MOCK_EXPLORATION_GROUP_MARKER) && pane.contains("Exploring (2 calls)"),
         Duration::from_secs(20),
     );
     assert!(
@@ -1938,10 +1932,7 @@ fn resize_during_streaming_preserves_status_and_composer() {
     session.send_line("stream while I resize the terminal");
 
     // Wait for streaming to start.
-    let streaming = session.wait_for(
-        |pane| pane.contains("chunk-0"),
-        Duration::from_secs(4),
-    );
+    let streaming = session.wait_for(|pane| pane.contains("chunk-0"), Duration::from_secs(4));
     assert!(
         streaming.contains("chunk-0"),
         "streaming did not start before resize:\n{streaming}"
@@ -2079,9 +2070,7 @@ fn assistant_message_with_blank_lines_has_trailing_separator_in_scrollback() {
     // (the trailing separator) before any non-blank row (status bar,
     // composer). A blank line is one that is empty or all-whitespace.
     let remaining = &lines[marker_line + 1..];
-    let has_blank_separator = remaining
-        .first()
-        .is_some_and(|line| line.trim().is_empty());
+    let has_blank_separator = remaining.first().is_some_and(|line| line.trim().is_empty());
 
     assert!(
         has_blank_separator,
@@ -2143,9 +2132,5 @@ fn write_mock_paragraph_break_response(mut stream: TcpStream) {
         }),
     ];
 
-    write_sse_chunks_with_delay(
-        &mut stream,
-        &chunks,
-        Duration::from_millis(5),
-    );
+    write_sse_chunks_with_delay(&mut stream, &chunks, Duration::from_millis(5));
 }

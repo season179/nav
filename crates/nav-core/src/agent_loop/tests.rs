@@ -1373,9 +1373,7 @@ fn emit_stream_events_emits_reasoning_delta() {
     emit_stream_events(&event, &tx, None);
     drop(tx);
     let received = rx.blocking_recv().unwrap();
-    assert!(
-        matches!(received, AgentEvent::ReasoningDelta { ref text } if text == "thinking")
-    );
+    assert!(matches!(received, AgentEvent::ReasoningDelta { ref text } if text == "thinking"));
 }
 
 #[test]

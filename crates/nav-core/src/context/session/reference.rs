@@ -352,10 +352,9 @@ fn event_label_and_body(event: &AgentEvent) -> (&'static str, String) {
             format!("trigger={}: {message}", trigger.as_str()),
         ),
         AgentEvent::Error { message } => ("error", message.clone()),
-        AgentEvent::HookStarted { name, event_type } => (
-            "hook started",
-            format!("{name} ({event_type})"),
-        ),
+        AgentEvent::HookStarted { name, event_type } => {
+            ("hook started", format!("{name} ({event_type})"))
+        }
         AgentEvent::HookCompleted {
             name,
             event_type,
