@@ -1,0 +1,15 @@
+id: 019f2f6f-f178-7a72-9f28-000000000200
+event: session.created
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000200","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"session.created"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000201
+event: run.started
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000201","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.started","run_id":"019f2f6f-f178-7a72-9f28-000000000101"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000206
+event: provider.error
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000206","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"provider.error","run_id":"019f2f6f-f178-7a72-9f28-000000000101","status":429,"message":"rate limit exceeded","error_type":"rate_limit_error","code":"rate_limit_exceeded","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large"}}
+
+id: 019f2f6f-f178-7a72-9f28-000000000207
+event: run.failed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000207","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.failed","run_id":"019f2f6f-f178-7a72-9f28-000000000101","message":"provider error: rate limit exceeded"}
