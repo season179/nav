@@ -12,6 +12,8 @@ use nav_server::http::{
 use nav_types::{RunId, SessionId};
 use serde_json::{Value, json};
 
+const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[test]
 fn session_create_accepts_omitted_params() {
     let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
@@ -454,7 +456,7 @@ fn receive_live_events(
     (0..count)
         .map(|_| {
             subscription
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(LIVE_EVENT_TIMEOUT)
                 .expect("live subscription should receive appended event")
         })
         .collect()

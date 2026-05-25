@@ -6,11 +6,13 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::time::Duration;
 
 use nav_protocol::EventEnvelope;
 use nav_types::{EventId, SessionId};
+
+const LIVE_SUBSCRIBER_BUFFER: usize = 64;
 
 #[derive(Debug, Default)]
 pub struct ProtocolEventStore {
@@ -57,14 +59,17 @@ impl ProtocolEventStore {
 #[derive(Debug, Default)]
 struct SessionEventLog {
     events: Vec<EventEnvelope>,
-    subscribers: Vec<mpsc::Sender<EventEnvelope>>,
+    subscribers: Vec<SyncSender<EventEnvelope>>,
 }
 
 impl SessionEventLog {
     fn append(&mut self, event: EventEnvelope) {
         self.events.push(event.clone());
         self.subscribers
-            .retain(|subscriber| subscriber.send(event.clone()).is_ok());
+            .retain(|subscriber| match subscriber.try_send(event.clone()) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            });
     }
 
     fn replay_after(
@@ -90,7 +95,7 @@ impl SessionEventLog {
         last_event_id: Option<&EventId>,
     ) -> Result<ProtocolEventSubscription, ReplayError> {
         let replay = self.replay_after(last_event_id)?;
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(LIVE_SUBSCRIBER_BUFFER);
         self.subscribers.push(sender);
 
         Ok(ProtocolEventSubscription { replay, receiver })
@@ -139,3 +144,43 @@ impl fmt::Display for ReplayError {
 }
 
 impl std::error::Error for ReplayError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use nav_protocol::BackendEvent;
+
+    #[test]
+    fn drops_subscriber_when_live_buffer_fills() {
+        let session_id = SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000000");
+        let mut log = SessionEventLog::default();
+        let subscription = log.subscribe(None).unwrap();
+
+        for index in 0..LIVE_SUBSCRIBER_BUFFER {
+            log.append(event(&session_id, index));
+        }
+
+        assert_eq!(log.subscribers.len(), 1);
+
+        log.append(event(&session_id, LIVE_SUBSCRIBER_BUFFER));
+
+        assert_eq!(log.subscribers.len(), 0);
+
+        for _ in 0..LIVE_SUBSCRIBER_BUFFER {
+            subscription.try_recv().unwrap();
+        }
+        assert!(matches!(
+            subscription.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+    }
+
+    fn event(session_id: &SessionId, index: usize) -> EventEnvelope {
+        EventEnvelope {
+            event_id: EventId::new_unchecked(format!("019f2f6f-f178-7a72-9f28-{index:012x}")),
+            session_id: session_id.clone(),
+            event: BackendEvent::SessionCreated,
+        }
+    }
+}
