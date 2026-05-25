@@ -1,0 +1,19 @@
+id: 019f2f6f-f178-7a72-9f28-000000000200
+event: session.created
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000200","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"session.created"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000201
+event: run.started
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000201","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.started","run_id":"019f2f6f-f178-7a72-9f28-000000000101"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000202
+event: model.text_delta
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000202","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"model.text_delta","run_id":"019f2f6f-f178-7a72-9f28-000000000101","message_id":"019f2f6f-f178-7a72-9f28-000000000102","delta":"hello from fixture frontend","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"minimal-run","provider_model":"vendor/model-large","choice_index":0}}
+
+id: 019f2f6f-f178-7a72-9f28-000000000203
+event: message.completed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000203","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"message.completed","run_id":"019f2f6f-f178-7a72-9f28-000000000101","message_id":"019f2f6f-f178-7a72-9f28-000000000102","finish_reason":"stop","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"minimal-run","provider_model":"vendor/model-large","choice_index":0}}
+
+id: 019f2f6f-f178-7a72-9f28-000000000204
+event: run.completed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000204","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.completed","run_id":"019f2f6f-f178-7a72-9f28-000000000101","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"minimal-run","provider_model":"vendor/model-large","choice_index":0}}

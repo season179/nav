@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": "019f2f6f-f178-7a72-9f28-000000000003",
+  "method": "session.sendMessage",
+  "params": {
+    "sessionId": "019f2f6f-f178-7a72-9f28-000000000100",
+    "text": "hello from fixture frontend"
+  }
+}
