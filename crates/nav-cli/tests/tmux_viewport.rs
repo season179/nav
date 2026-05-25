@@ -2000,3 +2000,152 @@ fn resize_during_streaming_preserves_status_and_composer() {
         "raw SSE payload leaked into the TUI after resize:\n{completed}"
     );
 }
+
+/// Line-spacing regression: assistant message with paragraph-break blank lines
+/// must produce a trailing separator in scrollback after consolidation.
+///
+/// Before the fix, `AgentMessageCell` chunks were emitted to scrollback
+/// without trailing blanks (correct for mid-message cells). When all chunks
+/// were already drained before consolidation, the replacement
+/// `AgentMarkdownCell`'s trailing blank was lost because `pending_start`
+/// advanced past it. The visible symptom was a missing blank line between
+/// the assistant message and the next cell (status bar, tool call, etc.).
+///
+/// The mock streams content with an explicit `\n\n` paragraph break.
+/// After the stream completes, the captured pane must show exactly one
+/// trailing blank line below the second paragraph — the separator that
+/// `AgentMarkdownCell` renders.
+///
+/// Self-check: revert the `TrailingBlankCell` carry addition in
+/// `ChatWidget::consolidate_trailing_agent_message` and this test fails
+/// with the final marker landing on the same row as the second paragraph.
+#[test]
+fn assistant_message_with_blank_lines_has_trailing_separator_in_scrollback() {
+    if !tmux_available() {
+        eprintln!("tmux unavailable or not runnable in this environment, skipping");
+        return;
+    }
+
+    let mock_port = spawn_mock_paragraph_break_server();
+    let workdir = tempdir().expect("tempdir for paragraph-break test");
+    write_mock_provider_settings(&workdir, "spacing", mock_port);
+
+    let session = fresh_session("paragraph-spacing");
+    session.start(100, 24);
+
+    let nav = env!("CARGO_BIN_EXE_nav");
+    let cwd = workdir.path().display();
+    session.send_line(&format!(
+        "cd {cwd} && {nav} --auth api-key --model mock/spacing"
+    ));
+
+    let ready = session.wait_for(status_bar_present, Duration::from_secs(6));
+    assert!(
+        status_bar_present(&ready),
+        "paragraph-spacing nav failed to boot:\n{ready}"
+    );
+
+    session.send_line("stream with paragraph breaks");
+
+    let completed = session.wait_for(
+        |pane| pane.contains(MOCK_PARAGRAPH_BREAK_MARKER),
+        Duration::from_secs(15),
+    );
+    assert!(
+        completed.contains(MOCK_PARAGRAPH_BREAK_MARKER),
+        "paragraph-break final marker never landed:\n{completed}"
+    );
+
+    // Count trailing blank lines after the second paragraph. The pane
+    // capture may include trailing empty rows from the terminal height,
+    // so we look for a blank row immediately below the assistant content
+    // (between the assistant message and the status bar / composer).
+    //
+    // With the bug, the pane shows:
+    //   • First paragraph.
+    //     [blank from paragraph break]
+    //     Second paragraph. SMOKE_OK_PARAGRAPH_BREAK source...
+    //   › Ask nav to do anything   (status/composer row, no gap)
+    //
+    // With the fix, there is a blank row between the assistant content
+    // and the composer, matching what AgentMarkdownCell produces.
+    let lines: Vec<&str> = completed.lines().collect();
+    let marker_line = lines
+        .iter()
+        .rposition(|line| line.contains(MOCK_PARAGRAPH_BREAK_MARKER))
+        .expect("marker line must exist");
+
+    // After the marker line, there must be at least one blank line
+    // (the trailing separator) before any non-blank row (status bar,
+    // composer). A blank line is one that is empty or all-whitespace.
+    let remaining = &lines[marker_line + 1..];
+    let has_blank_separator = remaining
+        .first()
+        .is_some_and(|line| line.trim().is_empty());
+
+    assert!(
+        has_blank_separator,
+        "missing trailing blank line after consolidated assistant message; \
+         pane after marker line: {remaining:?}\nfull pane:\n{completed}"
+    );
+
+    // The marker must appear exactly once.
+    assert_eq!(
+        completed.matches(MOCK_PARAGRAPH_BREAK_MARKER).count(),
+        1,
+        "final marker must appear exactly once:\n{completed}"
+    );
+
+    assert!(
+        !completed.contains("data:"),
+        "raw SSE payload leaked into the TUI:\n{completed}"
+    );
+}
+
+const MOCK_PARAGRAPH_BREAK_MARKER: &str = "SMOKE_OK_PARAGRAPH_BREAK";
+
+fn spawn_mock_paragraph_break_server() -> u16 {
+    spawn_mock_sse_server("paragraph break", write_mock_paragraph_break_response)
+}
+
+fn write_mock_paragraph_break_response(mut stream: TcpStream) {
+    read_http_request(&mut stream);
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    // Stream content with a paragraph-break blank line.
+    // Use enough source lines to cross the catch-up threshold (8)
+    // so commit ticks release all stable chunks before Done arrives.
+    let chunks = [
+        json!({"choices":[{"index":0,"delta":{"content":"First paragraph here.\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Second paragraph.\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Line four.\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Line five.\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Line six.\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Line seven.\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Line eight.\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Line nine.\n"}}]}),
+        json!({"choices":[{"index":0,"delta":{"content":"Line ten.\n"}}]}),
+        // Final chunk with the marker — no trailing newline so the marker
+        // text is the very last content. After consolidation the trailing
+        // blank must come from AgentMarkdownCell/TrailingBlankCell, not
+        // from internal content.
+        json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": MOCK_PARAGRAPH_BREAK_MARKER },
+                "finish_reason": "stop"
+            }]
+        }),
+    ];
+
+    write_sse_chunks_with_delay(
+        &mut stream,
+        &chunks,
+        Duration::from_millis(5),
+    );
+}
