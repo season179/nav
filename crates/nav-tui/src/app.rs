@@ -42,6 +42,17 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 /// Bottom pane height: composer (1) + separator (1) + status (1)
 const BOTTOM_PANE_HEIGHT: u16 = 3;
 
+/// RAII guard that restores terminal state on drop.
+/// Ensures raw mode and bracketed paste are cleaned up even on early returns.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
+    }
+}
+
 // ── App state ─────────────────────────────────────────────────────
 
 struct App {
@@ -149,9 +160,10 @@ pub async fn run(
     project: Arc<ProjectContext>,
     startup_notices: StartupNotices,
 ) -> Result<()> {
-    // Set up terminal
+    // Set up terminal with RAII guard to ensure cleanup on early returns
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
     enable_raw_mode()?;
+    let _terminal_guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
@@ -242,18 +254,16 @@ pub async fn run(
             _ = tokio::time::sleep_until(next_tick) => {
                 if matches!(app.status_state, StatusState::Working { .. }) {
                     app.spinner_idx = (app.spinner_idx + 1) % SPINNER.len();
-                    last_spinner_tick = Instant::now();
                 }
+                last_spinner_tick = Instant::now();
             }
         }
 
         flush_history_and_draw(&mut term, &mut app)?;
     }
 
-    // Restore terminal
-    disable_raw_mode()?;
-    crossterm::execute!(io::stdout(), DisableBracketedPaste)?;
-
+    // Restore terminal (guard also handles this on early returns)
+    drop(_terminal_guard);
     Ok(())
 }
 
@@ -560,7 +570,9 @@ fn handle_key_event(
             if app.active_turn.is_some() {
                 app.pending_approvals.abort_pending();
                 finalize_streaming(app);
-                app.active_turn = None;
+                if let Some(active) = app.active_turn.take() {
+                    active._handle.abort();
+                }
                 app.status_state = StatusState::Ready;
                 app.pending_history.push(Line::from(Span::styled(
                     "  user interrupt - turn aborted",
@@ -681,7 +693,7 @@ fn handle_key_event(
             if app.composer_cursor < app.composer_text.len() {
                 app.composer_cursor = app.composer_text[app.composer_cursor..]
                     .char_indices()
-                    .next()
+                    .nth(1)
                     .map(|(i, _)| app.composer_cursor + i)
                     .unwrap_or(app.composer_text.len());
             }
@@ -817,7 +829,9 @@ fn handle_slash_command(
             app.should_exit = true;
         }
         "/clear" => {
-            // Just skip - the next draw clears everything
+            app.pending_history.clear();
+            app.streaming_text.clear();
+            app.streaming_finalized = 0;
         }
         "/help" => {
             let help_lines: Vec<Line<'static>> = SLASH_COMMANDS
@@ -833,6 +847,12 @@ fn handle_slash_command(
                 })
                 .collect();
             app.pending_history.extend(help_lines);
+        }
+        "/find" => {
+            app.pending_history.push(Line::from(Span::styled(
+                "  skill search not yet implemented in rebuilt TUI",
+                Style::default().fg(Color::Yellow),
+            )));
         }
         "/compact" => {
             app.pending_history.push(Line::from(Span::styled(
@@ -1116,7 +1136,13 @@ fn truncate_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let cut = s
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= max)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &s[..cut])
     }
 }
 
