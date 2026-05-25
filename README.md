@@ -14,10 +14,11 @@ change drastically as the architecture becomes clearer.
 
 - `tui/cmd/nav` is the user-facing command. Running `nav` starts the TUI.
 - `crates/nav-backend` is the Rust backend process.
-- The TUI talks to the backend over newline-delimited JSON on stdio.
+- The target frontend/backend API is JSON-RPC over local HTTP plus typed SSE
+  events.
 
-This keeps terminal rendering in Go/Bubble Tea while keeping the agent runtime
-in Rust.
+This keeps terminal rendering in Go/Bubble Tea while keeping agent state and
+side effects in Rust. See `docs/architecture.md`.
 
 ## Development
 
@@ -44,7 +45,9 @@ navd
 `navd update` builds `target/debug/nav-backend`, `target/debug/nav`, and
 `target/debug/navd`, then installs only the launcher to `~/.local/bin/navd`.
 
-By default the TUI finds the Rust workspace and runs:
+Current prototype note: until the HTTP/SSE backend lands, the TUI still starts
+the backend over stdio and only performs a hello check. By default it finds the
+Rust workspace and runs:
 
 ```sh
 cargo run --quiet --manifest-path Cargo.toml -p nav-backend -- serve
