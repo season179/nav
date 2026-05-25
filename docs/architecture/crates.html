@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crates — nav</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600;700&family=Karla:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg: #0c1016; --text: #e6edf3; --muted: #8b9aab; --link: #4db8a8; --border: #243040; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Karla, sans-serif; font-size: 1.05rem; line-height: 1.6; color: var(--text); background: var(--bg); max-width: 36rem; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+    .crumb { font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .crumb a { color: var(--muted); text-decoration: none; }
+    .crumb a:hover { color: var(--link); }
+    h1 { font-family: "Cormorant Garamond", serif; font-size: 2.25rem; font-weight: 700; margin-bottom: 0.75rem; }
+    p, li { color: var(--muted); }
+    ul { margin: 1rem 0 0 1.1rem; }
+    li { margin-bottom: 0.4rem; }
+    code { font-size: 0.9em; color: var(--link); }
+  </style>
+</head>
+<body>
+  <p class="crumb"><a href="../">nav</a> / <a href="./">architecture</a> / crates</p>
+  <h1>Crates and folders</h1>
+  <p>Dependency flow: <code>nav-backend → nav-server → nav-harness</code>, with <code>nav-protocol → nav-types</code> for wire types.</p>
+  <ul>
+    <li><code>nav-backend</code> — binary entrypoint</li>
+    <li><code>nav-server</code> — HTTP, JSON-RPC, SSE, auth, bootstrap</li>
+    <li><code>nav-harness</code> — agent engine (sessions, tools, models, guardrails, …)</li>
+    <li><code>nav-protocol</code> — shared RPC and event types</li>
+    <li><code>nav-types</code> — primitives (UUIDv7 IDs)</li>
+    <li><code>tui/</code> — Go Bubble Tea frontend (<code>cmd/nav</code>, <code>internal/*</code>)</li>
+  </ul>
+</body>
+</html>

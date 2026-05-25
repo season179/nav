@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Model providers — nav</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600;700&family=Karla:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg: #0c1016; --text: #e6edf3; --muted: #8b9aab; --link: #4db8a8; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Karla, sans-serif; font-size: 1.05rem; line-height: 1.6; color: var(--text); background: var(--bg); max-width: 36rem; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+    .crumb { font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .crumb a { color: var(--muted); text-decoration: none; }
+    .crumb a:hover { color: var(--link); }
+    h1 { font-family: "Cormorant Garamond", serif; font-size: 2.25rem; font-weight: 700; margin-bottom: 0.75rem; }
+    p { color: var(--muted); margin-bottom: 1rem; }
+    code { font-size: 0.9em; color: var(--link); }
+    .note { font-size: 0.9rem; margin-top: 1.5rem; }
+    .note a { color: var(--link); }
+  </style>
+</head>
+<body>
+  <p class="crumb"><a href="../">nav</a> / <a href="./">backend</a> / model providers</p>
+  <h1>Model providers</h1>
+  <p><code>nav-harness</code> resolves providers from a Pi-style <code>models.json</code>: keyed <code>providers</code>, each with <code>baseUrl</code>, <code>api</code>, models list, and <code>compat</code> overrides.</p>
+  <p>Prefer environment variables for API keys; inline secrets are allowed for local use but must never appear in logs or errors.</p>
+  <p class="note">Full examples: <a href="../model-provider-settings.md">model-provider-settings.md</a></p>
+</body>
+</html>
