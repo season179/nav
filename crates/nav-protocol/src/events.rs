@@ -22,6 +22,20 @@ pub enum BackendEvent {
     SessionCreated,
     #[serde(rename = "run.started")]
     RunStarted { run_id: RunId },
+    #[serde(rename = "model.text_delta")]
+    ModelTextDelta {
+        run_id: RunId,
+        message_id: MessageId,
+        delta: String,
+        metadata: ProviderEventMetadata,
+    },
+    #[serde(rename = "model.reasoning_delta")]
+    ModelReasoningDelta {
+        run_id: RunId,
+        message_id: MessageId,
+        delta: String,
+        metadata: ProviderEventMetadata,
+    },
     #[serde(rename = "message.delta")]
     MessageDelta {
         run_id: RunId,
@@ -32,6 +46,10 @@ pub enum BackendEvent {
     MessageCompleted {
         run_id: RunId,
         message_id: MessageId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<ProviderEventMetadata>,
     },
     #[serde(rename = "tool.call_requested")]
     ToolCallRequested {
@@ -43,11 +61,27 @@ pub enum BackendEvent {
     ToolCallStarted {
         run_id: RunId,
         tool_call_id: ToolCallId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<ProviderEventMetadata>,
+    },
+    #[serde(rename = "tool.call_delta")]
+    ToolCallDelta {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        arguments_delta: String,
+        metadata: ProviderEventMetadata,
     },
     #[serde(rename = "tool.call_completed")]
     ToolCallCompleted {
         run_id: RunId,
         tool_call_id: ToolCallId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<ProviderEventMetadata>,
     },
     #[serde(rename = "tool.approval_requested")]
     ToolApprovalRequested {
@@ -61,13 +95,55 @@ pub enum BackendEvent {
         path: String,
     },
     #[serde(rename = "run.completed")]
-    RunCompleted { run_id: RunId },
+    RunCompleted {
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<ProviderEventMetadata>,
+    },
     #[serde(rename = "run.cancelled")]
     RunCancelled { run_id: RunId },
     #[serde(rename = "run.failed")]
     RunFailed { run_id: RunId, message: String },
+    #[serde(rename = "provider.error")]
+    ProviderError {
+        run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        metadata: ProviderEventMetadata,
+    },
     #[serde(rename = "error")]
     Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderEventMetadata {
+    pub provider_id: String,
+    pub configured_model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u32>,
 }
 
 impl BackendEvent {
@@ -75,16 +151,20 @@ impl BackendEvent {
         match self {
             Self::SessionCreated => "session.created",
             Self::RunStarted { .. } => "run.started",
+            Self::ModelTextDelta { .. } => "model.text_delta",
+            Self::ModelReasoningDelta { .. } => "model.reasoning_delta",
             Self::MessageDelta { .. } => "message.delta",
             Self::MessageCompleted { .. } => "message.completed",
             Self::ToolCallRequested { .. } => "tool.call_requested",
             Self::ToolCallStarted { .. } => "tool.call_started",
+            Self::ToolCallDelta { .. } => "tool.call_delta",
             Self::ToolCallCompleted { .. } => "tool.call_completed",
             Self::ToolApprovalRequested { .. } => "tool.approval_requested",
             Self::FileChanged { .. } => "file.changed",
             Self::RunCompleted { .. } => "run.completed",
             Self::RunCancelled { .. } => "run.cancelled",
             Self::RunFailed { .. } => "run.failed",
+            Self::ProviderError { .. } => "provider.error",
             Self::Error { .. } => "error",
         }
     }

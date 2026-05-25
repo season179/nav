@@ -1,4 +1,4 @@
-use nav_types::{ApprovalId, RequestId, RunId, SessionId};
+use nav_types::{ApprovalId, MessageId, RequestId, RunId, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -74,19 +74,42 @@ pub struct InitializeParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionCreateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCreateResult {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionSendMessageParams {
     pub session_id: SessionId,
     pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSendMessageResult {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub message_id: MessageId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunCancelParams {
+    pub run_id: RunId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunCancelResult {
     pub run_id: RunId,
 }
 
