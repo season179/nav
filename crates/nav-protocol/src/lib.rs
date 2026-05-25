@@ -6,5 +6,5 @@
 pub mod events;
 pub mod rpc;
 
-pub use events::{BackendEvent, EventEnvelope};
+pub use events::{BackendEvent, EventEnvelope, ProviderEventMetadata, ProviderUsage};
 pub use rpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
