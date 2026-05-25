@@ -18,14 +18,14 @@
       </div>
     </div>
 
-    <div class="page-inner detail-body animate">
-      <div>
-        <p><em>Planned.</em> One canonical transcript in SQLite — not per-provider copies. Encode on read for the current API shape; decode on write after each provider call.</p>
-        <p>Runs group ordered <code>Turn</code> rows; switching models mid-session only changes settings, not stored history.</p>
-      </div>
-      <div>
-        <p>Optional <code>provider_state</code> caches things like OpenAI <code>previous_response_id</code> but is not the source of truth.</p>
-        <p class="note">Full design: <a href="../session-storage.md">session-storage.md</a></p>
+    <div class="page-inner animate">
+      <div class="detail-body narrow">
+        <div>
+          <p><em>Planned.</em> One canonical transcript in SQLite — not per-provider copies. Encode on read for the current API shape; decode on write after each provider call.</p>
+          <p>Runs group ordered <code>Turn</code> rows; switching models mid-session only changes settings, not stored history.</p>
+          <p>Optional <code>provider_state</code> caches things like OpenAI <code>previous_response_id</code> but is not the source of truth.</p>
+          <p class="note">Full design: <a href="../session-storage.md">session-storage.md</a></p>
+        </div>
       </div>
     </div>
 

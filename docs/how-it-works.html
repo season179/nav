@@ -38,7 +38,7 @@ sequenceDiagram
   TUI->>Server: POST /rpc session.sendMessage
   Server->>Harness: create Run, enter agent loop
 
-  rect rgba(77,184,168,0.05)
+  rect rgba(52,211,153,0.06)
     Note over Harness,LLM: Agent Loop (may repeat)
     Harness->>LLM: send prompt + context
     LLM-->>Harness: streaming tokens
