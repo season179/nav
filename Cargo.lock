@@ -32,6 +32,10 @@ dependencies = [
 [[package]]
 name = "nav-harness"
 version = "26.5.12"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "nav-protocol"
