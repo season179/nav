@@ -17,17 +17,18 @@
 
       <div class="detail-header">
         <h1>Protocol<em>.</em></h1>
+        <p class="lead">A stable multi-frontend contract for nav clients. The TUI is one client of this boundary, not the owner of it.</p>
       </div>
     </div>
 
     <!-- ===== PROTOCOL OVERVIEW DIAGRAM ===== -->
     <div class="page-inner diagram-section animate">
       <h2>Two channels</h2>
-      <p class="lead">Commands go in via JSON-RPC. Events stream out via SSE. The frontend never polls.</p>
+      <p class="lead">Commands go in via JSON-RPC. Ordered session events stream out via SSE. Every frontend speaks the same contract.</p>
       <div class="mermaid">
 flowchart LR
   subgraph frontend["Frontend (TUI / Electron / Web)"]
-    f["UI"]
+    f["Client runtime"]
   end
   subgraph backend["Backend (nav-server)"]
     rpc["POST /rpc\nJSON-RPC 2.0"]
@@ -39,31 +40,362 @@ flowchart LR
       </div>
     </div>
 
-    <!-- ===== METHODS & EVENTS ===== -->
+    <!-- ===== STABILITY ===== -->
     <div class="page-inner animate">
+      <h2>Contract boundary</h2>
       <div class="detail-body">
         <div>
-          <h2>JSON-RPC methods</h2>
-          <p>Frontend commands hit <code>POST /rpc</code>. Responses acknowledge state immediately.</p>
+          <p>The protocol is the stable language between nav's backend and every frontend: terminal TUI, web UI, API client, and agent-to-agent client. It is defined by wire shapes, event ordering, replay semantics, and negotiated capabilities.</p>
+          <p>Frontend-specific rendering, keyboard handling, scrollback, optimistic UI, and reconnect UX stay outside this contract. Backend-owned work such as sessions, runs, models, tools, approvals, and filesystem effects stays behind the protocol.</p>
+        </div>
+        <div>
+          <h2>Implementation sources</h2>
+          <p>This page describes and constrains the current implementation paths:</p>
+          <ul class="source-list">
+            <li><code>crates/nav-protocol/src/rpc.rs</code> — JSON-RPC envelopes and method structs</li>
+            <li><code>crates/nav-protocol/src/events.rs</code> — SSE event envelope and payload variants</li>
+            <li><code>crates/nav-server/src/http/mod.rs</code> — method routing, run/session state, replay behavior</li>
+            <li><code>crates/nav-server/src/http/sse.rs</code> — SSE framing</li>
+            <li><code>crates/nav-server/src/http/live.rs</code> — local HTTP parsing and bootstrap</li>
+            <li><code>tui/internal/client/client.go</code> — current Go frontend client</li>
+            <li><code>crates/nav-server/tests/http_protocol.rs</code> and <code>tui/internal/client/client_test.go</code> — executable examples</li>
+            <li><code>plans/session-storage.md</code> — required storage model for future durable transcripts</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== STORAGE BOUNDARY ===== -->
+    <div class="page-inner animate">
+      <h2>Protocol and storage</h2>
+      <div class="detail-body">
+        <div>
+          <p>JSON-RPC and SSE are frontend-facing protocol projections. They are not the canonical transcript ledger and must not become a provider-native history format smuggled through the UI boundary.</p>
+          <p>The future durable source of truth is the session store described in <code>plans/session-storage.md</code>: sessions have runs, runs produce ordered turns, and turns are made of parts. The backend owns writes to that ledger; clients send commands and render projected events.</p>
+        </div>
+        <div>
+          <h3>Long-term invariants</h3>
           <ul>
-            <li><code>initialize</code> — handshake</li>
-            <li><code>session.create</code> — start a session</li>
-            <li><code>session.sendMessage</code> — user input</li>
-            <li><code>run.cancel</code> — abort a running agent loop</li>
-            <li><code>tool.approve</code> / <code>tool.reject</code> — tool permission</li>
-            <li><code>session.close</code> — end a session</li>
+            <li>Store canonical turns and turn parts in SQLite, then encode them for the selected provider on read.</li>
+            <li>Decode provider responses into canonical turns and parts before appending them to the ledger.</li>
+            <li>Keep <code>provider_response_id</code>, raw provider SSE chunks, and <code>provider_state</code> as correlation or continuation cache, never as the source of truth.</li>
+            <li>Treat SSE replay as replay of retained protocol events. Transcript reconstruction, fork, compaction, and future snapshots come from canonical session rows.</li>
+            <li>Keep model selection in session settings, such as <code>settings_json.modelRef</code>, so later clients are not tied to process-global or TUI-only configuration.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== JSON-RPC ===== -->
+    <div class="page-inner animate">
+      <h2>JSON-RPC commands</h2>
+      <div class="contract-section">
+        <p>Clients send commands to <code>POST /rpc</code> with <code>Content-Type: application/json</code>. Requests and responses use JSON-RPC 2.0. JSON-RPC errors are returned as JSON response bodies, normally with HTTP <code>200</code>; transport errors such as unknown paths still use HTTP status codes.</p>
+
+        <pre><code>{
+  "jsonrpc": "2.0",
+  "id": "019f2f6f-f178-7a72-9f28-000000000001",
+  "method": "session.sendMessage",
+  "params": {
+    "sessionId": "019f2f6f-f178-7a72-9f28-000000000100",
+    "text": "Explain this repo"
+  }
+}</code></pre>
+
+        <div class="spec-grid">
+          <div>
+            <h3>Envelope</h3>
+            <ul>
+              <li><code>jsonrpc</code> must be the string <code>2.0</code>.</li>
+              <li><code>id</code> is a lowercase UUIDv7 request ID. The client normally generates it; the server may generate one only when parsing fails before an ID is available.</li>
+              <li><code>method</code> is one of the stable method names below.</li>
+              <li><code>params</code> is omitted only when a method explicitly permits no params.</li>
+            </ul>
+          </div>
+          <div>
+            <h3>Response</h3>
+            <ul>
+              <li>Successful responses include <code>result</code> and omit <code>error</code>.</li>
+              <li>Failed responses include <code>error</code> and omit <code>result</code>.</li>
+              <li>The response <code>id</code> matches the request <code>id</code> whenever the request ID parsed successfully.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="spec-table-wrap">
+          <table class="spec-table">
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th>Params</th>
+                <th>Result</th>
+                <th>Semantics</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>initialize</code></td>
+                <td><code>{ clientName, clientVersion?, protocolVersion?, clientKind?, capabilities? }</code></td>
+                <td><code>{ serverName, serverVersion, protocolVersion, capabilities, methods, events }</code></td>
+                <td>Negotiates protocol version and optional client/server capabilities before session work.</td>
+              </tr>
+              <tr>
+                <td><code>session.create</code></td>
+                <td><code>{ cwd? }</code> or omitted</td>
+                <td><code>{ sessionId }</code></td>
+                <td>Creates a backend-owned session and appends <code>session.created</code> to its event log.</td>
+              </tr>
+              <tr>
+                <td><code>session.sendMessage</code></td>
+                <td><code>{ sessionId, text }</code></td>
+                <td><code>{ sessionId, runId, messageId }</code></td>
+                <td>Appends user input to a session, starts a run, and acknowledges the run IDs. Completion is reported later over SSE.</td>
+              </tr>
+              <tr>
+                <td><code>run.cancel</code></td>
+                <td><code>{ runId }</code></td>
+                <td><code>{ runId }</code></td>
+                <td>Requests cancellation for a running run and appends <code>run.cancelled</code> when accepted.</td>
+              </tr>
+              <tr>
+                <td><code>tool.approve</code></td>
+                <td><code>{ approvalId }</code></td>
+                <td><code>{ approvalId, accepted: true }</code></td>
+                <td>Allows a pending tool approval created by <code>tool.approval_requested</code>.</td>
+              </tr>
+              <tr>
+                <td><code>tool.reject</code></td>
+                <td><code>{ approvalId, reason? }</code></td>
+                <td><code>{ approvalId, accepted: false }</code></td>
+                <td>Rejects a pending tool approval and records an optional human-readable reason.</td>
+              </tr>
+              <tr>
+                <td><code>session.close</code></td>
+                <td><code>{ sessionId }</code></td>
+                <td><code>{ sessionId }</code></td>
+                <td>Closes the session for new runs. Existing retained events remain replayable while the session is retained.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== SSE ===== -->
+    <div class="page-inner animate">
+      <h2>SSE session events</h2>
+      <div class="contract-section">
+        <p>Clients subscribe to <code>GET /sessions/{sessionId}/events</code>. Each SSE frame includes an <code>id</code> line, an <code>event</code> line, and a JSON <code>data</code> payload. The SSE <code>id</code> must equal the payload <code>event_id</code>; the SSE <code>event</code> must equal the payload <code>type</code>.</p>
+
+        <pre><code>id: 019f2f6f-f178-7a72-9f28-000000000102
+event: model.text_delta
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"model.text_delta","run_id":"019f2f6f-f178-7a72-9f28-000000000101","message_id":"019f2f6f-f178-7a72-9f28-000000000103","delta":"hello","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large"}}</code></pre>
+
+        <div class="spec-grid">
+          <div>
+            <h3>Envelope</h3>
+            <ul>
+              <li><code>event_id</code> is a lowercase UUIDv7 and orders events within a session.</li>
+              <li><code>session_id</code> identifies the owning session.</li>
+              <li><code>type</code> is the event name. Event-specific fields are flattened into the same object.</li>
+              <li>All ID fields use the same lowercase UUIDv7 format as <code>nav-types</code>.</li>
+            </ul>
+          </div>
+          <div>
+            <h3>Replay and live mode</h3>
+            <ul>
+              <li>Without <code>Last-Event-ID</code>, the stream starts with the earliest retained session event and then continues live.</li>
+              <li>With a known <code>Last-Event-ID</code>, the stream resumes strictly after that event and then continues live.</li>
+              <li>With a malformed event ID, the server returns HTTP <code>400</code>.</li>
+              <li>With an unknown session, the server returns HTTP <code>404</code>.</li>
+              <li>With a valid but no-longer-retained event ID, the server returns HTTP <code>409</code> and a JSON resync error instead of an SSE stream.</li>
+            </ul>
+          </div>
+        </div>
+
+        <h3>Resync response</h3>
+        <p>A <code>409</code> response is not an SSE frame. It tells the client to discard its local protocol projection and rebuild before reconnecting.</p>
+        <pre><code>{
+  "error": "event_not_retained",
+  "sessionId": "019f2f6f-f178-7a72-9f28-000000000100",
+  "lastEventId": "019f2f6f-f178-7a72-9f28-000000000080",
+  "earliestEventId": "019f2f6f-f178-7a72-9f28-000000000120",
+  "snapshotRequired": true
+}</code></pre>
+        <p>Until a storage-backed snapshot or session-view method exists, servers should retain enough events to replay active sessions from the beginning. Once trimming is enabled, <code>snapshotRequired: true</code> means the client must load the canonical session view before opening a fresh event stream.</p>
+
+        <div class="spec-table-wrap">
+          <table class="spec-table">
+            <thead>
+              <tr>
+                <th>Event</th>
+                <th>Payload fields beyond envelope</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>session.created</code></td>
+                <td>None</td>
+                <td>First event for a newly created session.</td>
+              </tr>
+              <tr>
+                <td><code>run.started</code></td>
+                <td><code>run_id</code></td>
+                <td>Run accepted by the backend.</td>
+              </tr>
+              <tr>
+                <td><code>model.text_delta</code></td>
+                <td><code>run_id</code>, <code>message_id</code>, <code>delta</code>, <code>metadata</code></td>
+                <td>Provider-facing assistant text delta. Current TUI consumes this directly.</td>
+              </tr>
+              <tr>
+                <td><code>model.reasoning_delta</code></td>
+                <td><code>run_id</code>, <code>message_id</code>, <code>delta</code>, <code>metadata</code></td>
+                <td>Provider reasoning stream. Frontends must treat it as a separate display channel from assistant text.</td>
+              </tr>
+              <tr>
+                <td><code>message.delta</code></td>
+                <td><code>run_id</code>, <code>message_id</code>, <code>text</code></td>
+                <td>Normalized frontend-ready assistant text. This is the preferred stable display event once implemented.</td>
+              </tr>
+              <tr>
+                <td><code>message.completed</code></td>
+                <td><code>run_id</code>, <code>message_id</code>, <code>finish_reason?</code>, <code>metadata?</code></td>
+                <td>Marks the assistant message complete.</td>
+              </tr>
+              <tr>
+                <td><code>tool.call_requested</code></td>
+                <td><code>run_id</code>, <code>tool_call_id</code>, <code>name</code></td>
+                <td>High-level tool request before approval or execution.</td>
+              </tr>
+              <tr>
+                <td><code>tool.call_started</code></td>
+                <td><code>run_id</code>, <code>tool_call_id</code>, <code>name?</code>, <code>metadata?</code></td>
+                <td>Tool call stream started.</td>
+              </tr>
+              <tr>
+                <td><code>tool.call_delta</code></td>
+                <td><code>run_id</code>, <code>tool_call_id</code>, <code>arguments_delta</code>, <code>metadata</code></td>
+                <td>Incremental tool arguments from a provider stream.</td>
+              </tr>
+              <tr>
+                <td><code>tool.call_completed</code></td>
+                <td><code>run_id</code>, <code>tool_call_id</code>, <code>name?</code>, <code>arguments</code>, <code>metadata?</code></td>
+                <td>Tool call arguments are complete. Execution result events are separate future work.</td>
+              </tr>
+              <tr>
+                <td><code>tool.approval_requested</code></td>
+                <td><code>run_id</code>, <code>tool_call_id</code>, <code>approval_id</code></td>
+                <td>Frontend must ask the user or an agent policy before calling <code>tool.approve</code> or <code>tool.reject</code>.</td>
+              </tr>
+              <tr>
+                <td><code>file.changed</code></td>
+                <td><code>file_change_id</code>, <code>path</code></td>
+                <td>Backend observed or performed a workspace file change.</td>
+              </tr>
+              <tr>
+                <td><code>run.completed</code></td>
+                <td><code>run_id</code>, <code>metadata?</code></td>
+                <td>Terminal success event for the run.</td>
+              </tr>
+              <tr>
+                <td><code>run.cancelled</code></td>
+                <td><code>run_id</code></td>
+                <td>Terminal cancellation event for the run.</td>
+              </tr>
+              <tr>
+                <td><code>run.failed</code></td>
+                <td><code>run_id</code>, <code>message</code></td>
+                <td>Terminal backend failure event for the run.</td>
+              </tr>
+              <tr>
+                <td><code>provider.error</code></td>
+                <td><code>run_id</code>, <code>status?</code>, <code>message</code>, <code>error_type?</code>, <code>code?</code>, <code>metadata</code></td>
+                <td>Provider-originated error with sanitized provider metadata.</td>
+              </tr>
+              <tr>
+                <td><code>error</code></td>
+                <td><code>message</code></td>
+                <td>Session-level protocol error event when no narrower event applies.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== NEGOTIATION AND ERRORS ===== -->
+    <div class="page-inner animate">
+      <h2>Versioning and errors</h2>
+      <div class="detail-body">
+        <div>
+          <h3>Capability negotiation</h3>
+          <p><code>initialize</code> is the compatibility gate for future clients. Clients declare a protocol version and optional capabilities; the server returns the version it will speak, supported methods, supported event types, and enabled capabilities. Unknown capability keys must be ignored rather than treated as fatal.</p>
+          <pre><code>{
+  "clientName": "nav-tui",
+  "clientVersion": "26.5.12",
+  "protocolVersion": 1,
+  "clientKind": "tui",
+  "capabilities": {
+    "sseReplay": true,
+    "normalizedMessages": true,
+    "toolApprovals": true,
+    "providerMetadata": true
+  }
+}</code></pre>
+          <p>The stable server capability keys are <code>sseReplay</code>, <code>normalizedMessages</code>, <code>toolApprovals</code>, <code>fileEvents</code>, <code>providerMetadata</code>, and <code>sessionClose</code>. A client must not assume a capability unless the server returns it as enabled.</p>
+        </div>
+        <div>
+          <h3>Error codes</h3>
+          <div class="spec-table-wrap compact">
+            <table class="spec-table">
+              <thead>
+                <tr>
+                  <th>Code</th>
+                  <th>Meaning</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td><code>-32700</code></td><td>Parse error or invalid JSON-RPC body.</td></tr>
+                <tr><td><code>-32600</code></td><td>Invalid request envelope.</td></tr>
+                <tr><td><code>-32601</code></td><td>Unknown or unsupported method.</td></tr>
+                <tr><td><code>-32602</code></td><td>Invalid params, including blank <code>text</code>.</td></tr>
+                <tr><td><code>-32004</code></td><td>Resource not found: session, run, approval, or tool call.</td></tr>
+                <tr><td><code>-32005</code></td><td>Invalid resource state, such as cancelling an already completed run.</td></tr>
+                <tr><td><code>-32010</code></td><td>Unsupported protocol version or required capability.</td></tr>
+                <tr><td><code>-32020</code></td><td>Authentication, authorization, or local session-token failure.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== CURRENT IMPLEMENTATION ===== -->
+    <div class="page-inner animate">
+      <h2>Current implementation status</h2>
+      <div class="detail-body">
+        <div>
+          <h3>Already implemented</h3>
+          <ul>
+            <li><code>session.create</code>, <code>session.sendMessage</code>, and <code>run.cancel</code> are routed by <code>crates/nav-server/src/http/mod.rs</code>.</li>
+            <li><code>GET /sessions/{sessionId}/events</code> returns retained events encoded by <code>crates/nav-server/src/http/sse.rs</code>.</li>
+            <li>IDs are validated as lowercase UUIDv7 strings by <code>crates/nav-types/src/lib.rs</code>.</li>
+            <li>The Go TUI client creates a session, sends messages, tracks <code>Last-Event-ID</code>, and parses SSE in <code>tui/internal/client/client.go</code>.</li>
           </ul>
         </div>
         <div>
-          <h2>SSE event types</h2>
-          <p>Events stream to <code>GET /sessions/{id}/events</code>. Reconnect with <code>Last-Event-ID</code>.</p>
+          <h3>Prototype limitations</h3>
           <ul>
-            <li><code>session.created</code></li>
-            <li><code>run.started</code> / <code>run.completed</code> / <code>run.failed</code></li>
-            <li><code>message.delta</code> / <code>message.completed</code></li>
-            <li><code>tool.call_requested</code> / <code>tool.approval_requested</code></li>
-            <li><code>tool.call_started</code> / <code>tool.call_completed</code></li>
-            <li><code>file.changed</code></li>
+            <li><code>initialize</code>, <code>tool.approve</code>, <code>tool.reject</code>, and <code>session.close</code> are declared but not yet routed by the HTTP server.</li>
+            <li>The method table above is the stable target. Declared-but-unrouted RPC structs still need wire-shape alignment before exposure, including capability negotiation fields and camelCase approval/session params.</li>
+            <li>The SSE endpoint currently returns a finite replay response and closes; it does not hold a long-lived live connection.</li>
+            <li>If <code>Last-Event-ID</code> is valid but unknown, the current server replays the full retained log. The stable contract should move this to an explicit resync response.</li>
+            <li>Events are retained in memory only. <code>crates/nav-harness/src/sessions/mod.rs</code> is still a stub, so durable transcript storage, fork, compaction, and canonical replay remain backend storage work.</li>
+            <li>The current run path is intentionally minimal and maps model output through a synthetic OpenAI-compatible stream before the full harness loop is wired.</li>
+            <li>Local auth token types exist, but the current HTTP bootstrap exposes only <code>baseUrl</code>.</li>
+            <li>The current TUI consumes <code>model.text_delta</code> directly. Future general-purpose frontends should prefer normalized <code>message.delta</code> once emitted.</li>
           </ul>
         </div>
       </div>
@@ -74,7 +406,7 @@ flowchart LR
       <h2>Transport</h2>
       <div class="detail-body narrow">
         <div>
-          <p>Local HTTP on <code>127.0.0.1</code>, random port, random local auth token. Frontend launchers may spawn the backend and discover its URL/token through a small bootstrap mechanism.</p>
+          <p>Local clients talk to HTTP on <code>127.0.0.1</code> with a random port. Frontend launchers may spawn the backend and discover its base URL from the bootstrap line written by <code>nav-backend serve-http</code>.</p>
           <p>All protocol IDs are canonical lowercase <strong>UUIDv7</strong> strings — they're not secrets, but they do leak approximate creation time, so authentication uses separate random tokens.</p>
         </div>
       </div>

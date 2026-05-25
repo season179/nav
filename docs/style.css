@@ -155,6 +155,15 @@ h2 {
   letter-spacing: -0.02em;
 }
 
+.detail-body h3,
+.contract-section h3 {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--text-bright);
+  letter-spacing: 0;
+  margin: 0 0 0.65rem;
+}
+
 .lead {
   color: var(--text-dim);
   font-size: clamp(1rem, 1.5vw, 1.2rem);
@@ -423,23 +432,41 @@ pre code {
   gap: calc(var(--grid-gap) * 2);
 }
 
+.detail-body > div {
+  min-width: 0;
+}
+
 .detail-body h2 { margin-bottom: 0.75rem; }
 
 .detail-body p {
   margin-bottom: 1rem;
 }
 
-.detail-body ul {
+.detail-body ul,
+.spec-grid ul,
+.source-list {
   margin: 1rem 0 1.5rem 1.4rem;
   color: var(--text-dim);
 }
 
-.detail-body li {
+.spec-grid ul,
+.source-list {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+.detail-body li,
+.spec-grid li,
+.source-list li {
   margin-bottom: 0.45rem;
   line-height: 1.65;
 }
 
-.detail-body li::marker { color: var(--accent); }
+.detail-body li::marker,
+.spec-grid li::marker,
+.source-list li::marker {
+  color: var(--accent);
+}
 
 .note {
   margin-top: 2rem;
@@ -452,6 +479,71 @@ pre code {
 /* Single-column detail (for pages with less content) */
 .detail-body.narrow {
   grid-template-columns: minmax(0, 1.2fr);
+}
+
+.contract-section {
+  padding: 0 0 clamp(3rem, 6vh, 5rem);
+}
+
+.contract-section > p {
+  max-width: 78ch;
+}
+
+.spec-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--grid-gap);
+  margin: 1.5rem 0 2rem;
+}
+
+.spec-grid > div {
+  min-width: 0;
+}
+
+.spec-table-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 1.2rem 0 2rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(13, 21, 18, 0.55);
+}
+
+.spec-table-wrap.compact {
+  margin-top: 0;
+}
+
+.spec-table {
+  width: 100%;
+  min-width: 48rem;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.spec-table th,
+.spec-table td {
+  padding: 0.8rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  text-align: left;
+}
+
+.spec-table th {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: rgba(52, 211, 153, 0.06);
+}
+
+.spec-table td {
+  color: var(--text-dim);
+  line-height: 1.55;
+}
+
+.spec-table tr:last-child td {
+  border-bottom: 0;
 }
 
 /* ==========================================
@@ -622,6 +714,9 @@ pre code {
     grid-template-columns: repeat(2, 1fr);
   }
   .detail-body {
+    grid-template-columns: 1fr;
+  }
+  .spec-grid {
     grid-template-columns: 1fr;
   }
 }
