@@ -4,10 +4,43 @@ Status: accepted direction. The current prototype may lag behind this document.
 
 ## Intent
 
+`nav` is a learning project: a coding agent built from the ground up to make
+the agent loop, tool execution, permissions, context handling, and terminal UI
+easier to understand by building them directly.
+
+The primary purpose is learning by building a coding agent. The secondary
+purpose is to grow it into a personalized coding agent for Season's own
+workflow.
+
+That purpose should shape architecture decisions. Prefer clear boundaries,
+plain names, and easy-to-follow code over clever abstractions. The project
+should be understandable to someone studying how coding agents work.
+
+## Product Shape
+
 `nav` is a Rust coding agent backend with replaceable frontends.
 
 The first frontend is the Go Bubble Tea TUI, but the backend protocol must also
 support future Electron and web frontends.
+
+## Repository Folders
+
+- `crates/` contains Rust crates.
+- `crates/nav-backend/` contains the coding agent backend.
+- `docs/` contains architecture and design notes.
+- `tui/` contains the Go Bubble Tea terminal frontend.
+- `tui/cmd/` contains executable entrypoints only.
+- `tui/cmd/nav/` is the released TUI command.
+- `tui/cmd/navd/` is the local development entrypoint.
+- `tui/internal/` contains private Go packages for the TUI module.
+- `tui/internal/app/` wires the backend client into the Bubble Tea program.
+- `tui/internal/client/` owns the frontend-to-backend API client.
+- `tui/internal/localdev/` owns local checkout build/run behavior for `navd`.
+- `tui/internal/ui/` owns Bubble Tea state, updates, rendering, layout, and
+  styles.
+
+Generated folders such as `target/` and `.cache/` are build artifacts, not
+source architecture.
 
 ## Boundaries
 
@@ -26,6 +59,20 @@ Frontends own presentation:
 
 The protocol should not expose Bubble Tea, Electron, or browser-specific
 concepts.
+
+## TUI Package Rules
+
+The Go TUI should keep entrypoints thin and package names boring:
+
+- `cmd/*` should delegate immediately to internal packages.
+- `internal/app` is the composition point, not a domain layer.
+- `internal/client` is the backend protocol boundary.
+- `internal/ui` should translate backend events into UI state.
+- Rendering, styles, layout helpers, and input handling should stay split once
+  they become large enough to read independently.
+
+`navd` should not become a product subsystem. It is a development convenience
+for running local builds without confusing them with released `nav`.
 
 ## Protocol
 
@@ -91,7 +138,7 @@ The default backend transport is local HTTP:
 - require a random local auth token or secure local cookie
 - deny broad CORS by default
 
-`nav` and `navd` may spawn the backend and discover its URL/token through a
+Frontend launchers may spawn the backend and discover its URL/token through a
 small bootstrap mechanism. Stdio may be used for bootstrap or logs, but not as
 the application protocol.
 

@@ -1,4 +1,4 @@
-package backend
+package client
 
 import (
 	"bufio"
@@ -35,11 +35,11 @@ type Client struct {
 	stdout      *bufio.Scanner
 }
 
-func NewClient() *Client {
-	return NewClientWithBackendPath("")
+func New() *Client {
+	return NewWithBackendPath("")
 }
 
-func NewClientWithBackendPath(backendPath string) *Client {
+func NewWithBackendPath(backendPath string) *Client {
 	return &Client{backendPath: backendPath}
 }
 
