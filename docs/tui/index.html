@@ -4,25 +4,64 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TUI — nav</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600;700&family=Karla:wght@400;500&display=swap" rel="stylesheet">
-  <style>
-    :root { --bg: #0c1016; --text: #e6edf3; --muted: #8b9aab; --link: #4db8a8; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: Karla, sans-serif; font-size: 1.05rem; line-height: 1.6; color: var(--text); background: var(--bg); max-width: 36rem; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
-    .crumb { font-size: 0.85rem; margin-bottom: 1.5rem; }
-    .crumb a { color: var(--muted); text-decoration: none; }
-    .crumb a:hover { color: var(--link); }
-    h1 { font-family: "Cormorant Garamond", serif; font-size: 2.25rem; font-weight: 700; margin-bottom: 0.75rem; }
-    p { color: var(--muted); margin-bottom: 1rem; }
-    code { font-size: 0.9em; color: var(--link); }
-  </style>
+  <link rel="stylesheet" href="../style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script src="../mermaid.js"></script>
 </head>
 <body>
-  <p class="crumb"><a href="../">nav</a> / tui</p>
-  <h1>TUI</h1>
-  <p>Go Bubble Tea terminal UI. <code>nav</code> is the released command; <code>navd</code> runs local builds from a checkout.</p>
-  <p><code>internal/app</code> wires the backend client; <code>internal/client</code> is the protocol boundary; <code>internal/ui</code> maps events to views. Entrypoints in <code>cmd/*</code> stay thin.</p>
+  <div class="page">
+    <div class="page-inner animate">
+      <nav class="crumb">
+        <a href="../index.html">nav</a><span class="sep">/</span><span class="current">tui</span>
+      </nav>
+
+      <div class="detail-header">
+        <h1>TUI<em>.</em></h1>
+      </div>
+    </div>
+
+    <div class="page-inner diagram-section animate">
+      <h2>Go packages</h2>
+      <p class="lead">The TUI is a Bubble Tea program with thin entrypoints and clear internal boundaries.</p>
+      <div class="mermaid">
+flowchart TB
+  subgraph cmd["Entrypoints"]
+    nav["cmd/nav\nreleased binary"]
+    navd["cmd/navd\nlocal dev"]
+  end
+  subgraph internal["internal/"]
+    app["app/\ncomposition root"]
+    client["client/\nbackend API"]
+    ui["ui/\nviews &amp; styles"]
+    localdev["localdev/\nbuild &amp; run"]
+  end
+
+  nav --> app
+  navd --> app
+  app --> client
+  app --> ui
+  app --> localdev
+      </div>
+    </div>
+
+    <div class="page-inner animate">
+      <div class="detail-body narrow">
+        <div>
+          <p><code>internal/app</code> wires the backend client into the Bubble Tea program. <code>internal/client</code> is the protocol boundary — it speaks JSON-RPC and consumes SSE. <code>internal/ui</code> maps backend events to views.</p>
+          <p><code>nav</code> is the released command; <code>navd</code> runs local builds from a checkout. Entrypoints stay thin — they delegate to <code>internal/</code> immediately.</p>
+        </div>
+      </div>
+    </div>
+
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <span class="footer-left">nav v26.5.12</span>
+        <div class="footer-right">
+          <a href="../architecture/index.html">Architecture</a>
+          <a href="../index.html">Index</a>
+        </div>
+      </div>
+    </footer>
+  </div>
 </body>
 </html>
