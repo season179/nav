@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Protocol — nav</title>
   <link rel="stylesheet" href="../style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({theme:'dark',themeVariables:{darkMode:true,background:'#0d1512',primaryColor:'#1a2a23',primaryTextColor:'#e0ece4',primaryBorderColor:'#2a4a3a',lineColor:'#34d399',secondaryColor:'#152220',tertiaryColor:'#0d1512',fontFamily:'"JetBrains Mono","Fira Code",monospace',fontSize:'13px',noteBkgColor:'#1a2a23',noteTextColor:'#e0ece4',noteBorderColor:'#2a4a3a',actorTextColor:'#e0ece4',actorBorder:'#34d399',labelTextColor:'#e0ece4',edgeLabelBackground:'#0d1512'},flowchart:{htmlLabels:true,curve:'basis',padding:20}});</script>
 </head>
 <body>
   <div class="page">
@@ -18,13 +20,63 @@
       </div>
     </div>
 
-    <div class="page-inner detail-body animate">
-      <div>
-        <p><strong>Commands</strong> — JSON-RPC 2.0 at <code>POST /rpc</code> (<code>initialize</code>, <code>session.create</code>, <code>session.sendMessage</code>, tool approve/reject, etc.). Responses acknowledge state; long output streams separately.</p>
-        <p><strong>Events</strong> — SSE at <code>GET /sessions/{session_id}/events</code> (<code>message.delta</code>, tool lifecycle, run completed/failed, …). Reconnect with <code>Last-Event-ID</code>.</p>
+    <!-- ===== PROTOCOL OVERVIEW DIAGRAM ===== -->
+    <div class="page-inner diagram-section animate">
+      <h2>Two channels</h2>
+      <p class="lead">Commands go in via JSON-RPC. Events stream out via SSE. The frontend never polls.</p>
+      <div class="mermaid">
+flowchart LR
+  subgraph frontend["Frontend (TUI / Electron / Web)"]
+    f["UI"]
+  end
+  subgraph backend["Backend (nav-server)"]
+    rpc["POST /rpc\nJSON-RPC 2.0"]
+    sse["GET /sessions/{id}/events\nServer-Sent Events"]
+  end
+
+  f -->|"commands:\ninitialize, sendMessage,\ntool.approve, …"| rpc
+  sse -->|"events:\nmessage.delta, run.completed,\ntool.approval_requested, …"| f
       </div>
-      <div>
-        <p><strong>Transport</strong> — local HTTP on <code>127.0.0.1</code>, random port, local auth token. All protocol IDs are lowercase UUIDv7.</p>
+    </div>
+
+    <!-- ===== METHODS & EVENTS ===== -->
+    <div class="page-inner animate">
+      <div class="detail-body">
+        <div>
+          <h2 style="margin-bottom:0.75rem">JSON-RPC methods</h2>
+          <p>Frontend commands hit <code>POST /rpc</code>. Responses acknowledge state immediately.</p>
+          <ul>
+            <li><code>initialize</code> — handshake</li>
+            <li><code>session.create</code> — start a session</li>
+            <li><code>session.sendMessage</code> — user input</li>
+            <li><code>run.cancel</code> — abort a running agent loop</li>
+            <li><code>tool.approve</code> / <code>tool.reject</code> — tool permission</li>
+            <li><code>session.close</code> — end a session</li>
+          </ul>
+        </div>
+        <div>
+          <h2 style="margin-bottom:0.75rem">SSE event types</h2>
+          <p>Events stream to <code>GET /sessions/{id}/events</code>. Reconnect with <code>Last-Event-ID</code>.</p>
+          <ul>
+            <li><code>session.created</code></li>
+            <li><code>run.started</code> / <code>run.completed</code> / <code>run.failed</code></li>
+            <li><code>message.delta</code> / <code>message.completed</code></li>
+            <li><code>tool.call_requested</code> / <code>tool.approval_requested</code></li>
+            <li><code>tool.call_started</code> / <code>tool.call_completed</code></li>
+            <li><code>file.changed</code></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== TRANSPORT ===== -->
+    <div class="page-inner animate">
+      <h2>Transport</h2>
+      <div class="detail-body narrow">
+        <div>
+          <p>Local HTTP on <code>127.0.0.1</code>, random port, random local auth token. Frontend launchers may spawn the backend and discover its URL/token through a small bootstrap mechanism.</p>
+          <p>All protocol IDs are canonical lowercase <strong>UUIDv7</strong> strings — they're not secrets, but they do leak approximate creation time, so authentication uses separate random tokens.</p>
+        </div>
       </div>
     </div>
 

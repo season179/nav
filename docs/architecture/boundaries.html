@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Boundaries — nav</title>
   <link rel="stylesheet" href="../style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({theme:'dark',themeVariables:{darkMode:true,background:'#0d1512',primaryColor:'#1a2a23',primaryTextColor:'#e0ece4',primaryBorderColor:'#2a4a3a',lineColor:'#34d399',secondaryColor:'#152220',tertiaryColor:'#0d1512',fontFamily:'"JetBrains Mono","Fira Code",monospace',fontSize:'13px',noteBkgColor:'#1a2a23',noteTextColor:'#e0ece4',noteBorderColor:'#2a4a3a',actorTextColor:'#e0ece4',actorBorder:'#34d399',labelTextColor:'#e0ece4',edgeLabelBackground:'#0d1512'},flowchart:{htmlLabels:true,curve:'basis',padding:20}});</script>
 </head>
 <body>
   <div class="page">
@@ -18,13 +20,53 @@
       </div>
     </div>
 
-    <div class="page-inner detail-body animate">
-      <div>
-        <p><strong>Backend</strong> owns agent state and side effects: sessions, runs, tools, models, filesystem/shell, policy.</p>
-        <p><strong>Frontends</strong> own presentation: layout, input, reconnect UX, optimistic UI. The protocol stays UI-agnostic.</p>
+    <!-- ===== RESPONSIBILITY DIAGRAM ===== -->
+    <div class="page-inner diagram-section animate">
+      <h2>Who owns what</h2>
+      <div class="mermaid">
+flowchart LR
+  subgraph frontend["Frontend owns"]
+    direction TB
+    f1["Layout &amp; rendering"]
+    f2["Input handling"]
+    f3["Reconnect UX"]
+    f4["Optimistic UI state"]
+  end
+  subgraph protocol["Protocol"]
+    p["UI-agnostic\nJSON-RPC + SSE"]
+  end
+  subgraph backend["Backend owns"]
+    direction TB
+    b1["Sessions &amp; runs"]
+    b2["Agent loop"]
+    b3["Model orchestration"]
+    b4["Filesystem &amp; shell"]
+    b5["Permissions &amp; policy"]
+  end
+
+  frontend <-->|"protocol"| backend
       </div>
-      <div>
-        <p><strong>Prototype gap:</strong> today the TUI still talks to the backend over stdio with a hello check; HTTP&nbsp;+&nbsp;SSE is the target.</p>
+    </div>
+
+    <div class="page-inner animate">
+      <div class="detail-body">
+        <div>
+          <p><strong>Backend</strong> owns agent state and side effects: sessions, runs, tools, models, filesystem/shell, policy.</p>
+          <p><strong>Frontends</strong> own presentation: layout, input, reconnect UX, optimistic UI. The protocol stays UI-agnostic.</p>
+        </div>
+        <div>
+          <p><strong>Rule of thumb:</strong> if a concept would mean something in a CLI, an Electron app, and a web browser, it belongs in the backend. If it only makes sense on a screen, it belongs in the frontend.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== CURRENT GAP ===== -->
+    <div class="page-inner animate">
+      <h2>Prototype gap</h2>
+      <div class="detail-body narrow">
+        <div>
+          <p>Today the TUI still talks to the backend over <strong>stdio</strong> with a hello check; HTTP&nbsp;+&nbsp;SSE is the target. The next milestone replaces the stdio path with the full protocol.</p>
+        </div>
       </div>
     </div>
 

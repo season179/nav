@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TUI — nav</title>
   <link rel="stylesheet" href="../style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({theme:'dark',themeVariables:{darkMode:true,background:'#0d1512',primaryColor:'#1a2a23',primaryTextColor:'#e0ece4',primaryBorderColor:'#2a4a3a',lineColor:'#34d399',secondaryColor:'#152220',tertiaryColor:'#0d1512',fontFamily:'"JetBrains Mono","Fira Code",monospace',fontSize:'13px',noteBkgColor:'#1a2a23',noteTextColor:'#e0ece4',noteBorderColor:'#2a4a3a',actorTextColor:'#e0ece4',actorBorder:'#34d399',labelTextColor:'#e0ece4',edgeLabelBackground:'#0d1512'},flowchart:{htmlLabels:true,curve:'basis',padding:20}});</script>
 </head>
 <body>
   <div class="page">
@@ -18,13 +20,36 @@
       </div>
     </div>
 
-    <div class="page-inner detail-body animate">
-      <div>
-        <p>Go Bubble Tea terminal UI. <code>nav</code> is the released command; <code>navd</code> runs local builds from a checkout.</p>
-        <p><code>internal/app</code> wires the backend client; <code>internal/client</code> is the protocol boundary; <code>internal/ui</code> maps events to views.</p>
+    <div class="page-inner diagram-section animate">
+      <h2>Go packages</h2>
+      <p class="lead">The TUI is a Bubble Tea program with thin entrypoints and clear internal boundaries.</p>
+      <div class="mermaid">
+flowchart TB
+  subgraph cmd["Entrypoints"]
+    nav["cmd/nav\nreleased binary"]
+    navd["cmd/navd\nlocal dev"]
+  end
+  subgraph internal["internal/"]
+    app["app/\ncomposition root"]
+    client["client/\nbackend API"]
+    ui["ui/\nviews &amp; styles"]
+    localdev["localdev/\nbuild &amp; run"]
+  end
+
+  nav --> app
+  navd --> app
+  app --> client
+  app --> ui
+  app --> localdev
       </div>
-      <div>
-        <p>Entrypoints in <code>cmd/*</code> stay thin.</p>
+    </div>
+
+    <div class="page-inner animate">
+      <div class="detail-body narrow">
+        <div>
+          <p><code>internal/app</code> wires the backend client into the Bubble Tea program. <code>internal/client</code> is the protocol boundary — it speaks JSON-RPC and consumes SSE. <code>internal/ui</code> maps backend events to views.</p>
+          <p><code>nav</code> is the released command; <code>navd</code> runs local builds from a checkout. Entrypoints stay thin — they delegate to <code>internal/</code> immediately.</p>
+        </div>
       </div>
     </div>
 
@@ -32,6 +57,7 @@
       <div class="footer-inner">
         <span class="footer-left">nav v26.5.12</span>
         <div class="footer-right">
+          <a href="../architecture/index.html">Architecture</a>
           <a href="../index.html">Index</a>
         </div>
       </div>

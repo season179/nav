@@ -1,27 +1,29 @@
 /* ==========================================
-   NAV DOCS — "Blueprint" Design System
-   Full-width editorial layout with warm amber
-   accents on a deep slate canvas.
+   NAV DOCS — Emerald Design System
+   Lighter palette with high-contrast emerald
+   green accents.
    ========================================== */
 
 @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Atkinson+Hyperlegible:wght@400;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
-  --bg: #0a0e14;
-  --surface: #111820;
-  --surface-raised: #161e28;
-  --surface-hover: #1c2533;
-  --text: #d4cfc6;
-  --text-dim: #7a7568;
-  --text-bright: #f0ebe2;
-  --accent: #d4943c;
-  --accent-soft: rgba(212, 148, 60, 0.10);
-  --accent-glow: rgba(212, 148, 60, 0.04);
-  --teal: #4db8a8;
-  --teal-dim: rgba(77, 184, 168, 0.08);
-  --border: #1a2230;
-  --border-focus: #263040;
-  --mono: #c8b88a;
+  --bg: #0f1a17;
+  --surface: #152019;
+  --surface-raised: #1a2a23;
+  --surface-hover: #213530;
+  --text: #c8d6ce;
+  --text-dim: #8fa898;
+  --text-bright: #e8f0ea;
+  --accent: #34d399;
+  --accent-deep: #059669;
+  --accent-soft: rgba(52, 211, 153, 0.12);
+  --accent-glow: rgba(52, 211, 153, 0.05);
+  --accent-dim: rgba(52, 211, 153, 0.06);
+  --gold: #f0c060;
+  --gold-dim: rgba(240, 192, 96, 0.08);
+  --border: #1e3028;
+  --border-focus: #2a4a3a;
+  --mono: #a8d8b8;
   --font-display: 'Instrument Serif', Georgia, serif;
   --font-body: 'Atkinson Hyperlegible', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
@@ -51,7 +53,7 @@ body::before {
   inset: 0;
   background:
     radial-gradient(ellipse 80% 50% at 15% 10%, var(--accent-glow), transparent),
-    radial-gradient(ellipse 60% 40% at 85% 90%, var(--teal-dim), transparent);
+    radial-gradient(ellipse 60% 40% at 85% 90%, var(--gold-dim), transparent);
   pointer-events: none;
   z-index: 0;
 }
@@ -62,7 +64,7 @@ body::after {
   position: fixed;
   left: 0; top: 0; bottom: 0;
   width: 2px;
-  background: linear-gradient(180deg, var(--accent), var(--teal), var(--accent));
+  background: linear-gradient(180deg, var(--accent), var(--gold), var(--accent));
   background-size: 100% 200%;
   animation: bar-pulse 8s ease-in-out infinite;
   z-index: 100;
@@ -123,8 +125,8 @@ body::after {
   text-decoration: none;
   transition: color 0.2s;
 }
-.crumb a:hover { color: var(--teal); }
-.crumb .sep { margin: 0 0.5em; opacity: 0.3; }
+.crumb a:hover { color: var(--accent); }
+.crumb .sep { margin: 0 0.5em; opacity: 0.4; }
 .crumb .current { color: var(--accent); font-weight: 700; }
 
 /* ---- Typography ---- */
@@ -137,7 +139,7 @@ h1 {
   letter-spacing: -0.03em;
 }
 
-h1 .dot { color: var(--accent); }
+h1 .dot { color: var(--gold); }
 
 h1 em {
   font-style: italic;
@@ -170,11 +172,11 @@ strong { color: var(--text); font-weight: 700; }
 em { color: var(--text-dim); font-style: italic; }
 
 a {
-  color: var(--teal);
+  color: var(--accent);
   text-decoration: none;
   transition: color 0.2s;
 }
-a:hover { color: #6cd4c4; }
+a:hover { color: var(--gold); }
 
 /* ---- Inline code ---- */
 code {
@@ -245,7 +247,7 @@ pre code {
   background: var(--accent-soft);
   padding: 0.35rem 0.75rem;
   border-radius: 100px;
-  border: 1px solid rgba(212, 148, 60, 0.15);
+  border: 1px solid rgba(52, 211, 153, 0.2);
   width: fit-content;
 }
 
@@ -278,7 +280,7 @@ pre code {
   position: absolute;
   top: 0; left: 0; right: 0;
   height: 2px;
-  background: linear-gradient(90deg, var(--accent), var(--teal));
+  background: linear-gradient(90deg, var(--accent), var(--gold));
   opacity: 0;
   transition: opacity 0.3s;
 }
@@ -289,7 +291,7 @@ pre code {
   background: var(--surface-raised);
   box-shadow:
     0 20px 60px rgba(0, 0, 0, 0.4),
-    0 0 0 1px var(--accent-soft);
+    0 0 0 1px rgba(52, 211, 153, 0.15);
 }
 
 .card:hover::before { opacity: 1; }
@@ -448,6 +450,117 @@ pre code {
 /* Single-column detail (for pages with less content) */
 .detail-body.narrow {
   grid-template-columns: minmax(0, 1.2fr);
+}
+
+/* ==========================================
+   MERMAID DIAGRAMS
+   ========================================== */
+.mermaid {
+  background: #0d1512;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.5rem;
+  margin: 1.5rem 0;
+  text-align: center;
+  overflow-x: auto;
+}
+
+/* ==========================================
+   WALKTHROUGH / NUMBERED STEPS
+   ========================================== */
+.steps {
+  list-style: none;
+  counter-reset: step;
+  padding: 0;
+}
+
+.steps li {
+  counter-increment: step;
+  display: grid;
+  grid-template-columns: 2.5rem 1fr;
+  gap: 1rem;
+  align-items: start;
+  padding: 1.2rem 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  line-height: 1.65;
+}
+
+.steps li::before {
+  content: counter(step);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--accent);
+  width: 2.5rem;
+  height: 2.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-soft);
+  border: 1px solid rgba(52, 211, 153, 0.2);
+  border-radius: 50%;
+}
+
+.steps li:first-child {
+  border-top: 1px solid var(--border);
+}
+
+.steps strong {
+  color: var(--text);
+}
+
+.steps code {
+  font-size: 0.82em;
+}
+
+/* ==========================================
+   PRINCIPLE PILLS
+   ========================================== */
+.principles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: var(--grid-gap);
+  margin: 1.5rem 0;
+}
+
+.principle {
+  padding: 1.2rem 1.3rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  border-left: 3px solid var(--accent);
+}
+
+.principle strong {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  color: var(--text-bright);
+  margin-bottom: 0.3rem;
+}
+
+.principle p {
+  font-size: 0.88rem;
+  margin: 0;
+  max-width: none;
+  color: var(--text-dim);
+  line-height: 1.55;
+}
+
+/* ==========================================
+   FULL-WIDTH DIAGRAM SECTION
+   ========================================== */
+.diagram-section {
+  padding: 2rem 0 3rem;
+}
+
+.diagram-section h2 {
+  margin-bottom: 0.5rem;
+}
+
+.diagram-section .lead {
+  margin-bottom: 1.5rem;
 }
 
 /* ==========================================

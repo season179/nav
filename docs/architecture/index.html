@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Architecture — nav</title>
   <link rel="stylesheet" href="../style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({theme:'dark',themeVariables:{darkMode:true,background:'#0d1512',primaryColor:'#1a2a23',primaryTextColor:'#e0ece4',primaryBorderColor:'#2a4a3a',lineColor:'#34d399',secondaryColor:'#152220',tertiaryColor:'#0d1512',fontFamily:'"JetBrains Mono","Fira Code",monospace',fontSize:'13px',noteBkgColor:'#1a2a23',noteTextColor:'#e0ece4',noteBorderColor:'#2a4a3a',actorTextColor:'#e0ece4',actorBorder:'#34d399',labelTextColor:'#e0ece4',edgeLabelBackground:'#0d1512'},flowchart:{htmlLabels:true,curve:'basis',padding:20}});</script>
 </head>
 <body>
   <div class="page">
@@ -19,6 +21,35 @@
       </div>
     </div>
 
+    <!-- ===== CONTAINER DIAGRAM ===== -->
+    <div class="page-inner diagram-section animate">
+      <h2>Container view</h2>
+      <p class="lead">The deployable units and how they depend on each other.</p>
+      <div class="mermaid">
+flowchart TB
+  subgraph rust["Rust"]
+    direction TB
+    backend["nav-backend\nbinary entrypoint"]
+    server["nav-server\nHTTP · JSON-RPC · SSE · Auth"]
+    harness["nav-harness\nagent engine"]
+    protocol["nav-protocol\nwire types"]
+    types["nav-types\nprimitives (UUIDv7)"]
+  end
+  subgraph go["Go"]
+    tui["TUI\nBubble Tea frontend"]
+  end
+
+  backend --> server
+  server --> protocol
+  server --> harness
+  protocol --> types
+  harness -.->|"uses"| types
+
+  tui <-->|"HTTP\nJSON-RPC + SSE"| server
+      </div>
+    </div>
+
+    <!-- ===== SECTION LINKS ===== -->
     <div class="page-inner section-links animate">
       <ul>
         <li>
@@ -49,6 +80,7 @@
       <div class="footer-inner">
         <span class="footer-left">nav v26.5.12</span>
         <div class="footer-right">
+          <a href="../how-it-works.html">How it works</a>
           <a href="../index.html">Index</a>
         </div>
       </div>

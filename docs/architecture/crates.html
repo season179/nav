@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Crates — nav</title>
   <link rel="stylesheet" href="../style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({theme:'dark',themeVariables:{darkMode:true,background:'#0d1512',primaryColor:'#1a2a23',primaryTextColor:'#e0ece4',primaryBorderColor:'#2a4a3a',lineColor:'#34d399',secondaryColor:'#152220',tertiaryColor:'#0d1512',fontFamily:'"JetBrains Mono","Fira Code",monospace',fontSize:'13px',noteBkgColor:'#1a2a23',noteTextColor:'#e0ece4',noteBorderColor:'#2a4a3a',actorTextColor:'#e0ece4',actorBorder:'#34d399',labelTextColor:'#e0ece4',edgeLabelBackground:'#0d1512'},flowchart:{htmlLabels:true,curve:'basis',padding:20}});</script>
 </head>
 <body>
   <div class="page">
@@ -18,21 +20,83 @@
       </div>
     </div>
 
-    <div class="page-inner detail-body animate">
-      <div>
-        <p>Dependency flow: <code>nav-backend → nav-server → nav-harness</code>, with <code>nav-protocol → nav-types</code> for wire types.</p>
-        <ul>
-          <li><code>nav-backend</code> — binary entrypoint</li>
-          <li><code>nav-server</code> — HTTP, JSON-RPC, SSE, auth, bootstrap</li>
-          <li><code>nav-harness</code> — agent engine (sessions, tools, models, guardrails, …)</li>
-        </ul>
+    <!-- ===== CRATE DEPENDENCY DIAGRAM ===== -->
+    <div class="page-inner diagram-section animate">
+      <h2>Dependency graph</h2>
+      <p class="lead">Dependencies point inward. <code>nav-harness</code> knows nothing about HTTP or frontends.</p>
+      <div class="mermaid">
+flowchart BT
+  types["nav-types\nUUIDv7 primitives"]
+  protocol["nav-protocol\nJSON-RPC &amp; SSE types"]
+  harness["nav-harness\nagent engine"]
+  server["nav-server\nHTTP · Auth · Routing"]
+  backend["nav-backend\nbinary entrypoint"]
+
+  types --> protocol
+  protocol --> server
+  harness --> server
+  server --> backend
       </div>
-      <div>
-        <ul>
-          <li><code>nav-protocol</code> — shared RPC and event types</li>
-          <li><code>nav-types</code> — primitives (UUIDv7 IDs)</li>
-          <li><code>tui/</code> — Go Bubble Tea frontend (<code>cmd/nav</code>, <code>internal/*</code>)</li>
-        </ul>
+    </div>
+
+    <!-- ===== HARNESS INTERNALS ===== -->
+    <div class="page-inner diagram-section animate">
+      <h2>Inside nav-harness</h2>
+      <p class="lead">The agent engine is the heart of nav. Each folder owns one concern.</p>
+      <div class="mermaid">
+flowchart TB
+  subgraph harness["nav-harness"]
+    sessions["sessions/"]
+    agents["agents/"]
+    models["models/"]
+    context["context/"]
+    tools["tools/"]
+    skills["skills/"]
+    guardrails["guardrails/"]
+    verification["verification/"]
+    events["events/"]
+    observability["observability/"]
+    workspace["workspace/"]
+  end
+
+  agents --> models
+  agents --> context
+  agents --> tools
+  agents --> sessions
+  tools --> guardrails
+  tools --> workspace
+  sessions --> events
+  agents --> verification
+  agents --> observability
+  agents --> skills
+      </div>
+    </div>
+
+    <!-- ===== ALL CRATES LIST ===== -->
+    <div class="page-inner animate">
+      <h2>Full listing</h2>
+      <div class="detail-body">
+        <div>
+          <p><strong>Rust crates</strong> live in <code>crates/</code>:</p>
+          <ul>
+            <li><code>nav-backend</code> — binary entrypoint</li>
+            <li><code>nav-server</code> — HTTP, JSON-RPC, SSE, auth, bootstrap</li>
+            <li><code>nav-harness</code> — agent engine (the diagram above)</li>
+            <li><code>nav-protocol</code> — shared RPC and event types</li>
+            <li><code>nav-types</code> — primitives (UUIDv7 IDs)</li>
+          </ul>
+        </div>
+        <div>
+          <p><strong>Go packages</strong> live in <code>tui/</code>:</p>
+          <ul>
+            <li><code>cmd/nav</code> — released TUI command</li>
+            <li><code>cmd/navd</code> — local dev entrypoint</li>
+            <li><code>internal/app</code> — composition root</li>
+            <li><code>internal/client</code> — protocol boundary</li>
+            <li><code>internal/ui</code> — Bubble Tea views &amp; styles</li>
+            <li><code>internal/localdev</code> — build/run for navd</li>
+          </ul>
+        </div>
       </div>
     </div>
 

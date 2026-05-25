@@ -5,9 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>nav</title>
   <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({theme:'dark',themeVariables:{darkMode:true,background:'#0d1512',primaryColor:'#1a2a23',primaryTextColor:'#e0ece4',primaryBorderColor:'#2a4a3a',lineColor:'#34d399',secondaryColor:'#152220',tertiaryColor:'#0d1512',fontFamily:'"JetBrains Mono","Fira Code",monospace',fontSize:'13px',noteBkgColor:'#1a2a23',noteTextColor:'#e0ece4',noteBorderColor:'#2a4a3a',actorTextColor:'#e0ece4',actorBorder:'#34d399',labelTextColor:'#e0ece4',edgeLabelBackground:'#0d1512'},flowchart:{htmlLabels:true,curve:'basis',padding:20}});</script>
 </head>
 <body>
   <div class="page">
+    <!-- ===== HERO ===== -->
     <div class="page-inner animate">
       <div class="hero">
         <div class="hero-text">
@@ -16,35 +19,98 @@
         <div class="hero-aside">
           <span class="version-badge">v26.5.12 · MIT</span>
           <p class="lead">
-            A learning project: a coding agent built from scratch so the agent loop, tools,
-            permissions, context, and terminal UI stay readable. Experimental — do not depend on it yet.
+            A coding agent built from scratch — so the agent loop, tools,
+            permissions, context, and terminal UI stay readable.
           </p>
         </div>
       </div>
     </div>
 
+    <!-- ===== BIG PICTURE ===== -->
+    <div class="page-inner diagram-section animate">
+      <h2>The big picture</h2>
+      <p class="lead">
+        <strong>nav</strong> is a Rust backend that runs an agent loop — calling LLMs, executing tools,
+        enforcing guardrails — with a Go terminal UI that talks to it over HTTP.
+      </p>
+      <div class="mermaid">
+flowchart LR
+  subgraph ext["External"]
+    llm["🤖 LLM APIs"]
+    fs["📁 Filesystem &amp; Git"]
+  end
+  subgraph nav["nav"]
+    backend["Rust Backend"]
+    tui["Go TUI"]
+  end
+  dev["👨‍💻 Developer"]
+
+  dev -->|"types in"| tui
+  tui <-->|"JSON-RPC + SSE"| backend
+  backend -->|"API calls"| llm
+  backend -->|"reads / writes"| fs
+  llm -.->|"streaming tokens"| backend
+  backend -.->|"events"| tui
+      </div>
+    </div>
+
+    <!-- ===== PRINCIPLES ===== -->
+    <div class="page-inner animate">
+      <h2>Design principles</h2>
+      <p class="lead" style="margin-bottom:1.5rem">Every decision in nav traces back to one of these.</p>
+      <div class="principles">
+        <div class="principle">
+          <strong>Learn by building</strong>
+          <p>The primary purpose is understanding how coding agents work — not outperforming them.</p>
+        </div>
+        <div class="principle">
+          <strong>Clear boundaries</strong>
+          <p>Backend owns state &amp; side effects. Frontend owns presentation. Protocol stays UI-agnostic.</p>
+        </div>
+        <div class="principle">
+          <strong>Plain names</strong>
+          <p>Prefer <code>sessions/</code> over abstractions. Code should explain itself.</p>
+        </div>
+        <div class="principle">
+          <strong>Replaceable frontends</strong>
+          <p>Go TUI ships first, but the protocol must also support Electron and web frontends.</p>
+        </div>
+        <div class="principle">
+          <strong>Folders before crates</strong>
+          <p>Promote a folder to a crate only when its API is stable. Reshape while learning.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== SECTION CARDS ===== -->
     <div class="page-inner cards-section animate">
       <div class="cards-grid">
         <a href="architecture/index.html" class="card">
           <span class="num">§ 01</span>
           <h2>Architecture</h2>
-          <p>Shape, crates, protocol, and boundaries</p>
+          <p>Crates, container diagram, protocol, and boundaries</p>
+          <span class="go">explore →</span>
+        </a>
+        <a href="how-it-works.html" class="card">
+          <span class="num">§ 02</span>
+          <h2>How it works</h2>
+          <p>One message, end to end — from keystroke to tool call</p>
           <span class="go">explore →</span>
         </a>
         <a href="backend/index.html" class="card">
-          <span class="num">§ 02</span>
+          <span class="num">§ 03</span>
           <h2>Backend</h2>
           <p>Sessions, models, and harness design</p>
           <span class="go">explore →</span>
         </a>
         <a href="tui/index.html" class="card">
-          <span class="num">§ 03</span>
+          <span class="num">§ 04</span>
           <h2>TUI</h2>
           <p>Go Bubble Tea terminal frontend</p>
           <span class="go">explore →</span>
         </a>
         <a href="development/index.html" class="card">
-          <span class="num">§ 04</span>
+          <span class="num">§ 05</span>
           <h2>Development</h2>
           <p>Build, test, and run locally</p>
           <span class="go">explore →</span>
