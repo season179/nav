@@ -1,458 +1,57 @@
 # nav
 
-`nav` is a learning project: a Rust coding-agent harness built to understand
-how coding agents actually work by building one.
+`nav` is a learning project: a coding agent built from the ground up to make
+the agent loop, tool execution, permissions, context handling, and terminal UI
+easier to understand by building them directly.
 
-The first goal is learning. `nav` should keep the agent loop, tool plumbing,
-transport, approvals, session replay, compaction, and frontend contracts close
-enough to the surface that they can be studied and changed without digging
-through a giant framework.
+The primary purpose is learning by building a coding agent. The secondary
+purpose is to grow it into a personalized coding agent for my own workflow.
 
-The second goal is personal usefulness. As the harness gets clearer, it should
-also become good enough for real work in this checkout and nearby projects: safe
-around the workspace, explicit about what it is doing, resumable after longer
-sessions, and pleasant enough to use from the terminal.
+Do not depend on `nav` yet. The project is early, experimental, and likely to
+change drastically as the architecture becomes clearer.
 
-## Current Focus
+## Shape
 
-- **Learn the harness:** keep the model loop, tool calls, event stream,
-  approval flow, replay, and compaction behavior understandable from the code.
-- **Make it useful for me:** inspect files, edit code, run commands, show
-  diffs, ask for approval when needed, and keep a durable local session log.
-- **Understand long sessions:** support manual and automatic compaction, then
-  improve normal pre-compaction turns so old tool output does not bloat context
-  or disappear in a confusing way.
-- **Expose clean frontend seams:** keep one Rust agent loop and expose it
-  through the TUI, raw NDJSON, JSON-RPC, and future experiments.
-- **Stay local and auditable:** use local SQLite for history, default to
-  ChatGPT OAuth or an explicit API key, restrict file writes to the workspace,
-  and make shell approval/sandbox behavior visible.
+- `tui/cmd/nav` is the user-facing command. Running `nav` starts the TUI.
+- `crates/nav-backend` is the Rust backend process.
+- The TUI talks to the backend over newline-delimited JSON on stdio.
 
-For the broader project context, read [docs/CONTEXT.md](docs/CONTEXT.md). For a
-guided code tour, open [docs/ARCHITECTURE.html](docs/ARCHITECTURE.html).
+This keeps terminal rendering in Go/Bubble Tea while keeping the agent runtime
+in Rust.
 
-## What Works Today
+## Development
 
-- A terminal TUI when you run `nav` in a real terminal.
-- Headless raw events with `--json-events`.
-- Versioned JSON-RPC notifications with `--json-rpc` for non-TUI experiments.
-- Session persistence, resume, export, fork, labels, transcript search, and
-  session trees.
-- Workspace-aware tools: read files, list files, search with ripgrep, run
-  shell commands, edit files, apply patches, and spawn read-only helper agents.
-- Approval prompts, dangerous-command blocking, protected-file checks, and a
-  macOS sandbox for shell commands.
-- Manual `/compact`, automatic pre-turn compaction, context reports, and
-  bounded tool output.
+Versions use CalVer: `YY.M.PATCH`. The first version after the rewrite is
+`26.5.12`.
 
-Learning threads still in progress:
-
-- Budgeted replay of prior tool calls/results before compaction.
-- Native `read_file` slicing with `offset` and `limit`.
-- Observability that helps explain real runs: tokens, tools, retries,
-  approvals, compactions, and failures.
-- Frontend experiments beyond the terminal when they teach something
-  useful about harness boundaries.
-
-## Requirements
-
-- Rust toolchain with Cargo.
-- `rg` from ripgrep on `PATH`; `code_search` shells out to it.
-- Codex login for the default ChatGPT OAuth flow, or `OPENAI_API_KEY` for raw
-  API-key mode.
-
-## Setup
-
-Sign in once through Codex so `~/.codex/auth.json` exists:
+From the repository root:
 
 ```sh
-codex login
+cargo test
+cd tui && go test ./...
+cd tui && go run ./cmd/nav
 ```
 
-Run from source:
+`nav` is the production command. `navd` is the local development command.
+Use `navd update` from this checkout to build the current local state and
+install the dev launcher:
 
 ```sh
-cargo run -- "List the files and explain this project"
+make navd-update
+navd
 ```
 
-Install the `nav` binary from this checkout:
+`navd update` builds `target/debug/nav-backend`, `target/debug/nav`, and
+`target/debug/navd`, then installs only `navd` to `~/.local/bin/navd`.
+
+By default the TUI finds the Rust workspace and runs:
 
 ```sh
-cargo install --path crates/nav-cli
-nav "List the files and explain this project"
+cargo run --quiet --manifest-path Cargo.toml -p nav-backend -- serve
 ```
 
-By default `nav` uses:
+Set `NAV_BACKEND=/path/to/nav-backend` to point the TUI at a prebuilt backend.
 
-- model: `gpt-5.5`
-- auth: ChatGPT OAuth from `~/.codex/auth.json`
-- transport: WebSocket
-- approval policy: `on-request`
-- sandbox: `workspace-write`
+## License
 
-Use an API key instead:
-
-```sh
-OPENAI_API_KEY=... nav --auth api-key "Run the test suite"
-```
-
-Run a quick local health check:
-
-```sh
-nav doctor
-nav doctor --json
-```
-
-## Terminal TUI
-
-Run `nav` with no prompt in a terminal:
-
-```sh
-cd ~/code/my-project
-nav
-```
-
-The TUI shows the transcript above and a multi-line composer below.
-
-Useful keys and commands:
-
-- `Enter` submits. `Shift+Enter` inserts a newline.
-- `Ctrl+U` clears to the start of the line.
-- `Ctrl+W` deletes the previous word.
-- `Up` and `Down` recall earlier prompts from the same session.
-- `/help` shows slash commands.
-- `/clear` clears the visible transcript.
-- `/context` estimates what the next model request will contain.
-- `/context all` expands the context report into item-level rows.
-- `/compact` summarizes older history and continues from the checkpoint.
-- `/handoff <goal>` starts a fresh session with an editable focused prompt.
-- `/sessions` lists stored sessions.
-- `/resume` opens the session picker.
-- `/quit` exits. Press `Ctrl+C` twice to exit cleanly.
-
-Prompt templates and skills also appear in the slash popup when discovered.
-
-## Headless Modes
-
-Use raw NDJSON when you want one `AgentEvent` per line:
-
-```sh
-nav --json-events "list the files" > events.ndjson
-```
-
-Use JSON-RPC for a script, chat bridge, or another frontend experiment:
-
-```sh
-nav --json-rpc "list the files"
-```
-
-JSON-RPC mode emits newline-delimited JSON-RPC 2.0 notifications:
-
-- `nav.session.started` announces `protocol_version`, session id, cwd, model,
-  and transport.
-- `nav.event` wraps the same `AgentEvent` payloads the TUI consumes.
-- `nav.approval.respond` can be written to stdin to answer approval requests.
-
-If stdout is not a TTY, `nav` uses raw headless events automatically unless
-you pass `--json-rpc`.
-
-## Sessions
-
-Every run is stored in SQLite at `$XDG_DATA_HOME/nav/nav.db`, falling back to
-`~/.local/share/nav/nav.db`. Use `--db-path` to override it. Relative database
-paths are resolved inside the nav data directory.
-
-Common session commands:
-
-```sh
-nav --list-sessions
-nav --list-sessions --cwd "$PWD"
-nav --resume <session-id> "Continue from here"
-nav --pick-session
-nav export <session-id> --format md --out transcript.md
-```
-
-Advanced session workflows:
-
-```sh
-nav sessions fork <session-id> --name "try another approach"
-nav sessions tree <session-id>
-nav sessions label <session-id> bugfix
-nav sessions search "panic" --label bugfix
-```
-
-Token rollups appear in session listings. Cost is shown only when a provider
-reports it.
-
-## Safety Model
-
-`nav` is meant to be useful without being casual about your filesystem.
-
-- `read_file`, `list_files`, `edit_file`, `apply_patch`, and `code_search`
-  reject absolute workspace paths, `..`, and symlink escapes.
-- Writes are workspace-only.
-- Reads of `.env*`, `*.pem`, `*.key`, and SSH keys require approval.
-- Writes under `.git`, `.agents`, and `.nav` are blocked.
-- `bash` defaults to `--sandbox workspace-write`.
-- On macOS, shell commands run through `sandbox-exec`.
-- On Linux and Windows, sandboxing is currently passthrough; command
-  classification and protected-path rules still apply.
-- Dangerous commands can require approval or be refused outright.
-
-The main knobs are:
-
-```sh
-nav --approval-policy untrusted "inspect this repo"
-nav --approval-policy never --json-events "run read-only checks"
-nav --sandbox read-only "look around without writing"
-nav --sandbox danger-full-access "I know this needs full access"
-```
-
-`--dangerously-bypass-approvals-and-sandbox` bypasses prompts and sandboxing,
-but unbypassable dangerous commands and protected-metadata writes are still
-refused.
-
-## Tools
-
-The model can call these tools:
-
-- `read_file`: read a relative file path.
-- `list_files`: list a relative directory.
-- `code_search`: search with ripgrep.
-- `bash`: run a shell command with timeout, approval, and sandbox handling.
-- `edit_file`: create a file or replace one exact string.
-- `apply_patch`: apply a reviewable multi-file patch.
-- `spawn_subagent`: run a focused read-only helper agent for exploration or
-  review.
-
-Large tool output is bounded before it goes back to the model. Shell output can
-spill the full raw result to local storage while the model sees a smaller
-head/tail view.
-
-## Git Checkpoints
-
-For reversible work, `nav` can create stash-backed checkpoints:
-
-```sh
-nav git checkpoint "before refactor"
-nav git stash "pause this work"
-nav git list
-nav git restore
-```
-
-Enable automatic dirty-worktree checkpoints before normal turns:
-
-```sh
-nav --git-checkpoints "make the change"
-```
-
-Or put `"git_checkpoints": true` in settings.
-
-## Project Context And Settings
-
-At startup, `nav` reads context files only from the launch directory:
-
-- `<cwd>/AGENTS.md`
-- `<cwd>/CLAUDE.md`
-- `~/.agents/AGENTS.md`
-- `~/.agents/CLAUDE.md`
-
-It does not walk upward through parent directories.
-
-Settings can live in `<cwd>/.nav/settings.json` or `~/.nav/settings.json`.
-Project settings override user settings. Explicit CLI flags override both.
-
-Example:
-
-```json
-{
-  "model": "gpt-5.5",
-  "transport": "websocket",
-  "bash_timeout_secs": 30,
-  "auto_compact_token_limit": 200000,
-  "auto_compact_fraction": 1.0,
-  "ambient_context_token_budget": 256,
-  "git_checkpoints": true,
-  "theme": "night"
-}
-```
-
-Malformed settings fall back to defaults with an error on stderr. Unknown keys
-are rejected so typos do not silently change behavior.
-
-## Providers
-
-`nav` ships with built-in provider entries so you can connect to common
-OpenAI-compatible APIs with zero configuration. Set the environment variable,
-add the models you want, and run.
-
-Built-in providers:
-
-| ID | Service | `base_url` | Env var |
-|---|---|---|---|
-| `openai` | OpenAI | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
-| `openrouter` | OpenRouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
-| `deepseek` | DeepSeek | `https://api.deepseek.com/v1` | `DEEPSEEK_API_KEY` |
-| `groq` | Groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
-| `together` | Together | `https://api.together.xyz/v1` | `TOGETHER_API_KEY` |
-| `zai` | Z.AI | `https://api.z.ai/v1` | `ZAI_API_KEY` |
-| `ollama` | Ollama (local) | `http://localhost:11434/v1` | (none) |
-| `vllm` | vLLM (local) | `http://localhost:8000/v1` | (none) |
-
-No `models` are pre-seeded — add the ones you use under the matching provider
-id. User and project `settings.json` entries override built-ins by id (shallow
-merge: a user entry fully replaces the built-in with the same id).
-
-`default_model` uses `<provider_id>/<model_key>` form — the part before the
-slash selects the provider, the part after selects a model from that provider's
-`models` map.
-
-### Using a built-in provider
-
-Export the env var from the table above, then declare the models you want in
-`~/.nav/settings.json`. The pattern is the same for every cloud provider —
-just swap the id and model names:
-
-```sh
-export OPENAI_API_KEY=sk-...
-```
-
-```jsonc
-// ~/.nav/settings.json
-{
-  "providers": {
-    "openai": {
-      "models": {
-        "gpt-5.5": { "model_id": "gpt-5.5" }
-      }
-    }
-  },
-  "default_model": "openai/gpt-5.5"
-}
-```
-
-```sh
-nav "Refactor the parser module"
-```
-
-For **Ollama** or **vLLM**, no env var is needed — just make sure the local
-server is running and declare your models the same way.
-
-### macOS Keychain
-
-The `api_key` field resolves through three semantics in order:
-
-1. **`!command`** — runs the rest via `sh -c`, returns trimmed stdout
-2. **Env var** — if `std::env::var(input)` is set and non-empty, returns that
-3. **Literal** — returns the string as-is
-
-Use the `!command` form to pull secrets from macOS Keychain:
-
-```sh
-security add-generic-password -s nav-openai -a "$USER" -w "sk-..."
-```
-
-```jsonc
-// ~/.nav/settings.json
-{
-  "providers": {
-    "openai": {
-      "api_key": "!security find-generic-password -s nav-openai -w",
-      "models": {
-        "gpt-5.5": { "model_id": "gpt-5.5" }
-      }
-    }
-  },
-  "default_model": "openai/gpt-5.5"
-}
-```
-
-### Custom / Self-Hosted
-
-For a provider not in the built-in catalog, declare the full entry yourself.
-The id can be anything — just use the same `provider/model` form in
-`default_model`:
-
-```jsonc
-// ~/.nav/settings.json
-{
-  "providers": {
-    "my-vllm": {
-      "name": "My vLLM Cluster",
-      "base_url": "https://vllm.internal.example.com/v1",
-      "api_key": "!security find-generic-password -s nav-my-vllm -w",
-      "models": {
-        "codestral": { "model_id": "mistralai/Codestral-22B-v0.1" }
-      }
-    }
-  },
-  "default_model": "my-vllm/codestral"
-}
-```
-
-### Auth and the Provider Catalog
-
-`nav` has two auth paths:
-
-- **ChatGPT subscription (default).** When no `default_model` is set,
-  `--auth chatgpt` reads `~/.codex/auth.json` (created by `codex login`)
-  and calls OpenAI's **Responses API**.
-
-- **API key / third-party provider.** Set the provider's env var
-  (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, etc.) and either pass
-  `--model <provider>/<model>` on the command line or set `default_model` in
-  `settings.json`. These providers use the **Chat Completions API**.
-
-The provider catalog is consulted only when `default_model` or `--model`
-points at a provider entry; otherwise `nav` falls back to the Codex/ChatGPT
-OAuth flow.
-
-**Switching models mid-session.** `/model` swaps to any model in your provider
-catalog. Switching from the default ChatGPT path to a Chat Completions provider
-works; switching back mid-session is not supported — start a new session
-instead.
-
-## Skills And Extensions
-
-Project skills live in `<cwd>/.agents/skills/`. User skills live in
-`~/.agents/skills/`. Project skills shadow user skills with the same parsed
-name. Skills are readable by the agent but not writable by tool calls.
-
-Local extensions live in:
-
-- `<cwd>/.nav/extensions/<name>/extension.json`
-- `~/.nav/extensions/<name>/extension.json`
-
-Today, extensions can register:
-
-- prompt templates, available as `/prompt:<name>` in the TUI
-- simple TUI theme color overrides
-
-`nav extensions list` shows discovered manifests. Manifest sections for custom
-tools, MCP servers, hooks, and packages are parsed for visibility but are not
-executed yet.
-
-## Active Design Notes
-
-- [docs/context-management-plan.md](docs/context-management-plan.md)
-  ranks the next token-efficiency work: lazy skills section, prompt caching,
-  proactive pruning, budgeted tool-call replay with placeholders, and sliced
-  `read_file` reads, plus Tier 2 UX (edit/restore, handoff, `@file`).
-- [docs/otel-observability-prd.md](docs/otel-observability-prd.md) explains
-  the proposed telemetry shape: local logs stay canonical, while optional OTLP
-  traces make usage, failures, approvals, retries, compactions, and token
-  pressure easier to study.
-- [docs/TODO.md](docs/TODO.md) tracks shipped daily-driver work and remaining
-  follow-ups.
-
-## Development Checks
-
-Useful local checks:
-
-```sh
-cargo fmt --all -- --check
-cargo test -p nav-core -p nav-cli -p nav-tui
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-Snapshot tests use `insta`. Review pending snapshots before committing.
+MIT. See `LICENSE`.

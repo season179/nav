@@ -1,3 +1,0 @@
-data: {"error":{"message":"Your input is too long. The maximum context length is 8192 tokens, but you provided 12000 tokens.","type":"invalid_request_error","param":null,"code":"context_length_exceeded"}}
-
-data: [DONE]
