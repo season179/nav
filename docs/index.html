@@ -4,65 +4,62 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>nav</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600;700&family=Karla:wght@400;500&display=swap" rel="stylesheet">
-  <style>
-    :root { --bg: #0c1016; --text: #e6edf3; --muted: #8b9aab; --accent: #c9a84c; --link: #4db8a8; --border: #243040; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: Karla, sans-serif;
-      font-size: 1.05rem;
-      line-height: 1.6;
-      color: var(--text);
-      background: var(--bg);
-      max-width: 36rem;
-      margin: 0 auto;
-      padding: 3rem 1.5rem 4rem;
-    }
-    h1 {
-      font-family: "Cormorant Garamond", serif;
-      font-size: 2.5rem;
-      font-weight: 700;
-      margin-bottom: 0.75rem;
-    }
-    .lead { color: var(--muted); margin-bottom: 2rem; }
-    .domains { list-style: none; border-top: 1px solid var(--border); }
-    .domains li { border-bottom: 1px solid var(--border); }
-    .domains a {
-      display: block;
-      padding: 1rem 0;
-      color: var(--link);
-      text-decoration: none;
-      font-weight: 500;
-    }
-    .domains a:hover { color: var(--accent); }
-    .domains span { display: block; font-size: 0.9rem; font-weight: 400; color: var(--muted); margin-top: 0.2rem; }
-    footer { margin-top: 2.5rem; font-size: 0.85rem; color: var(--muted); }
-  </style>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <h1>nav</h1>
-  <p class="lead">
-    A learning project: a coding agent built from scratch so the agent loop, tools,
-    permissions, context, and terminal UI stay readable. Experimental—do not depend on it yet.
-  </p>
+  <div class="page">
+    <div class="page-inner animate">
+      <div class="hero">
+        <div class="hero-text">
+          <h1>nav<span class="dot">.</span></h1>
+        </div>
+        <div class="hero-aside">
+          <span class="version-badge">v26.5.12 · MIT</span>
+          <p class="lead">
+            A learning project: a coding agent built from scratch so the agent loop, tools,
+            permissions, context, and terminal UI stay readable. Experimental — do not depend on it yet.
+          </p>
+        </div>
+      </div>
+    </div>
 
-  <ul class="domains">
-    <li>
-      <a href="architecture/">Architecture<span>Shape, crates, protocol, and boundaries</span></a>
-    </li>
-    <li>
-      <a href="backend/">Backend<span>Sessions, models, and harness design</span></a>
-    </li>
-    <li>
-      <a href="tui/">TUI<span>Go Bubble Tea frontend</span></a>
-    </li>
-    <li>
-      <a href="development/">Development<span>Build, test, and run locally</span></a>
-    </li>
-  </ul>
+    <div class="page-inner cards-section animate">
+      <div class="cards-grid">
+        <a href="architecture/index.html" class="card">
+          <span class="num">§ 01</span>
+          <h2>Architecture</h2>
+          <p>Shape, crates, protocol, and boundaries</p>
+          <span class="go">explore →</span>
+        </a>
+        <a href="backend/index.html" class="card">
+          <span class="num">§ 02</span>
+          <h2>Backend</h2>
+          <p>Sessions, models, and harness design</p>
+          <span class="go">explore →</span>
+        </a>
+        <a href="tui/index.html" class="card">
+          <span class="num">§ 03</span>
+          <h2>TUI</h2>
+          <p>Go Bubble Tea terminal frontend</p>
+          <span class="go">explore →</span>
+        </a>
+        <a href="development/index.html" class="card">
+          <span class="num">§ 04</span>
+          <h2>Development</h2>
+          <p>Build, test, and run locally</p>
+          <span class="go">explore →</span>
+        </a>
+      </div>
+    </div>
 
-  <footer>CalVer 26.5.12 · MIT</footer>
+    <footer class="site-footer">
+      <div class="footer-inner">
+        <span class="footer-left">nav v26.5.12 · MIT</span>
+        <div class="footer-right">
+          <a href="https://github.com">Source</a>
+        </div>
+      </div>
+    </footer>
+  </div>
 </body>
 </html>
