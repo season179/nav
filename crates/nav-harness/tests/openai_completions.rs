@@ -1,4 +1,7 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ChatCompletionMessageRole, ChatCompletionRequestMessage,
@@ -19,6 +22,7 @@ fn builds_request_from_resolved_inline_key_without_exposing_secret() {
         },
         ProviderCompat {
             supports_reasoning_effort: Some(true),
+            supports_usage_in_streaming: Some(true),
             ..Default::default()
         },
     ))
@@ -54,6 +58,35 @@ fn builds_request_from_resolved_inline_key_without_exposing_secret() {
 
     let debug = format!("{plan:?}");
     assert!(!debug.contains("sk-inline-secret"));
+}
+
+#[test]
+fn omits_stream_usage_options_unless_compat_explicitly_enables_them() {
+    let resolved = ModelResolver::new(settings_for(
+        "compatible-gateway",
+        "https://llm.example.com/v1",
+        ApiKeyConfig::Inline {
+            inline: "sk-inline-secret".to_string(),
+        },
+        ProviderCompat::default(),
+    ))
+    .resolve_default()
+    .expect("model should resolve");
+
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(
+            &resolved,
+            &OpenAiCompletionsRequest {
+                messages: vec![ChatCompletionRequestMessage::user("Say hi")],
+                max_tokens: None,
+                temperature: None,
+                reasoning_effort: None,
+                stream: true,
+            },
+        )
+        .expect("request should build");
+
+    assert!(plan.body.get("stream_options").is_none());
 }
 
 #[test]
@@ -120,8 +153,8 @@ fn builds_request_for_custom_endpoint_with_env_key_and_compat_quirks() {
 }
 
 #[test]
-fn can_use_developer_role_when_compat_allows_it() {
-    let resolved = ModelResolver::new(settings_for(
+fn can_use_developer_role_for_non_reasoning_models_when_compat_allows_it() {
+    let mut resolved = ModelResolver::new(settings_for(
         "openai-compatible",
         "https://api.example.com/v1",
         ApiKeyConfig::Inline {
@@ -134,6 +167,7 @@ fn can_use_developer_role_when_compat_allows_it() {
     ))
     .resolve_default()
     .expect("model should resolve");
+    resolved.model.reasoning = false;
 
     let plan = OpenAiCompletionsClient::new()
         .build_request(
@@ -146,6 +180,33 @@ fn can_use_developer_role_when_compat_allows_it() {
         .expect("request should build");
 
     assert_eq!(plan.body["messages"][0]["role"], "developer");
+}
+
+#[test]
+fn complete_rejects_streaming_requests_before_http() {
+    let resolved = ModelResolver::new(settings_for(
+        "compatible-gateway",
+        "https://llm.example.com/v1",
+        ApiKeyConfig::Inline {
+            inline: "sk-test".to_string(),
+        },
+        ProviderCompat::default(),
+    ))
+    .resolve_default()
+    .expect("model should resolve");
+
+    let result = poll_ready(OpenAiCompletionsClient::new().complete(
+        &resolved,
+        &OpenAiCompletionsRequest {
+            messages: vec![ChatCompletionRequestMessage::user("Say hi")],
+            max_tokens: None,
+            temperature: None,
+            reasoning_effort: None,
+            stream: true,
+        },
+    ));
+
+    assert_eq!(result, Err(OpenAiCompletionsError::StreamingUnsupported));
 }
 
 #[test]
@@ -341,5 +402,22 @@ fn settings_for(
                 compat,
             },
         )]),
+    }
+}
+
+struct NoopWaker;
+
+impl Wake for NoopWaker {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn poll_ready<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(NoopWaker));
+    let mut context = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(output) => output,
+        Poll::Pending => panic!("future should complete before awaiting"),
     }
 }

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -174,6 +175,7 @@ pub enum OpenAiCompletionsError {
     Transport {
         message: String,
     },
+    StreamingUnsupported,
     Http {
         status: u16,
         body: String,
@@ -213,6 +215,10 @@ impl fmt::Display for OpenAiCompletionsError {
                 )
             }
             Self::Transport { message } => write!(formatter, "request transport failed: {message}"),
+            Self::StreamingUnsupported => write!(
+                formatter,
+                "streaming chat completions are not supported by complete()"
+            ),
             Self::Http { status, body } => {
                 write!(formatter, "provider returned HTTP {status}: {body}")
             }
@@ -316,7 +322,7 @@ impl Default for OpenAiCompletionsClient {
 impl OpenAiCompletionsClient {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: default_http_client(),
         }
     }
 
@@ -342,6 +348,10 @@ impl OpenAiCompletionsClient {
         model: &ResolvedModelConfig,
         request: &OpenAiCompletionsRequest,
     ) -> Result<ChatCompletionResponse, OpenAiCompletionsError> {
+        if request.stream {
+            return Err(OpenAiCompletionsError::StreamingUnsupported);
+        }
+
         let plan = self.build_request(model, request)?;
         let api_key = model.api_key.expose_secret();
         let response = self
@@ -390,6 +400,13 @@ fn validate_resolved_model(model: &ResolvedModelConfig) -> Result<(), OpenAiComp
     Ok(())
 }
 
+fn default_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("default reqwest client configuration should be valid")
+}
+
 fn chat_completions_endpoint(base_url: &str) -> Result<String, OpenAiCompletionsError> {
     let mut url = Url::parse(base_url).map_err(|error| OpenAiCompletionsError::InvalidBaseUrl {
         base_url: base_url.to_string(),
@@ -421,7 +438,7 @@ fn request_body(model: &ResolvedModelConfig, request: &OpenAiCompletionsRequest)
     body.insert("messages".to_string(), Value::Array(messages));
     body.insert("stream".to_string(), json!(request.stream));
 
-    if request.stream && model.compat.supports_usage_in_streaming.unwrap_or(true) {
+    if request.stream && model.compat.supports_usage_in_streaming == Some(true) {
         body.insert(
             "stream_options".to_string(),
             json!({
@@ -460,7 +477,7 @@ fn request_body(model: &ResolvedModelConfig, request: &OpenAiCompletionsRequest)
 fn message_value(model: &ResolvedModelConfig, message: &ChatCompletionRequestMessage) -> Value {
     let role = match message.role {
         ChatCompletionMessageRole::System => {
-            if model.model.reasoning && model.compat.supports_developer_role == Some(true) {
+            if model.compat.supports_developer_role == Some(true) {
                 "developer"
             } else {
                 "system"
