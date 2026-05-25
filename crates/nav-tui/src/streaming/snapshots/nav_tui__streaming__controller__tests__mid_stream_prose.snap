@@ -1,9 +1,0 @@
----
-source: crates/nav-tui/src/streaming/controller.rs
-assertion_line: 400
-expression: "snapshot_body(&c, 40)"
----
-=== stable ===
-  Hello there.
-=== tail ===
-  How are you doi

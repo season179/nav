@@ -1,7 +1,0 @@
----
-source: crates/nav-tui/tests/snapshot.rs
-expression: rendered
----
-◆ name  Session name set to "release work"
-
-◆ export  Wrote transcript to transcript.md
