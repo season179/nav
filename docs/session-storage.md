@@ -3,8 +3,8 @@
 Status: planned. Canonical transcript storage for the agent loop, with
 per-request encoding for multiple LLM API shapes.
 
-Informed by analysis of OpenCode's session/message/part system. See
-[Research notes](#research-notes-opencode) at the bottom for rationale.
+Informed by analysis of OpenCode's and Hermes Agent's session storage
+systems. See [Research notes](#research-notes) at the bottom for rationale.
 
 Related: [architecture.md](./architecture.md), [model-provider-settings.md](./model-provider-settings.md).
 
@@ -87,6 +87,10 @@ PRAGMA cache_size = -64000;
 `busy_timeout` prevents immediate failures under concurrent access.
 `synchronous = NORMAL` is safe with WAL and faster than FULL.
 `cache_size = -64000` gives SQLite 64 MB page cache.
+
+**Network filesystem fallback:** if `journal_mode = WAL` fails with
+`"locking protocol"` (NFS, SMB, some FUSE mounts), fall back to
+`journal_mode = DELETE`. Log one WARNING per process.
 
 ## ID scheme
 
@@ -247,6 +251,7 @@ CREATE TABLE schema_migrations (
 CREATE TABLE sessions (
     id              TEXT PRIMARY KEY NOT NULL,
     title           TEXT,
+    source          TEXT NOT NULL DEFAULT 'cli',     -- cli | api | tui
     workspace_root  TEXT,
     system_prompt   TEXT,
     settings_json   TEXT NOT NULL DEFAULT '{}',
@@ -544,6 +549,19 @@ for each tool_result part, newest first:
 Protected tools (e.g. `skill`) are never pruned — their output may be needed
 for context even when old.
 
+**Deduplication** (before pruning): hash tool-result content. If the same
+content appears multiple times (e.g. same file read 5×), replace older copies
+with `[Duplicate — see more recent result]`. Only the newest full copy survives.
+
+**Tool call argument truncation:** assistant messages outside the protected
+tail get their `ToolCall.arguments` JSON truncated — long string values are
+shrunk while preserving valid JSON structure. Prevents a single `write_file`
+with 50KB content from consuming the entire context budget.
+
+**Image stripping:** replace old `Image` parts (before the last image-bearing
+user turn) with `[Attached image — stripped after compression]`. Prevents
+multi-MB base64 blobs from surviving indefinitely.
+
 ### Summarization (expensive, on overflow or manual)
 
 When the total turn history exceeds the usable context window:
@@ -552,12 +570,46 @@ When the total turn history exceeds the usable context window:
    verbatim). Tail size is configurable (`tail_turns`, default 2). The tail
    budget is a fraction of usable context.
 2. **Generate summary** using a compaction agent over the head turns, building
-   on any previous summary (incremental).
+   on any previous summary (incremental — not from scratch each time).
 3. **Write compaction turn**: a user turn with a `Compaction` part
    (`tail_start_id` → first retained turn) followed by an assistant turn
    containing the summary as a `Text` part.
 4. **On replay**, the encoder loads: [compaction-marker turn → summary → turns
    from `tail_start_id` onward].
+
+#### Summary template
+
+The summarization prompt uses structured sections, not generic prose:
+
+```markdown
+## Active Task
+[Copy the user's most recent uncompleted request verbatim]
+
+## Goal
+[What the user is trying to accomplish overall]
+
+## Constraints & Preferences
+[User preferences, coding style, constraints]
+
+## Completed Actions
+1. ACTION target — outcome [tool: name]
+2. ...
+
+## Active State
+[Modified files, test status, working directory, running processes]
+
+## In Progress
+[Work underway when compaction fired]
+
+## Blocked
+[Unresolved errors, blockers]
+
+## Key Decisions
+[Important technical decisions and why]
+```
+
+This structure ensures the continuation model has a clear resumption point
+and doesn't repeat completed work.
 
 ```text
 Loaded for encoding:
@@ -579,10 +631,53 @@ When a request exceeds the provider's size limit even after pruning:
 3. Replay the triggering user message after compaction with a synthetic
    continuation prompt.
 
+### Anti-thrashing protection
+
+If two consecutive compressions each save <10% of context, skip further
+compression and surface a warning to the user. Prevents infinite loops where
+each pass removes only 1–2 messages. Counter resets on manual `/compress`
+or `/new`.
+
 ### Compaction schema support
 
 The `turn_parts.compacted_at` column (already in the schema) enables this
 without migration. No additional flags needed.
+
+### Alternative: session splitting (not adopted, considered)
+
+Hermes Agent uses a different approach: compression *ends* the current session
+and creates a new child session with `parent_session_id`. Full history is
+reconstructed by walking the lineage chain. This keeps each session's raw
+transcript clean (no compacted placeholders) but requires cross-session queries.
+Nav's in-place approach is simpler and sufficient for v1, but session splitting
+is an option if compaction markers prove awkward.
+
+## Full-text search (phase 6+)
+
+Add FTS5 virtual tables on `turn_parts` for fast text search across sessions:
+
+```sql
+CREATE VIRTUAL TABLE turn_parts_fts USING fts5(
+    content,
+    content='turn_parts',
+    content_rowid='rowid'
+);
+
+-- Trigram variant for CJK / substring matching
+CREATE VIRTUAL TABLE turn_parts_fts_trigram USING fts5(
+    content,
+    tokenize='trigram'
+);
+```
+
+Triggers auto-sync inserts/updates/deletes. The trigram tokenizer handles
+CJK, Thai, and other scripts where the default unicode61 tokenizer splits
+characters into individual tokens.
+
+**Anchored view with bookends:** for search results, load ±N messages around
+a hit *plus* the first and last few user/assistant messages of the session
+(the "goal" and "resolution"). This lets an FTS5 hit anywhere in a long session
+yield opening and closing context in a single query.
 
 ## Concurrency and durability
 
@@ -592,8 +687,19 @@ without migration. No additional flags needed.
 - One transaction per agent iteration (append turns + parts + provider state +
   cost accumulation).
 - `ON DELETE CASCADE` from sessions → runs → turns → turn_parts.
-- Transactions use `IMMEDIATE` behavior to avoid deadlocks when the write
-  connection is contended.
+- Transactions use `BEGIN IMMEDIATE` (acquires WAL write lock immediately)
+  with application-level retry using random jitter (20–150ms, up to 15 retries)
+  to avoid convoy effects under multi-process contention.
+- Periodic `PRAGMA wal_checkpoint(PASSIVE)` every ~50 writes to flush committed
+  WAL frames and prevent unbounded WAL growth.
+- **Batch flush:** don't write to the DB on every streaming delta. Track a
+  flush cursor and persist only new parts at natural boundaries (end of turn,
+  error exit). Reduces write contention while guaranteeing persistence at turn
+  boundaries.
+- **Declarative schema reconciliation:** store the canonical schema as a Rust
+  constant. On startup, diff live columns (via `PRAGMA table_info`) against the
+  declared schema and `ALTER TABLE ADD COLUMN` for anything missing. Column
+  additions are self-healing; only data migrations need version gates.
 
 ## Protocol / UI boundary
 
@@ -614,10 +720,10 @@ whole turns.
 | 2 | `encode` / `decode` for `OpenAiChatCompletions` only |
 | 3 | Agent loop wired to store + encode path (nav-server HTTP) |
 | 4 | `AnthropicMessages` + `OpenAiResponses` encoders; `provider_state`; step handling |
-| 5 | Attachments blob store |
-| 6 | Pruning (tool output compaction via `compacted_at`) |
-| 7 | Summarization compaction + overflow handling |
-| 8 | Fork, revert, session-level cost display |
+| 5 | Attachments blob store + FTS5 full-text search |
+| 6 | Pruning (tool output compaction via `compacted_at`, dedup, arg truncation, image stripping) |
+| 7 | Summarization compaction + overflow handling + anti-thrashing |
+| 8 | Fork, revert, session-level cost display, auto-title generation |
 
 ## Anti-patterns
 
@@ -641,9 +747,9 @@ whole turns.
   write paths narrow (all writes go through `SessionStore` methods) so a
   projector layer can be slotted in later without refactoring.
 
-## Research notes: OpenCode
+## Research notes
 
-Key patterns borrowed from OpenCode's session storage (TypeScript/Drizzle):
+### OpenCode (TypeScript/Drizzle)
 
 1. **Message/Part split** — OpenCode has `message` (envelope) and `part`
    (content) as separate tables. This enables streaming deltas on individual
@@ -683,3 +789,103 @@ Key patterns borrowed from OpenCode's session storage (TypeScript/Drizzle):
 8. **Cursor-based pagination** — OpenCode pages messages via
    `(time_created, id)` cursors with `DESC` ordering. Adopted for nav's
    `list_turns_for_session`.
+
+### Hermes Agent (Python/SQLite)
+
+9. **FTS5 full-text search** — Hermes indexes message content in two FTS5
+   virtual tables: one with the default unicode61 tokenizer (English/Latin),
+   one with the `trigram` tokenizer for CJK substring matching. Triggers
+   auto-sync inserts/updates/deletes. Enables fast session search across
+   all history. Nav should add FTS5 indexes on `turn_parts` at phase 6
+   (after the blob store). Trigram tokenizer handles all scripts.
+
+10. **Declarative schema reconciliation** — Instead of numbered migration
+    files, Hermes diffs live table columns (via `PRAGMA table_info`) against
+    the declared `SCHEMA_SQL` and `ALTER TABLE ADD COLUMN` for anything
+    missing. Self-healing on startup. Column additions are declarative;
+    only data migrations (row transforms) need version gates. Nav should
+    consider this pattern: store the canonical schema in a constant, run
+    reconciliation after `executescript`. Reduces migration drift risk.
+
+11. **Compression-triggered session splitting** — When context exceeds limits,
+    Hermes *ends* the current session (`end_reason = 'compression'`) and
+    creates a new child session linked via `parent_session_id`. The new
+    session starts with the summary + retained tail. Full history is
+    reconstructed by walking the lineage chain (`_session_lineage_root_to_tip`).
+    This differs from nav's in-place compaction approach (marking parts as
+    compacted within the same session). Nav's approach is simpler and avoids
+    cross-session queries, but the split approach has the advantage of keeping
+    each session's raw transcript clean (no compacted placeholders). Worth
+    considering as an alternative if in-place compaction proves awkward.
+
+12. **Anti-thrashing protection** — If two consecutive compressions each save
+    <10% of context, Hermes skips further compression and warns the user
+    to start a new session. Prevents infinite compression loops where each
+    pass removes only 1–2 messages. Nav should add a similar counter.
+
+13. **Iterative summaries** — The compressor stores `_previous_summary` and
+    generates an incremental update on each subsequent compaction, rather than
+    summarizing from scratch. This preserves information across multiple
+    compaction rounds. Nav's compaction design already plans for this via
+    the `Compaction` part referencing the previous summary.
+
+14. **Structured summary template** — Hermes uses a structured markdown
+    template with explicit sections: Active Task, Goal, Constraints,
+    Completed Actions (numbered, with tool name + target + outcome),
+    Active State (files, test status, working directory), In Progress,
+    Blocked, Key Decisions. Not generic prose. Nav should adopt a similar
+    template for the LLM summarization prompt.
+
+15. **Tool output deduplication** — Before pruning, Hermes hashes tool result
+    content and replaces older duplicates with a back-reference. If the same
+    file is read 5 times, only the newest full copy survives. Nav should add
+    this to the pruning pass.
+
+16. **Tool call argument truncation** — Assistant messages outside the
+    protected tail get their `tool_calls[].function.arguments` JSON truncated
+    (long string values shrunk while preserving valid JSON). Prevents a
+    single `write_file` with 50KB content from consuming the entire context
+    budget. Nav should add this to the pruning pass.
+
+17. **Image stripping in compression** — Old image parts are replaced with
+    text placeholders during compression. Anchored on the last image-bearing
+    user message; everything before it gets stripped. Prevents multi-MB
+    base64 blobs from surviving indefinitely. Nav's `Image` parts should
+    be stripped similarly during pruning.
+
+18. **Auto-title generation** — Async LLM call after the first exchange to
+    generate a 3–7 word session title. Stored in the `title` column. Nav
+    should add this as a post-turn hook.
+
+19. **Write contention: BEGIN IMMEDIATE + jitter retry** — Hermes uses
+    `BEGIN IMMEDIATE` (acquires WAL write lock immediately) with
+    application-level retry using random 20–150ms jitter, up to 15 retries.
+    This avoids the convoy effect that SQLite's built-in busy handler creates
+    under multi-process contention. Nav should adopt this for the write path.
+
+20. **WAL fallback for network filesystems** — If `PRAGMA journal_mode=WAL`
+    fails with "locking protocol" (NFS, SMB, some FUSE mounts), Hermes falls
+    back to `journal_mode=DELETE`. Nav should handle this gracefully too,
+    since users may store `nav.db` on network drives.
+
+21. **Periodic WAL checkpoint** — Every 50 writes, Hermes runs
+    `PRAGMA wal_checkpoint(PASSIVE)` to flush committed WAL frames back
+    into the main DB file. Prevents unbounded WAL growth when many processes
+    hold persistent connections. Nav should add this to the write helper.
+
+22. **Anchored view with bookends** — For search/recall, Hermes loads ±N
+    messages around a hit *plus* the first and last few user/assistant
+    messages of the session (the "goal" and "resolution"). This lets an
+    FTS5 hit anywhere in a long session yield the opening and closing
+    context on a single call. Nav's `get_anchored_view` should offer
+    this pattern when FTS5 is added.
+
+23. **Session source tagging** — A `source` column on sessions
+    (`cli`, `api`, `tui`, etc.) for filtering and display. Nav should
+    add this to the `sessions` table for multi-interface support.
+
+24. **Flush-based persistence** — Hermes doesn't write to the DB on every
+    streaming delta. Instead it tracks `_last_flushed_db_idx` and flushes
+    only new messages at natural boundaries (end of turn, error exit).
+    This reduces write contention while guaranteeing persistence at
+    turn boundaries. Nav should batch part updates similarly.
