@@ -32,9 +32,9 @@ cd tui && go test ./...
 cd tui && go run ./cmd/nav
 ```
 
-`nav` is the production command. `navd` is the local development command.
-Use `navd update` from this checkout to build the current local state and
-install the dev launcher:
+`nav` is the released command. `navd` is a development launcher that runs the
+locally built `target/debug/nav` with the locally built backend. Use
+`navd update` from this checkout to rebuild local state and install the launcher:
 
 ```sh
 make navd-update
@@ -42,7 +42,7 @@ navd
 ```
 
 `navd update` builds `target/debug/nav-backend`, `target/debug/nav`, and
-`target/debug/navd`, then installs only `navd` to `~/.local/bin/navd`.
+`target/debug/navd`, then installs only the launcher to `~/.local/bin/navd`.
 
 By default the TUI finds the Rust workspace and runs:
 

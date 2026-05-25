@@ -8,8 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"nav.local/tui/internal/app"
 )
 
 var sourceRoot string
@@ -26,10 +24,6 @@ func main() {
 		case "help", "-h", "--help":
 			printHelp()
 			return
-		default:
-			fmt.Fprintf(os.Stderr, "unknown navd command: %s\n\n", os.Args[1])
-			printHelp()
-			os.Exit(2)
 		}
 	}
 
@@ -40,22 +34,41 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := runLocalNav(root, os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "navd failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runLocalNav(root string, args []string) error {
+	navPath := filepath.Join(root, "target", "debug", "nav")
+	if !isExecutable(navPath) {
+		fmt.Fprintf(os.Stderr, "navd local nav is not built at %s\n", navPath)
+		fmt.Fprintln(os.Stderr, "Run `navd update` from the nav checkout.")
+		return errors.New("local nav binary missing")
+	}
+
 	backendPath := filepath.Join(root, "target", "debug", "nav-backend")
 	if !isExecutable(backendPath) {
 		fmt.Fprintf(os.Stderr, "navd backend is not built at %s\n", backendPath)
 		fmt.Fprintln(os.Stderr, "Run `navd update` from the nav checkout.")
-		os.Exit(1)
+		return errors.New("local backend binary missing")
 	}
 
-	os.Exit(app.Run(backendPath))
+	cmd := exec.Command(navPath, args...)
+	cmd.Env = append(os.Environ(), "NAV_BACKEND="+backendPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func printHelp() {
-	fmt.Println(`navd runs the local development build of nav.
+	fmt.Println(`navd launches the local development build of nav.
 
 Usage:
-  navd          Run the locally built development TUI
-  navd update   Build navd from the current checkout and install it
+  navd [args...]  Run target/debug/nav with target/debug/nav-backend
+  navd update     Build the local dev binaries and install the navd launcher
 
 Options for update:
   --install-dir <dir>  Install navd into this directory (default: ~/.local/bin)
@@ -102,7 +115,7 @@ func update(args []string) error {
 
 	targetDir := filepath.Join(root, "target", "debug")
 	devBinary := filepath.Join(targetDir, "navd")
-	prodBinary := filepath.Join(targetDir, "nav")
+	localNavBinary := filepath.Join(targetDir, "nav")
 
 	steps := []struct {
 		name string
@@ -120,18 +133,18 @@ func update(args []string) error {
 			),
 		},
 		{
-			name: "production tui",
+			name: "local nav tui",
 			cmd: goCommand(
 				root,
 				"go",
 				"build",
 				"-o",
-				prodBinary,
+				localNavBinary,
 				"./cmd/nav",
 			),
 		},
 		{
-			name: "dev tui",
+			name: "navd launcher",
 			cmd: goCommand(
 				root,
 				"go",
