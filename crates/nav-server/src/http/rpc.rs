@@ -1,0 +1,11 @@
+use nav_protocol::rpc::methods;
+
+pub const KNOWN_METHODS: &[&str] = &[
+    methods::INITIALIZE,
+    methods::SESSION_CREATE,
+    methods::SESSION_SEND_MESSAGE,
+    methods::RUN_CANCEL,
+    methods::TOOL_APPROVE,
+    methods::TOOL_REJECT,
+    methods::SESSION_CLOSE,
+];

@@ -26,7 +26,40 @@ support future Electron and web frontends.
 ## Repository Folders
 
 - `crates/` contains Rust crates.
-- `crates/nav-backend/` contains the coding agent backend.
+- `crates/nav-backend/` is the backend binary entrypoint.
+- `crates/nav-server/` owns frontend transports: local HTTP, JSON-RPC routing,
+  SSE streaming, auth, bootstrap, and the temporary stdio bridge.
+- `crates/nav-protocol/` owns JSON-RPC and SSE wire types shared by backends
+  and future frontends.
+- `crates/nav-harness/` owns the coding-agent engine and should stay free of
+  HTTP, SSE, JSON-RPC, Bubble Tea, Electron, and browser concepts.
+- `crates/nav-harness/src/models/` owns model routing, providers, fallbacks,
+  cost, latency, and eval visibility.
+- `crates/nav-harness/src/agents/` owns roles, loops, delegation, task state,
+  autonomy limits, and handoff rules.
+- `crates/nav-harness/src/context/` owns loading, memory, compression,
+  citations, discard rules, pinned context, and refresh behavior.
+- `crates/nav-harness/src/tools/` owns typed, permissioned, observable, and
+  recoverable tool access.
+- `crates/nav-harness/src/skills/` owns Agent Skills discovery, selection, trust
+  metadata, and execution adapters.
+- `crates/nav-harness/src/guardrails/` owns permissions, sandboxing, policy,
+  injection resistance, destructive-action checks, leakage prevention, and
+  fail-closed behavior.
+- `crates/nav-harness/src/verification/` owns tests, evals, screenshots, diffs,
+  runtime probes, acceptance criteria, and review gates.
+- `crates/nav-harness/src/observability/` owns logs, traces, metrics, timelines,
+  and inspectable run history.
+- `crates/nav-harness/src/sessions/` owns sessions, runs, messages, approvals,
+  and long-lived task state.
+- `crates/nav-harness/src/events/` owns internal event history and fan-out for
+  frontend replay. SSE is only one transport view of this log.
+- `crates/nav-harness/src/workspace/` owns filesystem, shell, git, and project
+  operations.
+- `crates/nav-harness/src/integrations/mcp.rs` adapts MCP into nav's own tools,
+  context, skills, permissions, and verification model.
+- `crates/nav-types/` owns shared primitive types, especially UUIDv7 protocol
+  IDs.
 - `docs/` contains architecture and design notes.
 - `tui/` contains the Go Bubble Tea terminal frontend.
 - `tui/cmd/` contains executable entrypoints only.
@@ -59,6 +92,23 @@ Frontends own presentation:
 
 The protocol should not expose Bubble Tea, Electron, or browser-specific
 concepts.
+
+Rust crate dependencies should point inward:
+
+```text
+nav-backend
+  -> nav-server
+  -> nav-harness
+
+nav-server
+  -> nav-protocol
+      -> nav-types
+  -> nav-harness
+```
+
+Do not split every harness folder into its own crate yet. Folders are easier to
+reshape while the project is still teaching us the right boundaries. Promote a
+folder to a crate only when the API is stable enough to be useful on its own.
 
 ## TUI Package Rules
 

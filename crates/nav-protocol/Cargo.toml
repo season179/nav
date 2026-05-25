@@ -1,0 +1,10 @@
+[package]
+name = "nav-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nav-types = { path = "../nav-types" }
+serde.workspace = true
+serde_json.workspace = true

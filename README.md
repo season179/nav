@@ -13,7 +13,9 @@ change drastically as the architecture becomes clearer.
 ## Shape
 
 - `tui/cmd/nav` is the user-facing command. Running `nav` starts the TUI.
-- `crates/nav-backend` is the Rust backend process.
+- `crates/nav-backend` is the Rust backend binary. The backend internals are
+  split across `crates/nav-server`, `crates/nav-protocol`, `crates/nav-harness`,
+  and `crates/nav-types`.
 - The target frontend/backend API is JSON-RPC over local HTTP plus typed SSE
   events.
 

@@ -25,8 +25,39 @@ name = "nav-backend"
 version = "26.5.12"
 dependencies = [
  "anyhow",
+ "nav-harness",
+ "nav-server",
+]
+
+[[package]]
+name = "nav-harness"
+version = "26.5.12"
+
+[[package]]
+name = "nav-protocol"
+version = "26.5.12"
+dependencies = [
+ "nav-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "nav-server"
+version = "26.5.12"
+dependencies = [
+ "anyhow",
+ "nav-harness",
+ "nav-protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nav-types"
+version = "26.5.12"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
