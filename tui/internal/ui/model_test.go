@@ -68,6 +68,38 @@ func TestSubmitComposerSurfacesBackendRunFailures(t *testing.T) {
 	}
 }
 
+func TestAgentReadyKeepsShortActivityListSafe(t *testing.T) {
+	model := New(&fakeAgent{})
+	model.activity = nil
+
+	updated, _ := model.Update(agentReadyMsg{session: client.SessionInfo{
+		SessionID: "session-1",
+		Endpoint:  "http://backend.test",
+		CWD:       "/tmp/nav",
+	}})
+	result := updated.(Model)
+
+	if len(result.activity) < 2 {
+		t.Fatalf("activity length = %d, want at least 2", len(result.activity))
+	}
+	if got := result.activity[0].Body; got != "http://backend.test" {
+		t.Fatalf("backend activity = %q, want endpoint", got)
+	}
+	if got := result.activity[1].Body; got != "session-1" {
+		t.Fatalf("session activity = %q, want session id", got)
+	}
+}
+
+func TestApplyAgentEventSurfacesUnknownEvents(t *testing.T) {
+	model := New(&fakeAgent{})
+
+	model.applyAgentEvent(client.Event{Type: "tool.call.started", Message: "running shell"})
+
+	if got := model.activity[0]; got.Icon != "?" || got.Title != "tool.call.started" || got.Body != "running shell" {
+		t.Fatalf("unknown event activity = %#v", got)
+	}
+}
+
 type fakeAgent struct {
 	sentText string
 	events   []client.Event

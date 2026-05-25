@@ -1,10 +1,12 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use super::{HttpRequest, HttpResponse, HttpServer};
+
+const MAX_HTTP_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub fn serve(mut server: HttpServer) -> Result<()> {
     let listener = TcpListener::bind(&server.config().bind_addr)
@@ -94,6 +96,10 @@ fn read_http_request(reader: &mut impl BufRead) -> Result<Option<HttpRequest>> {
         }
     }
 
+    if content_length > MAX_HTTP_BODY_BYTES {
+        bail!("HTTP Content-Length {content_length} exceeds limit of {MAX_HTTP_BODY_BYTES} bytes");
+    }
+
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
         reader.read_exact(&mut body)?;
@@ -166,5 +172,18 @@ mod tests {
             request.last_event_id.as_deref(),
             Some("019f2f6f-f17b-7a72-9f28-7f9aa0a1c853")
         );
+    }
+
+    #[test]
+    fn rejects_http_request_body_over_limit() {
+        let raw = format!(
+            "POST /rpc HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_HTTP_BODY_BYTES + 1
+        );
+        let mut reader = BufReader::new(raw.as_bytes());
+
+        let error = read_http_request(&mut reader).expect_err("oversized body should be rejected");
+
+        assert!(error.to_string().contains("exceeds limit"));
     }
 }

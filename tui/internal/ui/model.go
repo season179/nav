@@ -110,8 +110,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ready = true
 		m.status = "ready"
 		m.cwd = msg.session.CWD
-		m.activity[0] = activityItem{Icon: "◇", Title: "backend", Body: msg.session.Endpoint}
-		m.activity[1] = activityItem{Icon: "✓", Title: "session", Body: msg.session.SessionID}
+		m.setActivity(0, activityItem{Icon: "◇", Title: "backend", Body: msg.session.Endpoint})
+		m.setActivity(1, activityItem{Icon: "✓", Title: "session", Body: msg.session.SessionID})
 	case agentEventsMsg:
 		for _, event := range msg.events {
 			m.applyAgentEvent(event)
@@ -119,7 +119,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentErrorMsg:
 		m.status = "backend error"
 		m.err = msg.err
-		m.activity[0] = activityItem{Icon: "×", Title: "backend", Body: msg.err.Error()}
+		m.setActivity(0, activityItem{Icon: "×", Title: "backend", Body: msg.err.Error()})
 	}
 
 	nextComposer, cmd := m.composer.Update(msg)
@@ -189,6 +189,16 @@ func (m *Model) applyAgentEvent(event client.Event) {
 		m.status = "backend error"
 		m.err = errors.New(message)
 		m.prependActivity(activityItem{Icon: "×", Title: event.Type, Body: message})
+	default:
+		title := event.Type
+		if title == "" {
+			title = "unknown event"
+		}
+		message := event.Message
+		if message == "" {
+			message = "unexpected backend event"
+		}
+		m.prependActivity(activityItem{Icon: "?", Title: title, Body: message})
 	}
 }
 
@@ -211,4 +221,11 @@ func (m *Model) prependActivity(item activityItem) {
 	if len(m.activity) > 5 {
 		m.activity = m.activity[:5]
 	}
+}
+
+func (m *Model) setActivity(index int, item activityItem) {
+	for len(m.activity) <= index {
+		m.activity = append(m.activity, activityItem{})
+	}
+	m.activity[index] = item
 }
