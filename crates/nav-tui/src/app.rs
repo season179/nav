@@ -162,8 +162,8 @@ pub async fn run(
 ) -> Result<()> {
     // Set up terminal with RAII guard to ensure cleanup on early returns
     crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
-    enable_raw_mode()?;
     let _terminal_guard = TerminalGuard;
+    enable_raw_mode()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
