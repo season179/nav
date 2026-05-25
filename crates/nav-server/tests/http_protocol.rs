@@ -6,6 +6,34 @@ use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig};
 use serde_json::{Value, json};
 
 #[test]
+fn session_create_accepts_omitted_params() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+
+    let create_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(100),
+            "method": "session.create"
+        })
+        .to_string(),
+    ));
+
+    assert_eq!(create_response.status(), 200);
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = create_body["result"]["sessionId"]
+        .as_str()
+        .expect("session.create should return a session id without params");
+    assert_uuid_v7(session_id);
+
+    let event_response =
+        server.handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")));
+    let events = parse_sse(event_response.body());
+    assert_eq!(event_names(&events), vec!["session.created"]);
+    assert_protocol_event_ids(&events, session_id);
+}
+
+#[test]
 fn session_send_message_starts_run_and_streams_typed_sse_events() {
     let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
 
@@ -356,8 +384,12 @@ fn missing_key_model_settings() -> ModelSettings {
         .providers
         .get_mut("compatible-gateway")
         .expect("fixture should include provider");
+    let missing_env_var = (0u32..)
+        .map(|index| format!("NAV_TEST_MISSING_API_KEY_{}_{}", std::process::id(), index))
+        .find(|name| std::env::var_os(name).is_none())
+        .expect("should find an unset env var name for test fixture");
     provider.api_key = ApiKeyConfig::EnvVar {
-        env_var: "NAV_TEST_MISSING_API_KEY".to_string(),
+        env_var: missing_env_var,
     };
     settings
 }

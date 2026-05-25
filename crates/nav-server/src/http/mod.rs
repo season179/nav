@@ -141,9 +141,14 @@ impl HttpServer {
     }
 
     fn handle_session_create(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
-        let params = match parse_params::<SessionCreateParams>(request.params) {
-            Ok(params) => params,
-            Err(error) => return rpc_error(request.id, -32602, error),
+        let params = match request.params {
+            Some(params) => match serde_json::from_value::<SessionCreateParams>(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return rpc_error(request.id, -32602, format!("invalid params: {error}"));
+                }
+            },
+            None => SessionCreateParams { cwd: None },
         };
 
         let session_id = self.ids.next_session_id();
