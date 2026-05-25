@@ -7,6 +7,9 @@ The config shape intentionally follows Pi's `models.json` closely: `providers`
 is keyed by provider id, each provider owns its endpoint settings, and each
 provider lists the models available behind that endpoint.
 
+Ready-to-use example configs live in
+`crates/nav-harness/examples/model-settings-*.json`.
+
 Prefer environment variables for credentials. String values follow Pi's
 behavior: nav checks the environment first, then falls back to the string as a
 literal value.
