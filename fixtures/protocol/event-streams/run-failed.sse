@@ -1,0 +1,11 @@
+id: 019f2f6f-f178-7a72-9f28-000000000200
+event: session.created
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000200","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"session.created"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000201
+event: run.started
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000201","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.started","run_id":"019f2f6f-f178-7a72-9f28-000000000101"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000205
+event: run.failed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000205","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.failed","run_id":"019f2f6f-f178-7a72-9f28-000000000101","message":"MissingApiKey: compatible-gateway requires an API key"}
