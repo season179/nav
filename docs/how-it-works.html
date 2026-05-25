@@ -6,7 +6,7 @@
   <title>How it works — nav</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-  <script>mermaid.initialize({theme:'dark',themeVariables:{darkMode:true,background:'#0d1512',primaryColor:'#1a2a23',primaryTextColor:'#e0ece4',primaryBorderColor:'#2a4a3a',lineColor:'#34d399',secondaryColor:'#152220',tertiaryColor:'#0d1512',fontFamily:'"JetBrains Mono","Fira Code",monospace',fontSize:'13px',noteBkgColor:'#1a2a23',noteTextColor:'#e0ece4',noteBorderColor:'#2a4a3a',actorTextColor:'#e0ece4',actorBorder:'#34d399',labelTextColor:'#e0ece4',edgeLabelBackground:'#0d1512'},flowchart:{htmlLabels:true,curve:'basis',padding:20}},sequence:{actorMargin:80,messageAlign:'center',useMaxWidth:true});</script>
+  <script src="mermaid.js"></script>
 </head>
 <body>
   <div class="page">
@@ -26,7 +26,7 @@
     <!-- ===== SEQUENCE DIAGRAM ===== -->
     <div class="page-inner diagram-section animate">
       <h2>The flow</h2>
-      <div class="mermaid">
+      <div class="mermaid mermaid-seq">
 sequenceDiagram
   actor User
   participant TUI as TUI (Go)
