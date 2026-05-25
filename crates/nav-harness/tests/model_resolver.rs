@@ -390,3 +390,118 @@ fn minimal_model(id: &str) -> ModelConfig {
         compat: Default::default(),
     }
 }
+
+fn load_example(name: &str) -> String {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = base.join("examples").join(name);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read example file {}: {e}", path.display()))
+}
+
+#[test]
+fn parses_example_config_with_env_var_api_key() {
+    let json = load_example("model-settings-env-var.json");
+    let settings: ModelSettings = serde_json::from_str(&json)
+        .expect("env-var example should deserialize");
+
+    let provider = settings.providers.get("local-gateway")
+        .expect("local-gateway provider should exist");
+    let model = provider.models.first().expect("should have a model");
+
+    let default = settings.default_model.as_ref().unwrap();
+    assert_eq!(default.provider, "local-gateway");
+    assert_eq!(default.model, "local-coder:7b");
+    assert_eq!(provider.api, ApiKind::OpenAiCompletions);
+    assert_eq!(provider.base_url, "http://localhost:11434/v1");
+    assert_eq!(provider.api_key, ApiKeyConfig::EnvVar { env_var: "LOCAL_GATEWAY_API_KEY".to_string() });
+    assert_eq!(model.id, "local-coder:7b");
+    assert!(model.reasoning);
+    assert_eq!(model.context_window, Some(128000));
+    assert_eq!(model.max_tokens, Some(32000));
+}
+
+#[test]
+fn parses_example_config_with_inline_api_key() {
+    let json = load_example("model-settings-inline-key.json");
+    let settings: ModelSettings = serde_json::from_str(&json)
+        .expect("inline-key example should deserialize");
+
+    let provider = settings.providers.get("private-local")
+        .expect("private-local provider should exist");
+    let model = provider.models.first().expect("should have a model");
+
+    let default = settings.default_model.as_ref().unwrap();
+    assert_eq!(default.provider, "private-local");
+    assert_eq!(default.model, "local-model");
+    assert_eq!(provider.api, ApiKind::OpenAiCompletions);
+    assert_eq!(provider.base_url, "http://localhost:8080/v1");
+    assert_eq!(provider.api_key, ApiKeyConfig::Inline { inline: "local-only-secret".to_string() });
+    assert_eq!(model.id, "local-model");
+}
+
+#[test]
+fn parses_example_config_with_proxy_gateway() {
+    let json = load_example("model-settings-proxy.json");
+    let settings: ModelSettings = serde_json::from_str(&json)
+        .expect("proxy example should deserialize");
+
+    let default = settings.default_model.as_ref().unwrap();
+    assert_eq!(default.provider, "team-proxy");
+    assert_eq!(default.model, "vendor/model-large");
+
+    let provider = settings.providers.get("team-proxy")
+        .expect("team-proxy provider should exist");
+    let model = provider.models.first().expect("should have a model");
+
+    assert_eq!(provider.base_url, "https://llm.example.com/v1");
+    assert_eq!(provider.api_key, ApiKeyConfig::Value("TEAM_PROXY_API_KEY".to_string()));
+    assert_eq!(model.id, "vendor/model-large");
+    assert!(model.reasoning);
+    assert_eq!(model.input, vec![ModelInput::Text, ModelInput::Image]);
+}
+
+#[test]
+fn parses_example_config_with_compat_overrides() {
+    let json = load_example("model-settings-compat.json");
+    let settings: ModelSettings = serde_json::from_str(&json)
+        .expect("compat example should deserialize");
+
+    let provider = settings.providers.get("compatible-endpoint")
+        .expect("compatible-endpoint provider should exist");
+    let model = provider.models.first().expect("should have a model");
+
+    assert_eq!(provider.api, ApiKind::OpenAiCompletions);
+    assert_eq!(provider.compat.thinking_format, Some(ThinkingFormat::QwenChatTemplate));
+    assert_eq!(provider.compat.supports_usage_in_streaming, Some(false));
+    assert_eq!(provider.compat.max_tokens_field, Some(MaxTokensField::MaxTokens));
+    // Model-level compat override
+    assert_eq!(model.compat.thinking_format, Some(ThinkingFormat::OpenAi));
+}
+
+#[test]
+fn resolves_example_configs_without_http_requests() {
+    let examples = [
+        "model-settings-env-var.json",
+        "model-settings-inline-key.json",
+        "model-settings-proxy.json",
+        "model-settings-compat.json",
+    ];
+
+    for name in &examples {
+        let json = load_example(name);
+        let settings: ModelSettings = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("{name} should deserialize: {e}"));
+
+        let resolver = ModelResolver::new(settings);
+        let resolved = resolver.resolve_default_with_env(|var| match var {
+            "LOCAL_GATEWAY_API_KEY" => Some("sk-local".to_string()),
+            "TEAM_PROXY_API_KEY" => Some("sk-team".to_string()),
+            "COMPATIBLE_ENDPOINT_API_KEY" => Some("sk-compat".to_string()),
+            _ => None,
+        }).unwrap_or_else(|e| panic!("{name} should resolve: {e:?}"));
+
+        assert_eq!(resolved.api, ApiKind::OpenAiCompletions);
+        assert!(!resolved.base_url.is_empty());
+        assert!(!resolved.api_key.expose_secret().is_empty());
+    }
+}

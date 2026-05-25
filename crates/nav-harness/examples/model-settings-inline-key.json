@@ -1,0 +1,14 @@
+{
+  "defaultModel": {
+    "provider": "private-local",
+    "model": "local-model"
+  },
+  "providers": {
+    "private-local": {
+      "baseUrl": "http://localhost:8080/v1",
+      "api": "openai-completions",
+      "apiKey": { "inline": "local-only-secret" },
+      "models": [{ "id": "local-model" }]
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "defaultModel": {
+    "provider": "local-gateway",
+    "model": "local-coder:7b"
+  },
+  "providers": {
+    "local-gateway": {
+      "name": "Local Gateway",
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": { "envVar": "LOCAL_GATEWAY_API_KEY" },
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": true,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "local-coder:7b",
+          "name": "Local Coder 7B",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 32000
+        }
+      ]
+    }
+  }
+}
