@@ -1,4 +1,18 @@
 //! Model routing, provider config, fallback rules, and cost/latency choices.
 
+pub mod api;
+pub mod compat;
+pub mod config;
+pub mod model;
+pub mod provider;
+pub mod resolver;
+
+pub use api::ApiKind;
+pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
+pub use config::{ModelRef, ModelSettings};
+pub use model::{ModelConfig, ModelInput};
+pub use provider::{ApiKeyConfig, ProviderConfig};
+pub use resolver::{ModelResolver, ResolveModelError, ResolvedApiKey, ResolvedModelConfig};
+
 #[derive(Debug, Default)]
 pub struct ModelRouter;
