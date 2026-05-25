@@ -276,6 +276,11 @@ fn flush_history_and_draw(
     // Flush pending history lines into scrollback
     if !app.pending_history.is_empty() {
         let size = term.size()?;
+        // Mirror into transcript so the overlay shows full session history
+        for line in &app.pending_history {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            app.transcript_lines.push(text);
+        }
         let lines = std::mem::take(&mut app.pending_history);
         let viewport_bottom = app.viewport_y + BOTTOM_PANE_HEIGHT;
         insert_history::insert_history_lines(
@@ -1022,6 +1027,13 @@ fn submit_prompt(
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
     prompt: &str,
 ) -> Result<()> {
+    if app.active_turn.is_some() {
+        app.pending_history.push(Line::from(Span::styled(
+            "  turn in progress — please wait",
+            Style::default().fg(Color::Yellow),
+        )));
+        return Ok(());
+    }
     let bypass = app.args.dangerously_bypass_approvals_and_sandbox;
     let policy = if bypass {
         AskForApproval::OnRequest
