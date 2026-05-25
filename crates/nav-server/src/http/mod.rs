@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use nav_harness::models::{ModelResolver, ModelSettings};
+use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, RunCancelParams,
     RunCancelResult, SessionCreateParams, SessionCreateResult, SessionSendMessageParams,
@@ -15,12 +16,15 @@ use serde_json::Value;
 
 pub mod auth;
 mod event_mapping;
+mod event_store;
 mod ids;
 pub mod live;
 pub mod rpc;
 pub mod sse;
 
 use event_mapping::{harness_events_to_backend_events, stream_minimal_model_output};
+use event_store::ProtocolEventStore;
+pub use event_store::ProtocolEventSubscription;
 use ids::ProtocolIdSource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,8 +45,9 @@ pub struct HttpServer {
     config: HttpServerConfig,
     model_resolver: ModelResolver,
     ids: ProtocolIdSource,
-    sessions: HashMap<SessionId, SessionState>,
+    sessions: HashMap<SessionId, SessionMetadata>,
     runs: HashMap<RunId, RunState>,
+    event_store: ProtocolEventStore,
 }
 
 impl HttpServer {
@@ -57,6 +62,7 @@ impl HttpServer {
             ids: ProtocolIdSource::default(),
             sessions: HashMap::new(),
             runs: HashMap::new(),
+            event_store: ProtocolEventStore::default(),
         }
     }
 
@@ -104,10 +110,6 @@ impl HttpServer {
             status: 400,
             message: error.to_string(),
         })?;
-        let session = self.sessions.get(&session_id).ok_or_else(|| HttpError {
-            status: 404,
-            message: "session not found".to_string(),
-        })?;
         let last_event_id = last_event_id
             .map(EventId::try_new)
             .transpose()
@@ -115,7 +117,10 @@ impl HttpServer {
                 status: 400,
                 message: error.to_string(),
             })?;
-        let events = session.events_after(last_event_id.as_ref());
+        let events = self
+            .event_store
+            .replay_after(&session_id, last_event_id.as_ref())
+            .map_err(replay_error_to_http)?;
         let body = sse::encode_events(&events).map_err(|error| HttpError {
             status: 500,
             message: error.to_string(),
@@ -126,6 +131,24 @@ impl HttpServer {
             content_type: "text/event-stream".to_string(),
             body,
         })
+    }
+
+    pub fn subscribe_session_events(
+        &mut self,
+        session_id: &SessionId,
+        last_event_id: Option<&EventId>,
+    ) -> Result<ProtocolEventSubscription, HttpError> {
+        self.event_store
+            .subscribe(session_id, last_event_id)
+            .map_err(replay_error_to_http)
+    }
+
+    pub fn run_status(&self, run_id: &RunId) -> Option<RunStatus> {
+        self.runs.get(run_id).map(|run| run.status)
+    }
+
+    pub fn session_metadata(&self, session_id: &SessionId) -> Option<&SessionMetadata> {
+        self.sessions.get(session_id)
     }
 
     fn handle_rpc_request(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
@@ -149,7 +172,7 @@ impl HttpServer {
                     return rpc_error(request.id, -32602, format!("invalid params: {error}"));
                 }
             },
-            None => SessionCreateParams { cwd: None },
+            None => SessionCreateParams::default(),
         };
 
         let session_id = self.ids.next_session_id();
@@ -160,11 +183,13 @@ impl HttpServer {
         };
         self.sessions.insert(
             session_id.clone(),
-            SessionState {
+            SessionMetadata {
                 cwd: params.cwd,
-                events: vec![event],
+                source: params.source,
+                settings_json: params.settings_json,
             },
         );
+        self.event_store.append(event);
 
         rpc_result(request.id, SessionCreateResult { session_id })
     }
@@ -195,13 +220,14 @@ impl HttpServer {
                 status: RunStatus::Running,
             },
         );
-        let mut events = vec![EventEnvelope {
+        self.event_store.append(EventEnvelope {
             event_id: self.ids.next_event_id(),
             session_id: params.session_id.clone(),
             event: BackendEvent::RunStarted {
                 run_id: run_id.clone(),
             },
-        }];
+        });
+        let mut events = Vec::new();
 
         let final_status = match self.model_resolver.resolve_default() {
             Ok(model) => {
@@ -236,10 +262,7 @@ impl HttpServer {
         if let Some(run) = self.runs.get_mut(&run_id) {
             run.status = final_status;
         }
-
-        if let Some(session) = self.sessions.get_mut(&params.session_id) {
-            session.events.extend(events);
-        }
+        self.event_store.append_many(events);
 
         rpc_result(
             request.id,
@@ -276,9 +299,7 @@ impl HttpServer {
                 run_id: params.run_id.clone(),
             },
         };
-        if let Some(session) = self.sessions.get_mut(&run.session_id) {
-            session.events.push(event);
-        }
+        self.event_store.append(event);
         if let Some(run) = self.runs.get_mut(&params.run_id) {
             run.status = RunStatus::Cancelled;
         }
@@ -366,11 +387,25 @@ pub struct HttpError {
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
-struct SessionState {
-    #[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionMetadata {
     cwd: Option<String>,
-    events: Vec<EventEnvelope>,
+    source: Option<SessionSource>,
+    settings_json: Option<Value>,
+}
+
+impl SessionMetadata {
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    pub fn source(&self) -> Option<SessionSource> {
+        self.source
+    }
+
+    pub fn settings_json(&self) -> Option<&Value> {
+        self.settings_json.as_ref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -380,7 +415,7 @@ struct RunState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunStatus {
+pub enum RunStatus {
     Running,
     Completed,
     Failed,
@@ -388,30 +423,13 @@ enum RunStatus {
 }
 
 impl RunStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }
-    }
-}
-
-impl SessionState {
-    fn events_after(&self, last_event_id: Option<&EventId>) -> Vec<EventEnvelope> {
-        let Some(last_event_id) = last_event_id else {
-            return self.events.clone();
-        };
-        let Some(index) = self
-            .events
-            .iter()
-            .position(|event| &event.event_id == last_event_id)
-        else {
-            return self.events.clone();
-        };
-
-        self.events.iter().skip(index + 1).cloned().collect()
     }
 }
 
@@ -427,6 +445,18 @@ fn session_events_path_session_id(path: &str) -> Option<&str> {
     let session_id = path.strip_prefix("/sessions/")?.strip_suffix("/events")?;
 
     (!session_id.is_empty() && !session_id.contains('/')).then_some(session_id)
+}
+
+fn replay_error_to_http(error: event_store::ReplayError) -> HttpError {
+    let status = match error {
+        event_store::ReplayError::UnknownSession(_) => 404,
+        event_store::ReplayError::UnknownCursor(_) => 409,
+    };
+
+    HttpError {
+        status,
+        message: error.to_string(),
+    }
 }
 
 fn rpc_result<R>(id: nav_types::RequestId, result: R) -> JsonRpcResponse<Value>

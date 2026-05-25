@@ -128,7 +128,10 @@ func (c *Client) connectLocked(ctx context.Context) (SessionInfo, error) {
 	}
 
 	cwd, _ := os.Getwd()
-	result, err := c.callRPCLocked(ctx, rpcSessionCreate, map[string]any{"cwd": cwd})
+	result, err := c.callRPCLocked(ctx, rpcSessionCreate, map[string]any{
+		"cwd":    cwd,
+		"source": "tui",
+	})
 	if err != nil {
 		return SessionInfo{}, err
 	}

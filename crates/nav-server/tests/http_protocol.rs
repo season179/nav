@@ -1,8 +1,15 @@
+use std::time::Duration;
+
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
-use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig};
+use nav_protocol::EventEnvelope;
+use nav_protocol::rpc::SessionSource;
+use nav_server::http::{
+    HttpRequest, HttpServer, HttpServerConfig, ProtocolEventSubscription, RunStatus,
+};
+use nav_types::{RunId, SessionId};
 use serde_json::{Value, json};
 
 #[test]
@@ -31,6 +38,62 @@ fn session_create_accepts_omitted_params() {
     let events = parse_sse(event_response.body());
     assert_eq!(event_names(&events), vec!["session.created"]);
     assert_protocol_event_ids(&events, session_id);
+}
+
+#[test]
+fn session_create_keeps_optional_session_metadata_outside_event_log() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+
+    let create_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(101),
+            "method": "session.create",
+            "params": {
+                "cwd": "/tmp/nav-workspace",
+                "source": "tui",
+                "settingsJson": {
+                    "modelRef": {
+                        "provider": "compatible-gateway",
+                        "model": "vendor/model-large"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ));
+
+    assert_eq!(create_response.status(), 200);
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = SessionId::try_new(
+        create_body["result"]["sessionId"]
+            .as_str()
+            .expect("session.create should return a session id"),
+    )
+    .unwrap();
+
+    let metadata = server
+        .session_metadata(&session_id)
+        .expect("session metadata should be retained");
+    assert_eq!(metadata.cwd(), Some("/tmp/nav-workspace"));
+    assert_eq!(metadata.source(), Some(SessionSource::Tui));
+    assert_eq!(
+        metadata.settings_json().unwrap()["modelRef"]["provider"],
+        "compatible-gateway"
+    );
+
+    let events = parse_sse(
+        server
+            .handle_request(HttpRequest::get(format!(
+                "/sessions/{}/events",
+                session_id.as_str()
+            )))
+            .body(),
+    );
+    assert_eq!(event_names(&events), vec!["session.created"]);
+    assert!(events[0].data.get("settingsJson").is_none());
+    assert!(events[0].data.get("source").is_none());
 }
 
 #[test]
@@ -123,6 +186,81 @@ fn session_send_message_starts_run_and_streams_typed_sse_events() {
         vec!["model.text_delta", "message.completed", "run.completed"]
     );
     assert_protocol_event_ids(&replayed_events, session_id);
+}
+
+#[test]
+fn session_events_returns_conflict_for_unknown_last_event_id() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+    let session_id = create_session(&mut server);
+
+    let response = server.handle_request(
+        HttpRequest::get(format!("/sessions/{session_id}/events"))
+            .with_last_event_id(request_id(999)),
+    );
+
+    assert_eq!(response.status(), 409);
+    assert!(response.body().contains("is not retained for this session"));
+}
+
+#[test]
+fn session_event_subscriber_receives_events_appended_after_subscription() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+    let session_id = SessionId::try_new(create_session(&mut server)).unwrap();
+    let subscription = server
+        .subscribe_session_events(&session_id, None)
+        .expect("session event subscription should open");
+
+    assert_eq!(
+        envelope_event_names(subscription.replay()),
+        vec!["session.created"]
+    );
+
+    let run_id = send_message(&mut server, session_id.as_str());
+    let live_events = receive_live_events(&subscription, 4);
+
+    assert_eq!(
+        envelope_event_names(&live_events),
+        vec![
+            "run.started",
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+        ]
+    );
+    assert!(
+        live_events
+            .iter()
+            .all(|event| event.session_id == session_id)
+    );
+    assert_eq!(
+        server.run_status(&RunId::try_new(run_id).unwrap()),
+        Some(RunStatus::Completed)
+    );
+    assert!(subscription.try_recv().is_err());
+}
+
+#[test]
+fn run_status_transitions_are_explicit() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+    let session_id = create_session(&mut server);
+    let completed_run_id = RunId::try_new(send_message(&mut server, &session_id))
+        .expect("completed run id should be valid");
+
+    assert_eq!(
+        server.run_status(&completed_run_id),
+        Some(RunStatus::Completed)
+    );
+
+    let mut failing_server =
+        HttpServer::with_model_settings(HttpServerConfig::default(), missing_key_model_settings());
+    let failing_session_id = create_session(&mut failing_server);
+    let failed_run_id = RunId::try_new(send_message(&mut failing_server, &failing_session_id))
+        .expect("failed run id should be valid");
+
+    assert_eq!(
+        failing_server.run_status(&failed_run_id),
+        Some(RunStatus::Failed)
+    );
 }
 
 #[test]
@@ -307,6 +445,23 @@ fn assert_protocol_event_ids(events: &[SseEvent], session_id: &str) {
         assert_eq!(event.data["event_id"], event.id);
         assert_eq!(event.data["session_id"], session_id);
     }
+}
+
+fn receive_live_events(
+    subscription: &ProtocolEventSubscription,
+    count: usize,
+) -> Vec<EventEnvelope> {
+    (0..count)
+        .map(|_| {
+            subscription
+                .recv_timeout(Duration::from_secs(1))
+                .expect("live subscription should receive appended event")
+        })
+        .collect()
+}
+
+fn envelope_event_names(events: &[EventEnvelope]) -> Vec<&str> {
+    events.iter().map(|event| event.event_type()).collect()
 }
 
 fn create_session(server: &mut HttpServer) -> String {

@@ -141,9 +141,9 @@ flowchart LR
               </tr>
               <tr>
                 <td><code>session.create</code></td>
-                <td><code>{ cwd? }</code> or omitted</td>
+                <td><code>{ cwd?, source?, settingsJson? }</code> or omitted</td>
                 <td><code>{ sessionId }</code></td>
-                <td>Creates a backend-owned session and appends <code>session.created</code> to its event log.</td>
+                <td>Creates a backend-owned session, retains session metadata outside the protocol event log, and appends <code>session.created</code>.</td>
               </tr>
               <tr>
                 <td><code>session.sendMessage</code></td>
@@ -380,7 +380,9 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
           <h3>Already implemented</h3>
           <ul>
             <li><code>session.create</code>, <code>session.sendMessage</code>, and <code>run.cancel</code> are routed by <code>crates/nav-server/src/http/mod.rs</code>.</li>
+            <li><code>session.create</code> accepts optional <code>source</code> and <code>settingsJson</code> session metadata so the protocol event log can sit beside the future canonical <code>SessionStore</code>.</li>
             <li><code>GET /sessions/{sessionId}/events</code> returns retained events encoded by <code>crates/nav-server/src/http/sse.rs</code>.</li>
+            <li><code>crates/nav-server/src/http/event_store.rs</code> keeps the in-memory protocol event projection used for replay and live subscriber fan-out.</li>
             <li>IDs are validated as lowercase UUIDv7 strings by <code>crates/nav-types/src/lib.rs</code>.</li>
             <li>The Go TUI client creates a session, sends messages, tracks <code>Last-Event-ID</code>, and parses SSE in <code>tui/internal/client/client.go</code>.</li>
           </ul>
@@ -390,9 +392,9 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
           <ul>
             <li><code>initialize</code>, <code>tool.approve</code>, <code>tool.reject</code>, and <code>session.close</code> are declared but not yet routed by the HTTP server.</li>
             <li>The method table above is the stable target. Declared-but-unrouted RPC structs still need wire-shape alignment before exposure, including capability negotiation fields and camelCase approval/session params.</li>
-            <li>The SSE endpoint currently returns a finite replay response and closes; it does not hold a long-lived live connection.</li>
-            <li>If <code>Last-Event-ID</code> is valid but unknown, the current server replays the full retained log. The stable contract should move this to an explicit resync response.</li>
-            <li>Events are retained in memory only. <code>crates/nav-harness/src/sessions/mod.rs</code> is still a stub, so durable transcript storage, fork, compaction, and canonical replay remain backend storage work.</li>
+            <li>The SSE endpoint currently returns a finite replay response and closes; the underlying event store has live subscribers, but the HTTP transport has not yet been held open.</li>
+            <li>If <code>Last-Event-ID</code> is valid but unknown, the current server returns HTTP <code>409</code> so clients can resync from a future canonical session view.</li>
+            <li>Protocol events are retained in memory only. They are delivery projections, not the canonical transcript ledger; <code>crates/nav-harness/src/sessions/mod.rs</code> is still a stub, so durable transcript storage, fork, compaction, and canonical replay remain backend storage work.</li>
             <li>The current run path is intentionally minimal and maps model output through a synthetic OpenAI-compatible stream before the full harness loop is wired.</li>
             <li>Local auth token types exist, but the current HTTP bootstrap exposes only <code>baseUrl</code>.</li>
             <li>The current TUI consumes <code>model.text_delta</code> directly. Future general-purpose frontends should prefer normalized <code>message.delta</code> once emitted.</li>
