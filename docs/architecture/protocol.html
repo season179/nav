@@ -3,28 +3,27 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Protocol — nav</title>
+  <title>Protocol - nav</title>
   <link rel="stylesheet" href="../style.css">
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
   <script src="../mermaid.js"></script>
 </head>
 <body>
   <div class="page">
-    <div class="page-inner animate">
+    <div class="page-inner">
       <nav class="crumb">
         <a href="../index.html">nav</a><span class="sep">/</span><a href="index.html">architecture</a><span class="sep">/</span><span class="current">protocol</span>
       </nav>
 
       <div class="detail-header">
-        <h1>Protocol<em>.</em></h1>
+        <h1>Protocol</h1>
         <p class="lead">A stable multi-frontend contract for nav clients. The TUI is one client of this boundary, not the owner of it.</p>
       </div>
     </div>
 
-    <!-- ===== PROTOCOL OVERVIEW DIAGRAM ===== -->
-    <div class="page-inner diagram-section animate">
+    <div class="page-inner diagram-section">
       <h2>Two channels</h2>
-      <p class="lead">Commands go in via JSON-RPC. Ordered session events stream out via SSE. Every frontend speaks the same contract.</p>
+      <p class="lead">Commands go in through JSON-RPC. Ordered session events stream out through SSE. Every frontend speaks the same contract.</p>
       <div class="mermaid">
 flowchart LR
   subgraph frontend["Frontend (TUI / Electron / Web)"]
@@ -35,13 +34,12 @@ flowchart LR
     sse["GET /sessions/{id}/events\nServer-Sent Events"]
   end
 
-  f -->|"commands:\ninitialize, sendMessage,\ntool.approve, …"| rpc
-  sse -->|"events:\nmessage.delta, run.completed,\ntool.approval_requested, …"| f
+  f -->|"commands:\ninitialize,\nsession.sendMessage,\ntool.approve"| rpc
+  sse -->|"events:\nmodel.text_delta,\nmessage.completed,\nrun.completed"| f
       </div>
     </div>
 
-    <!-- ===== STABILITY ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>Contract boundary</h2>
       <div class="detail-body">
         <div>
@@ -49,25 +47,24 @@ flowchart LR
           <p>Frontend-specific rendering, keyboard handling, scrollback, optimistic UI, and reconnect UX stay outside this contract. Backend-owned work such as sessions, runs, models, tools, approvals, and filesystem effects stays behind the protocol.</p>
         </div>
         <div>
-          <h2>Implementation sources</h2>
+          <h3>Implementation sources</h3>
           <p>This page describes and constrains the current implementation paths:</p>
           <ul class="source-list">
-            <li><code>crates/nav-protocol/src/rpc.rs</code> — JSON-RPC envelopes and method structs</li>
-            <li><code>crates/nav-protocol/src/events.rs</code> — SSE event envelope and payload variants</li>
-            <li><code>crates/nav-server/src/http/mod.rs</code> — method routing, run/session state, replay behavior</li>
-            <li><code>crates/nav-server/src/http/sse.rs</code> — SSE framing</li>
-            <li><code>crates/nav-server/src/http/live.rs</code> — local HTTP parsing and bootstrap</li>
-            <li><code>tui/internal/client/client.go</code> — current Go frontend client</li>
-            <li><code>crates/nav-server/tests/http_protocol.rs</code> and <code>tui/internal/client/client_test.go</code> — executable examples</li>
-            <li><code>fixtures/protocol/</code> — shared JSON-RPC and SSE conformance fixtures for future clients</li>
-            <li><code>plans/session-storage.md</code> — required storage model for future durable transcripts</li>
+            <li><code>crates/nav-protocol/src/rpc.rs</code> - JSON-RPC envelopes and method structs</li>
+            <li><code>crates/nav-protocol/src/events.rs</code> - SSE event envelope and payload variants</li>
+            <li><code>crates/nav-server/src/http/mod.rs</code> - method routing, run/session state, replay behavior</li>
+            <li><code>crates/nav-server/src/http/sse.rs</code> - SSE framing</li>
+            <li><code>crates/nav-server/src/http/live.rs</code> - local HTTP parsing and bootstrap</li>
+            <li><code>tui/internal/client/client.go</code> - current Go frontend client</li>
+            <li><code>crates/nav-server/tests/http_protocol.rs</code> and <code>tui/internal/client/client_test.go</code> - executable examples</li>
+            <li><code>fixtures/protocol/</code> - shared JSON-RPC and SSE conformance fixtures for future clients</li>
+            <li><code>plans/session-storage.md</code> - required storage model for future durable transcripts</li>
           </ul>
         </div>
       </div>
     </div>
 
-    <!-- ===== STORAGE BOUNDARY ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>Protocol and storage</h2>
       <div class="detail-body">
         <div>
@@ -87,8 +84,7 @@ flowchart LR
       </div>
     </div>
 
-    <!-- ===== JSON-RPC ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>JSON-RPC commands</h2>
       <div class="contract-section">
         <p>Clients send commands to <code>POST /rpc</code> with <code>Content-Type: application/json</code>. Requests and responses use JSON-RPC 2.0. JSON-RPC errors are returned as JSON response bodies, normally with HTTP <code>200</code>; transport errors such as unknown paths still use HTTP status codes.</p>
@@ -182,8 +178,7 @@ flowchart LR
       </div>
     </div>
 
-    <!-- ===== SSE ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>SSE session events</h2>
       <div class="contract-section">
         <p>Clients subscribe to <code>GET /sessions/{sessionId}/events</code>. Each SSE frame includes an <code>id</code> line, an <code>event</code> line, and a JSON <code>data</code> payload. The SSE <code>id</code> must equal the payload <code>event_id</code>; the SSE <code>event</code> must equal the payload <code>type</code>.</p>
@@ -326,8 +321,7 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
       </div>
     </div>
 
-    <!-- ===== NEGOTIATION AND ERRORS ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>Versioning and errors</h2>
       <div class="detail-body">
         <div>
@@ -373,8 +367,7 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
       </div>
     </div>
 
-    <!-- ===== CURRENT IMPLEMENTATION ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>Current implementation status</h2>
       <div class="detail-body">
         <div>
@@ -404,13 +397,12 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
       </div>
     </div>
 
-    <!-- ===== TRANSPORT ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>Transport</h2>
       <div class="detail-body narrow">
         <div>
           <p>Local clients talk to HTTP on <code>127.0.0.1</code> with a random port. Frontend launchers may spawn the backend and discover its base URL from the bootstrap line written by <code>nav-backend serve-http</code>.</p>
-          <p>All protocol IDs are canonical lowercase <strong>UUIDv7</strong> strings — they're not secrets, but they do leak approximate creation time, so authentication uses separate random tokens.</p>
+          <p>All protocol IDs are canonical lowercase <strong>UUIDv7</strong> strings. They are not secrets, but they can reveal approximate creation time, so authentication uses separate random tokens.</p>
         </div>
       </div>
     </div>
@@ -419,7 +411,7 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
       <div class="footer-inner">
         <span class="footer-left">nav v26.5.12</span>
         <div class="footer-right">
-          <a href="index.html">↑ Architecture</a>
+          <a href="index.html">Architecture</a>
           <a href="../index.html">Index</a>
         </div>
       </div>

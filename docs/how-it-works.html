@@ -3,85 +3,71 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>How it works — nav</title>
+  <title>How it works - nav</title>
   <link rel="stylesheet" href="style.css">
   <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
   <script src="mermaid.js"></script>
 </head>
 <body>
   <div class="page">
-    <div class="page-inner animate">
+    <div class="page-inner">
       <nav class="crumb">
         <a href="index.html">nav</a><span class="sep">/</span><span class="current">how it works</span>
       </nav>
 
       <div class="section-header">
-        <h1>How it works<em>.</em></h1>
+        <h1>How it works</h1>
         <p class="lead">
-          Follow one message from keystroke to completed run. Every interaction with nav follows this pattern.
+          Follow the current local path for one TUI message. This page names what exists now and what is still future work.
         </p>
       </div>
     </div>
 
-    <!-- ===== SEQUENCE DIAGRAM ===== -->
-    <div class="page-inner diagram-section animate">
-      <h2>The flow</h2>
+    <div class="page-inner diagram-section">
+      <h2>Current message path</h2>
       <div class="mermaid mermaid-seq">
 sequenceDiagram
   actor User
   participant TUI as TUI (Go)
   participant Server as nav-server
   participant Harness as nav-harness
-  participant LLM as LLM API
+  participant Resolver as Model resolver
 
   User->>TUI: types message
   TUI->>Server: POST /rpc session.sendMessage
-  Server->>Harness: create Run, enter agent loop
+  Server->>Server: create run and message IDs
+  Server->>Resolver: resolve default provider and model
 
-  rect rgba(52,211,153,0.06)
-    Note over Harness,LLM: Agent Loop (may repeat)
-    Harness->>LLM: send prompt + context
-    LLM-->>Harness: streaming tokens
-    Harness-->>Server: SSE: message.delta
-    Server-->>TUI: SSE stream
+  alt model settings resolve
+    Server->>Harness: map minimal OpenAI-compatible chunks
+    Harness-->>Server: model and message events
+    Server-->>TUI: GET /sessions/{id}/events
+  else settings missing or invalid
+    Server-->>TUI: run.failed event
   end
 
-  alt tool call needed
-    Harness-->>Server: SSE: tool.approval_requested
-    Server-->>TUI: SSE event
-    User->>TUI: approves
-    TUI->>Server: POST /rpc tool.approve
-    Server->>Harness: execute tool
-    Harness-->>Server: SSE: tool.call_completed
-    Note over Harness,LLM: Loop continues with tool result
-  end
-
-  Harness-->>Server: SSE: run.completed
-  Server-->>TUI: SSE event
+  TUI->>TUI: render transcript or visible error
       </div>
     </div>
 
-    <!-- ===== WALKTHROUGH STEPS ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>Step by step</h2>
       <ol class="steps">
         <li><strong>User types a message</strong> in the TUI. The Go frontend sends a <code>session.sendMessage</code> JSON-RPC call to <code>POST /rpc</code> on the local HTTP server.</li>
-        <li><strong>Server creates a Run.</strong> <code>nav-server</code> receives the RPC, creates a Run in <code>nav-harness</code>, and enters the agent loop. The command response acknowledges immediately — it does not wait for the run to finish.</li>
-        <li><strong>Agent loop starts.</strong> The harness loads context (files, conversation history, skills), sends the prompt to the configured LLM provider, and begins receiving streaming tokens.</li>
-        <li><strong>Tokens stream back via SSE.</strong> Each chunk becomes a <code>message.delta</code> event pushed through <code>GET /sessions/{id}/events</code>. The TUI renders text as it arrives.</li>
-        <li><strong>Tool call may be requested.</strong> If the LLM decides to use a tool (read a file, run a command, etc.), the harness emits <code>tool.approval_requested</code> over SSE. The TUI shows the request to the user.</li>
-        <li><strong>User approves or rejects.</strong> The TUI sends <code>tool.approve</code> or <code>tool.reject</code> via JSON-RPC. If approved, the harness executes the tool and feeds the result back into the agent loop.</li>
-        <li><strong>Run completes.</strong> When the LLM finishes (or the user cancels), the harness emits <code>run.completed</code>. All events carry UUIDv7 IDs for replay via <code>Last-Event-ID</code>.</li>
+        <li><strong>Server creates IDs.</strong> <code>nav-server</code> validates the session and text, then creates a run ID and message ID.</li>
+        <li><strong>Model settings resolve.</strong> The backend reads the configured default provider and model. If settings are missing or invalid, the run fails visibly.</li>
+        <li><strong>Events are mapped.</strong> The current prototype maps a minimal OpenAI-compatible stream through the harness event mapper. This exercises the typed event path before the full agent loop exists.</li>
+        <li><strong>TUI fetches session events.</strong> The Go client calls <code>GET /sessions/{id}/events</code>, using <code>Last-Event-ID</code> on later reads.</li>
+        <li><strong>Output renders.</strong> The TUI turns model deltas, completed messages, and errors into transcript rows and status text.</li>
       </ol>
     </div>
 
-    <!-- ===== CURRENT STATUS ===== -->
-    <div class="page-inner animate">
+    <div class="page-inner">
       <h2>Current status</h2>
       <div class="detail-body narrow">
         <div>
-          <p>The prototype now uses the minimal local <strong>HTTP + JSON-RPC + SSE</strong> path for TUI prompts.</p>
-          <p>The backend run loop is still intentionally narrow, but user input now travels through <code>session.sendMessage</code> and typed SSE events drive assistant output or visible model errors.</p>
+          <p>The local <strong>HTTP + JSON-RPC + SSE</strong> path is real enough for the TUI to send prompts and render typed backend events.</p>
+          <p>Tool approval, filesystem writes, persistent sessions, and the full multi-step agent loop are still future work. Keep docs and tests honest about that boundary.</p>
         </div>
       </div>
     </div>
