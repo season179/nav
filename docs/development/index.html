@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Development — nav</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600;700&family=Karla:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg: #0c1016; --text: #e6edf3; --muted: #8b9aab; --link: #4db8a8; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Karla, sans-serif; font-size: 1.05rem; line-height: 1.6; color: var(--text); background: var(--bg); max-width: 36rem; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+    .crumb { font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .crumb a { color: var(--muted); text-decoration: none; }
+    .crumb a:hover { color: var(--link); }
+    h1 { font-family: "Cormorant Garamond", serif; font-size: 2.25rem; font-weight: 700; margin-bottom: 0.75rem; }
+    p { color: var(--muted); margin-bottom: 1rem; }
+    pre { font-size: 0.85rem; color: var(--link); background: #121820; padding: 1rem; border-radius: 4px; overflow-x: auto; margin: 0.75rem 0; }
+  </style>
+</head>
+<body>
+  <p class="crumb"><a href="../">nav</a> / development</p>
+  <h1>Development</h1>
+  <p>CalVer <code>26.5.12</code>. From the repo root:</p>
+  <pre>cargo test
+cd tui && go test ./...
+cd tui && go run ./cmd/nav</pre>
+  <p>Local launcher: <code>make navd-update</code> then <code>navd</code>. Override backend with <code>NAV_BACKEND</code>.</p>
+</body>
+</html>
