@@ -12,11 +12,12 @@ use nav_harness::events::{
 };
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ChatCompletionMessageRole, ChatCompletionRequestMessage,
-    ChatCompletionStreamEvent, MaxTokensField, ModelConfig, ModelInput, ModelRef, ModelResolver,
-    ModelSettings, OpenAiCompletionsCancellationToken, OpenAiCompletionsClient,
-    OpenAiCompletionsError, OpenAiCompletionsRequest, OpenAiCompletionsRequestContext,
-    OpenAiCompletionsResponseParser, ProviderCompat, ProviderConfig, ProviderRoutingCompat,
-    ReasoningEffort, ResolveModelError, ThinkingFormat,
+    ChatCompletionStreamEvent, ChatCompletionToolCall, ChatCompletionToolCallFunction,
+    MaxTokensField, ModelConfig, ModelInput, ModelRef, ModelResolver, ModelSettings,
+    OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, OpenAiCompletionsError,
+    OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, OpenAiCompletionsResponseParser,
+    ProviderCompat, ProviderConfig, ProviderRoutingCompat, ReasoningEffort, ResolveModelError,
+    ThinkingFormat,
 };
 use nav_types::{EventId, MessageId, RunId, ToolCallId};
 use serde_json::json;
@@ -183,7 +184,9 @@ fn can_use_developer_role_for_non_reasoning_models_when_compat_allows_it() {
             &resolved,
             &OpenAiCompletionsRequest::new(vec![ChatCompletionRequestMessage {
                 role: ChatCompletionMessageRole::System,
-                content: "Use developer rules.".to_string(),
+                content: Some("Use developer rules.".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
             }]),
         )
         .expect("request should build");
@@ -978,6 +981,153 @@ struct NoopWaker;
 
 impl Wake for NoopWaker {
     fn wake(self: Arc<Self>) {}
+}
+
+#[test]
+fn plain_assistant_message_serializes_with_content() {
+    let resolved = resolved_model("https://api.example.com/v1");
+    let request = OpenAiCompletionsRequest::new(vec![
+        ChatCompletionRequestMessage::user("Hello"),
+        ChatCompletionRequestMessage::assistant("Hi there!"),
+    ]);
+
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(&resolved, &request)
+        .expect("request should build");
+
+    let msg = &plan.body["messages"][1];
+    assert_eq!(msg["role"], "assistant");
+    assert_eq!(msg["content"], "Hi there!");
+    assert!(msg.get("tool_calls").is_none(), "plain assistant should not have tool_calls");
+    assert!(msg.get("tool_call_id").is_none(), "assistant should not have tool_call_id");
+}
+
+#[test]
+fn from_turns_maps_assistant_role_correctly() {
+    let turns = vec![
+        nav_harness::sessions::Turn::user_text("Hello"),
+        nav_harness::sessions::Turn::assistant_text("Hi there!"),
+    ];
+    let request = OpenAiCompletionsRequest::from_turns(&turns);
+
+    let resolved = resolved_model("https://api.example.com/v1");
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(&resolved, &request)
+        .expect("request should build");
+
+    assert_eq!(plan.body["messages"][0]["role"], "user");
+    assert_eq!(plan.body["messages"][0]["content"], "Hello");
+    assert!(plan.body["messages"][0].get("tool_calls").is_none());
+    assert!(plan.body["messages"][0].get("tool_call_id").is_none());
+    assert_eq!(plan.body["messages"][1]["role"], "assistant");
+    assert_eq!(plan.body["messages"][1]["content"], "Hi there!");
+    assert!(plan.body["messages"][1].get("tool_calls").is_none());
+    assert!(plan.body["messages"][1].get("tool_call_id").is_none());
+}
+
+#[test]
+fn assistant_with_content_and_tool_calls_serializes_both() {
+    let resolved = resolved_model("https://api.example.com/v1");
+    let request = OpenAiCompletionsRequest::new(vec![
+        ChatCompletionRequestMessage::user("Analyze this"),
+        ChatCompletionRequestMessage::assistant_with_content_and_tool_calls(
+            "Let me look that up.",
+            vec![ChatCompletionToolCall {
+                id: "call_xyz".to_string(),
+                function: ChatCompletionToolCallFunction {
+                    name: "search".to_string(),
+                    arguments: "{\"q\":\"test\"}".to_string(),
+                },
+            }],
+        ),
+    ]);
+
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(&resolved, &request)
+        .expect("request should build");
+
+    let msg = &plan.body["messages"][1];
+    assert_eq!(msg["role"], "assistant");
+    assert_eq!(msg["content"], "Let me look that up.");
+    assert!(msg.get("tool_call_id").is_none(), "assistant should not have tool_call_id");
+    let tool_calls = msg["tool_calls"].as_array().expect("tool_calls should be array");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0]["id"], "call_xyz");
+    assert_eq!(tool_calls[0]["type"], "function");
+    assert_eq!(tool_calls[0]["function"]["name"], "search");
+    assert_eq!(tool_calls[0]["function"]["arguments"], r#"{"q":"test"}"#);
+}
+
+#[test]
+fn user_message_does_not_include_tool_fields() {
+    let resolved = resolved_model("https://api.example.com/v1");
+    let request = OpenAiCompletionsRequest::new(vec![
+        ChatCompletionRequestMessage::user("Hello"),
+    ]);
+
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(&resolved, &request)
+        .expect("request should build");
+
+    let msg = &plan.body["messages"][0];
+    assert_eq!(msg["role"], "user");
+    assert_eq!(msg["content"], "Hello");
+    assert!(msg.get("tool_calls").is_none());
+    assert!(msg.get("tool_call_id").is_none());
+}
+
+#[test]
+fn assistant_with_tool_calls_serializes_correctly() {
+    let resolved = resolved_model("https://api.example.com/v1");
+    let request = OpenAiCompletionsRequest::new(vec![
+        ChatCompletionRequestMessage::user("What's the weather?"),
+        ChatCompletionRequestMessage::assistant_with_tool_calls(vec![
+            ChatCompletionToolCall {
+                id: "call_abc123".to_string(),
+                function: ChatCompletionToolCallFunction {
+                    name: "get_weather".to_string(),
+                    arguments: r#"{"location":"SF"}"#.to_string(),
+                },
+            },
+        ]),
+        ChatCompletionRequestMessage::tool("call_abc123", "Sunny, 72°F"),
+    ]);
+
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(&resolved, &request)
+        .expect("request should build");
+
+    let assistant_msg = &plan.body["messages"][1];
+    assert_eq!(assistant_msg["role"], "assistant");
+    assert!(assistant_msg["content"].is_null());
+    let tool_calls = assistant_msg["tool_calls"].as_array().expect("tool_calls should be array");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0]["id"], "call_abc123");
+    assert_eq!(tool_calls[0]["type"], "function");
+    assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
+    assert_eq!(tool_calls[0]["function"]["arguments"], r#"{"location":"SF"}"#);
+
+    let tool_msg = &plan.body["messages"][2];
+    assert_eq!(tool_msg["role"], "tool");
+    assert_eq!(tool_msg["tool_call_id"], "call_abc123");
+    assert_eq!(tool_msg["content"], "Sunny, 72°F");
+}
+
+#[test]
+fn tool_message_serializes_with_tool_call_id_and_content() {
+    let resolved = resolved_model("https://api.example.com/v1");
+    let request = OpenAiCompletionsRequest::new(vec![
+        ChatCompletionRequestMessage::user("What's the weather?"),
+        ChatCompletionRequestMessage::tool("call_abc123", "Sunny, 72°F"),
+    ]);
+
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(&resolved, &request)
+        .expect("request should build");
+
+    assert_eq!(plan.body["messages"][1]["role"], "tool");
+    assert_eq!(plan.body["messages"][1]["tool_call_id"], "call_abc123");
+    assert_eq!(plan.body["messages"][1]["content"], "Sunny, 72°F");
 }
 
 fn poll_ready<F: Future>(future: F) -> F::Output {
