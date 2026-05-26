@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
@@ -500,6 +500,50 @@ async fn stream_events_honors_cancelled_request_context_between_batches() {
     }
 }
 
+#[tokio::test]
+async fn stream_events_cancels_while_waiting_for_next_provider_chunk() {
+    let server = FakeSseServer::start_with_chunk_delay(
+        200,
+        "text/event-stream",
+        vec![
+            Vec::new(),
+            sse_data(
+                r#"{"id":"chatcmpl_1","choices":[{"delta":{"content":"hel"},"finish_reason":null}]}"#,
+            ),
+        ],
+        Duration::from_millis(250),
+    );
+    let resolved = resolved_model(server.base_url());
+    let token = OpenAiCompletionsCancellationToken::new();
+    let cancel_from_thread = token.clone();
+    let request_context = OpenAiCompletionsRequestContext::new().with_cancellation_token(token);
+    let mut ids = TestIds::default();
+    let mut events = Vec::new();
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        cancel_from_thread.cancel();
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(150),
+        OpenAiCompletionsClient::new().stream_events_with_context(
+            &resolved,
+            &OpenAiCompletionsRequest::from_user("Say hi"),
+            &request_context,
+            model_output_context(),
+            &mut ids,
+            |batch| events.extend(batch),
+        ),
+    )
+    .await
+    .expect("cancel should interrupt blocked chunk read");
+
+    server.join();
+    assert_eq!(result, Err(OpenAiCompletionsError::Cancelled));
+    assert!(events.is_empty());
+}
+
 #[test]
 fn reports_missing_key_from_resolver_as_client_error() {
     let error: OpenAiCompletionsError = ModelResolver::new(settings_for(
@@ -829,10 +873,15 @@ impl FakeSseServer {
             )
             .expect("response headers should write");
             for chunk in body_chunks {
-                stream
-                    .write_all(&chunk)
-                    .expect("response chunk should write");
-                stream.flush().expect("response chunk should flush");
+                if stop_sending_on_broken_pipe(
+                    stream.write_all(&chunk),
+                    "response chunk should write",
+                ) {
+                    break;
+                }
+                if stop_sending_on_broken_pipe(stream.flush(), "response chunk should flush") {
+                    break;
+                }
                 if let Some(chunk_delay) = chunk_delay {
                     thread::sleep(chunk_delay);
                 }
@@ -854,6 +903,14 @@ impl FakeSseServer {
 
     fn join(self) -> FakeHttpRequest {
         self.handle.join().expect("fake server should finish")
+    }
+}
+
+fn stop_sending_on_broken_pipe(result: std::io::Result<()>, context: &str) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => true,
+        Err(error) => panic!("{context}: {error}"),
     }
 }
 

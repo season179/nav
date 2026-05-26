@@ -12,6 +12,7 @@ use crate::events::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::sync::Notify;
 
 use super::{
     ApiKind, MaxTokensField, ProviderRoutingCompat, ResolveModelError, ResolvedModelConfig,
@@ -399,11 +400,35 @@ impl OpenAiCompletionsRequestContext {
             .as_ref()
             .is_some_and(OpenAiCompletionsCancellationToken::is_cancelled)
     }
+
+    async fn cancelled(&self) {
+        match &self.cancellation_token {
+            Some(cancellation_token) => cancellation_token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
+struct OpenAiCompletionsCancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+#[derive(Debug, Clone)]
 pub struct OpenAiCompletionsCancellationToken {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<OpenAiCompletionsCancellationState>,
+}
+
+impl Default for OpenAiCompletionsCancellationToken {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(OpenAiCompletionsCancellationState {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
 }
 
 impl OpenAiCompletionsCancellationToken {
@@ -412,11 +437,23 @@ impl OpenAiCompletionsCancellationToken {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        if !self.state.cancelled.swap(true, Ordering::SeqCst) {
+            self.state.notify.notify_waiters();
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+
+            self.state.notify.notified().await;
+        }
     }
 }
 
@@ -564,14 +601,14 @@ impl OpenAiCompletionsClient {
                 return Err(OpenAiCompletionsError::Cancelled);
             }
 
-            let Some(chunk) =
-                response
-                    .chunk()
-                    .await
-                    .map_err(|error| OpenAiCompletionsError::Transport {
-                        message: redact_secret(&error.to_string(), api_key),
-                    })?
-            else {
+            let chunk = tokio::select! {
+                _ = request_context.cancelled() => return Err(OpenAiCompletionsError::Cancelled),
+                chunk = response.chunk() => chunk.map_err(|error| OpenAiCompletionsError::Transport {
+                    message: redact_secret(&error.to_string(), api_key),
+                })?,
+            };
+
+            let Some(chunk) = chunk else {
                 break;
             };
 
