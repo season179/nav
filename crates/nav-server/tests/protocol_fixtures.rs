@@ -1,6 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
@@ -8,12 +6,11 @@ use nav_harness::models::{
 };
 use nav_protocol::{EventEnvelope, JsonRpcRequest, JsonRpcResponse};
 use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig, RunStatus, sse};
-use nav_types::RunId;
 use serde_json::{Value, json};
 
 mod support;
 
-use support::successful_provider_with_text;
+use support::{successful_provider_with_text, wait_for_run_status};
 
 const REQUEST_FIXTURES: &[(&str, &str)] = &[
     ("json-rpc/initialize-request.json", "initialize"),
@@ -331,23 +328,6 @@ fn session_events(server: &mut HttpServer, session_id: &str) -> Vec<SseEvent> {
             .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
             .body(),
     )
-}
-
-fn wait_for_run_status(server: &HttpServer, run_id: &str, expected: RunStatus) {
-    let run_id = RunId::try_new(run_id).expect("run id should be valid");
-    let deadline = Instant::now() + Duration::from_secs(5);
-
-    loop {
-        if server.run_status(&run_id) == Some(expected) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run {run_id} did not reach {}",
-            expected.as_str()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 fn fixture_json_response(relative_path: &str) -> JsonRpcResponse<Value> {

@@ -1,5 +1,4 @@
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
@@ -17,7 +16,7 @@ mod support;
 
 use support::{
     FakeProviderServer, HangingProviderServer, provider_sse_chunk, successful_provider_with_text,
-    unused_local_base_url,
+    unused_local_base_url, wait_for_run_status,
 };
 
 const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -696,23 +695,6 @@ fn receive_live_events(
 
 fn envelope_event_names(events: &[EventEnvelope]) -> Vec<&str> {
     events.iter().map(|event| event.event_type()).collect()
-}
-
-fn wait_for_run_status(server: &HttpServer, run_id: &str, expected: RunStatus) {
-    let run_id = RunId::try_new(run_id).expect("run id should be valid");
-    let deadline = Instant::now() + Duration::from_secs(5);
-
-    loop {
-        if server.run_status(&run_id) == Some(expected) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "run {run_id} did not reach {}",
-            expected.as_str()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 fn create_session(server: &mut HttpServer) -> String {

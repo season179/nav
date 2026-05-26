@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use nav_server::http::{HttpServer, RunStatus};
+use nav_types::RunId;
 use serde_json::{Value, json};
 
 #[derive(Debug)]
@@ -29,6 +31,7 @@ impl ProviderRequest {
 pub struct FakeProviderServer {
     addr: String,
     request: Arc<Mutex<Option<ProviderRequest>>>,
+    stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -40,9 +43,11 @@ impl FakeProviderServer {
             .expect("fake provider should support nonblocking accept");
         let addr = listener.local_addr().unwrap().to_string();
         let request = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
         let request_for_thread = Arc::clone(&request);
+        let stop_for_thread = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            if let Some(stream) = accept_provider_request(listener) {
+            if let Some(stream) = accept_provider_request(listener, stop_for_thread) {
                 handle_provider_connection(
                     stream,
                     request_for_thread,
@@ -56,6 +61,7 @@ impl FakeProviderServer {
         Self {
             addr,
             request,
+            stop,
             handle: Some(handle),
         }
     }
@@ -65,14 +71,28 @@ impl FakeProviderServer {
     }
 
     pub fn request(mut self) -> ProviderRequest {
-        if let Some(handle) = self.handle.take() {
-            handle.join().expect("fake provider thread should finish");
-        }
+        self.join_thread()
+            .expect("fake provider thread should finish");
         self.request
             .lock()
             .unwrap()
             .take()
             .expect("fake provider should receive a request")
+    }
+
+    fn join_thread(&mut self) -> thread::Result<()> {
+        if let Some(handle) = self.handle.take() {
+            handle.join()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for FakeProviderServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.join_thread();
     }
 }
 
@@ -96,7 +116,7 @@ impl HangingProviderServer {
         let request_for_thread = Arc::clone(&request);
         let stop_for_thread = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            if let Some(stream) = accept_provider_request(listener) {
+            if let Some(stream) = accept_provider_request(listener, Arc::clone(&stop_for_thread)) {
                 handle_hanging_provider_connection(stream, request_for_thread, stop_for_thread);
             }
         });
@@ -129,11 +149,44 @@ impl HangingProviderServer {
 
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.join_thread()
+            .expect("hanging provider thread should finish");
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.join_thread();
+    }
+
+    fn join_thread(&mut self) -> thread::Result<()> {
         if let Some(handle) = self.handle.take() {
-            handle
-                .join()
-                .expect("hanging provider thread should finish");
+            handle.join()
+        } else {
+            Ok(())
         }
+    }
+}
+
+impl Drop for HangingProviderServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+pub fn wait_for_run_status(server: &HttpServer, run_id: &str, expected: RunStatus) {
+    let run_id = RunId::try_new(run_id).expect("run id should be valid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        if server.run_status(&run_id) == Some(expected) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run {run_id} did not reach {}",
+            expected.as_str()
+        );
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -222,9 +275,13 @@ fn handle_hanging_provider_connection(
     }
 }
 
-fn accept_provider_request(listener: TcpListener) -> Option<TcpStream> {
+fn accept_provider_request(listener: TcpListener, stop: Arc<AtomicBool>) -> Option<TcpStream> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+
         match listener.accept() {
             Ok((stream, _)) => {
                 stream
