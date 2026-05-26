@@ -20,6 +20,8 @@ SQLite rows or provider-native response history.
 
 - `json-rpc/` contains representative JSON-RPC 2.0 requests and responses.
 - `event-streams/` contains SSE frames with `id`, `event`, and JSON `data`.
+- `provider-streams/` contains provider-native Chat Completions SSE frames used
+  by fake upstream servers in backend regression tests.
 
 ## Using the fixtures
 
@@ -50,3 +52,11 @@ transport capabilities.
 `GET /sessions/{sessionId}/events` with `Last-Event-ID` set to the
 `run.started` event ID from `event-streams/message-send-completed.sse`. The
 server should resume strictly after that event.
+
+## Provider stream fixtures
+
+`provider-streams/delayed-chat-completions.sse` is upstream provider output, not
+nav frontend protocol output. Tests should flush the first `data:` frame, pause
+before the `: delayed boundary` marker, then flush the remaining frames. That
+shape proves the backend publishes partial model text before the provider stream
+finishes and keeps replay cursors valid while a run is still active.

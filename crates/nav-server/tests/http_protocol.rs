@@ -6,8 +6,8 @@ use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
-use nav_protocol::EventEnvelope;
 use nav_protocol::rpc::SessionSource;
+use nav_protocol::{BackendEvent, EventEnvelope};
 use nav_server::http::{
     HttpRequest, HttpServer, HttpServerConfig, ProtocolEventSubscription, RunStatus,
 };
@@ -17,8 +17,8 @@ use serde_json::{Value, json};
 mod support;
 
 use support::{
-    FakeProviderServer, HangingProviderServer, provider_sse_chunk, successful_provider_with_text,
-    unused_local_base_url, wait_for_run_status,
+    FakeProviderServer, HangingProviderServer, delayed_chat_completions_provider,
+    provider_sse_chunk, successful_provider_with_text, unused_local_base_url, wait_for_run_status,
 };
 
 const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -341,6 +341,72 @@ fn session_send_message_returns_before_provider_stream_finishes() {
     let cancel_events = receive_live_events(&subscription, 1);
     assert_eq!(envelope_event_names(&cancel_events), vec!["run.cancelled"]);
     assert_eq!(cancel_events[0].session_id, session_id);
+}
+
+#[test]
+fn session_send_message_streams_delayed_provider_chunks_live_and_replays_midstream() {
+    let mut provider = delayed_chat_completions_provider();
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = SessionId::try_new(create_session(&mut server)).unwrap();
+    let subscription = server
+        .subscribe_session_events(&session_id, None)
+        .expect("session event subscription should open");
+
+    assert_eq!(
+        envelope_event_names(subscription.replay()),
+        vec!["session.created"]
+    );
+
+    let run_id = send_message(&mut server, session_id.as_str());
+    let request = provider.wait_for_request();
+    assert_eq!(request.path, "/v1/chat/completions");
+
+    let live_before_completion = receive_live_events(&subscription, 2);
+    assert_eq!(
+        envelope_event_names(&live_before_completion),
+        vec!["run.started", "model.text_delta"]
+    );
+    assert_model_text_delta(&live_before_completion[1], "hello ");
+    assert!(matches!(
+        subscription.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        server.run_status(&RunId::try_new(&run_id).unwrap()),
+        Some(RunStatus::Running)
+    );
+
+    let replay_after_run_started = server
+        .subscribe_session_events_http(
+            session_id.as_str(),
+            Some(live_before_completion[0].event_id.as_str()),
+        )
+        .expect("midstream replay subscription should open");
+    assert_eq!(
+        envelope_event_names(replay_after_run_started.replay()),
+        vec!["model.text_delta"]
+    );
+    assert_model_text_delta(&replay_after_run_started.replay()[0], "hello ");
+
+    provider.release_completion();
+
+    let live_after_release = receive_live_events(&subscription, 3);
+    assert_eq!(
+        envelope_event_names(&live_after_release),
+        vec!["model.text_delta", "message.completed", "run.completed"]
+    );
+    assert_model_text_delta(&live_after_release[0], "Season");
+
+    let replay_after_release = receive_live_events(&replay_after_run_started, 3);
+    assert_eq!(
+        envelope_event_names(&replay_after_release),
+        vec!["model.text_delta", "message.completed", "run.completed"]
+    );
+    assert_model_text_delta(&replay_after_release[0], "Season");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
 }
 
 #[test]
@@ -769,6 +835,13 @@ fn receive_live_events(
 
 fn envelope_event_names(events: &[EventEnvelope]) -> Vec<&str> {
     events.iter().map(|event| event.event_type()).collect()
+}
+
+fn assert_model_text_delta(event: &EventEnvelope, expected: &str) {
+    match &event.event {
+        BackendEvent::ModelTextDelta { delta, .. } => assert_eq!(delta, expected),
+        event => panic!("event = {event:?}, want model.text_delta"),
+    }
 }
 
 fn create_session(server: &mut HttpServer) -> String {

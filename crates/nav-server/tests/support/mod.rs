@@ -3,6 +3,7 @@
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -10,6 +11,10 @@ use std::time::{Duration, Instant};
 use nav_server::http::{HttpServer, RunStatus};
 use nav_types::RunId;
 use serde_json::{Value, json};
+
+const DELAYED_CHAT_COMPLETIONS_STREAM: &str =
+    include_str!("../../../../fixtures/protocol/provider-streams/delayed-chat-completions.sse");
+const DELAYED_BOUNDARY_MARKER: &str = ": delayed boundary";
 
 #[derive(Debug)]
 pub struct ProviderRequest {
@@ -32,6 +37,15 @@ pub struct FakeProviderServer {
     addr: String,
     request: Arc<Mutex<Option<ProviderRequest>>>,
     stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+pub struct DelayedProviderServer {
+    addr: String,
+    request: Arc<Mutex<Option<ProviderRequest>>>,
+    stop: Arc<AtomicBool>,
+    release: Option<Sender<()>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -96,6 +110,75 @@ impl Drop for FakeProviderServer {
     }
 }
 
+impl DelayedProviderServer {
+    fn start(first_chunks: Vec<String>, delayed_chunks: Vec<String>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("delayed provider should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("delayed provider should support nonblocking accept");
+        let addr = listener.local_addr().unwrap().to_string();
+        let request = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel();
+        let request_for_thread = Arc::clone(&request);
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            if let Some(stream) = accept_provider_request(listener, Arc::clone(&stop_for_thread)) {
+                handle_delayed_provider_connection(
+                    stream,
+                    request_for_thread,
+                    stop_for_thread,
+                    release_rx,
+                    first_chunks,
+                    delayed_chunks,
+                );
+            }
+        });
+
+        Self {
+            addr,
+            request,
+            stop,
+            release: Some(release_tx),
+            handle: Some(handle),
+        }
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://{}/v1", self.addr)
+    }
+
+    pub fn wait_for_request(&self) -> ProviderRequest {
+        wait_for_provider_request(&self.request, "delayed provider")
+    }
+
+    pub fn release_completion(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.release_completion();
+        let _ = self.join_thread();
+    }
+
+    fn join_thread(&mut self) -> thread::Result<()> {
+        if let Some(handle) = self.handle.take() {
+            handle.join()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for DelayedProviderServer {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[derive(Debug)]
 pub struct HangingProviderServer {
     addr: String,
@@ -134,17 +217,7 @@ impl HangingProviderServer {
     }
 
     pub fn wait_for_request(&self) -> ProviderRequest {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(request) = self.request.lock().unwrap().take() {
-                return request;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "hanging provider did not receive a request"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_provider_request(&self.request, "hanging provider")
     }
 
     pub fn stop(mut self) {
@@ -225,6 +298,17 @@ pub fn successful_provider_with_text(text: &str) -> FakeProviderServer {
     )
 }
 
+pub fn delayed_chat_completions_provider() -> DelayedProviderServer {
+    let (first, delayed) = DELAYED_CHAT_COMPLETIONS_STREAM
+        .split_once(DELAYED_BOUNDARY_MARKER)
+        .expect("delayed provider fixture should include a boundary marker");
+
+    DelayedProviderServer::start(
+        provider_stream_frames(first),
+        provider_stream_frames(delayed),
+    )
+}
+
 pub fn unused_local_base_url() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("test should reserve a local port");
     let addr = listener.local_addr().unwrap();
@@ -253,6 +337,41 @@ fn handle_provider_connection(
     stream.flush().expect("fake provider response should flush");
 }
 
+fn handle_delayed_provider_connection(
+    stream: TcpStream,
+    request: Arc<Mutex<Option<ProviderRequest>>>,
+    stop: Arc<AtomicBool>,
+    release: mpsc::Receiver<()>,
+    first_chunks: Vec<String>,
+    delayed_chunks: Vec<String>,
+) {
+    let (provider_request, mut stream) = read_provider_request(stream);
+    *request.lock().unwrap() = Some(provider_request);
+
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        )
+        .expect("delayed provider headers should write");
+    stream
+        .flush()
+        .expect("delayed provider headers should flush");
+
+    if !write_provider_chunks(&mut stream, first_chunks, "first") {
+        return;
+    }
+
+    loop {
+        match release.recv_timeout(Duration::from_millis(10)) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) if stop.load(Ordering::SeqCst) => return,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+
+    write_provider_chunks(&mut stream, delayed_chunks, "delayed");
+}
+
 fn handle_hanging_provider_connection(
     stream: TcpStream,
     request: Arc<Mutex<Option<ProviderRequest>>>,
@@ -272,6 +391,62 @@ fn handle_hanging_provider_connection(
 
     while !stop.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn provider_stream_frames(input: &str) -> Vec<String> {
+    input
+        .split("\n\n")
+        .filter_map(|frame| {
+            let lines = frame
+                .lines()
+                .map(str::trim_end)
+                .filter(|line| !line.is_empty() && !line.starts_with(':'))
+                .collect::<Vec<_>>();
+
+            (!lines.is_empty()).then(|| format!("{}\n\n", lines.join("\n")))
+        })
+        .collect()
+}
+
+fn wait_for_provider_request(
+    request: &Arc<Mutex<Option<ProviderRequest>>>,
+    provider_name: &str,
+) -> ProviderRequest {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(request) = request.lock().unwrap().take() {
+            return request;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{provider_name} did not receive a request"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn write_provider_chunks(stream: &mut TcpStream, chunks: Vec<String>, phase: &str) -> bool {
+    for chunk in chunks {
+        if stop_sending_on_broken_pipe(
+            stream.write_all(chunk.as_bytes()),
+            &format!("{phase} chunk should write"),
+        ) {
+            return false;
+        }
+        if stop_sending_on_broken_pipe(stream.flush(), &format!("{phase} chunk should flush")) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn stop_sending_on_broken_pipe(result: std::io::Result<()>, context: &str) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => true,
+        Err(error) => panic!("{context}: {error}"),
     }
 }
 
