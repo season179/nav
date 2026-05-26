@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"nav.local/tui/internal/client"
 )
 
@@ -23,9 +24,7 @@ func TestSubmitComposerRendersAssistantDeltasFromBackendEvents(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("submitComposer returned nil command")
 	}
-	message := cmd()
-	updated, _ := next.Update(message)
-	result := updated.(Model)
+	result := runUntilIdle(t, next, cmd)
 
 	if agent.sentText != "hello backend" {
 		t.Fatalf("sent text %q, want %q", agent.sentText, "hello backend")
@@ -36,6 +35,129 @@ func TestSubmitComposerRendersAssistantDeltasFromBackendEvents(t *testing.T) {
 	}
 	if result.status != "ready" {
 		t.Fatalf("status = %q, want ready", result.status)
+	}
+}
+
+func TestSubmitComposerAppliesStreamedDeltaBeforeRunCompletes(t *testing.T) {
+	events := make(chan client.Event, 2)
+	errs := make(chan error, 1)
+	agent := &fakeAgent{
+		streamEvents: events,
+		streamErrs:   errs,
+	}
+	model := New(agent)
+	model.ready = true
+	model.composer.SetValue("hello backend")
+
+	next, cmd := model.submitComposer()
+	if cmd == nil {
+		t.Fatal("submitComposer returned nil command")
+	}
+	started := cmd()
+	updated, waitForEvent := next.Update(started)
+	if waitForEvent == nil {
+		t.Fatalf("stream start produced no follow-up command after message %#v", started)
+	}
+
+	events <- client.Event{Type: "model.text_delta", Delta: "hello live"}
+	streamed := waitForEvent()
+	updated, waitForEvent = updated.Update(streamed)
+	result := updated.(Model)
+
+	last := result.messages[len(result.messages)-1]
+	if last.Role != "assistant" || last.Body != "hello live" {
+		t.Fatalf("last transcript item = %#v, want live assistant delta", last)
+	}
+	if result.status != "thinking" {
+		t.Fatalf("status = %q, want thinking while run is still open", result.status)
+	}
+	if waitForEvent == nil {
+		t.Fatal("stream should keep waiting after a non-terminal delta")
+	}
+
+	events <- client.Event{Type: "run.completed"}
+	close(events)
+	close(errs)
+	completed := waitForEvent()
+	updated, waitForEvent = updated.Update(completed)
+	if waitForEvent == nil {
+		t.Fatal("stream should wait for channel close after terminal event")
+	}
+	done := waitForEvent()
+	updated, _ = updated.Update(done)
+	result = updated.(Model)
+	if result.status != "ready" {
+		t.Fatalf("status = %q, want ready after run.completed", result.status)
+	}
+	if result.streamCancel != nil {
+		t.Fatal("stream cancel was not cleared after stream completion")
+	}
+}
+
+func TestQuitCancelsActiveStreamBeforeClosingAgent(t *testing.T) {
+	agent := &fakeAgent{
+		streamEvents: make(chan client.Event),
+		streamErrs:   make(chan error),
+	}
+	model := New(agent)
+	model.ready = true
+	model.composer.SetValue("hello backend")
+
+	next, cmd := model.submitComposer()
+	if cmd == nil {
+		t.Fatal("submitComposer returned nil command")
+	}
+	started := cmd()
+	updated, waitForEvent := next.Update(started)
+	if waitForEvent == nil {
+		t.Fatalf("stream start produced no follow-up command after message %#v", started)
+	}
+	if agent.streamCtx == nil {
+		t.Fatal("fake agent did not capture stream context")
+	}
+
+	updated, _ = updated.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+
+	if err := agent.streamCtx.Err(); err != context.Canceled {
+		t.Fatalf("stream context error = %v, want context.Canceled", err)
+	}
+	if updated.(Model).streamCancel != nil {
+		t.Fatal("stream cancel was not cleared after quit")
+	}
+}
+
+func TestSubmitComposerIgnoresSecondPromptWhileStreamIsActive(t *testing.T) {
+	agent := &fakeAgent{
+		streamEvents: make(chan client.Event),
+		streamErrs:   make(chan error),
+	}
+	model := New(agent)
+	model.ready = true
+	model.composer.SetValue("first prompt")
+
+	next, cmd := model.submitComposer()
+	if cmd == nil {
+		t.Fatal("first submitComposer returned nil command")
+	}
+	started := cmd()
+	updated, waitForEvent := next.Update(started)
+	if waitForEvent == nil {
+		t.Fatalf("stream start produced no follow-up command after message %#v", started)
+	}
+
+	active := updated.(Model)
+	active.composer.SetValue("second prompt")
+	next, cmd = active.submitComposer()
+
+	result := next.(Model)
+	if cmd != nil {
+		t.Fatal("second submitComposer returned a command while stream was active")
+	}
+	if len(result.messages) != len(active.messages) {
+		t.Fatalf("message count = %d, want %d", len(result.messages), len(active.messages))
+	}
+	if got := result.composer.Value(); got != "second prompt" {
+		t.Fatalf("composer value = %q, want second prompt preserved", got)
 	}
 }
 
@@ -53,9 +175,7 @@ func TestSubmitComposerSurfacesBackendRunFailures(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("submitComposer returned nil command")
 	}
-	message := cmd()
-	updated, _ := next.Update(message)
-	result := updated.(Model)
+	result := runUntilIdle(t, next, cmd)
 
 	if result.err == nil {
 		t.Fatal("expected backend error to be visible")
@@ -101,19 +221,45 @@ func TestApplyAgentEventSurfacesUnknownEvents(t *testing.T) {
 }
 
 type fakeAgent struct {
-	sentText string
-	events   []client.Event
+	sentText     string
+	streamCtx    context.Context
+	events       []client.Event
+	streamEvents <-chan client.Event
+	streamErrs   <-chan error
 }
 
 func (a *fakeAgent) Connect(context.Context) (client.SessionInfo, error) {
 	return client.SessionInfo{SessionID: "session-1", Endpoint: "http://backend.test", CWD: "/tmp/nav"}, nil
 }
 
-func (a *fakeAgent) SendMessage(_ context.Context, text string) ([]client.Event, error) {
+func (a *fakeAgent) StreamMessage(ctx context.Context, text string) (<-chan client.Event, <-chan error) {
+	a.streamCtx = ctx
 	a.sentText = text
-	return a.events, nil
+	if a.streamEvents != nil || a.streamErrs != nil {
+		return a.streamEvents, a.streamErrs
+	}
+
+	events := make(chan client.Event, len(a.events))
+	for _, event := range a.events {
+		events <- event
+	}
+	close(events)
+
+	errs := make(chan error, 1)
+	close(errs)
+	return events, errs
 }
 
 func (a *fakeAgent) Close() error {
 	return nil
+}
+
+func runUntilIdle(t *testing.T, model tea.Model, cmd tea.Cmd) Model {
+	t.Helper()
+	for cmd != nil {
+		var message tea.Msg
+		message = cmd()
+		model, cmd = model.Update(message)
+	}
+	return model.(Model)
 }

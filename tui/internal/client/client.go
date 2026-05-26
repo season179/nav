@@ -72,14 +72,41 @@ func (c *Client) Connect(ctx context.Context) (SessionInfo, error) {
 }
 
 func (c *Client) SendMessage(ctx context.Context, text string) ([]Event, error) {
+	events, errs := c.StreamMessage(ctx, text)
+	var collected []Event
+	for event := range events {
+		collected = append(collected, event)
+	}
+	if err, ok := <-errs; ok && err != nil {
+		return nil, err
+	}
+	return collected, nil
+}
+
+func (c *Client) StreamMessage(ctx context.Context, text string) (<-chan Event, <-chan error) {
+	events := make(chan Event, 16)
+	errs := make(chan error, 1)
+
+	go func() {
+		defer close(events)
+		defer close(errs)
+		if err := c.streamMessage(ctx, text, events); err != nil {
+			errs <- err
+		}
+	}()
+
+	return events, errs
+}
+
+func (c *Client) streamMessage(ctx context.Context, text string, events chan<- Event) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if _, err := c.connectLocked(ctx); err != nil {
-		return nil, err
+		return err
 	}
 	if strings.TrimSpace(text) == "" {
-		return nil, errors.New("message text is required")
+		return errors.New("message text is required")
 	}
 
 	result, err := c.callRPCLocked(ctx, rpcSessionSendMessage, map[string]any{
@@ -87,20 +114,20 @@ func (c *Client) SendMessage(ctx context.Context, text string) ([]Event, error) 
 		"text":      text,
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	var send struct {
 		RunID string `json:"runId"`
 	}
 	if err := json.Unmarshal(result, &send); err != nil {
-		return nil, fmt.Errorf("decode session.sendMessage result: %w", err)
+		return fmt.Errorf("decode session.sendMessage result: %w", err)
 	}
 	if send.RunID == "" {
-		return nil, errors.New("session.sendMessage returned an empty run id")
+		return errors.New("session.sendMessage returned an empty run id")
 	}
 
-	return c.fetchEventsLocked(ctx, runTerminalEvent(send.RunID))
+	return c.streamEventsLocked(ctx, runTerminalEvent(send.RunID), events)
 }
 
 func (c *Client) Close() error {
@@ -271,13 +298,54 @@ func (c *Client) callRPCLocked(ctx context.Context, method string, params any) (
 }
 
 func (c *Client) fetchEventsLocked(ctx context.Context, stop func(Event) bool) ([]Event, error) {
+	var events []Event
+	done, err := c.readSessionEventsLocked(ctx, stop, func(event Event) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if stop != nil && !done {
+		return nil, errSSEStreamEndedBeforeExpectedEvent
+	}
+	return events, nil
+}
+
+func (c *Client) streamEventsLocked(ctx context.Context, stop func(Event) bool, events chan<- Event) error {
+	for {
+		lastEventID := c.lastEventID
+		done, err := c.readSessionEventsLocked(ctx, stop, func(event Event) error {
+			select {
+			case events <- event:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		if err != nil {
+			if shouldReconnectAfterSSEReadError(ctx, err, c.lastEventID != lastEventID) {
+				continue
+			}
+			return err
+		}
+		if done {
+			return nil
+		}
+		if c.lastEventID == lastEventID {
+			return errSSEStreamEndedBeforeExpectedEvent
+		}
+	}
+}
+
+func (c *Client) readSessionEventsLocked(ctx context.Context, stop func(Event) bool, emit func(Event) error) (bool, error) {
 	if c.session.SessionID == "" {
-		return nil, errors.New("session is not connected")
+		return false, errors.New("session is not connected")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+"/sessions/"+c.session.SessionID+"/events", nil)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 	if c.lastEventID != "" {
 		req.Header.Set("Last-Event-ID", c.lastEventID)
@@ -285,23 +353,24 @@ func (c *Client) fetchEventsLocked(ctx context.Context, stop func(Event) bool) (
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("get session events: %w", err)
+		return false, fmt.Errorf("get session events: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("session events returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return false, fmt.Errorf("session events returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	events, err := parseSSEUntil(resp.Body, stop)
-	if err != nil {
-		return nil, err
-	}
-	if len(events) > 0 {
-		c.lastEventID = events[len(events)-1].ID
-	}
-	return events, nil
+	return scanSSE(resp.Body, func(event Event) (bool, error) {
+		if event.ID != "" {
+			c.lastEventID = event.ID
+		}
+		if err := emit(event); err != nil {
+			return false, err
+		}
+		return stop != nil && stop(event), nil
+	})
 }
 
 type jsonRPCRequest struct {
@@ -344,10 +413,24 @@ func parseSSE(reader io.Reader) ([]Event, error) {
 }
 
 func parseSSEUntil(reader io.Reader, stop func(Event) bool) ([]Event, error) {
+	var events []Event
+	done, err := scanSSE(reader, func(event Event) (bool, error) {
+		events = append(events, event)
+		return stop != nil && stop(event), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if stop != nil && !done {
+		return nil, errSSEStreamEndedBeforeExpectedEvent
+	}
+	return events, nil
+}
+
+func scanSSE(reader io.Reader, emit func(Event) (bool, error)) (bool, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 
-	var events []Event
 	current := Event{}
 	var dataLines []string
 	flush := func() (bool, error) {
@@ -358,10 +441,9 @@ func parseSSEUntil(reader io.Reader, stop func(Event) bool) ([]Event, error) {
 		if err != nil {
 			return false, err
 		}
-		events = append(events, event)
 		current = Event{}
 		dataLines = nil
-		return stop != nil && stop(event), nil
+		return emit(event)
 	}
 
 	for scanner.Scan() {
@@ -369,10 +451,10 @@ func parseSSEUntil(reader io.Reader, stop func(Event) bool) ([]Event, error) {
 		if line == "" {
 			done, err := flush()
 			if err != nil {
-				return nil, err
+				return false, err
 			}
 			if done {
-				return events, nil
+				return true, nil
 			}
 			continue
 		}
@@ -387,16 +469,30 @@ func parseSSEUntil(reader io.Reader, stop func(Event) bool) ([]Event, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("read SSE stream: %w", err)
+		return false, &sseReadError{err: err}
 	}
-	done, err := flush()
-	if err != nil {
-		return nil, err
+	return flush()
+}
+
+type sseReadError struct {
+	err error
+}
+
+func (err *sseReadError) Error() string {
+	return fmt.Sprintf("read SSE stream: %v", err.err)
+}
+
+func (err *sseReadError) Unwrap() error {
+	return err.err
+}
+
+func shouldReconnectAfterSSEReadError(ctx context.Context, err error, madeProgress bool) bool {
+	if ctx.Err() != nil || !madeProgress {
+		return false
 	}
-	if stop != nil && !done {
-		return nil, errSSEStreamEndedBeforeExpectedEvent
-	}
-	return events, nil
+
+	var readErr *sseReadError
+	return errors.As(err, &readErr)
 }
 
 func sessionCreatedEvent(event Event) bool {

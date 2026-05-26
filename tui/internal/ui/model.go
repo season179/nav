@@ -13,7 +13,7 @@ import (
 
 type agentClient interface {
 	Connect(context.Context) (client.SessionInfo, error)
-	SendMessage(context.Context, string) ([]client.Event, error)
+	StreamMessage(context.Context, string) (<-chan client.Event, <-chan error)
 	Close() error
 }
 
@@ -29,25 +29,38 @@ type activityItem struct {
 }
 
 type Model struct {
-	agent    agentClient
-	composer textarea.Model
-	width    int
-	height   int
-	ready    bool
-	status   string
-	cwd      string
-	err      error
-	messages []transcriptItem
-	activity []activityItem
+	agent        agentClient
+	streamCancel context.CancelFunc
+	composer     textarea.Model
+	width        int
+	height       int
+	ready        bool
+	status       string
+	cwd          string
+	err          error
+	messages     []transcriptItem
+	activity     []activityItem
 }
 
 type agentReadyMsg struct {
 	session client.SessionInfo
 }
 
-type agentEventsMsg struct {
-	events []client.Event
+type agentStream struct {
+	events <-chan client.Event
+	errs   <-chan error
 }
+
+type agentStreamStartedMsg struct {
+	stream agentStream
+}
+
+type agentEventMsg struct {
+	event  client.Event
+	stream agentStream
+}
+
+type agentStreamDoneMsg struct{}
 
 type agentErrorMsg struct {
 	err error
@@ -95,6 +108,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, quitBinding):
+			m.cancelActiveStream()
 			return m, tea.Sequence(closeAgent(m.agent), tea.Quit)
 		case key.Matches(msg, newlineBinding):
 			prevHeight := m.composer.Height()
@@ -112,11 +126,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cwd = msg.session.CWD
 		m.setActivity(0, activityItem{Icon: "◇", Title: "backend", Body: msg.session.Endpoint})
 		m.setActivity(1, activityItem{Icon: "✓", Title: "session", Body: msg.session.SessionID})
-	case agentEventsMsg:
-		for _, event := range msg.events {
-			m.applyAgentEvent(event)
+	case agentStreamStartedMsg:
+		return m, waitForAgentEvent(msg.stream)
+	case agentEventMsg:
+		m.applyAgentEvent(msg.event)
+		return m, waitForAgentEvent(msg.stream)
+	case agentStreamDoneMsg:
+		m.cancelActiveStream()
+		if m.status == "thinking" {
+			m.status = "ready"
 		}
 	case agentErrorMsg:
+		m.cancelActiveStream()
 		m.status = "backend error"
 		m.err = msg.err
 		m.setActivity(0, activityItem{Icon: "×", Title: "backend", Body: msg.err.Error()})
@@ -131,6 +152,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) submitComposer() (tea.Model, tea.Cmd) {
+	if m.streamCancel != nil {
+		return m, nil
+	}
+
 	value := m.composer.Value()
 	if before, ok := strings.CutSuffix(value, "\\"); ok {
 		m.composer.SetValue(before)
@@ -151,7 +176,9 @@ func (m Model) submitComposer() (tea.Model, tea.Cmd) {
 	m.prependActivity(activityItem{Icon: "⋯", Title: "last prompt", Body: value})
 	m.composer.Reset()
 	m.resizeComposer()
-	return m, sendMessage(m.agent, value)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.streamCancel = cancel
+	return m, sendMessage(m.agent, ctx, value)
 }
 
 func closeAgent(agent agentClient) tea.Cmd {
@@ -161,13 +188,23 @@ func closeAgent(agent agentClient) tea.Cmd {
 	}
 }
 
-func sendMessage(agent agentClient, text string) tea.Cmd {
+func sendMessage(agent agentClient, ctx context.Context, text string) tea.Cmd {
 	return func() tea.Msg {
-		events, err := agent.SendMessage(context.Background(), text)
-		if err != nil {
+		events, errs := agent.StreamMessage(ctx, text)
+		return agentStreamStartedMsg{stream: agentStream{events: events, errs: errs}}
+	}
+}
+
+func waitForAgentEvent(stream agentStream) tea.Cmd {
+	return func() tea.Msg {
+		event, ok := <-stream.events
+		if ok {
+			return agentEventMsg{event: event, stream: stream}
+		}
+		if err, ok := <-stream.errs; ok && err != nil {
 			return agentErrorMsg{err: err}
 		}
-		return agentEventsMsg{events: events}
+		return agentStreamDoneMsg{}
 	}
 }
 
@@ -200,6 +237,14 @@ func (m *Model) applyAgentEvent(event client.Event) {
 		}
 		m.prependActivity(activityItem{Icon: "?", Title: title, Body: message})
 	}
+}
+
+func (m *Model) cancelActiveStream() {
+	if m.streamCancel == nil {
+		return
+	}
+	m.streamCancel()
+	m.streamCancel = nil
 }
 
 func (m *Model) appendAssistantDelta(delta string) {
