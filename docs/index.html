@@ -37,10 +37,10 @@ flowchart LR
   llm["LLM APIs"]
   fs["Filesystem and Git"]
 
-  dev -->|"types into"| tui
-  tui <-->|"JSON-RPC + SSE"| backend
-  backend -.->|"provider path"| llm
-  backend -.->|"tool path"| fs
+  dev --&gt;|"types into"| tui
+  tui &lt;--&gt;|"JSON-RPC + SSE"| backend
+  backend -.-&gt;|"provider path"| llm
+  backend -.-&gt;|"tool path"| fs
       </div>
     </div>
 

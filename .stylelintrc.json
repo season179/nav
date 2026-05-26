@@ -1,0 +1,14 @@
+{
+  "rules": {
+    "value-keyword-case": [
+      "lower",
+      {
+        "ignoreKeywords": [
+          "BlinkMacSystemFont",
+          "SFMono-Regular",
+          "Consolas"
+        ]
+      }
+    ]
+  }
+}
