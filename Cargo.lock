@@ -452,6 +452,7 @@ dependencies = [
  "nav-types",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

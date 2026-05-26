@@ -9,7 +9,7 @@ nav-types = { path = "../nav-types" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1.48", features = ["sync"] }
+tokio = { version = "1.48", features = ["macros", "sync"] }
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }

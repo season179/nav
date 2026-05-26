@@ -23,9 +23,12 @@
         <div>
           <p><em>Implemented in memory.</em> <code>crates/nav-server/src/http/event_store.rs</code> stores frontend-facing <code>EventEnvelope</code> projections for replay and fans out appended events to live subscribers.</p>
           <p>The log is scoped to protocol delivery. It powers <code>GET /sessions/{sessionId}/events</code>, <code>Last-Event-ID</code> replay, and long-lived SSE streams.</p>
+          <p><code>session.sendMessage</code> now creates a run, starts a background model-run worker, resolves the configured OpenAI-compatible model, and publishes provider stream chunks through this log as typed protocol events.</p>
+          <p>Run state is explicit: new runs begin as <code>running</code>, then settle as <code>completed</code>, <code>failed</code>, or <code>cancelled</code>. Provider-shaped failures emit <code>provider.error</code> before the terminal run event; transport failures go straight to <code>run.failed</code>.</p>
           <p>It is not the canonical transcript ledger. It does not own turns, parts, compaction, forks, provider continuation state, cost totals, or durable recovery.</p>
           <p>Session metadata such as <code>source</code> and <code>settingsJson</code> is retained on the session record, not copied into every protocol event.</p>
-          <p>The future canonical store remains the SQLite <code>SessionStore</code> planned in <code>plans/session-storage.md</code>: sessions contain runs, runs produce ordered turns, and turns are made of <code>turn_parts</code>.</p>
+          <p>The future canonical store remains the SQLite <code>SessionStore</code> planned in <code>plans/session-storage.md</code>: sessions contain many runs, runs are the agent-loop unit, runs produce ordered turns, and turns are made of <code>turn_parts</code>.</p>
+          <p>The persistence seam attaches after live provider chunks have been decoded: the same mapped deltas that feed SSE can later append or patch canonical assistant turn parts. Provider continuation state may be cached beside the run, but it must not become authoritative history.</p>
           <p class="note">Current HTTP replays retained events first, then keeps the connection open for live fan-out without making the TUI the owner of event semantics.</p>
         </div>
       </div>
