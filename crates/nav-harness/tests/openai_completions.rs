@@ -1,15 +1,24 @@
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
+use nav_harness::events::{
+    HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
+};
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ChatCompletionMessageRole, ChatCompletionRequestMessage,
     ChatCompletionStreamEvent, MaxTokensField, ModelConfig, ModelInput, ModelRef, ModelResolver,
-    ModelSettings, OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsRequest,
+    ModelSettings, OpenAiCompletionsCancellationToken, OpenAiCompletionsClient,
+    OpenAiCompletionsError, OpenAiCompletionsRequest, OpenAiCompletionsRequestContext,
     OpenAiCompletionsResponseParser, ProviderCompat, ProviderConfig, ProviderRoutingCompat,
     ReasoningEffort, ResolveModelError, ThinkingFormat,
 };
+use nav_types::{EventId, MessageId, RunId, ToolCallId};
 use serde_json::json;
 
 #[test]
@@ -209,6 +218,332 @@ fn complete_rejects_streaming_requests_before_http() {
     assert_eq!(result, Err(OpenAiCompletionsError::StreamingUnsupported));
 }
 
+#[tokio::test]
+async fn stream_events_posts_streaming_request_and_maps_provider_deltas() {
+    let (result, request, events) = run_stream_events(FakeSseServer::start(
+        200,
+        "text/event-stream",
+        vec![
+            sse_data(
+                r#"{"id":"chatcmpl_1","model":"actual-model","choices":[{"index":0,"delta":{"content":"hel"},"finish_reason":null}]}"#,
+            ),
+            sse_data(
+                r#"{"id":"chatcmpl_1","model":"actual-model","choices":[{"index":0,"delta":{"reasoning_content":"thinking"},"finish_reason":null}]}"#,
+            ),
+            sse_data(
+                r#"{"id":"chatcmpl_1","model":"actual-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_provider_1","type":"function","function":{"name":"shell","arguments":"{\"cmd\""}}]},"finish_reason":null}]}"#,
+            ),
+            sse_data(
+                r#"{"id":"chatcmpl_1","model":"actual-model","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"ls\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ),
+            sse_data("[DONE]"),
+        ],
+    ))
+    .await;
+
+    result.expect("stream should complete");
+    assert_eq!(request.request_line, "POST /v1/chat/completions HTTP/1.1");
+    assert_eq!(request.header("authorization"), Some("Bearer sk-secret"));
+    assert_eq!(request.header("accept"), Some("text/event-stream"));
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(body["model"], "vendor/model-large");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["messages"][0]["content"], "Say hi");
+
+    assert_eq!(
+        event_types(&events),
+        vec![
+            "model.text_delta",
+            "model.reasoning_delta",
+            "tool.call_started",
+            "tool.call_delta",
+            "tool.call_delta",
+            "tool.call_completed",
+            "message.completed",
+            "run.completed",
+        ]
+    );
+
+    match &events[0].event {
+        HarnessEvent::ModelTextDelta { delta, .. } => assert_eq!(delta, "hel"),
+        event => panic!("expected text delta, got {event:?}"),
+    }
+    match &events[1].event {
+        HarnessEvent::ModelReasoningDelta { delta, .. } => assert_eq!(delta, "thinking"),
+        event => panic!("expected reasoning delta, got {event:?}"),
+    }
+    match &events[5].event {
+        HarnessEvent::ToolCallCompleted {
+            name, arguments, ..
+        } => {
+            assert_eq!(name.as_deref(), Some("shell"));
+            assert_eq!(arguments, r#"{"cmd":"ls"}"#);
+        }
+        event => panic!("expected tool completion, got {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_events_maps_provider_stream_error_and_redacts_key() {
+    let (result, _, events) = run_stream_events(FakeSseServer::start(
+        200,
+        "text/event-stream",
+        vec![sse_data(
+            r#"{"error":{"message":"bad key sk-secret","type":"authentication_error","code":"invalid_api_key"}}"#,
+        )],
+    ))
+    .await;
+
+    let error = result.expect_err("provider stream error should fail the stream call");
+    assert_eq!(
+        error,
+        OpenAiCompletionsError::ProviderStream(
+            nav_harness::models::OpenAiCompletionsStreamProviderError {
+                message: "bad key <redacted>".to_string(),
+                error_type: Some("authentication_error".to_string()),
+                code: Some("invalid_api_key".to_string()),
+            },
+        )
+    );
+    assert_eq!(event_types(&events), vec!["provider.error"]);
+    match &events[0].event {
+        HarnessEvent::ProviderError {
+            status,
+            message,
+            error_type,
+            code,
+            ..
+        } => {
+            assert_eq!(*status, None);
+            assert_eq!(message, "bad key <redacted>");
+            assert_eq!(error_type.as_deref(), Some("authentication_error"));
+            assert_eq!(code.as_deref(), Some("invalid_api_key"));
+        }
+        event => panic!("expected provider error, got {event:?}"),
+    }
+    assert!(!format!("{events:?}").contains("sk-secret"));
+}
+
+#[tokio::test]
+async fn stream_events_buffers_sse_events_split_across_network_chunks() {
+    let (result, _, events) = run_stream_events(FakeSseServer::start(
+        200,
+        "text/event-stream",
+        vec![
+            br#"data: {"id":"chatcmpl_1","choices":[{"delta":{"content":"hel"},"finish_reason":null"#.to_vec(),
+            br#"}]}"#.to_vec(),
+            b"\n\n".to_vec(),
+            sse_data("[DONE]"),
+        ],
+    ))
+    .await;
+
+    result.expect("split SSE event should complete");
+    assert_eq!(
+        event_types(&events),
+        vec!["model.text_delta", "run.completed"]
+    );
+    match &events[0].event {
+        HarnessEvent::ModelTextDelta { delta, .. } => assert_eq!(delta, "hel"),
+        event => panic!("expected text delta, got {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_events_maps_malformed_sse_data_to_provider_error() {
+    let (result, _, events) = run_stream_events(FakeSseServer::start(
+        200,
+        "text/event-stream",
+        vec![sse_data(
+            r#"{"choices":[{"delta":{"content":"sk-secret"}}]"#,
+        )],
+    ))
+    .await;
+
+    let error = result.expect_err("malformed SSE data should fail the stream call");
+    assert_eq!(event_types(&events), vec!["provider.error"]);
+    assert!(!format!("{error:?}").contains("sk-secret"));
+    match &events[0].event {
+        HarnessEvent::ProviderError { message, .. } => {
+            assert!(message.contains("malformed provider response"));
+            assert!(!message.contains("sk-secret"));
+        }
+        event => panic!("expected provider error, got {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_events_maps_eof_before_done_to_provider_error() {
+    let (result, _, events) = run_stream_events(FakeSseServer::start(
+        200,
+        "text/event-stream",
+        vec![sse_data(
+            r#"{"id":"chatcmpl_1","choices":[{"delta":{"content":"hel"},"finish_reason":null}]}"#,
+        )],
+    ))
+    .await;
+
+    let error = result.expect_err("EOF before [DONE] should fail the stream call");
+    assert_eq!(
+        error,
+        OpenAiCompletionsError::MalformedResponse {
+            message: "stream ended before [DONE]".to_string(),
+        }
+    );
+    assert_eq!(
+        event_types(&events),
+        vec!["model.text_delta", "provider.error"]
+    );
+    match &events[1].event {
+        HarnessEvent::ProviderError { message, .. } => {
+            assert_eq!(
+                message,
+                "malformed provider response: stream ended before [DONE]"
+            );
+        }
+        event => panic!("expected provider error, got {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_events_preserves_http_provider_error_parsing() {
+    let (result, _, events) = run_stream_events(FakeSseServer::start(
+        401,
+        "application/json",
+        vec![br#"{"error":{"message":"bad key sk-secret","type":"authentication_error","code":"invalid_api_key"}}"#.to_vec()],
+    ))
+    .await;
+
+    let error = result.expect_err("HTTP provider error should fail the stream call");
+    assert!(events.is_empty());
+    assert_eq!(
+        error,
+        OpenAiCompletionsError::Provider(nav_harness::models::OpenAiCompletionsProviderError {
+            status: 401,
+            message: "bad key <redacted>".to_string(),
+            error_type: Some("authentication_error".to_string()),
+            code: Some("invalid_api_key".to_string()),
+        })
+    );
+    assert!(!format!("{error:?}").contains("sk-secret"));
+}
+
+#[tokio::test]
+async fn stream_events_honors_cancelled_request_context_before_http() {
+    let resolved = resolved_model("http://127.0.0.1:9/v1");
+    let token = OpenAiCompletionsCancellationToken::new();
+    token.cancel();
+    let request_context = OpenAiCompletionsRequestContext::new().with_cancellation_token(token);
+    let mut ids = TestIds::default();
+    let mut events = Vec::new();
+
+    let error = OpenAiCompletionsClient::new()
+        .stream_events_with_context(
+            &resolved,
+            &OpenAiCompletionsRequest::from_user("Say hi"),
+            &request_context,
+            model_output_context(),
+            &mut ids,
+            |batch| events.extend(batch),
+        )
+        .await
+        .expect_err("cancelled request should not start transport");
+
+    assert_eq!(error, OpenAiCompletionsError::Cancelled);
+    assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn stream_events_honors_cancelled_request_context_between_batches() {
+    let server = FakeSseServer::start_with_chunk_delay(
+        200,
+        "text/event-stream",
+        vec![
+            sse_data(
+                r#"{"id":"chatcmpl_1","choices":[{"delta":{"content":"hel"},"finish_reason":null}]}"#,
+            ),
+            sse_data(
+                r#"{"id":"chatcmpl_1","choices":[{"delta":{"content":"lo"},"finish_reason":null}]}"#,
+            ),
+            sse_data("[DONE]"),
+        ],
+        Duration::from_millis(20),
+    );
+    let resolved = resolved_model(server.base_url());
+    let token = OpenAiCompletionsCancellationToken::new();
+    let request_context =
+        OpenAiCompletionsRequestContext::new().with_cancellation_token(token.clone());
+    let mut ids = TestIds::default();
+    let mut events = Vec::new();
+
+    let error = OpenAiCompletionsClient::new()
+        .stream_events_with_context(
+            &resolved,
+            &OpenAiCompletionsRequest::from_user("Say hi"),
+            &request_context,
+            model_output_context(),
+            &mut ids,
+            |batch| {
+                events.extend(batch);
+                token.cancel();
+            },
+        )
+        .await
+        .expect_err("cancelled request should stop the stream call");
+
+    server.join();
+    assert_eq!(error, OpenAiCompletionsError::Cancelled);
+    assert_eq!(event_types(&events), vec!["model.text_delta"]);
+    match &events[0].event {
+        HarnessEvent::ModelTextDelta { delta, .. } => assert_eq!(delta, "hel"),
+        event => panic!("expected text delta, got {event:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stream_events_cancels_while_waiting_for_next_provider_chunk() {
+    let server = FakeSseServer::start_with_chunk_delay(
+        200,
+        "text/event-stream",
+        vec![
+            Vec::new(),
+            sse_data(
+                r#"{"id":"chatcmpl_1","choices":[{"delta":{"content":"hel"},"finish_reason":null}]}"#,
+            ),
+        ],
+        Duration::from_millis(250),
+    );
+    let resolved = resolved_model(server.base_url());
+    let token = OpenAiCompletionsCancellationToken::new();
+    let cancel_from_thread = token.clone();
+    let request_context = OpenAiCompletionsRequestContext::new().with_cancellation_token(token);
+    let mut ids = TestIds::default();
+    let mut events = Vec::new();
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        cancel_from_thread.cancel();
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(150),
+        OpenAiCompletionsClient::new().stream_events_with_context(
+            &resolved,
+            &OpenAiCompletionsRequest::from_user("Say hi"),
+            &request_context,
+            model_output_context(),
+            &mut ids,
+            |batch| events.extend(batch),
+        ),
+    )
+    .await
+    .expect("cancel should interrupt blocked chunk read");
+
+    server.join();
+    assert_eq!(result, Err(OpenAiCompletionsError::Cancelled));
+    assert!(events.is_empty());
+}
+
 #[test]
 fn reports_missing_key_from_resolver_as_client_error() {
     let error: OpenAiCompletionsError = ModelResolver::new(settings_for(
@@ -372,6 +707,236 @@ fn malformed_response_is_typed() {
             message: "response did not include any choices".to_string(),
         }
     );
+}
+
+#[derive(Default)]
+struct TestIds {
+    next_event: u64,
+    next_tool_call: u64,
+}
+
+impl HarnessEventIdSource for TestIds {
+    fn next_event_id(&mut self) -> EventId {
+        self.next_event += 1;
+        event_id(self.next_event)
+    }
+
+    fn next_tool_call_id(&mut self) -> ToolCallId {
+        self.next_tool_call += 1;
+        tool_call_id(self.next_tool_call)
+    }
+}
+
+fn resolved_model(base_url: &str) -> nav_harness::models::ResolvedModelConfig {
+    ModelResolver::new(settings_for(
+        "compatible-gateway",
+        base_url,
+        ApiKeyConfig::Inline {
+            inline: "sk-secret".to_string(),
+        },
+        ProviderCompat::default(),
+    ))
+    .resolve_default()
+    .expect("model should resolve")
+}
+
+fn model_output_context() -> ModelOutputContext {
+    ModelOutputContext {
+        run_id: run_id(),
+        message_id: message_id(),
+        provider_id: "compatible-gateway".to_string(),
+        configured_model_id: "vendor/model-large".to_string(),
+    }
+}
+
+fn event_types(events: &[HarnessEventEnvelope]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|event| event.event.event_type())
+        .collect()
+}
+
+async fn run_stream_events(
+    server: FakeSseServer,
+) -> (
+    Result<(), OpenAiCompletionsError>,
+    FakeHttpRequest,
+    Vec<HarnessEventEnvelope>,
+) {
+    let resolved = resolved_model(server.base_url());
+    let mut ids = TestIds::default();
+    let mut events = Vec::new();
+
+    let result = OpenAiCompletionsClient::new()
+        .stream_events(
+            &resolved,
+            &OpenAiCompletionsRequest::from_user("Say hi"),
+            model_output_context(),
+            &mut ids,
+            |batch| events.extend(batch),
+        )
+        .await;
+    let request = server.join();
+
+    (result, request, events)
+}
+
+fn sse_data(data: &str) -> Vec<u8> {
+    format!("data: {data}\n\n").into_bytes()
+}
+
+fn event_id(index: u64) -> EventId {
+    EventId::try_new(format!("019f2f6f-f178-7a72-9f28-{index:012x}"))
+        .expect("test event id should be UUIDv7-shaped")
+}
+
+fn tool_call_id(index: u64) -> ToolCallId {
+    ToolCallId::try_new(format!("019f2f6f-f178-7a72-9f28-{index:012x}"))
+        .expect("test tool call id should be UUIDv7-shaped")
+}
+
+fn run_id() -> RunId {
+    RunId::try_new("019f2f6f-f178-7a72-9f28-000000000101")
+        .expect("test run id should be UUIDv7-shaped")
+}
+
+fn message_id() -> MessageId {
+    MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000202")
+        .expect("test message id should be UUIDv7-shaped")
+}
+
+struct FakeSseServer {
+    base_url: String,
+    handle: JoinHandle<FakeHttpRequest>,
+}
+
+impl FakeSseServer {
+    fn start(status: u16, content_type: &'static str, body_chunks: Vec<Vec<u8>>) -> Self {
+        Self::start_with_optional_chunk_delay(status, content_type, body_chunks, None)
+    }
+
+    fn start_with_chunk_delay(
+        status: u16,
+        content_type: &'static str,
+        body_chunks: Vec<Vec<u8>>,
+        chunk_delay: Duration,
+    ) -> Self {
+        Self::start_with_optional_chunk_delay(status, content_type, body_chunks, Some(chunk_delay))
+    }
+
+    fn start_with_optional_chunk_delay(
+        status: u16,
+        content_type: &'static str,
+        body_chunks: Vec<Vec<u8>>,
+        chunk_delay: Option<Duration>,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake server should bind");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("fake server should accept");
+            let mut reader = BufReader::new(stream);
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("request line should read");
+
+            let mut headers = Vec::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("request header should read");
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    content_length = value.trim().parse().unwrap();
+                }
+                headers.push(line.trim_end().to_string());
+            }
+
+            let mut body_bytes = vec![0; content_length];
+            reader
+                .read_exact(&mut body_bytes)
+                .expect("request body should read");
+
+            let mut stream = reader.into_inner();
+            write!(
+                stream,
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
+                status,
+                reason_phrase(status),
+                content_type
+            )
+            .expect("response headers should write");
+            for chunk in body_chunks {
+                if stop_sending_on_broken_pipe(
+                    stream.write_all(&chunk),
+                    "response chunk should write",
+                ) {
+                    break;
+                }
+                if stop_sending_on_broken_pipe(stream.flush(), "response chunk should flush") {
+                    break;
+                }
+                if let Some(chunk_delay) = chunk_delay {
+                    thread::sleep(chunk_delay);
+                }
+            }
+
+            FakeHttpRequest {
+                request_line: request_line.trim_end().to_string(),
+                headers,
+                body: String::from_utf8(body_bytes).expect("request body should be UTF-8"),
+            }
+        });
+
+        Self { base_url, handle }
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    fn join(self) -> FakeHttpRequest {
+        self.handle.join().expect("fake server should finish")
+    }
+}
+
+fn stop_sending_on_broken_pipe(result: std::io::Result<()>, context: &str) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => true,
+        Err(error) => panic!("{context}: {error}"),
+    }
+}
+
+struct FakeHttpRequest {
+    request_line: String,
+    headers: Vec<String>,
+    body: String,
+}
+
+impl FakeHttpRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find_map(|header| {
+            let (header_name, value) = header.split_once(':')?;
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
+        })
+    }
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        401 => "Unauthorized",
+        _ => "Error",
+    }
 }
 
 fn settings_for(

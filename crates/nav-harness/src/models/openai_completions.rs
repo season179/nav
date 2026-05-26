@@ -1,14 +1,25 @@
 use std::fmt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
+
+use crate::events::{
+    HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext, OpenAiStreamEventMapper,
+};
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::sync::Notify;
 
 use super::{
     ApiKind, MaxTokensField, ProviderRoutingCompat, ResolveModelError, ResolvedModelConfig,
     ThinkingFormat,
 };
+
+const OPENAI_COMPLETIONS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenAiCompletionsRequest {
@@ -228,6 +239,7 @@ pub enum OpenAiCompletionsError {
         status: u16,
         body: String,
     },
+    Cancelled,
     Provider(OpenAiCompletionsProviderError),
     ProviderStream(OpenAiCompletionsStreamProviderError),
     ModelResolution {
@@ -271,6 +283,7 @@ impl fmt::Display for OpenAiCompletionsError {
             Self::Http { status, body } => {
                 write!(formatter, "provider returned HTTP {status}: {body}")
             }
+            Self::Cancelled => write!(formatter, "request cancelled"),
             Self::Provider(error) => write!(
                 formatter,
                 "provider returned HTTP {}: {}",
@@ -364,6 +377,90 @@ impl OpenAiCompletionsResponseParser {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct OpenAiCompletionsRequestContext {
+    cancellation_token: Option<OpenAiCompletionsCancellationToken>,
+}
+
+impl OpenAiCompletionsRequestContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_cancellation_token(
+        mut self,
+        cancellation_token: OpenAiCompletionsCancellationToken,
+    ) -> Self {
+        self.cancellation_token = Some(cancellation_token);
+        self
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation_token
+            .as_ref()
+            .is_some_and(OpenAiCompletionsCancellationToken::is_cancelled)
+    }
+
+    async fn cancelled(&self) {
+        match &self.cancellation_token {
+            Some(cancellation_token) => cancellation_token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OpenAiCompletionsCancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAiCompletionsCancellationToken {
+    state: Arc<OpenAiCompletionsCancellationState>,
+}
+
+impl Default for OpenAiCompletionsCancellationToken {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(OpenAiCompletionsCancellationState {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+}
+
+impl OpenAiCompletionsCancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        if !self.state.cancelled.swap(true, Ordering::SeqCst) {
+            self.state.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::SeqCst)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.state.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.is_cancelled() {
+                return;
+            }
+
+            notified.await;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompletionsClient {
     http: reqwest::Client,
@@ -414,6 +511,7 @@ impl OpenAiCompletionsClient {
             .http
             .post(&plan.endpoint)
             .bearer_auth(api_key)
+            .timeout(OPENAI_COMPLETIONS_REQUEST_TIMEOUT)
             .json(&plan.body)
             .send()
             .await
@@ -439,6 +537,220 @@ impl OpenAiCompletionsClient {
 
         OpenAiCompletionsResponseParser::parse_response(&body, api_key)
     }
+
+    pub async fn stream_events(
+        &self,
+        model: &ResolvedModelConfig,
+        request: &OpenAiCompletionsRequest,
+        output_context: ModelOutputContext,
+        ids: &mut impl HarnessEventIdSource,
+        emit: impl FnMut(Vec<HarnessEventEnvelope>),
+    ) -> Result<(), OpenAiCompletionsError> {
+        let request_context = OpenAiCompletionsRequestContext::default();
+        self.stream_events_with_context(model, request, &request_context, output_context, ids, emit)
+            .await
+    }
+
+    pub async fn stream_events_with_context(
+        &self,
+        model: &ResolvedModelConfig,
+        request: &OpenAiCompletionsRequest,
+        request_context: &OpenAiCompletionsRequestContext,
+        output_context: ModelOutputContext,
+        ids: &mut impl HarnessEventIdSource,
+        mut emit: impl FnMut(Vec<HarnessEventEnvelope>),
+    ) -> Result<(), OpenAiCompletionsError> {
+        if request_context.is_cancelled() {
+            return Err(OpenAiCompletionsError::Cancelled);
+        }
+
+        let mut streaming_request = request.clone();
+        streaming_request.stream = true;
+
+        let plan = self.build_request(model, &streaming_request)?;
+        let api_key = model.api_key.expose_secret();
+        let mut response = self
+            .http
+            .post(&plan.endpoint)
+            .bearer_auth(api_key)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&plan.body)
+            .send()
+            .await
+            .map_err(|error| OpenAiCompletionsError::Transport {
+                message: redact_secret(&error.to_string(), api_key),
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body =
+                response
+                    .text()
+                    .await
+                    .map_err(|error| OpenAiCompletionsError::Transport {
+                        message: redact_secret(&error.to_string(), api_key),
+                    })?;
+            return Err(OpenAiCompletionsResponseParser::parse_error_response(
+                status.as_u16(),
+                &body,
+                api_key,
+            ));
+        }
+
+        let mut mapper = OpenAiStreamEventMapper::new(output_context);
+        let mut buffer = SseEventBuffer::default();
+
+        loop {
+            if request_context.is_cancelled() {
+                return Err(OpenAiCompletionsError::Cancelled);
+            }
+
+            let chunk = tokio::select! {
+                _ = request_context.cancelled() => return Err(OpenAiCompletionsError::Cancelled),
+                chunk = response.chunk() => chunk.map_err(|error| OpenAiCompletionsError::Transport {
+                    message: redact_secret(&error.to_string(), api_key),
+                })?,
+            };
+
+            let Some(chunk) = chunk else {
+                break;
+            };
+
+            let raw_events = match buffer.push_chunk(&chunk, api_key) {
+                Ok(raw_events) => raw_events,
+                Err(error) => {
+                    return emit_stream_error(error, &mut mapper, ids, &mut emit);
+                }
+            };
+
+            if handle_raw_stream_events(raw_events, api_key, &mut mapper, ids, &mut emit)? {
+                return Ok(());
+            }
+        }
+
+        let final_raw_event = match buffer.finish(api_key) {
+            Ok(raw_event) => raw_event,
+            Err(error) => {
+                return emit_stream_error(error, &mut mapper, ids, &mut emit);
+            }
+        };
+        if let Some(raw_event) = final_raw_event
+            && handle_raw_stream_events(vec![raw_event], api_key, &mut mapper, ids, &mut emit)?
+        {
+            return Ok(());
+        }
+
+        emit_stream_error(
+            OpenAiCompletionsError::MalformedResponse {
+                message: "stream ended before [DONE]".to_string(),
+            },
+            &mut mapper,
+            ids,
+            &mut emit,
+        )
+    }
+}
+
+fn handle_raw_stream_events(
+    raw_events: Vec<String>,
+    api_key: &str,
+    mapper: &mut OpenAiStreamEventMapper,
+    ids: &mut impl HarnessEventIdSource,
+    emit: &mut impl FnMut(Vec<HarnessEventEnvelope>),
+) -> Result<bool, OpenAiCompletionsError> {
+    for raw_event in raw_events {
+        let result = OpenAiCompletionsResponseParser::parse_stream_event(&raw_event, api_key);
+        let error = result.as_ref().err().cloned();
+        if emit_mapped_stream_result(result, mapper, ids, emit) {
+            return match error {
+                Some(error) => Err(error),
+                None => Ok(true),
+            };
+        }
+    }
+
+    Ok(false)
+}
+
+fn emit_stream_error(
+    error: OpenAiCompletionsError,
+    mapper: &mut OpenAiStreamEventMapper,
+    ids: &mut impl HarnessEventIdSource,
+    emit: &mut impl FnMut(Vec<HarnessEventEnvelope>),
+) -> Result<(), OpenAiCompletionsError> {
+    emit_mapped_stream_result(Err(error.clone()), mapper, ids, emit);
+    Err(error)
+}
+
+fn emit_mapped_stream_result(
+    result: Result<Option<ChatCompletionStreamEvent>, OpenAiCompletionsError>,
+    mapper: &mut OpenAiStreamEventMapper,
+    ids: &mut impl HarnessEventIdSource,
+    emit: &mut impl FnMut(Vec<HarnessEventEnvelope>),
+) -> bool {
+    let is_terminal = matches!(result, Ok(Some(ChatCompletionStreamEvent::Done)) | Err(_));
+    let events = mapper.map_stream_result(result, ids);
+    if !events.is_empty() {
+        emit(events);
+    }
+    is_terminal
+}
+
+#[derive(Debug, Default)]
+struct SseEventBuffer {
+    bytes: Vec<u8>,
+}
+
+impl SseEventBuffer {
+    fn push_chunk(
+        &mut self,
+        chunk: &[u8],
+        api_key: &str,
+    ) -> Result<Vec<String>, OpenAiCompletionsError> {
+        self.bytes.extend_from_slice(chunk);
+        let mut events = Vec::new();
+
+        while let Some((event_end, delimiter_len)) = find_sse_event_boundary(&self.bytes) {
+            let event_bytes = self.bytes[..event_end].to_vec();
+            self.bytes.drain(..event_end + delimiter_len);
+            events.push(decode_sse_event(event_bytes, api_key)?);
+        }
+
+        Ok(events)
+    }
+
+    fn finish(&mut self, api_key: &str) -> Result<Option<String>, OpenAiCompletionsError> {
+        if self.bytes.iter().all(u8::is_ascii_whitespace) {
+            self.bytes.clear();
+            return Ok(None);
+        }
+
+        let event_bytes = std::mem::take(&mut self.bytes);
+        decode_sse_event(event_bytes, api_key).map(Some)
+    }
+}
+
+fn find_sse_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+    [
+        b"\r\n\r\n".as_slice(),
+        b"\n\n".as_slice(),
+        b"\r\r".as_slice(),
+    ]
+    .into_iter()
+    .filter_map(|delimiter| find_bytes(bytes, delimiter).map(|index| (index, delimiter.len())))
+    .min_by_key(|(index, _)| *index)
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn decode_sse_event(bytes: Vec<u8>, api_key: &str) -> Result<String, OpenAiCompletionsError> {
+    String::from_utf8(bytes).map_err(|error| OpenAiCompletionsError::MalformedResponse {
+        message: redact_secret(&error.to_string(), api_key),
+    })
 }
 
 fn validate_resolved_model(model: &ResolvedModelConfig) -> Result<(), OpenAiCompletionsError> {
@@ -458,7 +770,7 @@ fn validate_resolved_model(model: &ResolvedModelConfig) -> Result<(), OpenAiComp
 
 fn default_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(OPENAI_COMPLETIONS_REQUEST_TIMEOUT)
         .build()
         .expect("default reqwest client configuration should be valid")
 }
