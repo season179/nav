@@ -84,14 +84,17 @@ impl HttpServer {
         };
 
         if !settings_path.exists() {
-            return Err(format!("settings file not found: {}", settings_path.display()));
+            return Err(format!(
+                "settings file not found: {}",
+                settings_path.display()
+            ));
         }
 
         let json = fs::read_to_string(settings_path)
             .map_err(|e| format!("failed to read settings: {}", e))?;
 
-        let model_settings: ModelSettings = serde_json::from_str(&json)
-            .map_err(|e| format!("failed to parse settings: {}", e))?;
+        let model_settings: ModelSettings =
+            serde_json::from_str(&json).map_err(|e| format!("failed to parse settings: {}", e))?;
 
         self.model_resolver = ModelResolver::new(model_settings);
         Ok(())
@@ -364,10 +367,7 @@ impl HttpServer {
 
     fn handle_settings_reload(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
         match self.reload_model_settings() {
-            Ok(()) => rpc_result(
-                request.id,
-                SettingsReloadResult { success: true },
-            ),
+            Ok(()) => rpc_result(request.id, SettingsReloadResult { success: true }),
             Err(error) => rpc_error(
                 request.id,
                 -32603,

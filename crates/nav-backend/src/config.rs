@@ -20,8 +20,7 @@ pub fn load_model_settings() -> Result<ModelSettings> {
 }
 
 pub fn settings_path() -> PathBuf {
-    env_path(NAV_MODEL_SETTINGS)
-        .unwrap_or_else(|| expand_home(PathBuf::from(DEFAULT_NAV_SETTINGS)))
+    env_path(NAV_MODEL_SETTINGS).unwrap_or_else(|| expand_home(PathBuf::from(DEFAULT_NAV_SETTINGS)))
 }
 
 fn read_nav_model_settings(path: &Path) -> Result<Option<ModelSettings>> {
