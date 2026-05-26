@@ -1,8 +1,10 @@
 //! Local HTTP transport for frontend-to-backend communication.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-use nav_harness::models::{ModelResolver, ModelSettings};
+use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
 use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
@@ -19,13 +21,14 @@ mod event_mapping;
 mod event_store;
 mod ids;
 pub mod live;
+mod model_run;
 pub mod rpc;
 pub mod sse;
 
-use event_mapping::{harness_events_to_backend_events, stream_minimal_model_output};
 use event_store::ProtocolEventStore;
 pub use event_store::ProtocolEventSubscription;
 use ids::ProtocolIdSource;
+use model_run::{ModelRunRequest, ModelRunService};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -46,10 +49,11 @@ impl Default for HttpServerConfig {
 pub struct HttpServer {
     config: HttpServerConfig,
     model_resolver: ModelResolver,
-    ids: ProtocolIdSource,
+    ids: Arc<Mutex<ProtocolIdSource>>,
     sessions: HashMap<SessionId, SessionMetadata>,
-    runs: HashMap<RunId, RunState>,
-    event_store: ProtocolEventStore,
+    runs: Arc<Mutex<HashMap<RunId, RunState>>>,
+    event_store: Arc<Mutex<ProtocolEventStore>>,
+    model_run_service: ModelRunService,
 }
 
 impl HttpServer {
@@ -61,10 +65,11 @@ impl HttpServer {
         Self {
             config,
             model_resolver: ModelResolver::new(model_settings),
-            ids: ProtocolIdSource::default(),
+            ids: Arc::new(Mutex::new(ProtocolIdSource::default())),
             sessions: HashMap::new(),
-            runs: HashMap::new(),
-            event_store: ProtocolEventStore::default(),
+            runs: Arc::new(Mutex::new(HashMap::new())),
+            event_store: Arc::new(Mutex::new(ProtocolEventStore::default())),
+            model_run_service: ModelRunService::default(),
         }
     }
 
@@ -77,7 +82,7 @@ impl HttpServer {
             Ok(request) => self.handle_rpc_request(request),
             Err(error) => JsonRpcResponse {
                 jsonrpc: JsonRpcVersion,
-                id: self.ids.next_request_id(),
+                id: self.next_request_id(),
                 result: None,
                 error: Some(JsonRpcError {
                     code: -32700,
@@ -111,6 +116,8 @@ impl HttpServer {
         let (session_id, last_event_id) = parse_session_event_cursor(session_id, last_event_id)?;
         let events = self
             .event_store
+            .lock()
+            .unwrap()
             .replay_after(&session_id, last_event_id.as_ref())
             .map_err(replay_error_to_http)?;
         let body = sse::encode_events(&events).map_err(|error| HttpError {
@@ -131,6 +138,8 @@ impl HttpServer {
         last_event_id: Option<&EventId>,
     ) -> Result<ProtocolEventSubscription, HttpError> {
         self.event_store
+            .lock()
+            .unwrap()
             .subscribe(session_id, last_event_id)
             .map_err(replay_error_to_http)
     }
@@ -146,7 +155,7 @@ impl HttpServer {
     }
 
     pub fn run_status(&self, run_id: &RunId) -> Option<RunStatus> {
-        self.runs.get(run_id).map(|run| run.status)
+        self.runs.lock().unwrap().get(run_id).map(|run| run.status)
     }
 
     pub fn session_metadata(&self, session_id: &SessionId) -> Option<&SessionMetadata> {
@@ -212,9 +221,9 @@ impl HttpServer {
             None => SessionCreateParams::default(),
         };
 
-        let session_id = self.ids.next_session_id();
+        let session_id = self.next_session_id();
         let event = EventEnvelope {
-            event_id: self.ids.next_event_id(),
+            event_id: self.next_event_id(),
             session_id: session_id.clone(),
             event: BackendEvent::SessionCreated,
         };
@@ -226,7 +235,7 @@ impl HttpServer {
                 settings_json: params.settings_json,
             },
         );
-        self.event_store.append(event);
+        self.append_event(event);
 
         rpc_result(request.id, SessionCreateResult { session_id })
     }
@@ -248,58 +257,31 @@ impl HttpServer {
             return rpc_error(request.id, -32004, "session not found");
         }
 
-        let run_id = self.ids.next_run_id();
-        let message_id = self.ids.next_message_id();
-        self.runs.insert(
+        let run_id = self.next_run_id();
+        let message_id = self.next_message_id();
+        let cancellation_token = OpenAiCompletionsCancellationToken::new();
+        self.runs.lock().unwrap().insert(
             run_id.clone(),
             RunState {
                 session_id: params.session_id.clone(),
                 status: RunStatus::Running,
+                cancellation_token: Some(cancellation_token.clone()),
             },
         );
-        self.event_store.append(EventEnvelope {
-            event_id: self.ids.next_event_id(),
+        self.append_event(EventEnvelope {
+            event_id: self.next_event_id(),
             session_id: params.session_id.clone(),
             event: BackendEvent::RunStarted {
                 run_id: run_id.clone(),
             },
         });
-        let mut events = Vec::new();
-
-        let final_status = match self.model_resolver.resolve_default() {
-            Ok(model) => {
-                let harness_events = stream_minimal_model_output(
-                    &mut self.ids,
-                    &model.provider_id,
-                    &model.model.id,
-                    model.api_key.expose_secret(),
-                    &run_id,
-                    &message_id,
-                    &params.text,
-                );
-                events.extend(harness_events_to_backend_events(
-                    &params.session_id,
-                    harness_events,
-                ));
-                RunStatus::Completed
-            }
-            Err(error) => {
-                events.push(EventEnvelope {
-                    event_id: self.ids.next_event_id(),
-                    session_id: params.session_id.clone(),
-                    event: BackendEvent::RunFailed {
-                        run_id: run_id.clone(),
-                        message: format!("{error:?}"),
-                    },
-                });
-                RunStatus::Failed
-            }
-        };
-
-        if let Some(run) = self.runs.get_mut(&run_id) {
-            run.status = final_status;
-        }
-        self.event_store.append_many(events);
+        self.spawn_model_run(
+            params.session_id.clone(),
+            run_id.clone(),
+            message_id.clone(),
+            params.text.clone(),
+            cancellation_token,
+        );
 
         rpc_result(
             request.id,
@@ -317,29 +299,35 @@ impl HttpServer {
             Err(error) => return rpc_error(request.id, -32602, error),
         };
 
-        let Some(run) = self.runs.get(&params.run_id).cloned() else {
-            return rpc_error(request.id, -32004, "run not found");
-        };
+        let cancellation_token = {
+            let mut runs = self.runs.lock().unwrap();
+            let Some(run) = runs.get_mut(&params.run_id) else {
+                return rpc_error(request.id, -32004, "run not found");
+            };
 
-        if run.status != RunStatus::Running {
-            return rpc_error(
-                request.id,
-                -32005,
-                format!("run is already {}", run.status.as_str()),
-            );
-        }
+            if run.status != RunStatus::Running {
+                return rpc_error(
+                    request.id,
+                    -32005,
+                    format!("run is already {}", run.status.as_str()),
+                );
+            }
 
-        let event = EventEnvelope {
-            event_id: self.ids.next_event_id(),
-            session_id: run.session_id.clone(),
-            event: BackendEvent::RunCancelled {
-                run_id: params.run_id.clone(),
-            },
-        };
-        self.event_store.append(event);
-        if let Some(run) = self.runs.get_mut(&params.run_id) {
             run.status = RunStatus::Cancelled;
-        }
+            let event = EventEnvelope {
+                event_id: self.ids.lock().unwrap().next_event_id(),
+                session_id: run.session_id.clone(),
+                event: BackendEvent::RunCancelled {
+                    run_id: params.run_id.clone(),
+                },
+            };
+            self.event_store.lock().unwrap().append(event);
+
+            run.cancellation_token
+                .clone()
+                .unwrap_or_else(OpenAiCompletionsCancellationToken::new)
+        };
+        cancellation_token.cancel();
 
         rpc_result(
             request.id,
@@ -347,6 +335,69 @@ impl HttpServer {
                 run_id: params.run_id,
             },
         )
+    }
+
+    fn spawn_model_run(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        message_id: nav_types::MessageId,
+        text: String,
+        cancellation_token: OpenAiCompletionsCancellationToken,
+    ) {
+        let model_run_service = self.model_run_service.clone();
+        let model_resolver = self.model_resolver.clone();
+        let ids = Arc::clone(&self.ids);
+        let event_store = Arc::clone(&self.event_store);
+        let runs = Arc::clone(&self.runs);
+
+        thread::spawn(move || {
+            let final_status = model_run_service.run_to_completion(
+                &model_resolver,
+                ids,
+                event_store,
+                Arc::clone(&runs),
+                cancellation_token,
+                ModelRunRequest {
+                    session_id: &session_id,
+                    run_id: &run_id,
+                    message_id: &message_id,
+                    text: &text,
+                },
+            );
+
+            let mut runs = runs.lock().unwrap();
+            if let Some(run) = runs.get_mut(&run_id) {
+                if run.status == RunStatus::Running {
+                    run.status = final_status;
+                }
+                run.cancellation_token = None;
+            }
+        });
+    }
+
+    fn append_event(&self, event: EventEnvelope) {
+        self.event_store.lock().unwrap().append(event);
+    }
+
+    fn next_request_id(&self) -> nav_types::RequestId {
+        self.ids.lock().unwrap().next_request_id()
+    }
+
+    fn next_session_id(&self) -> SessionId {
+        self.ids.lock().unwrap().next_session_id()
+    }
+
+    fn next_run_id(&self) -> RunId {
+        self.ids.lock().unwrap().next_run_id()
+    }
+
+    fn next_message_id(&self) -> nav_types::MessageId {
+        self.ids.lock().unwrap().next_message_id()
+    }
+
+    fn next_event_id(&self) -> EventId {
+        self.ids.lock().unwrap().next_event_id()
     }
 }
 
@@ -449,6 +500,7 @@ impl SessionMetadata {
 struct RunState {
     session_id: SessionId,
     status: RunStatus,
+    cancellation_token: Option<OpenAiCompletionsCancellationToken>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

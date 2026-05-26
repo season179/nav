@@ -5,8 +5,12 @@ use nav_harness::models::{
     ProviderConfig,
 };
 use nav_protocol::{EventEnvelope, JsonRpcRequest, JsonRpcResponse};
-use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig, sse};
+use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig, RunStatus, sse};
 use serde_json::{Value, json};
+
+mod support;
+
+use support::{successful_provider_with_text, wait_for_run_status};
 
 const REQUEST_FIXTURES: &[(&str, &str)] = &[
     ("json-rpc/initialize-request.json", "initialize"),
@@ -149,15 +153,18 @@ fn session_create_fixture_matches_server_contract() {
 
 #[test]
 fn session_send_message_fixture_matches_server_contract_and_replay() {
-    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
-    let session_id = create_session_from_fixture(&mut server);
-
     let mut request = fixture_json("json-rpc/session-send-message-request.json");
-    request["params"]["sessionId"] = json!(session_id);
     let expected: JsonRpcResponse<Value> =
         fixture_json_response("json-rpc/session-send-message-response.json");
     let request_id = request["id"].as_str().unwrap().to_string();
     let request_text = request["params"]["text"].as_str().unwrap().to_string();
+    let provider = successful_provider_with_text(&request_text);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session_from_fixture(&mut server);
+    request["params"]["sessionId"] = json!(session_id);
 
     let response = server.handle_request(HttpRequest::post("/rpc", request.to_string()));
 
@@ -173,6 +180,13 @@ fn session_send_message_fixture_matches_server_contract_and_replay() {
     let message_id = actual["result"]["messageId"].as_str().unwrap();
     assert_uuid_v7(run_id);
     assert_uuid_v7(message_id);
+    let provider_request = provider.request();
+    assert_eq!(provider_request.path, "/v1/chat/completions");
+    assert_eq!(
+        provider_request.body["messages"][0]["content"],
+        request_text
+    );
+    wait_for_run_status(&server, run_id, RunStatus::Completed);
 
     let events = session_events(&mut server, &session_id);
     assert_eq!(
@@ -221,6 +235,7 @@ fn run_failed_fixture_matches_server_contract() {
     let body: Value = serde_json::from_str(response.body()).unwrap();
     let run_id = body["result"]["runId"].as_str().unwrap();
     assert_uuid_v7(run_id);
+    wait_for_run_status(&server, run_id, RunStatus::Failed);
 
     let events = session_events(&mut server, &session_id);
     assert_eq!(
@@ -348,6 +363,10 @@ fn fixture_path(relative_path: &str) -> PathBuf {
 }
 
 fn model_settings() -> ModelSettings {
+    model_settings_with_base_url("https://gateway.example.com/v1".to_string())
+}
+
+fn model_settings_with_base_url(base_url: String) -> ModelSettings {
     let mut settings = ModelSettings {
         default_model: Some(ModelRef {
             provider: "compatible-gateway".to_string(),
@@ -361,7 +380,7 @@ fn model_settings() -> ModelSettings {
         ProviderConfig {
             name: Some("Compatible Gateway".to_string()),
             api: ApiKind::OpenAiCompletions,
-            base_url: "https://gateway.example.com/v1".to_string(),
+            base_url,
             api_key: ApiKeyConfig::Inline {
                 inline: "sk-test".to_string(),
             },

@@ -11,3 +11,4 @@ nav-protocol = { path = "../nav-protocol" }
 nav-types = { path = "../nav-types" }
 serde.workspace = true
 serde_json.workspace = true
+tokio = { version = "1.48", features = ["rt", "time"] }

@@ -1,40 +1,9 @@
 use nav_harness::events::{
-    HarnessEvent, HarnessEventEnvelope, ModelOutputContext, OpenAiStreamEventMapper,
-    ProviderEventMetadata as HarnessProviderEventMetadata, ProviderUsage as HarnessProviderUsage,
+    HarnessEvent, HarnessEventEnvelope, ProviderEventMetadata as HarnessProviderEventMetadata,
+    ProviderUsage as HarnessProviderUsage,
 };
-use nav_harness::models::OpenAiCompletionsResponseParser;
 use nav_protocol::{BackendEvent, EventEnvelope, ProviderEventMetadata, ProviderUsage};
-use nav_types::{MessageId, RunId, SessionId};
-use serde_json::json;
-
-use super::ids::ProtocolIdSource;
-
-pub(super) fn stream_minimal_model_output(
-    ids: &mut ProtocolIdSource,
-    provider_id: &str,
-    configured_model_id: &str,
-    api_key: &str,
-    run_id: &RunId,
-    message_id: &MessageId,
-    text: &str,
-) -> Vec<HarnessEventEnvelope> {
-    let mut mapper = OpenAiStreamEventMapper::new(ModelOutputContext {
-        run_id: run_id.clone(),
-        message_id: message_id.clone(),
-        provider_id: provider_id.to_string(),
-        configured_model_id: configured_model_id.to_string(),
-    });
-
-    minimal_openai_stream_events(configured_model_id, text)
-        .into_iter()
-        .flat_map(|raw_event| {
-            mapper.map_stream_result(
-                OpenAiCompletionsResponseParser::parse_stream_event(&raw_event, api_key),
-                ids,
-            )
-        })
-        .collect()
-}
+use nav_types::SessionId;
 
 pub(super) fn harness_events_to_backend_events(
     session_id: &SessionId,
@@ -48,33 +17,6 @@ pub(super) fn harness_events_to_backend_events(
             event: harness_event_to_backend_event(event.event),
         })
         .collect()
-}
-
-fn minimal_openai_stream_events(configured_model_id: &str, text: &str) -> Vec<String> {
-    let text_chunk = json!({
-        "id": "minimal-run",
-        "model": configured_model_id,
-        "choices": [{
-            "index": 0,
-            "delta": { "content": text },
-            "finish_reason": null
-        }]
-    });
-    let completed_chunk = json!({
-        "id": "minimal-run",
-        "model": configured_model_id,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": "stop"
-        }]
-    });
-
-    vec![
-        format!("data: {text_chunk}"),
-        format!("data: {completed_chunk}"),
-        "data: [DONE]".to_string(),
-    ]
 }
 
 fn harness_event_to_backend_event(event: HarnessEvent) -> BackendEvent {
