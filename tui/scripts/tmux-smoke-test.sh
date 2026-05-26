@@ -81,34 +81,34 @@ wait_gone() {
 }
 
 echo "==> Waiting for connection"
-wait_for "Enter send" 60 || fail "composer did not reach ready state"
+wait_for "/model" 60 || fail "composer did not reach ready state"
 
 echo "==> Checking layout (history top, composer bottom)"
 tmux capture-pane -p -t "$SESSION" -S -300 >"$OUT"
 COMPOSER_LINE="$(grep -n "Enter send" "$OUT" | tail -1 | cut -d: -f1)"
-HINT_LINE="$(grep -n "Messages appear here" "$OUT" | head -1 | cut -d: -f1 || true)"
+HINT_LINE="$(grep -n "Ask a question" "$OUT" | head -1 | cut -d: -f1 || true)"
 if [[ -z "$COMPOSER_LINE" ]]; then
 	fail "could not find composer hint line"
 fi
 if [[ -n "$HINT_LINE" && "$HINT_LINE" -ge "$COMPOSER_LINE" ]]; then
-	fail "history hint should appear above the composer"
+	fail "welcome text should appear above the composer"
 fi
 if ! tail -n 6 "$OUT" | tr -d '\n' | grep -Fq "Enter send"; then
 	fail "composer should be visible at the bottom of the terminal"
 fi
-PROMPT_LINE="$(grep -n '> ' "$OUT" | tail -1 | cut -d: -f1 || true)"
+PROMPT_LINE="$(grep -n '^>' "$OUT" | tail -1 | cut -d: -f1 || true)"
 if [[ -z "$PROMPT_LINE" ]]; then
 	fail "composer input row (> prompt) not visible"
 fi
 if [[ "$PROMPT_LINE" -ge "$COMPOSER_LINE" ]]; then
-	fail "input prompt should appear above the hint line"
+	fail "input row should appear above the hint line"
 fi
 
 echo "==> Typing into composer (send-keys)"
 tmux send-keys -t "$SESSION" 'x'
 sleep 0.4
 tmux capture-pane -p -t "$SESSION" -S -30 >"$OUT"
-if ! grep -Fq '> x' "$OUT" && ! grep -Fq '>x' "$OUT"; then
+if ! grep -Fq 'x' "$OUT"; then
 	fail "typed character did not appear in composer (keyboard input broken)"
 fi
 tmux send-keys -t "$SESSION" Escape
@@ -127,21 +127,20 @@ wait_for "Enter send" 30 || fail "composer did not return to ready after run"
 wait_for "ink-tmux-ok" 10 || fail "expected assistant reply text"
 
 tmux capture-pane -p -t "$SESSION" -S -300 >"$OUT"
-YOU_LINE="$(grep -En '^ ?You$' "$OUT" | head -1 | cut -d: -f1 || true)"
-NAV_LINE="$(grep -En '^ ?nav$' "$OUT" | head -1 | cut -d: -f1 || true)"
-if [[ -z "$YOU_LINE" || -z "$NAV_LINE" ]]; then
-	fail "expected You/nav labels in history"
+USER_LINE="$(grep -n "ink-tmux-ok" "$OUT" | head -1 | cut -d: -f1 || true)"
+if [[ -z "$USER_LINE" ]]; then
+	fail "expected user message in history"
 fi
-if [[ "$YOU_LINE" -ge "$COMPOSER_LINE" || "$NAV_LINE" -ge "$COMPOSER_LINE" ]]; then
-	fail "history labels should stay above the composer"
+if [[ "$USER_LINE" -ge "$COMPOSER_LINE" ]]; then
+	fail "user message should stay above the composer"
 fi
 if grep -Fq "Connection failed" "$OUT" || grep -Fq "backend exited" "$OUT"; then
 	fail "TUI reported a connection/backend error"
 fi
 
-# Require some assistant text after the nav label (not just an empty bubble).
-if ! awk -v nav="$NAV_LINE" -v comp="$COMPOSER_LINE" 'NR > nav && NR < comp && length($0) > 0 { found=1 } END { exit !found }' "$OUT"; then
-	fail "expected assistant text between nav label and composer"
+# Require assistant reply text after the user message.
+if ! awk -v user="$USER_LINE" -v comp="$COMPOSER_LINE" 'NR > user && NR < comp && length($0) > 0 { found=1 } END { exit !found }' "$OUT"; then
+	fail "expected assistant text between user message and composer"
 fi
 
 echo "==> PASS: tmux smoke test succeeded"

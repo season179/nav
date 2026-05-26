@@ -114,6 +114,12 @@ export class NavBackendClient {
 		this.stopOwnedBackend();
 	}
 
+	/** Restart the backend process and open a fresh session (e.g. after model env change). */
+	async reconnect(): Promise<SessionInfo> {
+		this.stopOwnedBackend();
+		return this.connect();
+	}
+
 	private stopOwnedBackend(): void {
 		const child = this.child;
 		this.child = null;

@@ -3,16 +3,28 @@ import {Box, useApp, useInput} from 'ink';
 import {useTerminalSize} from './use-terminal-size.js';
 import {COMPOSER_HEIGHT, Composer} from './Composer.js';
 import {HistoryPane} from './HistoryPane.js';
+import {ModelPicker} from './ModelPicker.js';
 import {
 	NavBackendClient,
 	eventText,
 	type NavEvent,
 } from './backend-client.js';
+import {parseSlashCommand} from './slash-commands.js';
+import {
+	applyModelEnv,
+	formatModelLabel,
+	listModelOptions,
+	resolveCurrentModelRef,
+	type ModelOption,
+	type ModelRef,
+} from './settings.js';
 import type {HistoryMessage} from './types.js';
 
 type Props = {
 	backendPath?: string;
 };
+
+const IDLE_HINT = 'Enter send · /model · /exit · Esc clear · Ctrl+C quit';
 
 export function App({backendPath = ''}: Props) {
 	const {exit} = useApp();
@@ -21,9 +33,13 @@ export function App({backendPath = ''}: Props) {
 	const [messages, setMessages] = useState<HistoryMessage[]>([]);
 	const [input, setInput] = useState('');
 	const [busy, setBusy] = useState(false);
-	const [hint, setHint] = useState('Enter send · Esc clear · Ctrl+C quit');
+	const [hint, setHint] = useState(IDLE_HINT);
+	const [modelPickerOpen, setModelPickerOpen] = useState(false);
+	const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
+	const [currentModel, setCurrentModel] = useState<ModelRef | null>(null);
 
 	useEffect(() => {
+		void resolveCurrentModelRef().then(setCurrentModel);
 		return () => {
 			void clientRef.current.close();
 		};
@@ -31,16 +47,18 @@ export function App({backendPath = ''}: Props) {
 
 	useInput(
 		(character, key) => {
+			if (modelPickerOpen) {
+				return;
+			}
 			if (key.ctrl && character === 'c') {
 				exit();
 				return;
 			}
-
 			if (!busy && key.escape) {
 				setInput('');
 			}
 		},
-		{isActive: true},
+		{isActive: !modelPickerOpen},
 	);
 
 	const historyHeight = Math.max(1, rows - COMPOSER_HEIGHT);
@@ -53,25 +71,112 @@ export function App({backendPath = ''}: Props) {
 				overflow="hidden"
 				flexShrink={0}
 			>
-				<HistoryPane messages={messages} />
+				{modelPickerOpen ? (
+					<ModelPicker
+						options={modelOptions}
+						current={currentModel}
+						onSelect={ref => {
+							void applyModelSelection(ref);
+						}}
+						onCancel={() => {
+							setModelPickerOpen(false);
+							setHint(IDLE_HINT);
+						}}
+					/>
+				) : (
+					<HistoryPane messages={messages} />
+				)}
 			</Box>
 			<Composer
 				value={input}
 				busy={busy}
 				hint={hint}
 				width={columns}
+				focused={!modelPickerOpen}
 				onChange={setInput}
 				onSubmit={submitted => {
-					const text = submitted.trim();
-					if (!text || busy) {
-						return;
-					}
-					setInput('');
-					void sendText(text);
+					void handleSubmit(submitted);
 				}}
 			/>
 		</Box>
 	);
+
+	async function handleSubmit(submitted: string) {
+		const text = submitted.trim();
+		if (!text || busy) {
+			return;
+		}
+
+		const slash = parseSlashCommand(text);
+		if (slash) {
+			setInput('');
+			await runSlashCommand(slash);
+			return;
+		}
+
+		setInput('');
+		await sendText(text);
+	}
+
+	async function runSlashCommand(
+		slash: NonNullable<ReturnType<typeof parseSlashCommand>>,
+	) {
+		switch (slash.kind) {
+			case 'exit':
+				exit();
+				return;
+			case 'model':
+				await openModelPicker();
+				return;
+			case 'unknown':
+				pushSystem(`Unknown command: /${slash.name}`);
+				return;
+		}
+	}
+
+	async function openModelPicker() {
+		try {
+			const [options, current] = await Promise.all([
+				listModelOptions(),
+				resolveCurrentModelRef(),
+			]);
+			setModelOptions(options);
+			setCurrentModel(current);
+			setModelPickerOpen(true);
+			setHint('Model picker — Esc cancel');
+		} catch (caught) {
+			const message =
+				caught instanceof Error ? caught.message : String(caught);
+			pushSystem(`Could not load models: ${message}`);
+		}
+	}
+
+	async function applyModelSelection(ref: ModelRef) {
+		setModelPickerOpen(false);
+		setBusy(true);
+		setHint('Switching model…');
+
+		try {
+			applyModelEnv(ref);
+			await clientRef.current.reconnect();
+			setCurrentModel(ref);
+			pushSystem(`Model set to ${formatModelLabel(ref)}`);
+		} catch (caught) {
+			const message =
+				caught instanceof Error ? caught.message : String(caught);
+			pushSystem(`Failed to switch model: ${message}`);
+		} finally {
+			setBusy(false);
+			setHint(IDLE_HINT);
+		}
+	}
+
+	function pushSystem(text: string) {
+		setMessages(previous => [
+			...previous,
+			{id: crypto.randomUUID(), role: 'system', text},
+		]);
+	}
 
 	async function sendText(text: string) {
 		const assistantId = crypto.randomUUID();
@@ -100,7 +205,7 @@ export function App({backendPath = ''}: Props) {
 			setHint('Error — Enter to retry');
 		} finally {
 			setBusy(false);
-			setHint('Enter send · Esc clear · Ctrl+C quit');
+			setHint(IDLE_HINT);
 		}
 	}
 

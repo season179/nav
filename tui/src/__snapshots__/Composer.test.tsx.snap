@@ -1,0 +1,15 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`Composer golden frames with text (stable plain-text frame) 1`] = `
+"────────────────────────────────────────
+> hello
+────────────────────────────────────────
+Enter send · /model · /exit"
+`;
+
+exports[`Composer golden frames busy (stable plain-text frame) 1`] = `
+"────────────────────────────────────────
+> hello
+────────────────────────────────────────
+Running…"
+`;

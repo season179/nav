@@ -1,0 +1,203 @@
+#!/usr/bin/env bun
+/**
+ * UI preview — no nav-backend, no navd, no LLM.
+ *
+ *   bun run preview              # full layout (default)
+ *   bun run preview history
+ *   bun run preview composer
+ *   bun run preview model
+ *
+ * Keys (shell scene): m model picker · e empty · c chat · q quit
+ */
+import React, {useState} from 'react';
+import {Box, render, Text, useApp, useInput} from 'ink';
+import {COMPOSER_HEIGHT, Composer} from './Composer.js';
+import {HistoryPane} from './HistoryPane.js';
+import {ModelPicker} from './ModelPicker.js';
+import type {ModelOption, ModelRef} from './settings.js';
+import type {HistoryMessage} from './types.js';
+import {theme} from './theme.js';
+import {useTerminalSize} from './use-terminal-size.js';
+
+const IDLE_HINT = 'Enter send · /model · /exit · Esc clear · Ctrl+C quit';
+
+const SAMPLE_MODELS: ModelOption[] = [
+	{provider: 'openai', model: 'gpt-4.1', label: 'openai/gpt-4.1'},
+	{provider: 'anthropic', model: 'claude-sonnet-4', label: 'anthropic/claude-sonnet-4'},
+	{provider: 'compatible', model: 'vendor/model', label: 'compatible/vendor/model'},
+];
+
+const CHAT_MESSAGES: HistoryMessage[] = [
+	{id: '1', role: 'user', text: 'How does the nav TUI look?'},
+	{
+		id: '2',
+		role: 'assistant',
+		text: 'Gray blocks for you, plain text for replies — similar to Claude Code.',
+	},
+	{id: '3', role: 'system', text: 'Model set to openai/gpt-4.1'},
+];
+
+const scene = process.argv[2] ?? 'shell';
+
+function PreviewFrame({children}: {children: React.ReactNode}) {
+	const {columns, rows} = useTerminalSize();
+	return (
+		<Box flexDirection="column" width={columns} height={rows}>
+			{children}
+		</Box>
+	);
+}
+
+function HistoryPreview() {
+	return (
+		<PreviewFrame>
+			<HistoryPane messages={CHAT_MESSAGES} />
+		</PreviewFrame>
+	);
+}
+
+function ComposerPreview() {
+	const {columns} = useTerminalSize();
+	const [value, setValue] = useState('Type here — no backend attached');
+	return (
+		<PreviewFrame>
+			<Box flexGrow={1} />
+			<Composer
+				value={value}
+				busy={false}
+				hint={IDLE_HINT}
+				width={columns}
+				focused
+				onChange={setValue}
+				onSubmit={() => {}}
+			/>
+		</PreviewFrame>
+	);
+}
+
+function ModelPreview() {
+	return (
+		<PreviewFrame>
+			<ModelPicker
+				options={SAMPLE_MODELS}
+				current={{provider: 'openai', model: 'gpt-4.1'}}
+				onSelect={() => process.exit(0)}
+				onCancel={() => process.exit(0)}
+			/>
+		</PreviewFrame>
+	);
+}
+
+function ShellPreview() {
+	const {exit} = useApp();
+	const {columns, rows} = useTerminalSize();
+	const [messages, setMessages] = useState<HistoryMessage[]>(CHAT_MESSAGES);
+	const [input, setInput] = useState('');
+	const [modelOpen, setModelOpen] = useState(false);
+	const historyHeight = Math.max(1, rows - COMPOSER_HEIGHT);
+
+	useInput((inputKey, key) => {
+		if (modelOpen) {
+			return;
+		}
+		if (inputKey === 'q' || (key.ctrl && inputKey === 'c')) {
+			exit();
+			return;
+		}
+		if (inputKey === 'm') {
+			setModelOpen(true);
+			return;
+		}
+		if (inputKey === 'e') {
+			setMessages([]);
+			return;
+		}
+		if (inputKey === 'c') {
+			setMessages(CHAT_MESSAGES);
+		}
+	});
+
+	return (
+		<Box flexDirection="column" width={columns} height={rows}>
+			<Box height={1} flexShrink={0} paddingX={2}>
+				<Text color={theme.inactive}>
+					Preview · m picker · e empty · c chat · q quit
+				</Text>
+			</Box>
+			<Box
+				flexDirection="column"
+				height={historyHeight - 1}
+				overflow="hidden"
+				flexShrink={0}
+			>
+				{modelOpen ? (
+					<ModelPicker
+						options={SAMPLE_MODELS}
+						current={{provider: 'openai', model: 'gpt-4.1'}}
+						onSelect={(ref: ModelRef) => {
+							setModelOpen(false);
+							setMessages(previous => [
+								...previous,
+								{
+									id: crypto.randomUUID(),
+									role: 'system',
+									text: `Model set to ${ref.provider}/${ref.model}`,
+								},
+							]);
+						}}
+						onCancel={() => setModelOpen(false)}
+					/>
+				) : (
+					<HistoryPane messages={messages} />
+				)}
+			</Box>
+			<Composer
+				value={input}
+				busy={false}
+				hint={modelOpen ? 'Model picker — Esc cancel' : IDLE_HINT}
+				width={columns}
+				focused={!modelOpen}
+				onChange={setInput}
+				onSubmit={text => {
+					const trimmed = text.trim();
+					if (!trimmed) {
+						return;
+					}
+					setInput('');
+					if (trimmed === '/exit') {
+						exit();
+						return;
+					}
+					if (trimmed === '/model') {
+						setModelOpen(true);
+						return;
+					}
+					setMessages(previous => [
+						...previous,
+						{id: crypto.randomUUID(), role: 'user', text: trimmed},
+						{
+							id: crypto.randomUUID(),
+							role: 'assistant',
+							text: '(preview — no backend)',
+						},
+					]);
+				}}
+			/>
+		</Box>
+	);
+}
+
+const views: Record<string, React.ComponentType> = {
+	shell: ShellPreview,
+	history: HistoryPreview,
+	composer: ComposerPreview,
+	model: ModelPreview,
+};
+
+const View = views[scene];
+if (!View) {
+	console.error(`Unknown preview scene "${scene}". Try: shell, history, composer, model`);
+	process.exit(1);
+}
+
+render(<View />);

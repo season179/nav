@@ -1,5 +1,5 @@
 export type HistoryMessage = {
 	id: string;
-	role: 'user' | 'assistant';
+	role: 'user' | 'assistant' | 'system';
 	text: string;
 };
