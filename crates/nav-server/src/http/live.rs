@@ -34,7 +34,7 @@ fn serve_listener(server: HttpServer, listener: TcpListener) -> Result<()> {
                 let server = Arc::clone(&server);
                 thread::spawn(move || {
                     if let Err(error) = handle_connection(server, stream) {
-                        eprintln!("nav-backend HTTP connection failed: {error:#}");
+                        log_connection_error(error);
                     }
                 });
             }
@@ -43,6 +43,28 @@ fn serve_listener(server: HttpServer, listener: TcpListener) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn log_connection_error(error: anyhow::Error) {
+    if is_client_disconnect(&error) {
+        return;
+    }
+
+    eprintln!("nav-backend HTTP connection failed: {error:#}");
+}
+
+fn is_client_disconnect(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
 fn write_bootstrap(base_url: &str) -> Result<()> {
@@ -212,6 +234,28 @@ mod tests {
     use std::io::BufReader;
 
     use super::*;
+
+    #[test]
+    fn treats_broken_pipe_as_normal_client_disconnect() {
+        let error = anyhow!(io::Error::from(io::ErrorKind::BrokenPipe));
+
+        assert!(is_client_disconnect(&error));
+    }
+
+    #[test]
+    fn treats_context_wrapped_disconnect_as_normal_client_disconnect() {
+        let error = anyhow!(io::Error::from(io::ErrorKind::ConnectionReset))
+            .context("write live SSE frame");
+
+        assert!(is_client_disconnect(&error));
+    }
+
+    #[test]
+    fn non_disconnect_errors_still_report_connection_failures() {
+        let error = anyhow!("invalid Content-Length");
+
+        assert!(!is_client_disconnect(&error));
+    }
 
     #[test]
     fn parses_http_request_body_and_last_event_id() {
