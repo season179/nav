@@ -318,6 +318,10 @@ fn session_send_message_returns_before_provider_stream_finishes() {
     let live_events = receive_live_events(&subscription, 1);
     assert_eq!(envelope_event_names(&live_events), vec!["run.started"]);
     assert_eq!(live_events[0].session_id, session_id);
+    assert!(matches!(
+        subscription.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
 
     let cancel_response = server.handle_request(HttpRequest::post(
         "/rpc",
