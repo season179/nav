@@ -7,6 +7,8 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
+const maxThinkingDisplayLines = 8
+
 func (m Model) View() tea.View {
 	if m.width == 0 || m.height == 0 {
 		return tea.NewView("")
@@ -85,8 +87,40 @@ func renderMessage(item transcriptItem, width int) string {
 		label = roleSystemStyle
 	}
 
-	body := messageBodyStyle.Width(width).Render(wrap(item.Body, width))
-	return lipgloss.JoinVertical(lipgloss.Left, label.Render(role), body)
+	hasThinking := item.Role == "assistant" && strings.TrimSpace(item.Thinking) != ""
+	hasBody := strings.TrimSpace(item.Body) != ""
+
+	sections := []string{label.Render(role)}
+	if hasThinking {
+		sections = append(sections, renderThinking(item.Thinking, width))
+	}
+	if hasBody || !hasThinking {
+		body := messageBodyStyle.Width(width).Render(wrap(item.Body, width))
+		sections = append(sections, body)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
+}
+
+func renderThinking(thinking string, width int) string {
+	content := strings.TrimSpace(thinking)
+	if content == "" {
+		return ""
+	}
+
+	content = lastLines(wrap(content, width), maxThinkingDisplayLines)
+	return thinkingBodyStyle.Width(width).Render(content)
+}
+
+func lastLines(text string, maxLines int) string {
+	if maxLines <= 0 {
+		return ""
+	}
+
+	lines := strings.Split(text, "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) renderActivity(width, height int) string {

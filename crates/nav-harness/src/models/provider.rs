@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, process::Command};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,13 +19,22 @@ pub enum ApiKeyConfig {
 
 impl ApiKeyConfig {
     pub(crate) fn resolve(&self, env: &impl Fn(&str) -> Option<String>) -> Option<String> {
-        match self {
+        let secret = match self {
             Self::EnvVar { env_var } => env(env_var),
             Self::Inline { inline } => Some(inline.clone()),
-            Self::Value(value) => env(value)
-                .filter(|secret| !secret.trim().is_empty())
-                .or_else(|| Some(value.clone())),
-        }
+            Self::Value(value) => {
+                if let Some(command) = value.strip_prefix('!') {
+                    resolve_command_value(command)
+                } else {
+                    env(value)
+                        .filter(|secret| !secret.trim().is_empty())
+                        .or_else(|| Some(value.clone()))
+                }
+            }
+        }?;
+
+        let secret = secret.trim();
+        (!secret.is_empty()).then(|| secret.to_string())
     }
 
     pub(crate) fn missing_env_var(&self) -> Option<String> {
@@ -34,6 +43,33 @@ impl ApiKeyConfig {
             Self::Inline { .. } | Self::Value(_) => None,
         }
     }
+}
+
+fn resolve_command_value(command: &str) -> Option<String> {
+    if command.trim().is_empty() {
+        return None;
+    }
+
+    let output = shell_command(command).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut shell = Command::new("cmd");
+    shell.arg("/C").arg(command);
+    shell
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut shell = Command::new("sh");
+    shell.arg("-c").arg(command);
+    shell
 }
 
 impl fmt::Debug for ApiKeyConfig {

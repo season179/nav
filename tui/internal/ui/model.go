@@ -18,8 +18,9 @@ type agentClient interface {
 }
 
 type transcriptItem struct {
-	Role string
-	Body string
+	Role     string
+	Body     string
+	Thinking string
 }
 
 type activityItem struct {
@@ -212,6 +213,9 @@ func (m *Model) applyAgentEvent(event client.Event) {
 	switch event.Type {
 	case "run.started":
 		m.status = "thinking"
+	case "model.reasoning_delta":
+		m.status = "thinking"
+		m.appendAssistantReasoningDelta(event.Delta)
 	case "model.text_delta":
 		m.appendAssistantDelta(event.Delta)
 	case "message.delta":
@@ -252,13 +256,27 @@ func (m *Model) appendAssistantDelta(delta string) {
 		return
 	}
 
-	last := len(m.messages) - 1
-	if last < 0 || m.messages[last].Role != "assistant" {
-		m.messages = append(m.messages, transcriptItem{Role: "assistant", Body: delta})
+	assistant := m.currentAssistantMessage()
+	assistant.Body += delta
+}
+
+func (m *Model) appendAssistantReasoningDelta(delta string) {
+	if delta == "" {
 		return
 	}
 
-	m.messages[last].Body += delta
+	assistant := m.currentAssistantMessage()
+	assistant.Thinking += delta
+}
+
+func (m *Model) currentAssistantMessage() *transcriptItem {
+	last := len(m.messages) - 1
+	if last < 0 || m.messages[last].Role != "assistant" {
+		m.messages = append(m.messages, transcriptItem{Role: "assistant"})
+		last = len(m.messages) - 1
+	}
+
+	return &m.messages[last]
 }
 
 func (m *Model) prependActivity(item activityItem) {

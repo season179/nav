@@ -11,6 +11,7 @@ import (
 func TestSubmitComposerRendersAssistantDeltasFromBackendEvents(t *testing.T) {
 	agent := &fakeAgent{
 		events: []client.Event{
+			{Type: "model.reasoning_delta", Delta: "thinking "},
 			{Type: "model.text_delta", Delta: "hello "},
 			{Type: "message.delta", Text: "from backend"},
 			{Type: "run.completed"},
@@ -32,6 +33,9 @@ func TestSubmitComposerRendersAssistantDeltasFromBackendEvents(t *testing.T) {
 	last := result.messages[len(result.messages)-1]
 	if last.Role != "assistant" || last.Body != "hello from backend" {
 		t.Fatalf("last transcript item = %#v, want assistant backend response", last)
+	}
+	if last.Thinking != "thinking " {
+		t.Fatalf("assistant thinking = %q, want streamed reasoning", last.Thinking)
 	}
 	if result.status != "ready" {
 		t.Fatalf("status = %q, want ready", result.status)
@@ -217,6 +221,24 @@ func TestApplyAgentEventSurfacesUnknownEvents(t *testing.T) {
 
 	if got := model.activity[0]; got.Icon != "?" || got.Title != "tool.call.started" || got.Body != "running shell" {
 		t.Fatalf("unknown event activity = %#v", got)
+	}
+}
+
+func TestApplyAgentEventAcceptsReasoningDeltasWithoutActivityNoise(t *testing.T) {
+	model := New(&fakeAgent{})
+	activityCount := len(model.activity)
+
+	model.applyAgentEvent(client.Event{Type: "model.reasoning_delta", Delta: "thinking"})
+
+	if len(model.activity) != activityCount {
+		t.Fatalf("activity length = %d, want %d", len(model.activity), activityCount)
+	}
+	if model.status != "thinking" {
+		t.Fatalf("status = %q, want thinking", model.status)
+	}
+	last := model.messages[len(model.messages)-1]
+	if last.Role != "assistant" || last.Thinking != "thinking" {
+		t.Fatalf("last transcript item = %#v, want assistant reasoning", last)
 	}
 }
 

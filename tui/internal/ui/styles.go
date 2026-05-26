@@ -62,4 +62,9 @@ var (
 
 	messageBodyStyle = lipgloss.NewStyle().
 				Foreground(textPrimary)
+
+	thinkingBodyStyle = lipgloss.NewStyle().
+				Foreground(textMuted).
+				Background(bgSubtle).
+				Padding(0, 1)
 )

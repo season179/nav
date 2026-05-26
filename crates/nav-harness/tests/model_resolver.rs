@@ -37,6 +37,51 @@ fn resolves_api_key_from_pi_style_env_var_string() {
 }
 
 #[test]
+fn resolves_api_key_from_pi_style_command_string() {
+    let resolved = ModelResolver::new(compatible_settings(command_api_key_config(
+        successful_api_key_command(),
+    )))
+    .resolve_default_with_env(|_| None)
+    .expect("Pi-style command API key should resolve");
+
+    assert_eq!(resolved.api_key.expose_secret(), "sk-command");
+}
+
+#[test]
+fn reports_missing_api_key_when_pi_style_command_outputs_empty_value() {
+    let error = ModelResolver::new(compatible_settings(command_api_key_config(
+        empty_api_key_command(),
+    )))
+    .resolve_default_with_env(|_| None)
+    .expect_err("empty command API key output should fail");
+
+    assert_eq!(
+        error,
+        ResolveModelError::MissingApiKey {
+            provider_id: "compatible-gateway".to_string(),
+            env_var: None,
+        }
+    );
+}
+
+#[test]
+fn reports_missing_api_key_when_pi_style_command_fails() {
+    let error = ModelResolver::new(compatible_settings(command_api_key_config(
+        failing_api_key_command(),
+    )))
+    .resolve_default_with_env(|_| None)
+    .expect_err("failed command API key should fail");
+
+    assert_eq!(
+        error,
+        ResolveModelError::MissingApiKey {
+            provider_id: "compatible-gateway".to_string(),
+            env_var: None,
+        }
+    );
+}
+
+#[test]
 fn falls_back_to_literal_for_pi_style_api_key_string() {
     let env_var = "NAV_COMPATIBLE_API_KEY";
 
@@ -377,6 +422,22 @@ fn compatible_settings(api_key: ApiKeyConfig) -> ModelSettings {
     }
 }
 
+fn command_api_key_config(command: &str) -> ApiKeyConfig {
+    ApiKeyConfig::Value(format!("!{command}"))
+}
+
+fn successful_api_key_command() -> &'static str {
+    "echo sk-command"
+}
+
+fn empty_api_key_command() -> &'static str {
+    if cfg!(windows) { "ver > nul" } else { ":" }
+}
+
+fn failing_api_key_command() -> &'static str {
+    if cfg!(windows) { "exit /B 7" } else { "exit 7" }
+}
+
 fn minimal_model(id: &str) -> ModelConfig {
     ModelConfig {
         id: id.to_string(),
@@ -401,10 +462,12 @@ fn load_example(name: &str) -> String {
 #[test]
 fn parses_example_config_with_env_var_api_key() {
     let json = load_example("model-settings-env-var.json");
-    let settings: ModelSettings = serde_json::from_str(&json)
-        .expect("env-var example should deserialize");
+    let settings: ModelSettings =
+        serde_json::from_str(&json).expect("env-var example should deserialize");
 
-    let provider = settings.providers.get("local-gateway")
+    let provider = settings
+        .providers
+        .get("local-gateway")
         .expect("local-gateway provider should exist");
     let model = provider.models.first().expect("should have a model");
 
@@ -413,7 +476,12 @@ fn parses_example_config_with_env_var_api_key() {
     assert_eq!(default.model, "local-coder:7b");
     assert_eq!(provider.api, ApiKind::OpenAiCompletions);
     assert_eq!(provider.base_url, "http://localhost:11434/v1");
-    assert_eq!(provider.api_key, ApiKeyConfig::EnvVar { env_var: "LOCAL_GATEWAY_API_KEY".to_string() });
+    assert_eq!(
+        provider.api_key,
+        ApiKeyConfig::EnvVar {
+            env_var: "LOCAL_GATEWAY_API_KEY".to_string()
+        }
+    );
     assert_eq!(model.id, "local-coder:7b");
     assert!(model.reasoning);
     assert_eq!(model.context_window, Some(128000));
@@ -423,10 +491,12 @@ fn parses_example_config_with_env_var_api_key() {
 #[test]
 fn parses_example_config_with_inline_api_key() {
     let json = load_example("model-settings-inline-key.json");
-    let settings: ModelSettings = serde_json::from_str(&json)
-        .expect("inline-key example should deserialize");
+    let settings: ModelSettings =
+        serde_json::from_str(&json).expect("inline-key example should deserialize");
 
-    let provider = settings.providers.get("private-local")
+    let provider = settings
+        .providers
+        .get("private-local")
         .expect("private-local provider should exist");
     let model = provider.models.first().expect("should have a model");
 
@@ -435,26 +505,36 @@ fn parses_example_config_with_inline_api_key() {
     assert_eq!(default.model, "local-model");
     assert_eq!(provider.api, ApiKind::OpenAiCompletions);
     assert_eq!(provider.base_url, "http://localhost:8080/v1");
-    assert_eq!(provider.api_key, ApiKeyConfig::Inline { inline: "local-only-secret".to_string() });
+    assert_eq!(
+        provider.api_key,
+        ApiKeyConfig::Inline {
+            inline: "local-only-secret".to_string()
+        }
+    );
     assert_eq!(model.id, "local-model");
 }
 
 #[test]
 fn parses_example_config_with_proxy_gateway() {
     let json = load_example("model-settings-proxy.json");
-    let settings: ModelSettings = serde_json::from_str(&json)
-        .expect("proxy example should deserialize");
+    let settings: ModelSettings =
+        serde_json::from_str(&json).expect("proxy example should deserialize");
 
     let default = settings.default_model.as_ref().unwrap();
     assert_eq!(default.provider, "team-proxy");
     assert_eq!(default.model, "vendor/model-large");
 
-    let provider = settings.providers.get("team-proxy")
+    let provider = settings
+        .providers
+        .get("team-proxy")
         .expect("team-proxy provider should exist");
     let model = provider.models.first().expect("should have a model");
 
     assert_eq!(provider.base_url, "https://llm.example.com/v1");
-    assert_eq!(provider.api_key, ApiKeyConfig::Value("TEAM_PROXY_API_KEY".to_string()));
+    assert_eq!(
+        provider.api_key,
+        ApiKeyConfig::Value("TEAM_PROXY_API_KEY".to_string())
+    );
     assert_eq!(model.id, "vendor/model-large");
     assert!(model.reasoning);
     assert_eq!(model.input, vec![ModelInput::Text, ModelInput::Image]);
@@ -463,17 +543,25 @@ fn parses_example_config_with_proxy_gateway() {
 #[test]
 fn parses_example_config_with_compat_overrides() {
     let json = load_example("model-settings-compat.json");
-    let settings: ModelSettings = serde_json::from_str(&json)
-        .expect("compat example should deserialize");
+    let settings: ModelSettings =
+        serde_json::from_str(&json).expect("compat example should deserialize");
 
-    let provider = settings.providers.get("compatible-endpoint")
+    let provider = settings
+        .providers
+        .get("compatible-endpoint")
         .expect("compatible-endpoint provider should exist");
     let model = provider.models.first().expect("should have a model");
 
     assert_eq!(provider.api, ApiKind::OpenAiCompletions);
-    assert_eq!(provider.compat.thinking_format, Some(ThinkingFormat::QwenChatTemplate));
+    assert_eq!(
+        provider.compat.thinking_format,
+        Some(ThinkingFormat::QwenChatTemplate)
+    );
     assert_eq!(provider.compat.supports_usage_in_streaming, Some(false));
-    assert_eq!(provider.compat.max_tokens_field, Some(MaxTokensField::MaxTokens));
+    assert_eq!(
+        provider.compat.max_tokens_field,
+        Some(MaxTokensField::MaxTokens)
+    );
     // Model-level compat override
     assert_eq!(model.compat.thinking_format, Some(ThinkingFormat::OpenAi));
 }
@@ -493,12 +581,14 @@ fn resolves_example_configs_without_http_requests() {
             .unwrap_or_else(|e| panic!("{name} should deserialize: {e}"));
 
         let resolver = ModelResolver::new(settings);
-        let resolved = resolver.resolve_default_with_env(|var| match var {
-            "LOCAL_GATEWAY_API_KEY" => Some("sk-local".to_string()),
-            "TEAM_PROXY_API_KEY" => Some("sk-team".to_string()),
-            "COMPATIBLE_ENDPOINT_API_KEY" => Some("sk-compat".to_string()),
-            _ => None,
-        }).unwrap_or_else(|e| panic!("{name} should resolve: {e:?}"));
+        let resolved = resolver
+            .resolve_default_with_env(|var| match var {
+                "LOCAL_GATEWAY_API_KEY" => Some("sk-local".to_string()),
+                "TEAM_PROXY_API_KEY" => Some("sk-team".to_string()),
+                "COMPATIBLE_ENDPOINT_API_KEY" => Some("sk-compat".to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("{name} should resolve: {e:?}"));
 
         assert_eq!(resolved.api, ApiKind::OpenAiCompletions);
         assert!(!resolved.base_url.is_empty());
