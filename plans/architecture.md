@@ -20,8 +20,8 @@ should be understandable to someone studying how coding agents work.
 
 `nav` is a Rust coding agent backend with replaceable frontends.
 
-The first frontend is the Go Bubble Tea TUI, but the backend protocol must also
-support future Electron and web frontends.
+The first frontend is the Ink (React) TUI in `tui/`, but the backend protocol
+must also support future Electron and web frontends.
 
 ## Repository Folders
 
@@ -61,16 +61,9 @@ support future Electron and web frontends.
 - `crates/nav-types/` owns shared primitive types, especially UUIDv7 protocol
   IDs.
 - `docs/` contains architecture and design notes.
-- `tui/` contains the Go Bubble Tea terminal frontend.
-- `tui/cmd/` contains executable entrypoints only.
-- `tui/cmd/nav/` is the released TUI command.
-- `tui/cmd/navd/` is the local development entrypoint.
-- `tui/internal/` contains private Go packages for the TUI module.
-- `tui/internal/app/` wires the backend client into the Bubble Tea program.
-- `tui/internal/client/` owns the frontend-to-backend API client.
-- `tui/internal/localdev/` owns local checkout build/run behavior for `navd`.
-- `tui/internal/ui/` owns Bubble Tea state, updates, rendering, layout, and
-  styles.
+- `tui/` contains the Ink terminal frontend (TypeScript + React).
+- `tui/src/backend-client.ts` owns the frontend-to-backend API client.
+- `tui/src/App.tsx` owns React/Ink state, layout, and input handling.
 
 Generated folders such as `target/` and `.cache/` are build artifacts, not
 source architecture.
@@ -112,17 +105,12 @@ folder to a crate only when the API is stable enough to be useful on its own.
 
 ## TUI Package Rules
 
-The Go TUI should keep entrypoints thin and package names boring:
+The Ink TUI should keep the protocol client separate from React components:
 
-- `cmd/*` should delegate immediately to internal packages.
-- `internal/app` is the composition point, not a domain layer.
-- `internal/client` is the backend protocol boundary.
-- `internal/ui` should translate backend events into UI state.
-- Rendering, styles, layout helpers, and input handling should stay split once
-  they become large enough to read independently.
-
-`navd` should not become a product subsystem. It is a development convenience
-for running local builds without confusing them with released `nav`.
+- `src/backend-client.ts` is the only place that spawns the backend or speaks
+  JSON-RPC/SSE.
+- `src/App.tsx` (and future components) translate backend events into UI state.
+- Split rendering into more components once the screen grows beyond one file.
 
 ## Protocol
 

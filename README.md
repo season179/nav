@@ -12,14 +12,14 @@ change drastically as the architecture becomes clearer.
 
 ## Shape
 
-- `tui/cmd/nav` is the user-facing command. Running `nav` starts the TUI.
+- `tui/` is the Ink (React) terminal UI. Run it with `cd tui && bun run start`.
 - `crates/nav-backend` is the Rust backend binary. The backend internals are
   split across `crates/nav-server`, `crates/nav-protocol`, `crates/nav-harness`,
   and `crates/nav-types`.
 - The target frontend/backend API is JSON-RPC over local HTTP plus typed SSE
   events.
 
-This keeps terminal rendering in Go/Bubble Tea while keeping agent state and
+This keeps terminal rendering in TypeScript/Ink while keeping agent state and
 side effects in Rust. See `docs/architecture.md`.
 
 ## Development
@@ -31,21 +31,17 @@ From the repository root:
 
 ```sh
 cargo test
-cd tui && go test ./...
-cd tui && go run ./cmd/nav
+cd tui && bun install
+cd tui && bun run typecheck
+make run-tui
 ```
 
-`nav` is the released command. `navd` is a development launcher that runs the
-locally built `target/debug/nav` with the locally built backend. Use
-`navd update` from this checkout to rebuild local state and install the launcher:
+**`navd`** is the dev alias for **`nav`**: run `navd` from a checkout to start
+the Ink TUI against `target/debug/nav-backend`. Run **`navd update`** (or
+`make navd-update`) to build the backend, refresh TUI deps, and install
+`navd` into `~/.local/bin`.
 
-```sh
-make navd-update
-navd
-```
-
-`navd update` builds `target/debug/nav-backend`, `target/debug/nav`, and
-`target/debug/navd`, then installs only the launcher to `~/.local/bin/navd`.
+When `NAV_BACKEND` is unset, the Ink UI spawns the backend automatically.
 
 The TUI starts the backend in the minimal local HTTP/SSE mode. By default it
 finds the Rust workspace and runs:
@@ -72,7 +68,7 @@ The config shape follows Pi's `models.json`; see
 Manual OR-06 check:
 
 ```sh
-make navd-update
+navd update   # once per checkout (or: make navd-update)
 navd
 ```
 

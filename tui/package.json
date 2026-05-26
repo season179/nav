@@ -1,0 +1,25 @@
+{
+  "name": "@nav/tui",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "nav terminal UI (Ink)",
+  "bin": {
+    "nav": "./src/cli.tsx"
+  },
+  "scripts": {
+    "dev": "bun run src/cli.tsx",
+    "start": "bun run src/cli.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ink": "^6.7.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/react": "^19.2.0",
+    "typescript": "^5.9.2"
+  }
+}
