@@ -87,7 +87,7 @@ export function App({backendPath = ''}: Props) {
 						}}
 					/>
 				) : (
-					<HistoryRegion messages={messages} />
+					<HistoryRegion messages={messages} height={historyHeight} />
 				)}
 			</Box>
 			<ComposerRegion
