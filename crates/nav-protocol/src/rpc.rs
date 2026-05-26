@@ -71,6 +71,40 @@ pub struct InitializeParams {
     pub client_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ProtocolCapabilities>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitializeResult {
+    pub server_name: String,
+    pub server_version: String,
+    pub protocol_version: u32,
+    pub capabilities: ProtocolCapabilities,
+    pub methods: Vec<String>,
+    pub events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolCapabilities {
+    #[serde(default)]
+    pub sse_replay: bool,
+    #[serde(default)]
+    pub normalized_messages: bool,
+    #[serde(default)]
+    pub tool_approvals: bool,
+    #[serde(default)]
+    pub file_events: bool,
+    #[serde(default)]
+    pub provider_metadata: bool,
+    #[serde(default)]
+    pub session_close: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

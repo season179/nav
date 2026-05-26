@@ -1,6 +1,26 @@
 use nav_types::{ApprovalId, EventId, FileChangeId, MessageId, RunId, SessionId, ToolCallId};
 use serde::{Deserialize, Serialize};
 
+pub const BACKEND_EVENT_TYPES: &[&str] = &[
+    "session.created",
+    "run.started",
+    "model.text_delta",
+    "model.reasoning_delta",
+    "message.delta",
+    "message.completed",
+    "tool.call_requested",
+    "tool.call_started",
+    "tool.call_delta",
+    "tool.call_completed",
+    "tool.approval_requested",
+    "file.changed",
+    "run.completed",
+    "run.cancelled",
+    "run.failed",
+    "provider.error",
+    "error",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub event_id: EventId,

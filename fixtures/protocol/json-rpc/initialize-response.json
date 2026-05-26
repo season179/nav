@@ -17,10 +17,7 @@
       "initialize",
       "session.create",
       "session.sendMessage",
-      "run.cancel",
-      "tool.approve",
-      "tool.reject",
-      "session.close"
+      "run.cancel"
     ],
     "events": [
       "session.created",

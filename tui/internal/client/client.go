@@ -23,6 +23,8 @@ const (
 	rpcSessionSendMessage = "session.sendMessage"
 )
 
+var errSSEStreamEndedBeforeExpectedEvent = errors.New("SSE stream ended before the expected event")
+
 type SessionInfo struct {
 	SessionID string
 	Endpoint  string
@@ -80,7 +82,7 @@ func (c *Client) SendMessage(ctx context.Context, text string) ([]Event, error) 
 		return nil, errors.New("message text is required")
 	}
 
-	_, err := c.callRPCLocked(ctx, rpcSessionSendMessage, map[string]any{
+	result, err := c.callRPCLocked(ctx, rpcSessionSendMessage, map[string]any{
 		"sessionId": c.session.SessionID,
 		"text":      text,
 	})
@@ -88,7 +90,17 @@ func (c *Client) SendMessage(ctx context.Context, text string) ([]Event, error) 
 		return nil, err
 	}
 
-	return c.fetchEventsLocked(ctx)
+	var send struct {
+		RunID string `json:"runId"`
+	}
+	if err := json.Unmarshal(result, &send); err != nil {
+		return nil, fmt.Errorf("decode session.sendMessage result: %w", err)
+	}
+	if send.RunID == "" {
+		return nil, errors.New("session.sendMessage returned an empty run id")
+	}
+
+	return c.fetchEventsLocked(ctx, runTerminalEvent(send.RunID))
 }
 
 func (c *Client) Close() error {
@@ -151,7 +163,7 @@ func (c *Client) connectLocked(ctx context.Context) (SessionInfo, error) {
 		Endpoint:  c.endpoint,
 		CWD:       cwd,
 	}
-	if _, err := c.fetchEventsLocked(ctx); err != nil {
+	if _, err := c.fetchEventsLocked(ctx, sessionCreatedEvent); err != nil {
 		c.session = SessionInfo{}
 		c.lastEventID = ""
 		return SessionInfo{}, err
@@ -258,7 +270,7 @@ func (c *Client) callRPCLocked(ctx context.Context, method string, params any) (
 	return response.Result, nil
 }
 
-func (c *Client) fetchEventsLocked(ctx context.Context) ([]Event, error) {
+func (c *Client) fetchEventsLocked(ctx context.Context, stop func(Event) bool) ([]Event, error) {
 	if c.session.SessionID == "" {
 		return nil, errors.New("session is not connected")
 	}
@@ -282,7 +294,7 @@ func (c *Client) fetchEventsLocked(ctx context.Context) ([]Event, error) {
 		return nil, fmt.Errorf("session events returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	events, err := parseSSE(resp.Body)
+	events, err := parseSSEUntil(resp.Body, stop)
 	if err != nil {
 		return nil, err
 	}
@@ -328,31 +340,39 @@ type eventPayload struct {
 }
 
 func parseSSE(reader io.Reader) ([]Event, error) {
+	return parseSSEUntil(reader, nil)
+}
+
+func parseSSEUntil(reader io.Reader, stop func(Event) bool) ([]Event, error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 
 	var events []Event
 	current := Event{}
 	var dataLines []string
-	flush := func() error {
+	flush := func() (bool, error) {
 		if current.ID == "" && current.Type == "" && len(dataLines) == 0 {
-			return nil
+			return false, nil
 		}
 		event, err := decodeSSEEvent(current, dataLines)
 		if err != nil {
-			return err
+			return false, err
 		}
 		events = append(events, event)
 		current = Event{}
 		dataLines = nil
-		return nil
+		return stop != nil && stop(event), nil
 	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
-			if err := flush(); err != nil {
+			done, err := flush()
+			if err != nil {
 				return nil, err
+			}
+			if done {
+				return events, nil
 			}
 			continue
 		}
@@ -369,10 +389,32 @@ func parseSSE(reader io.Reader) ([]Event, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("read SSE stream: %w", err)
 	}
-	if err := flush(); err != nil {
+	done, err := flush()
+	if err != nil {
 		return nil, err
 	}
+	if stop != nil && !done {
+		return nil, errSSEStreamEndedBeforeExpectedEvent
+	}
 	return events, nil
+}
+
+func sessionCreatedEvent(event Event) bool {
+	return event.Type == "session.created"
+}
+
+func runTerminalEvent(runID string) func(Event) bool {
+	return func(event Event) bool {
+		if event.RunID != runID {
+			return false
+		}
+		switch event.Type {
+		case "run.completed", "run.failed", "run.cancelled":
+			return true
+		default:
+			return false
+		}
+	}
 }
 
 func decodeSSEEvent(event Event, dataLines []string) (Event, error) {

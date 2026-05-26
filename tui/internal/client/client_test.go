@@ -3,11 +3,13 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClientSendMessageUsesJSONRPCAndParsesAssistantDeltas(t *testing.T) {
@@ -215,6 +217,170 @@ func TestClientConnectClearsPartialSessionWhenInitialEventsFail(t *testing.T) {
 	}
 }
 
+func TestClientStopsReadingLiveSSEAfterExpectedEvents(t *testing.T) {
+	const (
+		sessionID      = "019f2f6f-f178-7a72-9f28-7f9aa0a1c853"
+		runID          = "019f2f6f-f179-7a72-9f28-7f9aa0a1c853"
+		messageID      = "019f2f6f-f17a-7a72-9f28-7f9aa0a1c853"
+		sessionEventID = "019f2f6f-f17b-7a72-9f28-7f9aa0a1c853"
+		deltaEventID   = "019f2f6f-f17c-7a72-9f28-7f9aa0a1c853"
+		doneEventID    = "019f2f6f-f17d-7a72-9f28-7f9aa0a1c853"
+	)
+
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/rpc":
+			var request jsonRPCRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode JSON-RPC request: %v", err)
+			}
+			switch request.Method {
+			case "session.create":
+				return jsonResponse(t, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      request.ID,
+					"result":  map[string]any{"sessionId": sessionID},
+				}), nil
+			case "session.sendMessage":
+				return jsonResponse(t, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      request.ID,
+					"result": map[string]any{
+						"sessionId": sessionID,
+						"runId":     runID,
+						"messageId": messageID,
+					},
+				}), nil
+			default:
+				t.Fatalf("unexpected JSON-RPC method %q", request.Method)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/sessions/"+sessionID+"/events":
+			if r.Header.Get("Last-Event-ID") == "" {
+				return liveSSEResponse(
+					sseEventText(sessionEventID, "session.created", map[string]any{
+						"event_id":   sessionEventID,
+						"session_id": sessionID,
+						"type":       "session.created",
+					}),
+				), nil
+			}
+			return liveSSEResponse(
+				sseEventText(deltaEventID, "model.text_delta", map[string]any{
+					"event_id":   deltaEventID,
+					"session_id": sessionID,
+					"type":       "model.text_delta",
+					"run_id":     runID,
+					"message_id": messageID,
+					"delta":      "hello from live stream",
+				}),
+				sseEventText(doneEventID, "run.completed", map[string]any{
+					"event_id":   doneEventID,
+					"session_id": sessionID,
+					"type":       "run.completed",
+					"run_id":     runID,
+				}),
+			), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		return nil, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	client := NewWithEndpoint("http://backend.test")
+	client.httpClient = &http.Client{Transport: transport}
+	if _, err := client.Connect(ctx); err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+
+	events, err := client.SendMessage(ctx, "hello backend")
+	if err != nil {
+		t.Fatalf("send message: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events len = %d, want 2", len(events))
+	}
+	if events[0].Delta != "hello from live stream" || events[1].Type != "run.completed" {
+		t.Fatalf("events = %#v, want live delta then run.completed", events)
+	}
+}
+
+func TestClientErrorsWhenLiveSSEEndsBeforeExpectedEvent(t *testing.T) {
+	const (
+		sessionID      = "019f2f6f-f178-7a72-9f28-7f9aa0a1c853"
+		runID          = "019f2f6f-f179-7a72-9f28-7f9aa0a1c853"
+		messageID      = "019f2f6f-f17a-7a72-9f28-7f9aa0a1c853"
+		sessionEventID = "019f2f6f-f17b-7a72-9f28-7f9aa0a1c853"
+		deltaEventID   = "019f2f6f-f17c-7a72-9f28-7f9aa0a1c853"
+	)
+
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/rpc":
+			var request jsonRPCRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode JSON-RPC request: %v", err)
+			}
+			switch request.Method {
+			case "session.create":
+				return jsonResponse(t, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      request.ID,
+					"result":  map[string]any{"sessionId": sessionID},
+				}), nil
+			case "session.sendMessage":
+				return jsonResponse(t, map[string]any{
+					"jsonrpc": "2.0",
+					"id":      request.ID,
+					"result": map[string]any{
+						"sessionId": sessionID,
+						"runId":     runID,
+						"messageId": messageID,
+					},
+				}), nil
+			default:
+				t.Fatalf("unexpected JSON-RPC method %q", request.Method)
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/sessions/"+sessionID+"/events":
+			if r.Header.Get("Last-Event-ID") == "" {
+				return sseResponse(
+					sseEventText(sessionEventID, "session.created", map[string]any{
+						"event_id":   sessionEventID,
+						"session_id": sessionID,
+						"type":       "session.created",
+					}),
+				), nil
+			}
+			return sseResponse(
+				sseEventText(deltaEventID, "model.text_delta", map[string]any{
+					"event_id":   deltaEventID,
+					"session_id": sessionID,
+					"type":       "model.text_delta",
+					"run_id":     runID,
+					"message_id": messageID,
+					"delta":      "partial response",
+				}),
+			), nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		return nil, nil
+	})
+
+	client := NewWithEndpoint("http://backend.test")
+	client.httpClient = &http.Client{Transport: transport}
+	if _, err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+
+	_, err := client.SendMessage(context.Background(), "hello backend")
+	if !errors.Is(err, errSSEStreamEndedBeforeExpectedEvent) {
+		t.Fatalf("SendMessage error = %v, want early live SSE close", err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -232,6 +398,31 @@ func jsonResponse(t *testing.T, value any) *http.Response {
 
 func sseResponse(events ...string) *http.Response {
 	return response(http.StatusOK, "text/event-stream", strings.Join(events, ""))
+}
+
+func liveSSEResponse(events ...string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       &openEndedBody{reader: strings.NewReader(strings.Join(events, ""))},
+	}
+}
+
+var errLiveStreamStillOpen = errors.New("live SSE stream is still open")
+
+type openEndedBody struct {
+	reader *strings.Reader
+}
+
+func (body *openEndedBody) Read(p []byte) (int, error) {
+	if body.reader.Len() > 0 {
+		return body.reader.Read(p)
+	}
+	return 0, errLiveStreamStillOpen
+}
+
+func (body *openEndedBody) Close() error {
+	return nil
 }
 
 func sseEventText(id string, event string, data any) string {

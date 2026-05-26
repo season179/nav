@@ -40,9 +40,9 @@ byte-for-byte ID equality.
 ## Client identity
 
 `json-rpc/initialize-request.json` demonstrates the intended client identity and
-capability negotiation surface for future non-TUI frontends. The current server
-declares `initialize` as part of the stable protocol target, but it is not routed
-yet.
+capability negotiation surface for future non-TUI frontends. The server routes
+`initialize` and returns the currently supported methods, event types, and
+transport capabilities.
 
 ## Replay
 
