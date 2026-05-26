@@ -28,10 +28,13 @@ func (m Model) View() tea.View {
 
 	content = fitHeight(content, m.height)
 
-	// Overlay the model selector dialog if active.
-	if m.modelSelector != nil && m.modelSelector.Active() {
-		dialogView := m.modelSelector.View()
-		if dialogView != "" {
+	// Overlay dialogs when active.
+	if m.commands != nil && m.commands.Active() {
+		if dialogView := m.commands.View(); dialogView != "" {
+			content = overlayCenter(content, dialogView)
+		}
+	} else if m.modelSelector != nil && m.modelSelector.Active() {
+		if dialogView := m.modelSelector.View(); dialogView != "" {
 			content = overlayCenter(content, dialogView)
 		}
 	}
@@ -239,7 +242,7 @@ func (m Model) renderComposer() string {
 }
 
 func (m Model) renderStatus() string {
-	left := "enter send  ctrl+j newline  ctrl+m models  ctrl+c quit"
+	left := "/ commands  ctrl+j newline  ctrl+l models  ctrl+c quit"
 	right := "bubbletea"
 	if m.currentModel != "" {
 		right = m.currentModel

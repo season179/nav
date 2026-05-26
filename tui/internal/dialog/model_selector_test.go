@@ -100,12 +100,15 @@ func TestModelSelectorFilter(t *testing.T) {
 	ms.filter.SetValue("4o")
 	ms.applyFilter()
 
-	// Should show only gpt-4o (no headers during filtering).
-	if len(ms.items) != 1 {
-		t.Fatalf("filtered items = %d, want 1", len(ms.items))
+	// Should show the provider header and the matching model.
+	if len(ms.items) != 2 {
+		t.Fatalf("filtered items = %d, want 2", len(ms.items))
 	}
-	if ms.items[0].modelID != "gpt-4o" {
-		t.Fatalf("filtered item = %q, want gpt-4o", ms.items[0].modelID)
+	if ms.items[0].modelID != "" {
+		t.Fatal("first filtered item should be provider header")
+	}
+	if ms.items[1].modelID != "gpt-4o" {
+		t.Fatalf("filtered item = %q, want gpt-4o", ms.items[1].modelID)
 	}
 }
 
@@ -133,11 +136,11 @@ func TestModelSelectorFilterByProvider(t *testing.T) {
 	ms.filter.SetValue("anthropic")
 	ms.applyFilter()
 
-	if len(ms.items) != 1 {
-		t.Fatalf("filtered items = %d, want 1", len(ms.items))
+	if len(ms.items) != 2 {
+		t.Fatalf("filtered items = %d, want 2", len(ms.items))
 	}
-	if ms.items[0].provider != "anthropic" {
-		t.Fatalf("filtered provider = %q, want anthropic", ms.items[0].provider)
+	if ms.items[1].provider != "anthropic" {
+		t.Fatalf("filtered provider = %q, want anthropic", ms.items[1].provider)
 	}
 }
 
@@ -252,8 +255,63 @@ func TestModelSelectorView(t *testing.T) {
 	if !strings.Contains(view, "GPT-4") {
 		t.Error("view should contain model name")
 	}
-	if !strings.Contains(view, "enter select") {
+	if !strings.Contains(view, "enter confirm") {
 		t.Error("view should contain help text")
+	}
+}
+
+func TestModelSelectorFilterFuzzyMatch(t *testing.T) {
+	s := settings.ModelSettings{
+		Providers: map[string]settings.ProviderEntry{
+			"openai": {
+				Models: []settings.ModelEntry{
+					{ID: "gpt-4o", Name: "GPT-4o"},
+				},
+			},
+		},
+	}
+
+	ms, err := NewModelSelector(s, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// "gpto" should still match "gpt-4o" via fuzzy search.
+	ms.filter.SetValue("gpto")
+	ms.applyFilter()
+
+	if len(ms.items) != 2 {
+		t.Fatalf("filtered items = %d, want 2", len(ms.items))
+	}
+	if ms.items[1].modelID != "gpt-4o" {
+		t.Fatalf("filtered item = %q, want gpt-4o", ms.items[1].modelID)
+	}
+}
+
+func TestModelSelectorPreviousWrapsFromFirst(t *testing.T) {
+	s := settings.ModelSettings{
+		Providers: map[string]settings.ProviderEntry{
+			"openai": {
+				Models: []settings.ModelEntry{
+					{ID: "gpt-4", Name: "GPT-4"},
+					{ID: "gpt-4o", Name: "GPT-4o"},
+				},
+			},
+		},
+	}
+
+	ms, err := NewModelSelector(s, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !ms.list.IsSelectedFirst() {
+		t.Fatal("expected initial selection on first model")
+	}
+
+	ms.HandleMsg(tea.KeyPressMsg{Code: tea.KeyUp})
+	if ms.list.Selected() != 2 {
+		t.Fatalf("Selected() = %d, want 2 after wrap from first", ms.list.Selected())
 	}
 }
 

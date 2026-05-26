@@ -13,6 +13,7 @@ import (
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"github.com/sahilm/fuzzy"
 	"nav.local/tui/internal/list"
 	"nav.local/tui/internal/settings"
 )
@@ -53,12 +54,24 @@ const (
 	selectorMaxHeight = 20
 )
 
-// Key bindings for the model selector.
+// Key bindings for the model selector (aligned with Crush's models dialog).
 var (
-	selectorUp    = key.NewBinding(key.WithKeys("up", "ctrl+p"))
-	selectorDown  = key.NewBinding(key.WithKeys("down", "ctrl+n"))
-	selectorEnter = key.NewBinding(key.WithKeys("enter"))
-	selectorEsc   = key.NewBinding(key.WithKeys("esc"))
+	selectorPrevious = key.NewBinding(
+		key.WithKeys("up", "ctrl+p"),
+		key.WithHelp("↑", "previous item"),
+	)
+	selectorNext = key.NewBinding(
+		key.WithKeys("down", "ctrl+n"),
+		key.WithHelp("↓", "next item"),
+	)
+	selectorEnter = key.NewBinding(
+		key.WithKeys("enter"),
+		key.WithHelp("enter", "confirm"),
+	)
+	selectorEsc = key.NewBinding(
+		key.WithKeys("esc", "alt+esc"),
+		key.WithHelp("esc", "exit"),
+	)
 )
 
 // NewModelSelector creates a model selector dialog populated from
@@ -75,7 +88,7 @@ func NewModelSelector(s settings.ModelSettings, width, height int) (*ModelSelect
 	}
 
 	ti := textinput.New()
-	ti.Placeholder = "Filter models..."
+	ti.Placeholder = "Find a model"
 	ti.CharLimit = 60
 	ti.SetWidth(ms.width - 6)
 	ti.Focus()
@@ -162,12 +175,20 @@ func (ms *ModelSelector) HandleMsg(msg tea.Msg) (*SelectedModel, tea.Cmd) {
 				Provider: si.provider,
 				Model:    si.modelID,
 			}, nil
-		case key.Matches(msg, selectorUp):
-			ms.list.SelectPrev()
+		case key.Matches(msg, selectorPrevious):
+			if ms.list.IsSelectedFirst() {
+				ms.list.SelectLast()
+			} else {
+				ms.list.SelectPrev()
+			}
 			ms.list.ScrollToSelected()
 			return nil, nil
-		case key.Matches(msg, selectorDown):
-			ms.list.SelectNext()
+		case key.Matches(msg, selectorNext):
+			if ms.list.IsSelectedLast() {
+				ms.list.SelectFirst()
+			} else {
+				ms.list.SelectNext()
+			}
 			ms.list.ScrollToSelected()
 			return nil, nil
 		}
@@ -182,30 +203,72 @@ func (ms *ModelSelector) HandleMsg(msg tea.Msg) (*SelectedModel, tea.Cmd) {
 	return nil, cmd
 }
 
-// applyFilter rebuilds the visible item list from the current
-// filter text using substring matching (case-insensitive).
+// applyFilter rebuilds the visible item list from the current filter
+// text. Empty query shows all providers; otherwise Crush-style fuzzy
+// matching keeps provider section headers for matched groups.
 func (ms *ModelSelector) applyFilter() {
-	query := strings.ToLower(strings.TrimSpace(ms.filter.Value()))
-
+	query := normalizeFilterQuery(ms.filter.Value())
 	if query == "" {
 		ms.items = append([]selectorItem(nil), ms.allItems...)
 	} else {
-		var filtered []selectorItem
-		for _, item := range ms.allItems {
-			if item.modelID == "" {
-				continue // skip headers during filtering
-			}
-			label := strings.ToLower(item.name)
-			provider := strings.ToLower(item.provider)
-			if strings.Contains(label, query) || strings.Contains(provider, query) {
-				filtered = append(filtered, item)
-			}
-		}
-		ms.items = filtered
+		ms.items = ms.filterItemsFuzzy(query)
 	}
 
 	ms.list.SetItems(toListItems(ms.items)...)
-	ms.list.ScrollToSelected()
+	ms.list.SelectFirst()
+	ms.list.ScrollToTop()
+}
+
+func (ms *ModelSelector) filterItemsFuzzy(query string) []selectorItem {
+	groups := providerGroups(ms.allItems)
+	filtered := make([]selectorItem, 0, len(ms.allItems))
+
+	for _, g := range groups {
+		names := make([]string, len(g.models))
+		for i, item := range g.models {
+			names[i] = strings.ToLower(g.header.name) + " " +
+				strings.ToLower(item.provider) + " " +
+				strings.ToLower(item.name)
+		}
+
+		matches := fuzzy.Find(query, names)
+		if len(matches) == 0 {
+			continue
+		}
+
+		filtered = append(filtered, g.header)
+		for _, match := range matches {
+			filtered = append(filtered, g.models[match.Index])
+		}
+	}
+
+	return filtered
+}
+
+type providerGroup struct {
+	header selectorItem
+	models []selectorItem
+}
+
+func providerGroups(items []selectorItem) []providerGroup {
+	var groups []providerGroup
+	var current *providerGroup
+	for _, item := range items {
+		if item.modelID == "" {
+			if current != nil {
+				groups = append(groups, *current)
+			}
+			current = &providerGroup{header: item}
+			continue
+		}
+		if current != nil {
+			current.models = append(current.models, item)
+		}
+	}
+	if current != nil {
+		groups = append(groups, *current)
+	}
+	return groups
 }
 
 // View renders the dialog as a centered box with title, filter
@@ -273,7 +336,7 @@ func (ms *ModelSelector) View() string {
 	b.WriteString(strings.Repeat("─", w-2))
 	b.WriteString("┤\n")
 
-	help := "↑↓ navigate  enter select  esc cancel"
+	help := "↑/↓ choose  enter confirm  esc cancel"
 	if scrollIndicator != "" {
 		help = padRight(help, w-4-len(scrollIndicator)) + scrollIndicator
 	} else {
@@ -316,54 +379,4 @@ func toListItems(items []selectorItem) []list.Item {
 		out[i] = items[i]
 	}
 	return out
-}
-
-// padCenter centers text within the given width.
-func padCenter(s string, width int) string {
-	if len(s) >= width {
-		return s
-	}
-	left := (width - len(s)) / 2
-	right := width - len(s) - left
-	return strings.Repeat(" ", left) + s + strings.Repeat(" ", right)
-}
-
-// padRight right-pads text to the given width.
-func padRight(s string, width int) string {
-	visible := stripANSI(s)
-	if len(visible) >= width {
-		return s
-	}
-	return s + strings.Repeat(" ", width-len(visible))
-}
-
-// truncate shortens text to fit within width, adding "…" if needed.
-func truncate(s string, width int) string {
-	if len(s) <= width {
-		return s
-	}
-	if width <= 1 {
-		return s[:width]
-	}
-	return s[:width-1] + "…"
-}
-
-// stripANSI removes ANSI escape sequences for width calculation.
-func stripANSI(s string) string {
-	var b strings.Builder
-	inEscape := false
-	for _, r := range s {
-		if r == '\033' {
-			inEscape = true
-			continue
-		}
-		if inEscape {
-			if r == 'm' {
-				inEscape = false
-			}
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
 }

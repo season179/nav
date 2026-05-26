@@ -2,6 +2,9 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -225,6 +228,166 @@ func TestApplyAgentEventSurfacesUnknownEvents(t *testing.T) {
 	}
 }
 
+func TestSlashOpensCommandsWhenComposerEmpty(t *testing.T) {
+	model := New(&fakeAgent{})
+	model.width = 80
+	model.height = 24
+
+	updated, cmd := model.Update(tea.KeyPressMsg{Code: '/'})
+	result := updated.(Model)
+	if cmd != nil {
+		t.Fatal("openCommands should not return a command")
+	}
+	if result.commands == nil || !result.commands.Active() {
+		t.Fatal("expected commands dialog after /")
+	}
+}
+
+func TestCtrlPOpensCommands(t *testing.T) {
+	model := New(&fakeAgent{})
+	model.width = 80
+	model.height = 24
+	model.composer.SetValue("draft text")
+
+	updated, _ := model.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
+	result := updated.(Model)
+	if result.commands == nil || !result.commands.Active() {
+		t.Fatal("ctrl+p should open commands even when composer has text")
+	}
+}
+
+func TestCommandsQuitExits(t *testing.T) {
+	agent := &fakeAgent{}
+	model := New(agent)
+	model.width = 80
+	model.height = 24
+
+	updated, _ := model.Update(tea.KeyPressMsg{Code: '/'})
+	active := updated.(Model)
+
+	// Navigate to Quit (third item).
+	updated, _ = active.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	updated, _ = updated.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	updated, cmd := updated.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("quit command should schedule exit")
+	}
+
+	// First batch step closes the agent; second is tea.Quit.
+	msg := cmd()
+	if msg == nil {
+		t.Fatal("expected quit sequence message")
+	}
+	if followUp, ok := msg.(tea.Cmd); ok && followUp != nil {
+		if quit := followUp(); quit == nil {
+			t.Fatal("expected tea.Quit from command palette")
+		}
+	}
+}
+
+func TestModelsBindingOpensSelector(t *testing.T) {
+	path := writeModelSettingsFile(t, `{
+		"defaultModel": {"provider": "openai", "model": "gpt-4"},
+		"providers": {
+			"openai": {
+				"models": [
+					{"id": "gpt-4", "name": "GPT-4"},
+					{"id": "gpt-4o", "name": "GPT-4o"}
+				]
+			}
+		}
+	}`)
+	t.Setenv("NAV_MODEL_SETTINGS", path)
+
+	model := New(&fakeAgent{})
+	model.width = 80
+	model.height = 24
+
+	updated, cmd := model.Update(tea.KeyPressMsg{Code: 'l', Mod: tea.ModCtrl})
+	result := updated.(Model)
+	if cmd != nil {
+		t.Fatal("openModelSelector should not return a command")
+	}
+	if result.modelSelector == nil || !result.modelSelector.Active() {
+		t.Fatal("ctrl+l should open the model selector")
+	}
+}
+
+func TestModelsBindingCtrlMOpensSelector(t *testing.T) {
+	path := writeModelSettingsFile(t, `{
+		"providers": {
+			"openai": {"models": [{"id": "gpt-4"}]}
+		}
+	}`)
+	t.Setenv("NAV_MODEL_SETTINGS", path)
+
+	model := New(&fakeAgent{})
+	model.width = 80
+	model.height = 24
+
+	updated, _ := model.Update(tea.KeyPressMsg{Code: 'm', Mod: tea.ModCtrl})
+	result := updated.(Model)
+	if result.modelSelector == nil || !result.modelSelector.Active() {
+		t.Fatal("ctrl+m should open the model selector")
+	}
+}
+
+func TestSelectModelPersistsSettingsAndReloadsBackend(t *testing.T) {
+	path := writeModelSettingsFile(t, `{
+		"defaultModel": {"provider": "openai", "model": "gpt-4"},
+		"providers": {
+			"openai": {
+				"models": [
+					{"id": "gpt-4", "name": "GPT-4"},
+					{"id": "gpt-4o", "name": "GPT-4o"}
+				]
+			}
+		}
+	}`)
+	t.Setenv("NAV_MODEL_SETTINGS", path)
+
+	agent := &fakeAgent{}
+	model := New(agent)
+	model.width = 80
+	model.height = 24
+
+	updated, _ := model.Update(tea.KeyPressMsg{Code: 'l', Mod: tea.ModCtrl})
+	active := updated.(Model)
+	if active.modelSelector == nil {
+		t.Fatal("model selector not open")
+	}
+
+	updated, _ = active.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	updated, cmd := updated.(Model).Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("enter should schedule model selection")
+	}
+
+	result := runUntilIdle(t, updated, cmd)
+	if !agent.reloaded {
+		t.Fatal("expected backend settings reload after model selection")
+	}
+	if result.currentModel != "openai/gpt-4o" {
+		t.Fatalf("currentModel = %q, want openai/gpt-4o", result.currentModel)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var dm map[string]string
+	if err := json.Unmarshal(raw["defaultModel"], &dm); err != nil {
+		t.Fatal(err)
+	}
+	if dm["provider"] != "openai" || dm["model"] != "gpt-4o" {
+		t.Fatalf("defaultModel = %v, want openai/gpt-4o", dm)
+	}
+}
+
 func TestApplyAgentEventAcceptsReasoningDeltasWithoutActivityNoise(t *testing.T) {
 	model := New(&fakeAgent{})
 	activityCount := len(model.activity)
@@ -246,6 +409,7 @@ func TestApplyAgentEventAcceptsReasoningDeltasWithoutActivityNoise(t *testing.T)
 type fakeAgent struct {
 	sentText     string
 	streamCtx    context.Context
+	reloaded     bool
 	events       []client.Event
 	streamEvents <-chan client.Event
 	streamErrs   <-chan error
@@ -278,7 +442,17 @@ func (a *fakeAgent) Close() error {
 }
 
 func (a *fakeAgent) ReloadSettings(context.Context) error {
+	a.reloaded = true
 	return nil
+}
+
+func writeModelSettingsFile(t *testing.T, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func runUntilIdle(t *testing.T, model tea.Model, cmd tea.Cmd) Model {

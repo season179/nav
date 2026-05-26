@@ -46,7 +46,8 @@ type Model struct {
 	messages     []transcriptItem
 	activity     []activityItem
 
-	// Model selector dialog state.
+	// Overlay dialogs.
+	commands      *dialog.Commands
 	modelSelector *dialog.ModelSelector
 	currentModel  string // "provider/model" or empty
 }
@@ -128,27 +129,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.resizeComposer()
 
-	case tea.KeyMsg:
-		// When the model selector is active, route all key events to it.
-		if m.modelSelector != nil && m.modelSelector.Active() {
-			sel, cmd := m.modelSelector.HandleMsg(msg)
-			if cmd != nil {
-				cmds = append(cmds, cmd)
-			}
-			if sel != nil {
-				return m.selectModel(sel.Provider, sel.Model)
-			}
-			if !m.modelSelector.Active() {
-				// Dialog closed (esc or selection); refocus composer.
-				cmds = append(cmds, m.composer.Focus())
-			}
-			return m, tea.Batch(cmds...)
+	case tea.KeyPressMsg:
+		if handled, next, cmd := m.handleDialogKey(msg); handled {
+			return next, cmd
 		}
 
 		switch {
 		case key.Matches(msg, quitBinding):
 			m.cancelActiveStream()
 			return m, tea.Sequence(closeAgent(m.agent), tea.Quit)
+		case key.Matches(msg, slashCommandsBinding) && strings.TrimSpace(m.composer.Value()) == "":
+			return m.openCommands()
+		case key.Matches(msg, ctrlPCommandsBinding):
+			return m.openCommands()
 		case key.Matches(msg, modelsBinding):
 			return m.openModelSelector()
 		case key.Matches(msg, newlineBinding):
@@ -210,6 +203,63 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 	}
 	return m, tea.Batch(cmds...)
+}
+
+func (m Model) handleDialogKey(msg tea.KeyPressMsg) (handled bool, next tea.Model, cmd tea.Cmd) {
+	if m.commands != nil && m.commands.Active() {
+		sel, c := m.commands.HandleMsg(msg)
+		var cmds []tea.Cmd
+		if c != nil {
+			cmds = append(cmds, c)
+		}
+		if sel != nil {
+			next, c := m.executeCommand(sel)
+			return true, next, c
+		}
+		if !m.commands.Active() {
+			cmds = append(cmds, m.composer.Focus())
+		}
+		return true, m, tea.Batch(cmds...)
+	}
+
+	if m.modelSelector != nil && m.modelSelector.Active() {
+		sel, c := m.modelSelector.HandleMsg(msg)
+		var cmds []tea.Cmd
+		if c != nil {
+			cmds = append(cmds, c)
+		}
+		if sel != nil {
+			next, c := m.selectModel(sel.Provider, sel.Model)
+			return true, next, c
+		}
+		if !m.modelSelector.Active() {
+			cmds = append(cmds, m.composer.Focus())
+		}
+		return true, m, tea.Batch(cmds...)
+	}
+
+	return false, m, nil
+}
+
+func (m Model) openCommands() (tea.Model, tea.Cmd) {
+	m.commands = dialog.NewCommands(m.width, m.height)
+	return m, nil
+}
+
+func (m Model) executeCommand(sel *dialog.SelectedCommand) (tea.Model, tea.Cmd) {
+	switch sel.Action {
+	case dialog.CommandQuit:
+		m.cancelActiveStream()
+		return m, tea.Sequence(closeAgent(m.agent), tea.Quit)
+	case dialog.CommandOpenModels:
+		return m.openModelSelector()
+	case dialog.CommandClearTranscript:
+		m.messages = nil
+		m.prependActivity(activityItem{Icon: "✓", Title: "transcript", Body: "cleared"})
+		return m, m.composer.Focus()
+	default:
+		return m, m.composer.Focus()
+	}
 }
 
 func (m Model) openModelSelector() (tea.Model, tea.Cmd) {
