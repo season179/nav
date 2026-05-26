@@ -1,7 +1,17 @@
 # nav TUI (Ink)
 
 React-for-the-terminal UI for nav. The backend protocol client is
-`src/backend-client.ts` (JSON-RPC + SSE).
+`src/backend/client.ts` (JSON-RPC + SSE).
+
+## Layout
+
+Two **regions** plus an **overlay**:
+
+- **History region** (`src/regions/history/`) — scrollable messages
+- **Composer region** (`src/regions/composer/`) — fixed-height input at the bottom
+- **Model overlay** (`src/overlays/model/`) — replaces the history slot for `/model`
+
+Shell wiring lives in `src/app/App.tsx`. Slash commands: `src/commands/slash.ts`.
 
 ## Run
 
@@ -19,9 +29,9 @@ Iterate on layout and styling without `navd update`, `nav-backend`, or an LLM:
 ```sh
 cd tui
 bun run preview              # full shell with mock messages
-bun run preview history      # history pane only
-bun run preview composer     # composer only
-bun run preview model        # /model picker only
+bun run preview history      # history region only
+bun run preview composer     # composer region only
+bun run preview model        # /model overlay only
 ```
 
 In the default `shell` preview: `m` opens the model picker, `e` clears history,

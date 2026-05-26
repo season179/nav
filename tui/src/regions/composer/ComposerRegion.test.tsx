@@ -1,21 +1,21 @@
 import {describe, expect, test} from 'bun:test';
 import React from 'react';
 import {render} from 'ink-testing-library';
-import {COMPOSER_HEIGHT, Composer} from './Composer.js';
+import {COMPOSER_HEIGHT, ComposerRegion} from './ComposerRegion.js';
 import {
 	COMPOSER_ROW_COUNT,
 	assertComposerLayout,
 	horizontalRule,
-} from './composer-layout.js';
+} from './layout.js';
 
 const WIDTH = 40;
 const HINT = 'Enter send · /model · /exit';
 
 function renderComposer(
-	overrides: Partial<React.ComponentProps<typeof Composer>> = {},
+	overrides: Partial<React.ComponentProps<typeof ComposerRegion>> = {},
 ) {
 	return render(
-		<Composer
+		<ComposerRegion
 			value=""
 			busy={false}
 			hint={HINT}
@@ -28,7 +28,7 @@ function renderComposer(
 	);
 }
 
-describe('Composer layout invariants', () => {
+describe('ComposerRegion layout invariants', () => {
 	test('reserves four terminal rows', () => {
 		expect(COMPOSER_HEIGHT).toBe(COMPOSER_ROW_COUNT);
 	});
@@ -70,7 +70,7 @@ describe('Composer layout invariants', () => {
 	});
 });
 
-describe('Composer golden frames', () => {
+describe('ComposerRegion golden frames', () => {
 	test('with text (stable plain-text frame)', () => {
 		const {lastFrame} = renderComposer({
 			value: 'hello',
@@ -88,7 +88,7 @@ describe('Composer golden frames', () => {
 	});
 });
 
-describe('Composer regression guards', () => {
+describe('ComposerRegion regression guards', () => {
 	test('does not use round prompt border (Claude uses horizontal rules)', () => {
 		const {lastFrame} = renderComposer({value: 'x', focused: false});
 		const frame = lastFrame() ?? '';

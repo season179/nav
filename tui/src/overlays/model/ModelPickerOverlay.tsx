@@ -1,8 +1,8 @@
 import React, {useMemo, useState} from 'react';
 import {Box, Text, useInput} from 'ink';
-import type {ModelOption, ModelRef} from './settings.js';
-import {formatModelLabel} from './settings.js';
-import {theme} from './theme.js';
+import type {ModelOption, ModelRef} from './load-models.js';
+import {formatModelLabel} from './load-models.js';
+import {theme} from '../../theme/index.js';
 
 type Props = {
 	options: ModelOption[];
@@ -11,7 +11,12 @@ type Props = {
 	onCancel: () => void;
 };
 
-export function ModelPicker({options, current, onSelect, onCancel}: Props) {
+export function ModelPickerOverlay({
+	options,
+	current,
+	onSelect,
+	onCancel,
+}: Props) {
 	const currentKey = current
 		? `${current.provider}\0${current.model}`
 		: null;

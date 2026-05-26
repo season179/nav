@@ -1,7 +1,7 @@
 import React from 'react';
 import {Box, Text} from 'ink';
 import TextInput from 'ink-text-input';
-import {theme} from './theme.js';
+import {theme} from '../../theme/index.js';
 
 /** Terminal rows: top rule + input + bottom rule + hint. */
 export const COMPOSER_HEIGHT = 4;
@@ -24,7 +24,7 @@ function HorizontalRule({width}: {width: number}) {
 	);
 }
 
-export function Composer({
+export function ComposerRegion({
 	value,
 	busy,
 	hint,

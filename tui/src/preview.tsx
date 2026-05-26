@@ -11,13 +11,16 @@
  */
 import React, {useState} from 'react';
 import {Box, render, Text, useApp, useInput} from 'ink';
-import {COMPOSER_HEIGHT, Composer} from './Composer.js';
-import {HistoryPane} from './HistoryPane.js';
-import {ModelPicker} from './ModelPicker.js';
-import type {ModelOption, ModelRef} from './settings.js';
-import type {HistoryMessage} from './types.js';
-import {theme} from './theme.js';
-import {useTerminalSize} from './use-terminal-size.js';
+import {
+	COMPOSER_HEIGHT,
+	ComposerRegion,
+} from './regions/composer/ComposerRegion.js';
+import {HistoryRegion} from './regions/history/HistoryRegion.js';
+import {ModelPickerOverlay} from './overlays/model/ModelPickerOverlay.js';
+import type {ModelOption, ModelRef} from './overlays/model/load-models.js';
+import type {HistoryMessage} from './regions/history/types.js';
+import {theme} from './theme/index.js';
+import {useTerminalSize} from './app/use-terminal-size.js';
 
 const IDLE_HINT = 'Enter send · /model · /exit · Esc clear · Ctrl+C quit';
 
@@ -51,7 +54,7 @@ function PreviewFrame({children}: {children: React.ReactNode}) {
 function HistoryPreview() {
 	return (
 		<PreviewFrame>
-			<HistoryPane messages={CHAT_MESSAGES} />
+			<HistoryRegion messages={CHAT_MESSAGES} />
 		</PreviewFrame>
 	);
 }
@@ -62,7 +65,7 @@ function ComposerPreview() {
 	return (
 		<PreviewFrame>
 			<Box flexGrow={1} />
-			<Composer
+			<ComposerRegion
 				value={value}
 				busy={false}
 				hint={IDLE_HINT}
@@ -78,7 +81,7 @@ function ComposerPreview() {
 function ModelPreview() {
 	return (
 		<PreviewFrame>
-			<ModelPicker
+			<ModelPickerOverlay
 				options={SAMPLE_MODELS}
 				current={{provider: 'openai', model: 'gpt-4.1'}}
 				onSelect={() => process.exit(0)}
@@ -131,7 +134,7 @@ function ShellPreview() {
 				flexShrink={0}
 			>
 				{modelOpen ? (
-					<ModelPicker
+					<ModelPickerOverlay
 						options={SAMPLE_MODELS}
 						current={{provider: 'openai', model: 'gpt-4.1'}}
 						onSelect={(ref: ModelRef) => {
@@ -148,10 +151,10 @@ function ShellPreview() {
 						onCancel={() => setModelOpen(false)}
 					/>
 				) : (
-					<HistoryPane messages={messages} />
+					<HistoryRegion messages={messages} />
 				)}
 			</Box>
-			<Composer
+			<ComposerRegion
 				value={input}
 				busy={false}
 				hint={modelOpen ? 'Model picker — Esc cancel' : IDLE_HINT}

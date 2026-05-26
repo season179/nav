@@ -1,13 +1,13 @@
 import React from 'react';
 import {Box, Text} from 'ink';
 import type {HistoryMessage} from './types.js';
-import {theme} from './theme.js';
+import {theme} from '../../theme/index.js';
 
 type Props = {
 	messages: HistoryMessage[];
 };
 
-export function HistoryPane({messages}: Props) {
+export function HistoryRegion({messages}: Props) {
 	return (
 		<Box flexDirection="column" flexGrow={1} paddingX={2} paddingY={0}>
 			{messages.length === 0 ? (

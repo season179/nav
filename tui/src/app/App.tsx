@@ -1,15 +1,18 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {Box, useApp, useInput} from 'ink';
 import {useTerminalSize} from './use-terminal-size.js';
-import {COMPOSER_HEIGHT, Composer} from './Composer.js';
-import {HistoryPane} from './HistoryPane.js';
-import {ModelPicker} from './ModelPicker.js';
+import {
+	COMPOSER_HEIGHT,
+	ComposerRegion,
+} from '../regions/composer/ComposerRegion.js';
+import {HistoryRegion} from '../regions/history/HistoryRegion.js';
+import {ModelPickerOverlay} from '../overlays/model/ModelPickerOverlay.js';
 import {
 	NavBackendClient,
 	eventText,
 	type NavEvent,
-} from './backend-client.js';
-import {parseSlashCommand} from './slash-commands.js';
+} from '../backend/client.js';
+import {parseSlashCommand} from '../commands/slash.js';
 import {
 	applyModelEnv,
 	formatModelLabel,
@@ -17,8 +20,8 @@ import {
 	resolveCurrentModelRef,
 	type ModelOption,
 	type ModelRef,
-} from './settings.js';
-import type {HistoryMessage} from './types.js';
+} from '../overlays/model/load-models.js';
+import type {HistoryMessage} from '../regions/history/types.js';
 
 type Props = {
 	backendPath?: string;
@@ -72,7 +75,7 @@ export function App({backendPath = ''}: Props) {
 				flexShrink={0}
 			>
 				{modelPickerOpen ? (
-					<ModelPicker
+					<ModelPickerOverlay
 						options={modelOptions}
 						current={currentModel}
 						onSelect={ref => {
@@ -84,10 +87,10 @@ export function App({backendPath = ''}: Props) {
 						}}
 					/>
 				) : (
-					<HistoryPane messages={messages} />
+					<HistoryRegion messages={messages} />
 				)}
 			</Box>
-			<Composer
+			<ComposerRegion
 				value={input}
 				busy={busy}
 				hint={hint}
