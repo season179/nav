@@ -1,3 +1,5 @@
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use nav_harness::models::{
@@ -20,6 +22,7 @@ use support::{
 };
 
 const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+const RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
 fn session_create_accepts_omitted_params() {
@@ -267,6 +270,73 @@ fn session_send_message_posts_provider_stream_and_publishes_provider_events() {
         server.run_status(&RunId::try_new(run_id).unwrap()),
         Some(RunStatus::Completed)
     );
+}
+
+#[test]
+fn session_send_message_returns_before_provider_stream_finishes() {
+    let provider = HangingProviderServer::start();
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = SessionId::try_new(create_session(&mut server)).unwrap();
+    let subscription = server
+        .subscribe_session_events(&session_id, None)
+        .expect("session event subscription should open");
+
+    assert_eq!(
+        envelope_event_names(subscription.replay()),
+        vec!["session.created"]
+    );
+
+    let session_id_for_send = session_id.clone();
+    let (send_tx, send_rx) = mpsc::channel();
+    let send_handle = thread::spawn(move || {
+        let send = send_message_ids(&mut server, session_id_for_send.as_str(), request_id(8));
+        let _ = send_tx.send((server, send));
+    });
+    let (mut server, send) = match send_rx.recv_timeout(RPC_RESPONSE_TIMEOUT) {
+        Ok(result) => result,
+        Err(error) => {
+            provider.stop();
+            panic!("session.sendMessage should return before provider stream finishes: {error}");
+        }
+    };
+    send_handle
+        .join()
+        .expect("session.sendMessage thread should finish");
+
+    let request = provider.wait_for_request();
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_uuid_v7(&send.run_id);
+    assert_uuid_v7(&send.message_id);
+    assert_eq!(
+        server.run_status(&RunId::try_new(&send.run_id).unwrap()),
+        Some(RunStatus::Running)
+    );
+
+    let live_events = receive_live_events(&subscription, 1);
+    assert_eq!(envelope_event_names(&live_events), vec!["run.started"]);
+    assert_eq!(live_events[0].session_id, session_id);
+
+    let cancel_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(9),
+            "method": "run.cancel",
+            "params": { "runId": send.run_id.as_str() }
+        })
+        .to_string(),
+    ));
+    let cancel_body: Value = serde_json::from_str(cancel_response.body()).unwrap();
+    assert_eq!(cancel_body["result"]["runId"], send.run_id);
+    wait_for_run_status(&server, &send.run_id, RunStatus::Cancelled);
+    provider.stop();
+
+    let cancel_events = receive_live_events(&subscription, 1);
+    assert_eq!(envelope_event_names(&cancel_events), vec!["run.cancelled"]);
+    assert_eq!(cancel_events[0].session_id, session_id);
 }
 
 #[test]
@@ -715,19 +785,39 @@ fn create_session(server: &mut HttpServer) -> String {
         .to_string()
 }
 
+#[derive(Debug)]
+struct SendMessageIds {
+    run_id: String,
+    message_id: String,
+}
+
 fn send_message(server: &mut HttpServer, session_id: &str) -> String {
+    send_message_ids(server, session_id, request_id(98)).run_id
+}
+
+fn send_message_ids(
+    server: &mut HttpServer,
+    session_id: &str,
+    rpc_request_id: String,
+) -> SendMessageIds {
     let send_response = server.handle_request(HttpRequest::post(
         "/rpc",
         json!({
             "jsonrpc": "2.0",
-            "id": request_id(98),
+            "id": rpc_request_id,
             "method": "session.sendMessage",
             "params": { "sessionId": session_id, "text": "hello" }
         })
         .to_string(),
     ));
     let send_body: Value = serde_json::from_str(send_response.body()).unwrap();
-    send_body["result"]["runId"].as_str().unwrap().to_string()
+    SendMessageIds {
+        run_id: send_body["result"]["runId"].as_str().unwrap().to_string(),
+        message_id: send_body["result"]["messageId"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    }
 }
 
 fn model_settings() -> ModelSettings {
