@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
+use nav_harness::sessions::{SessionStore, Turn};
 use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
@@ -31,7 +32,7 @@ pub mod sse;
 use event_store::ProtocolEventStore;
 pub use event_store::ProtocolEventSubscription;
 use ids::ProtocolIdSource;
-use model_run::{ModelRunRequest, ModelRunService};
+use model_run::{ModelRunRequest, ModelRunService, ModelRunState};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -57,6 +58,7 @@ pub struct HttpServer {
     ids: Arc<Mutex<ProtocolIdSource>>,
     sessions: HashMap<SessionId, SessionMetadata>,
     runs: Arc<Mutex<HashMap<RunId, RunState>>>,
+    session_store: Arc<Mutex<SessionStore>>,
     event_store: Arc<Mutex<ProtocolEventStore>>,
     model_run_service: ModelRunService,
 }
@@ -73,6 +75,7 @@ impl HttpServer {
             ids: Arc::new(Mutex::new(ProtocolIdSource::default())),
             sessions: HashMap::new(),
             runs: Arc::new(Mutex::new(HashMap::new())),
+            session_store: Arc::new(Mutex::new(SessionStore::default())),
             event_store: Arc::new(Mutex::new(ProtocolEventStore::default())),
             model_run_service: ModelRunService::default(),
         }
@@ -263,6 +266,10 @@ impl HttpServer {
                 settings_json: params.settings_json,
             },
         );
+        self.session_store
+            .lock()
+            .unwrap()
+            .create_session(session_id.clone());
         self.append_event(event);
 
         rpc_result(request.id, SessionCreateResult { session_id })
@@ -285,6 +292,11 @@ impl HttpServer {
             return rpc_error(request.id, -32004, "session not found");
         }
 
+        let turns = {
+            let mut session_store = self.session_store.lock().unwrap();
+            session_store.append_turn(&params.session_id, Turn::user_text(params.text.clone()));
+            session_store.turns(&params.session_id)
+        };
         let run_id = self.next_run_id();
         let message_id = self.next_message_id();
         let cancellation_token = OpenAiCompletionsCancellationToken::new();
@@ -307,7 +319,7 @@ impl HttpServer {
             params.session_id.clone(),
             run_id.clone(),
             message_id.clone(),
-            params.text.clone(),
+            turns,
             cancellation_token,
         );
 
@@ -381,7 +393,7 @@ impl HttpServer {
         session_id: SessionId,
         run_id: RunId,
         message_id: nav_types::MessageId,
-        text: String,
+        turns: Vec<Turn>,
         cancellation_token: OpenAiCompletionsCancellationToken,
     ) {
         let model_run_service = self.model_run_service.clone();
@@ -389,19 +401,18 @@ impl HttpServer {
         let ids = Arc::clone(&self.ids);
         let event_store = Arc::clone(&self.event_store);
         let runs = Arc::clone(&self.runs);
+        let session_store = Arc::clone(&self.session_store);
 
         thread::spawn(move || {
             let final_status = model_run_service.run_to_completion(
                 &model_resolver,
-                ids,
-                event_store,
-                Arc::clone(&runs),
+                ModelRunState::new(ids, event_store, Arc::clone(&runs), session_store),
                 cancellation_token,
                 ModelRunRequest {
                     session_id: &session_id,
                     run_id: &run_id,
                     message_id: &message_id,
-                    text: &text,
+                    turns: &turns,
                 },
             );
 

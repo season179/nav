@@ -17,8 +17,9 @@ use serde_json::{Value, json};
 mod support;
 
 use support::{
-    FakeProviderServer, HangingProviderServer, delayed_chat_completions_provider,
-    provider_sse_chunk, successful_provider_with_text, unused_local_base_url, wait_for_run_status,
+    FakeProviderServer, HangingProviderServer, SequencedProviderServer,
+    delayed_chat_completions_provider, provider_sse_chunk, successful_provider_chunks,
+    successful_provider_with_text, unused_local_base_url, wait_for_run_status,
 };
 
 const LIVE_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -269,6 +270,80 @@ fn session_send_message_posts_provider_stream_and_publishes_provider_events() {
     assert_eq!(
         server.run_status(&RunId::try_new(run_id).unwrap()),
         Some(RunStatus::Completed)
+    );
+}
+
+#[test]
+fn session_send_message_replays_previous_user_and_assistant_turns_to_provider() {
+    let provider = SequencedProviderServer::start(vec![
+        successful_provider_chunks("assistant remembered one"),
+        successful_provider_chunks("assistant remembered two"),
+    ]);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session(&mut server);
+
+    let first_run_id = send_message_text(&mut server, &session_id, "first user turn");
+    wait_for_run_status(&server, &first_run_id, RunStatus::Completed);
+    let second_run_id = send_message_text(&mut server, &session_id, "second user turn");
+    wait_for_run_status(&server, &second_run_id, RunStatus::Completed);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"],
+        json!([
+            { "role": "user", "content": "first user turn" },
+            { "role": "assistant", "content": "assistant remembered one" },
+            { "role": "user", "content": "second user turn" },
+        ])
+    );
+}
+
+#[test]
+fn session_send_message_keeps_interleaved_session_turns_isolated() {
+    let provider = SequencedProviderServer::start(vec![
+        successful_provider_chunks("assistant reply for session one"),
+        successful_provider_chunks("assistant reply for session two"),
+        successful_provider_chunks("second reply for session one"),
+    ]);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_one = create_session(&mut server);
+    let session_two = create_session(&mut server);
+
+    let first_one = send_message_text(&mut server, &session_one, "session one first user turn");
+    wait_for_run_status(&server, &first_one, RunStatus::Completed);
+    let first_two = send_message_text(&mut server, &session_two, "session two first user turn");
+    wait_for_run_status(&server, &first_two, RunStatus::Completed);
+    let second_one = send_message_text(&mut server, &session_one, "session one second user turn");
+    wait_for_run_status(&server, &second_one, RunStatus::Completed);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].body["messages"],
+        json!([
+            { "role": "user", "content": "session one first user turn" },
+            { "role": "assistant", "content": "assistant reply for session one" },
+            { "role": "user", "content": "session one second user turn" },
+        ])
+    );
+    assert!(
+        !requests[2]
+            .body
+            .to_string()
+            .contains("session two first user turn")
+    );
+    assert!(
+        !requests[2]
+            .body
+            .to_string()
+            .contains("assistant reply for session two")
     );
 }
 
@@ -869,7 +944,11 @@ struct SendMessageIds {
 }
 
 fn send_message(server: &mut HttpServer, session_id: &str) -> String {
-    send_message_ids(server, session_id, request_id(98)).run_id
+    send_message_text(server, session_id, "hello")
+}
+
+fn send_message_text(server: &mut HttpServer, session_id: &str, text: &str) -> String {
+    send_message_ids_with_text(server, session_id, request_id(98), text).run_id
 }
 
 fn send_message_ids(
@@ -877,13 +956,22 @@ fn send_message_ids(
     session_id: &str,
     rpc_request_id: String,
 ) -> SendMessageIds {
+    send_message_ids_with_text(server, session_id, rpc_request_id, "hello")
+}
+
+fn send_message_ids_with_text(
+    server: &mut HttpServer,
+    session_id: &str,
+    rpc_request_id: String,
+    text: &str,
+) -> SendMessageIds {
     let send_response = server.handle_request(HttpRequest::post(
         "/rpc",
         json!({
             "jsonrpc": "2.0",
             "id": rpc_request_id,
             "method": "session.sendMessage",
-            "params": { "sessionId": session_id, "text": "hello" }
+            "params": { "sessionId": session_id, "text": text }
         })
         .to_string(),
     ));

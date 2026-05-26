@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
+use crate::sessions::{Turn, TurnRole};
+
 use super::{
     ApiKind, MaxTokensField, ProviderRoutingCompat, ResolveModelError, ResolvedModelConfig,
     ThinkingFormat,
@@ -44,12 +46,22 @@ impl OpenAiCompletionsRequest {
     pub fn from_user(content: impl Into<String>) -> Self {
         Self::new(vec![ChatCompletionRequestMessage::user(content)])
     }
+
+    pub fn from_turns(turns: &[Turn]) -> Self {
+        Self::new(
+            turns
+                .iter()
+                .map(ChatCompletionRequestMessage::from_turn)
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatCompletionMessageRole {
     System,
     User,
+    Assistant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +82,20 @@ impl ChatCompletionRequestMessage {
         Self {
             role: ChatCompletionMessageRole::User,
             content: content.into(),
+        }
+    }
+
+    fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatCompletionMessageRole::Assistant,
+            content: content.into(),
+        }
+    }
+
+    fn from_turn(turn: &Turn) -> Self {
+        match turn.role {
+            TurnRole::User => Self::user(turn.text_content()),
+            TurnRole::Assistant => Self::assistant(turn.text_content()),
         }
     }
 }
@@ -852,6 +878,7 @@ fn message_value(model: &ResolvedModelConfig, message: &ChatCompletionRequestMes
             }
         }
         ChatCompletionMessageRole::User => "user",
+        ChatCompletionMessageRole::Assistant => "assistant",
     };
 
     json!({
