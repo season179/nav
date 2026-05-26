@@ -9,3 +9,10 @@ pub const KNOWN_METHODS: &[&str] = &[
     methods::TOOL_REJECT,
     methods::SESSION_CLOSE,
 ];
+
+pub const ROUTED_METHODS: &[&str] = &[
+    methods::INITIALIZE,
+    methods::SESSION_CREATE,
+    methods::SESSION_SEND_MESSAGE,
+    methods::RUN_CANCEL,
+];

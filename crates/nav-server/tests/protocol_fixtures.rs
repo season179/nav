@@ -5,8 +5,8 @@ use nav_harness::models::{
     ProviderConfig,
 };
 use nav_protocol::{EventEnvelope, JsonRpcRequest, JsonRpcResponse};
-use nav_server::http::{sse, HttpRequest, HttpServer, HttpServerConfig};
-use serde_json::{json, Value};
+use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig, sse};
+use serde_json::{Value, json};
 
 const REQUEST_FIXTURES: &[(&str, &str)] = &[
     ("json-rpc/initialize-request.json", "initialize"),
@@ -100,6 +100,20 @@ fn sse_fixtures_match_server_encoder() {
             "{fixture}"
         );
     }
+}
+
+#[test]
+fn initialize_fixture_matches_server_contract() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+    let request_body = fixture_text("json-rpc/initialize-request.json");
+    let expected = fixture_json("json-rpc/initialize-response.json");
+
+    let response = server.handle_request(HttpRequest::post("/rpc", request_body));
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.content_type(), "application/json");
+    let actual: Value = serde_json::from_str(response.body()).unwrap();
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -216,10 +230,12 @@ fn run_failed_fixture_matches_server_contract() {
     assert_protocol_event_ids(&events, &session_id);
     assert_eq!(events[1].data["run_id"].as_str(), Some(run_id));
     assert_eq!(events[2].data["run_id"].as_str(), Some(run_id));
-    assert!(events[2].data["message"]
-        .as_str()
-        .unwrap()
-        .contains("MissingApiKey"));
+    assert!(
+        events[2].data["message"]
+            .as_str()
+            .unwrap()
+            .contains("MissingApiKey")
+    );
 }
 
 #[derive(Debug)]

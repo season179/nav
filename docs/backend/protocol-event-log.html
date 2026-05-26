@@ -22,11 +22,11 @@
       <div class="detail-body narrow">
         <div>
           <p><em>Implemented in memory.</em> <code>crates/nav-server/src/http/event_store.rs</code> stores frontend-facing <code>EventEnvelope</code> projections for replay and fans out appended events to live subscribers.</p>
-          <p>The log is scoped to protocol delivery. It powers <code>GET /sessions/{sessionId}/events</code>, <code>Last-Event-ID</code> replay, and future long-lived SSE streams.</p>
+          <p>The log is scoped to protocol delivery. It powers <code>GET /sessions/{sessionId}/events</code>, <code>Last-Event-ID</code> replay, and long-lived SSE streams.</p>
           <p>It is not the canonical transcript ledger. It does not own turns, parts, compaction, forks, provider continuation state, cost totals, or durable recovery.</p>
           <p>Session metadata such as <code>source</code> and <code>settingsJson</code> is retained on the session record, not copied into every protocol event.</p>
           <p>The future canonical store remains the SQLite <code>SessionStore</code> planned in <code>plans/session-storage.md</code>: sessions contain runs, runs produce ordered turns, and turns are made of <code>turn_parts</code>.</p>
-          <p class="note">Current HTTP still returns a finite replay response. The event log now has the live subscriber primitive needed to turn that into a long-lived stream without making the TUI the owner of event semantics.</p>
+          <p class="note">Current HTTP replays retained events first, then keeps the connection open for live fan-out without making the TUI the owner of event semantics.</p>
         </div>
       </div>
     </div>

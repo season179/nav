@@ -5,11 +5,11 @@ use std::collections::HashMap;
 use nav_harness::models::{ModelResolver, ModelSettings};
 use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, RunCancelParams,
-    RunCancelResult, SessionCreateParams, SessionCreateResult, SessionSendMessageParams,
-    SessionSendMessageResult, methods,
+    InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
+    JsonRpcVersion, ProtocolCapabilities, RunCancelParams, RunCancelResult, SessionCreateParams,
+    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, methods,
 };
-use nav_protocol::{BackendEvent, EventEnvelope};
+use nav_protocol::{BACKEND_EVENT_TYPES, BackendEvent, EventEnvelope};
 use nav_types::{EventId, RunId, SessionId};
 use serde::Serialize;
 use serde_json::Value;
@@ -26,6 +26,8 @@ use event_mapping::{harness_events_to_backend_events, stream_minimal_model_outpu
 use event_store::ProtocolEventStore;
 pub use event_store::ProtocolEventSubscription;
 use ids::ProtocolIdSource;
+
+pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpServerConfig {
@@ -106,17 +108,7 @@ impl HttpServer {
         session_id: &str,
         last_event_id: Option<&str>,
     ) -> Result<HttpResponse, HttpError> {
-        let session_id = SessionId::try_new(session_id).map_err(|error| HttpError {
-            status: 400,
-            message: error.to_string(),
-        })?;
-        let last_event_id = last_event_id
-            .map(EventId::try_new)
-            .transpose()
-            .map_err(|error| HttpError {
-                status: 400,
-                message: error.to_string(),
-            })?;
+        let (session_id, last_event_id) = parse_session_event_cursor(session_id, last_event_id)?;
         let events = self
             .event_store
             .replay_after(&session_id, last_event_id.as_ref())
@@ -143,6 +135,16 @@ impl HttpServer {
             .map_err(replay_error_to_http)
     }
 
+    pub fn subscribe_session_events_http(
+        &mut self,
+        session_id: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<ProtocolEventSubscription, HttpError> {
+        let (session_id, last_event_id) = parse_session_event_cursor(session_id, last_event_id)?;
+
+        self.subscribe_session_events(&session_id, last_event_id.as_ref())
+    }
+
     pub fn run_status(&self, run_id: &RunId) -> Option<RunStatus> {
         self.runs.get(run_id).map(|run| run.status)
     }
@@ -153,6 +155,7 @@ impl HttpServer {
 
     fn handle_rpc_request(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
         match request.method.as_str() {
+            methods::INITIALIZE => self.handle_initialize(request),
             methods::SESSION_CREATE => self.handle_session_create(request),
             methods::SESSION_SEND_MESSAGE => self.handle_session_send_message(request),
             methods::RUN_CANCEL => self.handle_run_cancel(request),
@@ -162,6 +165,40 @@ impl HttpServer {
                 format!("unknown JSON-RPC method: {method}"),
             ),
         }
+    }
+
+    fn handle_initialize(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
+        let params = match parse_params::<InitializeParams>(request.params) {
+            Ok(params) => params,
+            Err(error) => return rpc_error(request.id, -32602, error),
+        };
+
+        let requested_version = params.protocol_version.unwrap_or(PROTOCOL_VERSION);
+        if requested_version != PROTOCOL_VERSION {
+            return rpc_error(
+                request.id,
+                -32010,
+                format!("unsupported protocol version: {requested_version}"),
+            );
+        }
+
+        rpc_result(
+            request.id,
+            InitializeResult {
+                server_name: "nav-server".to_string(),
+                server_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: server_capabilities(),
+                methods: rpc::ROUTED_METHODS
+                    .iter()
+                    .map(|method| (*method).to_string())
+                    .collect(),
+                events: BACKEND_EVENT_TYPES
+                    .iter()
+                    .map(|event_type| (*event_type).to_string())
+                    .collect(),
+            },
+        )
     }
 
     fn handle_session_create(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
@@ -441,10 +478,40 @@ where
     serde_json::from_value(value).map_err(|error| format!("invalid params: {error}"))
 }
 
-fn session_events_path_session_id(path: &str) -> Option<&str> {
+pub(super) fn session_events_path_session_id(path: &str) -> Option<&str> {
     let session_id = path.strip_prefix("/sessions/")?.strip_suffix("/events")?;
 
     (!session_id.is_empty() && !session_id.contains('/')).then_some(session_id)
+}
+
+pub fn server_capabilities() -> ProtocolCapabilities {
+    ProtocolCapabilities {
+        sse_replay: true,
+        normalized_messages: false,
+        tool_approvals: false,
+        file_events: false,
+        provider_metadata: true,
+        session_close: false,
+    }
+}
+
+fn parse_session_event_cursor(
+    session_id: &str,
+    last_event_id: Option<&str>,
+) -> Result<(SessionId, Option<EventId>), HttpError> {
+    let session_id = SessionId::try_new(session_id).map_err(|error| HttpError {
+        status: 400,
+        message: error.to_string(),
+    })?;
+    let last_event_id = last_event_id
+        .map(EventId::try_new)
+        .transpose()
+        .map_err(|error| HttpError {
+            status: 400,
+            message: error.to_string(),
+        })?;
+
+    Ok((session_id, last_event_id))
 }
 
 fn replay_error_to_http(error: event_store::ReplayError) -> HttpError {

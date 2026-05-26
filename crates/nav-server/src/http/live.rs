@@ -1,25 +1,42 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 
-use super::{HttpRequest, HttpResponse, HttpServer};
+use super::{
+    HttpRequest, HttpResponse, HttpServer, PROTOCOL_VERSION, ProtocolEventSubscription,
+    server_capabilities, session_events_path_session_id, sse,
+};
 
 const MAX_HTTP_BODY_BYTES: usize = 10 * 1024 * 1024;
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const LIVE_SSE_RESPONSE_HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
 
-pub fn serve(mut server: HttpServer) -> Result<()> {
+type SharedHttpServer = Arc<Mutex<HttpServer>>;
+
+pub fn serve(server: HttpServer) -> Result<()> {
     let listener = TcpListener::bind(&server.config().bind_addr)
         .with_context(|| format!("bind HTTP server to {}", server.config().bind_addr))?;
     let base_url = format!("http://{}", listener.local_addr()?);
     write_bootstrap(&base_url)?;
+    serve_listener(server, listener)
+}
 
+fn serve_listener(server: HttpServer, listener: TcpListener) -> Result<()> {
+    let server = Arc::new(Mutex::new(server));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_connection(&mut server, stream) {
-                    eprintln!("nav-backend HTTP connection failed: {error:#}");
-                }
+                let server = Arc::clone(&server);
+                thread::spawn(move || {
+                    if let Err(error) = handle_connection(server, stream) {
+                        eprintln!("nav-backend HTTP connection failed: {error:#}");
+                    }
+                });
             }
             Err(error) => eprintln!("nav-backend HTTP accept failed: {error}"),
         }
@@ -35,6 +52,10 @@ fn write_bootstrap(base_url: &str) -> Result<()> {
         &json!({
             "type": "backend.ready",
             "baseUrl": base_url,
+            "protocolVersion": PROTOCOL_VERSION,
+            "rpcPath": "/rpc",
+            "eventPathTemplate": "/sessions/{sessionId}/events",
+            "capabilities": server_capabilities(),
         }),
     )?;
     writeln!(stdout)?;
@@ -42,7 +63,7 @@ fn write_bootstrap(base_url: &str) -> Result<()> {
     Ok(())
 }
 
-fn handle_connection(server: &mut HttpServer, mut stream: TcpStream) -> Result<()> {
+fn handle_connection(server: SharedHttpServer, mut stream: TcpStream) -> Result<()> {
     let request = {
         let mut reader = BufReader::new(&mut stream);
         match read_http_request(&mut reader)? {
@@ -51,7 +72,26 @@ fn handle_connection(server: &mut HttpServer, mut stream: TcpStream) -> Result<(
         }
     };
 
-    let response = server.handle_request(request);
+    let session_events_id = match request.method.as_str() {
+        "GET" => session_events_path_session_id(&request.path),
+        _ => None,
+    };
+
+    if let Some(session_id) = session_events_id {
+        let subscription = server
+            .lock()
+            .map_err(|_| anyhow!("HTTP server state lock was poisoned"))?
+            .subscribe_session_events_http(session_id, request.last_event_id.as_deref());
+        return match subscription {
+            Ok(subscription) => write_live_sse_response(&mut stream, subscription),
+            Err(error) => write_http_response(&mut stream, HttpResponse::from_error(error)),
+        };
+    }
+
+    let response = server
+        .lock()
+        .map_err(|_| anyhow!("HTTP server state lock was poisoned"))?
+        .handle_request(request);
     write_http_response(&mut stream, response)
 }
 
@@ -127,6 +167,29 @@ fn write_http_response(writer: &mut impl Write, response: HttpResponse) -> Resul
     )?;
     writer.flush()?;
     Ok(())
+}
+
+fn write_live_sse_response(
+    writer: &mut impl Write,
+    subscription: ProtocolEventSubscription,
+) -> Result<()> {
+    writer.write_all(LIVE_SSE_RESPONSE_HEADERS)?;
+    writer.write_all(sse::encode_events(subscription.replay())?.as_bytes())?;
+    writer.flush()?;
+
+    loop {
+        match subscription.recv_timeout(SSE_KEEPALIVE_INTERVAL) {
+            Ok(event) => {
+                writer.write_all(sse::encode_event(&event)?.as_bytes())?;
+                writer.flush()?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                writer.write_all(b": keep-alive\n\n")?;
+                writer.flush()?;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
 }
 
 fn trim_http_line(line: &str) -> &str {

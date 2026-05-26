@@ -1,6 +1,26 @@
 use nav_types::{ApprovalId, EventId, FileChangeId, MessageId, RunId, SessionId, ToolCallId};
 use serde::{Deserialize, Serialize};
 
+pub const BACKEND_EVENT_TYPES: &[&str] = &[
+    "session.created",
+    "run.started",
+    "model.text_delta",
+    "model.reasoning_delta",
+    "message.delta",
+    "message.completed",
+    "tool.call_requested",
+    "tool.call_started",
+    "tool.call_delta",
+    "tool.call_completed",
+    "tool.approval_requested",
+    "file.changed",
+    "run.completed",
+    "run.cancelled",
+    "run.failed",
+    "provider.error",
+    "error",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub event_id: EventId,
@@ -166,6 +186,143 @@ impl BackendEvent {
             Self::RunFailed { .. } => "run.failed",
             Self::ProviderError { .. } => "provider.error",
             Self::Error { .. } => "error",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn advertised_event_types_match_backend_event_variants() {
+        let advertised = BACKEND_EVENT_TYPES.iter().copied().collect::<BTreeSet<_>>();
+        let emitted = backend_event_samples()
+            .iter()
+            .map(BackendEvent::event_type)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(advertised, emitted);
+    }
+
+    fn backend_event_samples() -> Vec<BackendEvent> {
+        vec![
+            BackendEvent::SessionCreated,
+            BackendEvent::RunStarted { run_id: run_id() },
+            BackendEvent::ModelTextDelta {
+                run_id: run_id(),
+                message_id: message_id(),
+                delta: "hello".to_string(),
+                metadata: provider_metadata(),
+            },
+            BackendEvent::ModelReasoningDelta {
+                run_id: run_id(),
+                message_id: message_id(),
+                delta: "thinking".to_string(),
+                metadata: provider_metadata(),
+            },
+            BackendEvent::MessageDelta {
+                run_id: run_id(),
+                message_id: message_id(),
+                text: "hello".to_string(),
+            },
+            BackendEvent::MessageCompleted {
+                run_id: run_id(),
+                message_id: message_id(),
+                finish_reason: Some("stop".to_string()),
+                metadata: Some(provider_metadata()),
+            },
+            BackendEvent::ToolCallRequested {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                name: "read".to_string(),
+            },
+            BackendEvent::ToolCallStarted {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                name: Some("read".to_string()),
+                metadata: Some(provider_metadata()),
+            },
+            BackendEvent::ToolCallDelta {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                arguments_delta: "{}".to_string(),
+                metadata: provider_metadata(),
+            },
+            BackendEvent::ToolCallCompleted {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                name: Some("read".to_string()),
+                arguments: "{}".to_string(),
+                metadata: Some(provider_metadata()),
+            },
+            BackendEvent::ToolApprovalRequested {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                approval_id: approval_id(),
+            },
+            BackendEvent::FileChanged {
+                file_change_id: file_change_id(),
+                path: "README.md".to_string(),
+            },
+            BackendEvent::RunCompleted {
+                run_id: run_id(),
+                metadata: Some(provider_metadata()),
+            },
+            BackendEvent::RunCancelled { run_id: run_id() },
+            BackendEvent::RunFailed {
+                run_id: run_id(),
+                message: "failed".to_string(),
+            },
+            BackendEvent::ProviderError {
+                run_id: run_id(),
+                status: Some(500),
+                message: "provider failed".to_string(),
+                error_type: Some("server_error".to_string()),
+                code: Some("server_error".to_string()),
+                metadata: provider_metadata(),
+            },
+            BackendEvent::Error {
+                message: "failed".to_string(),
+            },
+        ]
+    }
+
+    fn run_id() -> RunId {
+        RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap()
+    }
+
+    fn message_id() -> MessageId {
+        MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002").unwrap()
+    }
+
+    fn tool_call_id() -> ToolCallId {
+        ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000003").unwrap()
+    }
+
+    fn approval_id() -> ApprovalId {
+        ApprovalId::try_new("019f2f6f-f178-7a72-9f28-000000000004").unwrap()
+    }
+
+    fn file_change_id() -> FileChangeId {
+        FileChangeId::try_new("019f2f6f-f178-7a72-9f28-000000000005").unwrap()
+    }
+
+    fn provider_metadata() -> ProviderEventMetadata {
+        ProviderEventMetadata {
+            provider_id: "test-provider".to_string(),
+            configured_model_id: "test-model".to_string(),
+            provider_response_id: Some("response-1".to_string()),
+            provider_model: Some("test-provider-model".to_string()),
+            choice_index: Some(0),
+            provider_tool_call_id: Some("tool-1".to_string()),
+            usage: Some(ProviderUsage {
+                prompt_tokens: Some(1),
+                completion_tokens: Some(2),
+                total_tokens: Some(3),
+            }),
         }
     }
 }
