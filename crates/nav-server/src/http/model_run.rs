@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use nav_harness::events::ModelOutputContext;
+use nav_harness::events::{HarnessEvent, HarnessEventEnvelope, ModelOutputContext};
 use nav_harness::models::{
     ModelResolver, OpenAiCompletionsCancellationToken, OpenAiCompletionsClient,
     OpenAiCompletionsError, OpenAiCompletionsRequest, OpenAiCompletionsRequestContext,
     ResolveModelError, ResolvedModelConfig,
 };
+use nav_harness::sessions::{SessionStore, Turn};
 use nav_protocol::{BackendEvent, EventEnvelope, ProviderEventMetadata};
 use nav_types::{EventId, MessageId, RunId, SessionId, ToolCallId};
 
@@ -21,20 +22,42 @@ pub(super) struct ModelRunService {
 }
 
 #[derive(Debug)]
+pub(super) struct ModelRunState {
+    ids: Arc<Mutex<ProtocolIdSource>>,
+    event_store: Arc<Mutex<ProtocolEventStore>>,
+    runs: Arc<Mutex<HashMap<RunId, RunState>>>,
+    session_store: Arc<Mutex<SessionStore>>,
+}
+
+impl ModelRunState {
+    pub fn new(
+        ids: Arc<Mutex<ProtocolIdSource>>,
+        event_store: Arc<Mutex<ProtocolEventStore>>,
+        runs: Arc<Mutex<HashMap<RunId, RunState>>>,
+        session_store: Arc<Mutex<SessionStore>>,
+    ) -> Self {
+        Self {
+            ids,
+            event_store,
+            runs,
+            session_store,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct ModelRunRequest<'a> {
     pub session_id: &'a SessionId,
     pub run_id: &'a RunId,
     pub message_id: &'a MessageId,
-    pub text: &'a str,
+    pub turns: &'a [Turn],
 }
 
 impl ModelRunService {
     pub fn run_to_completion(
         &self,
         resolver: &ModelResolver,
-        ids: Arc<Mutex<ProtocolIdSource>>,
-        event_store: Arc<Mutex<ProtocolEventStore>>,
-        runs: Arc<Mutex<HashMap<RunId, RunState>>>,
+        state: ModelRunState,
         cancellation_token: OpenAiCompletionsCancellationToken,
         request: ModelRunRequest<'_>,
     ) -> RunStatus {
@@ -42,9 +65,9 @@ impl ModelRunService {
             Ok(model) => model,
             Err(error) => {
                 publish_run_failure(
-                    &ids,
-                    &event_store,
-                    &runs,
+                    &state.ids,
+                    &state.event_store,
+                    &state.runs,
                     request.session_id,
                     request.run_id,
                     resolve_error_message(error),
@@ -54,12 +77,13 @@ impl ModelRunService {
             }
         };
 
-        let completion_request = OpenAiCompletionsRequest::from_user(request.text);
+        let completion_request = OpenAiCompletionsRequest::from_turns(request.turns);
         let request_context =
             OpenAiCompletionsRequestContext::new().with_cancellation_token(cancellation_token);
         let mut stream_ids = SharedProtocolIdSource {
-            ids: Arc::clone(&ids),
+            ids: Arc::clone(&state.ids),
         };
+        let mut assistant_turn = AssistantTurnCapture::default();
         let mut pending_provider_errors = Vec::new();
         let stream_result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -77,11 +101,20 @@ impl ModelRunService {
                 },
                 &mut stream_ids,
                 |harness_events| {
+                    assistant_turn.observe(&harness_events);
                     let (provider_errors, stream_events) = split_provider_errors(
                         harness_events_to_backend_events(request.session_id, harness_events),
                     );
                     pending_provider_errors.extend(provider_errors);
-                    publish_stream_events(&event_store, &runs, request.run_id, stream_events);
+                    publish_model_run_events(
+                        &state.event_store,
+                        &state.runs,
+                        &state.session_store,
+                        request.session_id,
+                        request.run_id,
+                        &mut assistant_turn,
+                        stream_events,
+                    );
                 },
             ));
 
@@ -91,7 +124,7 @@ impl ModelRunService {
             Err(error) => {
                 if pending_provider_errors.is_empty()
                     && let Some(provider_error) = provider_error_event(
-                        &ids,
+                        &state.ids,
                         request.session_id,
                         request.run_id,
                         &model,
@@ -101,9 +134,9 @@ impl ModelRunService {
                     pending_provider_errors.push(provider_error);
                 }
                 publish_run_failure(
-                    &ids,
-                    &event_store,
-                    &runs,
+                    &state.ids,
+                    &state.event_store,
+                    &state.runs,
                     request.session_id,
                     request.run_id,
                     run_failed_message(&error),
@@ -112,6 +145,34 @@ impl ModelRunService {
                 RunStatus::Failed
             }
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AssistantTurnCapture {
+    text: String,
+    persisted: bool,
+}
+
+impl AssistantTurnCapture {
+    fn observe(&mut self, events: &[HarnessEventEnvelope]) {
+        for event in events {
+            if let HarnessEvent::ModelTextDelta { delta, .. } = &event.event {
+                self.text.push_str(delta);
+            }
+        }
+    }
+
+    fn persist(&mut self, session_store: &Arc<Mutex<SessionStore>>, session_id: &SessionId) {
+        if self.persisted || self.text.is_empty() {
+            return;
+        }
+
+        session_store
+            .lock()
+            .unwrap()
+            .append_turn(session_id, Turn::assistant_text(self.text.as_str()));
+        self.persisted = true;
     }
 }
 
@@ -130,6 +191,57 @@ fn split_provider_errors(events: Vec<EventEnvelope>) -> (Vec<EventEnvelope>, Vec
     (provider_errors, stream_events)
 }
 
+fn publish_model_run_events(
+    event_store: &Arc<Mutex<ProtocolEventStore>>,
+    runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
+    session_store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    assistant_turn: &mut AssistantTurnCapture,
+    events: impl IntoIterator<Item = EventEnvelope>,
+) {
+    for event in events {
+        if matches!(&event.event, BackendEvent::RunCompleted { .. }) {
+            publish_model_run_completed_event(
+                event_store,
+                runs,
+                session_store,
+                session_id,
+                run_id,
+                assistant_turn,
+                event,
+            );
+        } else {
+            publish_running_event(event_store, runs, run_id, event);
+        }
+    }
+}
+
+fn publish_model_run_completed_event(
+    event_store: &Arc<Mutex<ProtocolEventStore>>,
+    runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
+    session_store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    assistant_turn: &mut AssistantTurnCapture,
+    event: EventEnvelope,
+) -> bool {
+    let mut runs = runs.lock().unwrap();
+    let Some(run) = runs.get_mut(run_id) else {
+        return false;
+    };
+
+    if run.status != RunStatus::Running {
+        return false;
+    }
+
+    assistant_turn.persist(session_store, session_id);
+    run.status = RunStatus::Completed;
+    event_store.lock().unwrap().append(event);
+    true
+}
+
+#[cfg(test)]
 fn publish_stream_events(
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
@@ -184,6 +296,7 @@ fn publish_running_event(
     true
 }
 
+#[cfg(test)]
 fn publish_terminal_event(
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
@@ -362,6 +475,66 @@ mod tests {
     }
 
     #[test]
+    fn completed_model_run_persists_assistant_turn_before_terminal_status() {
+        let fixture = RunFixture::new(RunStatus::Running);
+        let session_store = fixture.session_store();
+        let mut assistant_turn = AssistantTurnCapture {
+            text: "assistant reply".to_string(),
+            persisted: false,
+        };
+
+        publish_model_run_events(
+            &fixture.event_store,
+            &fixture.runs,
+            &session_store,
+            &fixture.session_id,
+            &fixture.run_id,
+            &mut assistant_turn,
+            vec![fixture.run_completed_event()],
+        );
+
+        assert_eq!(
+            session_store.lock().unwrap().turns(&fixture.session_id),
+            vec![Turn::assistant_text("assistant reply")]
+        );
+        assert_eq!(
+            fixture.event_types(),
+            vec!["session.created", "run.completed"]
+        );
+        assert_eq!(fixture.run_status(), RunStatus::Completed);
+    }
+
+    #[test]
+    fn completed_model_run_does_not_persist_assistant_turn_after_run_stops_running() {
+        let fixture = RunFixture::new(RunStatus::Cancelled);
+        let session_store = fixture.session_store();
+        let mut assistant_turn = AssistantTurnCapture {
+            text: "late assistant reply".to_string(),
+            persisted: false,
+        };
+
+        publish_model_run_events(
+            &fixture.event_store,
+            &fixture.runs,
+            &session_store,
+            &fixture.session_id,
+            &fixture.run_id,
+            &mut assistant_turn,
+            vec![fixture.run_completed_event()],
+        );
+
+        assert!(
+            session_store
+                .lock()
+                .unwrap()
+                .turns(&fixture.session_id)
+                .is_empty()
+        );
+        assert_eq!(fixture.event_types(), vec!["session.created"]);
+        assert_eq!(fixture.run_status(), RunStatus::Cancelled);
+    }
+
+    #[test]
     fn failed_run_events_are_not_published_after_run_stops_running() {
         let fixture = RunFixture::new(RunStatus::Cancelled);
         let ids = fixture.shared_ids();
@@ -426,6 +599,12 @@ mod tests {
 
         fn shared_ids(&self) -> Arc<Mutex<ProtocolIdSource>> {
             Arc::new(Mutex::new(self.ids.lock().unwrap().clone()))
+        }
+
+        fn session_store(&self) -> Arc<Mutex<SessionStore>> {
+            let mut store = SessionStore::default();
+            store.create_session(self.session_id.clone());
+            Arc::new(Mutex::new(store))
         }
 
         fn text_delta_event(&self, delta: &str) -> EventEnvelope {

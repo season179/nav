@@ -16,7 +16,7 @@ const DELAYED_CHAT_COMPLETIONS_STREAM: &str =
     include_str!("../../../../fixtures/protocol/provider-streams/delayed-chat-completions.sse");
 const DELAYED_BOUNDARY_MARKER: &str = ": delayed boundary";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProviderRequest {
     pub path: String,
     pub body: Value,
@@ -36,6 +36,14 @@ impl ProviderRequest {
 pub struct FakeProviderServer {
     addr: String,
     request: Arc<Mutex<Option<ProviderRequest>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+pub struct SequencedProviderServer {
+    addr: String,
+    requests: Arc<Mutex<Vec<ProviderRequest>>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -61,7 +69,7 @@ impl FakeProviderServer {
         let request_for_thread = Arc::clone(&request);
         let stop_for_thread = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            if let Some(stream) = accept_provider_request(listener, stop_for_thread) {
+            if let Some(stream) = accept_provider_request(&listener, &stop_for_thread) {
                 handle_provider_connection(
                     stream,
                     request_for_thread,
@@ -110,6 +118,65 @@ impl Drop for FakeProviderServer {
     }
 }
 
+impl SequencedProviderServer {
+    pub fn start(responses: Vec<Vec<String>>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake provider should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("fake provider should support nonblocking accept");
+        let addr = listener.local_addr().unwrap().to_string();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_for_thread = Arc::clone(&requests);
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            for chunks in responses {
+                if let Some(stream) = accept_provider_request(&listener, &stop_for_thread) {
+                    handle_queued_provider_connection(
+                        stream,
+                        Arc::clone(&requests_for_thread),
+                        200,
+                        "text/event-stream",
+                        chunks,
+                    );
+                }
+            }
+        });
+
+        Self {
+            addr,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn base_url(&self) -> String {
+        format!("http://{}/v1", self.addr)
+    }
+
+    pub fn requests(mut self) -> Vec<ProviderRequest> {
+        self.join_thread()
+            .expect("fake provider thread should finish");
+        std::mem::take(&mut *self.requests.lock().unwrap())
+    }
+
+    fn join_thread(&mut self) -> thread::Result<()> {
+        if let Some(handle) = self.handle.take() {
+            handle.join()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for SequencedProviderServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.join_thread();
+    }
+}
+
 impl DelayedProviderServer {
     fn start(first_chunks: Vec<String>, delayed_chunks: Vec<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("delayed provider should bind");
@@ -123,7 +190,7 @@ impl DelayedProviderServer {
         let request_for_thread = Arc::clone(&request);
         let stop_for_thread = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            if let Some(stream) = accept_provider_request(listener, Arc::clone(&stop_for_thread)) {
+            if let Some(stream) = accept_provider_request(&listener, &stop_for_thread) {
                 handle_delayed_provider_connection(
                     stream,
                     request_for_thread,
@@ -199,7 +266,7 @@ impl HangingProviderServer {
         let request_for_thread = Arc::clone(&request);
         let stop_for_thread = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            if let Some(stream) = accept_provider_request(listener, Arc::clone(&stop_for_thread)) {
+            if let Some(stream) = accept_provider_request(&listener, &stop_for_thread) {
                 handle_hanging_provider_connection(stream, request_for_thread, stop_for_thread);
             }
         });
@@ -268,6 +335,10 @@ pub fn provider_sse_chunk(json: &str) -> String {
 }
 
 pub fn successful_provider_with_text(text: &str) -> FakeProviderServer {
+    FakeProviderServer::start(200, "text/event-stream", successful_provider_chunks(text))
+}
+
+pub fn successful_provider_chunks(text: &str) -> Vec<String> {
     let text_chunk = json!({
         "id": "provider-run",
         "model": "vendor/model-large",
@@ -287,15 +358,11 @@ pub fn successful_provider_with_text(text: &str) -> FakeProviderServer {
         }]
     });
 
-    FakeProviderServer::start(
-        200,
-        "text/event-stream",
-        vec![
-            provider_sse_chunk(&text_chunk.to_string()),
-            provider_sse_chunk(&completed_chunk.to_string()),
-            "data: [DONE]\n\n".to_string(),
-        ],
-    )
+    vec![
+        provider_sse_chunk(&text_chunk.to_string()),
+        provider_sse_chunk(&completed_chunk.to_string()),
+        "data: [DONE]\n\n".to_string(),
+    ]
 }
 
 pub fn delayed_chat_completions_provider() -> DelayedProviderServer {
@@ -325,6 +392,27 @@ fn handle_provider_connection(
 ) {
     let (provider_request, mut stream) = read_provider_request(stream);
     *request.lock().unwrap() = Some(provider_request);
+
+    let body = chunks.concat();
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .expect("fake provider response should write");
+    stream.flush().expect("fake provider response should flush");
+}
+
+fn handle_queued_provider_connection(
+    stream: TcpStream,
+    requests: Arc<Mutex<Vec<ProviderRequest>>>,
+    status: u16,
+    content_type: &str,
+    chunks: Vec<String>,
+) {
+    let (provider_request, mut stream) = read_provider_request(stream);
+    requests.lock().unwrap().push(provider_request);
 
     let body = chunks.concat();
     let response = format!(
@@ -454,7 +542,7 @@ fn stop_sending_on_broken_pipe(result: std::io::Result<()>, context: &str) -> bo
     }
 }
 
-fn accept_provider_request(listener: TcpListener, stop: Arc<AtomicBool>) -> Option<TcpStream> {
+fn accept_provider_request(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if stop.load(Ordering::SeqCst) {
