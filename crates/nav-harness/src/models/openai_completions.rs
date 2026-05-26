@@ -62,33 +62,101 @@ pub enum ChatCompletionMessageRole {
     System,
     User,
     Assistant,
+    Tool,
+}
+
+/// A tool call inside an assistant message.
+///
+/// Follows the OpenAI schema:
+/// `{ "id": "call_...", "type": "function", "function": { "name": "...", "arguments": "..." } }`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatCompletionToolCall {
+    pub id: String,
+    pub function: ChatCompletionToolCallFunction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatCompletionToolCallFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// A single message in a chat completions request.
+///
+/// ## Serialization shape
+///
+/// | Role      | Fields                                  |
+/// |-----------|-----------------------------------------|
+/// | `system`  | `role`, `content`                       |
+/// | `user`    | `role`, `content`                       |
+/// | `assistant`| `role`, `content` (may be null), `tool_calls` (optional) |
+/// | `tool`    | `role`, `tool_call_id`, `content`       |
+///
+/// `tool_calls` is an array of `{ id, type: "function", function: { name, arguments } }`.
+/// A tool-role message carries the result for one `tool_call_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatCompletionRequestMessage {
     pub role: ChatCompletionMessageRole,
-    pub content: String,
+    pub content: Option<String>,
+    pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatCompletionRequestMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: ChatCompletionMessageRole::System,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: ChatCompletionMessageRole::User,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
-    fn assistant(content: impl Into<String>) -> Self {
+    pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: ChatCompletionMessageRole::Assistant,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_with_tool_calls(tool_calls: Vec<ChatCompletionToolCall>) -> Self {
+        Self {
+            role: ChatCompletionMessageRole::Assistant,
+            content: None,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_with_content_and_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ChatCompletionToolCall>,
+    ) -> Self {
+        Self {
+            role: ChatCompletionMessageRole::Assistant,
+            content: Some(content.into()),
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatCompletionMessageRole::Tool,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 
@@ -879,12 +947,42 @@ fn message_value(model: &ResolvedModelConfig, message: &ChatCompletionRequestMes
         }
         ChatCompletionMessageRole::User => "user",
         ChatCompletionMessageRole::Assistant => "assistant",
+        ChatCompletionMessageRole::Tool => "tool",
     };
 
-    json!({
+    let content = message
+        .content
+        .as_deref()
+        .map_or(Value::Null, |c| json!(c));
+
+    let mut obj = json!({
         "role": role,
-        "content": message.content,
-    })
+        "content": content,
+    });
+
+    let obj_map = obj.as_object_mut().expect("json! produces an object");
+
+    if let Some(tool_call_id) = &message.tool_call_id {
+        obj_map.insert("tool_call_id".to_string(), json!(tool_call_id));
+    }
+
+    if let Some(tool_calls) = &message.tool_calls {
+        obj_map.insert(
+            "tool_calls".to_string(),
+            json!(tool_calls.iter().map(|tc| {
+                json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                })
+            }).collect::<Vec<_>>()),
+        );
+    }
+
+    obj
 }
 
 fn apply_reasoning_settings(
