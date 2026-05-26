@@ -120,7 +120,8 @@ func TestQuitCancelsActiveStreamBeforeClosingAgent(t *testing.T) {
 		t.Fatal("fake agent did not capture stream context")
 	}
 
-	updated, _ = updated.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	// ctrl+c quits (esc now closes dialogs, matching Crush's keybindings).
+	updated, _ = updated.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
 
 	if err := agent.streamCtx.Err(); err != context.Canceled {
 		t.Fatalf("stream context error = %v, want context.Canceled", err)
@@ -273,6 +274,10 @@ func (a *fakeAgent) StreamMessage(ctx context.Context, text string) (<-chan clie
 }
 
 func (a *fakeAgent) Close() error {
+	return nil
+}
+
+func (a *fakeAgent) ReloadSettings(context.Context) error {
 	return nil
 }
 

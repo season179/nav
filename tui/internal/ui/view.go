@@ -26,10 +26,105 @@ func (m Model) View() tea.View {
 		m.renderStatus(),
 	)
 
-	view := tea.NewView(fitHeight(content, m.height))
+	content = fitHeight(content, m.height)
+
+	// Overlay the model selector dialog if active.
+	if m.modelSelector != nil && m.modelSelector.Active() {
+		dialogView := m.modelSelector.View()
+		if dialogView != "" {
+			content = overlayCenter(content, dialogView)
+		}
+	}
+
+	view := tea.NewView(content)
 	view.AltScreen = true
 	view.WindowTitle = "nav"
 	return view
+}
+
+// overlayCenter places a dialog string centered on top of the
+// background content, line-by-line.
+func overlayCenter(bg, fg string) string {
+	bgLines := strings.Split(bg, "\n")
+	fgLines := strings.Split(fg, "\n")
+
+	if len(fgLines) > len(bgLines) {
+		return bg
+	}
+
+	startRow := (len(bgLines) - len(fgLines)) / 2
+	for i, fgLine := range fgLines {
+		row := startRow + i
+		if row >= len(bgLines) {
+			break
+		}
+		bgLine := bgLines[row]
+		bgWidth := lipgloss.Width(bgLine)
+		fgWidth := lipgloss.Width(fgLine)
+
+		startCol := max(0, (bgWidth-fgWidth)/2)
+		prefix := truncateToWidth(bgLine, startCol)
+		prefixPad := startCol - lipgloss.Width(prefix)
+		if prefixPad > 0 {
+			prefix += strings.Repeat(" ", prefixPad)
+		}
+
+		afterCol := startCol + fgWidth
+		suffix := sliceFromWidth(bgLine, afterCol)
+
+		bgLines[row] = prefix + fgLine + suffix
+	}
+
+	return strings.Join(bgLines, "\n")
+}
+
+// truncateToWidth returns the prefix of s that fits within maxWidth.
+func truncateToWidth(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	w := 0
+	for i, r := range s {
+		rw := runeWidth(r)
+		if w+rw > maxWidth {
+			return s[:i]
+		}
+		w += rw
+	}
+	return s
+}
+
+// sliceFromWidth returns the suffix of s starting at startCol.
+func sliceFromWidth(s string, startCol int) string {
+	w := 0
+	for i, r := range s {
+		if w >= startCol {
+			return s[i:]
+		}
+		w += runeWidth(r)
+	}
+	return ""
+}
+
+func runeWidth(r rune) int {
+	if r == '\t' {
+		return 4 // approximate
+	}
+	// Simple heuristic: CJK chars are double-width.
+	if r > 0x1100 &&
+		(r <= 0x115f || r == 0x2329 || r == 0x232a ||
+			(r >= 0x2e80 && r <= 0xa4cf && r != 0x303f) ||
+			(r >= 0xac00 && r <= 0xd7a3) ||
+			(r >= 0xf900 && r <= 0xfaff) ||
+			(r >= 0xfe10 && r <= 0xfe19) ||
+			(r >= 0xfe30 && r <= 0xfe6f) ||
+			(r >= 0xff01 && r <= 0xff60) ||
+			(r >= 0xffe0 && r <= 0xffe6) ||
+			(r >= 0x20000 && r <= 0x2fffd) ||
+			(r >= 0x30000 && r <= 0x3fffd)) {
+		return 2
+	}
+	return 1
 }
 
 func (m Model) renderHeader() string {
@@ -144,9 +239,12 @@ func (m Model) renderComposer() string {
 }
 
 func (m Model) renderStatus() string {
-	left := "enter send  ctrl+j newline  esc quit"
+	left := "enter send  ctrl+j newline  ctrl+m models  ctrl+c quit"
 	right := "bubbletea"
-	if m.ready {
+	if m.currentModel != "" {
+		right = m.currentModel
+	}
+	if m.ready && m.currentModel == "" {
 		right = "backend connected"
 	}
 	if m.err != nil {

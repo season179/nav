@@ -15,4 +15,5 @@ pub const ROUTED_METHODS: &[&str] = &[
     methods::SESSION_CREATE,
     methods::SESSION_SEND_MESSAGE,
     methods::RUN_CANCEL,
+    methods::SETTINGS_RELOAD,
 ];

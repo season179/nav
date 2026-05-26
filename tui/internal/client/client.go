@@ -21,6 +21,7 @@ import (
 const (
 	rpcSessionCreate      = "session.create"
 	rpcSessionSendMessage = "session.sendMessage"
+	rpcSettingsReload     = "settings.reload"
 )
 
 var errSSEStreamEndedBeforeExpectedEvent = errors.New("SSE stream ended before the expected event")
@@ -142,6 +143,18 @@ func (c *Client) Close() error {
 
 	c.stopOwnedBackendLocked()
 	return nil
+}
+
+func (c *Client) ReloadSettings(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, err := c.connectLocked(ctx); err != nil {
+		return err
+	}
+
+	_, err := c.callRPCLocked(ctx, rpcSettingsReload, nil)
+	return err
 }
 
 func (c *Client) stopOwnedBackendLocked() {

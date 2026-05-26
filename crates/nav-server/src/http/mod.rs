@@ -1,6 +1,8 @@
 //! Local HTTP transport for frontend-to-backend communication.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -9,7 +11,8 @@ use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     JsonRpcVersion, ProtocolCapabilities, RunCancelParams, RunCancelResult, SessionCreateParams,
-    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, methods,
+    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, SettingsReloadResult,
+    methods,
 };
 use nav_protocol::{BACKEND_EVENT_TYPES, BackendEvent, EventEnvelope};
 use nav_types::{EventId, RunId, SessionId};
@@ -35,12 +38,14 @@ pub const PROTOCOL_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpServerConfig {
     pub bind_addr: String,
+    pub settings_path: Option<PathBuf>,
 }
 
 impl Default for HttpServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:0".to_string(),
+            settings_path: None,
         }
     }
 }
@@ -63,7 +68,7 @@ impl HttpServer {
 
     pub fn with_model_settings(config: HttpServerConfig, model_settings: ModelSettings) -> Self {
         Self {
-            config,
+            config: config.clone(),
             model_resolver: ModelResolver::new(model_settings),
             ids: Arc::new(Mutex::new(ProtocolIdSource::default())),
             sessions: HashMap::new(),
@@ -71,6 +76,25 @@ impl HttpServer {
             event_store: Arc::new(Mutex::new(ProtocolEventStore::default())),
             model_run_service: ModelRunService::default(),
         }
+    }
+
+    pub fn reload_model_settings(&mut self) -> Result<(), String> {
+        let Some(settings_path) = &self.config.settings_path else {
+            return Err("settings path not configured".to_string());
+        };
+
+        if !settings_path.exists() {
+            return Err(format!("settings file not found: {}", settings_path.display()));
+        }
+
+        let json = fs::read_to_string(settings_path)
+            .map_err(|e| format!("failed to read settings: {}", e))?;
+
+        let model_settings: ModelSettings = serde_json::from_str(&json)
+            .map_err(|e| format!("failed to parse settings: {}", e))?;
+
+        self.model_resolver = ModelResolver::new(model_settings);
+        Ok(())
     }
 
     pub fn config(&self) -> &HttpServerConfig {
@@ -168,6 +192,7 @@ impl HttpServer {
             methods::SESSION_CREATE => self.handle_session_create(request),
             methods::SESSION_SEND_MESSAGE => self.handle_session_send_message(request),
             methods::RUN_CANCEL => self.handle_run_cancel(request),
+            methods::SETTINGS_RELOAD => self.handle_settings_reload(request),
             method => rpc_error(
                 request.id,
                 -32601,
@@ -335,6 +360,20 @@ impl HttpServer {
                 run_id: params.run_id,
             },
         )
+    }
+
+    fn handle_settings_reload(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
+        match self.reload_model_settings() {
+            Ok(()) => rpc_result(
+                request.id,
+                SettingsReloadResult { success: true },
+            ),
+            Err(error) => rpc_error(
+                request.id,
+                -32603,
+                format!("failed to reload settings: {error}"),
+            ),
+        }
     }
 
     fn spawn_model_run(

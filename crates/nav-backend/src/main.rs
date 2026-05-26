@@ -12,9 +12,14 @@ fn main() -> Result<()> {
     match env::args().nth(1).as_deref() {
         Some("serve") | None => nav_server::stdio::serve(harness),
         Some("serve-http") => {
+            let settings_path = config::settings_path();
             let model_settings = config::load_model_settings()?;
+            let http_config = HttpServerConfig {
+                settings_path: Some(settings_path),
+                ..Default::default()
+            };
             nav_server::http::live::serve(HttpServer::with_model_settings(
-                HttpServerConfig::default(),
+                http_config,
                 model_settings,
             ))
         }

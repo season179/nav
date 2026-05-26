@@ -12,12 +12,16 @@ const NAV_MODEL: &str = "NAV_MODEL";
 const DEFAULT_NAV_SETTINGS: &str = "~/.nav/settings.json";
 
 pub fn load_model_settings() -> Result<ModelSettings> {
-    let path = env_path(NAV_MODEL_SETTINGS)
-        .unwrap_or_else(|| expand_home(PathBuf::from(DEFAULT_NAV_SETTINGS)));
+    let path = settings_path();
     let mut settings = read_nav_model_settings(&path)?.unwrap_or_default();
 
     apply_env_model_override(&mut settings)?;
     Ok(settings)
+}
+
+pub fn settings_path() -> PathBuf {
+    env_path(NAV_MODEL_SETTINGS)
+        .unwrap_or_else(|| expand_home(PathBuf::from(DEFAULT_NAV_SETTINGS)))
 }
 
 fn read_nav_model_settings(path: &Path) -> Result<Option<ModelSettings>> {

@@ -10,6 +10,7 @@ pub mod methods {
     pub const TOOL_APPROVE: &str = "tool.approve";
     pub const TOOL_REJECT: &str = "tool.reject";
     pub const SESSION_CLOSE: &str = "session.close";
+    pub const SETTINGS_RELOAD: &str = "settings.reload";
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,4 +175,10 @@ pub struct ToolRejectParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCloseParams {
     pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsReloadResult {
+    pub success: bool,
 }
