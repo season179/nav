@@ -369,6 +369,10 @@ fn handle_delayed_provider_connection(
         }
     }
 
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
+
     write_provider_chunks(&mut stream, delayed_chunks, "delayed");
 }
 
