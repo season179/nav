@@ -448,11 +448,15 @@ impl OpenAiCompletionsCancellationToken {
 
     async fn cancelled(&self) {
         loop {
+            let notified = self.state.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if self.is_cancelled() {
                 return;
             }
 
-            self.state.notify.notified().await;
+            notified.await;
         }
     }
 }
