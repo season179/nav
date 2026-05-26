@@ -1,7 +1,7 @@
-import React from 'react';
 import {Box, Text} from 'ink';
 import type {HistoryMessage} from './types.js';
 import {theme} from '../../theme/index.js';
+import {Markdown} from '../../markdown/Markdown.js';
 
 type Props = {
 	messages: HistoryMessage[];
@@ -12,7 +12,7 @@ export function HistoryRegion({messages}: Props) {
 		<Box flexDirection="column" flexGrow={1} paddingX={2} paddingY={0}>
 			{messages.length === 0 ? (
 				<Box flexDirection="column" marginTop={1}>
-					<Text color={theme.claude} bold>
+					<Text color={theme.accent} bold>
 						nav
 					</Text>
 					<Text color={theme.inactive}>
@@ -56,9 +56,11 @@ function MessageRow({message}: {message: HistoryMessage}) {
 
 	return (
 		<Box flexDirection="column" marginBottom={1}>
-			<Text wrap="wrap" color={theme.text}>
-				{message.text || ' '}
-			</Text>
+			{message.text ? (
+				<Markdown source={message.text} />
+			) : (
+				<Text color={theme.text}> </Text>
+			)}
 		</Box>
 	);
 }

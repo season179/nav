@@ -89,7 +89,7 @@ export function ModelPickerOverlay({
 								<Box key={option.label}>
 									<Text
 										color={
-											selected ? theme.claude : theme.text
+											selected ? theme.accent : theme.text
 										}
 										inverse={selected}
 									>

@@ -31,11 +31,26 @@ const SAMPLE_MODELS: ModelOption[] = [
 ];
 
 const CHAT_MESSAGES: HistoryMessage[] = [
-	{id: '1', role: 'user', text: 'How does the nav TUI look?'},
+	{id: '1', role: 'user', text: 'Show me a small Python snippet.'},
 	{
 		id: '2',
 		role: 'assistant',
-		text: 'Gray blocks for you, plain text for replies — similar to Claude Code.',
+		text: [
+			'### A tiny example',
+			'',
+			'Here is a function that returns the first `n` even numbers — note how the **keyword**, *string*, and `comment` tokens land on different Solarized accents.',
+			'',
+			'```python',
+			'# return the first n even numbers',
+			'def evens(n: int) -> list[int]:',
+			'    return [i * 2 for i in range(n)]',
+			'',
+			'print(evens(5))  # [0, 2, 4, 6, 8]',
+			'```',
+			'',
+			'- bullet one',
+			'- bullet two',
+		].join('\n'),
 	},
 	{id: '3', role: 'system', text: 'Model set to openai/gpt-4.1'},
 ];

@@ -15,8 +15,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "cli-highlight": "^2.1.11",
     "ink": "^6.7.0",
     "ink-text-input": "^6.0.0",
+    "marked": "^18.0.4",
     "react": "^19.2.0"
   },
   "devDependencies": {
