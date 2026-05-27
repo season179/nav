@@ -274,42 +274,54 @@ This plan will be implemented across the following milestones:
 ```mermaid
 graph TD
     M1[Milestone 1: Database & Request Prep] --> M2[Milestone 2: Lossless Pruning]
-    M2 --> M3[Milestone 3: LLM Compaction]
-    M3 --> M4[Milestone 4: Subagent Reintegration]
-    M4 --> M5[Milestone 5: Trigram FTS5 Search]
+    M2 --> M3[Milestone 3: LLM Compaction — same-model]
+    M3 --> M4[Milestone 4: Compaction Model Override & Media]
+    M4 --> M5[Milestone 5: Subagent Reintegration]
+    M5 --> M6[Milestone 6: Loop Guards]
+    M6 --> M7[Milestone 7: Trigram FTS5 Search]
 ```
 
-### Milestone 1: Database & Request Prep (LOOP-01, LOOP-02)
-*   Implement the main-loop step budget (default 80) and the doom-loop guard (3 identical calls).
-*   *Verification:* Assert that a loop emitting the same tool call 3× receives a synthetic error on the third attempt, and that a loop exceeding 80 steps terminates with a text-only final turn.
+### Milestone 1: Database & Request Prep
 *   Implement `turns` and `turn_parts` schema in SQLite.
 *   Build the stable-dynamic system prompt partitioner.
+*   Implement hybrid token estimation (`chars / 3.8` heuristic + provider `usage` feedback loop) and two-scope budgeting (total context + body-after-prefix).
 *   Add Anthropic/OpenAI prompt-cache adapters to the provider layer.
-*   *Verification:* Run integration tests asserting that the serialized provider payload contains cache markers where supported, preserves `prompt_cache_key` / `prompt_cache_retention` on OpenAI-family requests, and remains byte-identical across identical turns.
+*   *Verification:* Run integration tests asserting that the serialized provider payload contains cache markers where supported, preserves `prompt_cache_key` / `prompt_cache_retention` on OpenAI-family requests, and remains byte-identical across identical turns. Assert token estimates fall within ±15% of provider-reported `usage.input_tokens` on a corpus of mixed text/JSON/image payloads.
 
-### Milestone 2: Lossless Pruning (TOOL-03, TOOL-10)
+### Milestone 2: Lossless Pruning
 *   Add artifact references for large tool arguments, raw tool outputs, and media attachments before enabling replay truncation.
 *   Add `compacted_at` logic to `turn_parts` in SQLite.
 *   Implement the pruning worker that truncates old tool results to one-line summaries.
 *   Implement historical media eviction (`keep_media_turns`) at read-time.
 *   *Verification:* Assert that (a) sending a 50KB tool result, executing pruning, and reloading the context yields a summary block under 200 characters while `expand_artifact` returns the full original bytes; (b) a large tool-call argument is executed/persisted in full but replayed as valid truncated JSON; and (c) a conversation with images across many turns sends full image blocks only for the last `keep_media_turns` and `[image elided]` placeholders for the rest.
 
-### Milestone 3: LLM Compaction (APR-02, LOOP-05)
-*   Implement the compaction agent loop.
-*   Add the structured markdown compaction template with cumulative `## Files` tracking.
+### Milestone 3: LLM Compaction (same-model)
+*   Implement the compaction agent loop using the **same model** as the active session (no model override yet).
+*   Add the structured markdown compaction template with cumulative `## Files` tracking. The template is a first-class design surface: expect to iterate on the section headings, ordering, and carry-forward logic independently of the compaction engine itself.
 *   Build split-turn detection and PTL retry loops.
 *   Validate compaction summaries before commit.
 *   Build the failure circuit breaker and thrashing guard (Stage 4) as separate counters.
 *   Implement the terminal fallback (Stage 5): if summary + tail still exceeds budget, surface `ContextOverflowError` rather than looping.
 *   *Verification:* (a) Simulate a context-overflow response and verify that the system automatically triggers compaction, completes the summary, and replays the original user message successfully; (b) force the compaction call to error 3× and assert auto-compaction disables itself (rather than retry-looping) while a manual `/compact` still resets and runs; (c) verify that a second compaction merges the previous `## Files` section into the new summary rather than re-discovering the same files.
 
-### Milestone 4: Subagent Reintegration (TOOL-11)
+### Milestone 4: Compaction Model Override & Media Awareness
+*   Implement the `compaction.model_override` config option. When set, compaction routes to the cheaper model with a stripped payload (no images, truncated tool results, no tool definitions). When unset, compaction continues using the session model (the M3 default).
+*   *Verification:* Configure a model override, trigger compaction, and assert the compaction request is sent to the override model with stripped payload. Verify that with the override cleared, compaction still uses the session model (no regression from M3).
+*   **Live media handling is intentionally deprioritized to this milestone.** Images are a second-class citizen in most coding sessions — the critical path is prompt assembly → lossless pruning → LLM compaction (M1–M3), and media eviction only matters once that pipeline is stable. The historical media eviction rules (§3 Stage 1, `keep_media_turns`) are already implemented in M2; this milestone adds the compaction-side media stripping (removing `[image elided]` placeholders from the summarizer's input so they don't waste summary tokens on image descriptions) and validates the end-to-end image token budget against provider-reported usage.
+
+### Milestone 5: Subagent Reintegration
 *   Implement the `task` tool in `nav-harness`.
 *   Build tool-pool derivation and slimmed system prompt filters.
 *   Add subagent task-result XML wrapping, cancellation propagation, and changed-file/conflict reporting.
 *   *Verification:* Run a subagent task and assert that only a single size-capped tool result is appended to the parent's history, while the subagent's full history is persisted under its own session ID; cancel a parent run and assert the child is interrupted; run two mutating tasks and assert overlapping edits are surfaced in the parent result instead of disappearing into the transcript.
 
-### Milestone 5: Trigram FTS5 Search (FTS-01)
+### Milestone 6: Loop Guards
+*   Implement the main-loop step budget (default 80). On the final step, send a synthetic assistant message instructing the model that tools are disabled and it must produce a text-only summary of its progress.
+*   Implement the doom-loop guard: same tool name + structurally identical arguments 3 consecutive times → synthetic error.
+*   These are safety rails on an agent loop that now exists (M1–M5); they don't belong on the critical path.
+*   *Verification:* Assert that a loop emitting the same tool call 3× receives a synthetic error on the third attempt, and that a loop exceeding 80 steps terminates with a text-only final turn.
+
+### Milestone 7: Trigram FTS5 Search
 *   Create virtual tables and sync triggers.
 *   Implement search endpoints returning hits with bookended session starts and ends.
 *   *Verification:* Query for code patterns inside old tool outputs and verify that the search matches CJK characters and multiline text.
