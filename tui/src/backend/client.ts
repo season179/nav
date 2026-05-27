@@ -151,15 +151,58 @@ type EventPayload = {
 	message?: string;
 };
 
+const RPC_TOOL_APPROVE = 'tool.approve';
+const RPC_TOOL_REJECT = 'tool.reject';
+
+export type ApprovalResult = {
+	approvalId: string;
+	outcome: 'approved' | 'rejected';
+};
+
+export class RpcError extends Error {
+	constructor(
+		public readonly code: number,
+		message: string,
+	) {
+		super(message);
+		this.name = 'RpcError';
+	}
+}
+
+export class ApprovalError extends Error {
+	constructor(
+		public readonly kind: 'not_pending' | 'network',
+		message: string,
+	) {
+		super(message);
+		this.name = 'ApprovalError';
+	}
+}
+
+const APPROVAL_NOT_PENDING_CODE = -32006;
+
+function toApprovalError(error: unknown): ApprovalError {
+	if (error instanceof RpcError) {
+		const kind = error.code === APPROVAL_NOT_PENDING_CODE ? 'not_pending' : 'network';
+		return new ApprovalError(kind, error.message);
+	}
+	if (error instanceof Error) {
+		return new ApprovalError('network', error.message);
+	}
+	return new ApprovalError('network', String(error));
+}
+
 export class NavBackendClient {
 	private backendPath: string;
 	private endpoint = '';
 	private child: ChildProcess | null = null;
 	private session: SessionInfo | null = null;
 	private lastEventId = '';
+	private fetchImpl: typeof fetch;
 
 	constructor(backendPath = '') {
 		this.backendPath = backendPath;
+		this.fetchImpl = globalThis.fetch.bind(globalThis);
 	}
 
 	async connect(toolsPreset?: ToolsPreset): Promise<SessionInfo> {
@@ -207,6 +250,34 @@ export class NavBackendClient {
 		}
 
 		yield* this.streamEvents(event => isRunTerminal(event, send.runId!));
+	}
+
+	async approveTool(approvalId: string): Promise<ApprovalResult> {
+		return this.callApprovalRpc(RPC_TOOL_APPROVE, {approval_id: approvalId});
+	}
+
+	async rejectTool(approvalId: string, reason?: string): Promise<ApprovalResult> {
+		const params: Record<string, string> = {approval_id: approvalId};
+		if (reason) params.reason = reason;
+		return this.callApprovalRpc(RPC_TOOL_REJECT, params);
+	}
+
+	private async callApprovalRpc(
+		method: string,
+		params: Record<string, string>,
+	): Promise<ApprovalResult> {
+		let raw: unknown;
+		try {
+			raw = await this.callRpc(method, params);
+		} catch (error) {
+			throw toApprovalError(error);
+		}
+
+		const result = raw as {approvalId?: string; outcome?: string};
+		if (!result.approvalId || !result.outcome) {
+			throw new Error(`${method} returned unexpected result shape`);
+		}
+		return {approvalId: result.approvalId, outcome: result.outcome as 'approved' | 'rejected'};
 	}
 
 	async close(): Promise<void> {
@@ -271,7 +342,7 @@ export class NavBackendClient {
 			params,
 		};
 
-		const response = await fetch(`${this.endpoint}/rpc`, {
+		const response = await this.fetchImpl(`${this.endpoint}/rpc`, {
 			method: 'POST',
 			headers: {'Content-Type': 'application/json'},
 			body: JSON.stringify(payload),
@@ -284,7 +355,7 @@ export class NavBackendClient {
 
 		const parsed = JSON.parse(body) as JsonRpcResponse;
 		if (parsed.error) {
-			throw new Error(parsed.error.message);
+			throw new RpcError(parsed.error.code, parsed.error.message);
 		}
 		if (parsed.result === undefined) {
 			throw new Error(`JSON-RPC ${method} returned no result`);
@@ -341,7 +412,7 @@ export class NavBackendClient {
 			headers['Last-Event-ID'] = this.lastEventId;
 		}
 
-		const response = await fetch(
+		const response = await this.fetchImpl(
 			`${this.endpoint}/sessions/${this.session.sessionId}/events`,
 			{headers},
 		);
