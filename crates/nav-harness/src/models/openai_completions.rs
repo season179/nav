@@ -162,6 +162,7 @@ impl ChatCompletionRequestMessage {
 
     fn from_turn(turn: &Turn) -> Self {
         match turn.role {
+            TurnRole::System => Self::system(turn.text_content()),
             TurnRole::User => Self::user(turn.text_content()),
             TurnRole::Assistant => Self::assistant(turn.text_content()),
         }

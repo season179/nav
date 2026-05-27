@@ -218,6 +218,10 @@ impl ToolRegistry {
         self.tools_by_name.get(name).cloned()
     }
 
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tools_by_name.keys().map(String::as_str).collect()
+    }
+
     pub fn add_to_preset(
         &mut self,
         preset: ToolPreset,
@@ -356,6 +360,20 @@ mod tests {
     }
 
     #[test]
+    fn tool_names_returns_registered_tools_in_sorted_order() {
+        let mut registry = ToolRegistry::default();
+
+        registry
+            .register(NamedTool("zeta"))
+            .expect("zeta should register");
+        registry
+            .register(NamedTool("alpha"))
+            .expect("alpha should register");
+
+        assert_eq!(registry.tool_names(), vec!["alpha", "zeta"]);
+    }
+
+    #[test]
     fn risk_class_names_match_the_tool_contract() {
         assert_eq!(RiskClass::Read.name(), "read");
         assert_eq!(RiskClass::Mutate.name(), "mutate");
@@ -419,6 +437,39 @@ mod tests {
                     args["text"].as_str().unwrap_or_default().to_string(),
                 ))
             })
+        }
+    }
+
+    struct NamedTool(&'static str);
+
+    impl NavTool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "A named test tool."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Read
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+            _args: Value,
+            _cancel: super::ToolCancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::text("")) })
         }
     }
 }
