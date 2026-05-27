@@ -28,7 +28,7 @@ Other shifts from rev 1:
 
 - **LOOP-\*** — multi-turn state, agent loop scaffold, harness prompt
 - **TOOL-\*** — registry, schema encoding, individual tools, file mutation queue
-- **APR-\*** — guardrails, approval RPC handlers, run pause/resume
+- **APR-\*** — guardrails, hook-confirmation RPC handlers, run pause/resume
 - **INK-\*** — TUI event payload parsing, tool/approval/file cells, approval modal, client methods
 
 Single `AG-*` umbrella was considered; four prefixes match how OR/PRT/RSM/TUI grouped past work and grep cleaner. `INK-*` is preferred over `TUI-*` because past closed `TUI-*` issues referenced the now-deleted Go TUI.
@@ -75,7 +75,7 @@ Goal: nav can run arbitrary commands with the approval gate that distinguishes i
 | # | Issue | Model | Scope |
 |---|---|---|---|
 | APR-01 | Tool guardrail hook contract | strong | Replace the policy-engine/table shape with a small deterministic hook runner. Tool dispatch builds a normalized `ToolCallContext`, first-party hooks return `Allow`, `Deny`, or `RequestConfirmation`, and after-hooks may redact/normalize results before they are returned to the model. Default with no hooks is allow after schema validation; non-interactive confirmation fails closed until APR-02a/APR-02b provide the approval channel. |
-| APR-02a | Approval RPC handlers + protocol surface | strong | Backend wiring of `tool.approve` / `tool.reject`; emit `tool.approval_requested`. Server-side only. |
+| APR-02a | Confirmation RPC handlers + protocol surface | strong | Backend wiring of `tool.approve` / `tool.reject` as answers to hook-requested confirmations; emit generic `tool.approval_requested` payloads with `approval_id`, tool name, reason, argument summary, and risk class. Server-side only; pause/resume remains APR-02b. |
 | APR-02b | Run pause/resume state machine in harness | strong | Run lifecycle change: harness suspends loop on approval-required tool, resumes on signal from APR-02a. Cancellable. Distinct PR from APR-02a because the failure modes don't overlap. |
 | APR-03 | `bash` tool (strong, absorbs cancel) | strong | `workspace::shell`, `tokio::process`, cwd, env allowlist, timeout, output cap with temp-file spill, child process group kill on `run.cancel`. Approval gated via APR-01. Returns one blob in this PR — live streaming is APR-04. Acceptance includes the deleted APR-06 end-to-end approve + reject test as a merge gate. Absorbs the deleted APR-05 cancellation work. |
 | APR-04 | Live `bash` output streaming (protocol + harness) | strong | New `tool.output_delta` SSE event variant (deliberately separate from `tool.call_delta`, which is model-arg streaming per the pi-tools doc). `bash` streams stdout/stderr chunks from the spawned process through harness events; final `tool.call_completed` still carries the truncated full result. Backpressure + chunk coalescing live here. Depends on APR-03. |

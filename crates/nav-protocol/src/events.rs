@@ -119,6 +119,11 @@ pub enum BackendEvent {
         run_id: RunId,
         tool_call_id: ToolCallId,
         approval_id: ApprovalId,
+        tool_name: String,
+        reason: String,
+        arguments_summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk_class: Option<String>,
     },
     #[serde(rename = "file.changed")]
     FileChanged {
@@ -281,6 +286,10 @@ mod tests {
                 run_id: run_id(),
                 tool_call_id: tool_call_id(),
                 approval_id: approval_id(),
+                tool_name: "write_file".to_string(),
+                reason: "writes outside the current task focus".to_string(),
+                arguments_summary: r#"{"path":"notes.md","content":"hello"}"#.to_string(),
+                risk_class: Some("mutate".to_string()),
             },
             BackendEvent::FileChanged {
                 file_change_id: file_change_id(),

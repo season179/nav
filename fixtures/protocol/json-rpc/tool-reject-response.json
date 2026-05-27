@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": "019f2f6f-f178-7a72-9f28-000000000021",
+  "result": {
+    "approval_id": "019f2f6f-f178-7a72-9f28-000000000041",
+    "outcome": "rejected"
+  }
+}

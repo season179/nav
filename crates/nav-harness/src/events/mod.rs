@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use nav_types::{EventId, MessageId, RunId, ToolCallId};
+use nav_types::{ApprovalId, EventId, MessageId, RunId, ToolCallId};
 
 use crate::models::{
     ChatCompletionStreamChoice, ChatCompletionStreamChunk, ChatCompletionStreamEvent,
@@ -68,6 +68,15 @@ pub enum HarnessEvent {
         error_message: String,
         metadata: ProviderEventMetadata,
     },
+    ToolApprovalRequested {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        approval_id: ApprovalId,
+        tool_name: String,
+        reason: String,
+        arguments_summary: String,
+        risk_class: Option<String>,
+    },
     ProviderError {
         run_id: RunId,
         status: Option<u16>,
@@ -92,6 +101,7 @@ impl HarnessEvent {
             Self::ToolCallDelta { .. } => "tool.call_delta",
             Self::ToolCallCompleted { .. } => "tool.call_completed",
             Self::ToolCallFailed { .. } => "tool.call_failed",
+            Self::ToolApprovalRequested { .. } => "tool.approval_requested",
             Self::ProviderError { .. } => "provider.error",
             Self::RunCompleted { .. } => "run.completed",
         }
@@ -101,6 +111,7 @@ impl HarnessEvent {
 pub trait HarnessEventIdSource {
     fn next_event_id(&mut self) -> EventId;
     fn next_tool_call_id(&mut self) -> ToolCallId;
+    fn next_approval_id(&mut self) -> ApprovalId;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -102,6 +102,23 @@ fn harness_event_to_backend_event(event: HarnessEvent) -> BackendEvent {
             error_message,
             metadata: Some(provider_metadata(metadata)),
         },
+        HarnessEvent::ToolApprovalRequested {
+            run_id,
+            tool_call_id,
+            approval_id,
+            tool_name,
+            reason,
+            arguments_summary,
+            risk_class,
+        } => BackendEvent::ToolApprovalRequested {
+            run_id,
+            tool_call_id,
+            approval_id,
+            tool_name,
+            reason,
+            arguments_summary,
+            risk_class,
+        },
         HarnessEvent::ProviderError {
             run_id,
             status,
@@ -148,7 +165,7 @@ fn provider_usage(usage: HarnessProviderUsage) -> ProviderUsage {
 mod tests {
     use super::*;
     use nav_harness::events::ProviderEventMetadata as HMeta;
-    use nav_types::{EventId, RunId, ToolCallId};
+    use nav_types::{ApprovalId, EventId, RunId, ToolCallId};
 
     fn run_id() -> RunId {
         RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap()
@@ -240,19 +257,22 @@ mod tests {
         let events = vec![
             HarnessEvent::ModelTextDelta {
                 run_id: run_id(),
-                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002").unwrap(),
+                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002")
+                    .unwrap(),
                 delta: "hi".to_string(),
                 metadata: harness_metadata(),
             },
             HarnessEvent::ModelReasoningDelta {
                 run_id: run_id(),
-                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002").unwrap(),
+                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002")
+                    .unwrap(),
                 delta: "think".to_string(),
                 metadata: harness_metadata(),
             },
             HarnessEvent::MessageCompleted {
                 run_id: run_id(),
-                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002").unwrap(),
+                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002")
+                    .unwrap(),
                 finish_reason: Some("stop".to_string()),
                 metadata: harness_metadata(),
             },
@@ -282,6 +302,15 @@ mod tests {
                 error_message: "not found".to_string(),
                 metadata: harness_metadata(),
             },
+            HarnessEvent::ToolApprovalRequested {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                approval_id: approval_id(),
+                tool_name: "write_file".to_string(),
+                reason: "confirm write".to_string(),
+                arguments_summary: "{}".to_string(),
+                risk_class: Some("mutate".to_string()),
+            },
             HarnessEvent::ProviderError {
                 run_id: run_id(),
                 status: Some(500),
@@ -307,9 +336,13 @@ mod tests {
             .collect();
 
         let result = harness_events_to_backend_events(&session_id, envelopes);
-        assert_eq!(result.len(), 9);
+        assert_eq!(result.len(), 10);
         for envelope in &result {
             assert_eq!(envelope.session_id, session_id);
         }
+    }
+
+    fn approval_id() -> ApprovalId {
+        ApprovalId::try_new("019f2f6f-f178-7a72-9f28-000000000004").unwrap()
     }
 }

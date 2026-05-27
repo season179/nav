@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
+use nav_harness::sessions::{ConfirmationDecision, PendingConfirmation};
 use nav_protocol::{EventEnvelope, JsonRpcRequest, JsonRpcResponse};
 use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig, RunStatus, sse};
+use nav_types::{ApprovalId, RunId, ToolCallId};
 use serde_json::{Value, json};
 
 mod support;
@@ -19,12 +22,16 @@ const REQUEST_FIXTURES: &[(&str, &str)] = &[
         "json-rpc/session-send-message-request.json",
         "session.sendMessage",
     ),
+    ("json-rpc/tool-approve-request.json", "tool.approve"),
+    ("json-rpc/tool-reject-request.json", "tool.reject"),
 ];
 
 const RESPONSE_FIXTURES: &[&str] = &[
     "json-rpc/initialize-response.json",
     "json-rpc/session-create-response.json",
     "json-rpc/session-send-message-response.json",
+    "json-rpc/tool-approve-response.json",
+    "json-rpc/tool-reject-response.json",
 ];
 
 const SSE_FIXTURES: &[&str] = &[
@@ -35,6 +42,7 @@ const SSE_FIXTURES: &[&str] = &[
     "event-streams/provider-error.sse",
     "event-streams/tool-call-read.sse",
     "event-streams/tool-call-failed.sse",
+    "event-streams/tool-approval-requested.sse",
 ];
 
 #[test]
@@ -73,6 +81,7 @@ fn sse_fixtures_are_valid_typed_protocol_events() {
     let mut saw_tool_call_started = false;
     let mut saw_tool_call_completed = false;
     let mut saw_tool_call_failed = false;
+    let mut saw_tool_approval_requested = false;
 
     for fixture in SSE_FIXTURES {
         let events = parse_sse(&fixture_text(fixture));
@@ -93,15 +102,29 @@ fn sse_fixtures_are_valid_typed_protocol_events() {
                 "tool.call_started" => saw_tool_call_started = true,
                 "tool.call_completed" => saw_tool_call_completed = true,
                 "tool.call_failed" => saw_tool_call_failed = true,
+                "tool.approval_requested" => saw_tool_approval_requested = true,
                 _ => {}
             }
         }
     }
 
     assert!(saw_provider_error, "fixtures should cover provider.error");
-    assert!(saw_tool_call_started, "fixtures should cover tool.call_started");
-    assert!(saw_tool_call_completed, "fixtures should cover tool.call_completed");
-    assert!(saw_tool_call_failed, "fixtures should cover tool.call_failed");
+    assert!(
+        saw_tool_call_started,
+        "fixtures should cover tool.call_started"
+    );
+    assert!(
+        saw_tool_call_completed,
+        "fixtures should cover tool.call_completed"
+    );
+    assert!(
+        saw_tool_call_failed,
+        "fixtures should cover tool.call_failed"
+    );
+    assert!(
+        saw_tool_approval_requested,
+        "fixtures should cover tool.approval_requested"
+    );
 }
 
 #[test]
@@ -238,6 +261,59 @@ fn session_send_message_fixture_matches_server_contract_and_replay() {
 }
 
 #[test]
+fn tool_approve_fixture_satisfies_pending_confirmation() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+    let request_fixture = "json-rpc/tool-approve-request.json";
+    let approval_id = fixture_approval_id(request_fixture);
+    let receiver = server
+        .register_pending_confirmation(pending_confirmation(approval_id))
+        .expect("pending confirmation should register");
+
+    let actual = rpc_fixture_response(&mut server, request_fixture);
+
+    assert_eq!(actual, fixture_json("json-rpc/tool-approve-response.json"));
+    assert_eq!(
+        receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("approval decision should be delivered"),
+        ConfirmationDecision::Approved
+    );
+
+    let already_resolved = rpc_fixture_response(&mut server, request_fixture);
+    assert_not_pending_confirmation_error(&already_resolved);
+}
+
+#[test]
+fn tool_reject_fixture_satisfies_pending_confirmation() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+    let request_fixture = "json-rpc/tool-reject-request.json";
+    let approval_id = fixture_approval_id(request_fixture);
+    let receiver = server
+        .register_pending_confirmation(pending_confirmation(approval_id))
+        .expect("pending confirmation should register");
+
+    let actual = rpc_fixture_response(&mut server, request_fixture);
+
+    assert_eq!(actual, fixture_json("json-rpc/tool-reject-response.json"));
+    assert_eq!(
+        receiver
+            .recv_timeout(Duration::from_millis(100))
+            .expect("rejection decision should be delivered"),
+        ConfirmationDecision::Rejected {
+            reason: Some("user declined the tool request".to_string())
+        }
+    );
+}
+
+#[test]
+fn tool_approve_returns_structured_error_for_unknown_confirmation() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+    let body = rpc_fixture_response(&mut server, "json-rpc/tool-approve-request.json");
+
+    assert_not_pending_confirmation_error(&body);
+}
+
+#[test]
 fn run_failed_fixture_matches_server_contract() {
     let mut server =
         HttpServer::with_model_settings(HttpServerConfig::default(), missing_key_model_settings());
@@ -354,6 +430,35 @@ fn fixture_json(relative_path: &str) -> Value {
         .unwrap_or_else(|error| panic!("{relative_path} should be valid JSON: {error}"))
 }
 
+fn rpc_fixture_response(server: &mut HttpServer, request_fixture: &str) -> Value {
+    let response = server.handle_request(HttpRequest::post("/rpc", fixture_text(request_fixture)));
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.content_type(), "application/json");
+    serde_json::from_str(response.body())
+        .unwrap_or_else(|error| panic!("{request_fixture} response should be JSON: {error}"))
+}
+
+fn fixture_approval_id(request_fixture: &str) -> ApprovalId {
+    let request = fixture_json(request_fixture);
+    ApprovalId::try_new(
+        request["params"]["approval_id"]
+            .as_str()
+            .expect("fixture should include approval_id"),
+    )
+    .expect("fixture approval_id should be valid")
+}
+
+fn assert_not_pending_confirmation_error(body: &Value) {
+    assert!(body.get("result").is_none());
+    assert_eq!(body["error"]["code"].as_i64(), Some(-32006));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("error message should be present")
+            .contains("not pending")
+    );
+}
+
 fn fixture_text(relative_path: &str) -> String {
     std::fs::read_to_string(fixture_path(relative_path))
         .unwrap_or_else(|error| panic!("{relative_path} should be readable: {error}"))
@@ -433,6 +538,18 @@ fn missing_key_model_settings() -> ModelSettings {
     settings
 }
 
+fn pending_confirmation(approval_id: ApprovalId) -> PendingConfirmation {
+    PendingConfirmation {
+        approval_id,
+        run_id: RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap(),
+        tool_call_id: ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap(),
+        tool_name: "write_file".to_string(),
+        reason: "writes outside the current task focus".to_string(),
+        arguments_summary: r#"{"path":"notes.md","content":"hello"}"#.to_string(),
+        risk_class: Some("mutate".to_string()),
+    }
+}
+
 fn assert_uuid_v7(value: &str) {
     assert_eq!(value.len(), 36);
     assert_eq!(&value[14..15], "7");
@@ -466,16 +583,38 @@ fn tool_call_read_fixture_round_trips_through_sse_encoder() {
         .unwrap_or_else(|error| panic!("{fixture} should encode: {error}"));
     assert_eq!(encoded, fixture_body_with_final_separator(&fixture_body));
 
-    let started = envelopes.iter().find(|e| e.event_type() == "tool.call_started").unwrap();
-    let completed = envelopes.iter().find(|e| e.event_type() == "tool.call_completed").unwrap();
-    let delta = envelopes.iter().find(|e| e.event_type() == "tool.call_delta").unwrap();
+    let started = envelopes
+        .iter()
+        .find(|e| e.event_type() == "tool.call_started")
+        .unwrap();
+    let completed = envelopes
+        .iter()
+        .find(|e| e.event_type() == "tool.call_completed")
+        .unwrap();
+    let delta = envelopes
+        .iter()
+        .find(|e| e.event_type() == "tool.call_delta")
+        .unwrap();
 
     // Verify tool call events have consistent run_id and tool_call_id
     match (&started.event, &completed.event, &delta.event) {
         (
-            nav_protocol::BackendEvent::ToolCallStarted { run_id: rid1, tool_call_id: tcid1, name, .. },
-            nav_protocol::BackendEvent::ToolCallCompleted { run_id: rid2, tool_call_id: tcid2, .. },
-            nav_protocol::BackendEvent::ToolCallDelta { run_id: rid3, tool_call_id: tcid3, .. },
+            nav_protocol::BackendEvent::ToolCallStarted {
+                run_id: rid1,
+                tool_call_id: tcid1,
+                name,
+                ..
+            },
+            nav_protocol::BackendEvent::ToolCallCompleted {
+                run_id: rid2,
+                tool_call_id: tcid2,
+                ..
+            },
+            nav_protocol::BackendEvent::ToolCallDelta {
+                run_id: rid3,
+                tool_call_id: tcid3,
+                ..
+            },
         ) => {
             assert_eq!(rid1, rid2);
             assert_eq!(rid1, rid3);
@@ -515,12 +654,71 @@ fn tool_call_failed_fixture_round_trips_through_sse_encoder() {
         .unwrap_or_else(|error| panic!("{fixture} should encode: {error}"));
     assert_eq!(encoded, fixture_body_with_final_separator(&fixture_body));
 
-    let failed = envelopes.iter().find(|e| e.event_type() == "tool.call_failed").unwrap();
+    let failed = envelopes
+        .iter()
+        .find(|e| e.event_type() == "tool.call_failed")
+        .unwrap();
     match &failed.event {
-        nav_protocol::BackendEvent::ToolCallFailed { name, error_message, .. } => {
+        nav_protocol::BackendEvent::ToolCallFailed {
+            name,
+            error_message,
+            ..
+        } => {
             assert_eq!(name.as_deref(), Some("read"));
             assert!(!error_message.is_empty());
         }
         _ => panic!("expected tool.call_failed"),
+    }
+}
+
+#[test]
+fn tool_approval_requested_fixture_is_generic_hook_confirmation() {
+    let fixture = "event-streams/tool-approval-requested.sse";
+    let fixture_body = fixture_text(fixture);
+    let events = parse_sse(&fixture_body);
+
+    let approval = events
+        .iter()
+        .find(|event| event.name == "tool.approval_requested")
+        .expect("fixture should include approval request");
+
+    assert_eq!(approval.data["tool_name"].as_str(), Some("write_file"));
+    assert_eq!(
+        approval.data["reason"].as_str(),
+        Some("writes outside the current task focus")
+    );
+    assert_eq!(
+        approval.data["arguments_summary"].as_str(),
+        Some(r#"{"path":"notes.md","content":"hello"}"#)
+    );
+    assert_eq!(approval.data["risk_class"].as_str(), Some("mutate"));
+    assert_ne!(approval.data["tool_name"].as_str(), Some("bash"));
+
+    let envelopes = event_envelopes(events);
+    let encoded = sse::encode_events(&envelopes)
+        .unwrap_or_else(|error| panic!("{fixture} should encode: {error}"));
+    assert_eq!(encoded, fixture_body_with_final_separator(&fixture_body));
+
+    let approval = envelopes
+        .iter()
+        .find(|event| event.event_type() == "tool.approval_requested")
+        .expect("envelope should include approval request");
+    match &approval.event {
+        nav_protocol::BackendEvent::ToolApprovalRequested {
+            tool_name,
+            reason,
+            arguments_summary,
+            risk_class,
+            ..
+        } => {
+            assert_eq!(tool_name, "write_file");
+            assert_eq!(reason, "writes outside the current task focus");
+            assert_eq!(
+                arguments_summary,
+                r#"{"path":"notes.md","content":"hello"}"#
+            );
+            assert_eq!(risk_class.as_deref(), Some("mutate"));
+        }
+        other => panic!("expected ToolApprovalRequested, got {other:?}"),
     }
 }
