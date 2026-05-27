@@ -1,0 +1,50 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`ToolCallCell snapshots running call shows name, status, and argument summary 1`] = `
+"tool read running
+args path: fixture.txt
+"
+`;
+
+exports[`ToolCallCell snapshots successful call keeps the argument summary visible 1`] = `
+"tool read success
+args path: fixture.txt
+"
+`;
+
+exports[`ToolCallCell snapshots failed call shows the error without hiding the call 1`] = `
+"tool read failed
+args path: ../secret.txt
+error path escapes workspace
+"
+`;
+
+exports[`ToolResultCell snapshots successful result shows a bounded snippet 1`] = `
+"tool read result completed
+1: alpha
+2: beta
+"
+`;
+
+exports[`ToolResultCell snapshots failed result emphasizes the error 1`] = `
+"tool read result failed
+path escapes workspace
+"
+`;
+
+exports[`ToolResultCell snapshots truncated result includes a marker and can render expanded state 1`] = `
+"tool read result completed
+1: alpha beta gamma delta epsilon zeta eta theta iota kappa
+2: lambda...
+... truncated, 63 chars hidden
+"
+`;
+
+exports[`ToolResultCell snapshots truncated result includes a marker and can render expanded state 2`] = `
+"tool read result completed
+1: alpha beta gamma delta epsilon zeta eta theta iota kappa
+2: lambda mu nu xi omicron pi rho sigma tau upsilon
+3: phi chi psi omega
+expanded result
+"
+`;

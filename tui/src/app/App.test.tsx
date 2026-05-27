@@ -81,6 +81,43 @@ describe('applyEventToHistory', () => {
 		expect(warn).not.toHaveBeenCalled();
 	});
 
+	test('keeps late assistant text and errors after interleaved tool events', () => {
+		const warn = mock(() => {});
+		let messages: HistoryMessage[] = [
+			{id: ASSISTANT_ID, role: 'assistant', text: ''},
+		];
+
+		messages = applyEventToHistory(
+			messages,
+			event('tool.call_started', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				name: 'read',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('run.failed', {
+				runId: 'run-1',
+				message: 'provider disconnected',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		expect(messages.map(message => message.role)).toEqual([
+			'tool_call',
+			'assistant',
+		]);
+		expect(messages.at(-1)).toMatchObject({
+			role: 'assistant',
+			text: 'provider disconnected',
+		});
+		expect(warn).not.toHaveBeenCalled();
+	});
+
 	test('dispatches text, tool, approval, and file events without falling through to text extraction', () => {
 		const warn = mock(() => {});
 		let messages: HistoryMessage[] = [
