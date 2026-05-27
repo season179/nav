@@ -1,0 +1,1532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Context Management — Harness Comparison</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@300;400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0c0e13;
+    --bg-raised: #12151c;
+    --bg-cell: #161a24;
+    --bg-cell-alt: #1a1f2b;
+    --bg-header: #0f1118;
+    --border: #1e2330;
+    --border-light: #2a3042;
+    --text: #c8cdd8;
+    --text-muted: #6b7394;
+    --text-heading: #e8ecf4;
+    --text-dim: #4a5070;
+
+    --cc-accent: #f59e0b;
+    --codex-accent: #22c55e;
+    --flue-accent: #3b82f6;
+    --hermes-accent: #06b6d4;
+    --kf-accent: #ec4899;
+    --nc-accent: #eab308;
+    --oc-accent: #a78bfa;
+    --pi-accent: #f87171;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 16px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+
+  /* ── Header ────────────────────────────────────────── */
+  .page-header {
+    padding: 28px 40px 32px;
+  }
+  .page-header h1 {
+    font-family: 'Instrument Serif', serif;
+    font-size: 32px;
+    font-weight: 400;
+    color: var(--text-heading);
+    letter-spacing: -0.3px;
+    line-height: 1.1;
+  }
+  .page-header h1 em {
+    font-style: italic;
+    color: var(--text-muted);
+    font-size: 0.65em;
+    margin-left: 12px;
+    letter-spacing: 0;
+  }
+  .page-header .subtitle {
+    margin-top: 6px;
+    font-size: 12.5px;
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+  .legend {
+    display: flex;
+    gap: 16px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+  }
+  .legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  /* ── Table wrapper ─────────────────────────────────── */
+  .table-wrap {
+    padding: 0 0 80px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border-top: 1px solid var(--border-light);
+  }
+  .table-wrap::-webkit-scrollbar { height: 6px; }
+  .table-wrap::-webkit-scrollbar-track { background: var(--bg); }
+  .table-wrap::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 3px; }
+
+  table {
+    border-collapse: separate;
+    border-spacing: 0;
+    min-width: 100%;
+  }
+
+  /* ── Column widths ─────────────────────────────────── */
+  th, td {
+    padding: 14px 18px;
+    vertical-align: top;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+  }
+  /* Aspect label column */
+  th:first-child, td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 10;
+    min-width: 150px;
+    max-width: 150px;
+    width: 150px;
+    background: var(--bg-header);
+  }
+  td:first-child {
+    background: var(--bg-raised);
+  }
+  /* Harness columns */
+  th:nth-child(n+2), td:nth-child(n+2) {
+    min-width: 220px;
+    max-width: 260px;
+  }
+
+  /* ── Header row ────────────────────────────────────── */
+  thead th {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: var(--bg-header);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 12px 18px 10px;
+    border-bottom: 2px solid var(--border-light);
+    white-space: nowrap;
+  }
+  thead th:first-child {
+    z-index: 30;
+  }
+  thead th .harness-name {
+    display: block;
+    font-size: 13.5px;
+    font-weight: 700;
+    letter-spacing: 0;
+    text-transform: none;
+    margin-bottom: 1px;
+  }
+  thead th .harness-sub {
+    font-weight: 400;
+    font-size: 10.5px;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+  }
+
+  /* ── Aspect label cells ────────────────────────────── */
+  td:first-child {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-heading);
+    letter-spacing: 0.2px;
+    border-right: 1px solid var(--border);
+  }
+  td:first-child .aspect-num {
+    display: block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-bottom: 3px;
+    font-weight: 400;
+  }
+
+  /* ── Data cells ────────────────────────────────────── */
+  tbody td:nth-child(n+2) {
+    font-size: 15px;
+    color: var(--text);
+    border-right: 1px solid var(--border);
+  }
+  tbody tr:nth-child(even) td:nth-child(n+2) { background: var(--bg-cell); }
+  tbody tr:nth-child(odd) td:nth-child(n+2) { background: var(--bg-cell-alt); }
+  tbody tr:nth-child(even) td:first-child { background: var(--bg-cell); }
+  tbody tr:nth-child(odd) td:first-child { background: var(--bg-cell-alt); }
+
+  /* ── Accent top-border per column ──────────────────── */
+  thead th:nth-child(2) { border-top: 3px solid var(--cc-accent); }
+  thead th:nth-child(3) { border-top: 3px solid var(--codex-accent); }
+  thead th:nth-child(4) { border-top: 3px solid var(--flue-accent); }
+  thead th:nth-child(5) { border-top: 3px solid var(--hermes-accent); }
+  thead th:nth-child(6) { border-top: 3px solid var(--kf-accent); }
+  thead th:nth-child(7) { border-top: 3px solid var(--nc-accent); }
+  thead th:nth-child(8) { border-top: 3px solid var(--oc-accent); }
+  thead th:nth-child(9) { border-top: 3px solid var(--pi-accent); }
+
+  thead th:nth-child(2) .harness-name { color: var(--cc-accent); }
+  thead th:nth-child(3) .harness-name { color: var(--codex-accent); }
+  thead th:nth-child(4) .harness-name { color: var(--flue-accent); }
+  thead th:nth-child(5) .harness-name { color: var(--hermes-accent); }
+  thead th:nth-child(6) .harness-name { color: var(--kf-accent); }
+  thead th:nth-child(7) .harness-name { color: var(--nc-accent); }
+  thead th:nth-child(8) .harness-name { color: var(--oc-accent); }
+  thead th:nth-child(9) .harness-name { color: var(--pi-accent); }
+
+  /* ── Row hover ─────────────────────────────────────── */
+  tbody tr:hover td:nth-child(n+2) {
+    background: #1d2233 !important;
+  }
+  tbody tr:hover td:first-child {
+    background: #1a1f2e !important;
+  }
+
+  /* ── Cell content styling ──────────────────────────── */
+  .cell-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    margin-bottom: 5px;
+    letter-spacing: 0.3px;
+  }
+  .cell-body {
+    font-size: 15px;
+    line-height: 1.55;
+  }
+  ul.cell-list {
+    list-style: none;
+    padding: 0;
+  }
+  ul.cell-list li {
+    padding: 1.5px 0;
+    padding-left: 12px;
+    position: relative;
+  }
+  ul.cell-list li::before {
+    content: '→';
+    position: absolute;
+    left: 0;
+    color: var(--text-dim);
+    font-size: 10px;
+  }
+  .tag {
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 3px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: #a0a8c4;
+    letter-spacing: 0.2px;
+    white-space: nowrap;
+    margin: 1px 2px;
+  }
+  .tag-yes {
+    color: #86efac;
+    border-color: rgba(74,222,128,0.3);
+    background: rgba(74,222,128,0.1);
+  }
+  .tag-no {
+    color: #fca5a5;
+    border-color: rgba(248,113,113,0.3);
+    background: rgba(248,113,113,0.1);
+  }
+  .tag-warn {
+    color: #fde68a;
+    border-color: rgba(251,191,36,0.3);
+    background: rgba(251,191,36,0.1);
+  }
+  .mono {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: #b0b9d4;
+  }
+  .dim { color: #8a92ad; font-size: 13px; }
+  strong { color: var(--text-heading); font-weight: 600; }
+
+  /* ── Section header rows ────────────────────────── */
+  tr.section-header td {
+    background: var(--bg-header) !important;
+    padding: 10px 18px 8px;
+    border-bottom: 1px solid var(--border-light);
+    border-top: 1px solid var(--border-light);
+  }
+  tr.section-header td:first-child {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  tr.section-header td:nth-child(n+2) {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+
+<header class="page-header">
+  <h1>Context Management <em>across harnesses</em></h1>
+  <p class="subtitle">Side-by-side comparison of how eight coding agent implementations handle context window pressure, compaction, caching, and memory.</p>
+  <div class="legend">
+    <span class="legend-item"><span class="legend-dot" style="background:var(--cc-accent)"></span>Claude Code</span>
+    <span class="legend-item"><span class="legend-dot" style="background:var(--codex-accent)"></span>Codex</span>
+    <span class="legend-item"><span class="legend-dot" style="background:var(--flue-accent)"></span>Flue</span>
+    <span class="legend-item"><span class="legend-dot" style="background:var(--hermes-accent)"></span>Hermes</span>
+    <span class="legend-item"><span class="legend-dot" style="background:var(--kf-accent)"></span>Kimiflare</span>
+    <span class="legend-item"><span class="legend-dot" style="background:var(--nc-accent)"></span>Nanoclaw</span>
+    <span class="legend-item"><span class="legend-dot" style="background:var(--oc-accent)"></span>OpenCode</span>
+    <span class="legend-item"><span class="legend-dot" style="background:var(--pi-accent)"></span>Pi</span>
+  </div>
+</header>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr>
+  <th>Aspect</th>
+  <th>
+    <span class="harness-name">Claude Code</span>
+    <span class="harness-sub">Anthropic CLI</span>
+  </th>
+  <th>
+    <span class="harness-name">Codex</span>
+    <span class="harness-sub">OpenAI CLI</span>
+  </th>
+  <th>
+    <span class="harness-name">Flue</span>
+    <span class="harness-sub">Pi-based agent</span>
+  </th>
+  <th>
+    <span class="harness-name">Hermes</span>
+    <span class="harness-sub">Multi-provider</span>
+  </th>
+  <th>
+    <span class="harness-name">Kimiflare</span>
+    <span class="harness-sub">CF Workers</span>
+  </th>
+  <th>
+    <span class="harness-name">Nanoclaw</span>
+    <span class="harness-sub">Containerised</span>
+  </th>
+  <th>
+    <span class="harness-name">OpenCode</span>
+    <span class="harness-sub">Go CLI</span>
+  </th>
+  <th>
+    <span class="harness-name">Pi</span>
+    <span class="harness-sub">Node CLI</span>
+  </th>
+</tr>
+</thead>
+<tbody>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: TOOL OUTPUT                                -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Tool Output</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">01</span>Live Truncation<br><span class="dim">LLM never sees full output</span></td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag tag-warn">Budget-based</span><br>
+    <span class="mono">applyToolResultBudget</span> caps per-message aggregate. Oversized replaced in-place, persisted via <span class="mono">contentReplacementState</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag tag-warn">At-record</span><br>
+    <span class="mono">truncate_function_output_payload</span> runs when recording into history. Uses policy × 1.2× headroom. <strong>Original gone after truncation.</strong></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag tag-warn">Per-tool caps</span><br>
+    read: 2K lines / 50KB (head). bash: 2K lines / 50KB (tail). grep: 100 matches × 500 chars. <span class="dim">LLM not told output was truncated.</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No fixed-size cap on fresh tool output. A single large output can blow the window before compressor reacts.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag tag-warn">Per-tool reducer + hard cap</span><br>
+    bash: 40 lines / 4K chars. read: 200 slices / 4K chars. grep: 50 lines / 3K chars. Hard cap <span class="mono">10,000 chars</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span><br>
+    No NanoClaw-level cap. Only truncates to 2K chars for offline markdown archive — not live context.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No truncation at the conversion layer on normal turns. Each tool's own <span class="mono">execute</span> is responsible.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Upstream only (bash)</span><br>
+    bash: 2K lines / 50KB (tail). Other tool results never trimmed on live turns. LLM told: <span class="mono">[Showing lines X–Y of Z. Full output: /tmp/…]</span></div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">02</span>Pruning Truncation<br><span class="dim">Old outputs trimmed before compaction</span></td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Microcompact clears old tool results with <span class="mono">[Old tool result content cleared]</span>. Time-based trigger.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No pruning pass. Truncation happens at record time only — once recorded, content stays as-is until compaction summarization.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No pruning before summarization. Cut point respects turn boundaries but doesn't trim individual results.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Phase 1 of pipeline: old tool-result bodies replaced with <strong>1-line summaries</strong>. Duplicate results de-duplicated. Protects last 20 messages.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No lossless pruning pass before compaction. Relies on the live per-tool reducer caps.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">prune</span> zeros out old tool outputs beyond <span class="mono">PRUNE_PROTECT = 40K</span> tokens as <span class="mono">[Old tool result content cleared]</span> at conversion time.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No pruning before summarization. Old content stays verbatim until the compaction cut point removes it entirely.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">03</span>Summarizer-Only Truncation<br><span class="dim">Only the compaction summarizer sees truncated</span></td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Auto-compact LLM receives the full remaining message history (post-microcompact).</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Local compaction sends the retained messages as-is. Remote paths are opaque.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="mono">2K chars</span><br>
+    Tool results capped at <span class="mono">TOOL_RESULT_MAX_CHARS = 2000</span> in compaction serialization.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Pruning already replaced old outputs with 1-line summaries before the summarizer sees them.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="mono">500 chars</span><br>
+    Tool content truncated to 500 chars in the transcript rendered for the LLM summarizer.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="mono">2K chars</span><br>
+    <span class="mono">toolOutputMaxChars: 2000</span> applied to tool outputs sent to the compaction summarizer.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="mono">2K chars</span><br>
+    <span class="mono">TOOL_RESULT_MAX_CHARS = 2000</span> in compaction serialization. Normal turns ship full results.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">04</span>Truncation Disclosure<br><span class="dim">LLM told output was cut</span></td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Partial</span><br>
+    Microcompact replacement is visible as text marker. Live budget truncation is not explicitly flagged.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No explicit truncation notice appended. Original is gone.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    LLM not told output was truncated.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    1-line pruning summaries like <span class="mono">[terminal] ran npm test -> exit 0, 47 lines</span> are self-describing.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    System prompt tells model about <span class="mono">expand_artifact</span>. <span class="mono">onTruncation</span> callback surfaces artifact ID.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Pruned outputs become <span class="mono">[Old tool result content cleared]</span> — no retrieval hint.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    bash appends <span class="mono">[Showing lines X–Y of Z. Full output: /tmp/path]</span>. Tool description warns upfront.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">05</span>Artifact Store<br><span class="dim">Full output preserved &amp; retrievable</span></td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Oversized content persisted via <span class="mono">contentReplacementState</span> for resume.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Original is gone after truncation. No artifact store for retrieval.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No artifact store. Truncated output is all that exists.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Full output kept in SQLite messages table but no dedicated artifact store or retrieval tool.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Full raw bytes in <strong>ToolArtifactStore</strong> (200 artifacts / 500K chars). Recoverable via <span class="mono">expand_artifact</span> tool.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Pruned content gone from context. Raw messages still in SQLite but no retrieval tool.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes (bash)</span><br>
+    Full bash output saved to temp file. Path disclosed to LLM. No artifact store for other tools.</div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: COMPACTION                                  -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Compaction</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">06</span>Compaction Trigger</td>
+  <td>
+    <div class="cell-body"><span class="mono">contextWindow − 13K</span>. Also reactive on overflow. Six layers per turn: budget → snip → microcompact → collapse → auto-compact → blocking cutoff.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Pre-turn + mid-turn + model-switch</span>. Two scopes: <span class="mono">Total</span> and <span class="mono">BodyAfterPrefix</span>. Remote v2 also pre-trims.</div>
+  </td>
+  <td>
+    <div class="cell-body">Threshold (<span class="mono">contextWindow − reserveTokens</span>) after every assistant turn. Overflow recovery: drop failed assistant, compact, retry. Manual <span class="mono">session.compact()</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">~80% of context window</span>. Checked after each turn. Anti-thrashing: 2× &lt;10% savings → suppress. Manual <span class="mono">/compress [topic]</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">&gt;80K tokens OR &gt;12 turns</span> (defaults). Wired into <span class="mono">onIterationEnd</span>. Manual <span class="mono">/compact</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body">Delegated to SDK. <span class="mono">AUTO_COMPACT_WINDOW = 165K</span>. Manual <span class="mono">/compact</span> passed through.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">tokens.total ≥ usable(input − reserved)</span> after every step-finish. Also on <span class="mono">ContextOverflowError</span> from provider.</div>
+  </td>
+  <td>
+    <div class="cell-body">Threshold (<span class="mono">usage &gt; contextWindow − reserveTokens</span>) or overflow error. Checked post-turn and pre-prompt for aborted turns.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">07</span>Compaction Algorithm</td>
+  <td>
+    <div class="cell-body"><strong>LLM summarization</strong> via forked-agent with structured 9-section prompt. Pre-pass layers are algorithmic (budget, snip, microcompact, collapse).</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>3 paths:</strong> Local (LLM handoff), Remote v1 (dedicated endpoint), Remote v2 (encrypted blob, opaque). Pre-pass drops oldest on overflow.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>LLM summarization</strong> with structured Markdown template. No pre-pass pruning. Split-turn: 2 parallel summarization calls.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>Hybrid:</strong> Phase 1 = algorithmic pruning (1-line summaries, no LLM). Phase 2 = LLM summary via auxiliary model (default Gemini Flash).</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>Two options:</strong> A = Artifact (regex, no LLM) — opt-in. B = LLM Summarize (default) ~400–800 tokens, temp 0.1.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>Delegated to SDK.</strong> PreCompact hook injects custom instructions only.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>LLM compaction</strong> via full streaming assistant turn against a special compaction agent. Reuses same SessionProcessor plumbing.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>LLM compaction only.</strong> Same provider/model as user session. No cheaper fallback model. Iterative merge via UPDATE prompt.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">08</span>Summary Format</td>
+  <td>
+    <div class="cell-body"><strong>9-section</strong> in <span class="mono">&lt;summary&gt;</span> tags after <span class="mono">&lt;analysis&gt;</span> scratchpad. Preserves all non-tool-result user turns. Inserted as user message.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>Local:</strong> freeform handoff (progress, context, next steps). <strong>Remote v2:</strong> opaque encrypted blob — no client-visible structure.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>Fixed markdown:</strong> Goal, Constraints, Progress, Key Decisions, Next Steps, Critical Context + <span class="mono">&lt;read-files&gt;</span> / <span class="mono">&lt;modified-files&gt;</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body">Resolved/pending questions, remaining work. Trailing <span class="mono">--- END OF CONTEXT SUMMARY ---</span> marker. Dynamic role to avoid same-role adjacency.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>LLM:</strong> ~400–800 tokens, inserted as <strong>user</strong> message. <strong>Artifact:</strong> structured <span class="mono">SessionState</span> with regex-extracted decisions.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">SDK-internal.</span> NanoClaw steers via customInstructions to preserve XML tags.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>Fixed markdown:</strong> Goal, Constraints, Progress, Key Decisions, Next Steps, Critical Context, Relevant Files. Stored as message with <span class="mono">summary: true</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>Fixed markdown:</strong> Goal, Constraints, Progress (Done/In Progress/Blocked), Key Decisions, Next Steps, Critical Context + file lists. Split-turn stitching.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">09</span>Iterative Update<br><span class="dim">Merge with prior summary vs re-summarize</span></td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Partial</span><br>
+    Session-memory compact can reuse extracted memory file. Standard compact re-summarizes fresh.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Each compaction rebuilds history from scratch with a new handoff summary. No merge with prior.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">UPDATE_SUMMARIZATION_PROMPT</span> preserves prior fields, rolls In Progress → Done.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    If prior summary exists, LLM told to update iteratively rather than re-summarize.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Partial</span><br>
+    LLM path: fresh each time. Artifact path: <span class="mono">SessionState</span> accumulates across compactions.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    "Update the anchored summary…" vs "Create a new anchored summary…" based on previousSummary existence.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">UPDATE_SUMMARIZATION_PROMPT</span> explicitly merges with previous summary.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">10</span>Split-Turn Handling<br><span class="dim">Cut point lands mid tool-call exchange</span></td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No special handling</span><br>
+    Slices at the compact boundary marker. No explicit split-turn logic.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Not mentioned.</span><br>
+    Local compaction retains last 20K tokens of user messages; cut is at message level.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    If cut lands on assistant (mid-turn), walks back to nearest user message. Two parallel summarization calls (history + turn prefix) stitched together.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Not mentioned.</span><br>
+    Protected head/tail by token budget. No explicit mid-turn splitting.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Not mentioned.</span><br>
+    <span class="mono">groupIntoTurns</span> splits at user-message boundaries; last N whole turns kept.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">splitTurn</span> finds midpoint where suffix fits. Walks backward for valid cut point.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">findTurnStartIndex</span> finds prior user message. Two parallel summaries stitched.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">11</span>Tail Preservation</td>
+  <td>
+    <div class="cell-body">Up to 5 recent files (≤5K each, ≤50K total) attached post-compact. Core compact drops everything before boundary.</div>
+  </td>
+  <td>
+    <div class="cell-body">Local: last <span class="mono">20K tokens</span> of user messages. Remote v2: <span class="mono">64K tokens</span> retained message budget.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">keepRecentTokens = 8,000</span>. Cut snaps to user/assistant boundaries, never a toolResult.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">tail_token_budget</span> of recent tokens. <span class="mono">protect_last_n = 20</span> tool results shielded from pruning.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">keepLastTurns = 4</span> user-anchored turns kept verbatim.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Delegated to SDK.</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">tail_turns = 2</span> (default). <span class="mono">preserve_recent_tokens = min(8K, max(2K, 0.25×usable))</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">keepRecentTokens = 20,000</span>. Cut walks backward accumulating estimated tokens, snaps to user/assistant/bashExecution boundary.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">12</span>Anti-Thrashing / Circuit Breaker</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Auto-compact circuit breaker at <span class="mono">3 consecutive failures</span>. PTL retry: truncate head and retry up to 3×.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Drops oldest items iteratively on overflow. No explicit circuit breaker.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Overflow guard only</span><br>
+    <span class="mono">overflowRecoveryAttempted</span> prevents double-recovery. No thrashing detector.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">2× &lt;10% savings → suppress</span> auto-compress with warning. Transient error cooldown.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Compaction overflow → terminal <span class="mono">ContextOverflowError</span>. No second-pass strategy.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Relies on single compaction attempt. No local fallback summarizer.</div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: CACHING                                     -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Caching</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">13</span>Cache Breakpoints</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">1 message-level marker</span><br>
+    Last message (second-to-last for forks). System blocks get <span class="mono">cacheScope</span> (global/org). TTL up to 1h.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No client-side breakpoints</span><br>
+    Uses <span class="mono">prompt_cache_key = thread_id</span> for server-side KV. Diff items after first turn.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No cache breakpoints</span><br>
+    Whatever pi-ai does internally. Date/readdir in system prompt change per <span class="mono">init()</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">4 breakpoints</span><br>
+    <span class="mono">system_and_3</span>: system prompt + last 3 non-system messages. TTL: 5m or 1h.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No cache breakpoints</span><br>
+    Relies on provider-side prefix cache. AI Gateway response cache via <span class="mono">cf-aig-cache-ttl</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No cache breakpoints</span><br>
+    Server-side 5-min prefix cache. Keeps streams open for cache warmth.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">4 breakpoints</span><br>
+    First 2 system + last 2 non-system. Anthropic-family only. Per-session <span class="mono">prompt_cache_key</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">3 breakpoints</span><br>
+    System, last tool def, last user content block. Inside provider transport. Rolling user-message breakpoint.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">14</span>Prefix Stability Strategy</td>
+  <td>
+    <div class="cell-body"><span class="mono">SYSTEM_PROMPT_DYNAMIC_BOUNDARY</span> splits static/dynamic. Tool schema cached by <span class="mono">name:hash(schema)</span>. Fork-cache sharing.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No explicit strategy</span><br>
+    <span class="mono">prompt_cache_key</span> stays same across window generations. No prefix-stability engineering.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No strategy</span><br>
+    Date and directory listing change per <span class="mono">init()</span>, defeating system prompt caching.</div>
+  </td>
+  <td>
+    <div class="cell-body">System prompt cached for session lifetime. Only invalidated by compression. Skills as user messages to preserve system cache.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Dual system messages</span><br>
+    <span class="mono">messages[0]</span> truly static, never mutated. <span class="mono">messages[1]</span> only refreshed on mode/tools/skills change.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Delegated to SDK.</span></div>
+  </td>
+  <td>
+    <div class="cell-body">Tools sorted alphabetically. ≤2 system messages for cache budget. Plugin output in second slot. Instructions re-read every turn.</div>
+  </td>
+  <td>
+    <div class="cell-body">System prompt rebuilt only when tools/skills/context change. Extensions can replace per-turn. Date string causes daily cache miss.</div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: TOKEN MANAGEMENT                            -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Token Management</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">15</span>Token Estimation</td>
+  <td>
+    <div class="cell-body"><span class="mono">chars / 4</span>. JSON: <span class="mono">chars / 2</span>. Images: flat <span class="mono">2,000</span>. Refined with API <span class="mono">usage.input_tokens</span>. Haiku fallback probe.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">(len + 3) / 4</span>. Images: 7,373 bytes. Encrypted reasoning: <span class="mono">len*3/4 − 650</span>. Server <span class="mono">TokenUsage</span> authoritative.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">chars / 4</span>. Images: 4,800 chars. Provider <span class="mono">usage.totalTokens</span> preferred.</div>
+  </td>
+  <td>
+    <div class="cell-body">Provider-reported <span class="mono">usage.prompt_tokens</span>. No tiktoken. Hardcoded context-window per model slug.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">chars / 3.5</span> (deliberately over-counts). Real usage from model's streamed <span class="mono">usage</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">None</span><br>
+    All accounting internal to SDK. Only knob: 165K compact window.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">Math.round(len / 4)</span>. No tiktoken. Provider <span class="mono">Usage</span> on step-finish authoritative.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">Math.ceil(chars / 4)</span>. Images: 1,200 tokens. Provider <span class="mono">Usage</span> authoritative for compaction.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">16</span>Overflow Recovery</td>
+  <td>
+    <div class="cell-body"><strong>Multi-stage:</strong> collapse-drain → reactive-compact → max-output-escalate → max-output-recover → stop-hooks → token-budget-continuation. Each with own guard flag.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">ContextWindowExceeded</span> → set tokens to full, propagate. During compaction, drops oldest items one by one. Remote v2 pre-trims.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Compact-and-retry</span><br>
+    Drop failed assistant, compact, then <span class="mono">harness.continue()</span>. Guarded by <span class="mono">overflowRecoveryAttempted</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body">Relies on model returning overflow error. Compressor only kicks in after turn boundary. No mid-flight handling.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>Pre-flight hard error</strong> if <span class="mono">promptTokens &gt; maxPromptTokens</span>. No runtime overflow recovery.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Delegated to SDK.</span></div>
+  </td>
+  <td>
+    <div class="cell-body">Stream drain halted mid-step on overflow. Compaction enqueued. After compact, original user message replayed. Terminal <span class="mono">ContextOverflowError</span> if still too large.</div>
+  </td>
+  <td>
+    <div class="cell-body">Error message popped from state. Auto-compact with <span class="mono">"overflow"</span> reason. Retry once. No second-pass if compact itself fails.</div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: LOOP GUARDS                                 -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Loop Guards</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">17</span>Step Budget</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No explicit budget</span><br>
+    Token budget is the primary control. Max-output-tokens recovery limited to 3 injections.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag">Parent: 90 · Sub: 50</span><br>
+    <span class="mono">execute_code</span> rounds refunded.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    <span class="mono">MAX_FOLLOWUPS = 32</span> for result-schema retry only. No general iteration limit.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag">Parent: 90 · Sub: 50</span><br>
+    Each subagent gets independent budget (can exceed nominal cap in delegation tree).</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="mono">50</span> default<br>
+    Budget exhaustion fires one final "synthesize" turn.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Liveness only: 30-min heartbeat ceiling. 60-second claim-stuck timeout.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag">Configurable</span><br>
+    On last step: tools disabled, text-only final turn via <span class="mono">max-steps.txt</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No explicit iteration limit. Relies on token budget and compaction.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">18</span>Doom-Loop Detection</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    No detection of repeated identical tool calls.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag">Window: 8 · Threshold: 2</span><br>
+    3rd identical call → synthetic failure. Also web-fetch spiral cap. Loop exhaustion → continue/synthesize/stop choice.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Delegated to SDK</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag">3 identical calls</span><br>
+    Triggers <span class="mono">permission.ask({ permission: "doom_loop" })</span>. Users can auto-deny/auto-allow.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span></div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: SYSTEM PROMPT                               -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>System Prompt</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">19</span>Prompt Structure</td>
+  <td>
+    <div class="cell-body">Array of strings: static sections (intro/rules/tools) → <span class="mono">DYNAMIC_BOUNDARY</span> → dynamic (memory, env, skills). Git status appended as trailing block.</div>
+  </td>
+  <td>
+    <div class="cell-body">Single <span class="mono">instructions</span> field to Responses API. Config override → resumed session → model-family default.</div>
+  </td>
+  <td>
+    <div class="cell-body">Preamble + AGENTS.md + CLAUDE.md + skill registry (names only) + Date + cwd + directory listing. Composed once at init.</div>
+  </td>
+  <td>
+    <div class="cell-body">Three-tier: stable (persona, tools) + context (AGENTS.md, .cursorrules) + volatile (MEMORY.md, USER.md, timestamp).</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Dual messages</span><br>
+    <span class="mono">messages[0]</span> = static (identity, rules). <span class="mono">messages[1]</span> = session (env, tools, KIMI.md, skills).</div>
+  </td>
+  <td>
+    <div class="cell-body">SDK preset + appended runtime addendum (identity + destination map). CLAUDE.md regenerated every spawn.</div>
+  </td>
+  <td>
+    <div class="cell-body">Provider-specific base prompt + env + instruction files + skills. Folded into ≤2 system messages.</div>
+  </td>
+  <td>
+    <div class="cell-body">Monolithic string: identity + tool descriptions + guidelines + Pi docs + <span class="mono">&lt;project_context&gt;</span> + <span class="mono">&lt;available_skills&gt;</span> + Date + cwd.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">20</span>Skill Loading</td>
+  <td>
+    <div class="cell-body">Skill discovery prefetch during streaming; consumed post-tools. Listed in system prompt area.</div>
+  </td>
+  <td>
+    <div class="cell-body">Skills via <span class="mono">build_skills_and_plugins</span> in initial context injection.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Progressive disclosure</span><br>
+    Name + description only. Model reads SKILL.md with <span class="mono">read</span> tool when needed.</div>
+  </td>
+  <td>
+    <div class="cell-body">Skill payloads as <strong>user messages</strong> (not system) to preserve system prompt cache.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">skillContext</span> block in session prefix. Bodies loaded on demand.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">SDK's built-in skill tool.</span> No NanoClaw-specific loading.</div>
+  </td>
+  <td>
+    <div class="cell-body">Verbose dump of all skills in system prompt every turn (if agent has <span class="mono">skill</span> permission).</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Progressive disclosure</span><br>
+    <span class="mono">&lt;available_skills&gt;</span> lists name/description/location. Bodies loaded via <span class="mono">read</span> tool. <span class="mono">/skill:name</span> expands inline.</div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: MEDIA                                       -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Media</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">21</span>Live Media Handling</td>
+  <td>
+    <div class="cell-body">Images estimated at <span class="mono">2,000</span> tokens (undershoots ~5,333 actual). No eviction on normal turns.</div>
+  </td>
+  <td>
+    <div class="cell-body">Stripped when model doesn't support images. Invalid images replaced with placeholder. LRU cache for estimates.</div>
+  </td>
+  <td>
+    <div class="cell-body">Images via <span class="mono">prompt(text, images)</span> parameter. No special eviction — same compaction as text.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">_strip_historical_media</span> removes large historical media before newest image turn. Protected tail preserved.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="mono">keepLastImageTurns = 2</span><br>
+    Image URL parts removed from older user messages. Retained in backing array but excluded from API call.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Not addressed</span><br>
+    Text-only XML messaging layer. Media handling entirely within SDK.</div>
+  </td>
+  <td>
+    <div class="cell-body">Attachments extracted and re-injected as synthetic user message for incompatible providers. No explicit eviction policy.</div>
+  </td>
+  <td>
+    <div class="cell-body">No explicit eviction on live turns. <span class="mono">convertToLlmWithBlockImages</span> strips/deduplicates when <span class="mono">blockImages</span> set.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">22</span>Compaction Media Stripping</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">stripImagesFromMessages</span> → <span class="mono">[image]</span> / <span class="mono">[document]</span>. <strong>Not re-attached post-compact.</strong></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Images removed from history when model doesn't support them. Stripped by compaction.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Same as text</span><br>
+    No special media handling during compaction. Subject to same summarization as text.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Historical media stripped before summarizer sees it.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Not mentioned separately.</span><br>
+    Handled by the general turn-based image eviction.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Delegated to SDK.</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">stripMedia: true</span> from messages sent to compaction agent.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Compaction serialization strips images from summarizer input.</div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: MEMORY                                      -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Memory</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">23</span>Cross-Session Store</td>
+  <td>
+    <div class="cell-body"><strong>Layered:</strong> CLAUDE.md (cwd walk), memdir (<span class="mono">MEMORY.md</span> ≤200 lines / 25KB), team memory (gated), session memory (experimental).</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>File-backed pipeline:</strong> Phase 1 extracts from rollouts → state DB. Phase 2 consolidation sub-agent → git-tracked <span class="mono">MEMORY.md</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No cross-session memory</span><br>
+    AGENTS.md read once at <span class="mono">init()</span>. Continuity via reusing same agent instance.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>SQLite + FTS5</strong> search tool. <span class="mono">MEMORY.md</span> (2,200 chars) + <span class="mono">USER.md</span> (1,375 chars). Pluggable memory providers.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>SQLite + vector embeddings</strong> (<span class="mono">bge-base-en-v1.5</span>). Session files on disk. <span class="mono">KIMI.md</span> capped 20KB.</div>
+  </td>
+  <td>
+    <div class="cell-body">Composed CLAUDE.md per spawn. <span class="mono">CLAUDE.local.md</span> per-group writable. Global shared memory (read-only). SDK auto-memory.</div>
+  </td>
+  <td>
+    <div class="cell-body"><strong>File-based only:</strong> AGENTS.md/CLAUDE.md read from disk every turn. No vector store. Plan files in <span class="mono">.opencode/plans/</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body">JSONL session files resumable. AGENTS.md/CLAUDE.md walked from cwd, inlined. One-way read. No separate memory file or vector store.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">24</span>Memory Recall</td>
+  <td>
+    <div class="cell-body">Memory prefetch during streaming; consumed post-tools. No auto-injection of search results.</div>
+  </td>
+  <td>
+    <div class="cell-body">Memories referenced as filesystem artifacts and citations, not auto-pasted into prompts.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No recall mechanism</span></div>
+  </td>
+  <td>
+    <div class="cell-body">FTS5 + trigram search exposed as explicit tool (<strong>not</strong> auto-injected). Memory provider <span class="mono">prefetch_all</span> runs before each turn.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Hybrid retrieval</span><br>
+    FTS + vector + exact + topic-key. Session-start recall using cwd as query. On-demand via <span class="mono">memory_recall</span> tool.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Agents read markdown files as files.</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No recall</span><br>
+    Instruction files re-read every turn. No auto-recall of past session content.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No recall</span><br>
+    Past sessions resumable via CLI flags but no auto-injection of prior session content.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">25</span>Memory Write</td>
+  <td>
+    <div class="cell-body">Auto memory dir with model-managed per-topic files. Session-memory extraction as post-sampling hook. Team memory sync (gated).</div>
+  </td>
+  <td>
+    <div class="cell-body">Background Phase 1 per-rollout extraction. Phase 2 consolidation sub-agent updates <span class="mono">MEMORY.md</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No write mechanism</span><br>
+    User-extensible <span class="mono">metadata</span> bag only.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">memory_tool.py</span> (add/replace/remove to MEMORY.md/USER.md). Pluggable providers' <span class="mono">sync_all</span>. Curator ages skills.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">memory_remember</span> / <span class="mono">memory_forget</span> tools. Auto-extraction on every tool result. 3 secondary LLM calls per remember.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">SDK auto-memory + CLAUDE.local.md.</span></div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No write mechanism</span><br>
+    Only editing AGENTS.md/CLAUDE.md files directly.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No write mechanism</span><br>
+    One-way read of AGENTS.md/CLAUDE.md.</div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: SUBAGENTS                                   -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Subagents</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">26</span>Subagent Support</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes — 3 flavors</span><br>
+    Sync local, async local (background), remote (CCR).</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Fork modes: <span class="mono">FullHistory</span> or <span class="mono">LastNTurns(n)</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span> <span class="tag">Depth cap: 4</span><br>
+    Fresh session, shares sandbox.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Single or batch (parallel, <span class="mono">max_workers=3</span>).</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No</span><br>
+    Closest: Code Mode sandbox — same history, not a separate conversation.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">SDK teams enabled, unconfigured</span><br>
+    Multi-agent = separate containers via SQLite messaging.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Via <span class="mono">task</span> tool. Background subagents: experimental flag.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No built-in primitive</span><br>
+    SDK exposes <span class="mono">createAgentSession</span> for extensions only.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">27</span>Context Inheritance</td>
+  <td>
+    <div class="cell-body">Read-only agents drop CLAUDE.md and gitStatus. Fork uses <span class="mono">useExactTools</span> for byte-identical prefix.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">FullHistory</span> or <span class="mono">LastNTurns(n)</span>. Inherits shell snapshot, exec policy, connector state.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No history</span><br>
+    Child starts empty. Re-discovers AGENTS.md from own cwd. Inherits model, sandbox.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No history</span><br>
+    Copies model, provider, credentials, toolset. No inherited messages.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">N/A</span></div>
+  </td>
+  <td>
+    <div class="cell-body">Messages carry only sender's <span class="mono">&lt;message&gt;</span> block. Each container has own full session.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No history</span><br>
+    Prompt text only. Model defaults to parent's model.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">N/A</span></div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">28</span>Reintegration</td>
+  <td>
+    <div class="cell-body">Single <span class="mono">tool_result</span> block + agentId trailer. Full sidechain transcript persisted to disk.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">InterAgentCommunication</span> as assistant message with <span class="mono">phase: Commentary</span>. Counts as turn boundary.</div>
+  </td>
+  <td>
+    <div class="cell-body">Child's full text reply as single <span class="mono">AgentToolResult</span>. Child session closed after call.</div>
+  </td>
+  <td>
+    <div class="cell-body">JSON summary only: <span class="mono">{status, summary, error, api_calls, duration}</span>. Full transcript in own SQLite row.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">N/A</span></div>
+  </td>
+  <td>
+    <div class="cell-body">Ordinary message delivery between containers. Not context merging.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="mono">&lt;task_result&gt;</span> XML as tool output. Background tasks get placeholder + later synthetic message.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">N/A</span></div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">29</span>Parallelism</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Async local (background mailbox). Remote (CCR). Teammate spawn.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">ThreadPoolExecutor</span>, polling with <span class="mono">wait(FIRST_COMPLETED)</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">Sequential only</span><br>
+    <span class="mono">runExclusive</span> ensures one operation at a time.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">ThreadPoolExecutor(max_workers=3)</span>. Cost warning if &gt;10.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">N/A</span></div>
+  </td>
+  <td>
+    <div class="cell-body">Separate containers run independently. Host routes messages. No in-process parallelism.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Foreground blocks parent</span><br>
+    Background subagents gated on experimental flag.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">N/A</span></div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: PERSISTENCE                                 -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Persistence</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">30</span>Session Storage</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">File-based transcripts</span><br>
+    JSONL via <span class="mono">recordTranscript</span>. Sidechain transcripts per subagent.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">3 layers</span><br>
+    JSONL rollouts + SQLite state DB + filesystem memory workspace (git-tracked).</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Pluggable</span><br>
+    Default: in-memory (lost on exit). Cloudflare: Durable Object SQLite. Writes entire blob every turn.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">SQLite + FTS5</span><br>
+    Schema v13. WAL mode. FTS5 + trigram virtual tables. Turn-by-turn persistence.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">JSON + SQLite</span><br>
+    Sessions: disk JSON. Memory: SQLite with vector embeddings.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">SQLite + JSONL</span><br>
+    SQLite for messaging. JSONL SDK transcript bind-mounted. Markdown archives.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">SQLite (Drizzle)</span><br>
+    All state in project-scoped DB. Messages, parts, sessions in tables.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">JSONL session tree</span><br>
+    <span class="mono">~/.pi/agent/sessions/</span>. Per-entry <span class="mono">parentId</span>. Branch walk for reconstruction.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">31</span>Forking / Branching</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Resume only</span><br>
+    <span class="mono">--resume</span>. No explicit forking of main thread.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    Fork modes for subagents. Session resume from JSONL replay.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No user-facing fork</span><br>
+    <span class="mono">BranchSummaryEntry</span> type exists but never produced.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">/resume</span>, <span class="mono">/branch</span>, <span class="mono">/reset</span>. Compression creates new session row with <span class="mono">parent_session_id</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Resume only</span><br>
+    <span class="mono">/resume</span> reloads prior session. No branching.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No forking</span><br>
+    <span class="mono">/clear</span> resets continuation only.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">Session.fork</span> copies messages up to optional messageID, remapping IDs.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Yes</span><br>
+    <span class="mono">--continue</span>, <span class="mono">--resume</span>, <span class="mono">--session</span>, <span class="mono">--fork</span>. Branch summarization on leaf navigation.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">32</span>History Reconstruction</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">In-place mutation</span><br>
+    <span class="mono">getMessagesAfterCompactBoundary</span> slices array. Content replacements mutate messages.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Clone per turn</span><br>
+    <span class="mono">sess.clone_history()</span> clones and normalizes every turn (strip images, remove orphans).</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">DAG walk</span><br>
+    <span class="mono">history.buildContext()</span> walks leaf → root, renders into flat array.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">In-place mutation</span><br>
+    Python list appended and compressed in place.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Shared ref</span><br>
+    <span class="mono">messagesRef.current</span> mutated in place. No rebuild per turn.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-no">No reconstruction</span><br>
+    Only new batch sent; history is SDK-resumed via continuation handle.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Full re-read from DB</span><br>
+    SQLite query every turn. No in-memory buffer across iterations.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Branch walk</span><br>
+    <span class="mono">buildSessionContext</span> reconstructs from JSONL entries every turn.</div>
+  </td>
+</tr>
+
+<!-- ════════════════════════════════════════════════════ -->
+<!-- SECTION: PROVIDER                                    -->
+<!-- ════════════════════════════════════════════════════ -->
+<tr class="section-header"><td>Provider</td><td colspan="8"></td></tr>
+
+<tr>
+  <td><span class="aspect-num">33</span>Provider Abstraction</td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Anthropic-only</span><br>
+    Deep Anthropic-specific optimizations (cache scopes, cache_edits). Bedrock/Vertex variants.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">OpenAI-only</span><br>
+    Responses API (HTTP or WebSocket). Bedrock for token counting.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Multi-provider</span><br>
+    Via pi-ai: Cloudflare Workers AI, OpenAI, Anthropic.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Multi-provider</span><br>
+    chat_completions, anthropic_messages, bedrock, codex, gemini.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Multi-provider</span><br>
+    Cloudflare AI Gateway as routing layer. Workers AI + external via gateway.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-warn">Anthropic-only</span><br>
+    Delegates to Claude Agent SDK.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Multi-provider</span><br>
+    AI SDK v6: Anthropic, OpenAI, Gemini, Codex, Kimi, Trinity.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Multi-provider</span><br>
+    pi-ai: Anthropic, OpenAI, OpenRouter, etc. Provider-specific cache breakpoints in transport.</div>
+  </td>
+</tr>
+
+<tr>
+  <td><span class="aspect-num">34</span>Compaction Model</td>
+  <td>
+    <div class="cell-body">Same model as session. No cheap-model fallback.</div>
+  </td>
+  <td>
+    <div class="cell-body">Local: same model. Remote: server-side (opaque model).</div>
+  </td>
+  <td>
+    <div class="cell-body">Same model as session via <span class="mono">completeSimple</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="tag tag-yes">Configurable</span><br>
+    Default: Gemini Flash via OpenRouter. Fallback: main model on transient error.</div>
+  </td>
+  <td>
+    <div class="cell-body">Same model, lightweight params: <span class="mono">temp 0.1, reasoningEffort "low"</span>.</div>
+  </td>
+  <td>
+    <div class="cell-body"><span class="dim">Delegated to SDK.</span></div>
+  </td>
+  <td>
+    <div class="cell-body">Same model as session. Reuses full SessionProcessor plumbing.</div>
+  </td>
+  <td>
+    <div class="cell-body">Same model as session. No cheap fallback. <span class="dim">Config option for override not implemented.</span></div>
+  </td>
+</tr>
+
+</tbody>
+
+</table>
+</div>
+
+</body>
+</html>
