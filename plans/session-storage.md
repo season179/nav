@@ -39,6 +39,9 @@ Nav targets three API shapes:
    deltas, compaction, and partial deletes work without rewriting entire turns.
 7. **Session-level aggregates** — cost and token counts accumulated on the
    `sessions` row for O(1) queries, not recomputed from parts.
+8. **Raw payloads survive replay trimming** — large tool arguments, raw tool
+   outputs, and media bytes spill to an artifact blob store. Compaction changes
+   the model-visible projection, not the underlying bytes.
 
 ```text
 Persist (always)              Reconstruct (per turn)
@@ -57,7 +60,7 @@ SQLite: canonical turns  →    ModelResolver → ApiKind
 | `nav-harness::sessions::migrate` | SQL migrations |
 | `nav-harness::models::encode` | Build provider request from canonical turns (no HTTP) |
 | `nav-harness::models::decode` | Parse provider response into canonical turns |
-| `nav-types` | `SessionId`, `RunId`, `MessageId`, `ToolCallId` (prefixed monotonic IDs) |
+| `nav-types` | `SessionId`, `RunId`, `MessageId`, `ToolCallId`, `ArtifactId` (prefixed monotonic IDs) |
 
 Extend `models::api::ApiKind` when encoders land:
 
@@ -103,6 +106,7 @@ All IDs are prefixed, monotonic, and human-readable:
 | `msg_` | MessageId (= TurnId) | ascending | `msg_3b4c5d6e7f8a...` |
 | `prt_` | PartId | ascending | `prt_9a0b1c2d3e4f...` |
 | `tool_` | ToolCallId | ascending | `tool_5e6f7a8b9c0d...` |
+| `art_` | ArtifactId | ascending | `art_1a2b3c4d5e6f...` |
 
 **Ascending** = newer IDs are lexicographically larger. **Descending** = newer
 IDs are lexicographically smaller (so `ORDER BY id` gives recent-first without
@@ -155,16 +159,18 @@ enum Part {
     },
     Image {
         mime: String,
-        source: ImageSource,          // FileRef { attachment_id } or inline bytes
+        source: ImageSource,          // FileRef { artifact_id } or inline bytes
     },
     ToolCall {
         id: ToolCallId,
         name: String,
         arguments: serde_json::Value,
+        raw_arguments_artifact_id: Option<ArtifactId>,
     },
     ToolResult {
         call_id: ToolCallId,
         content: String,
+        raw_artifact_id: Option<ArtifactId>,
         is_error: bool,
     },
     Thinking {
@@ -214,9 +220,11 @@ UI for debugging, excluded from encoding by default.
 - Tool results go on the assistant turn (not a separate `user` turn). The
   Anthropic encoder restructures them into the `tool_result` content blocks
   Anthropic expects.
-- Images: `ImageSource::FileRef { attachment_id }` with bytes in `attachments`.
+- Images: `ImageSource::FileRef { artifact_id }` with bytes in `artifacts`.
+- Large tool arguments/results keep a compact replay projection in `data_json`
+  and the full original bytes in `artifacts`.
 - `synthetic: true` on Text parts marks nav-generated text (e.g. compaction
-  follow-ups, attachment descriptions) so the UI can style them differently.
+  follow-ups, artifact descriptions) so the UI can style them differently.
 
 ### TurnMeta
 
@@ -251,11 +259,11 @@ CREATE TABLE schema_migrations (
 CREATE TABLE sessions (
     id              TEXT PRIMARY KEY NOT NULL,
     title           TEXT,
-    source          TEXT NOT NULL DEFAULT 'cli',     -- cli | api | tui
+    source          TEXT NOT NULL DEFAULT 'cli',     -- cli | api | tui | task
     workspace_root  TEXT,
     system_prompt   TEXT,
     settings_json   TEXT NOT NULL DEFAULT '{}',
-    parent_id       TEXT REFERENCES sessions(id),    -- fork chain
+    parent_id       TEXT REFERENCES sessions(id),    -- fork/subagent chain
     version         TEXT NOT NULL,                    -- app version at creation
     slug            TEXT,                             -- human-readable URL slug
     -- Session-level cost/token accumulation
@@ -287,8 +295,10 @@ prefs), e.g.:
 Changing model mid-session updates this field only; existing turns stay
 canonical.
 
-**Fork chain:** `parent_id` links to the session this was forked from. Forking
-copies turns up to a given message into a new session with remapped IDs.
+**Lineage chain:** `parent_id` links to the session this was forked from or the
+parent session that spawned a subagent. Forking copies turns up to a given
+message into a new session with remapped IDs. Subagents start as separate
+sessions with their own runs and use `source = 'task'`.
 
 **Cost/tokens:** accumulated via SQL arithmetic (`cost = cost + ?`) on every
 `StepFinish` part upsert. Reversed when parts are updated/replaced. Gives O(1)
@@ -378,12 +388,14 @@ Example `state_json` for OpenAI Responses:
 
 Clear or ignore this row when `ApiKind` changes for the session/run.
 
-### `attachments`
+### `artifacts`
 
 ```sql
-CREATE TABLE attachments (
+CREATE TABLE artifacts (
     id              TEXT PRIMARY KEY NOT NULL,
     session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    part_id         TEXT REFERENCES turn_parts(id) ON DELETE SET NULL,
+    kind            TEXT NOT NULL,   -- media | tool_input | tool_output | snapshot | other
     mime            TEXT NOT NULL,
     sha256          TEXT NOT NULL,
     path            TEXT NOT NULL,
@@ -392,7 +404,10 @@ CREATE TABLE attachments (
 );
 ```
 
-Blob files live under `{data_dir}/blobs/`; DB stores path + hash.
+Blob files live under `{data_dir}/blobs/`; DB stores path + hash. Media
+attachments, spilled tool-call arguments, raw tool outputs, and filesystem
+snapshots all use the same artifact table. `turn_parts.data_json` keeps the
+small model-visible projection and references `artifacts.id` for expansion.
 
 ## `SessionStore` API
 
@@ -426,6 +441,10 @@ impl SessionStore {
     pub fn update_part_delta(&self, turn_id: &MessageId, part_id: &PartId, field: &str, delta: &str) -> Result<()>;
     pub fn remove_part(&self, session_id: &SessionId, turn_id: &MessageId, part_id: &PartId) -> Result<()>;
     pub fn compact_part(&self, part_id: &PartId) -> Result<()>;  // sets compacted_at
+
+    // Artifacts
+    pub fn put_artifact(&self, artifact: NewArtifact, bytes: &[u8]) -> Result<ArtifactId>;
+    pub fn get_artifact(&self, id: &ArtifactId) -> Result<Artifact>;
 
     // Provider state
     pub fn get_provider_state(&self, run_id: &RunId) -> Result<Option<ProviderState>>;
@@ -531,14 +550,14 @@ Because canonical storage is API-agnostic, switching is seamless:
 ## Compaction
 
 Context windows fill up. Compaction shrinks the turn history sent to the model
-while preserving the canonical ledger intact.
+while preserving the canonical ledger and artifact bytes intact.
 
 ### Pruning (cheap, frequent)
 
 Walk backward through tool-result parts. Keep a token budget of recent results
 (`PRUNE_PROTECT = 40K` tokens). For older results, set `compacted_at` on the
 part — the encoder replaces the content with `"[Old tool result content
-cleared]"`. No rows are deleted. No summarization LLM call needed.
+cleared]"`. No rows or artifacts are deleted. No summarization LLM call needed.
 
 ```text
 for each tool_result part, newest first:
@@ -551,16 +570,19 @@ for context even when old.
 
 **Deduplication** (before pruning): hash tool-result content. If the same
 content appears multiple times (e.g. same file read 5×), replace older copies
-with `[Duplicate — see more recent result]`. Only the newest full copy survives.
+with `[Duplicate — see more recent result]` in the replay projection. Raw
+artifact bytes remain available through `expand_artifact`.
 
 **Tool call argument truncation:** assistant messages outside the protected
 tail get their `ToolCall.arguments` JSON truncated — long string values are
 shrunk while preserving valid JSON structure. Prevents a single `write_file`
-with 50KB content from consuming the entire context budget.
+with 50KB content from consuming the entire context budget. If the raw argument
+was spilled, `raw_arguments_artifact_id` points at the original JSON bytes.
 
 **Image stripping:** replace old `Image` parts (before the last image-bearing
 user turn) with `[Attached image — stripped after compression]`. Prevents
-multi-MB base64 blobs from surviving indefinitely.
+multi-MB base64 blobs from surviving indefinitely in replay; the media artifact
+stays on disk until artifact retention deletes it.
 
 ### Summarization (expensive, on overflow or manual)
 
@@ -720,8 +742,8 @@ whole turns.
 | 2 | `encode` / `decode` for `OpenAiChatCompletions` only |
 | 3 | Agent loop wired to store + encode path (nav-server HTTP) |
 | 4 | `AnthropicMessages` + `OpenAiResponses` encoders; `provider_state`; step handling |
-| 5 | Attachments blob store + FTS5 full-text search |
-| 6 | Pruning (tool output compaction via `compacted_at`, dedup, arg truncation, image stripping) |
+| 5 | Artifact blob store + FTS5 full-text search |
+| 6 | Pruning (tool output compaction via `compacted_at`, dedup, arg/result projection, image stripping) |
 | 7 | Summarization compaction + overflow handling + anti-thrashing |
 | 8 | Fork, revert, session-level cost display, auto-title generation |
 
@@ -740,7 +762,7 @@ whole turns.
 
 - Default `data_dir` resolution: global vs per-workspace DB.
 - Whether `list_turns_for_session` spans all runs or only the active run for UI.
-- Retention policy for old runs/attachments (not required for v1).
+- Retention policy for old runs/artifacts (not required for v1).
 - Whether event sourcing (typed events + projectors → read models) should be
   introduced from the start or added later. OpenCode uses this pattern
   extensively for sync and replay, but it adds complexity. Recommendation: keep
