@@ -20,7 +20,7 @@ use nav_harness::models::{
     ThinkingFormat,
 };
 use nav_harness::tools::{ToolPreset, ToolRegistry, read};
-use nav_types::{EventId, MessageId, RunId, ToolCallId};
+use nav_types::{ApprovalId, EventId, MessageId, RunId, ToolCallId};
 use serde_json::json;
 
 #[test]
@@ -782,6 +782,11 @@ impl HarnessEventIdSource for TestIds {
     fn next_tool_call_id(&mut self) -> ToolCallId {
         self.next_tool_call += 1;
         tool_call_id(self.next_tool_call)
+    }
+
+    fn next_approval_id(&mut self) -> ApprovalId {
+        ApprovalId::try_new("019f2f6f-f178-7a72-9f28-000000000040")
+            .expect("test approval id should be UUIDv7-shaped")
     }
 }
 

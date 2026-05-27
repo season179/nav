@@ -8,12 +8,13 @@ use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
+use nav_harness::sessions::PendingConfirmation;
 use nav_protocol::rpc::{SessionSource, ToolsPreset};
 use nav_protocol::{BackendEvent, EventEnvelope};
 use nav_server::http::{
     HttpRequest, HttpServer, HttpServerConfig, ProtocolEventSubscription, RunStatus,
 };
-use nav_types::{RunId, SessionId};
+use nav_types::{ApprovalId, RunId, SessionId, ToolCallId};
 use serde_json::{Value, json};
 
 mod support;
@@ -847,6 +848,10 @@ fn run_cancel_cancels_active_provider_stream_and_publishes_run_cancelled() {
     );
     let session_id = create_session(&mut server);
     let run_id = send_message(&mut server, &session_id);
+    let pending_approval_id = approval_id(70);
+    server
+        .register_pending_confirmation(pending_confirmation(&run_id, pending_approval_id.clone()))
+        .expect("pending confirmation should register");
 
     let request = provider.wait_for_request();
     assert_eq!(request.path, "/v1/chat/completions");
@@ -880,6 +885,25 @@ fn run_cancel_cancels_active_provider_stream_and_publishes_run_cancelled() {
         vec!["session.created", "run.started", "run.cancelled"]
     );
     assert_eq!(events[2].data["run_id"], run_id);
+
+    let approve_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(8),
+            "method": "tool.approve",
+            "params": { "approval_id": pending_approval_id }
+        })
+        .to_string(),
+    ));
+    let approve_body: Value = serde_json::from_str(approve_response.body()).unwrap();
+    assert_eq!(approve_body["error"]["code"], -32006);
+    assert!(
+        approve_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not pending")
+    );
 }
 
 #[test]
@@ -1207,6 +1231,18 @@ fn create_session_with_cwd(server: &mut HttpServer, cwd: &Path) -> String {
         .to_string()
 }
 
+fn pending_confirmation(run_id: &str, approval_id: ApprovalId) -> PendingConfirmation {
+    PendingConfirmation {
+        approval_id,
+        run_id: RunId::try_new(run_id).unwrap(),
+        tool_call_id: ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap(),
+        tool_name: "write_file".to_string(),
+        reason: "writes outside the current task focus".to_string(),
+        arguments_summary: r#"{"path":"notes.md","content":"hello"}"#.to_string(),
+        risk_class: Some("mutate".to_string()),
+    }
+}
+
 struct TestWorkspace {
     root: PathBuf,
 }
@@ -1342,6 +1378,10 @@ fn missing_key_model_settings() -> ModelSettings {
 
 fn request_id(index: u64) -> String {
     format!("019f2f6f-f178-7a72-9f28-{index:012x}")
+}
+
+fn approval_id(index: u64) -> ApprovalId {
+    ApprovalId::try_new(format!("019f2f6f-f178-7a72-9f28-{index:012x}")).unwrap()
 }
 
 fn assert_uuid_v7(value: &str) {

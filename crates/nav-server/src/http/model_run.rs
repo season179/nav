@@ -6,10 +6,10 @@ use nav_harness::models::{
     ModelResolver, OpenAiCompletionsCancellationToken, OpenAiCompletionsError, ResolveModelError,
     ResolvedModelConfig,
 };
-use nav_harness::sessions::{SessionStore, Turn};
+use nav_harness::sessions::{PendingConfirmation, PendingConfirmationRegistry, SessionStore, Turn};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};
 use nav_protocol::{BackendEvent, EventEnvelope, ProviderEventMetadata};
-use nav_types::{EventId, MessageId, RunId, SessionId, ToolCallId};
+use nav_types::{ApprovalId, EventId, MessageId, RunId, SessionId, ToolCallId};
 
 use super::event_mapping::harness_events_to_backend_events;
 use super::event_store::ProtocolEventStore;
@@ -27,6 +27,7 @@ pub(super) struct ModelRunState {
     event_store: Arc<Mutex<ProtocolEventStore>>,
     runs: Arc<Mutex<HashMap<RunId, RunState>>>,
     session_store: Arc<Mutex<SessionStore>>,
+    pending_confirmations: Arc<Mutex<PendingConfirmationRegistry>>,
 }
 
 impl ModelRunState {
@@ -35,12 +36,14 @@ impl ModelRunState {
         event_store: Arc<Mutex<ProtocolEventStore>>,
         runs: Arc<Mutex<HashMap<RunId, RunState>>>,
         session_store: Arc<Mutex<SessionStore>>,
+        pending_confirmations: Arc<Mutex<PendingConfirmationRegistry>>,
     ) -> Self {
         Self {
             ids,
             event_store,
             runs,
             session_store,
+            pending_confirmations,
         }
     }
 }
@@ -71,6 +74,7 @@ impl ModelRunService {
                     &state.ids,
                     &state.event_store,
                     &state.runs,
+                    &state.pending_confirmations,
                     request.session_id,
                     request.run_id,
                     resolve_error_message(error),
@@ -104,6 +108,7 @@ impl ModelRunService {
                 publish_run_loop_events(
                     &state.event_store,
                     &state.runs,
+                    &state.pending_confirmations,
                     request.run_id,
                     stream_events,
                 );
@@ -122,6 +127,7 @@ impl ModelRunService {
                     &state.event_store,
                     &state.runs,
                     &state.session_store,
+                    &state.pending_confirmations,
                     request.session_id,
                     request.run_id,
                     completion.turns,
@@ -146,6 +152,7 @@ impl ModelRunService {
                     &state.ids,
                     &state.event_store,
                     &state.runs,
+                    &state.pending_confirmations,
                     request.session_id,
                     request.run_id,
                     run_failed_message(&error),
@@ -175,13 +182,20 @@ fn split_provider_errors(events: Vec<EventEnvelope>) -> (Vec<EventEnvelope>, Vec
 fn publish_run_loop_events(
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
+    pending_confirmations: &Arc<Mutex<PendingConfirmationRegistry>>,
     run_id: &RunId,
     events: impl IntoIterator<Item = EventEnvelope>,
 ) {
     for event in events {
         debug_assert!(!matches!(&event.event, BackendEvent::RunCompleted { .. }));
         if !matches!(&event.event, BackendEvent::RunCompleted { .. }) {
-            publish_running_event(event_store, runs, run_id, event);
+            publish_running_event(
+                event_store,
+                runs,
+                Some(pending_confirmations),
+                run_id,
+                event,
+            );
         }
     }
 }
@@ -190,6 +204,7 @@ fn publish_run_loop_completion(
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
     session_store: &Arc<Mutex<SessionStore>>,
+    pending_confirmations: &Arc<Mutex<PendingConfirmationRegistry>>,
     session_id: &SessionId,
     run_id: &RunId,
     turns: Vec<Turn>,
@@ -211,6 +226,7 @@ fn publish_run_loop_completion(
         }
     }
     run.status = RunStatus::Completed;
+    pending_confirmations.lock().unwrap().clear_for_run(run_id);
     event_store.lock().unwrap().append_many(events);
     true
 }
@@ -226,7 +242,7 @@ fn publish_stream_events(
         if matches!(&event.event, BackendEvent::RunCompleted { .. }) {
             publish_terminal_event(event_store, runs, run_id, RunStatus::Completed, event);
         } else {
-            publish_running_event(event_store, runs, run_id, event);
+            publish_running_event(event_store, runs, None, run_id, event);
         }
     }
 }
@@ -235,6 +251,7 @@ fn publish_run_failure(
     ids: &Arc<Mutex<ProtocolIdSource>>,
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
+    pending_confirmations: &Arc<Mutex<PendingConfirmationRegistry>>,
     session_id: &SessionId,
     run_id: &RunId,
     message: String,
@@ -244,6 +261,7 @@ fn publish_run_failure(
     publish_terminal_events(
         event_store,
         runs,
+        Some(pending_confirmations),
         run_id,
         RunStatus::Failed,
         provider_errors
@@ -255,6 +273,7 @@ fn publish_run_failure(
 fn publish_running_event(
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
+    pending_confirmations: Option<&Arc<Mutex<PendingConfirmationRegistry>>>,
     run_id: &RunId,
     event: EventEnvelope,
 ) -> bool {
@@ -266,8 +285,40 @@ fn publish_running_event(
         return false;
     }
 
+    if let Some(pending_confirmations) = pending_confirmations {
+        record_pending_confirmation(pending_confirmations, &event);
+    }
     event_store.lock().unwrap().append(event);
     true
+}
+
+fn record_pending_confirmation(
+    pending_confirmations: &Arc<Mutex<PendingConfirmationRegistry>>,
+    event: &EventEnvelope,
+) {
+    let BackendEvent::ToolApprovalRequested {
+        run_id,
+        tool_call_id,
+        approval_id,
+        tool_name,
+        reason,
+        arguments_summary,
+        risk_class,
+    } = &event.event
+    else {
+        return;
+    };
+
+    let pending = PendingConfirmation {
+        approval_id: approval_id.clone(),
+        run_id: run_id.clone(),
+        tool_call_id: tool_call_id.clone(),
+        tool_name: tool_name.clone(),
+        reason: reason.clone(),
+        arguments_summary: arguments_summary.clone(),
+        risk_class: risk_class.clone(),
+    };
+    let _ = pending_confirmations.lock().unwrap().record(pending);
 }
 
 #[cfg(test)]
@@ -278,12 +329,20 @@ fn publish_terminal_event(
     status: RunStatus,
     event: EventEnvelope,
 ) -> bool {
-    publish_terminal_events(event_store, runs, run_id, status, std::iter::once(event))
+    publish_terminal_events(
+        event_store,
+        runs,
+        None,
+        run_id,
+        status,
+        std::iter::once(event),
+    )
 }
 
 fn publish_terminal_events(
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
+    pending_confirmations: Option<&Arc<Mutex<PendingConfirmationRegistry>>>,
     run_id: &RunId,
     status: RunStatus,
     events: impl IntoIterator<Item = EventEnvelope>,
@@ -298,6 +357,9 @@ fn publish_terminal_events(
     }
 
     run.status = status;
+    if let Some(pending_confirmations) = pending_confirmations {
+        pending_confirmations.lock().unwrap().clear_for_run(run_id);
+    }
     event_store.lock().unwrap().append_many(events);
     true
 }
@@ -313,6 +375,10 @@ impl nav_harness::events::HarnessEventIdSource for SharedProtocolIdSource {
 
     fn next_tool_call_id(&mut self) -> ToolCallId {
         self.ids.lock().unwrap().next_tool_call_id()
+    }
+
+    fn next_approval_id(&mut self) -> ApprovalId {
+        self.ids.lock().unwrap().next_approval_id()
     }
 }
 
@@ -449,14 +515,64 @@ mod tests {
     }
 
     #[test]
+    fn approval_requests_are_recorded_before_publication() {
+        let fixture = RunFixture::new(RunStatus::Running);
+        let pending_confirmations = fixture.pending_confirmations();
+        let approval_id = fixture.next_approval_id();
+
+        publish_run_loop_events(
+            &fixture.event_store,
+            &fixture.runs,
+            &pending_confirmations,
+            &fixture.run_id,
+            vec![fixture.approval_requested_event(&approval_id)],
+        );
+
+        assert_eq!(
+            fixture.event_types(),
+            vec!["session.created", "tool.approval_requested"]
+        );
+        assert!(
+            pending_confirmations
+                .lock()
+                .unwrap()
+                .resolve(
+                    &approval_id,
+                    nav_harness::sessions::ConfirmationDecision::Approved,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn approval_requests_are_not_recorded_after_run_stops_running() {
+        let fixture = RunFixture::new(RunStatus::Cancelled);
+        let pending_confirmations = fixture.pending_confirmations();
+        let approval_id = fixture.next_approval_id();
+
+        publish_run_loop_events(
+            &fixture.event_store,
+            &fixture.runs,
+            &pending_confirmations,
+            &fixture.run_id,
+            vec![fixture.approval_requested_event(&approval_id)],
+        );
+
+        assert_eq!(fixture.event_types(), vec!["session.created"]);
+        assert_confirmation_not_pending(&pending_confirmations, &approval_id);
+    }
+
+    #[test]
     fn completed_model_run_persists_assistant_turn_before_terminal_status() {
         let fixture = RunFixture::new(RunStatus::Running);
         let session_store = fixture.session_store();
+        let pending_confirmations = fixture.pending_confirmations();
 
         publish_run_loop_completion(
             &fixture.event_store,
             &fixture.runs,
             &session_store,
+            &pending_confirmations,
             &fixture.session_id,
             &fixture.run_id,
             vec![Turn::assistant_text("assistant reply")],
@@ -478,11 +594,13 @@ mod tests {
     fn completed_model_run_does_not_persist_assistant_turn_after_run_stops_running() {
         let fixture = RunFixture::new(RunStatus::Cancelled);
         let session_store = fixture.session_store();
+        let pending_confirmations = fixture.pending_confirmations();
 
         publish_run_loop_completion(
             &fixture.event_store,
             &fixture.runs,
             &session_store,
+            &pending_confirmations,
             &fixture.session_id,
             &fixture.run_id,
             vec![Turn::assistant_text("late assistant reply")],
@@ -501,14 +619,68 @@ mod tests {
     }
 
     #[test]
-    fn failed_run_events_are_not_published_after_run_stops_running() {
-        let fixture = RunFixture::new(RunStatus::Cancelled);
+    fn completed_model_run_clears_pending_confirmations() {
+        let fixture = RunFixture::new(RunStatus::Running);
+        let session_store = fixture.session_store();
+        let pending_confirmations = fixture.pending_confirmations();
+        let approval_id = fixture.next_approval_id();
+        pending_confirmations
+            .lock()
+            .unwrap()
+            .record(fixture.pending_confirmation(&approval_id))
+            .expect("pending confirmation should record");
+
+        publish_run_loop_completion(
+            &fixture.event_store,
+            &fixture.runs,
+            &session_store,
+            &pending_confirmations,
+            &fixture.session_id,
+            &fixture.run_id,
+            Vec::new(),
+            vec![fixture.run_completed_event()],
+        );
+
+        assert_confirmation_not_pending(&pending_confirmations, &approval_id);
+    }
+
+    #[test]
+    fn failed_model_run_clears_pending_confirmations() {
+        let fixture = RunFixture::new(RunStatus::Running);
         let ids = fixture.shared_ids();
+        let pending_confirmations = fixture.pending_confirmations();
+        let approval_id = fixture.next_approval_id();
+        pending_confirmations
+            .lock()
+            .unwrap()
+            .record(fixture.pending_confirmation(&approval_id))
+            .expect("pending confirmation should record");
 
         publish_run_failure(
             &ids,
             &fixture.event_store,
             &fixture.runs,
+            &pending_confirmations,
+            &fixture.session_id,
+            &fixture.run_id,
+            "provider stopped".to_string(),
+            Vec::new(),
+        );
+
+        assert_confirmation_not_pending(&pending_confirmations, &approval_id);
+    }
+
+    #[test]
+    fn failed_run_events_are_not_published_after_run_stops_running() {
+        let fixture = RunFixture::new(RunStatus::Cancelled);
+        let ids = fixture.shared_ids();
+        let pending_confirmations = fixture.pending_confirmations();
+
+        publish_run_failure(
+            &ids,
+            &fixture.event_store,
+            &fixture.runs,
+            &pending_confirmations,
             &fixture.session_id,
             &fixture.run_id,
             "provider stopped".to_string(),
@@ -573,6 +745,10 @@ mod tests {
             Arc::new(Mutex::new(store))
         }
 
+        fn pending_confirmations(&self) -> Arc<Mutex<PendingConfirmationRegistry>> {
+            Arc::new(Mutex::new(PendingConfirmationRegistry::default()))
+        }
+
         fn text_delta_event(&self, delta: &str) -> EventEnvelope {
             EventEnvelope {
                 event_id: self.next_event_id(),
@@ -597,8 +773,41 @@ mod tests {
             }
         }
 
+        fn approval_requested_event(&self, approval_id: &ApprovalId) -> EventEnvelope {
+            let pending = self.pending_confirmation(approval_id);
+            EventEnvelope {
+                event_id: self.next_event_id(),
+                session_id: self.session_id.clone(),
+                event: BackendEvent::ToolApprovalRequested {
+                    run_id: pending.run_id,
+                    tool_call_id: pending.tool_call_id,
+                    approval_id: pending.approval_id,
+                    tool_name: pending.tool_name,
+                    reason: pending.reason,
+                    arguments_summary: pending.arguments_summary,
+                    risk_class: pending.risk_class,
+                },
+            }
+        }
+
+        fn pending_confirmation(&self, approval_id: &ApprovalId) -> PendingConfirmation {
+            PendingConfirmation {
+                approval_id: approval_id.clone(),
+                run_id: self.run_id.clone(),
+                tool_call_id: ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap(),
+                tool_name: "write_file".to_string(),
+                reason: "writes outside the current task focus".to_string(),
+                arguments_summary: r#"{"path":"notes.md","content":"hello"}"#.to_string(),
+                risk_class: Some("mutate".to_string()),
+            }
+        }
+
         fn next_event_id(&self) -> EventId {
             self.ids.lock().unwrap().next_event_id()
+        }
+
+        fn next_approval_id(&self) -> ApprovalId {
+            self.ids.lock().unwrap().next_approval_id()
         }
 
         fn event_types(&self) -> Vec<&'static str> {
@@ -615,6 +824,22 @@ mod tests {
         fn run_status(&self) -> RunStatus {
             self.runs.lock().unwrap().get(&self.run_id).unwrap().status
         }
+    }
+
+    fn assert_confirmation_not_pending(
+        pending_confirmations: &Arc<Mutex<PendingConfirmationRegistry>>,
+        approval_id: &ApprovalId,
+    ) {
+        assert!(
+            pending_confirmations
+                .lock()
+                .unwrap()
+                .resolve(
+                    approval_id,
+                    nav_harness::sessions::ConfirmationDecision::Approved,
+                )
+                .is_err()
+        );
     }
 
     fn provider_metadata() -> ProviderEventMetadata {

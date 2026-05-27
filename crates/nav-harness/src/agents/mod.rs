@@ -6,7 +6,7 @@ use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
 };
-use crate::guardrails::{ToolCallContext, ToolCallContextParams};
+use crate::guardrails::{GuardrailError, ToolCallContext, ToolCallContextParams};
 use crate::models::{
     OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, OpenAiCompletionsError,
     OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, ResolvedModelConfig,
@@ -365,6 +365,17 @@ where
 
         if let Err(error) = context.guardrails().before_tool_call(&guardrail_context) {
             let message = error.message();
+            if let GuardrailError::ConfirmationRequired { reason, .. } = &error {
+                emit_tool_approval_requested(
+                    ids,
+                    emit,
+                    run_id,
+                    tool_call,
+                    reason,
+                    &guardrail_context.arguments.summary,
+                    tool.risk_class().name(),
+                );
+            }
             emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
             turns.push(tool_error_turn(tool_call, message));
             continue;
@@ -431,6 +442,37 @@ fn emit_tool_call_failed<Ids, Emit>(
     emit(vec![event]);
 }
 
+fn emit_tool_approval_requested<Ids, Emit>(
+    ids: &mut Ids,
+    emit: &mut Emit,
+    run_id: &RunId,
+    tool_call: &ToolCall,
+    reason: &str,
+    arguments_summary: &str,
+    risk_class: &str,
+) where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let Some(nav_tool_call_id) = &tool_call.tool_call_id else {
+        return;
+    };
+
+    let event = HarnessEventEnvelope {
+        event_id: ids.next_event_id(),
+        event: HarnessEvent::ToolApprovalRequested {
+            run_id: run_id.clone(),
+            tool_call_id: nav_tool_call_id.clone(),
+            approval_id: ids.next_approval_id(),
+            tool_name: tool_call.name.clone(),
+            reason: reason.to_string(),
+            arguments_summary: arguments_summary.to_string(),
+            risk_class: Some(risk_class.to_string()),
+        },
+    };
+    emit(vec![event]);
+}
+
 fn structured_tool_error(message: impl Into<String>) -> String {
     serde_json::json!({
         "ok": false,
@@ -448,7 +490,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use nav_types::{EventId, ToolCallId as NavToolCallId};
+    use nav_types::{ApprovalId, EventId, ToolCallId as NavToolCallId};
     use serde_json::{Value, json};
 
     use super::*;
@@ -473,6 +515,10 @@ mod tests {
 
         fn next_tool_call_id(&mut self) -> NavToolCallId {
             NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000098").unwrap()
+        }
+
+        fn next_approval_id(&mut self) -> ApprovalId {
+            ApprovalId::try_new("019f2f6f-f178-7a72-9f28-000000000040").unwrap()
         }
     }
 
@@ -806,6 +852,72 @@ mod tests {
                 .expect("message should be a string")
                 .contains("no approval channel is available")
         );
+    }
+
+    #[test]
+    fn dispatch_emits_approval_requested_when_guardrail_requests_confirmation() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PanicIfExecutedTool)
+            .expect("panic tool should register");
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(ConfirmGuardrailHook)
+            .expect("confirmation hook should register");
+        let context = ToolContext::default().with_guardrails(guardrails);
+        let nav_id = NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap();
+        let tool_calls = vec![ToolCall {
+            id: "call_confirm".to_string(),
+            tool_call_id: Some(nav_id.clone()),
+            name: "panic-if-executed".to_string(),
+            arguments: r#"{"path":"notes.md","content":"hello"}"#.to_string(),
+        }];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let mut events: Vec<HarnessEventEnvelope> = Vec::new();
+        let metadata = test_metadata();
+
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &context,
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
+
+        assert!(matches!(result, ToolDispatchResult::Completed(_)));
+        assert_eq!(events.len(), 2);
+        match &events[0].event {
+            HarnessEvent::ToolApprovalRequested {
+                run_id: rid,
+                tool_call_id,
+                tool_name,
+                reason,
+                arguments_summary,
+                risk_class,
+                ..
+            } => {
+                assert_eq!(rid, &run_id);
+                assert_eq!(tool_call_id, &nav_id);
+                assert_eq!(tool_name, "panic-if-executed");
+                assert_eq!(reason, "tool requires approval");
+                assert_eq!(
+                    arguments_summary,
+                    r#"{"content":"hello","path":"notes.md"}"#
+                );
+                assert_eq!(risk_class.as_deref(), Some("exec"));
+            }
+            other => panic!("expected ToolApprovalRequested, got {other:?}"),
+        }
+        assert!(matches!(
+            events[1].event,
+            HarnessEvent::ToolCallFailed { .. }
+        ));
     }
 
     #[test]

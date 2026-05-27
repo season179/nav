@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
-use nav_harness::sessions::{SessionStore, Turn};
+use nav_harness::sessions::{
+    ConfirmationDecision, PendingConfirmation, PendingConfirmationError,
+    PendingConfirmationReceiver, PendingConfirmationRegistry, SessionStore, Turn,
+};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, read};
 use nav_harness::workspace::path::WorkspacePathPolicy;
 use nav_protocol::rpc::SessionSource;
@@ -15,6 +18,7 @@ use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     JsonRpcVersion, ProtocolCapabilities, RunCancelParams, RunCancelResult, SessionCreateParams,
     SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, SettingsReloadResult,
+    ToolApproveParams, ToolConfirmationOutcome, ToolConfirmationResult, ToolRejectParams,
     ToolsPreset, methods,
 };
 use nav_protocol::{BACKEND_EVENT_TYPES, BackendEvent, EventEnvelope};
@@ -61,6 +65,7 @@ pub struct HttpServer {
     sessions: HashMap<SessionId, SessionMetadata>,
     runs: Arc<Mutex<HashMap<RunId, RunState>>>,
     session_store: Arc<Mutex<SessionStore>>,
+    pending_confirmations: Arc<Mutex<PendingConfirmationRegistry>>,
     event_store: Arc<Mutex<ProtocolEventStore>>,
     model_run_service: ModelRunService,
     tool_registry: Arc<ToolRegistry>,
@@ -82,6 +87,7 @@ impl HttpServer {
             sessions: HashMap::new(),
             runs: Arc::new(Mutex::new(HashMap::new())),
             session_store: Arc::new(Mutex::new(SessionStore::default())),
+            pending_confirmations: Arc::new(Mutex::new(PendingConfirmationRegistry::default())),
             event_store: Arc::new(Mutex::new(ProtocolEventStore::default())),
             model_run_service: ModelRunService::default(),
             tool_registry: Arc::new(tool_registry),
@@ -199,12 +205,21 @@ impl HttpServer {
         self.sessions.get(session_id)
     }
 
+    pub fn register_pending_confirmation(
+        &self,
+        pending: PendingConfirmation,
+    ) -> Result<PendingConfirmationReceiver, PendingConfirmationError> {
+        self.pending_confirmations.lock().unwrap().register(pending)
+    }
+
     fn handle_rpc_request(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
         match request.method.as_str() {
             methods::INITIALIZE => self.handle_initialize(request),
             methods::SESSION_CREATE => self.handle_session_create(request),
             methods::SESSION_SEND_MESSAGE => self.handle_session_send_message(request),
             methods::RUN_CANCEL => self.handle_run_cancel(request),
+            methods::TOOL_APPROVE => self.handle_tool_approve(request),
+            methods::TOOL_REJECT => self.handle_tool_reject(request),
             methods::SETTINGS_RELOAD => self.handle_settings_reload(request),
             method => rpc_error(
                 request.id,
@@ -363,6 +378,10 @@ impl HttpServer {
             }
 
             run.status = RunStatus::Cancelled;
+            self.pending_confirmations
+                .lock()
+                .unwrap()
+                .clear_for_run(&params.run_id);
             let event = EventEnvelope {
                 event_id: self.ids.lock().unwrap().next_event_id(),
                 session_id: run.session_id.clone(),
@@ -384,6 +403,64 @@ impl HttpServer {
                 run_id: params.run_id,
             },
         )
+    }
+
+    fn handle_tool_approve(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
+        let params = match parse_params::<ToolApproveParams>(request.params) {
+            Ok(params) => params,
+            Err(error) => return rpc_error(request.id, -32602, error),
+        };
+
+        self.resolve_tool_confirmation(
+            request.id,
+            params.approval_id,
+            ConfirmationDecision::Approved,
+            ToolConfirmationOutcome::Approved,
+        )
+    }
+
+    fn handle_tool_reject(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
+        let params = match parse_params::<ToolRejectParams>(request.params) {
+            Ok(params) => params,
+            Err(error) => return rpc_error(request.id, -32602, error),
+        };
+
+        self.resolve_tool_confirmation(
+            request.id,
+            params.approval_id,
+            ConfirmationDecision::Rejected {
+                reason: params.reason,
+            },
+            ToolConfirmationOutcome::Rejected,
+        )
+    }
+
+    fn resolve_tool_confirmation(
+        &mut self,
+        request_id: nav_types::RequestId,
+        approval_id: nav_types::ApprovalId,
+        decision: ConfirmationDecision,
+        outcome: ToolConfirmationOutcome,
+    ) -> JsonRpcResponse<Value> {
+        match self
+            .pending_confirmations
+            .lock()
+            .unwrap()
+            .resolve(&approval_id, decision)
+        {
+            Ok(pending) => rpc_result(
+                request_id,
+                ToolConfirmationResult {
+                    approval_id: pending.approval_id,
+                    outcome,
+                },
+            ),
+            Err(error) => rpc_error(
+                request_id,
+                pending_confirmation_error_code(&error),
+                error.to_string(),
+            ),
+        }
     }
 
     fn handle_settings_reload(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
@@ -412,6 +489,7 @@ impl HttpServer {
         let event_store = Arc::clone(&self.event_store);
         let runs = Arc::clone(&self.runs);
         let session_store = Arc::clone(&self.session_store);
+        let pending_confirmations = Arc::clone(&self.pending_confirmations);
         let tool_registry = Arc::clone(&self.tool_registry);
         let tool_context = tool_context_for_session(session_metadata.cwd());
         let tool_preset = harness_tool_preset(session_metadata.tools_preset());
@@ -419,7 +497,13 @@ impl HttpServer {
         thread::spawn(move || {
             let final_status = model_run_service.run(
                 &model_resolver,
-                ModelRunState::new(ids, event_store, Arc::clone(&runs), session_store),
+                ModelRunState::new(
+                    ids,
+                    event_store,
+                    Arc::clone(&runs),
+                    session_store,
+                    pending_confirmations,
+                ),
                 cancellation_token,
                 ModelRunRequest {
                     session_id: &session_id,
@@ -629,7 +713,7 @@ pub fn server_capabilities() -> ProtocolCapabilities {
     ProtocolCapabilities {
         sse_replay: true,
         normalized_messages: false,
-        tool_approvals: false,
+        tool_approvals: true,
         file_events: false,
         provider_metadata: true,
         session_close: false,
@@ -664,6 +748,13 @@ fn replay_error_to_http(error: event_store::ReplayError) -> HttpError {
     HttpError {
         status,
         message: error.to_string(),
+    }
+}
+
+fn pending_confirmation_error_code(error: &PendingConfirmationError) -> i64 {
+    match error {
+        PendingConfirmationError::Duplicate(_) => -32006,
+        PendingConfirmationError::NotPending(_) => -32006,
     }
 }
 

@@ -1,8 +1,11 @@
 //! Sessions, runs, messages, approvals, and long-lived task state.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
-use nav_types::{SessionId, ToolCallId};
+use nav_types::{ApprovalId, RunId, SessionId, ToolCallId};
 
 #[derive(Debug, Default)]
 pub struct SessionStore {
@@ -145,3 +148,121 @@ pub struct ToolCall {
     pub name: String,
     pub arguments: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingConfirmation {
+    pub approval_id: ApprovalId,
+    pub run_id: RunId,
+    pub tool_call_id: ToolCallId,
+    pub tool_name: String,
+    pub reason: String,
+    pub arguments_summary: String,
+    pub risk_class: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmationDecision {
+    Approved,
+    Rejected { reason: Option<String> },
+}
+
+#[derive(Debug, Default)]
+pub struct PendingConfirmationRegistry {
+    entries: HashMap<ApprovalId, PendingConfirmationEntry>,
+}
+
+impl PendingConfirmationRegistry {
+    pub fn record(&mut self, pending: PendingConfirmation) -> Result<(), PendingConfirmationError> {
+        self.insert(pending, None).map(|_| ())
+    }
+
+    pub fn register(
+        &mut self,
+        pending: PendingConfirmation,
+    ) -> Result<PendingConfirmationReceiver, PendingConfirmationError> {
+        let (sender, receiver) = mpsc::channel();
+        self.insert(pending, Some(sender))?;
+
+        Ok(PendingConfirmationReceiver { receiver })
+    }
+
+    pub fn resolve(
+        &mut self,
+        approval_id: &ApprovalId,
+        decision: ConfirmationDecision,
+    ) -> Result<PendingConfirmation, PendingConfirmationError> {
+        let entry = self
+            .entries
+            .remove(approval_id)
+            .ok_or_else(|| PendingConfirmationError::NotPending(approval_id.clone()))?;
+
+        if let Some(sender) = entry.sender {
+            let _ = sender.send(decision);
+        }
+
+        Ok(entry.pending)
+    }
+
+    pub fn clear_for_run(&mut self, run_id: &RunId) {
+        self.entries
+            .retain(|_, entry| &entry.pending.run_id != run_id);
+    }
+
+    fn insert(
+        &mut self,
+        pending: PendingConfirmation,
+        sender: Option<Sender<ConfirmationDecision>>,
+    ) -> Result<(), PendingConfirmationError> {
+        if self.entries.contains_key(&pending.approval_id) {
+            return Err(PendingConfirmationError::Duplicate(pending.approval_id));
+        }
+
+        self.entries.insert(
+            pending.approval_id.clone(),
+            PendingConfirmationEntry { pending, sender },
+        );
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PendingConfirmationEntry {
+    pending: PendingConfirmation,
+    sender: Option<Sender<ConfirmationDecision>>,
+}
+
+#[derive(Debug)]
+pub struct PendingConfirmationReceiver {
+    receiver: Receiver<ConfirmationDecision>,
+}
+
+impl PendingConfirmationReceiver {
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<ConfirmationDecision, RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingConfirmationError {
+    Duplicate(ApprovalId),
+    NotPending(ApprovalId),
+}
+
+impl fmt::Display for PendingConfirmationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplicate(approval_id) => {
+                write!(formatter, "approval `{approval_id}` is already pending")
+            }
+            Self::NotPending(approval_id) => {
+                write!(formatter, "approval `{approval_id}` is not pending")
+            }
+        }
+    }
+}
+
+impl Error for PendingConfirmationError {}

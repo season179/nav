@@ -183,6 +183,19 @@ pub struct ToolRejectParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfirmationResult {
+    pub approval_id: ApprovalId,
+    pub outcome: ToolConfirmationOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolConfirmationOutcome {
+    Approved,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCloseParams {
     pub session_id: SessionId,
 }

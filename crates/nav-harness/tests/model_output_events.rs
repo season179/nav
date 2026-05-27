@@ -3,7 +3,7 @@ use nav_harness::events::{
     OpenAiStreamEventMapper,
 };
 use nav_harness::models::OpenAiCompletionsResponseParser;
-use nav_types::{EventId, MessageId, RunId, ToolCallId};
+use nav_types::{ApprovalId, EventId, MessageId, RunId, ToolCallId};
 
 #[test]
 fn normal_text_streaming_emits_model_output_events() {
@@ -340,6 +340,11 @@ impl HarnessEventIdSource for TestIds {
             self.next_tool_call
         ))
         .expect("test tool call id should be UUIDv7-shaped")
+    }
+
+    fn next_approval_id(&mut self) -> ApprovalId {
+        ApprovalId::try_new("019f2f6f-f178-7a72-9f28-000000000040")
+            .expect("test approval id should be UUIDv7-shaped")
     }
 }
 
