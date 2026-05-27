@@ -1094,6 +1094,7 @@ fn from_turns_maps_assistant_tool_calls_and_tool_results() {
         Turn::user_text("Read Cargo.toml"),
         Turn::assistant_tool_calls(vec![ToolCall {
             id: "call_read_1".to_string(),
+            tool_call_id: None,
             name: "read".to_string(),
             arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
         }]),

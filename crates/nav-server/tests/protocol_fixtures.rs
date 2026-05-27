@@ -33,6 +33,8 @@ const SSE_FIXTURES: &[&str] = &[
     "event-streams/replay-after-run-started.sse",
     "event-streams/run-failed.sse",
     "event-streams/provider-error.sse",
+    "event-streams/tool-call-read.sse",
+    "event-streams/tool-call-failed.sse",
 ];
 
 #[test]
@@ -68,6 +70,9 @@ fn json_rpc_fixtures_are_valid_protocol_envelopes() {
 #[test]
 fn sse_fixtures_are_valid_typed_protocol_events() {
     let mut saw_provider_error = false;
+    let mut saw_tool_call_started = false;
+    let mut saw_tool_call_completed = false;
+    let mut saw_tool_call_failed = false;
 
     for fixture in SSE_FIXTURES {
         let events = parse_sse(&fixture_text(fixture));
@@ -82,11 +87,21 @@ fn sse_fixtures_are_valid_typed_protocol_events() {
                 .unwrap_or_else(|error| panic!("{fixture} should parse as EventEnvelope: {error}"));
             assert_eq!(envelope.event_id.as_str(), event.id);
             assert_eq!(envelope.event_type(), event.name);
-            saw_provider_error |= envelope.event_type() == "provider.error";
+
+            match event.name.as_str() {
+                "provider.error" => saw_provider_error = true,
+                "tool.call_started" => saw_tool_call_started = true,
+                "tool.call_completed" => saw_tool_call_completed = true,
+                "tool.call_failed" => saw_tool_call_failed = true,
+                _ => {}
+            }
         }
     }
 
     assert!(saw_provider_error, "fixtures should cover provider.error");
+    assert!(saw_tool_call_started, "fixtures should cover tool.call_started");
+    assert!(saw_tool_call_completed, "fixtures should cover tool.call_completed");
+    assert!(saw_tool_call_failed, "fixtures should cover tool.call_failed");
 }
 
 #[test]
@@ -422,4 +437,90 @@ fn assert_uuid_v7(value: &str) {
     assert_eq!(value.len(), 36);
     assert_eq!(&value[14..15], "7");
     assert!(matches!(&value[19..20], "8" | "9" | "a" | "b"));
+}
+
+#[test]
+fn tool_call_read_fixture_round_trips_through_sse_encoder() {
+    let fixture = "event-streams/tool-call-read.sse";
+    let fixture_body = fixture_text(fixture);
+    let events = parse_sse(&fixture_body);
+
+    let event_sequence: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        event_sequence,
+        vec![
+            "session.created",
+            "run.started",
+            "tool.call_started",
+            "tool.call_delta",
+            "tool.call_completed",
+            "message.completed",
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+        ]
+    );
+
+    let envelopes = event_envelopes(events);
+    let encoded = sse::encode_events(&envelopes)
+        .unwrap_or_else(|error| panic!("{fixture} should encode: {error}"));
+    assert_eq!(encoded, fixture_body_with_final_separator(&fixture_body));
+
+    let started = envelopes.iter().find(|e| e.event_type() == "tool.call_started").unwrap();
+    let completed = envelopes.iter().find(|e| e.event_type() == "tool.call_completed").unwrap();
+    let delta = envelopes.iter().find(|e| e.event_type() == "tool.call_delta").unwrap();
+
+    // Verify tool call events have consistent run_id and tool_call_id
+    match (&started.event, &completed.event, &delta.event) {
+        (
+            nav_protocol::BackendEvent::ToolCallStarted { run_id: rid1, tool_call_id: tcid1, name, .. },
+            nav_protocol::BackendEvent::ToolCallCompleted { run_id: rid2, tool_call_id: tcid2, .. },
+            nav_protocol::BackendEvent::ToolCallDelta { run_id: rid3, tool_call_id: tcid3, .. },
+        ) => {
+            assert_eq!(rid1, rid2);
+            assert_eq!(rid1, rid3);
+            assert_eq!(tcid1, tcid2);
+            assert_eq!(tcid1, tcid3);
+            assert_eq!(name.as_deref(), Some("read"));
+        }
+        _ => panic!("unexpected event types"),
+    }
+}
+
+#[test]
+fn tool_call_failed_fixture_round_trips_through_sse_encoder() {
+    let fixture = "event-streams/tool-call-failed.sse";
+    let fixture_body = fixture_text(fixture);
+    let events = parse_sse(&fixture_body);
+
+    let event_sequence: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        event_sequence,
+        vec![
+            "session.created",
+            "run.started",
+            "tool.call_started",
+            "tool.call_delta",
+            "tool.call_completed",
+            "message.completed",
+            "tool.call_failed",
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+        ]
+    );
+
+    let envelopes = event_envelopes(events);
+    let encoded = sse::encode_events(&envelopes)
+        .unwrap_or_else(|error| panic!("{fixture} should encode: {error}"));
+    assert_eq!(encoded, fixture_body_with_final_separator(&fixture_body));
+
+    let failed = envelopes.iter().find(|e| e.event_type() == "tool.call_failed").unwrap();
+    match &failed.event {
+        nav_protocol::BackendEvent::ToolCallFailed { name, error_message, .. } => {
+            assert_eq!(name.as_deref(), Some("read"));
+            assert!(!error_message.is_empty());
+        }
+        _ => panic!("expected tool.call_failed"),
+    }
 }

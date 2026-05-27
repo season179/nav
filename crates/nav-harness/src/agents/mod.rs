@@ -2,7 +2,7 @@
 
 use nav_types::{MessageId, RunId};
 
-use crate::events::{HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext};
+use crate::events::{HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext, ProviderEventMetadata};
 use crate::models::{
     OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, OpenAiCompletionsError,
     OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, ResolvedModelConfig,
@@ -110,12 +110,25 @@ impl RunLoop {
             if request.cancellation_token.is_cancelled() {
                 tool_cancel.cancel();
             }
+            let tool_dispatch_metadata = ProviderEventMetadata {
+                provider_id: output_context.provider_id.clone(),
+                configured_model_id: output_context.configured_model_id.clone(),
+                provider_response_id: None,
+                provider_model: None,
+                choice_index: None,
+                provider_tool_call_id: None,
+                usage: None,
+            };
             match dispatch_tool_calls(
                 &tool_calls,
                 request.tool_registry,
                 request.tool_context,
                 tool_cancel,
                 Some(request.cancellation_token.clone()),
+                request.run_id,
+                ids,
+                &mut emit,
+                &tool_dispatch_metadata,
             ) {
                 ToolDispatchResult::Completed(tool_turns) => {
                     turns.extend(tool_turns.clone());
@@ -215,6 +228,7 @@ impl AssistantTurnCapture {
                         .provider_tool_call_id
                         .clone()
                         .unwrap_or_else(|| tool_call_id.to_string()),
+                    tool_call_id: Some(tool_call_id.clone()),
                     name: name.clone().unwrap_or_default(),
                     arguments: arguments.clone(),
                 }),
@@ -262,13 +276,21 @@ enum ToolDispatchResult {
     Cancelled,
 }
 
-fn dispatch_tool_calls(
+fn dispatch_tool_calls<Ids, Emit>(
     tool_calls: &[ToolCall],
     registry: &ToolRegistry,
     context: &ToolContext,
     cancel: ToolCancellationToken,
     run_cancel: Option<OpenAiCompletionsCancellationToken>,
-) -> ToolDispatchResult {
+    run_id: &RunId,
+    ids: &mut Ids,
+    emit: &mut Emit,
+    base_metadata: &ProviderEventMetadata,
+) -> ToolDispatchResult
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -288,20 +310,18 @@ fn dispatch_tool_calls(
         }
 
         let Some(tool) = registry.get(&tool_call.name) else {
-            turns.push(tool_error_turn(
-                tool_call,
-                format!("unknown tool `{}`", tool_call.name),
-            ));
+            let message = format!("unknown tool `{}`", tool_call.name);
+            emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+            turns.push(tool_error_turn(tool_call, message));
             continue;
         };
 
         let args = match serde_json::from_str(&tool_call.arguments) {
             Ok(args) => args,
             Err(error) => {
-                turns.push(tool_error_turn(
-                    tool_call,
-                    format!("tool call arguments are not valid JSON: {error}"),
-                ));
+                let message = format!("tool call arguments are not valid JSON: {error}");
+                emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+                turns.push(tool_error_turn(tool_call, message));
                 continue;
             }
         };
@@ -313,7 +333,11 @@ fn dispatch_tool_calls(
 
         match result {
             Ok(output) => turns.push(Turn::tool_result(&tool_call.id, output.content)),
-            Err(error) => turns.push(tool_error_turn(tool_call, error.message())),
+            Err(error) => {
+                let message = error.message();
+                emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+                turns.push(tool_error_turn(tool_call, message));
+            }
         }
     }
 
@@ -322,6 +346,36 @@ fn dispatch_tool_calls(
 
 fn tool_error_turn(tool_call: &ToolCall, message: impl Into<String>) -> Turn {
     Turn::tool_result(&tool_call.id, structured_tool_error(message))
+}
+
+fn emit_tool_call_failed<Ids, Emit>(
+    ids: &mut Ids,
+    emit: &mut Emit,
+    run_id: &RunId,
+    tool_call: &ToolCall,
+    message: &str,
+    base_metadata: &ProviderEventMetadata,
+)
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let Some(nav_tool_call_id) = &tool_call.tool_call_id else {
+        return;
+    };
+
+    let event_id = ids.next_event_id();
+    let event = HarnessEventEnvelope {
+        event_id,
+        event: HarnessEvent::ToolCallFailed {
+            run_id: run_id.clone(),
+            tool_call_id: nav_tool_call_id.clone(),
+            name: Some(tool_call.name.clone()),
+            error_message: message.to_string(),
+            metadata: base_metadata.clone(),
+        },
+    };
+    emit(vec![event]);
 }
 
 fn structured_tool_error(message: impl Into<String>) -> String {
@@ -334,6 +388,7 @@ fn structured_tool_error(message: impl Into<String>) -> String {
     .to_string()
 }
 
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -341,9 +396,11 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use nav_types::{EventId, ToolCallId as NavToolCallId};
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::events::HarnessEventIdSource;
     use crate::sessions::ToolCall;
     use crate::tools::{
         NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput,
@@ -351,22 +408,70 @@ mod tests {
     };
     use crate::workspace::path::WorkspacePathPolicy;
 
+    struct TestIdSource;
+
+    impl HarnessEventIdSource for TestIdSource {
+        fn next_event_id(&mut self) -> EventId {
+            EventId::try_new("019f2f6f-f178-7a72-9f28-000000000099").unwrap()
+        }
+
+        fn next_tool_call_id(&mut self) -> NavToolCallId {
+            NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000098").unwrap()
+        }
+    }
+
+    fn test_metadata() -> ProviderEventMetadata {
+        ProviderEventMetadata {
+            provider_id: "test-provider".to_string(),
+            configured_model_id: "test-model".to_string(),
+            provider_response_id: None,
+            provider_model: None,
+            choice_index: None,
+            provider_tool_call_id: None,
+            usage: None,
+        }
+    }
+
+    fn dispatch_test(
+        tool_calls: &[ToolCall],
+        registry: &ToolRegistry,
+        context: &ToolContext,
+        cancel: ToolCancellationToken,
+        run_cancel: Option<OpenAiCompletionsCancellationToken>,
+    ) -> ToolDispatchResult {
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let mut events: Vec<HarnessEventEnvelope> = Vec::new();
+        let metadata = test_metadata();
+        let result = dispatch_tool_calls(
+            tool_calls,
+            registry,
+            context,
+            cancel,
+            run_cancel,
+            &run_id,
+            &mut ids,
+            &mut |envelopes| events.extend(envelopes),
+            &metadata,
+        );
+        let _ = events;
+        result
+    }
+
     #[test]
     fn dispatches_single_tool_call_success_as_tool_turn() {
         let mut registry = ToolRegistry::default();
         registry.register(EchoTool).expect("echo should register");
         let tool_calls = vec![ToolCall {
             id: "call_echo_1".to_string(),
+            tool_call_id: None,
             name: "echo".to_string(),
             arguments: r#"{"text":"hello"}"#.to_string(),
         }];
 
-        let result = dispatch_tool_calls(
-            &tool_calls,
-            &registry,
-            &ToolContext::default(),
-            ToolCancellationToken::new(),
-            None,
+        let result = dispatch_test(
+            &tool_calls, &registry, &ToolContext::default(),
+            ToolCancellationToken::new(), None,
         );
 
         assert_eq!(
@@ -382,22 +487,21 @@ mod tests {
         let tool_calls = vec![
             ToolCall {
                 id: "call_echo_1".to_string(),
+                tool_call_id: None,
                 name: "echo".to_string(),
                 arguments: r#"{"text":"first"}"#.to_string(),
             },
             ToolCall {
                 id: "call_echo_2".to_string(),
+                tool_call_id: None,
                 name: "echo".to_string(),
                 arguments: r#"{"text":"second"}"#.to_string(),
             },
         ];
 
-        let result = dispatch_tool_calls(
-            &tool_calls,
-            &registry,
-            &ToolContext::default(),
-            ToolCancellationToken::new(),
-            None,
+        let result = dispatch_test(
+            &tool_calls, &registry, &ToolContext::default(),
+            ToolCancellationToken::new(), None,
         );
 
         assert_eq!(
@@ -415,16 +519,14 @@ mod tests {
         registry.register(EchoTool).expect("echo should register");
         let tool_calls = vec![ToolCall {
             id: "call_echo_bad".to_string(),
+            tool_call_id: None,
             name: "echo".to_string(),
             arguments: "not json".to_string(),
         }];
 
-        let result = dispatch_tool_calls(
-            &tool_calls,
-            &registry,
-            &ToolContext::default(),
-            ToolCancellationToken::new(),
-            None,
+        let result = dispatch_test(
+            &tool_calls, &registry, &ToolContext::default(),
+            ToolCancellationToken::new(), None,
         );
 
         let ToolDispatchResult::Completed(turns) = result else {
@@ -434,12 +536,7 @@ mod tests {
         let error: Value = serde_json::from_str(&turns[0].text_content())
             .expect("tool error should be structured JSON");
         assert_eq!(error["ok"], false);
-        assert!(
-            error["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not valid JSON")
-        );
+        assert!(error["error"]["message"].as_str().unwrap().contains("not valid JSON"));
     }
 
     #[test]
@@ -447,16 +544,14 @@ mod tests {
         let registry = ToolRegistry::default();
         let tool_calls = vec![ToolCall {
             id: "call_missing".to_string(),
+            tool_call_id: None,
             name: "missing".to_string(),
             arguments: "{}".to_string(),
         }];
 
-        let result = dispatch_tool_calls(
-            &tool_calls,
-            &registry,
-            &ToolContext::default(),
-            ToolCancellationToken::new(),
-            None,
+        let result = dispatch_test(
+            &tool_calls, &registry, &ToolContext::default(),
+            ToolCancellationToken::new(), None,
         );
 
         let ToolDispatchResult::Completed(turns) = result else {
@@ -471,11 +566,10 @@ mod tests {
     #[test]
     fn dispatch_honors_cancellation_mid_execute() {
         let mut registry = ToolRegistry::default();
-        registry
-            .register(WaitForCancelTool)
-            .expect("wait should register");
+        registry.register(WaitForCancelTool).expect("wait should register");
         let tool_calls = vec![ToolCall {
             id: "call_wait".to_string(),
+            tool_call_id: None,
             name: "wait".to_string(),
             arguments: "{}".to_string(),
         }];
@@ -486,25 +580,19 @@ mod tests {
             cancel_from_thread.cancel();
         });
 
-        let result = dispatch_tool_calls(
-            &tool_calls,
-            &registry,
-            &ToolContext::default(),
-            cancel,
-            None,
+        let result = dispatch_test(
+            &tool_calls, &registry, &ToolContext::default(), cancel, None,
         );
-
         assert_eq!(result, ToolDispatchResult::Cancelled);
     }
 
     #[test]
     fn dispatch_bridges_run_cancellation_to_tool_token() {
         let mut registry = ToolRegistry::default();
-        registry
-            .register(WaitForCancelTool)
-            .expect("wait should register");
+        registry.register(WaitForCancelTool).expect("wait should register");
         let tool_calls = vec![ToolCall {
             id: "call_wait".to_string(),
+            tool_call_id: None,
             name: "wait".to_string(),
             arguments: "{}".to_string(),
         }];
@@ -515,14 +603,10 @@ mod tests {
             cancel_from_thread.cancel();
         });
 
-        let result = dispatch_tool_calls(
-            &tool_calls,
-            &registry,
-            &ToolContext::default(),
-            ToolCancellationToken::new(),
-            Some(run_cancel),
+        let result = dispatch_test(
+            &tool_calls, &registry, &ToolContext::default(),
+            ToolCancellationToken::new(), Some(run_cancel),
         );
-
         assert_eq!(result, ToolDispatchResult::Cancelled);
     }
 
@@ -534,16 +618,14 @@ mod tests {
         let context = ToolContext::with_path_policy(workspace.policy());
         let tool_calls = vec![ToolCall {
             id: "call_read_escape".to_string(),
+            tool_call_id: None,
             name: "read".to_string(),
             arguments: r#"{"path":"../secret.txt"}"#.to_string(),
         }];
 
-        let result = dispatch_tool_calls(
-            &tool_calls,
-            &registry,
-            &context,
-            ToolCancellationToken::new(),
-            None,
+        let result = dispatch_test(
+            &tool_calls, &registry, &context,
+            ToolCancellationToken::new(), None,
         );
 
         let ToolDispatchResult::Completed(turns) = result else {
@@ -552,50 +634,92 @@ mod tests {
         let error: Value = serde_json::from_str(&turns[0].text_content())
             .expect("tool error should be structured JSON");
         assert_eq!(error["ok"], false);
-        assert!(
-            error["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("escapes workspace")
+        assert!(error["error"]["message"].as_str().unwrap().contains("escapes workspace"));
+    }
+
+    #[test]
+    fn dispatch_emits_tool_call_failed_event_for_unknown_tool() {
+        let registry = ToolRegistry::default();
+        let nav_id = NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap();
+        let tool_calls = vec![ToolCall {
+            id: "call_missing".to_string(),
+            tool_call_id: Some(nav_id.clone()),
+            name: "missing".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let mut events: Vec<HarnessEventEnvelope> = Vec::new();
+        let metadata = test_metadata();
+
+        let result = dispatch_tool_calls(
+            &tool_calls, &registry, &ToolContext::default(),
+            ToolCancellationToken::new(), None,
+            &run_id, &mut ids,
+            &mut |envelopes| events.extend(envelopes),
+            &metadata,
         );
+
+        assert!(matches!(result, ToolDispatchResult::Completed(_)));
+        assert_eq!(events.len(), 1);
+        match &events[0].event {
+            HarnessEvent::ToolCallFailed {
+                run_id: rid, tool_call_id: tcid, name, error_message, ..
+            } => {
+                assert_eq!(rid, &run_id);
+                assert_eq!(tcid, &nav_id);
+                assert_eq!(name.as_deref(), Some("missing"));
+                assert!(error_message.contains("unknown tool"));
+            }
+            other => panic!("expected ToolCallFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_does_not_emit_tool_call_failed_when_no_nav_tool_call_id() {
+        let registry = ToolRegistry::default();
+        let tool_calls = vec![ToolCall {
+            id: "call_missing".to_string(),
+            tool_call_id: None,
+            name: "missing".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let mut events: Vec<HarnessEventEnvelope> = Vec::new();
+        let metadata = test_metadata();
+
+        let _result = dispatch_tool_calls(
+            &tool_calls, &registry, &ToolContext::default(),
+            ToolCancellationToken::new(), None,
+            &run_id, &mut ids,
+            &mut |envelopes| events.extend(envelopes),
+            &metadata,
+        );
+
+        assert!(events.is_empty(),
+            "no events should be emitted without a nav tool_call_id");
     }
 
     struct EchoTool;
 
     impl NavTool for EchoTool {
-        fn name(&self) -> &str {
-            "echo"
-        }
-
-        fn description(&self) -> &str {
-            "Echoes text."
-        }
-
+        fn name(&self) -> &str { "echo" }
+        fn description(&self) -> &str { "Echoes text." }
         fn parameters(&self) -> Value {
             json!({
                 "type": "object",
-                "properties": {
-                    "text": { "type": "string" }
-                },
+                "properties": { "text": { "type": "string" } },
                 "required": ["text"],
                 "additionalProperties": false
             })
         }
-
-        fn risk_class(&self) -> RiskClass {
-            RiskClass::Read
-        }
-
+        fn risk_class(&self) -> RiskClass { RiskClass::Read }
         fn execute<'a>(
-            &'a self,
-            _ctx: &'a ToolContext,
-            args: Value,
-            _cancel: ToolCancellationToken,
+            &'a self, _ctx: &'a ToolContext, args: Value, _cancel: ToolCancellationToken,
         ) -> ToolFuture<'a> {
             Box::pin(async move {
-                Ok(ToolOutput::text(
-                    args["text"].as_str().unwrap_or_default().to_string(),
-                ))
+                Ok(ToolOutput::text(args["text"].as_str().unwrap_or_default().to_string()))
             })
         }
     }
@@ -603,31 +727,14 @@ mod tests {
     struct WaitForCancelTool;
 
     impl NavTool for WaitForCancelTool {
-        fn name(&self) -> &str {
-            "wait"
-        }
-
-        fn description(&self) -> &str {
-            "Waits for cancellation."
-        }
-
+        fn name(&self) -> &str { "wait" }
+        fn description(&self) -> &str { "Waits for cancellation." }
         fn parameters(&self) -> Value {
-            json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            })
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
         }
-
-        fn risk_class(&self) -> RiskClass {
-            RiskClass::Read
-        }
-
+        fn risk_class(&self) -> RiskClass { RiskClass::Read }
         fn execute<'a>(
-            &'a self,
-            _ctx: &'a ToolContext,
-            _args: Value,
-            cancel: ToolCancellationToken,
+            &'a self, _ctx: &'a ToolContext, _args: Value, cancel: ToolCancellationToken,
         ) -> ToolFuture<'a> {
             Box::pin(async move {
                 cancel.cancelled().await;
@@ -636,30 +743,21 @@ mod tests {
         }
     }
 
-    struct TestWorkspace {
-        root: PathBuf,
-    }
+    struct TestWorkspace { root: PathBuf }
 
     impl TestWorkspace {
         fn new(name: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("nav-agents-{name}-{}", std::process::id()));
+            let root = std::env::temp_dir().join(format!("nav-agents-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("workspace should be created");
-            Self {
-                root: fs::canonicalize(root).expect("workspace should canonicalize"),
-            }
+            Self { root: fs::canonicalize(root).expect("workspace should canonicalize") }
         }
-
         fn policy(&self) -> WorkspacePathPolicy {
-            WorkspacePathPolicy::new(&self.root, &self.root)
-                .expect("path policy should accept workspace")
+            WorkspacePathPolicy::new(&self.root, &self.root).expect("path policy should accept workspace")
         }
     }
 
     impl Drop for TestWorkspace {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); }
     }
 }

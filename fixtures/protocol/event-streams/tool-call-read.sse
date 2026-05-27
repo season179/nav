@@ -1,0 +1,35 @@
+id: 019f2f6f-f178-7a72-9f28-000000000300
+event: session.created
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000300","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"session.created"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000301
+event: run.started
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000301","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.started","run_id":"019f2f6f-f178-7a72-9f28-000000000301"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000302
+event: tool.call_started
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000302","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"tool.call_started","run_id":"019f2f6f-f178-7a72-9f28-000000000301","tool_call_id":"019f2f6f-f178-7a72-9f28-000000000303","name":"read","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"provider-run-1","provider_model":"vendor/model-large","choice_index":0,"provider_tool_call_id":"call_read_1"}}
+
+id: 019f2f6f-f178-7a72-9f28-000000000304
+event: tool.call_delta
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000304","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"tool.call_delta","run_id":"019f2f6f-f178-7a72-9f28-000000000301","tool_call_id":"019f2f6f-f178-7a72-9f28-000000000303","arguments_delta":"{\"path\":\"fixture.txt\"}","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"provider-run-1","provider_model":"vendor/model-large","choice_index":0,"provider_tool_call_id":"call_read_1"}}
+
+id: 019f2f6f-f178-7a72-9f28-000000000305
+event: tool.call_completed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000305","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"tool.call_completed","run_id":"019f2f6f-f178-7a72-9f28-000000000301","tool_call_id":"019f2f6f-f178-7a72-9f28-000000000303","name":"read","arguments":"{\"path\":\"fixture.txt\"}","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"provider-run-1","provider_model":"vendor/model-large","choice_index":0,"provider_tool_call_id":"call_read_1"}}
+
+id: 019f2f6f-f178-7a72-9f28-000000000306
+event: message.completed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000306","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"message.completed","run_id":"019f2f6f-f178-7a72-9f28-000000000301","message_id":"019f2f6f-f178-7a72-9f28-000000000307","finish_reason":"tool_calls","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"provider-run-1","provider_model":"vendor/model-large","choice_index":0}}
+
+id: 019f2f6f-f178-7a72-9f28-000000000308
+event: model.text_delta
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000308","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"model.text_delta","run_id":"019f2f6f-f178-7a72-9f28-000000000301","message_id":"019f2f6f-f178-7a72-9f28-000000000309","delta":"read complete","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"provider-run-2","provider_model":"vendor/model-large","choice_index":0}}
+
+id: 019f2f6f-f178-7a72-9f28-00000000030a
+event: message.completed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-00000000030a","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"message.completed","run_id":"019f2f6f-f178-7a72-9f28-000000000301","message_id":"019f2f6f-f178-7a72-9f28-000000000309","finish_reason":"stop","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"provider-run-2","provider_model":"vendor/model-large","choice_index":0}}
+
+id: 019f2f6f-f178-7a72-9f28-00000000030b
+event: run.completed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-00000000030b","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.completed","run_id":"019f2f6f-f178-7a72-9f28-000000000301","metadata":{"provider_id":"compatible-gateway","configured_model_id":"vendor/model-large","provider_response_id":"provider-run-2","provider_model":"vendor/model-large","choice_index":0}}
