@@ -3,6 +3,8 @@
 //! Real filesystem and shell tools intentionally land later in TOOL-04 and
 //! follow-up issues; this module only owns the registry/API shape.
 
+pub mod truncation;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
