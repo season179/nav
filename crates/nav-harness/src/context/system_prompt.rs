@@ -112,7 +112,6 @@ impl<'a> SystemPromptBuilder<'a> {
         }
 
         // -- Tools --
-        // TODO(TOOL-01): test the non-empty branch once ToolRegistry has real data.
         writeln!(out, "## Tools").unwrap();
         let tool_names = self.tools.map(|r| r.tool_names()).unwrap_or_default();
         if tool_names.is_empty() {
@@ -170,7 +169,13 @@ fn gregorian_date(days_since_epoch: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     use super::*;
+    use crate::tools::{
+        NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput,
+        ToolRegistry,
+    };
 
     // -- Fake seams ----------------------------------------------------------
 
@@ -284,6 +289,29 @@ No force-push.
     }
 
     #[test]
+    fn system_prompt_lists_registered_tools() {
+        let clock = FakeClock {
+            date: "2025-01-01".to_string(),
+        };
+        let cwd = FakeCwd {
+            dir: "/app".to_string(),
+        };
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PromptTool("read"))
+            .expect("read should register");
+        registry
+            .register(PromptTool("bash"))
+            .expect("bash should register");
+
+        let prompt = SystemPromptBuilder::new(&clock, &cwd)
+            .tools(&registry)
+            .build();
+
+        assert!(prompt.text_content().contains("## Tools\n- bash\n- read\n"));
+    }
+
+    #[test]
     fn conventions_without_trailing_newline() {
         let clock = FakeClock {
             date: "2025-03-10".to_string(),
@@ -299,8 +327,10 @@ No force-push.
         let text = prompt.text_content();
         // The builder appends a newline after conventions, so the section
         // separator before ## Tools should still be exactly one blank line.
-        assert!(text.contains("No force-push.\n\n## Tools"),
-            "conventions without trailing newline should still separate from Tools: {text:?}");
+        assert!(
+            text.contains("No force-push.\n\n## Tools"),
+            "conventions without trailing newline should still separate from Tools: {text:?}"
+        );
     }
 
     // -- Unit tests for helpers ----------------------------------------------
@@ -320,5 +350,38 @@ No force-push.
     fn gregorian_date_leap_year() {
         // 2024-02-29 = 19 782 days after epoch
         assert_eq!(gregorian_date(19_782), "2024-02-29");
+    }
+
+    struct PromptTool(&'static str);
+
+    impl NavTool for PromptTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "A prompt test tool."
+        }
+
+        fn parameters(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        }
+
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Read
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+            _args: Value,
+            _cancel: ToolCancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move { Ok(ToolOutput::text("")) })
+        }
     }
 }
