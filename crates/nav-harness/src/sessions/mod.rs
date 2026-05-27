@@ -364,8 +364,8 @@ mod tests {
             run_id,
             tool_call_id: ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap(),
             tool_name: "bash".to_string(),
-            reason: "bash requires approval".to_string(),
-            arguments_summary: r#"{"cmd":"echo hi"}"#.to_string(),
+            reason: "bash command requires confirmation".to_string(),
+            arguments_summary: r#"{"command":"echo hi"}"#.to_string(),
             risk_class: Some("exec".to_string()),
         }
     }
