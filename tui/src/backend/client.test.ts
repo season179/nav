@@ -1,7 +1,13 @@
 import {describe, expect, test} from 'bun:test';
 import {readFileSync} from 'node:fs';
 import path from 'node:path';
-import {parseSse, readSseStream, type NavEvent} from './client.js';
+import {
+	NavBackendClient,
+	ApprovalError,
+	parseSse,
+	readSseStream,
+	type NavEvent,
+} from './client.js';
 
 describe('parseSse', () => {
 	test('parses a tool call started payload from SSE', () => {
@@ -161,3 +167,180 @@ function sse(event: string, payload: Record<string, unknown>): string {
 		'',
 	].join('\n');
 }
+
+// --- Fake transport for NavBackendClient RPC tests ---
+
+type CapturedRequest = {
+	jsonrpc: string;
+	id: string;
+	method: string;
+	params?: unknown;
+};
+
+type FakeResponse = {
+	result?: unknown;
+	error?: {code: number; message: string};
+};
+
+function createClientWithFakeRpc(responses: FakeResponse[]) {
+	const client = new NavBackendClient();
+	const requests: CapturedRequest[] = [];
+	let callIndex = 0;
+
+	// Bypass backend spawning — wire in a fake endpoint and transport.
+	(client as any).endpoint = 'http://fake';
+	(client as any).session = {
+		sessionId: 'test-session',
+		endpoint: 'http://fake',
+		cwd: '/tmp',
+	};
+	(client as any).fetchImpl = async (
+		_url: string,
+		options: {body: string},
+	) => {
+		const request = JSON.parse(options.body) as CapturedRequest;
+		requests.push(request);
+		const response = responses[callIndex++] as FakeResponse;
+
+		const body = JSON.stringify({
+			jsonrpc: '2.0',
+			id: request.id,
+			...(response.error
+				? {error: response.error}
+				: {result: response.result}),
+		});
+
+		return {
+			ok: true,
+			status: 200,
+			text: async () => body,
+		};
+	};
+
+	return {client, getRequests: () => requests};
+}
+
+// --- tool.approve / tool.reject client methods ---
+
+describe('NavBackendClient tool approval methods', () => {
+	test('approveTool sends tool.approve RPC and returns parsed result', async () => {
+		const {client, getRequests} = createClientWithFakeRpc([
+			{result: {approvalId: 'appr-1', outcome: 'approved'}},
+		]);
+
+		const result = await client.approveTool('appr-1');
+
+		expect(result).toEqual({approvalId: 'appr-1', outcome: 'approved'});
+		expect(getRequests()[0]).toMatchObject({
+			method: 'tool.approve',
+			params: {approval_id: 'appr-1'},
+		});
+	});
+
+	test('rejectTool sends tool.reject RPC with optional reason and returns result', async () => {
+		const {client, getRequests} = createClientWithFakeRpc([
+			{result: {approvalId: 'appr-2', outcome: 'rejected'}},
+		]);
+
+		const result = await client.rejectTool('appr-2', 'not this command');
+
+		expect(result).toEqual({approvalId: 'appr-2', outcome: 'rejected'});
+		expect(getRequests()[0]).toMatchObject({
+			method: 'tool.reject',
+			params: {
+				approval_id: 'appr-2',
+				reason: 'not this command',
+			},
+		});
+	});
+
+	test('rejectTool omits reason when not provided', async () => {
+		const {client, getRequests} = createClientWithFakeRpc([
+			{result: {approvalId: 'appr-3', outcome: 'rejected'}},
+		]);
+
+		await client.rejectTool('appr-3');
+
+		expect(getRequests()[0].params).toEqual({approval_id: 'appr-3'});
+	});
+
+	test('approveTool throws ApprovalError not_pending for unknown approval id', async () => {
+		const {client} = createClientWithFakeRpc([
+			{
+				error: {
+					code: -32006,
+					message: 'approval `unknown-1` is not pending',
+				},
+			},
+		]);
+
+		try {
+			await client.approveTool('unknown-1');
+			expect.unreachable('should have thrown');
+		} catch (error) {
+			expect(error).toBeInstanceOf(ApprovalError);
+			expect((error as ApprovalError).kind).toBe('not_pending');
+			expect((error as ApprovalError).message).toContain('not pending');
+		}
+	});
+
+	test('rejectTool throws ApprovalError not_pending for already-resolved approval id', async () => {
+		const {client} = createClientWithFakeRpc([
+			{
+				error: {
+					code: -32006,
+					message: 'approval `appr-done` is already pending',
+				},
+			},
+		]);
+
+		try {
+			await client.rejectTool('appr-done');
+			expect.unreachable('should have thrown');
+		} catch (error) {
+			expect(error).toBeInstanceOf(ApprovalError);
+			expect((error as ApprovalError).kind).toBe('not_pending');
+		}
+	});
+
+	test('approveTool throws ApprovalError network for non-32006 RPC errors', async () => {
+		const {client} = createClientWithFakeRpc([
+			{
+				error: {
+					code: -32600,
+					message: 'invalid request',
+				},
+			},
+		]);
+
+		try {
+			await client.approveTool('appr-1');
+			expect.unreachable('should have thrown');
+		} catch (error) {
+			expect(error).toBeInstanceOf(ApprovalError);
+			expect((error as ApprovalError).kind).toBe('network');
+		}
+	});
+
+	test('approveTool throws ApprovalError network when fetch throws', async () => {
+		const client = new NavBackendClient();
+		(client as any).endpoint = 'http://fake';
+		(client as any).session = {
+			sessionId: 'test-session',
+			endpoint: 'http://fake',
+			cwd: '/tmp',
+		};
+		(client as any).fetchImpl = async () => {
+			throw new TypeError('fetch failed');
+		};
+
+		try {
+			await client.approveTool('appr-net');
+			expect.unreachable('should have thrown');
+		} catch (error) {
+			expect(error).toBeInstanceOf(ApprovalError);
+			expect((error as ApprovalError).kind).toBe('network');
+			expect((error as ApprovalError).message).toContain('fetch failed');
+		}
+	});
+});
