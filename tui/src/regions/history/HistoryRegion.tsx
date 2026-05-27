@@ -1,6 +1,8 @@
 import React, {useState, useEffect, useRef} from 'react';
 import {Box, Text, useInput} from 'ink';
-import type {HistoryMessage, ToolCallHistoryMessage} from './types.js';
+import {ToolCallCell} from './ToolCallCell.js';
+import {ToolResultCell} from './ToolResultCell.js';
+import type {HistoryMessage} from './types.js';
 import {theme} from '../../theme/index.js';
 import {Markdown} from '../../markdown/Markdown.js';
 
@@ -144,23 +146,11 @@ const MessageRow = React.memo(function MessageRow({
 	}
 
 	if (message.role === 'tool_call') {
-		return (
-			<Box flexDirection="column" marginBottom={1}>
-				<Text color={theme.inactive} wrap="wrap">
-					{toolCallSummary(message)}
-				</Text>
-			</Box>
-		);
+		return <ToolCallCell message={message} />;
 	}
 
 	if (message.role === 'tool_result') {
-		return (
-			<Box flexDirection="column" marginBottom={1}>
-				<Text color={theme.inactive} wrap="wrap">
-					{message.errorMessage || message.text || 'Tool result'}
-				</Text>
-			</Box>
-		);
+		return <ToolResultCell message={message} />;
 	}
 
 	return (
@@ -173,11 +163,3 @@ const MessageRow = React.memo(function MessageRow({
 		</Box>
 	);
 });
-
-function toolCallSummary(message: ToolCallHistoryMessage): string {
-	const label = message.name || 'tool';
-	if (!message.arguments) {
-		return `[${message.status}] ${label}`;
-	}
-	return `[${message.status}] ${label} ${message.arguments}`;
-}

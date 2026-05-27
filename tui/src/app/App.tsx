@@ -323,11 +323,7 @@ function appendAssistantText(
 		return messages;
 	}
 
-	return messages.map(entry =>
-		entry.id === assistantId && entry.role === 'assistant'
-			? {...entry, text: entry.text + chunk}
-			: entry,
-	);
+	return updateAssistantText(messages, assistantId, text => text + chunk);
 }
 
 function replaceAssistantText(
@@ -335,10 +331,37 @@ function replaceAssistantText(
 	assistantId: string,
 	text: string,
 ): HistoryMessage[] {
-	return messages.map(entry =>
-		entry.id === assistantId && entry.role === 'assistant'
-			? {...entry, text}
-			: entry,
+	return updateAssistantText(messages, assistantId, () => text);
+}
+
+function updateAssistantText(
+	messages: HistoryMessage[],
+	assistantId: string,
+	updateText: (text: string) => string,
+): HistoryMessage[] {
+	const index = messages.findIndex(
+		entry => entry.id === assistantId && entry.role === 'assistant',
+	);
+	if (index === -1) {
+		return messages;
+	}
+
+	const assistant = messages[index];
+	if (assistant.role !== 'assistant') {
+		return messages;
+	}
+
+	const updatedAssistant = {...assistant, text: updateText(assistant.text)};
+	if (assistant.text === '' && index < messages.length - 1) {
+		return [
+			...messages.slice(0, index),
+			...messages.slice(index + 1),
+			updatedAssistant,
+		];
+	}
+
+	return messages.map((entry, entryIndex) =>
+		entryIndex === index ? updatedAssistant : entry,
 	);
 }
 
