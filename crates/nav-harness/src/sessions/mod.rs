@@ -44,6 +44,10 @@ impl Turn {
         Self::text(TurnRole::Assistant, text)
     }
 
+    pub fn system_text(text: impl Into<String>) -> Self {
+        Self::text(TurnRole::System, text)
+    }
+
     pub fn text_content(&self) -> String {
         self.parts
             .iter()
@@ -62,6 +66,7 @@ impl Turn {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnRole {
+    System,
     User,
     Assistant,
 }
