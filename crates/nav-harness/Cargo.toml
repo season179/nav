@@ -5,11 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
 nav-types = { path = "../nav-types" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1.48", features = ["macros", "sync"] }
+tokio = { version = "1.48", features = ["io-util", "macros", "process", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }

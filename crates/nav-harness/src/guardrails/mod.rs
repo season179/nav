@@ -157,6 +157,37 @@ impl GuardrailRunner {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BashConfirmationHook;
+
+impl ToolGuardrailHook for BashConfirmationHook {
+    fn name(&self) -> &str {
+        "default-bash-confirmation"
+    }
+
+    fn before_tool_call(
+        &self,
+        context: &ToolCallContext,
+    ) -> Result<BeforeToolCallDecision, GuardrailError> {
+        if context.tool_name != "bash" {
+            return Ok(BeforeToolCallDecision::Allow);
+        }
+
+        Ok(BeforeToolCallDecision::RequestConfirmation {
+            reason: "bash command requires confirmation".to_string(),
+            summary: context.arguments.summary.clone(),
+        })
+    }
+}
+
+pub fn default_guardrails() -> GuardrailRunner {
+    let mut guardrails = GuardrailRunner::default();
+    guardrails
+        .register_hook(BashConfirmationHook)
+        .expect("built-in bash confirmation hook should register");
+    guardrails
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCallContext {
     pub tool_name: String,
@@ -420,7 +451,7 @@ mod tests {
 
     use super::{
         BeforeToolCallDecision, ConfirmationPolicy, GuardrailError, GuardrailRunner,
-        ToolCallContext, ToolCallContextParams, ToolGuardrailHook,
+        ToolCallContext, ToolCallContextParams, ToolGuardrailHook, default_guardrails,
     };
     use crate::tools::{RiskClass, ToolContext, ToolPreset};
     use crate::workspace::path::WorkspacePathPolicy;
@@ -532,6 +563,35 @@ mod tests {
     }
 
     #[test]
+    fn default_guardrails_request_confirmation_for_bash_only() {
+        let runner = default_guardrails();
+
+        let error = runner
+            .before_tool_call(&tool_call_context_for_tool(
+                "bash",
+                RiskClass::Exec,
+                json!({"command": "cargo test"}),
+            ))
+            .expect_err("bash should request confirmation by default");
+
+        assert_eq!(
+            error,
+            GuardrailError::confirmation_required(
+                "default-bash-confirmation",
+                "bash command requires confirmation",
+                r#"{"command":"cargo test"}"#,
+            )
+        );
+        runner
+            .before_tool_call(&tool_call_context_for_tool(
+                "read",
+                RiskClass::Read,
+                json!({"path": "Cargo.toml"}),
+            ))
+            .expect("read should not be blocked by the bash confirmation hook");
+    }
+
+    #[test]
     fn hook_errors_include_the_hook_name() {
         let mut runner = GuardrailRunner::default();
         runner
@@ -608,6 +668,26 @@ mod tests {
     fn tool_call_context(arguments: serde_json::Value) -> ToolCallContext {
         let tool_context = ToolContext::default();
         tool_call_context_with_tool_context(arguments, &tool_context)
+    }
+
+    fn tool_call_context_for_tool(
+        tool_name: &str,
+        risk_class: RiskClass,
+        arguments: serde_json::Value,
+    ) -> ToolCallContext {
+        let tool_context = ToolContext::default();
+        ToolCallContext::new(ToolCallContextParams {
+            tool_name,
+            raw_arguments: arguments.to_string(),
+            parsed_arguments: arguments,
+            preset: ToolPreset::Coding,
+            risk_class,
+            tool_context: &tool_context,
+            call_id: "call_test_1",
+            nav_tool_call_id: None,
+            run_id: RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001")
+                .expect("run id should parse"),
+        })
     }
 
     fn tool_call_context_with_tool_context(

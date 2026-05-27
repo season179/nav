@@ -1,22 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use nav_harness::guardrails::{
-    BeforeToolCallDecision, GuardrailError, GuardrailRunner, ToolCallContext, ToolGuardrailHook,
-};
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
 use nav_harness::sessions::PendingConfirmation;
-use nav_harness::tools::{
-    NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput, ToolRegistry,
-};
+use nav_harness::tools::{ToolRegistry, bash};
 use nav_protocol::rpc::{SessionSource, ToolsPreset};
 use nav_protocol::{BackendEvent, EventEnvelope};
 use nav_server::http::{
@@ -491,7 +484,10 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].body["tools"][0]["function"]["name"], "read");
+    assert_eq!(
+        tool_names_from_request(&requests[0].body),
+        vec!["bash", "read"]
+    );
     assert_eq!(
         requests[1].body["messages"],
         json!([
@@ -543,13 +539,13 @@ fn session_send_message_approves_guarded_bash_tool_and_resumes_run() {
     let (run_id, approval_id) = fixture.wait_for_approval_request();
 
     assert_eq!(fixture.provider.request_count(), 1);
-    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.execution_count(), 0);
     approve_tool_request(&mut fixture.server, &approval_id);
 
     wait_for_run_status(&fixture.server, &run_id, RunStatus::Completed);
-    assert_eq!(fixture.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.execution_count(), 1);
     assert_not_pending_confirmation(approve_tool_request_body(&mut fixture.server, &approval_id));
-    assert_eq!(fixture.executions.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.execution_count(), 1);
     let requests = fixture.provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[1].body["messages"][2]["role"], "tool");
@@ -568,7 +564,7 @@ fn session_send_message_rejects_guarded_bash_tool_without_execution() {
     reject_tool_request(&mut fixture.server, &approval_id, "not this command");
 
     wait_for_run_status(&fixture.server, &run_id, RunStatus::Completed);
-    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.execution_count(), 0);
     let requests = fixture.provider.requests();
     assert_eq!(requests.len(), 2);
     let tool_result = &requests[1].body["messages"][2];
@@ -589,10 +585,10 @@ fn session_send_message_cancel_wakes_guarded_bash_confirmation_without_execution
     cancel_run(&mut fixture.server, &run_id);
 
     wait_for_run_status(&fixture.server, &run_id, RunStatus::Cancelled);
-    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.execution_count(), 0);
     assert_eq!(fixture.provider.request_count(), 1);
     assert_not_pending_confirmation(approve_tool_request_body(&mut fixture.server, &approval_id));
-    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.execution_count(), 0);
 }
 
 #[test]
@@ -1282,28 +1278,47 @@ fn approval_id_from_event(event: &EventEnvelope) -> String {
     }
 }
 
+fn tool_names_from_request(body: &Value) -> Vec<&str> {
+    body["tools"]
+        .as_array()
+        .expect("request tools should be an array")
+        .iter()
+        .map(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .expect("tool function name should be a string")
+        })
+        .collect()
+}
+
 struct GuardedBashFixture {
     server: HttpServer,
     provider: SequencedProviderServer,
-    executions: Arc<AtomicUsize>,
+    _workspace: TestWorkspace,
+    execution_marker: PathBuf,
     session_id: SessionId,
     subscription: ProtocolEventSubscription,
 }
 
 impl GuardedBashFixture {
     fn new(provider_call_id: &str, final_response: &str) -> Self {
-        let executions = Arc::new(AtomicUsize::new(0));
+        let workspace = TestWorkspace::new(provider_call_id);
+        let execution_marker = workspace.root.join("bash-executions.txt");
+        let command = format!(
+            "printf 'bash output'; printf 'run\\n' >> {}",
+            shell_quote_path(&execution_marker)
+        );
         let provider = SequencedProviderServer::start(vec![
-            bash_tool_call_chunks(provider_call_id),
+            bash_tool_call_chunks(provider_call_id, &command),
             successful_provider_chunks(final_response),
         ]);
         let mut server = HttpServer::with_model_settings(
             HttpServerConfig::default(),
             model_settings_with_base_url(provider.base_url()),
         )
-        .with_tool_registry(bash_tool_registry(Arc::clone(&executions)))
-        .with_guardrails(bash_guardrails());
-        let session_id = SessionId::try_new(create_session(&mut server)).unwrap();
+        .with_tool_registry(bash_tool_registry());
+        let session_id =
+            SessionId::try_new(create_session_with_cwd(&mut server, workspace.root())).unwrap();
         let subscription = server
             .subscribe_session_events(&session_id, None)
             .expect("session event subscription should open");
@@ -1311,7 +1326,8 @@ impl GuardedBashFixture {
         Self {
             server,
             provider,
-            executions,
+            _workspace: workspace,
+            execution_marker,
             session_id,
             subscription,
         }
@@ -1334,22 +1350,18 @@ impl GuardedBashFixture {
         let approval_id = approval_id_from_event(&pending_events[5]);
         (run_id, approval_id)
     }
+
+    fn execution_count(&self) -> usize {
+        fs::read_to_string(&self.execution_marker)
+            .map(|content| content.lines().count())
+            .unwrap_or(0)
+    }
 }
 
-fn bash_tool_registry(executions: Arc<AtomicUsize>) -> ToolRegistry {
+fn bash_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::default();
+    bash::register(&mut registry).expect("bash test tool should register");
     registry
-        .register(CountingBashTool { executions })
-        .expect("bash test tool should register");
-    registry
-}
-
-fn bash_guardrails() -> GuardrailRunner {
-    let mut guardrails = GuardrailRunner::default();
-    guardrails
-        .register_hook(ConfirmBashHook)
-        .expect("bash confirmation hook should register");
-    guardrails
 }
 
 fn approve_tool_request(server: &mut HttpServer, approval_id: &str) {
@@ -1414,11 +1426,29 @@ fn assert_not_pending_confirmation(body: Value) {
     );
 }
 
-fn bash_tool_call_chunks(provider_call_id: &str) -> Vec<String> {
+fn bash_tool_call_chunks(provider_call_id: &str, command: &str) -> Vec<String> {
+    let tool_arguments = json!({ "command": command }).to_string();
+    let chunk = json!({
+        "id": "provider-run-1",
+        "model": "vendor/model-large",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": provider_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "arguments": tool_arguments
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
     vec![
-        provider_sse_chunk(&format!(
-            r#"{{"id":"provider-run-1","model":"vendor/model-large","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"{provider_call_id}","type":"function","function":{{"name":"bash","arguments":"{{\"cmd\":\"echo hi\"}}"}}}}]}},"finish_reason":null}}]}}"#
-        )),
+        provider_sse_chunk(&chunk.to_string()),
         provider_sse_chunk(
             r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
         ),
@@ -1426,71 +1456,12 @@ fn bash_tool_call_chunks(provider_call_id: &str) -> Vec<String> {
     ]
 }
 
-#[derive(Debug)]
-struct ConfirmBashHook;
-
-impl ToolGuardrailHook for ConfirmBashHook {
-    fn name(&self) -> &str {
-        "confirm-bash"
-    }
-
-    fn before_tool_call(
-        &self,
-        context: &ToolCallContext,
-    ) -> Result<BeforeToolCallDecision, GuardrailError> {
-        if context.tool_name == "bash" {
-            return Ok(BeforeToolCallDecision::RequestConfirmation {
-                reason: "bash requires approval".to_string(),
-                summary: context.arguments.summary.clone(),
-            });
-        }
-
-        Ok(BeforeToolCallDecision::Allow)
-    }
-}
-
-struct CountingBashTool {
-    executions: Arc<AtomicUsize>,
-}
-
-impl NavTool for CountingBashTool {
-    fn name(&self) -> &str {
-        "bash"
-    }
-
-    fn description(&self) -> &str {
-        "Runs a test shell command."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "cmd": { "type": "string" } },
-            "required": ["cmd"],
-            "additionalProperties": false
-        })
-    }
-
-    fn risk_class(&self) -> RiskClass {
-        RiskClass::Exec
-    }
-
-    fn execute<'a>(
-        &'a self,
-        _ctx: &'a ToolContext,
-        _args: Value,
-        _cancel: ToolCancellationToken,
-    ) -> ToolFuture<'a> {
-        let executions = Arc::clone(&self.executions);
-        Box::pin(async move {
-            executions.fetch_add(1, Ordering::SeqCst);
-            Ok(ToolOutput::text("bash output"))
-        })
-    }
-}
-
 fn create_session(server: &mut HttpServer) -> String {
     create_session_with_cwd(server, Path::new("/tmp/nav-workspace"))
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 fn create_session_with_cwd(server: &mut HttpServer, cwd: &Path) -> String {

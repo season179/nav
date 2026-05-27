@@ -6,13 +6,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use nav_harness::guardrails::GuardrailRunner;
+use nav_harness::guardrails::{GuardrailRunner, default_guardrails};
 use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
 use nav_harness::sessions::{
     ConfirmationDecision, PendingConfirmation, PendingConfirmationError,
     PendingConfirmationReceiver, PendingConfirmationRegistry, SessionStore, Turn,
 };
-use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, read};
+use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, bash, read};
 use nav_harness::workspace::path::WorkspacePathPolicy;
 use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
@@ -81,6 +81,7 @@ impl HttpServer {
     pub fn with_model_settings(config: HttpServerConfig, model_settings: ModelSettings) -> Self {
         let mut tool_registry = ToolRegistry::default();
         read::register(&mut tool_registry).expect("built-in read tool should register");
+        bash::register(&mut tool_registry).expect("built-in bash tool should register");
 
         Self {
             config: config.clone(),
@@ -93,7 +94,7 @@ impl HttpServer {
             event_store: Arc::new(Mutex::new(ProtocolEventStore::default())),
             model_run_service: ModelRunService::default(),
             tool_registry: Arc::new(tool_registry),
-            guardrails: GuardrailRunner::default(),
+            guardrails: default_guardrails(),
         }
     }
 

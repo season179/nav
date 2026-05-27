@@ -1,8 +1,9 @@
 //! Typed, permissioned, observable, and recoverable tool access.
 //!
-//! Mutating filesystem and shell tools intentionally land in follow-up issues;
-//! this module owns the registry/API shape and read-only built-ins.
+//! This module owns the registry/API shape plus built-in tool definitions.
+//! Risky execution policy stays in guardrail hooks, outside individual tools.
 
+pub mod bash;
 pub mod ls;
 pub mod read;
 pub mod truncation;
