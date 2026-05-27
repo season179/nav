@@ -21,7 +21,11 @@ import {
 	type ModelOption,
 	type ModelRef,
 } from '../overlays/model/load-models.js';
-import type {HistoryMessage} from '../regions/history/types.js';
+import type {
+	HistoryMessage,
+	ToolCallHistoryMessage,
+	ToolCallStatus,
+} from '../regions/history/types.js';
 
 type Props = {
 	backendPath?: string;
@@ -200,7 +204,7 @@ export function App({backendPath = ''}: Props) {
 				caught instanceof Error ? caught.message : String(caught);
 			setMessages(previous =>
 				previous.map(entry =>
-					entry.id === assistantId
+					entry.id === assistantId && entry.role === 'assistant'
 						? {...entry, text: message}
 						: entry,
 				),
@@ -213,37 +217,195 @@ export function App({backendPath = ''}: Props) {
 	}
 
 	function applyEvent(event: NavEvent, assistantId: string) {
-		if (event.type === 'model.reasoning_delta') {
-			return;
-		}
-
-		if (
-			event.type === 'run.failed' ||
-			event.type === 'error' ||
-			event.type === 'provider.error'
-		) {
-			const message = eventText(event) || event.message || event.type;
-			setMessages(previous =>
-				previous.map(entry =>
-					entry.id === assistantId
-						? {...entry, text: message}
-						: entry,
-				),
-			);
-			return;
-		}
-
-		const chunk = eventText(event);
-		if (!chunk) {
-			return;
-		}
-
 		setMessages(previous =>
-			previous.map(entry =>
-				entry.id === assistantId
-					? {...entry, text: entry.text + chunk}
-					: entry,
-			),
+			applyEventToHistory(previous, event, assistantId),
 		);
 	}
+}
+
+export function applyEventToHistory(
+	messages: HistoryMessage[],
+	event: NavEvent,
+	assistantId: string,
+	warn: (message: string) => void = console.warn,
+): HistoryMessage[] {
+	switch (event.type) {
+		case 'session.created':
+		case 'run.started':
+		case 'message.completed':
+		case 'run.completed':
+		case 'run.cancelled':
+		case 'model.reasoning_delta':
+			return messages;
+		case 'message.delta':
+		case 'model.text_delta':
+			return appendAssistantText(messages, assistantId, eventText(event));
+		case 'run.failed':
+		case 'error':
+		case 'provider.error':
+			return replaceAssistantText(
+				messages,
+				assistantId,
+				eventText(event) || event.message || event.type,
+			);
+		case 'tool.call_requested':
+			return upsertToolCall(messages, event, {
+				status: 'requested',
+				name: event.name,
+			});
+		case 'tool.call_started':
+			return upsertToolCall(messages, event, {
+				status: 'running',
+				name: event.name,
+			});
+		case 'tool.call_delta':
+			return upsertToolCall(messages, event, {
+				status: 'running',
+				argumentsDelta: event.argumentsDelta,
+			});
+		case 'tool.call_completed':
+			return upsertToolCall(messages, event, {
+				status: 'completed',
+				name: event.name,
+				arguments: event.arguments,
+			});
+		case 'tool.call_failed': {
+			const withCall = upsertToolCall(messages, event, {
+				status: 'failed',
+				name: event.name,
+				errorMessage: event.errorMessage,
+			});
+			return [
+				...withCall,
+				{
+					id: event.id || `${event.toolCallId}-failed`,
+					role: 'tool_result',
+					runId: event.runId,
+					toolCallId: event.toolCallId,
+					name: event.name,
+					status: 'failed',
+					text: event.errorMessage,
+					errorMessage: event.errorMessage,
+				},
+			];
+		}
+		case 'tool.approval_requested':
+			return upsertToolCall(messages, event, {
+				status: 'approval_requested',
+				approvalId: event.approvalId,
+			});
+		case 'file.changed':
+			return [
+				...messages,
+				{
+					id: event.fileChangeId || event.id,
+					role: 'system',
+					text: `Changed file: ${event.path || '(unknown)'}`,
+				},
+			];
+		case 'unknown':
+			warn(`Unknown nav event type: ${event.rawType || '(missing)'}`);
+			return messages;
+		default: {
+			const exhaustive: never = event;
+			warn(`Unhandled nav event: ${JSON.stringify(exhaustive)}`);
+			return messages;
+		}
+	}
+}
+
+function appendAssistantText(
+	messages: HistoryMessage[],
+	assistantId: string,
+	chunk: string,
+): HistoryMessage[] {
+	if (!chunk) {
+		return messages;
+	}
+
+	return messages.map(entry =>
+		entry.id === assistantId && entry.role === 'assistant'
+			? {...entry, text: entry.text + chunk}
+			: entry,
+	);
+}
+
+function replaceAssistantText(
+	messages: HistoryMessage[],
+	assistantId: string,
+	text: string,
+): HistoryMessage[] {
+	return messages.map(entry =>
+		entry.id === assistantId && entry.role === 'assistant'
+			? {...entry, text}
+			: entry,
+	);
+}
+
+type ToolCallUpdate = {
+	status: ToolCallStatus;
+	name?: string;
+	arguments?: string;
+	argumentsDelta?: string;
+	approvalId?: string;
+	errorMessage?: string;
+};
+
+type ToolEvent = Extract<NavEvent, {toolCallId: string}>;
+
+function upsertToolCall(
+	messages: HistoryMessage[],
+	event: ToolEvent,
+	update: ToolCallUpdate,
+): HistoryMessage[] {
+	const toolCallId = event.toolCallId || event.id;
+	const index = messages.findIndex(
+		entry => entry.role === 'tool_call' && entry.toolCallId === toolCallId,
+	);
+
+	const buildMessage = (): ToolCallHistoryMessage => ({
+		id: toolCallId,
+		role: 'tool_call',
+		runId: event.runId,
+		toolCallId,
+		name: update.name ?? '',
+		arguments: initialToolArguments(update),
+		status: update.status,
+		approvalId: update.approvalId,
+		errorMessage: update.errorMessage,
+	});
+
+	if (index === -1) {
+		return [...messages, buildMessage()];
+	}
+
+	return messages.map((entry, entryIndex) => {
+		if (entryIndex !== index || entry.role !== 'tool_call') {
+			return entry;
+		}
+
+		return {
+			...entry,
+			runId: event.runId || entry.runId,
+			name: update.name || entry.name,
+			arguments: updateToolArguments(entry.arguments, update),
+			status: update.status,
+			approvalId: update.approvalId ?? entry.approvalId,
+			errorMessage: update.errorMessage ?? entry.errorMessage,
+		};
+	});
+}
+
+function initialToolArguments(update: ToolCallUpdate): string {
+	return update.arguments ?? update.argumentsDelta ?? '';
+}
+
+function updateToolArguments(current: string, update: ToolCallUpdate): string {
+	if (update.arguments !== undefined) {
+		return update.arguments;
+	}
+	if (update.argumentsDelta !== undefined) {
+		return current + update.argumentsDelta;
+	}
+	return current;
 }

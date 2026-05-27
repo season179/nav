@@ -67,9 +67,10 @@ function PreviewFrame({children}: {children: React.ReactNode}) {
 }
 
 function HistoryPreview() {
+	const {rows} = useTerminalSize();
 	return (
 		<PreviewFrame>
-			<HistoryRegion messages={CHAT_MESSAGES} />
+			<HistoryRegion messages={CHAT_MESSAGES} height={rows} />
 		</PreviewFrame>
 	);
 }
@@ -166,7 +167,7 @@ function ShellPreview() {
 						onCancel={() => setModelOpen(false)}
 					/>
 				) : (
-					<HistoryRegion messages={messages} />
+					<HistoryRegion messages={messages} height={historyHeight - 1} />
 				)}
 			</Box>
 			<ComposerRegion
