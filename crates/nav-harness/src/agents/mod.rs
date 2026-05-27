@@ -1,5 +1,9 @@
 //! Agent roles, loops, delegation, task state, and autonomy limits.
 
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use nav_types::{MessageId, RunId};
 
 use crate::events::{
@@ -11,7 +15,10 @@ use crate::models::{
     OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, OpenAiCompletionsError,
     OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, ResolvedModelConfig,
 };
-use crate::sessions::{ToolCall, Turn};
+use crate::sessions::{
+    ConfirmationDecision, PendingConfirmation, PendingConfirmationReceiver,
+    PendingConfirmationRegistry, ToolCall, Turn,
+};
 use crate::tools::{ToolCancellationToken, ToolContext, ToolPreset, ToolRegistry};
 
 #[derive(Debug, Default)]
@@ -30,6 +37,7 @@ pub struct RunLoopRequest<'a> {
     pub tool_registry: &'a ToolRegistry,
     pub tool_preset: ToolPreset,
     pub tool_context: &'a ToolContext,
+    pub pending_confirmations: Option<&'a Arc<Mutex<PendingConfirmationRegistry>>>,
     pub cancellation_token: OpenAiCompletionsCancellationToken,
 }
 
@@ -130,6 +138,7 @@ impl RunLoop {
                 context: request.tool_context,
                 cancel: tool_cancel,
                 run_cancel: Some(request.cancellation_token.clone()),
+                pending_confirmations: request.pending_confirmations,
                 run_id: request.run_id,
                 ids,
                 emit: &mut emit,
@@ -292,6 +301,7 @@ where
     context: &'a ToolContext,
     cancel: ToolCancellationToken,
     run_cancel: Option<OpenAiCompletionsCancellationToken>,
+    pending_confirmations: Option<&'a Arc<Mutex<PendingConfirmationRegistry>>>,
     run_id: &'a RunId,
     ids: &'a mut Ids,
     emit: &'a mut Emit,
@@ -310,6 +320,7 @@ where
         context,
         cancel,
         run_cancel,
+        pending_confirmations,
         run_id,
         ids,
         emit,
@@ -320,7 +331,7 @@ where
         .enable_all()
         .build()
         .expect("tool dispatch runtime should build");
-    if let Some(run_cancel) = run_cancel {
+    if let Some(run_cancel) = run_cancel.clone() {
         let tool_cancel = cancel.clone();
         runtime.spawn(async move {
             run_cancel.cancelled().await;
@@ -366,19 +377,53 @@ where
         if let Err(error) = context.guardrails().before_tool_call(&guardrail_context) {
             let message = error.message();
             if let GuardrailError::ConfirmationRequired { reason, .. } = &error {
-                emit_tool_approval_requested(
+                match request_tool_confirmation(ToolConfirmationRequest {
+                    pending_confirmations,
+                    receiver_cancel: run_cancel.as_ref(),
                     ids,
                     emit,
                     run_id,
                     tool_call,
                     reason,
-                    &guardrail_context.arguments.summary,
-                    tool.risk_class().name(),
-                );
+                    arguments_summary: &guardrail_context.arguments.summary,
+                    risk_class: tool.risk_class().name(),
+                }) {
+                    ToolConfirmationDecision::Approved => {}
+                    ToolConfirmationDecision::Rejected { reason } => {
+                        turns.push(tool_rejected_turn(tool_call, reason));
+                        continue;
+                    }
+                    ToolConfirmationDecision::Cancelled => return ToolDispatchResult::Cancelled,
+                    ToolConfirmationDecision::Unavailable => {
+                        emit_tool_call_failed(
+                            ids,
+                            emit,
+                            run_id,
+                            tool_call,
+                            &message,
+                            base_metadata,
+                        );
+                        turns.push(tool_error_turn(tool_call, message));
+                        continue;
+                    }
+                    ToolConfirmationDecision::Failed(registration_error) => {
+                        emit_tool_call_failed(
+                            ids,
+                            emit,
+                            run_id,
+                            tool_call,
+                            &registration_error,
+                            base_metadata,
+                        );
+                        turns.push(tool_error_turn(tool_call, registration_error));
+                        continue;
+                    }
+                }
+            } else {
+                emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+                turns.push(tool_error_turn(tool_call, message));
+                continue;
             }
-            emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
-            turns.push(tool_error_turn(tool_call, message));
-            continue;
         }
 
         let result = runtime.block_on(tool.execute(context, args, cancel.clone()));
@@ -413,6 +458,134 @@ fn tool_error_turn(tool_call: &ToolCall, message: impl Into<String>) -> Turn {
     Turn::tool_result(&tool_call.id, structured_tool_error(message))
 }
 
+fn tool_rejected_turn(tool_call: &ToolCall, reason: Option<String>) -> Turn {
+    Turn::tool_result(&tool_call.id, structured_tool_rejection(reason))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolConfirmationDecision {
+    Approved,
+    Rejected { reason: Option<String> },
+    Cancelled,
+    Unavailable,
+    Failed(String),
+}
+
+struct ToolConfirmationRequest<'a, 'b, Ids, Emit>
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    pending_confirmations: Option<&'a Arc<Mutex<PendingConfirmationRegistry>>>,
+    receiver_cancel: Option<&'a OpenAiCompletionsCancellationToken>,
+    ids: &'a mut Ids,
+    emit: &'a mut Emit,
+    run_id: &'a RunId,
+    tool_call: &'a ToolCall,
+    reason: &'b str,
+    arguments_summary: &'b str,
+    risk_class: &'b str,
+}
+
+fn request_tool_confirmation<Ids, Emit>(
+    request: ToolConfirmationRequest<'_, '_, Ids, Emit>,
+) -> ToolConfirmationDecision
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let ToolConfirmationRequest {
+        pending_confirmations,
+        receiver_cancel,
+        ids,
+        emit,
+        run_id,
+        tool_call,
+        reason,
+        arguments_summary,
+        risk_class,
+    } = request;
+
+    let approval_id = ids.next_approval_id();
+    let Some(pending_confirmations) = pending_confirmations else {
+        emit_tool_approval_requested(
+            ids,
+            emit,
+            ToolApprovalRequestedEvent {
+                run_id,
+                tool_call,
+                approval_id,
+                reason,
+                arguments_summary,
+                risk_class,
+            },
+        );
+        return ToolConfirmationDecision::Unavailable;
+    };
+    let Some(tool_call_id) = tool_call.tool_call_id.clone() else {
+        return ToolConfirmationDecision::Failed(
+            "tool confirmation requested without a nav tool_call_id".to_string(),
+        );
+    };
+
+    let pending = PendingConfirmation {
+        approval_id: approval_id.clone(),
+        run_id: run_id.clone(),
+        tool_call_id,
+        tool_name: tool_call.name.clone(),
+        reason: reason.to_string(),
+        arguments_summary: arguments_summary.to_string(),
+        risk_class: Some(risk_class.to_string()),
+    };
+    let receiver = match pending_confirmations.lock().unwrap().register(pending) {
+        Ok(receiver) => receiver,
+        Err(error) => return ToolConfirmationDecision::Failed(error.to_string()),
+    };
+
+    emit_tool_approval_requested(
+        ids,
+        emit,
+        ToolApprovalRequestedEvent {
+            run_id,
+            tool_call,
+            approval_id,
+            reason,
+            arguments_summary,
+            risk_class,
+        },
+    );
+
+    wait_for_tool_confirmation(receiver, receiver_cancel)
+}
+
+fn wait_for_tool_confirmation(
+    receiver: PendingConfirmationReceiver,
+    cancel: Option<&OpenAiCompletionsCancellationToken>,
+) -> ToolConfirmationDecision {
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(ConfirmationDecision::Approved) => return ToolConfirmationDecision::Approved,
+            Ok(ConfirmationDecision::Rejected { reason }) => {
+                return ToolConfirmationDecision::Rejected { reason };
+            }
+            Ok(ConfirmationDecision::Cancelled) => return ToolConfirmationDecision::Cancelled,
+            Err(RecvTimeoutError::Timeout) => {
+                if cancel.is_some_and(OpenAiCompletionsCancellationToken::is_cancelled) {
+                    return ToolConfirmationDecision::Cancelled;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if cancel.is_some_and(OpenAiCompletionsCancellationToken::is_cancelled) {
+                    return ToolConfirmationDecision::Cancelled;
+                }
+                return ToolConfirmationDecision::Failed(
+                    "tool confirmation channel closed before a decision".to_string(),
+                );
+            }
+        }
+    }
+}
+
 fn emit_tool_call_failed<Ids, Emit>(
     ids: &mut Ids,
     emit: &mut Emit,
@@ -442,32 +615,37 @@ fn emit_tool_call_failed<Ids, Emit>(
     emit(vec![event]);
 }
 
+struct ToolApprovalRequestedEvent<'a> {
+    run_id: &'a RunId,
+    tool_call: &'a ToolCall,
+    approval_id: nav_types::ApprovalId,
+    reason: &'a str,
+    arguments_summary: &'a str,
+    risk_class: &'a str,
+}
+
 fn emit_tool_approval_requested<Ids, Emit>(
     ids: &mut Ids,
     emit: &mut Emit,
-    run_id: &RunId,
-    tool_call: &ToolCall,
-    reason: &str,
-    arguments_summary: &str,
-    risk_class: &str,
+    request: ToolApprovalRequestedEvent<'_>,
 ) where
     Ids: HarnessEventIdSource,
     Emit: FnMut(Vec<HarnessEventEnvelope>),
 {
-    let Some(nav_tool_call_id) = &tool_call.tool_call_id else {
+    let Some(nav_tool_call_id) = &request.tool_call.tool_call_id else {
         return;
     };
 
     let event = HarnessEventEnvelope {
         event_id: ids.next_event_id(),
         event: HarnessEvent::ToolApprovalRequested {
-            run_id: run_id.clone(),
+            run_id: request.run_id.clone(),
             tool_call_id: nav_tool_call_id.clone(),
-            approval_id: ids.next_approval_id(),
-            tool_name: tool_call.name.clone(),
-            reason: reason.to_string(),
-            arguments_summary: arguments_summary.to_string(),
-            risk_class: Some(risk_class.to_string()),
+            approval_id: request.approval_id,
+            tool_name: request.tool_call.name.clone(),
+            reason: request.reason.to_string(),
+            arguments_summary: request.arguments_summary.to_string(),
+            risk_class: Some(request.risk_class.to_string()),
         },
     };
     emit(vec![event]);
@@ -483,10 +661,23 @@ fn structured_tool_error(message: impl Into<String>) -> String {
     .to_string()
 }
 
+fn structured_tool_rejection(reason: Option<String>) -> String {
+    serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "tool_rejected",
+            "message": "tool call rejected by user",
+            "reason": reason,
+        },
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -499,7 +690,7 @@ mod tests {
         BeforeToolCallDecision, ConfirmationPolicy, GuardrailError, GuardrailRunner,
         ToolCallContext, ToolGuardrailHook,
     };
-    use crate::sessions::ToolCall;
+    use crate::sessions::{ConfirmationDecision, PendingConfirmationRegistry, ToolCall};
     use crate::tools::{
         NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput,
         ToolRegistry, read,
@@ -552,6 +743,7 @@ mod tests {
             context,
             cancel,
             run_cancel,
+            pending_confirmations: None,
             run_id: &run_id,
             ids: &mut ids,
             emit: &mut |envelopes| events.extend(envelopes),
@@ -559,6 +751,68 @@ mod tests {
         });
         let _ = events;
         result
+    }
+
+    fn dispatch_with_pending_confirmation(
+        registry: &ToolRegistry,
+        context: &ToolContext,
+        tool_call: ToolCall,
+        run_cancel: Option<OpenAiCompletionsCancellationToken>,
+        mut on_approval_requested: impl FnMut(
+            &ApprovalId,
+            &Arc<Mutex<PendingConfirmationRegistry>>,
+            &RunId,
+        ),
+    ) -> (ToolDispatchResult, Vec<HarnessEventEnvelope>) {
+        let tool_calls = vec![tool_call];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let pending_confirmations = Arc::new(Mutex::new(PendingConfirmationRegistry::default()));
+        let mut ids = TestIdSource;
+        let mut events: Vec<HarnessEventEnvelope> = Vec::new();
+        let metadata = test_metadata();
+
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry,
+            tool_preset: ToolPreset::Coding,
+            context,
+            cancel: ToolCancellationToken::new(),
+            run_cancel,
+            pending_confirmations: Some(&pending_confirmations),
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| {
+                for envelope in &envelopes {
+                    if let HarnessEvent::ToolApprovalRequested { approval_id, .. } = &envelope.event
+                    {
+                        on_approval_requested(approval_id, &pending_confirmations, &run_id);
+                    }
+                }
+                events.extend(envelopes);
+            },
+            base_metadata: &metadata,
+        });
+
+        (result, events)
+    }
+
+    fn confirmation_context() -> ToolContext {
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(ConfirmGuardrailHook)
+            .expect("confirmation hook should register");
+        ToolContext::default().with_guardrails(guardrails)
+    }
+
+    fn tool_call_with_nav_id(id: &str, name: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool_call_id: Some(
+                NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap(),
+            ),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        }
     }
 
     #[test]
@@ -884,6 +1138,7 @@ mod tests {
             context: &context,
             cancel: ToolCancellationToken::new(),
             run_cancel: None,
+            pending_confirmations: None,
             run_id: &run_id,
             ids: &mut ids,
             emit: &mut |envelopes| events.extend(envelopes),
@@ -918,6 +1173,123 @@ mod tests {
             events[1].event,
             HarnessEvent::ToolCallFailed { .. }
         ));
+    }
+
+    #[test]
+    fn dispatch_waits_for_confirmation_and_executes_after_approval() {
+        let mut registry = ToolRegistry::default();
+        registry.register(EchoTool).expect("echo should register");
+        let context = confirmation_context();
+
+        let (result, events) = dispatch_with_pending_confirmation(
+            &registry,
+            &context,
+            tool_call_with_nav_id(
+                "call_confirm_approved",
+                "echo",
+                r#"{"text":"approved after rpc"}"#,
+            ),
+            None,
+            |approval_id, pending_confirmations, _run_id| {
+                pending_confirmations
+                    .lock()
+                    .unwrap()
+                    .resolve(approval_id, ConfirmationDecision::Approved)
+                    .expect("approval should resolve pending confirmation");
+            },
+        );
+
+        assert_eq!(
+            result,
+            ToolDispatchResult::Completed(vec![Turn::tool_result(
+                "call_confirm_approved",
+                "approved after rpc",
+            )])
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, HarnessEvent::ToolApprovalRequested { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.event, HarnessEvent::ToolCallFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn dispatch_turns_rejected_confirmation_into_tool_result_without_execution() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PanicIfExecutedTool)
+            .expect("panic tool should register");
+        let context = confirmation_context();
+
+        let (result, events) = dispatch_with_pending_confirmation(
+            &registry,
+            &context,
+            tool_call_with_nav_id("call_confirm_rejected", "panic-if-executed", "{}"),
+            None,
+            |approval_id, pending_confirmations, _run_id| {
+                pending_confirmations
+                    .lock()
+                    .unwrap()
+                    .resolve(
+                        approval_id,
+                        ConfirmationDecision::Rejected {
+                            reason: Some("no thanks".to_string()),
+                        },
+                    )
+                    .expect("rejection should resolve pending confirmation");
+            },
+        );
+
+        let ToolDispatchResult::Completed(turns) = result else {
+            panic!("rejection should return a tool result and re-enter the loop");
+        };
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tool_call_id(), Some("call_confirm_rejected"));
+        let rejection: Value = serde_json::from_str(&turns[0].text_content())
+            .expect("rejection should be structured JSON");
+        assert_eq!(rejection["ok"], false);
+        assert_eq!(rejection["error"]["code"], "tool_rejected");
+        assert_eq!(rejection["error"]["message"], "tool call rejected by user");
+        assert_eq!(rejection["error"]["reason"], "no thanks");
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event.event, HarnessEvent::ToolCallFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn dispatch_cancels_while_confirmation_is_pending() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PanicIfExecutedTool)
+            .expect("panic tool should register");
+        let context = confirmation_context();
+        let run_cancel = OpenAiCompletionsCancellationToken::new();
+        let cancel_from_callback = run_cancel.clone();
+
+        let (result, events) = dispatch_with_pending_confirmation(
+            &registry,
+            &context,
+            tool_call_with_nav_id("call_confirm_cancelled", "panic-if-executed", "{}"),
+            Some(run_cancel),
+            move |_approval_id, pending_confirmations, run_id| {
+                pending_confirmations.lock().unwrap().clear_for_run(run_id);
+                cancel_from_callback.cancel();
+            },
+        );
+
+        assert_eq!(result, ToolDispatchResult::Cancelled);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, HarnessEvent::ToolApprovalRequested { .. }))
+        );
     }
 
     #[test]
@@ -1009,6 +1381,7 @@ mod tests {
             context: &ToolContext::default(),
             cancel: ToolCancellationToken::new(),
             run_cancel: None,
+            pending_confirmations: None,
             run_id: &run_id,
             ids: &mut ids,
             emit: &mut |envelopes| events.extend(envelopes),
@@ -1055,6 +1428,7 @@ mod tests {
             context: &ToolContext::default(),
             cancel: ToolCancellationToken::new(),
             run_cancel: None,
+            pending_confirmations: None,
             run_id: &run_id,
             ids: &mut ids,
             emit: &mut |envelopes| events.extend(envelopes),

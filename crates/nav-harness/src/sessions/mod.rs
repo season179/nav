@@ -164,6 +164,7 @@ pub struct PendingConfirmation {
 pub enum ConfirmationDecision {
     Approved,
     Rejected { reason: Option<String> },
+    Cancelled,
 }
 
 #[derive(Debug, Default)]
@@ -204,8 +205,20 @@ impl PendingConfirmationRegistry {
     }
 
     pub fn clear_for_run(&mut self, run_id: &RunId) {
-        self.entries
-            .retain(|_, entry| &entry.pending.run_id != run_id);
+        let approval_ids = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| &entry.pending.run_id == run_id)
+            .map(|(approval_id, _)| approval_id.clone())
+            .collect::<Vec<_>>();
+
+        for approval_id in approval_ids {
+            if let Some(entry) = self.entries.remove(&approval_id)
+                && let Some(sender) = entry.sender
+            {
+                let _ = sender.send(ConfirmationDecision::Cancelled);
+            }
+        }
     }
 
     fn insert(
@@ -266,3 +279,102 @@ impl fmt::Display for PendingConfirmationError {
 }
 
 impl Error for PendingConfirmationError {}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use nav_types::{ApprovalId, RunId, ToolCallId};
+
+    use super::{
+        ConfirmationDecision, PendingConfirmation, PendingConfirmationError,
+        PendingConfirmationRegistry,
+    };
+
+    #[test]
+    fn clear_for_run_notifies_waiting_confirmation_receiver() {
+        let mut registry = PendingConfirmationRegistry::default();
+        let run_id = run_id(1);
+        let approval_id = approval_id(1);
+        let receiver = registry
+            .register(pending_confirmation(run_id.clone(), approval_id.clone()))
+            .expect("pending confirmation should register");
+
+        registry.clear_for_run(&run_id);
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Ok(ConfirmationDecision::Cancelled)
+        );
+        assert_eq!(
+            registry.resolve(&approval_id, ConfirmationDecision::Approved),
+            Err(PendingConfirmationError::NotPending(approval_id))
+        );
+    }
+
+    #[test]
+    fn resolve_consumes_confirmation_once() {
+        let mut registry = PendingConfirmationRegistry::default();
+        let run_id = run_id(2);
+        let approval_id = approval_id(2);
+        let receiver = registry
+            .register(pending_confirmation(run_id, approval_id.clone()))
+            .expect("pending confirmation should register");
+
+        registry
+            .resolve(&approval_id, ConfirmationDecision::Approved)
+            .expect("approval should resolve");
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Ok(ConfirmationDecision::Approved)
+        );
+        assert_eq!(
+            registry.resolve(&approval_id, ConfirmationDecision::Approved),
+            Err(PendingConfirmationError::NotPending(approval_id))
+        );
+    }
+
+    #[test]
+    fn register_rejects_duplicate_approval_id_without_replacing_receiver() {
+        let mut registry = PendingConfirmationRegistry::default();
+        let run_id = run_id(3);
+        let approval_id = approval_id(3);
+        let receiver = registry
+            .register(pending_confirmation(run_id.clone(), approval_id.clone()))
+            .expect("first pending confirmation should register");
+
+        assert!(matches!(
+            registry.register(pending_confirmation(run_id, approval_id.clone())),
+            Err(PendingConfirmationError::Duplicate(duplicate_id)) if duplicate_id == approval_id
+        ));
+
+        registry
+            .resolve(&approval_id, ConfirmationDecision::Approved)
+            .expect("original pending confirmation should remain resolvable");
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Ok(ConfirmationDecision::Approved)
+        );
+    }
+
+    fn pending_confirmation(run_id: RunId, approval_id: ApprovalId) -> PendingConfirmation {
+        PendingConfirmation {
+            approval_id,
+            run_id,
+            tool_call_id: ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap(),
+            tool_name: "bash".to_string(),
+            reason: "bash requires approval".to_string(),
+            arguments_summary: r#"{"cmd":"echo hi"}"#.to_string(),
+            risk_class: Some("exec".to_string()),
+        }
+    }
+
+    fn run_id(index: u64) -> RunId {
+        RunId::try_new(format!("019f2f6f-f178-7a72-9f28-{index:012x}")).unwrap()
+    }
+
+    fn approval_id(index: u64) -> ApprovalId {
+        ApprovalId::try_new(format!("019f2f6f-f178-7a72-9f29-{index:012x}")).unwrap()
+    }
+}

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use nav_harness::guardrails::GuardrailRunner;
 use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
 use nav_harness::sessions::{
     ConfirmationDecision, PendingConfirmation, PendingConfirmationError,
@@ -69,6 +70,7 @@ pub struct HttpServer {
     event_store: Arc<Mutex<ProtocolEventStore>>,
     model_run_service: ModelRunService,
     tool_registry: Arc<ToolRegistry>,
+    guardrails: GuardrailRunner,
 }
 
 impl HttpServer {
@@ -91,7 +93,18 @@ impl HttpServer {
             event_store: Arc::new(Mutex::new(ProtocolEventStore::default())),
             model_run_service: ModelRunService::default(),
             tool_registry: Arc::new(tool_registry),
+            guardrails: GuardrailRunner::default(),
         }
+    }
+
+    pub fn with_tool_registry(mut self, tool_registry: ToolRegistry) -> Self {
+        self.tool_registry = Arc::new(tool_registry);
+        self
+    }
+
+    pub fn with_guardrails(mut self, guardrails: GuardrailRunner) -> Self {
+        self.guardrails = guardrails;
+        self
     }
 
     pub fn reload_model_settings(&mut self) -> Result<(), String> {
@@ -491,7 +504,8 @@ impl HttpServer {
         let session_store = Arc::clone(&self.session_store);
         let pending_confirmations = Arc::clone(&self.pending_confirmations);
         let tool_registry = Arc::clone(&self.tool_registry);
-        let tool_context = tool_context_for_session(session_metadata.cwd());
+        let tool_context =
+            tool_context_for_session(session_metadata.cwd(), self.guardrails.clone());
         let tool_preset = harness_tool_preset(session_metadata.tools_preset());
 
         thread::spawn(move || {
@@ -551,15 +565,16 @@ impl HttpServer {
     }
 }
 
-fn tool_context_for_session(cwd: Option<&str>) -> ToolContext {
+fn tool_context_for_session(cwd: Option<&str>, guardrails: GuardrailRunner) -> ToolContext {
     let cwd = cwd
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    WorkspacePathPolicy::new(&cwd, &cwd)
+    let context = WorkspacePathPolicy::new(&cwd, &cwd)
         .map(ToolContext::with_path_policy)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    context.with_guardrails(guardrails)
 }
 
 fn harness_tool_preset(preset: ToolsPreset) -> ToolPreset {

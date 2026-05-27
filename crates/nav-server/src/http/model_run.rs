@@ -46,6 +46,21 @@ impl ModelRunState {
             pending_confirmations,
         }
     }
+
+    fn publication_stores(&self) -> RunPublicationStores<'_> {
+        RunPublicationStores {
+            event_store: &self.event_store,
+            runs: &self.runs,
+            pending_confirmations: &self.pending_confirmations,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RunPublicationStores<'a> {
+    event_store: &'a Arc<Mutex<ProtocolEventStore>>,
+    runs: &'a Arc<Mutex<HashMap<RunId, RunState>>>,
+    pending_confirmations: &'a Arc<Mutex<PendingConfirmationRegistry>>,
 }
 
 #[derive(Debug)]
@@ -72,9 +87,7 @@ impl ModelRunService {
             Err(error) => {
                 publish_run_failure(
                     &state.ids,
-                    &state.event_store,
-                    &state.runs,
-                    &state.pending_confirmations,
+                    state.publication_stores(),
                     request.session_id,
                     request.run_id,
                     resolve_error_message(error),
@@ -97,6 +110,7 @@ impl ModelRunService {
                 tool_registry: request.tool_registry,
                 tool_preset: request.tool_preset,
                 tool_context: request.tool_context,
+                pending_confirmations: Some(&state.pending_confirmations),
                 cancellation_token,
             },
             &mut stream_ids,
@@ -105,13 +119,7 @@ impl ModelRunService {
                     harness_events_to_backend_events(request.session_id, harness_events),
                 );
                 pending_provider_errors.extend(provider_errors);
-                publish_run_loop_events(
-                    &state.event_store,
-                    &state.runs,
-                    &state.pending_confirmations,
-                    request.run_id,
-                    stream_events,
-                );
+                publish_run_loop_events(state.publication_stores(), request.run_id, stream_events);
             },
         );
 
@@ -124,10 +132,8 @@ impl ModelRunService {
                     ));
                 pending_provider_errors.extend(provider_errors);
                 publish_run_loop_completion(
-                    &state.event_store,
-                    &state.runs,
+                    state.publication_stores(),
                     &state.session_store,
-                    &state.pending_confirmations,
                     request.session_id,
                     request.run_id,
                     completion.turns,
@@ -150,9 +156,7 @@ impl ModelRunService {
                 }
                 publish_run_failure(
                     &state.ids,
-                    &state.event_store,
-                    &state.runs,
-                    &state.pending_confirmations,
+                    state.publication_stores(),
                     request.session_id,
                     request.run_id,
                     run_failed_message(&error),
@@ -180,9 +184,7 @@ fn split_provider_errors(events: Vec<EventEnvelope>) -> (Vec<EventEnvelope>, Vec
 }
 
 fn publish_run_loop_events(
-    event_store: &Arc<Mutex<ProtocolEventStore>>,
-    runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
-    pending_confirmations: &Arc<Mutex<PendingConfirmationRegistry>>,
+    stores: RunPublicationStores<'_>,
     run_id: &RunId,
     events: impl IntoIterator<Item = EventEnvelope>,
 ) {
@@ -190,9 +192,9 @@ fn publish_run_loop_events(
         debug_assert!(!matches!(&event.event, BackendEvent::RunCompleted { .. }));
         if !matches!(&event.event, BackendEvent::RunCompleted { .. }) {
             publish_running_event(
-                event_store,
-                runs,
-                Some(pending_confirmations),
+                stores.event_store,
+                stores.runs,
+                Some(stores.pending_confirmations),
                 run_id,
                 event,
             );
@@ -201,16 +203,14 @@ fn publish_run_loop_events(
 }
 
 fn publish_run_loop_completion(
-    event_store: &Arc<Mutex<ProtocolEventStore>>,
-    runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
+    stores: RunPublicationStores<'_>,
     session_store: &Arc<Mutex<SessionStore>>,
-    pending_confirmations: &Arc<Mutex<PendingConfirmationRegistry>>,
     session_id: &SessionId,
     run_id: &RunId,
     turns: Vec<Turn>,
     events: impl IntoIterator<Item = EventEnvelope>,
 ) -> bool {
-    let mut runs = runs.lock().unwrap();
+    let mut runs = stores.runs.lock().unwrap();
     let Some(run) = runs.get_mut(run_id) else {
         return false;
     };
@@ -226,8 +226,12 @@ fn publish_run_loop_completion(
         }
     }
     run.status = RunStatus::Completed;
-    pending_confirmations.lock().unwrap().clear_for_run(run_id);
-    event_store.lock().unwrap().append_many(events);
+    stores
+        .pending_confirmations
+        .lock()
+        .unwrap()
+        .clear_for_run(run_id);
+    stores.event_store.lock().unwrap().append_many(events);
     true
 }
 
@@ -249,9 +253,7 @@ fn publish_stream_events(
 
 fn publish_run_failure(
     ids: &Arc<Mutex<ProtocolIdSource>>,
-    event_store: &Arc<Mutex<ProtocolEventStore>>,
-    runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
-    pending_confirmations: &Arc<Mutex<PendingConfirmationRegistry>>,
+    stores: RunPublicationStores<'_>,
     session_id: &SessionId,
     run_id: &RunId,
     message: String,
@@ -259,9 +261,9 @@ fn publish_run_failure(
 ) {
     let failed_event = run_failed_event(ids, session_id, run_id, message);
     publish_terminal_events(
-        event_store,
-        runs,
-        Some(pending_confirmations),
+        stores.event_store,
+        stores.runs,
+        Some(stores.pending_confirmations),
         run_id,
         RunStatus::Failed,
         provider_errors
@@ -521,9 +523,7 @@ mod tests {
         let approval_id = fixture.next_approval_id();
 
         publish_run_loop_events(
-            &fixture.event_store,
-            &fixture.runs,
-            &pending_confirmations,
+            fixture.publication_stores(&pending_confirmations),
             &fixture.run_id,
             vec![fixture.approval_requested_event(&approval_id)],
         );
@@ -551,9 +551,7 @@ mod tests {
         let approval_id = fixture.next_approval_id();
 
         publish_run_loop_events(
-            &fixture.event_store,
-            &fixture.runs,
-            &pending_confirmations,
+            fixture.publication_stores(&pending_confirmations),
             &fixture.run_id,
             vec![fixture.approval_requested_event(&approval_id)],
         );
@@ -569,10 +567,8 @@ mod tests {
         let pending_confirmations = fixture.pending_confirmations();
 
         publish_run_loop_completion(
-            &fixture.event_store,
-            &fixture.runs,
+            fixture.publication_stores(&pending_confirmations),
             &session_store,
-            &pending_confirmations,
             &fixture.session_id,
             &fixture.run_id,
             vec![Turn::assistant_text("assistant reply")],
@@ -597,10 +593,8 @@ mod tests {
         let pending_confirmations = fixture.pending_confirmations();
 
         publish_run_loop_completion(
-            &fixture.event_store,
-            &fixture.runs,
+            fixture.publication_stores(&pending_confirmations),
             &session_store,
-            &pending_confirmations,
             &fixture.session_id,
             &fixture.run_id,
             vec![Turn::assistant_text("late assistant reply")],
@@ -631,10 +625,8 @@ mod tests {
             .expect("pending confirmation should record");
 
         publish_run_loop_completion(
-            &fixture.event_store,
-            &fixture.runs,
+            fixture.publication_stores(&pending_confirmations),
             &session_store,
-            &pending_confirmations,
             &fixture.session_id,
             &fixture.run_id,
             Vec::new(),
@@ -658,9 +650,7 @@ mod tests {
 
         publish_run_failure(
             &ids,
-            &fixture.event_store,
-            &fixture.runs,
-            &pending_confirmations,
+            fixture.publication_stores(&pending_confirmations),
             &fixture.session_id,
             &fixture.run_id,
             "provider stopped".to_string(),
@@ -678,9 +668,7 @@ mod tests {
 
         publish_run_failure(
             &ids,
-            &fixture.event_store,
-            &fixture.runs,
-            &pending_confirmations,
+            fixture.publication_stores(&pending_confirmations),
             &fixture.session_id,
             &fixture.run_id,
             "provider stopped".to_string(),
@@ -747,6 +735,17 @@ mod tests {
 
         fn pending_confirmations(&self) -> Arc<Mutex<PendingConfirmationRegistry>> {
             Arc::new(Mutex::new(PendingConfirmationRegistry::default()))
+        }
+
+        fn publication_stores<'a>(
+            &'a self,
+            pending_confirmations: &'a Arc<Mutex<PendingConfirmationRegistry>>,
+        ) -> RunPublicationStores<'a> {
+            RunPublicationStores {
+                event_store: &self.event_store,
+                runs: &self.runs,
+                pending_confirmations,
+            }
         }
 
         fn text_delta_event(&self, delta: &str) -> EventEnvelope {

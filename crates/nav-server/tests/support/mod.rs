@@ -155,6 +155,10 @@ impl SequencedProviderServer {
         format!("http://{}/v1", self.addr)
     }
 
+    pub fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
     pub fn requests(mut self) -> Vec<ProviderRequest> {
         self.join_thread()
             .expect("fake provider thread should finish");

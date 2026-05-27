@@ -1,14 +1,22 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use nav_harness::guardrails::{
+    BeforeToolCallDecision, GuardrailError, GuardrailRunner, ToolCallContext, ToolGuardrailHook,
+};
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
 use nav_harness::sessions::PendingConfirmation;
+use nav_harness::tools::{
+    NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput, ToolRegistry,
+};
 use nav_protocol::rpc::{SessionSource, ToolsPreset};
 use nav_protocol::{BackendEvent, EventEnvelope};
 use nav_server::http::{
@@ -527,6 +535,64 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
             "run.completed",
         ]
     );
+}
+
+#[test]
+fn session_send_message_approves_guarded_bash_tool_and_resumes_run() {
+    let mut fixture = GuardedBashFixture::new("call_bash_approve", "bash handled");
+    let (run_id, approval_id) = fixture.wait_for_approval_request();
+
+    assert_eq!(fixture.provider.request_count(), 1);
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
+    approve_tool_request(&mut fixture.server, &approval_id);
+
+    wait_for_run_status(&fixture.server, &run_id, RunStatus::Completed);
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 1);
+    assert_not_pending_confirmation(approve_tool_request_body(&mut fixture.server, &approval_id));
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 1);
+    let requests = fixture.provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body["messages"][2]["role"], "tool");
+    assert_eq!(
+        requests[1].body["messages"][2]["tool_call_id"],
+        "call_bash_approve"
+    );
+    assert_eq!(requests[1].body["messages"][2]["content"], "bash output");
+}
+
+#[test]
+fn session_send_message_rejects_guarded_bash_tool_without_execution() {
+    let mut fixture = GuardedBashFixture::new("call_bash_reject", "bash rejected");
+    let (run_id, approval_id) = fixture.wait_for_approval_request();
+
+    reject_tool_request(&mut fixture.server, &approval_id, "not this command");
+
+    wait_for_run_status(&fixture.server, &run_id, RunStatus::Completed);
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
+    let requests = fixture.provider.requests();
+    assert_eq!(requests.len(), 2);
+    let tool_result = &requests[1].body["messages"][2];
+    assert_eq!(tool_result["role"], "tool");
+    assert_eq!(tool_result["tool_call_id"], "call_bash_reject");
+    let rejection: Value = serde_json::from_str(tool_result["content"].as_str().unwrap())
+        .expect("rejection should be structured JSON");
+    assert_eq!(rejection["ok"], false);
+    assert_eq!(rejection["error"]["code"], "tool_rejected");
+    assert_eq!(rejection["error"]["reason"], "not this command");
+}
+
+#[test]
+fn session_send_message_cancel_wakes_guarded_bash_confirmation_without_execution() {
+    let mut fixture = GuardedBashFixture::new("call_bash_cancel", "should not be requested");
+    let (run_id, approval_id) = fixture.wait_for_approval_request();
+
+    cancel_run(&mut fixture.server, &run_id);
+
+    wait_for_run_status(&fixture.server, &run_id, RunStatus::Cancelled);
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.provider.request_count(), 1);
+    assert_not_pending_confirmation(approve_tool_request_body(&mut fixture.server, &approval_id));
+    assert_eq!(fixture.executions.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1206,6 +1272,220 @@ fn assert_model_text_delta(event: &EventEnvelope, expected: &str) {
     match &event.event {
         BackendEvent::ModelTextDelta { delta, .. } => assert_eq!(delta, expected),
         event => panic!("event = {event:?}, want model.text_delta"),
+    }
+}
+
+fn approval_id_from_event(event: &EventEnvelope) -> String {
+    match &event.event {
+        BackendEvent::ToolApprovalRequested { approval_id, .. } => approval_id.to_string(),
+        event => panic!("event = {event:?}, want tool.approval_requested"),
+    }
+}
+
+struct GuardedBashFixture {
+    server: HttpServer,
+    provider: SequencedProviderServer,
+    executions: Arc<AtomicUsize>,
+    session_id: SessionId,
+    subscription: ProtocolEventSubscription,
+}
+
+impl GuardedBashFixture {
+    fn new(provider_call_id: &str, final_response: &str) -> Self {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let provider = SequencedProviderServer::start(vec![
+            bash_tool_call_chunks(provider_call_id),
+            successful_provider_chunks(final_response),
+        ]);
+        let mut server = HttpServer::with_model_settings(
+            HttpServerConfig::default(),
+            model_settings_with_base_url(provider.base_url()),
+        )
+        .with_tool_registry(bash_tool_registry(Arc::clone(&executions)))
+        .with_guardrails(bash_guardrails());
+        let session_id = SessionId::try_new(create_session(&mut server)).unwrap();
+        let subscription = server
+            .subscribe_session_events(&session_id, None)
+            .expect("session event subscription should open");
+
+        Self {
+            server,
+            provider,
+            executions,
+            session_id,
+            subscription,
+        }
+    }
+
+    fn wait_for_approval_request(&mut self) -> (String, String) {
+        let run_id = send_message_text(&mut self.server, self.session_id.as_str(), "run bash");
+        let pending_events = receive_live_events(&self.subscription, 6);
+        assert_eq!(
+            envelope_event_names(&pending_events),
+            vec![
+                "run.started",
+                "tool.call_started",
+                "tool.call_delta",
+                "tool.call_completed",
+                "message.completed",
+                "tool.approval_requested",
+            ]
+        );
+        let approval_id = approval_id_from_event(&pending_events[5]);
+        (run_id, approval_id)
+    }
+}
+
+fn bash_tool_registry(executions: Arc<AtomicUsize>) -> ToolRegistry {
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(CountingBashTool { executions })
+        .expect("bash test tool should register");
+    registry
+}
+
+fn bash_guardrails() -> GuardrailRunner {
+    let mut guardrails = GuardrailRunner::default();
+    guardrails
+        .register_hook(ConfirmBashHook)
+        .expect("bash confirmation hook should register");
+    guardrails
+}
+
+fn approve_tool_request(server: &mut HttpServer, approval_id: &str) {
+    let body = approve_tool_request_body(server, approval_id);
+    assert_eq!(body["result"]["outcome"], "approved");
+}
+
+fn approve_tool_request_body(server: &mut HttpServer, approval_id: &str) -> Value {
+    let response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(70),
+            "method": "tool.approve",
+            "params": { "approval_id": approval_id }
+        })
+        .to_string(),
+    ));
+    serde_json::from_str(response.body()).unwrap()
+}
+
+fn reject_tool_request(server: &mut HttpServer, approval_id: &str, reason: &str) {
+    let response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(71),
+            "method": "tool.reject",
+            "params": {
+                "approval_id": approval_id,
+                "reason": reason
+            }
+        })
+        .to_string(),
+    ));
+    let body: Value = serde_json::from_str(response.body()).unwrap();
+    assert_eq!(body["result"]["outcome"], "rejected");
+}
+
+fn cancel_run(server: &mut HttpServer, run_id: &str) {
+    let response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(72),
+            "method": "run.cancel",
+            "params": { "runId": run_id }
+        })
+        .to_string(),
+    ));
+    let body: Value = serde_json::from_str(response.body()).unwrap();
+    assert_eq!(body["result"]["runId"], run_id);
+}
+
+fn assert_not_pending_confirmation(body: Value) {
+    assert_eq!(body["error"]["code"], -32006);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("error message should be a string")
+            .contains("not pending")
+    );
+}
+
+fn bash_tool_call_chunks(provider_call_id: &str) -> Vec<String> {
+    vec![
+        provider_sse_chunk(&format!(
+            r#"{{"id":"provider-run-1","model":"vendor/model-large","choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"{provider_call_id}","type":"function","function":{{"name":"bash","arguments":"{{\"cmd\":\"echo hi\"}}"}}}}]}},"finish_reason":null}}]}}"#
+        )),
+        provider_sse_chunk(
+            r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+}
+
+#[derive(Debug)]
+struct ConfirmBashHook;
+
+impl ToolGuardrailHook for ConfirmBashHook {
+    fn name(&self) -> &str {
+        "confirm-bash"
+    }
+
+    fn before_tool_call(
+        &self,
+        context: &ToolCallContext,
+    ) -> Result<BeforeToolCallDecision, GuardrailError> {
+        if context.tool_name == "bash" {
+            return Ok(BeforeToolCallDecision::RequestConfirmation {
+                reason: "bash requires approval".to_string(),
+                summary: context.arguments.summary.clone(),
+            });
+        }
+
+        Ok(BeforeToolCallDecision::Allow)
+    }
+}
+
+struct CountingBashTool {
+    executions: Arc<AtomicUsize>,
+}
+
+impl NavTool for CountingBashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        "Runs a test shell command."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "cmd": { "type": "string" } },
+            "required": ["cmd"],
+            "additionalProperties": false
+        })
+    }
+
+    fn risk_class(&self) -> RiskClass {
+        RiskClass::Exec
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _ctx: &'a ToolContext,
+        _args: Value,
+        _cancel: ToolCancellationToken,
+    ) -> ToolFuture<'a> {
+        let executions = Arc::clone(&self.executions);
+        Box::pin(async move {
+            executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput::text("bash output"))
+        })
     }
 }
 
