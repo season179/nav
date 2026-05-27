@@ -440,6 +440,7 @@ fn session_send_message_returns_structured_tool_error_for_unknown_tool() {
             "tool.call_delta",
             "tool.call_completed",
             "message.completed",
+            "tool.call_failed",
             "model.text_delta",
             "message.completed",
             "run.completed",

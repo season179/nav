@@ -12,6 +12,7 @@ pub const BACKEND_EVENT_TYPES: &[&str] = &[
     "tool.call_started",
     "tool.call_delta",
     "tool.call_completed",
+    "tool.call_failed",
     "tool.approval_requested",
     "file.changed",
     "run.completed",
@@ -103,6 +104,16 @@ pub enum BackendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<ProviderEventMetadata>,
     },
+    #[serde(rename = "tool.call_failed")]
+    ToolCallFailed {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        error_message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<ProviderEventMetadata>,
+    },
     #[serde(rename = "tool.approval_requested")]
     ToolApprovalRequested {
         run_id: RunId,
@@ -179,6 +190,7 @@ impl BackendEvent {
             Self::ToolCallStarted { .. } => "tool.call_started",
             Self::ToolCallDelta { .. } => "tool.call_delta",
             Self::ToolCallCompleted { .. } => "tool.call_completed",
+            Self::ToolCallFailed { .. } => "tool.call_failed",
             Self::ToolApprovalRequested { .. } => "tool.approval_requested",
             Self::FileChanged { .. } => "file.changed",
             Self::RunCompleted { .. } => "run.completed",
@@ -256,6 +268,13 @@ mod tests {
                 tool_call_id: tool_call_id(),
                 name: Some("read".to_string()),
                 arguments: "{}".to_string(),
+                metadata: Some(provider_metadata()),
+            },
+            BackendEvent::ToolCallFailed {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                name: Some("read".to_string()),
+                error_message: "file not found".to_string(),
                 metadata: Some(provider_metadata()),
             },
             BackendEvent::ToolApprovalRequested {

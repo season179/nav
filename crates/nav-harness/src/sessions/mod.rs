@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use nav_types::SessionId;
+use nav_types::{SessionId, ToolCallId};
 
 #[derive(Debug, Default)]
 pub struct SessionStore {
@@ -141,6 +141,7 @@ impl TurnPart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
+    pub tool_call_id: Option<ToolCallId>,
     pub name: String,
     pub arguments: String,
 }

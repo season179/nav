@@ -61,6 +61,13 @@ pub enum HarnessEvent {
         arguments: String,
         metadata: ProviderEventMetadata,
     },
+    ToolCallFailed {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        name: Option<String>,
+        error_message: String,
+        metadata: ProviderEventMetadata,
+    },
     ProviderError {
         run_id: RunId,
         status: Option<u16>,
@@ -84,6 +91,7 @@ impl HarnessEvent {
             Self::ToolCallStarted { .. } => "tool.call_started",
             Self::ToolCallDelta { .. } => "tool.call_delta",
             Self::ToolCallCompleted { .. } => "tool.call_completed",
+            Self::ToolCallFailed { .. } => "tool.call_failed",
             Self::ProviderError { .. } => "provider.error",
             Self::RunCompleted { .. } => "run.completed",
         }
