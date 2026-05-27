@@ -404,7 +404,7 @@ impl HttpServer {
         let session_store = Arc::clone(&self.session_store);
 
         thread::spawn(move || {
-            let final_status = model_run_service.run_to_completion(
+            let final_status = model_run_service.run(
                 &model_resolver,
                 ModelRunState::new(ids, event_store, Arc::clone(&runs), session_store),
                 cancellation_token,
