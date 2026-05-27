@@ -2,7 +2,11 @@
 
 use nav_types::{MessageId, RunId};
 
-use crate::events::{HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext, ProviderEventMetadata};
+use crate::events::{
+    HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
+    ProviderEventMetadata,
+};
+use crate::guardrails::{ToolCallContext, ToolCallContextParams};
 use crate::models::{
     OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, OpenAiCompletionsError,
     OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, ResolvedModelConfig,
@@ -119,17 +123,18 @@ impl RunLoop {
                 provider_tool_call_id: None,
                 usage: None,
             };
-            match dispatch_tool_calls(
-                &tool_calls,
-                request.tool_registry,
-                request.tool_context,
-                tool_cancel,
-                Some(request.cancellation_token.clone()),
-                request.run_id,
+            match dispatch_tool_calls(ToolDispatchRequest {
+                tool_calls: &tool_calls,
+                registry: request.tool_registry,
+                tool_preset: request.tool_preset,
+                context: request.tool_context,
+                cancel: tool_cancel,
+                run_cancel: Some(request.cancellation_token.clone()),
+                run_id: request.run_id,
                 ids,
-                &mut emit,
-                &tool_dispatch_metadata,
-            ) {
+                emit: &mut emit,
+                base_metadata: &tool_dispatch_metadata,
+            }) {
                 ToolDispatchResult::Completed(tool_turns) => {
                     turns.extend(tool_turns.clone());
                     new_turns.extend(tool_turns);
@@ -276,21 +281,41 @@ enum ToolDispatchResult {
     Cancelled,
 }
 
-fn dispatch_tool_calls<Ids, Emit>(
-    tool_calls: &[ToolCall],
-    registry: &ToolRegistry,
-    context: &ToolContext,
-    cancel: ToolCancellationToken,
-    run_cancel: Option<OpenAiCompletionsCancellationToken>,
-    run_id: &RunId,
-    ids: &mut Ids,
-    emit: &mut Emit,
-    base_metadata: &ProviderEventMetadata,
-) -> ToolDispatchResult
+struct ToolDispatchRequest<'a, Ids, Emit>
 where
     Ids: HarnessEventIdSource,
     Emit: FnMut(Vec<HarnessEventEnvelope>),
 {
+    tool_calls: &'a [ToolCall],
+    registry: &'a ToolRegistry,
+    tool_preset: ToolPreset,
+    context: &'a ToolContext,
+    cancel: ToolCancellationToken,
+    run_cancel: Option<OpenAiCompletionsCancellationToken>,
+    run_id: &'a RunId,
+    ids: &'a mut Ids,
+    emit: &'a mut Emit,
+    base_metadata: &'a ProviderEventMetadata,
+}
+
+fn dispatch_tool_calls<Ids, Emit>(request: ToolDispatchRequest<'_, Ids, Emit>) -> ToolDispatchResult
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let ToolDispatchRequest {
+        tool_calls,
+        registry,
+        tool_preset,
+        context,
+        cancel,
+        run_cancel,
+        run_id,
+        ids,
+        emit,
+        base_metadata,
+    } = request;
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -316,7 +341,7 @@ where
             continue;
         };
 
-        let args = match serde_json::from_str(&tool_call.arguments) {
+        let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments) {
             Ok(args) => args,
             Err(error) => {
                 let message = format!("tool call arguments are not valid JSON: {error}");
@@ -326,16 +351,45 @@ where
             }
         };
 
+        let guardrail_context = ToolCallContext::new(ToolCallContextParams {
+            tool_name: &tool_call.name,
+            raw_arguments: tool_call.arguments.clone(),
+            parsed_arguments: args.clone(),
+            preset: tool_preset,
+            risk_class: tool.risk_class(),
+            tool_context: context,
+            call_id: &tool_call.id,
+            nav_tool_call_id: tool_call.tool_call_id.clone(),
+            run_id: run_id.clone(),
+        });
+
+        if let Err(error) = context.guardrails().before_tool_call(&guardrail_context) {
+            let message = error.message();
+            emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+            turns.push(tool_error_turn(tool_call, message));
+            continue;
+        }
+
         let result = runtime.block_on(tool.execute(context, args, cancel.clone()));
         if cancel.is_cancelled() {
             return ToolDispatchResult::Cancelled;
         }
 
         match result {
-            Ok(output) => turns.push(Turn::tool_result(&tool_call.id, output.content)),
+            Ok(output) => match context
+                .guardrails()
+                .after_tool_call(&guardrail_context, output)
+            {
+                Ok(output) => turns.push(Turn::tool_result(&tool_call.id, output.content)),
+                Err(error) => {
+                    let message = error.message();
+                    emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+                    turns.push(tool_error_turn(tool_call, message));
+                }
+            },
             Err(error) => {
                 let message = error.message();
-                emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+                emit_tool_call_failed(ids, emit, run_id, tool_call, message, base_metadata);
                 turns.push(tool_error_turn(tool_call, message));
             }
         }
@@ -355,8 +409,7 @@ fn emit_tool_call_failed<Ids, Emit>(
     tool_call: &ToolCall,
     message: &str,
     base_metadata: &ProviderEventMetadata,
-)
-where
+) where
     Ids: HarnessEventIdSource,
     Emit: FnMut(Vec<HarnessEventEnvelope>),
 {
@@ -388,7 +441,6 @@ fn structured_tool_error(message: impl Into<String>) -> String {
     .to_string()
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -401,6 +453,10 @@ mod tests {
 
     use super::*;
     use crate::events::HarnessEventIdSource;
+    use crate::guardrails::{
+        BeforeToolCallDecision, ConfirmationPolicy, GuardrailError, GuardrailRunner,
+        ToolCallContext, ToolGuardrailHook,
+    };
     use crate::sessions::ToolCall;
     use crate::tools::{
         NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput,
@@ -443,17 +499,18 @@ mod tests {
         let mut ids = TestIdSource;
         let mut events: Vec<HarnessEventEnvelope> = Vec::new();
         let metadata = test_metadata();
-        let result = dispatch_tool_calls(
+        let result = dispatch_tool_calls(ToolDispatchRequest {
             tool_calls,
             registry,
+            tool_preset: ToolPreset::Coding,
             context,
             cancel,
             run_cancel,
-            &run_id,
-            &mut ids,
-            &mut |envelopes| events.extend(envelopes),
-            &metadata,
-        );
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
         let _ = events;
         result
     }
@@ -470,8 +527,11 @@ mod tests {
         }];
 
         let result = dispatch_test(
-            &tool_calls, &registry, &ToolContext::default(),
-            ToolCancellationToken::new(), None,
+            &tool_calls,
+            &registry,
+            &ToolContext::default(),
+            ToolCancellationToken::new(),
+            None,
         );
 
         assert_eq!(
@@ -500,8 +560,11 @@ mod tests {
         ];
 
         let result = dispatch_test(
-            &tool_calls, &registry, &ToolContext::default(),
-            ToolCancellationToken::new(), None,
+            &tool_calls,
+            &registry,
+            &ToolContext::default(),
+            ToolCancellationToken::new(),
+            None,
         );
 
         assert_eq!(
@@ -525,8 +588,11 @@ mod tests {
         }];
 
         let result = dispatch_test(
-            &tool_calls, &registry, &ToolContext::default(),
-            ToolCancellationToken::new(), None,
+            &tool_calls,
+            &registry,
+            &ToolContext::default(),
+            ToolCancellationToken::new(),
+            None,
         );
 
         let ToolDispatchResult::Completed(turns) = result else {
@@ -536,7 +602,12 @@ mod tests {
         let error: Value = serde_json::from_str(&turns[0].text_content())
             .expect("tool error should be structured JSON");
         assert_eq!(error["ok"], false);
-        assert!(error["error"]["message"].as_str().unwrap().contains("not valid JSON"));
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not valid JSON")
+        );
     }
 
     #[test]
@@ -550,8 +621,11 @@ mod tests {
         }];
 
         let result = dispatch_test(
-            &tool_calls, &registry, &ToolContext::default(),
-            ToolCancellationToken::new(), None,
+            &tool_calls,
+            &registry,
+            &ToolContext::default(),
+            ToolCancellationToken::new(),
+            None,
         );
 
         let ToolDispatchResult::Completed(turns) = result else {
@@ -566,7 +640,9 @@ mod tests {
     #[test]
     fn dispatch_honors_cancellation_mid_execute() {
         let mut registry = ToolRegistry::default();
-        registry.register(WaitForCancelTool).expect("wait should register");
+        registry
+            .register(WaitForCancelTool)
+            .expect("wait should register");
         let tool_calls = vec![ToolCall {
             id: "call_wait".to_string(),
             tool_call_id: None,
@@ -581,7 +657,11 @@ mod tests {
         });
 
         let result = dispatch_test(
-            &tool_calls, &registry, &ToolContext::default(), cancel, None,
+            &tool_calls,
+            &registry,
+            &ToolContext::default(),
+            cancel,
+            None,
         );
         assert_eq!(result, ToolDispatchResult::Cancelled);
     }
@@ -589,7 +669,9 @@ mod tests {
     #[test]
     fn dispatch_bridges_run_cancellation_to_tool_token() {
         let mut registry = ToolRegistry::default();
-        registry.register(WaitForCancelTool).expect("wait should register");
+        registry
+            .register(WaitForCancelTool)
+            .expect("wait should register");
         let tool_calls = vec![ToolCall {
             id: "call_wait".to_string(),
             tool_call_id: None,
@@ -604,8 +686,11 @@ mod tests {
         });
 
         let result = dispatch_test(
-            &tool_calls, &registry, &ToolContext::default(),
-            ToolCancellationToken::new(), Some(run_cancel),
+            &tool_calls,
+            &registry,
+            &ToolContext::default(),
+            ToolCancellationToken::new(),
+            Some(run_cancel),
         );
         assert_eq!(result, ToolDispatchResult::Cancelled);
     }
@@ -624,8 +709,11 @@ mod tests {
         }];
 
         let result = dispatch_test(
-            &tool_calls, &registry, &context,
-            ToolCancellationToken::new(), None,
+            &tool_calls,
+            &registry,
+            &context,
+            ToolCancellationToken::new(),
+            None,
         );
 
         let ToolDispatchResult::Completed(turns) = result else {
@@ -634,7 +722,157 @@ mod tests {
         let error: Value = serde_json::from_str(&turns[0].text_content())
             .expect("tool error should be structured JSON");
         assert_eq!(error["ok"], false);
-        assert!(error["error"]["message"].as_str().unwrap().contains("escapes workspace"));
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("escapes workspace")
+        );
+    }
+
+    #[test]
+    fn dispatch_returns_structured_error_when_guardrail_denies_tool_call() {
+        let mut registry = ToolRegistry::default();
+        registry.register(EchoTool).expect("echo should register");
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(DenyGuardrailHook)
+            .expect("deny hook should register");
+        let context = ToolContext::default().with_guardrails(guardrails);
+        let tool_calls = vec![ToolCall {
+            id: "call_echo_guarded".to_string(),
+            tool_call_id: None,
+            name: "echo".to_string(),
+            arguments: r#"{"text":"hello"}"#.to_string(),
+        }];
+
+        let result = dispatch_test(
+            &tool_calls,
+            &registry,
+            &context,
+            ToolCancellationToken::new(),
+            None,
+        );
+
+        let ToolDispatchResult::Completed(turns) = result else {
+            panic!("guardrail denial should complete with an error tool turn");
+        };
+        let error: Value = serde_json::from_str(&turns[0].text_content())
+            .expect("tool error should be structured JSON");
+        assert_eq!(error["ok"], false);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .expect("message should be a string")
+                .contains("blocked by test guardrail")
+        );
+    }
+
+    #[test]
+    fn dispatch_fails_closed_when_guardrail_requests_confirmation() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PanicIfExecutedTool)
+            .expect("panic tool should register");
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(ConfirmGuardrailHook)
+            .expect("confirmation hook should register");
+        let context = ToolContext::default().with_guardrails(guardrails);
+        let tool_calls = vec![ToolCall {
+            id: "call_confirm".to_string(),
+            tool_call_id: None,
+            name: "panic-if-executed".to_string(),
+            arguments: "{}".to_string(),
+        }];
+
+        let result = dispatch_test(
+            &tool_calls,
+            &registry,
+            &context,
+            ToolCancellationToken::new(),
+            None,
+        );
+
+        let ToolDispatchResult::Completed(turns) = result else {
+            panic!("confirmation request should complete with an error tool turn");
+        };
+        let error: Value = serde_json::from_str(&turns[0].text_content())
+            .expect("tool error should be structured JSON");
+        assert_eq!(error["ok"], false);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .expect("message should be a string")
+                .contains("no approval channel is available")
+        );
+    }
+
+    #[test]
+    fn dispatch_executes_confirmation_request_with_scripted_approval() {
+        let mut registry = ToolRegistry::default();
+        registry.register(EchoTool).expect("echo should register");
+        let mut guardrails =
+            GuardrailRunner::default().with_confirmation_policy(ConfirmationPolicy::ScriptedAllow);
+        guardrails
+            .register_hook(ConfirmGuardrailHook)
+            .expect("confirmation hook should register");
+        let context = ToolContext::default().with_guardrails(guardrails);
+        let tool_calls = vec![ToolCall {
+            id: "call_confirm_approved".to_string(),
+            tool_call_id: None,
+            name: "echo".to_string(),
+            arguments: r#"{"text":"approved"}"#.to_string(),
+        }];
+
+        let result = dispatch_test(
+            &tool_calls,
+            &registry,
+            &context,
+            ToolCancellationToken::new(),
+            None,
+        );
+
+        assert_eq!(
+            result,
+            ToolDispatchResult::Completed(vec![Turn::tool_result(
+                "call_confirm_approved",
+                "approved",
+            )])
+        );
+    }
+
+    #[test]
+    fn dispatch_applies_after_guardrails_to_successful_tool_output() {
+        let mut registry = ToolRegistry::default();
+        registry.register(EchoTool).expect("echo should register");
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(RedactAfterGuardrailHook)
+            .expect("redaction hook should register");
+        let context = ToolContext::default().with_guardrails(guardrails);
+        let tool_calls = vec![ToolCall {
+            id: "call_echo_secret".to_string(),
+            tool_call_id: None,
+            name: "echo".to_string(),
+            arguments: r#"{"text":"token=secret"}"#.to_string(),
+        }];
+
+        let result = dispatch_test(
+            &tool_calls,
+            &registry,
+            &context,
+            ToolCancellationToken::new(),
+            None,
+        );
+
+        assert_eq!(
+            result,
+            ToolDispatchResult::Completed(vec![Turn::tool_result(
+                "call_echo_secret",
+                "token=[redacted]",
+            )])
+        );
     }
 
     #[test]
@@ -652,19 +890,28 @@ mod tests {
         let mut events: Vec<HarnessEventEnvelope> = Vec::new();
         let metadata = test_metadata();
 
-        let result = dispatch_tool_calls(
-            &tool_calls, &registry, &ToolContext::default(),
-            ToolCancellationToken::new(), None,
-            &run_id, &mut ids,
-            &mut |envelopes| events.extend(envelopes),
-            &metadata,
-        );
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &ToolContext::default(),
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
 
         assert!(matches!(result, ToolDispatchResult::Completed(_)));
         assert_eq!(events.len(), 1);
         match &events[0].event {
             HarnessEvent::ToolCallFailed {
-                run_id: rid, tool_call_id: tcid, name, error_message, ..
+                run_id: rid,
+                tool_call_id: tcid,
+                name,
+                error_message,
+                ..
             } => {
                 assert_eq!(rid, &run_id);
                 assert_eq!(tcid, &nav_id);
@@ -689,23 +936,34 @@ mod tests {
         let mut events: Vec<HarnessEventEnvelope> = Vec::new();
         let metadata = test_metadata();
 
-        let _result = dispatch_tool_calls(
-            &tool_calls, &registry, &ToolContext::default(),
-            ToolCancellationToken::new(), None,
-            &run_id, &mut ids,
-            &mut |envelopes| events.extend(envelopes),
-            &metadata,
-        );
+        let _result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &ToolContext::default(),
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
 
-        assert!(events.is_empty(),
-            "no events should be emitted without a nav tool_call_id");
+        assert!(
+            events.is_empty(),
+            "no events should be emitted without a nav tool_call_id"
+        );
     }
 
     struct EchoTool;
 
     impl NavTool for EchoTool {
-        fn name(&self) -> &str { "echo" }
-        fn description(&self) -> &str { "Echoes text." }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes text."
+        }
         fn parameters(&self) -> Value {
             json!({
                 "type": "object",
@@ -714,12 +972,19 @@ mod tests {
                 "additionalProperties": false
             })
         }
-        fn risk_class(&self) -> RiskClass { RiskClass::Read }
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Read
+        }
         fn execute<'a>(
-            &'a self, _ctx: &'a ToolContext, args: Value, _cancel: ToolCancellationToken,
+            &'a self,
+            _ctx: &'a ToolContext,
+            args: Value,
+            _cancel: ToolCancellationToken,
         ) -> ToolFuture<'a> {
             Box::pin(async move {
-                Ok(ToolOutput::text(args["text"].as_str().unwrap_or_default().to_string()))
+                Ok(ToolOutput::text(
+                    args["text"].as_str().unwrap_or_default().to_string(),
+                ))
             })
         }
     }
@@ -727,14 +992,23 @@ mod tests {
     struct WaitForCancelTool;
 
     impl NavTool for WaitForCancelTool {
-        fn name(&self) -> &str { "wait" }
-        fn description(&self) -> &str { "Waits for cancellation." }
+        fn name(&self) -> &str {
+            "wait"
+        }
+        fn description(&self) -> &str {
+            "Waits for cancellation."
+        }
         fn parameters(&self) -> Value {
             json!({ "type": "object", "properties": {}, "additionalProperties": false })
         }
-        fn risk_class(&self) -> RiskClass { RiskClass::Read }
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Read
+        }
         fn execute<'a>(
-            &'a self, _ctx: &'a ToolContext, _args: Value, cancel: ToolCancellationToken,
+            &'a self,
+            _ctx: &'a ToolContext,
+            _args: Value,
+            cancel: ToolCancellationToken,
         ) -> ToolFuture<'a> {
             Box::pin(async move {
                 cancel.cancelled().await;
@@ -743,21 +1017,112 @@ mod tests {
         }
     }
 
-    struct TestWorkspace { root: PathBuf }
+    struct PanicIfExecutedTool;
+
+    impl NavTool for PanicIfExecutedTool {
+        fn name(&self) -> &str {
+            "panic-if-executed"
+        }
+        fn description(&self) -> &str {
+            "Panics if executed."
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Exec
+        }
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+            _args: Value,
+            _cancel: ToolCancellationToken,
+        ) -> ToolFuture<'a> {
+            panic!("confirmation should stop execution before this tool runs")
+        }
+    }
+
+    #[derive(Debug)]
+    struct DenyGuardrailHook;
+
+    impl ToolGuardrailHook for DenyGuardrailHook {
+        fn name(&self) -> &str {
+            "deny-test"
+        }
+
+        fn before_tool_call(
+            &self,
+            _context: &ToolCallContext,
+        ) -> Result<BeforeToolCallDecision, GuardrailError> {
+            Ok(BeforeToolCallDecision::Deny {
+                reason: "blocked by test guardrail".to_string(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConfirmGuardrailHook;
+
+    impl ToolGuardrailHook for ConfirmGuardrailHook {
+        fn name(&self) -> &str {
+            "confirm-test"
+        }
+
+        fn before_tool_call(
+            &self,
+            _context: &ToolCallContext,
+        ) -> Result<BeforeToolCallDecision, GuardrailError> {
+            Ok(BeforeToolCallDecision::RequestConfirmation {
+                reason: "tool requires approval".to_string(),
+                summary: "Confirm test tool call".to_string(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RedactAfterGuardrailHook;
+
+    impl ToolGuardrailHook for RedactAfterGuardrailHook {
+        fn name(&self) -> &str {
+            "redact-after-test"
+        }
+
+        fn after_tool_call(
+            &self,
+            context: &ToolCallContext,
+            output: ToolOutput,
+        ) -> Result<ToolOutput, GuardrailError> {
+            assert_eq!(context.tool_name, "echo");
+            assert_eq!(context.arguments.parsed["text"], "token=secret");
+            Ok(ToolOutput::text(
+                output.content.replace("secret", "[redacted]"),
+            ))
+        }
+    }
+
+    struct TestWorkspace {
+        root: PathBuf,
+    }
 
     impl TestWorkspace {
         fn new(name: &str) -> Self {
-            let root = std::env::temp_dir().join(format!("nav-agents-{name}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("nav-agents-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("workspace should be created");
-            Self { root: fs::canonicalize(root).expect("workspace should canonicalize") }
+            Self {
+                root: fs::canonicalize(root).expect("workspace should canonicalize"),
+            }
         }
         fn policy(&self) -> WorkspacePathPolicy {
-            WorkspacePathPolicy::new(&self.root, &self.root).expect("path policy should accept workspace")
+            WorkspacePathPolicy::new(&self.root, &self.root)
+                .expect("path policy should accept workspace")
         }
     }
 
     impl Drop for TestWorkspace {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }

@@ -64,7 +64,7 @@ Pi has **no built-in human approval RPC** for tools; extensions can block in `be
 | --- | --- |
 | `nav-harness::tools` | `ToolRegistry`, schemas (JSON Schema for encoders), `execute`, truncation, result shaping |
 | `nav-harness::workspace` | cwd resolution, path policy, `tokio::fs`, process spawn, optional git metadata |
-| `nav-harness::guardrails` | allow/deny paths, command policies, approval requirements |
+| `nav-harness::guardrails` | hook runner, normalized tool-call context, allow/deny/approval decisions, result redaction |
 | `nav-harness::agents` | loop: model turn → tool calls → execute → append turns → repeat |
 | `nav-harness::sessions` | durable tool call/result parts, approval state |
 | `nav-harness::events` | internal `HarnessEvent` (already has tool stream variants) |
@@ -160,10 +160,11 @@ Pi: extensions may throw in `beforeToolCall` to block.
 
 Nav: first-class protocol:
 
-1. Agent loop decides tool needs approval (`guardrails` policy by tool name + args hash).
-2. Emit `tool.approval_requested` with `approval_id`, pause run.
-3. Frontend calls `tool.approve` or `tool.reject` (wire exists; **server handlers TODO**).
-4. On approve, execute and append `ToolResult` part; on reject, append error result and continue or fail run per policy.
+1. Agent loop builds `ToolCallContext` and runs guardrail hooks before execution.
+2. A hook returns `RequestConfirmation { reason, summary }`.
+3. Emit `tool.approval_requested` with `approval_id`, pause run.
+4. Frontend calls `tool.approve` or `tool.reject` (wire exists; **server handlers TODO**).
+5. On approve, resume the same call through the scripted approval channel; on reject, append error result and continue or fail run per policy.
 
 Suggested default policy (align with Pi’s default active tools):
 
@@ -231,7 +232,7 @@ Do not add Pi-style `~/.nav/tools/*.ts` unless we later embed a script runtime; 
 | Spawn | `workspace::shell` | `tokio::process::Command`, session cwd, inherit minimal env (document whitelist) |
 | Timeout | `tools/bash.rs` | `tokio::time::timeout` |
 | Output cap | `tools/truncation.rs` | Match Pi; optional spill to temp under `{data_dir}/tool-output/` |
-| Approval | `guardrails` | Default require approval; store pending command in approval payload |
+| Approval | `guardrails` | Bash hook returns `RequestConfirmation`; APR-02 stores pending command in approval payload |
 | Cancellation | `run.cancel` | Kill child process group when run cancelled |
 | User shell (`!` in Pi) | Defer or `tui` local | Pi’s `user_bash` is not an LLM tool; nav can keep as frontend-only exec or later RPC `shell.exec` |
 
@@ -359,7 +360,7 @@ session.sendMessage
        if assistant has tool_calls:
          for each call:
            emit tool.call_requested (optional)
-           guardrails → approval? → tool.approval_requested → wait RPC
+           guardrails.before_tool_call → RequestConfirmation? → tool.approval_requested → wait RPC
            emit tool.call_started
            registry.execute
            emit tool.call_completed
@@ -422,7 +423,7 @@ Tool schemas must be included in `models::encode` for each `ApiKind` (OpenAI `to
 | Topic | Pi | Nav (planned) |
 | --- | --- | --- |
 | Tool transport | In-process TS only | Rust harness; SSE for all frontends |
-| Approvals | Extension hooks | Protocol RPC + guardrails engine |
+| Approvals | Extension hooks | Protocol RPC + guardrail hooks |
 | TUI rendering | Built into `ToolDefinition` | Frontend renders from events; harness returns plain results |
 | Default tools | 4 active (`read`,`bash`,`edit`,`write`) | Same default reasonable for coding agent |
 | MCP | Via extensions only | First-class `integrations/mcp` into same registry |
@@ -453,7 +454,7 @@ Tool schemas must be included in `models::encode` for each `ApiKind` (OpenAI `to
 | `ls` | `tools/ls.rs` | `workspace/path` |
 | (extension tools) | `skills/`, `integrations/mcp` | registry plugin API |
 | (registry) | `tools/mod.rs` | `agents/`, `models/encode` |
-| (policy) | `guardrails/` | sessions approvals |
+| (guardrails) | `guardrails/` | sessions approvals |
 | (persistence) | `sessions/` | SQLite parts per session-storage plan |
 | (wire) | `nav-server/event_mapping` | existing `BackendEvent` variants |
 

@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::Value;
 use tokio::sync::Notify;
 
+use crate::guardrails::GuardrailRunner;
 use crate::workspace::path::WorkspacePathPolicy;
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
@@ -59,17 +60,28 @@ impl RiskClass {
 #[derive(Debug, Default, Clone)]
 pub struct ToolContext {
     path_policy: Option<WorkspacePathPolicy>,
+    guardrails: GuardrailRunner,
 }
 
 impl ToolContext {
     pub fn with_path_policy(path_policy: WorkspacePathPolicy) -> Self {
         Self {
             path_policy: Some(path_policy),
+            guardrails: GuardrailRunner::default(),
         }
+    }
+
+    pub fn with_guardrails(mut self, guardrails: GuardrailRunner) -> Self {
+        self.guardrails = guardrails;
+        self
     }
 
     pub fn path_policy(&self) -> Option<&WorkspacePathPolicy> {
         self.path_policy.as_ref()
+    }
+
+    pub fn guardrails(&self) -> &GuardrailRunner {
+        &self.guardrails
     }
 }
 
