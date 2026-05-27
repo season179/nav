@@ -3,6 +3,7 @@
 //! Mutating filesystem and shell tools intentionally land in follow-up issues;
 //! this module owns the registry/API shape and read-only built-ins.
 
+pub mod ls;
 pub mod read;
 pub mod truncation;
 
@@ -109,6 +110,32 @@ impl fmt::Display for ToolError {
 }
 
 impl Error for ToolError {}
+
+/// Parse an optional positive integer argument from a JSON tool parameter.
+///
+/// Shared by `read` and `ls` (and future tools) so the validation message
+/// is consistent across all tools.
+pub fn parse_optional_positive_usize(
+    value: Option<&Value>,
+    name: &str,
+) -> Result<Option<usize>, ToolError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(number) = value.as_u64() else {
+        return Err(ToolError::new(format!(
+            "argument `{name}` must be a positive integer"
+        )));
+    };
+    let number = usize::try_from(number)
+        .map_err(|_| ToolError::new(format!("argument `{name}` is too large")))?;
+    if number == 0 {
+        return Err(ToolError::new(format!(
+            "argument `{name}` must be a positive integer"
+        )));
+    }
+    Ok(Some(number))
+}
 
 #[derive(Debug)]
 struct ToolCancellationState {
