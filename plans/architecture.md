@@ -43,9 +43,9 @@ must also support future Electron and web frontends.
   recoverable tool access.
 - `crates/nav-harness/src/skills/` owns Agent Skills discovery, selection, trust
   metadata, and execution adapters.
-- `crates/nav-harness/src/guardrails/` owns permissions, sandboxing, policy,
-  injection resistance, destructive-action checks, leakage prevention, and
-  fail-closed behavior.
+- `crates/nav-harness/src/guardrails/` owns hook-driven tool decisions,
+  confirmation requests, result redaction, injection resistance,
+  destructive-action checks, leakage prevention, and fail-closed behavior.
 - `crates/nav-harness/src/verification/` owns tests, evals, screenshots, diffs,
   runtime probes, acceptance criteria, and review gates.
 - `crates/nav-harness/src/observability/` owns logs, traces, metrics, timelines,
