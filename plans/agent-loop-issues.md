@@ -84,7 +84,7 @@ Goal: nav can run arbitrary commands with the approval gate that distinguishes i
 
 | # | Issue | Model | Scope |
 |---|---|---|---|
-| INK-03 | Approval modal overlay | strong | Reuses `overlays/` shape from ModelPicker. Triggered by `tool.approval_requested`; composer currently goes inert during busy mode (`ComposerRegion.tsx:47`, `App.tsx:184`) so showing approval input requires real App-state change. **Must land before APR-03 enforces approvals**, or runs will hang or require a hidden feature gate. |
+| INK-03 | Generic confirmation modal overlay | strong | Reuses `overlays/` shape from ModelPicker. Triggered by generic hook-requested `tool.approval_requested` events; showing confirmation input while the run is busy requires App-level confirmation state so the composer stays inert. **Must land before APR-03 enforces confirmations**, or runs will hang or require a hidden feature gate. |
 | INK-04 | `tool.approve` / `tool.reject` client methods | weak | Add to `NavBackendClient`; current client only exposes `session.create` / `session.sendMessage` (`client.ts:7`). Depends on APR-02a being merged. |
 | INK-05 | Streaming output rendering in tool cells | strong | Teach `ToolCallCell` to append `tool.output_delta` chunks live; bounded scroll inside the cell (cap visible lines, "…N more lines" tail) so the history region doesn't reflow on every chunk. App-state change: streaming cells must coexist with the busy/approval state. Depends on INK-02 and APR-04. |
 
