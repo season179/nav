@@ -15,15 +15,90 @@ type SessionCreateParams = {
 	toolsPreset?: ToolsPreset;
 };
 
-export type NavEvent = {
+type NavEventBase = {
+	id: string;
+	sessionId: string;
+};
+
+type RunScopedEvent = NavEventBase & {
+	runId: string;
+};
+
+type MessageScopedEvent = RunScopedEvent & {
+	messageId: string;
+};
+
+type ToolScopedEvent = RunScopedEvent & {
+	toolCallId: string;
+};
+
+export type NavEvent =
+	| (NavEventBase & {type: 'session.created'})
+	| (RunScopedEvent & {
+			type: 'run.started' | 'run.completed' | 'run.cancelled';
+	  })
+	| (MessageScopedEvent & {
+			type: 'model.text_delta' | 'model.reasoning_delta';
+			delta: string;
+	  })
+	| (MessageScopedEvent & {
+			type: 'message.delta';
+			text: string;
+	  })
+	| (MessageScopedEvent & {
+			type: 'message.completed';
+			finishReason: string;
+	  })
+	| (ToolScopedEvent & {
+			type: 'tool.call_requested';
+			name: string;
+	  })
+	| (ToolScopedEvent & {
+			type: 'tool.call_started';
+			name: string;
+	  })
+	| (ToolScopedEvent & {
+			type: 'tool.call_delta';
+			argumentsDelta: string;
+	  })
+	| (ToolScopedEvent & {
+			type: 'tool.call_completed';
+			name: string;
+			arguments: string;
+	  })
+	| (ToolScopedEvent & {
+			type: 'tool.call_failed';
+			name: string;
+			errorMessage: string;
+	  })
+	| (ToolScopedEvent & {
+			type: 'tool.approval_requested';
+			approvalId: string;
+	  })
+	| (NavEventBase & {
+			type: 'file.changed';
+			fileChangeId: string;
+			path: string;
+			kind?: 'created' | 'modified' | 'deleted';
+	  })
+	| (RunScopedEvent & {type: 'run.failed'; message: string})
+	| (RunScopedEvent & {
+			type: 'provider.error';
+			message: string;
+			status?: number;
+			errorType?: string;
+			code?: string;
+	  })
+	| (NavEventBase & {type: 'error'; message: string})
+	| (NavEventBase & {
+			type: 'unknown';
+			rawType: string;
+			payload: Record<string, unknown>;
+	  });
+
+type SseEventFrame = {
 	id: string;
 	type: string;
-	sessionId: string;
-	runId: string;
-	messageId: string;
-	delta: string;
-	text: string;
-	message: string;
 };
 
 export type SessionInfo = {
@@ -57,6 +132,20 @@ type EventPayload = {
 	type?: string;
 	run_id?: string;
 	message_id?: string;
+	finish_reason?: string;
+	tool_call_id?: string;
+	name?: string;
+	arguments_delta?: string;
+	arguments?: string;
+	error_message?: string;
+	approval_id?: string;
+	file_change_id?: string;
+	change_id?: string;
+	path?: string;
+	kind?: string;
+	status?: number;
+	error_type?: string;
+	code?: string;
 	delta?: string;
 	text?: string;
 	message?: string;
@@ -279,8 +368,9 @@ export class NavBackendClient {
 export function eventText(event: NavEvent): string {
 	switch (event.type) {
 		case 'message.delta':
+			return event.text;
 		case 'model.text_delta':
-			return event.text || event.delta;
+			return event.delta;
 		case 'model.reasoning_delta':
 			return event.delta;
 		case 'run.failed':
@@ -293,7 +383,7 @@ export function eventText(event: NavEvent): string {
 }
 
 function isRunTerminal(event: NavEvent, runId: string): boolean {
-	if (event.runId !== runId) {
+	if (!('runId' in event) || event.runId !== runId) {
 		return false;
 	}
 	return (
@@ -427,7 +517,7 @@ async function isExecutable(filePath: string): Promise<boolean> {
 	}
 }
 
-async function* readSseStream(
+export async function* readSseStream(
 	body: ReadableStream<Uint8Array>,
 	onEvent: (event: NavEvent) => void,
 ): AsyncGenerator<NavEvent, void, void> {
@@ -505,7 +595,7 @@ export function parseSse(
 	emit: (event: NavEvent) => boolean,
 ): boolean {
 	const lines = input.split(/\r?\n/);
-	let current: NavEvent = emptyEvent();
+	let current: SseEventFrame = emptyEvent();
 	let dataLines: string[] = [];
 
 	const flush = (): boolean => {
@@ -538,33 +628,162 @@ export function parseSse(
 	return flush();
 }
 
-function emptyEvent(): NavEvent {
+function emptyEvent(): SseEventFrame {
 	return {
 		id: '',
 		type: '',
-		sessionId: '',
-		runId: '',
-		messageId: '',
-		delta: '',
-		text: '',
-		message: '',
 	};
 }
 
-function decodeSseEvent(event: NavEvent, dataLines: string[]): NavEvent {
+function decodeSseEvent(event: SseEventFrame, dataLines: string[]): NavEvent {
 	let payload: EventPayload = {};
 	if (dataLines.length > 0) {
 		payload = JSON.parse(dataLines.join('\n')) as EventPayload;
 	}
 
+	const type = event.type || payload.type || '';
+	const base = eventBase(event, payload);
+
+	switch (type) {
+		case 'session.created':
+			return {...base, type};
+		case 'run.started':
+		case 'run.completed':
+		case 'run.cancelled':
+			return {...base, type, ...runFields(payload)};
+		case 'model.text_delta':
+		case 'model.reasoning_delta':
+			return {
+				...base,
+				type,
+				...messageFields(payload),
+				delta: payload.delta || '',
+			};
+		case 'message.delta':
+			return {
+				...base,
+				type,
+				...messageFields(payload),
+				text: payload.text || '',
+			};
+		case 'message.completed':
+			return {
+				...base,
+				type,
+				...messageFields(payload),
+				finishReason: payload.finish_reason || '',
+			};
+		case 'tool.call_requested':
+		case 'tool.call_started':
+			return {
+				...base,
+				type,
+				...toolFields(payload),
+				name: payload.name || '',
+			};
+		case 'tool.call_delta':
+			return {
+				...base,
+				type,
+				...toolFields(payload),
+				argumentsDelta: payload.arguments_delta || '',
+			};
+		case 'tool.call_completed':
+			return {
+				...base,
+				type,
+				...toolFields(payload),
+				name: payload.name || '',
+				arguments: payload.arguments || '',
+			};
+		case 'tool.call_failed':
+			return {
+				...base,
+				type,
+				...toolFields(payload),
+				name: payload.name || '',
+				errorMessage: payload.error_message || '',
+			};
+		case 'tool.approval_requested':
+			return {
+				...base,
+				type,
+				...toolFields(payload),
+				approvalId: payload.approval_id || '',
+			};
+		case 'file.changed':
+			return {
+				...base,
+				type,
+				fileChangeId: payload.file_change_id || payload.change_id || '',
+				path: payload.path || '',
+				kind: fileChangeKind(payload.kind),
+			};
+		case 'run.failed':
+			return {
+				...base,
+				type,
+				...runFields(payload),
+				message: payload.message || '',
+			};
+		case 'provider.error':
+			return {
+				...base,
+				type,
+				...runFields(payload),
+				message: payload.message || '',
+				status: payload.status,
+				errorType: payload.error_type,
+				code: payload.code,
+			};
+		case 'error':
+			return {...base, type, message: payload.message || ''};
+		default:
+			return {
+				...base,
+				type: 'unknown',
+				rawType: type,
+				payload: payload as Record<string, unknown>,
+			};
+	}
+}
+
+function eventBase(event: SseEventFrame, payload: EventPayload): NavEventBase {
 	return {
 		id: event.id || payload.event_id || '',
-		type: event.type || payload.type || '',
 		sessionId: payload.session_id || '',
-		runId: payload.run_id || '',
-		messageId: payload.message_id || '',
-		delta: payload.delta || '',
-		text: payload.text || '',
-		message: payload.message || '',
 	};
+}
+
+function runFields(payload: EventPayload): Pick<RunScopedEvent, 'runId'> {
+	return {
+		runId: payload.run_id || '',
+	};
+}
+
+function messageFields(
+	payload: EventPayload,
+): Pick<MessageScopedEvent, 'runId' | 'messageId'> {
+	return {
+		...runFields(payload),
+		messageId: payload.message_id || '',
+	};
+}
+
+function toolFields(
+	payload: EventPayload,
+): Pick<ToolScopedEvent, 'runId' | 'toolCallId'> {
+	return {
+		...runFields(payload),
+		toolCallId: payload.tool_call_id || '',
+	};
+}
+
+function fileChangeKind(
+	kind: string | undefined,
+): 'created' | 'modified' | 'deleted' | undefined {
+	if (kind === 'created' || kind === 'modified' || kind === 'deleted') {
+		return kind;
+	}
+	return undefined;
 }
