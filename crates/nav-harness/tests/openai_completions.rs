@@ -19,6 +19,7 @@ use nav_harness::models::{
     ProviderCompat, ProviderConfig, ProviderRoutingCompat, ReasoningEffort, ResolveModelError,
     ThinkingFormat,
 };
+use nav_harness::tools::{ToolPreset, ToolRegistry, read};
 use nav_types::{EventId, MessageId, RunId, ToolCallId};
 use serde_json::json;
 
@@ -44,6 +45,7 @@ fn builds_request_from_resolved_inline_key_without_exposing_secret() {
             ChatCompletionRequestMessage::system("You are concise."),
             ChatCompletionRequestMessage::user("Say hi"),
         ],
+        tools: Vec::new(),
         max_tokens: Some(128),
         temperature: Some(0.2),
         reasoning_effort: Some(ReasoningEffort::Low),
@@ -71,6 +73,56 @@ fn builds_request_from_resolved_inline_key_without_exposing_secret() {
 }
 
 #[test]
+fn encodes_active_preset_tools_into_openai_request() {
+    let resolved = resolved_model("https://api.example.com/v1");
+    let mut registry = ToolRegistry::default();
+    read::register(&mut registry).expect("read should register");
+    let request = OpenAiCompletionsRequest::from_turns_with_tools(
+        &[nav_harness::sessions::Turn::user_text("Read Cargo.toml")],
+        &registry,
+        ToolPreset::Coding,
+    );
+
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(&resolved, &request)
+        .expect("request should build");
+
+    assert_eq!(
+        plan.body["tools"],
+        json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read a UTF-8 text file from the workspace with line numbers.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Workspace-relative or in-workspace absolute file path to read."
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Optional 1-based line number to start from."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Optional maximum number of lines to return."
+                            }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        ])
+    );
+}
+
+#[test]
 fn omits_stream_usage_options_unless_compat_explicitly_enables_them() {
     let resolved = ModelResolver::new(settings_for(
         "compatible-gateway",
@@ -88,6 +140,7 @@ fn omits_stream_usage_options_unless_compat_explicitly_enables_them() {
             &resolved,
             &OpenAiCompletionsRequest {
                 messages: vec![ChatCompletionRequestMessage::user("Say hi")],
+                tools: Vec::new(),
                 max_tokens: None,
                 temperature: None,
                 reasoning_effort: None,
@@ -132,6 +185,7 @@ fn builds_request_for_custom_endpoint_with_env_key_and_compat_quirks() {
                     ChatCompletionRequestMessage::system("Use local rules."),
                     ChatCompletionRequestMessage::user("Say hi"),
                 ],
+                tools: Vec::new(),
                 max_tokens: Some(64),
                 temperature: None,
                 reasoning_effort: Some(ReasoningEffort::Medium),
@@ -211,6 +265,7 @@ fn complete_rejects_streaming_requests_before_http() {
         &resolved,
         &OpenAiCompletionsRequest {
             messages: vec![ChatCompletionRequestMessage::user("Say hi")],
+            tools: Vec::new(),
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
@@ -998,8 +1053,14 @@ fn plain_assistant_message_serializes_with_content() {
     let msg = &plan.body["messages"][1];
     assert_eq!(msg["role"], "assistant");
     assert_eq!(msg["content"], "Hi there!");
-    assert!(msg.get("tool_calls").is_none(), "plain assistant should not have tool_calls");
-    assert!(msg.get("tool_call_id").is_none(), "assistant should not have tool_call_id");
+    assert!(
+        msg.get("tool_calls").is_none(),
+        "plain assistant should not have tool_calls"
+    );
+    assert!(
+        msg.get("tool_call_id").is_none(),
+        "assistant should not have tool_call_id"
+    );
 }
 
 #[test]
@@ -1026,6 +1087,51 @@ fn from_turns_maps_assistant_role_correctly() {
 }
 
 #[test]
+fn from_turns_maps_assistant_tool_calls_and_tool_results() {
+    use nav_harness::sessions::{ToolCall, Turn};
+
+    let turns = vec![
+        Turn::user_text("Read Cargo.toml"),
+        Turn::assistant_tool_calls(vec![ToolCall {
+            id: "call_read_1".to_string(),
+            name: "read".to_string(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
+        }]),
+        Turn::tool_result("call_read_1", "1: [package]\n2: name = \"nav\""),
+    ];
+    let request = OpenAiCompletionsRequest::from_turns(&turns);
+
+    let resolved = resolved_model("https://api.example.com/v1");
+    let plan = OpenAiCompletionsClient::new()
+        .build_request(&resolved, &request)
+        .expect("request should build");
+
+    assert_eq!(
+        plan.body["messages"],
+        json!([
+            { "role": "user", "content": "Read Cargo.toml" },
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_read_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"Cargo.toml\"}"
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "content": "1: [package]\n2: name = \"nav\"",
+                "tool_call_id": "call_read_1"
+            }
+        ])
+    );
+}
+
+#[test]
 fn assistant_with_content_and_tool_calls_serializes_both() {
     let resolved = resolved_model("https://api.example.com/v1");
     let request = OpenAiCompletionsRequest::new(vec![
@@ -1049,8 +1155,13 @@ fn assistant_with_content_and_tool_calls_serializes_both() {
     let msg = &plan.body["messages"][1];
     assert_eq!(msg["role"], "assistant");
     assert_eq!(msg["content"], "Let me look that up.");
-    assert!(msg.get("tool_call_id").is_none(), "assistant should not have tool_call_id");
-    let tool_calls = msg["tool_calls"].as_array().expect("tool_calls should be array");
+    assert!(
+        msg.get("tool_call_id").is_none(),
+        "assistant should not have tool_call_id"
+    );
+    let tool_calls = msg["tool_calls"]
+        .as_array()
+        .expect("tool_calls should be array");
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0]["id"], "call_xyz");
     assert_eq!(tool_calls[0]["type"], "function");
@@ -1061,9 +1172,7 @@ fn assistant_with_content_and_tool_calls_serializes_both() {
 #[test]
 fn user_message_does_not_include_tool_fields() {
     let resolved = resolved_model("https://api.example.com/v1");
-    let request = OpenAiCompletionsRequest::new(vec![
-        ChatCompletionRequestMessage::user("Hello"),
-    ]);
+    let request = OpenAiCompletionsRequest::new(vec![ChatCompletionRequestMessage::user("Hello")]);
 
     let plan = OpenAiCompletionsClient::new()
         .build_request(&resolved, &request)
@@ -1081,15 +1190,13 @@ fn assistant_with_tool_calls_serializes_correctly() {
     let resolved = resolved_model("https://api.example.com/v1");
     let request = OpenAiCompletionsRequest::new(vec![
         ChatCompletionRequestMessage::user("What's the weather?"),
-        ChatCompletionRequestMessage::assistant_with_tool_calls(vec![
-            ChatCompletionToolCall {
-                id: "call_abc123".to_string(),
-                function: ChatCompletionToolCallFunction {
-                    name: "get_weather".to_string(),
-                    arguments: r#"{"location":"SF"}"#.to_string(),
-                },
+        ChatCompletionRequestMessage::assistant_with_tool_calls(vec![ChatCompletionToolCall {
+            id: "call_abc123".to_string(),
+            function: ChatCompletionToolCallFunction {
+                name: "get_weather".to_string(),
+                arguments: r#"{"location":"SF"}"#.to_string(),
             },
-        ]),
+        }]),
         ChatCompletionRequestMessage::tool("call_abc123", "Sunny, 72°F"),
     ]);
 
@@ -1100,12 +1207,17 @@ fn assistant_with_tool_calls_serializes_correctly() {
     let assistant_msg = &plan.body["messages"][1];
     assert_eq!(assistant_msg["role"], "assistant");
     assert!(assistant_msg["content"].is_null());
-    let tool_calls = assistant_msg["tool_calls"].as_array().expect("tool_calls should be array");
+    let tool_calls = assistant_msg["tool_calls"]
+        .as_array()
+        .expect("tool_calls should be array");
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0]["id"], "call_abc123");
     assert_eq!(tool_calls[0]["type"], "function");
     assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
-    assert_eq!(tool_calls[0]["function"]["arguments"], r#"{"location":"SF"}"#);
+    assert_eq!(
+        tool_calls[0]["function"]["arguments"],
+        r#"{"location":"SF"}"#
+    );
 
     let tool_msg = &plan.body["messages"][2];
     assert_eq!(tool_msg["role"], "tool");

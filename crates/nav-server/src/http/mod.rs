@@ -8,6 +8,8 @@ use std::thread;
 
 use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
 use nav_harness::sessions::{SessionStore, Turn};
+use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, read};
+use nav_harness::workspace::path::WorkspacePathPolicy;
 use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
@@ -61,6 +63,7 @@ pub struct HttpServer {
     session_store: Arc<Mutex<SessionStore>>,
     event_store: Arc<Mutex<ProtocolEventStore>>,
     model_run_service: ModelRunService,
+    tool_registry: Arc<ToolRegistry>,
 }
 
 impl HttpServer {
@@ -69,6 +72,9 @@ impl HttpServer {
     }
 
     pub fn with_model_settings(config: HttpServerConfig, model_settings: ModelSettings) -> Self {
+        let mut tool_registry = ToolRegistry::default();
+        read::register(&mut tool_registry).expect("built-in read tool should register");
+
         Self {
             config: config.clone(),
             model_resolver: ModelResolver::new(model_settings),
@@ -78,6 +84,7 @@ impl HttpServer {
             session_store: Arc::new(Mutex::new(SessionStore::default())),
             event_store: Arc::new(Mutex::new(ProtocolEventStore::default())),
             model_run_service: ModelRunService::default(),
+            tool_registry: Arc::new(tool_registry),
         }
     }
 
@@ -289,9 +296,9 @@ impl HttpServer {
             return rpc_error(request.id, -32602, "text is required");
         }
 
-        if !self.sessions.contains_key(&params.session_id) {
+        let Some(session_metadata) = self.sessions.get(&params.session_id).cloned() else {
             return rpc_error(request.id, -32004, "session not found");
-        }
+        };
 
         let turns = {
             let mut session_store = self.session_store.lock().unwrap();
@@ -321,6 +328,7 @@ impl HttpServer {
             run_id.clone(),
             message_id.clone(),
             turns,
+            session_metadata,
             cancellation_token,
         );
 
@@ -395,6 +403,7 @@ impl HttpServer {
         run_id: RunId,
         message_id: nav_types::MessageId,
         turns: Vec<Turn>,
+        session_metadata: SessionMetadata,
         cancellation_token: OpenAiCompletionsCancellationToken,
     ) {
         let model_run_service = self.model_run_service.clone();
@@ -403,6 +412,9 @@ impl HttpServer {
         let event_store = Arc::clone(&self.event_store);
         let runs = Arc::clone(&self.runs);
         let session_store = Arc::clone(&self.session_store);
+        let tool_registry = Arc::clone(&self.tool_registry);
+        let tool_context = tool_context_for_session(session_metadata.cwd());
+        let tool_preset = harness_tool_preset(session_metadata.tools_preset());
 
         thread::spawn(move || {
             let final_status = model_run_service.run(
@@ -414,6 +426,9 @@ impl HttpServer {
                     run_id: &run_id,
                     message_id: &message_id,
                     turns: &turns,
+                    tool_registry: tool_registry.as_ref(),
+                    tool_preset,
+                    tool_context: &tool_context,
                 },
             );
 
@@ -449,6 +464,24 @@ impl HttpServer {
 
     fn next_event_id(&self) -> EventId {
         self.ids.lock().unwrap().next_event_id()
+    }
+}
+
+fn tool_context_for_session(cwd: Option<&str>) -> ToolContext {
+    let cwd = cwd
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    WorkspacePathPolicy::new(&cwd, &cwd)
+        .map(ToolContext::with_path_policy)
+        .unwrap_or_default()
+}
+
+fn harness_tool_preset(preset: ToolsPreset) -> ToolPreset {
+    match preset {
+        ToolsPreset::Coding => ToolPreset::Coding,
+        ToolsPreset::Readonly => ToolPreset::Readonly,
     }
 }
 

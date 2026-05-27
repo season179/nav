@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use nav_harness::agents::{RunLoop, RunLoopFailure, RunLoopRequest, RunLoopResult};
+use nav_harness::agents::{RunLoop, RunLoopRequest, RunLoopResult};
 use nav_harness::models::{
     ModelResolver, OpenAiCompletionsCancellationToken, OpenAiCompletionsError, ResolveModelError,
     ResolvedModelConfig,
 };
 use nav_harness::sessions::{SessionStore, Turn};
+use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};
 use nav_protocol::{BackendEvent, EventEnvelope, ProviderEventMetadata};
 use nav_types::{EventId, MessageId, RunId, SessionId, ToolCallId};
 
@@ -50,6 +51,9 @@ pub(super) struct ModelRunRequest<'a> {
     pub run_id: &'a RunId,
     pub message_id: &'a MessageId,
     pub turns: &'a [Turn],
+    pub tool_registry: &'a ToolRegistry,
+    pub tool_preset: ToolPreset,
+    pub tool_context: &'a ToolContext,
 }
 
 impl ModelRunService {
@@ -86,6 +90,9 @@ impl ModelRunService {
                 run_id: request.run_id,
                 message_id: request.message_id,
                 turns: request.turns,
+                tool_registry: request.tool_registry,
+                tool_preset: request.tool_preset,
+                tool_context: request.tool_context,
                 cancellation_token,
             },
             &mut stream_ids,
@@ -117,25 +124,13 @@ impl ModelRunService {
                     &state.session_store,
                     request.session_id,
                     request.run_id,
-                    completion.assistant_turn,
+                    completion.turns,
                     terminal_events,
                 );
                 RunStatus::Completed
             }
             RunLoopResult::Cancelled => RunStatus::Cancelled,
-            RunLoopResult::Failed(RunLoopFailure::ToolExecutionNotImplemented) => {
-                publish_run_failure(
-                    &state.ids,
-                    &state.event_store,
-                    &state.runs,
-                    request.session_id,
-                    request.run_id,
-                    "TOOL-04: tool execution not implemented".to_string(),
-                    pending_provider_errors,
-                );
-                RunStatus::Failed
-            }
-            RunLoopResult::Failed(RunLoopFailure::Model(error)) => {
+            RunLoopResult::Failed(error) => {
                 if pending_provider_errors.is_empty()
                     && let Some(provider_error) = provider_error_event(
                         &state.ids,
@@ -197,7 +192,7 @@ fn publish_run_loop_completion(
     session_store: &Arc<Mutex<SessionStore>>,
     session_id: &SessionId,
     run_id: &RunId,
-    assistant_turn: Option<Turn>,
+    turns: Vec<Turn>,
     events: impl IntoIterator<Item = EventEnvelope>,
 ) -> bool {
     let mut runs = runs.lock().unwrap();
@@ -209,8 +204,11 @@ fn publish_run_loop_completion(
         return false;
     }
 
-    if let Some(turn) = assistant_turn {
-        session_store.lock().unwrap().append_turn(session_id, turn);
+    {
+        let mut session_store = session_store.lock().unwrap();
+        for turn in turns {
+            session_store.append_turn(session_id, turn);
+        }
     }
     run.status = RunStatus::Completed;
     event_store.lock().unwrap().append_many(events);
@@ -461,7 +459,7 @@ mod tests {
             &session_store,
             &fixture.session_id,
             &fixture.run_id,
-            Some(Turn::assistant_text("assistant reply")),
+            vec![Turn::assistant_text("assistant reply")],
             vec![fixture.run_completed_event()],
         );
 
@@ -487,7 +485,7 @@ mod tests {
             &session_store,
             &fixture.session_id,
             &fixture.run_id,
-            Some(Turn::assistant_text("late assistant reply")),
+            vec![Turn::assistant_text("late assistant reply")],
             vec![fixture.run_completed_event()],
         );
 

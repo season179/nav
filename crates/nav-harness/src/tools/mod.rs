@@ -1,8 +1,9 @@
 //! Typed, permissioned, observable, and recoverable tool access.
 //!
-//! Real filesystem and shell tools intentionally land later in TOOL-04 and
-//! follow-up issues; this module only owns the registry/API shape.
+//! Mutating filesystem and shell tools intentionally land in follow-up issues;
+//! this module owns the registry/API shape and read-only built-ins.
 
+pub mod read;
 pub mod truncation;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,6 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 use tokio::sync::Notify;
+
+use crate::workspace::path::WorkspacePathPolicy;
 
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
 pub type ToolResult = Result<ToolOutput, ToolError>;
@@ -52,8 +55,22 @@ impl RiskClass {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ToolContext;
+#[derive(Debug, Default, Clone)]
+pub struct ToolContext {
+    path_policy: Option<WorkspacePathPolicy>,
+}
+
+impl ToolContext {
+    pub fn with_path_policy(path_policy: WorkspacePathPolicy) -> Self {
+        Self {
+            path_policy: Some(path_policy),
+        }
+    }
+
+    pub fn path_policy(&self) -> Option<&WorkspacePathPolicy> {
+        self.path_policy.as_ref()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
@@ -251,6 +268,15 @@ impl ToolRegistry {
             .flat_map(|tools| tools.iter().cloned())
             .collect()
     }
+
+    pub fn preset_tools(&self, preset: ToolPreset) -> Vec<Arc<dyn NavTool>> {
+        self.preset_tools
+            .get(&preset)
+            .into_iter()
+            .flat_map(|tools| tools.iter())
+            .filter_map(|name| self.get(name))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -290,7 +316,7 @@ mod tests {
             .expect("echo should register successfully");
 
         let tool = registry.get("echo").expect("echo should be registered");
-        let context = ToolContext;
+        let context = ToolContext::default();
         let cancel = ToolCancellationToken::new();
         let result = tool
             .execute(

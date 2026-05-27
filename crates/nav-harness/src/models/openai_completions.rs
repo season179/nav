@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
-use crate::sessions::{Turn, TurnRole};
+use crate::sessions::{ToolCall, Turn, TurnRole};
+use crate::tools::{NavTool, ToolPreset, ToolRegistry};
 
 use super::{
     ApiKind, MaxTokensField, ProviderRoutingCompat, ResolveModelError, ResolvedModelConfig,
@@ -26,6 +27,7 @@ const OPENAI_COMPLETIONS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpenAiCompletionsRequest {
     pub messages: Vec<ChatCompletionRequestMessage>,
+    pub tools: Vec<ChatCompletionToolDefinition>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -36,6 +38,7 @@ impl OpenAiCompletionsRequest {
     pub fn new(messages: Vec<ChatCompletionRequestMessage>) -> Self {
         Self {
             messages,
+            tools: Vec::new(),
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,
@@ -54,6 +57,37 @@ impl OpenAiCompletionsRequest {
                 .map(ChatCompletionRequestMessage::from_turn)
                 .collect(),
         )
+    }
+
+    pub fn from_turns_with_tools(
+        turns: &[Turn],
+        registry: &ToolRegistry,
+        preset: ToolPreset,
+    ) -> Self {
+        let mut request = Self::from_turns(turns);
+        request.tools = registry
+            .preset_tools(preset)
+            .into_iter()
+            .map(|tool| ChatCompletionToolDefinition::from_tool(tool.as_ref()))
+            .collect();
+        request
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatCompletionToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl ChatCompletionToolDefinition {
+    fn from_tool(tool: &dyn NavTool) -> Self {
+        Self {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            parameters: tool.parameters(),
+        }
     }
 }
 
@@ -164,8 +198,35 @@ impl ChatCompletionRequestMessage {
         match turn.role {
             TurnRole::System => Self::system(turn.text_content()),
             TurnRole::User => Self::user(turn.text_content()),
-            TurnRole::Assistant => Self::assistant(turn.text_content()),
+            TurnRole::Assistant => {
+                let tool_calls = turn
+                    .tool_calls()
+                    .into_iter()
+                    .map(chat_completion_tool_call)
+                    .collect::<Vec<_>>();
+                let content = turn.text_content();
+                if tool_calls.is_empty() {
+                    Self::assistant(content)
+                } else if content.is_empty() {
+                    Self::assistant_with_tool_calls(tool_calls)
+                } else {
+                    Self::assistant_with_content_and_tool_calls(content, tool_calls)
+                }
+            }
+            TurnRole::Tool => {
+                Self::tool(turn.tool_call_id().unwrap_or_default(), turn.text_content())
+            }
         }
+    }
+}
+
+fn chat_completion_tool_call(tool_call: ToolCall) -> ChatCompletionToolCall {
+    ChatCompletionToolCall {
+        id: tool_call.id,
+        function: ChatCompletionToolCallFunction {
+            name: tool_call.name,
+            arguments: tool_call.arguments,
+        },
     }
 }
 
@@ -541,7 +602,7 @@ impl OpenAiCompletionsCancellationToken {
         self.state.cancelled.load(Ordering::SeqCst)
     }
 
-    async fn cancelled(&self) {
+    pub async fn cancelled(&self) {
         loop {
             let notified = self.state.notify.notified();
             tokio::pin!(notified);
@@ -901,6 +962,19 @@ fn request_body(model: &ResolvedModelConfig, request: &OpenAiCompletionsRequest)
     body.insert("messages".to_string(), Value::Array(messages));
     body.insert("stream".to_string(), json!(request.stream));
 
+    if !request.tools.is_empty() {
+        body.insert(
+            "tools".to_string(),
+            json!(
+                request
+                    .tools
+                    .iter()
+                    .map(tool_definition_value)
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+
     if request.stream && model.compat.supports_usage_in_streaming == Some(true) {
         body.insert(
             "stream_options".to_string(),
@@ -937,6 +1011,17 @@ fn request_body(model: &ResolvedModelConfig, request: &OpenAiCompletionsRequest)
     Value::Object(body)
 }
 
+fn tool_definition_value(tool: &ChatCompletionToolDefinition) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    })
+}
+
 fn message_value(model: &ResolvedModelConfig, message: &ChatCompletionRequestMessage) -> Value {
     let role = match message.role {
         ChatCompletionMessageRole::System => {
@@ -951,10 +1036,7 @@ fn message_value(model: &ResolvedModelConfig, message: &ChatCompletionRequestMes
         ChatCompletionMessageRole::Tool => "tool",
     };
 
-    let content = message
-        .content
-        .as_deref()
-        .map_or(Value::Null, |c| json!(c));
+    let content = message.content.as_deref().map_or(Value::Null, |c| json!(c));
 
     let mut obj = json!({
         "role": role,
@@ -970,16 +1052,21 @@ fn message_value(model: &ResolvedModelConfig, message: &ChatCompletionRequestMes
     if let Some(tool_calls) = &message.tool_calls {
         obj_map.insert(
             "tool_calls".to_string(),
-            json!(tool_calls.iter().map(|tc| {
-                json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                })
-            }).collect::<Vec<_>>()),
+            json!(
+                tool_calls
+                    .iter()
+                    .map(|tc| {
+                        json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            ),
         );
     }
 

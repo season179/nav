@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -392,20 +394,19 @@ fn session_send_message_replays_previous_user_and_assistant_turns_to_provider() 
 }
 
 #[test]
-fn session_send_message_fails_clearly_when_model_requests_tool_calls() {
-    let provider = FakeProviderServer::start(
-        200,
-        "text/event-stream",
+fn session_send_message_returns_structured_tool_error_for_unknown_tool() {
+    let provider = SequencedProviderServer::start(vec![
         vec![
             provider_sse_chunk(
-                r#"{"id":"provider-run","model":"vendor/model-large","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_provider_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}]},"finish_reason":null}]}"#,
+                r#"{"id":"provider-run","model":"vendor/model-large","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_missing_1","type":"function","function":{"name":"missing","arguments":"{}"}}]},"finish_reason":null}]}"#,
             ),
             provider_sse_chunk(
                 r#"{"id":"provider-run","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
             ),
             "data: [DONE]\n\n".to_string(),
         ],
-    );
+        successful_provider_chunks("unknown handled"),
+    ]);
     let mut server = HttpServer::with_model_settings(
         HttpServerConfig::default(),
         model_settings_with_base_url(provider.base_url()),
@@ -414,8 +415,17 @@ fn session_send_message_fails_clearly_when_model_requests_tool_calls() {
 
     let run_id = send_message(&mut server, &session_id);
 
-    assert_eq!(provider.request().path, "/v1/chat/completions");
-    wait_for_run_status(&server, &run_id, RunStatus::Failed);
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let tool_result = &requests[1].body["messages"][2];
+    assert_eq!(tool_result["role"], "tool");
+    assert_eq!(tool_result["tool_call_id"], "call_missing_1");
+    let tool_error: Value = serde_json::from_str(tool_result["content"].as_str().unwrap())
+        .expect("tool result should be structured JSON");
+    assert_eq!(tool_error["ok"], false);
+    assert_eq!(tool_error["error"]["message"], "unknown tool `missing`");
+
     let events = parse_sse(
         server
             .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
@@ -430,27 +440,130 @@ fn session_send_message_fails_clearly_when_model_requests_tool_calls() {
             "tool.call_delta",
             "tool.call_completed",
             "message.completed",
-            "run.failed",
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
         ]
     );
 
     let tool_call = events
         .iter()
         .find(|event| event.name == "tool.call_completed")
-        .expect("tool call should be exposed before the loop fails");
-    assert_eq!(tool_call.data["name"], "read");
-    assert_eq!(tool_call.data["arguments"], r#"{"path":"Cargo.toml"}"#);
+        .expect("tool call should be exposed before the loop continues");
+    assert_eq!(tool_call.data["name"], "missing");
+    assert_eq!(tool_call.data["arguments"], "{}");
+}
 
-    let failed = events
-        .iter()
-        .find(|event| event.name == "run.failed")
-        .expect("tool calls should fail the run until TOOL-04 implements dispatch");
-    assert_eq!(failed.data["run_id"], run_id);
+#[test]
+fn session_send_message_executes_read_tool_and_reenters_model_loop() {
+    let workspace = TestWorkspace::new("read_tool_loop");
+    workspace.write("fixture.txt", "alpha\nbeta\n");
+    let provider = SequencedProviderServer::start(vec![
+        vec![
+            provider_sse_chunk(
+                r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_read_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"fixture.txt\"}"}}]},"finish_reason":null}]}"#,
+            ),
+            provider_sse_chunk(
+                r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ],
+        successful_provider_chunks("read complete"),
+    ]);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session_with_cwd(&mut server, workspace.root());
+
+    let run_id = send_message_text(&mut server, &session_id, "read the fixture");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body["tools"][0]["function"]["name"], "read");
+    assert_eq!(
+        requests[1].body["messages"],
+        json!([
+            { "role": "user", "content": "read the fixture" },
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_read_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": "{\"path\":\"fixture.txt\"}"
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "content": "1: alpha\n2: beta",
+                "tool_call_id": "call_read_1"
+            }
+        ])
+    );
+
+    let events = parse_sse(
+        server
+            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
+            .body(),
+    );
+    assert_eq!(
+        event_names(&events),
+        vec![
+            "session.created",
+            "run.started",
+            "tool.call_started",
+            "tool.call_delta",
+            "tool.call_completed",
+            "message.completed",
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+        ]
+    );
+}
+
+#[test]
+fn session_send_message_returns_structured_read_error_for_path_escape() {
+    let workspace = TestWorkspace::new("read_tool_escape");
+    let provider = SequencedProviderServer::start(vec![
+        vec![
+            provider_sse_chunk(
+                r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_read_escape","type":"function","function":{"name":"read","arguments":"{\"path\":\"../secret.txt\"}"}}]},"finish_reason":null}]}"#,
+            ),
+            provider_sse_chunk(
+                r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ],
+        successful_provider_chunks("escape handled"),
+    ]);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session_with_cwd(&mut server, workspace.root());
+
+    let run_id = send_message_text(&mut server, &session_id, "read outside the workspace");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let tool_result = &requests[1].body["messages"][2];
+    assert_eq!(tool_result["role"], "tool");
+    assert_eq!(tool_result["tool_call_id"], "call_read_escape");
+    let tool_error: Value = serde_json::from_str(tool_result["content"].as_str().unwrap())
+        .expect("tool result should be structured JSON");
+    assert_eq!(tool_error["ok"], false);
     assert!(
-        failed.data["message"]
+        tool_error["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("tool execution not implemented")
+            .contains("escapes workspace")
     );
 }
 
@@ -1072,13 +1185,17 @@ fn assert_model_text_delta(event: &EventEnvelope, expected: &str) {
 }
 
 fn create_session(server: &mut HttpServer) -> String {
+    create_session_with_cwd(server, Path::new("/tmp/nav-workspace"))
+}
+
+fn create_session_with_cwd(server: &mut HttpServer, cwd: &Path) -> String {
     let create_response = server.handle_request(HttpRequest::post(
         "/rpc",
         json!({
             "jsonrpc": "2.0",
             "id": request_id(99),
             "method": "session.create",
-            "params": { "cwd": "/tmp/nav-workspace" }
+            "params": { "cwd": cwd.display().to_string() }
         })
         .to_string(),
     ));
@@ -1087,6 +1204,35 @@ fn create_session(server: &mut HttpServer) -> String {
         .as_str()
         .unwrap()
         .to_string()
+}
+
+struct TestWorkspace {
+    root: PathBuf,
+}
+
+impl TestWorkspace {
+    fn new(name: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("nav-server-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("workspace should be created");
+        Self {
+            root: fs::canonicalize(root).expect("workspace should canonicalize"),
+        }
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn write(&self, relative_path: &str, content: &str) {
+        fs::write(self.root.join(relative_path), content).expect("file should be written");
+    }
+}
+
+impl Drop for TestWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 #[derive(Debug)]

@@ -348,8 +348,8 @@ fn render_head_tail(head: &str, tail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        truncate_output, TruncationLimit, TruncationOptions, TruncationStrategy, DEFAULT_MAX_BYTES,
-        MAX_LINES, TRUNCATED_MARKER,
+        DEFAULT_MAX_BYTES, MAX_LINES, TRUNCATED_MARKER, TruncationLimit, TruncationOptions,
+        TruncationStrategy, truncate_output,
     };
 
     #[test]
