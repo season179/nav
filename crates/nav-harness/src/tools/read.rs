@@ -112,8 +112,8 @@ impl ReadArgs {
             .filter(|path| !path.trim().is_empty())
             .ok_or_else(|| super::ToolError::new("read argument `path` is required"))?
             .to_string();
-        let offset = optional_positive_usize(object.get("offset"), "offset")?.unwrap_or(1);
-        let limit = optional_positive_usize(object.get("limit"), "limit")?;
+        let offset = super::parse_optional_positive_usize(object.get("offset"), "offset")?.unwrap_or(1);
+        let limit = super::parse_optional_positive_usize(object.get("limit"), "limit")?;
 
         Ok(Self {
             path,
@@ -121,28 +121,6 @@ impl ReadArgs {
             limit,
         })
     }
-}
-
-fn optional_positive_usize(
-    value: Option<&Value>,
-    name: &str,
-) -> Result<Option<usize>, super::ToolError> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let Some(number) = value.as_u64() else {
-        return Err(super::ToolError::new(format!(
-            "read argument `{name}` must be a positive integer"
-        )));
-    };
-    let number = usize::try_from(number)
-        .map_err(|_| super::ToolError::new(format!("read argument `{name}` is too large")))?;
-    if number == 0 {
-        return Err(super::ToolError::new(format!(
-            "read argument `{name}` must be a positive integer"
-        )));
-    }
-    Ok(Some(number))
 }
 
 fn render_numbered_lines(content: &str, offset: usize, limit: Option<usize>) -> String {
