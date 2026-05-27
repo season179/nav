@@ -90,6 +90,10 @@ describe('readSseStream', () => {
 					run_id: 'run-1',
 					tool_call_id: 'tool-3',
 					approval_id: 'approval-1',
+					tool_name: 'bash',
+					reason: 'bash requires approval',
+					arguments_summary: '{"cmd":"echo hi"}',
+					risk_class: 'exec',
 				}),
 				sse('file.changed', {
 					event_id: 'evt-file',
@@ -108,6 +112,10 @@ describe('readSseStream', () => {
 		expect(events[0]).toMatchObject({
 			toolCallId: 'tool-3',
 			approvalId: 'approval-1',
+			toolName: 'bash',
+			reason: 'bash requires approval',
+			argumentsSummary: '{"cmd":"echo hi"}',
+			riskClass: 'exec',
 		});
 		expect(events[1]).toMatchObject({
 			fileChangeId: 'change-1',
@@ -225,7 +233,7 @@ function createClientWithFakeRpc(responses: FakeResponse[]) {
 describe('NavBackendClient tool approval methods', () => {
 	test('approveTool sends tool.approve RPC and returns parsed result', async () => {
 		const {client, getRequests} = createClientWithFakeRpc([
-			{result: {approvalId: 'appr-1', outcome: 'approved'}},
+			{result: {approval_id: 'appr-1', outcome: 'approved'}},
 		]);
 
 		const result = await client.approveTool('appr-1');
@@ -239,7 +247,7 @@ describe('NavBackendClient tool approval methods', () => {
 
 	test('rejectTool sends tool.reject RPC with optional reason and returns result', async () => {
 		const {client, getRequests} = createClientWithFakeRpc([
-			{result: {approvalId: 'appr-2', outcome: 'rejected'}},
+			{result: {approval_id: 'appr-2', outcome: 'rejected'}},
 		]);
 
 		const result = await client.rejectTool('appr-2', 'not this command');
@@ -256,7 +264,7 @@ describe('NavBackendClient tool approval methods', () => {
 
 	test('rejectTool omits reason when not provided', async () => {
 		const {client, getRequests} = createClientWithFakeRpc([
-			{result: {approvalId: 'appr-3', outcome: 'rejected'}},
+			{result: {approval_id: 'appr-3', outcome: 'rejected'}},
 		]);
 
 		await client.rejectTool('appr-3');
@@ -341,6 +349,23 @@ describe('NavBackendClient tool approval methods', () => {
 			expect(error).toBeInstanceOf(ApprovalError);
 			expect((error as ApprovalError).kind).toBe('network');
 			expect((error as ApprovalError).message).toContain('fetch failed');
+		}
+	});
+
+	test('approveTool throws ApprovalError network for unexpected result shapes', async () => {
+		const {client} = createClientWithFakeRpc([
+			{result: {approval_id: 'appr-odd', outcome: 'maybe'}},
+		]);
+
+		try {
+			await client.approveTool('appr-odd');
+			expect.unreachable('should have thrown');
+		} catch (error) {
+			expect(error).toBeInstanceOf(ApprovalError);
+			expect((error as ApprovalError).kind).toBe('network');
+			expect((error as ApprovalError).message).toContain(
+				'unexpected result shape',
+			);
 		}
 	});
 });

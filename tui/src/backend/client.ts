@@ -74,6 +74,10 @@ export type NavEvent =
 	| (ToolScopedEvent & {
 			type: 'tool.approval_requested';
 			approvalId: string;
+			toolName: string;
+			reason: string;
+			argumentsSummary: string;
+			riskClass?: string;
 	  })
 	| (NavEventBase & {
 			type: 'file.changed';
@@ -121,6 +125,12 @@ type JsonRpcResponse = {
 	error?: {code: number; message: string};
 };
 
+type ApprovalRpcResult = {
+	approvalId?: string;
+	approval_id?: string;
+	outcome?: string;
+};
+
 type BackendReady = {
 	type: string;
 	baseUrl: string;
@@ -139,6 +149,10 @@ type EventPayload = {
 	arguments?: string;
 	error_message?: string;
 	approval_id?: string;
+	tool_name?: string;
+	reason?: string;
+	arguments_summary?: string;
+	risk_class?: string;
 	file_change_id?: string;
 	change_id?: string;
 	path?: string;
@@ -273,11 +287,15 @@ export class NavBackendClient {
 			throw toApprovalError(error);
 		}
 
-		const result = raw as {approvalId?: string; outcome?: string};
-		if (!result.approvalId || !result.outcome) {
-			throw new Error(`${method} returned unexpected result shape`);
+		const result = raw as ApprovalRpcResult;
+		const approvalId = result.approvalId ?? result.approval_id;
+		if (!approvalId || !isApprovalOutcome(result.outcome)) {
+			throw new ApprovalError(
+				'network',
+				`${method} returned unexpected result shape`,
+			);
 		}
-		return {approvalId: result.approvalId, outcome: result.outcome as 'approved' | 'rejected'};
+		return {approvalId, outcome: result.outcome};
 	}
 
 	async close(): Promise<void> {
@@ -462,6 +480,10 @@ function isRunTerminal(event: NavEvent, runId: string): boolean {
 		event.type === 'run.failed' ||
 		event.type === 'run.cancelled'
 	);
+}
+
+function isApprovalOutcome(value: unknown): value is ApprovalResult['outcome'] {
+	return value === 'approved' || value === 'rejected';
 }
 
 function newRequestId(): string {
@@ -781,6 +803,10 @@ function decodeSseEvent(event: SseEventFrame, dataLines: string[]): NavEvent {
 				type,
 				...toolFields(payload),
 				approvalId: payload.approval_id || '',
+				toolName: payload.tool_name || '',
+				reason: payload.reason || '',
+				argumentsSummary: payload.arguments_summary || '',
+				riskClass: payload.risk_class,
 			};
 		case 'file.changed':
 			return {
