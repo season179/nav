@@ -303,6 +303,69 @@ fn session_send_message_replays_previous_user_and_assistant_turns_to_provider() 
 }
 
 #[test]
+fn session_send_message_fails_clearly_when_model_requests_tool_calls() {
+    let provider = FakeProviderServer::start(
+        200,
+        "text/event-stream",
+        vec![
+            provider_sse_chunk(
+                r#"{"id":"provider-run","model":"vendor/model-large","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_provider_1","type":"function","function":{"name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}]},"finish_reason":null}]}"#,
+            ),
+            provider_sse_chunk(
+                r#"{"id":"provider-run","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ],
+    );
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session(&mut server);
+
+    let run_id = send_message(&mut server, &session_id);
+
+    assert_eq!(provider.request().path, "/v1/chat/completions");
+    wait_for_run_status(&server, &run_id, RunStatus::Failed);
+    let events = parse_sse(
+        server
+            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
+            .body(),
+    );
+    assert_eq!(
+        event_names(&events),
+        vec![
+            "session.created",
+            "run.started",
+            "tool.call_started",
+            "tool.call_delta",
+            "tool.call_completed",
+            "message.completed",
+            "run.failed",
+        ]
+    );
+
+    let tool_call = events
+        .iter()
+        .find(|event| event.name == "tool.call_completed")
+        .expect("tool call should be exposed before the loop fails");
+    assert_eq!(tool_call.data["name"], "read");
+    assert_eq!(tool_call.data["arguments"], r#"{"path":"Cargo.toml"}"#);
+
+    let failed = events
+        .iter()
+        .find(|event| event.name == "run.failed")
+        .expect("tool calls should fail the run until TOOL-04 implements dispatch");
+    assert_eq!(failed.data["run_id"], run_id);
+    assert!(
+        failed.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("tool execution not implemented")
+    );
+}
+
+#[test]
 fn session_send_message_keeps_interleaved_session_turns_isolated() {
     let provider = SequencedProviderServer::start(vec![
         successful_provider_chunks("assistant reply for session one"),

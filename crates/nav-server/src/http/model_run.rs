@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use nav_harness::events::{HarnessEvent, HarnessEventEnvelope, ModelOutputContext};
+use nav_harness::agents::{RunLoop, RunLoopFailure, RunLoopRequest, RunLoopResult};
 use nav_harness::models::{
-    ModelResolver, OpenAiCompletionsCancellationToken, OpenAiCompletionsClient,
-    OpenAiCompletionsError, OpenAiCompletionsRequest, OpenAiCompletionsRequestContext,
-    ResolveModelError, ResolvedModelConfig,
+    ModelResolver, OpenAiCompletionsCancellationToken, OpenAiCompletionsError, ResolveModelError,
+    ResolvedModelConfig,
 };
 use nav_harness::sessions::{SessionStore, Turn};
 use nav_protocol::{BackendEvent, EventEnvelope, ProviderEventMetadata};
@@ -18,7 +17,7 @@ use super::{RunState, RunStatus};
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct ModelRunService {
-    client: OpenAiCompletionsClient,
+    run_loop: RunLoop,
 }
 
 #[derive(Debug)]
@@ -54,7 +53,7 @@ pub(super) struct ModelRunRequest<'a> {
 }
 
 impl ModelRunService {
-    pub fn run_to_completion(
+    pub fn run(
         &self,
         resolver: &ModelResolver,
         state: ModelRunState,
@@ -77,51 +76,66 @@ impl ModelRunService {
             }
         };
 
-        let completion_request = OpenAiCompletionsRequest::from_turns(request.turns);
-        let request_context =
-            OpenAiCompletionsRequestContext::new().with_cancellation_token(cancellation_token);
         let mut stream_ids = SharedProtocolIdSource {
             ids: Arc::clone(&state.ids),
         };
-        let mut assistant_turn = AssistantTurnCapture::default();
         let mut pending_provider_errors = Vec::new();
-        let stream_result = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("model streaming runtime should build")
-            .block_on(self.client.stream_events_with_context(
-                &model,
-                &completion_request,
-                &request_context,
-                ModelOutputContext {
-                    run_id: request.run_id.clone(),
-                    message_id: request.message_id.clone(),
-                    provider_id: model.provider_id.clone(),
-                    configured_model_id: model.model.id.clone(),
-                },
-                &mut stream_ids,
-                |harness_events| {
-                    assistant_turn.observe(&harness_events);
-                    let (provider_errors, stream_events) = split_provider_errors(
-                        harness_events_to_backend_events(request.session_id, harness_events),
-                    );
-                    pending_provider_errors.extend(provider_errors);
-                    publish_model_run_events(
-                        &state.event_store,
-                        &state.runs,
-                        &state.session_store,
-                        request.session_id,
-                        request.run_id,
-                        &mut assistant_turn,
-                        stream_events,
-                    );
-                },
-            ));
+        let run_loop_result = self.run_loop.run(
+            &model,
+            RunLoopRequest {
+                run_id: request.run_id,
+                message_id: request.message_id,
+                turns: request.turns,
+                cancellation_token,
+            },
+            &mut stream_ids,
+            |harness_events| {
+                let (provider_errors, stream_events) = split_provider_errors(
+                    harness_events_to_backend_events(request.session_id, harness_events),
+                );
+                pending_provider_errors.extend(provider_errors);
+                publish_run_loop_events(
+                    &state.event_store,
+                    &state.runs,
+                    request.run_id,
+                    stream_events,
+                );
+            },
+        );
 
-        match stream_result {
-            Ok(()) => RunStatus::Completed,
-            Err(OpenAiCompletionsError::Cancelled) => RunStatus::Cancelled,
-            Err(error) => {
+        match run_loop_result {
+            RunLoopResult::Completed(completion) => {
+                let (provider_errors, terminal_events) =
+                    split_provider_errors(harness_events_to_backend_events(
+                        request.session_id,
+                        completion.terminal_events,
+                    ));
+                pending_provider_errors.extend(provider_errors);
+                publish_run_loop_completion(
+                    &state.event_store,
+                    &state.runs,
+                    &state.session_store,
+                    request.session_id,
+                    request.run_id,
+                    completion.assistant_turn,
+                    terminal_events,
+                );
+                RunStatus::Completed
+            }
+            RunLoopResult::Cancelled => RunStatus::Cancelled,
+            RunLoopResult::Failed(RunLoopFailure::ToolExecutionNotImplemented) => {
+                publish_run_failure(
+                    &state.ids,
+                    &state.event_store,
+                    &state.runs,
+                    request.session_id,
+                    request.run_id,
+                    "TOOL-04: tool execution not implemented".to_string(),
+                    pending_provider_errors,
+                );
+                RunStatus::Failed
+            }
+            RunLoopResult::Failed(RunLoopFailure::Model(error)) => {
                 if pending_provider_errors.is_empty()
                     && let Some(provider_error) = provider_error_event(
                         &state.ids,
@@ -148,34 +162,6 @@ impl ModelRunService {
     }
 }
 
-#[derive(Debug, Default)]
-struct AssistantTurnCapture {
-    text: String,
-    persisted: bool,
-}
-
-impl AssistantTurnCapture {
-    fn observe(&mut self, events: &[HarnessEventEnvelope]) {
-        for event in events {
-            if let HarnessEvent::ModelTextDelta { delta, .. } = &event.event {
-                self.text.push_str(delta);
-            }
-        }
-    }
-
-    fn persist(&mut self, session_store: &Arc<Mutex<SessionStore>>, session_id: &SessionId) {
-        if self.persisted || self.text.is_empty() {
-            return;
-        }
-
-        session_store
-            .lock()
-            .unwrap()
-            .append_turn(session_id, Turn::assistant_text(self.text.as_str()));
-        self.persisted = true;
-    }
-}
-
 fn split_provider_errors(events: Vec<EventEnvelope>) -> (Vec<EventEnvelope>, Vec<EventEnvelope>) {
     let mut provider_errors = Vec::new();
     let mut stream_events = Vec::new();
@@ -191,40 +177,28 @@ fn split_provider_errors(events: Vec<EventEnvelope>) -> (Vec<EventEnvelope>, Vec
     (provider_errors, stream_events)
 }
 
-fn publish_model_run_events(
+fn publish_run_loop_events(
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
-    session_store: &Arc<Mutex<SessionStore>>,
-    session_id: &SessionId,
     run_id: &RunId,
-    assistant_turn: &mut AssistantTurnCapture,
     events: impl IntoIterator<Item = EventEnvelope>,
 ) {
     for event in events {
-        if matches!(&event.event, BackendEvent::RunCompleted { .. }) {
-            publish_model_run_completed_event(
-                event_store,
-                runs,
-                session_store,
-                session_id,
-                run_id,
-                assistant_turn,
-                event,
-            );
-        } else {
+        debug_assert!(!matches!(&event.event, BackendEvent::RunCompleted { .. }));
+        if !matches!(&event.event, BackendEvent::RunCompleted { .. }) {
             publish_running_event(event_store, runs, run_id, event);
         }
     }
 }
 
-fn publish_model_run_completed_event(
+fn publish_run_loop_completion(
     event_store: &Arc<Mutex<ProtocolEventStore>>,
     runs: &Arc<Mutex<HashMap<RunId, RunState>>>,
     session_store: &Arc<Mutex<SessionStore>>,
     session_id: &SessionId,
     run_id: &RunId,
-    assistant_turn: &mut AssistantTurnCapture,
-    event: EventEnvelope,
+    assistant_turn: Option<Turn>,
+    events: impl IntoIterator<Item = EventEnvelope>,
 ) -> bool {
     let mut runs = runs.lock().unwrap();
     let Some(run) = runs.get_mut(run_id) else {
@@ -235,9 +209,11 @@ fn publish_model_run_completed_event(
         return false;
     }
 
-    assistant_turn.persist(session_store, session_id);
+    if let Some(turn) = assistant_turn {
+        session_store.lock().unwrap().append_turn(session_id, turn);
+    }
     run.status = RunStatus::Completed;
-    event_store.lock().unwrap().append(event);
+    event_store.lock().unwrap().append_many(events);
     true
 }
 
@@ -478,18 +454,14 @@ mod tests {
     fn completed_model_run_persists_assistant_turn_before_terminal_status() {
         let fixture = RunFixture::new(RunStatus::Running);
         let session_store = fixture.session_store();
-        let mut assistant_turn = AssistantTurnCapture {
-            text: "assistant reply".to_string(),
-            persisted: false,
-        };
 
-        publish_model_run_events(
+        publish_run_loop_completion(
             &fixture.event_store,
             &fixture.runs,
             &session_store,
             &fixture.session_id,
             &fixture.run_id,
-            &mut assistant_turn,
+            Some(Turn::assistant_text("assistant reply")),
             vec![fixture.run_completed_event()],
         );
 
@@ -508,18 +480,14 @@ mod tests {
     fn completed_model_run_does_not_persist_assistant_turn_after_run_stops_running() {
         let fixture = RunFixture::new(RunStatus::Cancelled);
         let session_store = fixture.session_store();
-        let mut assistant_turn = AssistantTurnCapture {
-            text: "late assistant reply".to_string(),
-            persisted: false,
-        };
 
-        publish_model_run_events(
+        publish_run_loop_completion(
             &fixture.event_store,
             &fixture.runs,
             &session_store,
             &fixture.session_id,
             &fixture.run_id,
-            &mut assistant_turn,
+            Some(Turn::assistant_text("late assistant reply")),
             vec![fixture.run_completed_event()],
         );
 
