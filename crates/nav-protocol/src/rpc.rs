@@ -108,6 +108,14 @@ pub struct ProtocolCapabilities {
     pub session_close: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolsPreset {
+    #[default]
+    Coding,
+    Readonly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionCreateParams {
@@ -117,6 +125,8 @@ pub struct SessionCreateParams {
     pub source: Option<SessionSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_json: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_preset: Option<ToolsPreset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

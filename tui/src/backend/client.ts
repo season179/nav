@@ -4,8 +4,16 @@ import {createInterface} from 'node:readline';
 import {access, constants, readFile} from 'node:fs/promises';
 import path from 'node:path';
 
+export type ToolsPreset = 'coding' | 'readonly';
+
 const RPC_SESSION_CREATE = 'session.create';
 const RPC_SESSION_SEND_MESSAGE = 'session.sendMessage';
+
+type SessionCreateParams = {
+	cwd?: string;
+	source?: string;
+	toolsPreset?: ToolsPreset;
+};
 
 export type NavEvent = {
 	id: string;
@@ -65,17 +73,19 @@ export class NavBackendClient {
 		this.backendPath = backendPath;
 	}
 
-	async connect(): Promise<SessionInfo> {
+	async connect(toolsPreset?: ToolsPreset): Promise<SessionInfo> {
 		if (this.session) {
 			return this.session;
 		}
 
 		await this.startBackend();
 		const cwd = process.cwd();
-		const result = await this.callRpc(RPC_SESSION_CREATE, {
+		const params: SessionCreateParams = {
 			cwd,
 			source: 'tui',
-		});
+			toolsPreset,
+		};
+		const result = await this.callRpc(RPC_SESSION_CREATE, params);
 		const create = result as {sessionId?: string};
 		if (!create.sessionId) {
 			throw new Error('session.create returned an empty session id');
