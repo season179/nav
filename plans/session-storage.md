@@ -16,17 +16,22 @@ Completions → Anthropic Messages). History must survive that switch without
 corrupting the thread.
 
 Legacy OpenAI `/v1/completions` (`prompt` + `choices[].text`) is out of scope.
-Nav targets three API shapes:
+Nav targets several API families, and the storage design must treat this set as
+open-ended:
 
-| API | Endpoint | Wire input | Wire output |
+| API family | Transport / endpoint | Wire input | Wire output |
 | --- | --- | --- | --- |
-| OpenAI Chat Completions | `POST /v1/chat/completions` | `messages[]` | `choices[].message` |
-| OpenAI Responses | `POST /v1/responses` | `input` / `instructions` | `output[]`, `output_text` |
-| Anthropic Messages | `POST /v1/messages` | `messages[]` + `system` | `content` blocks |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | `messages[]` | `choices[].message`, `tool_calls` |
+| OpenAI Responses | `POST /v1/responses` | `input` / `instructions` | `output[]`, `output_text`, response items |
+| ChatGPT subscription / Codex backend | WebSocket or private HTTP dialect | response-style items + session metadata | item/event stream, encrypted reasoning, tool calls |
+| Anthropic Messages | `POST /v1/messages` | `messages[]` + `system` | `content` blocks, `stop_reason` |
+| OpenAI-compatible gateways | `POST /v1/chat/completions` variants | mostly `messages[]` | OpenAI-like chunks with provider-specific extras |
 
 ## Principles
 
-1. **One canonical ledger in SQLite** — not three provider-native copies per turn.
+1. **One canonical replay ledger in SQLite** — canonical turns are what nav
+   replays across providers; provider-native payloads are retained as evidence,
+   not as the model-visible source of truth.
 2. **Encode on read** — load canonical turns, then `Encoder(api_kind)` for the
    model resolved *this* iteration.
 3. **Decode on write** — provider response → canonical `Turn` → append in one
@@ -42,6 +47,10 @@ Nav targets three API shapes:
 8. **Raw payloads survive replay trimming** — large tool arguments, raw tool
    outputs, and media bytes spill to an artifact blob store. Compaction changes
    the model-visible projection, not the underlying bytes.
+9. **Provider envelopes are durable** — every request, response, streaming event
+   batch, and provider error is persisted as a raw payload artifact with
+   `api_kind`, provider/model ids, decoder version, and decode status. If the
+   canonical decoder misses a field, the raw envelope can be re-decoded later.
 
 ```text
 Persist (always)              Reconstruct (per turn)
@@ -60,7 +69,7 @@ SQLite: canonical turns  →    ModelResolver → ApiKind
 | `nav-harness::sessions::migrate` | SQL migrations |
 | `nav-harness::models::encode` | Build provider request from canonical turns (no HTTP) |
 | `nav-harness::models::decode` | Parse provider response into canonical turns |
-| `nav-types` | `SessionId`, `RunId`, `MessageId`, `ToolCallId`, `ArtifactId` (prefixed monotonic IDs) |
+| `nav-types` | `SessionId`, `RunId`, `MessageId`, `ToolCallId`, `ArtifactId`, `ProviderPayloadId` (prefixed monotonic IDs) |
 
 Extend `models::api::ApiKind` when encoders land:
 
@@ -68,9 +77,16 @@ Extend `models::api::ApiKind` when encoders land:
 pub enum ApiKind {
     OpenAiChatCompletions,
     OpenAiResponses,
+    ChatGptSubscription,
     AnthropicMessages,
 }
 ```
+
+`ApiKind` names the wire dialect, not the brand. For example, an
+OpenAI-compatible local gateway can use `OpenAiChatCompletions`, while ChatGPT
+subscription/Codex traffic gets its own dialect because response item shapes,
+streaming events, and reasoning payloads are not guaranteed to match public
+Responses exactly.
 
 **Dependencies (workspace):** `rusqlite` (bundled SQLite), `serde_json`, error
 crate as used elsewhere. SQL stays in `nav-harness`; `nav-server` opens the DB
@@ -107,6 +123,7 @@ All IDs are prefixed, monotonic, and human-readable:
 | `prt_` | PartId | ascending | `prt_9a0b1c2d3e4f...` |
 | `tool_` | ToolCallId | ascending | `tool_5e6f7a8b9c0d...` |
 | `art_` | ArtifactId | ascending | `art_1a2b3c4d5e6f...` |
+| `pay_` | ProviderPayloadId | ascending | `pay_6f7a8b9c0d1e...` |
 
 **Ascending** = newer IDs are lexicographically larger. **Descending** = newer
 IDs are lexicographically smaller (so `ORDER BY id` gives recent-first without
@@ -197,6 +214,11 @@ enum Part {
     Snapshot {
         snapshot_id: String,          // filesystem checkpoint reference
     },
+    ProviderOpaque {
+        api_kind: ApiKind,
+        kind: String,                 // provider item/event type
+        raw_artifact_id: ArtifactId,
+    },
 }
 ```
 
@@ -213,6 +235,10 @@ onward].
 
 **Retry** — records failed attempts before the successful one. Visible in the
 UI for debugging, excluded from encoding by default.
+
+**ProviderOpaque** — preserves provider items that nav does not yet understand
+well enough to replay semantically. Encoders render it as a short synthetic text
+placeholder by default, while `expand_artifact` exposes the raw payload.
 
 **Conventions**
 
@@ -346,6 +372,39 @@ CREATE INDEX idx_turns_run_seq ON turns(run_id, seq);
 
 Note: no `parts_json` column. Parts live in `turn_parts`.
 
+### `provider_payloads`
+
+```sql
+CREATE TABLE provider_payloads (
+    id                  TEXT PRIMARY KEY NOT NULL,
+    session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id              TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    direction           TEXT NOT NULL,   -- request | response | stream_batch | error
+    api_kind            TEXT NOT NULL,
+    provider_id         TEXT,
+    model_id            TEXT,
+    sequence            INTEGER NOT NULL,
+    provider_payload_id TEXT,            -- e.g. resp_..., chatcmpl_..., request id
+    artifact_id         TEXT NOT NULL REFERENCES artifacts(id),
+    sha256              TEXT NOT NULL,
+    decoder_version     TEXT,
+    decode_status       TEXT NOT NULL DEFAULT 'pending',
+        -- pending | decoded | decoded_with_unknowns | failed | ignored
+    error_json          TEXT,
+    created_at          INTEGER NOT NULL,
+    decoded_at          INTEGER,
+    UNIQUE (run_id, direction, sequence)
+);
+
+CREATE INDEX idx_provider_payloads_run_sequence ON provider_payloads(run_id, sequence);
+CREATE INDEX idx_provider_payloads_session ON provider_payloads(session_id, created_at);
+```
+
+Provider payloads are the lossless wire-format journal. They are not replayed
+directly to a different model, but every canonical part decoded from a provider
+response should be traceable back to one payload row and a JSON pointer within
+that payload.
+
 ### `turn_parts`
 
 ```sql
@@ -355,6 +414,8 @@ CREATE TABLE turn_parts (
     session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     type            TEXT NOT NULL,           -- "text", "tool_call", "tool_result", etc.
     data_json       TEXT NOT NULL,           -- type-specific payload
+    provider_payload_id TEXT REFERENCES provider_payloads(id) ON DELETE SET NULL,
+    provider_json_pointer TEXT,              -- where this part came from in the raw payload
     compacted_at    INTEGER,                -- null = live; set = tool output cleared
     created_at      INTEGER NOT NULL
 );
@@ -364,9 +425,10 @@ CREATE INDEX idx_turn_parts_session_id ON turn_parts(session_id);
 ```
 
 Each part is its own row. `type` is the discriminator; `data_json` holds the
-type-specific fields. `compacted_at` is `NULL` for live parts; when set, it
-means old tool output was cleared to save context space. The timestamp enables
-"when was this compacted?" queries.
+type-specific fields. `provider_payload_id` and `provider_json_pointer` preserve
+decode provenance across API standards. `compacted_at` is `NULL` for live parts;
+when set, it means old tool output was cleared to save context space. The
+timestamp enables "when was this compacted?" queries.
 
 ### `provider_state`
 
@@ -406,7 +468,8 @@ CREATE TABLE artifacts (
 
 Blob files live under `{data_dir}/blobs/`; DB stores path + hash. Media
 attachments, spilled tool-call arguments, raw tool outputs, and filesystem
-snapshots all use the same artifact table. `turn_parts.data_json` keeps the
+snapshots all use the same artifact table. Raw provider envelopes also use this
+table via `provider_payloads.artifact_id`. `turn_parts.data_json` keeps the
 small model-visible projection and references `artifacts.id` for expansion.
 
 ## `SessionStore` API
@@ -446,6 +509,15 @@ impl SessionStore {
     pub fn put_artifact(&self, artifact: NewArtifact, bytes: &[u8]) -> Result<ArtifactId>;
     pub fn get_artifact(&self, id: &ArtifactId) -> Result<Artifact>;
 
+    // Provider payload journal
+    pub fn append_provider_payload(&self, payload: NewProviderPayload) -> Result<ProviderPayloadId>;
+    pub fn mark_provider_payload_decoded(
+        &self,
+        id: &ProviderPayloadId,
+        decoder_version: &str,
+        status: DecodeStatus,
+    ) -> Result<()>;
+
     // Provider state
     pub fn get_provider_state(&self, run_id: &RunId) -> Result<Option<ProviderState>>;
     pub fn set_provider_state(&self, run_id: &RunId, state: ProviderState) -> Result<()>;
@@ -479,12 +551,15 @@ where the cursor is `(created_at, id)` for stable cursor-based pagination.
      optional: prune_compacted_parts(turns)    -- clear old tool output
      optional: context::truncate(turns, budget) → turns_for_model
      request = encode(api_kind, turns, system_prompt, tools, compat)
+     request_payload_id = append_provider_payload(request envelope)
      if api_kind == OpenAiResponses:
          attach previous_response_id from provider_state when valid
      response = http_client.call(request)   // nav-server only
-     new_turns_with_parts = decode(api_kind, response)
+     response_payload_id = append_provider_payload(response envelope)
+     new_turns_with_parts = decode(api_kind, response_payload_id, response)
      BEGIN;
        append_turns(new_turns_with_parts);
+       mark response payload decoded;
        update provider_state;
        update session cost/tokens from StepFinish parts;
      COMMIT
@@ -508,27 +583,53 @@ No migration of historical rows required.
 | Prune | `compaction` | turns | turns with old tool output cleared |
 | Truncate | `context` | turns + token budget | `Vec<(Turn, Vec<Part>)>` |
 | Encode | `models::encode` | `ApiKind`, turns, compat | `EncodedRequest` |
-| Decode | `models::decode` | response + `ApiKind` | `Vec<(Turn, Vec<Part>)>` |
+| Persist envelope | `SessionStore` | encoded request / raw response / stream batch | `ProviderPayloadId` |
+| Decode | `models::decode` | `ProviderPayloadId`, raw payload, `ApiKind` | `Vec<(Turn, Vec<Part>)>` |
 | Save | `SessionStore` | `Vec<(Turn, Vec<Part>)>` | SQLite |
 
-Storage never stores `EncodedRequest` or raw provider response bodies as the
-ledger (optional debug tables are out of scope for v1).
+Storage does not use provider-native JSON as the replay ledger, but it does
+persist the raw provider envelopes. Canonical `Turn`/`Part` rows are the stable
+projection used for cross-provider replay; `provider_payloads` is the audit and
+re-decode trail when an API schema changes or a decoder loses information.
 
-### How the three API shapes map to canonical parts
+### Decode reliability rules
 
-All three encoders consume the same `Vec<(Turn, Vec<Part>)>`. They differ only
-in how they flatten/group the parts into wire format:
+- **Persist before trusting the decoder:** write the request/response envelope
+  artifact and `provider_payloads` row before, or in the same transaction as,
+  canonical parts. If the process crashes after the payload is stored but before
+  decode finishes, startup can find `decode_status = 'pending'` and retry.
+- **Unknown provider items are not discarded:** if a decoder sees an item it
+  cannot project into `Text`, `ToolCall`, `ToolResult`, `Thinking`, etc., write a
+  synthetic `Text`/`ProviderOpaque` projection with an artifact pointer and mark
+  the payload `decoded_with_unknowns` in `error_json`. That keeps the transcript
+  coherent while preserving the raw bytes.
+- **Every decoded part has provenance:** provider-produced `turn_parts` carry
+  `provider_payload_id` plus a JSON pointer such as `/output/3/content/0` or
+  `/choices/0/message/tool_calls/1`. This makes fixture failures debuggable.
+- **Decoder version is stored:** bump `decoder_version` whenever mapping rules
+  change. A maintenance command can re-run newer decoders over old raw payloads
+  and compare the canonical projection.
+- **Streaming is batched, not lossy:** for SSE/WebSocket APIs, persist raw event
+  batches at step boundaries and final response boundaries. Token deltas may be
+  coalesced for the canonical text part, but raw event order remains recoverable
+  from the provider payload journal.
 
-| Canonical part | Chat Completions | Responses API | Anthropic Messages |
-| --- | --- | --- | --- |
-| `Text` | `message.content` | `output_text` | `content[].text` |
-| `Image` | `message.content[].image_url` | `input[].image` | `content[].image` |
-| `ToolCall` | `message.tool_calls[]` | `output[].function_call` | `content[].tool_use` |
-| `ToolResult` | `message.role=tool` | `input[].function_call_output` | `content[].tool_result` |
-| `Thinking` | dropped | dropped | `content[].thinking` |
-| `StepStart/Finish` | ignored | mapped to separate `output[]` entries | mapped to multi-step `content` |
-| `Compaction` | rendered as user text | rendered as user text | rendered as user text |
-| `Retry` | excluded | excluded | excluded |
+### How provider API shapes map to canonical parts
+
+All encoders consume the same `Vec<(Turn, Vec<Part>)>`. They differ only in how
+they flatten/group the parts into wire format:
+
+| Canonical part | Chat Completions | Responses API | ChatGPT/Codex subscription | Anthropic Messages |
+| --- | --- | --- | --- | --- |
+| `Text` | `message.content` | `output_text` / message items | response-style text item/event | `content[].text` |
+| `Image` | `message.content[].image_url` | `input[].image` | response-style image item/event | `content[].image` |
+| `ToolCall` | `message.tool_calls[]` | `output[].function_call` | tool-call item/event | `content[].tool_use` |
+| `ToolResult` | `message.role=tool` | `input[].function_call_output` | tool-result item/event | `content[].tool_result` |
+| `Thinking` | dropped | encrypted reasoning item when available | encrypted reasoning item/event | `content[].thinking` |
+| `StepStart/Finish` | ignored | mapped to separate `output[]` entries | mapped from stream/item boundaries | mapped to multi-step `content` |
+| `Compaction` | rendered as user text | rendered as user text or compaction item | rendered as user text or compaction item | rendered as user text |
+| `Retry` | excluded | excluded | excluded | excluded |
+| `ProviderOpaque` | synthetic text placeholder | synthetic text placeholder | synthetic text placeholder | synthetic text placeholder |
 
 ### Encoding failures on old turns
 
@@ -733,15 +834,40 @@ reconstruction. See [architecture.md](./architecture.md) for SSE/event IDs.
 real-time text streaming. Individual parts are streamed as they arrive, not
 whole turns.
 
+## Reliability verification
+
+Storage work is not complete until these cases pass with fixtures:
+
+1. **Raw envelope survives decoder loss** — feed a provider response containing
+   a deliberately unknown item type. The canonical transcript should include a
+   `ProviderOpaque` placeholder, and `get_artifact(raw_artifact_id)` should
+   return the original JSON bytes exactly.
+2. **Re-decode is possible** — insert a `provider_payloads` row with
+   `decode_status = 'pending'`, restart the store, run the decoder, and assert
+   the payload moves to `decoded` or `decoded_with_unknowns` with canonical
+   parts linked by `provider_payload_id`.
+3. **API-family round trips** — fixture each supported dialect separately:
+   OpenAI Chat Completions, OpenAI Responses, ChatGPT subscription/Codex,
+   Anthropic Messages, and at least one OpenAI-compatible gateway with extra
+   fields. Encode → raw envelope → decode → canonical rows must preserve text,
+   tool calls, tool results, finish reasons, usage, and reasoning artifacts
+   where that dialect exposes them.
+4. **Cross-provider replay** — decode a run from one dialect, switch
+   `ApiKind`, and encode the same canonical turns into another dialect without
+   reading provider-native JSON as the source of truth.
+5. **Crash window** — simulate a crash after raw payload persistence but before
+   canonical append. On restart, pending payload recovery should complete or
+   surface a visible failed-decode row; it must not silently drop the response.
+
 ## Implementation phases
 
 | Phase | Deliverable |
 | --- | --- |
-| 0 | Migrations, `SessionStore::open` / `migrate`, sessions + runs + turns + turn_parts CRUD |
+| 0 | Migrations, `SessionStore::open` / `migrate`, sessions + runs + turns + turn_parts + provider_payloads CRUD |
 | 1 | Canonical `Turn` / `Part` types + row round-trip tests |
-| 2 | `encode` / `decode` for `OpenAiChatCompletions` only |
+| 2 | `encode` / `decode` for `OpenAiChatCompletions` only, with raw request/response envelope capture |
 | 3 | Agent loop wired to store + encode path (nav-server HTTP) |
-| 4 | `AnthropicMessages` + `OpenAiResponses` encoders; `provider_state`; step handling |
+| 4 | `AnthropicMessages` + `OpenAiResponses` + ChatGPT subscription/Codex dialect encoders; `provider_state`; step handling |
 | 5 | Artifact blob store + FTS5 full-text search |
 | 6 | Pruning (tool output compaction via `compacted_at`, dedup, arg/result projection, image stripping) |
 | 7 | Summarization compaction + overflow handling + anti-thrashing |
@@ -751,6 +877,9 @@ whole turns.
 
 - Storing separate `openai_request`, `anthropic_request`, and `responses_request`
   JSON per turn (drift, 3× size, unclear source of truth).
+- Treating canonical parts as the only stored evidence of a provider response.
+  Canonical parts are the replay projection; raw provider envelopes are required
+  for schema drift, decoder bugs, and subscription/private API dialects.
 - Using only OpenAI `previous_response_id` without a local canonical ledger.
 - Appending provider-native messages directly from the client without decode.
 - Storing `parts` as a JSON blob inside the turn row (forces full rewrite on
@@ -763,6 +892,9 @@ whole turns.
 - Default `data_dir` resolution: global vs per-workspace DB.
 - Whether `list_turns_for_session` spans all runs or only the active run for UI.
 - Retention policy for old runs/artifacts (not required for v1).
+- How long to keep provider payload artifacts after successful re-decode
+  coverage exists. Recommendation for a single-user local tool: keep them by
+  default and add manual pruning later.
 - Whether event sourcing (typed events + projectors → read models) should be
   introduced from the start or added later. OpenCode uses this pattern
   extensively for sync and replay, but it adds complexity. Recommendation: keep
