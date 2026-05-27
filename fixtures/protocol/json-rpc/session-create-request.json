@@ -3,6 +3,7 @@
   "id": "019f2f6f-f178-7a72-9f28-000000000002",
   "method": "session.create",
   "params": {
-    "cwd": "/workspace/nav-fixture"
+    "cwd": "/workspace/nav-fixture",
+    "toolsPreset": "coding"
   }
 }

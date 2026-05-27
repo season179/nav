@@ -6,7 +6,7 @@ use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
-use nav_protocol::rpc::SessionSource;
+use nav_protocol::rpc::{SessionSource, ToolsPreset};
 use nav_protocol::{BackendEvent, EventEnvelope};
 use nav_server::http::{
     HttpRequest, HttpServer, HttpServerConfig, ProtocolEventSubscription, RunStatus,
@@ -51,6 +51,95 @@ fn session_create_accepts_omitted_params() {
     let events = parse_sse(event_response.body());
     assert_eq!(event_names(&events), vec!["session.created"]);
     assert_protocol_event_ids(&events, session_id);
+}
+
+#[test]
+fn session_create_stores_tools_preset_on_session_metadata() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+
+    let create_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(102),
+            "method": "session.create",
+            "params": {
+                "toolsPreset": "readonly"
+            }
+        })
+        .to_string(),
+    ));
+
+    assert_eq!(create_response.status(), 200);
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = SessionId::try_new(
+        create_body["result"]["sessionId"]
+            .as_str()
+            .expect("session.create should return a session id"),
+    )
+    .unwrap();
+
+    let metadata = server
+        .session_metadata(&session_id)
+        .expect("session metadata should be retained");
+    assert_eq!(metadata.tools_preset(), ToolsPreset::Readonly);
+}
+
+#[test]
+fn session_create_defaults_tools_preset_to_coding() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+
+    let create_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(103),
+            "method": "session.create"
+        })
+        .to_string(),
+    ));
+
+    assert_eq!(create_response.status(), 200);
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = SessionId::try_new(
+        create_body["result"]["sessionId"]
+            .as_str()
+            .expect("session.create should return a session id"),
+    )
+    .unwrap();
+
+    let metadata = server
+        .session_metadata(&session_id)
+        .expect("session metadata should be retained");
+    assert_eq!(metadata.tools_preset(), ToolsPreset::Coding);
+}
+
+#[test]
+fn session_create_rejects_invalid_tools_preset() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+
+    let create_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(104),
+            "method": "session.create",
+            "params": {
+                "toolsPreset": "unknown"
+            }
+        })
+        .to_string(),
+    ));
+
+    assert_eq!(create_response.status(), 200);
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    assert_eq!(create_body["error"]["code"], -32602);
+    assert!(
+        create_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid params")
+    );
 }
 
 #[test]

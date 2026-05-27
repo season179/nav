@@ -13,7 +13,7 @@ use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     JsonRpcVersion, ProtocolCapabilities, RunCancelParams, RunCancelResult, SessionCreateParams,
     SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, SettingsReloadResult,
-    methods,
+    ToolsPreset, methods,
 };
 use nav_protocol::{BACKEND_EVENT_TYPES, BackendEvent, EventEnvelope};
 use nav_types::{EventId, RunId, SessionId};
@@ -264,6 +264,7 @@ impl HttpServer {
                 cwd: params.cwd,
                 source: params.source,
                 settings_json: params.settings_json,
+                tools_preset: params.tools_preset.unwrap_or_default(),
             },
         );
         self.session_store
@@ -530,6 +531,7 @@ pub struct SessionMetadata {
     cwd: Option<String>,
     source: Option<SessionSource>,
     settings_json: Option<Value>,
+    tools_preset: ToolsPreset,
 }
 
 impl SessionMetadata {
@@ -543,6 +545,10 @@ impl SessionMetadata {
 
     pub fn settings_json(&self) -> Option<&Value> {
         self.settings_json.as_ref()
+    }
+
+    pub fn tools_preset(&self) -> ToolsPreset {
+        self.tools_preset
     }
 }
 
