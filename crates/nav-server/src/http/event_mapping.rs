@@ -141,9 +141,11 @@ fn harness_event_to_backend_event(event: HarnessEvent) -> BackendEvent {
         HarnessEvent::FileChanged {
             file_change_id,
             path,
+            kind,
         } => BackendEvent::FileChanged {
             file_change_id,
             path,
+            kind,
         },
         HarnessEvent::ProviderError {
             run_id,
@@ -356,6 +358,7 @@ mod tests {
             HarnessEvent::FileChanged {
                 file_change_id: file_change_id(),
                 path: "notes.md".to_string(),
+                kind: nav_types::FileChangeKind::Modified,
             },
             HarnessEvent::ProviderError {
                 run_id: run_id(),

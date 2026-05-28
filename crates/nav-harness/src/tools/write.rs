@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 use super::{
-    NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolError, ToolFuture, ToolOutput,
-    ToolRegistry, ToolRegistryError,
+    FileChangeKind, NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolError, ToolFuture,
+    ToolOutput, ToolRegistry, ToolRegistryError,
 };
 
 pub fn register(registry: &mut ToolRegistry) -> Result<(), ToolRegistryError> {
@@ -87,9 +87,10 @@ async fn execute_write(
     if cancel.is_cancelled() {
         return Err(ToolError::new("tool call cancelled"));
     }
+    let kind = file_change_kind(resolved.path()).await;
     atomic_write(resolved.path(), args.content.as_bytes()).await?;
 
-    Ok(ToolOutput::text(format!("wrote {}", args.path)).with_file_changed(changed_path))
+    Ok(ToolOutput::text(format!("wrote {}", args.path)).with_file_changed(changed_path, kind))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +133,19 @@ fn reject_unknown_arguments(object: &serde_json::Map<String, Value>) -> Result<(
 
 fn is_obviously_binary(content: &str) -> bool {
     content.contains('\0')
+}
+
+/// Classify a write as `Created` or `Modified` by probing the target before
+/// the atomic rename. Callers must hold the path queue lock so the probe and
+/// the write observe the same filesystem state. A probe error is rare (the
+/// path policy has already canonicalized the path) and falls through to
+/// `Modified` as a conservative default — only `Ok(false)` definitively
+/// proves the file is new.
+async fn file_change_kind(path: &Path) -> FileChangeKind {
+    match tokio::fs::try_exists(path).await {
+        Ok(false) => FileChangeKind::Created,
+        _ => FileChangeKind::Modified,
+    }
 }
 
 fn display_changed_path(workspace_root: &Path, path: &Path) -> String {
@@ -219,7 +233,8 @@ mod tests {
 
     use super::WriteTool;
     use crate::tools::{
-        NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolPreset, ToolRegistry,
+        FileChangeKind, NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFileChange,
+        ToolPreset, ToolRegistry,
     };
     use crate::workspace::path::WorkspacePathPolicy;
 
@@ -245,6 +260,53 @@ mod tests {
             fs::read_to_string(workspace.root.join("notes/today.md"))
                 .expect("written file should be readable"),
             "hello\nSeason\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tool_reports_created_for_a_new_path() {
+        let workspace = TestWorkspace::new("file_change_created");
+        let context = ToolContext::with_path_policy(workspace.policy());
+
+        let output = WriteTool
+            .execute(
+                &context,
+                json!({"path": "notes.md", "content": "fresh\n"}),
+                ToolCancellationToken::new(),
+            )
+            .await
+            .expect("write should succeed");
+
+        assert_eq!(
+            output.file_changes,
+            vec![ToolFileChange {
+                path: "notes.md".to_string(),
+                kind: FileChangeKind::Created,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tool_reports_modified_when_overwriting() {
+        let workspace = TestWorkspace::new("file_change_modified");
+        workspace.write("notes.md", "old\n");
+        let context = ToolContext::with_path_policy(workspace.policy());
+
+        let output = WriteTool
+            .execute(
+                &context,
+                json!({"path": "notes.md", "content": "new\n"}),
+                ToolCancellationToken::new(),
+            )
+            .await
+            .expect("write should succeed");
+
+        assert_eq!(
+            output.file_changes,
+            vec![ToolFileChange {
+                path: "notes.md".to_string(),
+                kind: FileChangeKind::Modified,
+            }]
         );
     }
 

@@ -560,6 +560,7 @@ fn emit_file_changed_events<Ids, Emit>(
             event: HarnessEvent::FileChanged {
                 file_change_id,
                 path: file_change.path.clone(),
+                kind: file_change.kind,
             },
         }]);
     }
@@ -991,8 +992,8 @@ mod tests {
     };
     use crate::sessions::{ConfirmationDecision, PendingConfirmationRegistry, ToolCall};
     use crate::tools::{
-        NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolError, ToolFuture, ToolOutput,
-        ToolRegistry, read, write,
+        FileChangeKind, NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolError,
+        ToolFuture, ToolOutput, ToolRegistry, read, write,
     };
     use crate::workspace::path::WorkspacePathPolicy;
 
@@ -1446,7 +1447,8 @@ mod tests {
         assert!(events.iter().any(|event| {
             matches!(
                 &event.event,
-                HarnessEvent::FileChanged { path, .. } if path == "notes.md"
+                HarnessEvent::FileChanged { path, kind, .. }
+                    if path == "notes.md" && *kind == FileChangeKind::Created
             )
         }));
     }
@@ -2183,7 +2185,7 @@ mod tests {
         ) -> ToolFuture<'a> {
             Box::pin(async move {
                 cancel.cancel();
-                Ok(ToolOutput::text("mutated").with_file_changed("notes.md"))
+                Ok(ToolOutput::text("mutated").with_file_changed("notes.md", FileChangeKind::Modified))
             })
         }
     }

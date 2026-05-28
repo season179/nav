@@ -8,7 +8,7 @@ use nav_harness::models::{
 use nav_harness::sessions::{ConfirmationDecision, PendingConfirmation};
 use nav_protocol::{EventEnvelope, JsonRpcRequest, JsonRpcResponse};
 use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig, RunStatus, sse};
-use nav_types::{ApprovalId, RunId, ToolCallId};
+use nav_types::{ApprovalId, FileChangeKind, RunId, ToolCallId};
 use serde_json::{Value, json};
 
 mod support;
@@ -43,6 +43,7 @@ const SSE_FIXTURES: &[&str] = &[
     "event-streams/tool-call-read.sse",
     "event-streams/tool-call-failed.sse",
     "event-streams/tool-approval-requested.sse",
+    "event-streams/file-changed.sse",
 ];
 
 #[test]
@@ -624,6 +625,41 @@ fn tool_call_read_fixture_round_trips_through_sse_encoder() {
         }
         _ => panic!("unexpected event types"),
     }
+}
+
+#[test]
+fn file_changed_fixture_round_trips_every_kind() {
+    let fixture = "event-streams/file-changed.sse";
+    let fixture_body = fixture_text(fixture);
+    let events = parse_sse(&fixture_body);
+
+    let kinds: Vec<&str> = events
+        .iter()
+        .filter(|event| event.name == "file.changed")
+        .map(|event| event.data["kind"].as_str().expect("kind should be a string"))
+        .collect();
+    assert_eq!(kinds, vec!["created", "modified", "deleted"]);
+
+    let envelopes = event_envelopes(events);
+    let encoded = sse::encode_events(&envelopes)
+        .unwrap_or_else(|error| panic!("{fixture} should encode: {error}"));
+    assert_eq!(encoded, fixture_body_with_final_separator(&fixture_body));
+
+    let decoded_kinds: Vec<FileChangeKind> = envelopes
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            nav_protocol::BackendEvent::FileChanged { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        decoded_kinds,
+        vec![
+            FileChangeKind::Created,
+            FileChangeKind::Modified,
+            FileChangeKind::Deleted,
+        ]
+    );
 }
 
 #[test]

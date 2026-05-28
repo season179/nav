@@ -1,4 +1,6 @@
-use nav_types::{ApprovalId, EventId, FileChangeId, MessageId, RunId, SessionId, ToolCallId};
+use nav_types::{
+    ApprovalId, EventId, FileChangeId, FileChangeKind, MessageId, RunId, SessionId, ToolCallId,
+};
 use serde::{Deserialize, Serialize};
 
 pub const BACKEND_EVENT_TYPES: &[&str] = &[
@@ -147,6 +149,7 @@ pub enum BackendEvent {
     FileChanged {
         file_change_id: FileChangeId,
         path: String,
+        kind: FileChangeKind,
     },
     #[serde(rename = "run.completed")]
     RunCompleted {
@@ -243,6 +246,29 @@ mod tests {
         assert_eq!(advertised, emitted);
     }
 
+    #[test]
+    fn file_changed_round_trips_every_kind() {
+        for (kind, expected) in [
+            (FileChangeKind::Created, "created"),
+            (FileChangeKind::Modified, "modified"),
+            (FileChangeKind::Deleted, "deleted"),
+        ] {
+            let event = BackendEvent::FileChanged {
+                file_change_id: file_change_id(),
+                path: "README.md".to_string(),
+                kind,
+            };
+
+            let json = serde_json::to_value(&event).expect("file.changed should serialize");
+            assert_eq!(json["type"], "file.changed");
+            assert_eq!(json["kind"], expected);
+
+            let decoded: BackendEvent =
+                serde_json::from_value(json).expect("file.changed should deserialize");
+            assert_eq!(decoded, event);
+        }
+    }
+
     fn backend_event_samples() -> Vec<BackendEvent> {
         vec![
             BackendEvent::SessionCreated,
@@ -323,6 +349,7 @@ mod tests {
             BackendEvent::FileChanged {
                 file_change_id: file_change_id(),
                 path: "README.md".to_string(),
+                kind: FileChangeKind::Modified,
             },
             BackendEvent::RunCompleted {
                 run_id: run_id(),

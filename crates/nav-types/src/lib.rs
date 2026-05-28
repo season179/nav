@@ -68,6 +68,17 @@ define_uuid_v7_id!(ApprovalId);
 define_uuid_v7_id!(EventId);
 define_uuid_v7_id!(FileChangeId);
 
+/// How a workspace file was affected by a tool call. Shared by the harness
+/// event log and the wire protocol so a `file.changed` event carries the same
+/// vocabulary end to end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdError {
     value: String,

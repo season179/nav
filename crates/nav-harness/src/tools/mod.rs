@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::Value;
 use tokio::sync::Notify;
 
+pub use nav_types::FileChangeKind;
+
 use crate::guardrails::GuardrailRunner;
 use crate::workspace::path::WorkspacePathPolicy;
 
@@ -118,8 +120,11 @@ impl ToolOutput {
         }
     }
 
-    pub fn with_file_changed(mut self, path: impl Into<String>) -> Self {
-        self.file_changes.push(ToolFileChange { path: path.into() });
+    pub fn with_file_changed(mut self, path: impl Into<String>, kind: FileChangeKind) -> Self {
+        self.file_changes.push(ToolFileChange {
+            path: path.into(),
+            kind,
+        });
         self
     }
 }
@@ -127,6 +132,7 @@ impl ToolOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolFileChange {
     pub path: String,
+    pub kind: FileChangeKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

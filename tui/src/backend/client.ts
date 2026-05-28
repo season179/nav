@@ -6,6 +6,8 @@ import path from 'node:path';
 
 export type ToolsPreset = 'coding' | 'readonly';
 
+export type FileChangeKind = 'created' | 'modified' | 'deleted';
+
 const RPC_SESSION_CREATE = 'session.create';
 const RPC_SESSION_SEND_MESSAGE = 'session.sendMessage';
 
@@ -92,7 +94,7 @@ export type NavEvent =
 			type: 'file.changed';
 			fileChangeId: string;
 			path: string;
-			kind?: 'created' | 'modified' | 'deleted';
+			kind?: FileChangeKind;
 	  })
 	| (RunScopedEvent & {type: 'run.failed'; message: string})
 	| (RunScopedEvent & {
@@ -901,9 +903,7 @@ function toolFields(
 	};
 }
 
-function fileChangeKind(
-	kind: string | undefined,
-): 'created' | 'modified' | 'deleted' | undefined {
+function fileChangeKind(kind: string | undefined): FileChangeKind | undefined {
 	if (kind === 'created' || kind === 'modified' || kind === 'deleted') {
 		return kind;
 	}
