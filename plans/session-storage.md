@@ -69,7 +69,7 @@ SQLite: canonical turns  →    ModelResolver → ApiKind
 | `nav-harness::sessions::migrate` | SQL migrations |
 | `nav-harness::models::encode` | Build provider request from canonical turns (no HTTP) |
 | `nav-harness::models::decode` | Parse provider response into canonical turns |
-| `nav-types` | `SessionId`, `RunId`, `MessageId`, `ToolCallId`, `ArtifactId`, `ProviderPayloadId` (prefixed monotonic IDs) |
+| `nav-types` | Protocol UUIDv7 IDs plus storage-only `PartId`, `ArtifactId`, and `ProviderPayloadId` |
 
 Extend `models::api::ApiKind` when encoders land:
 
@@ -113,25 +113,25 @@ PRAGMA cache_size = -64000;
 
 ## ID scheme
 
-All IDs are prefixed, monotonic, and human-readable:
+Protocol-visible IDs (`SessionId`, `RunId`, `MessageId`, `ToolCallId`,
+`RequestId`, SSE `EventId`, approvals, and file changes) remain lowercase
+UUIDv7 strings for JSON-RPC/SSE compatibility. Do not replace them with
+prefixed IDs unless a later issue performs an explicit compatibility migration.
+
+Storage-only rows introduced by this plan use prefixed, monotonic, and
+human-readable IDs:
 
 | Prefix | Type | Direction | Example |
 | --- | --- | --- | --- |
-| `ses_` | SessionId | descending (recent sorts first) | `ses_a1b2c3d4e5f6...` |
-| `run_` | RunId | ascending | `run_7f8e9d0c1a2b...` |
-| `msg_` | MessageId (= TurnId) | ascending | `msg_3b4c5d6e7f8a...` |
-| `prt_` | PartId | ascending | `prt_9a0b1c2d3e4f...` |
-| `tool_` | ToolCallId | ascending | `tool_5e6f7a8b9c0d...` |
-| `art_` | ArtifactId | ascending | `art_1a2b3c4d5e6f...` |
-| `pay_` | ProviderPayloadId | ascending | `pay_6f7a8b9c0d1e...` |
+| `prt_` | PartId | ascending | `prt_0000018bcfe56800_9a0b1c2d3e4f5678` |
+| `art_` | ArtifactId | ascending | `art_0000018bcfe56800_1a2b3c4d5e6f7890` |
+| `pay_` | ProviderPayloadId | ascending | `pay_0000018bcfe56800_6f7a8b9c0d1e2345` |
 
-**Ascending** = newer IDs are lexicographically larger. **Descending** = newer
-IDs are lexicographically smaller (so `ORDER BY id` gives recent-first without
-needing a separate timestamp column in the index).
+**Ascending** = newer storage IDs are lexicographically larger.
 
-IDs embed a millisecond timestamp (like UUIDv7) so they are temporally ordered
-and can be extracted for display. The prefix makes logs and debug output
-immediately legible.
+Storage-only IDs embed a millisecond timestamp (like UUIDv7) so they are
+temporally ordered and can be extracted for display. The prefix makes logs and
+debug output immediately legible without changing the wire protocol.
 
 **Pagination** uses cursor-based paging on `(created_at, id)` — stable across
 concurrent writes, no offset drift:
@@ -923,9 +923,10 @@ Storage work is not complete until these cases pass with fixtures:
      the user message.
    Adopted for nav's compaction design.
 
-4. **Prefixed monotonic IDs** — OpenCode uses `ses_`, `msg_`, `prt_` prefixed
-   IDs with embedded timestamps and sort order (ascending or descending).
-   Adopted for nav's ID scheme.
+4. **Prefixed monotonic storage IDs** — OpenCode uses `ses_`, `msg_`, `prt_`
+   prefixed IDs with embedded timestamps and sort order (ascending or
+   descending). Nav adopts that shape only for storage-only IDs while keeping
+   protocol-visible IDs as UUIDv7 strings.
 
 5. **StepStart/StepFinish** — OpenCode models multi-step responses (Anthropic
    extended thinking, multiple tool rounds per response) with explicit step

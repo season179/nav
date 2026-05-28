@@ -352,6 +352,7 @@ describe('NavBackendClient public methods', () => {
 			method: 'tool.approve',
 			params: {approval_id: 'appr-1'},
 		});
+		expectUuidV7(getRequests()[0].id);
 	});
 
 	test('rejectTool sends tool.reject RPC with optional reason and returns result', async () => {
@@ -489,5 +490,11 @@ function jsonResponse(response: FakeResponse): Response {
 				id: 'response-id',
 				...(response.error ? {error: response.error} : {result: response.result}),
 			}),
-	} as Response;
+		} as Response;
+}
+
+function expectUuidV7(value: string): void {
+	expect(value).toMatch(
+		/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+	);
 }
