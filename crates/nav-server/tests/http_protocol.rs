@@ -486,7 +486,7 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
     assert_eq!(requests.len(), 2);
     assert_eq!(
         tool_names_from_request(&requests[0].body),
-        vec!["bash", "read", "write"]
+        vec!["bash", "edit", "read", "write"]
     );
     assert_eq!(
         requests[1].body["messages"],
@@ -614,6 +614,72 @@ fn session_send_message_executes_write_tool_and_publishes_file_changed() {
         file_changed.data["file_change_id"]
             .as_str()
             .expect("file.changed should include file_change_id"),
+    );
+}
+
+#[test]
+fn session_send_message_executes_edit_tool_and_publishes_file_changed() {
+    let workspace = TestWorkspace::new("edit_tool_loop");
+    workspace.write("agent.md", "hello\nold line\n");
+    let tool_arguments = json!({
+        "path": "agent.md",
+        "old_text": "old line",
+        "new_text": "new line",
+    })
+    .to_string();
+    let provider = SequencedProviderServer::start(vec![
+        edit_tool_call_chunks("call_edit_1", &tool_arguments),
+        successful_provider_chunks("edit complete"),
+    ]);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session_with_cwd(&mut server, workspace.root());
+
+    let run_id = send_message_text(&mut server, &session_id, "edit the note");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("agent.md"))
+            .expect("edit tool should update the requested file"),
+        "hello\nnew line\n"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"],
+        json!([
+            { "role": "user", "content": "edit the note" },
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_edit_1",
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "arguments": tool_arguments
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "content": "edited agent.md",
+                "tool_call_id": "call_edit_1"
+            }
+        ])
+    );
+
+    let events = parse_sse(
+        server
+            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
+            .body(),
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| { event.name == "file.changed" && event.data["path"] == "agent.md" })
     );
 }
 
@@ -1595,35 +1661,18 @@ fn assert_not_pending_confirmation(body: Value) {
 
 fn bash_tool_call_chunks(provider_call_id: &str, command: &str) -> Vec<String> {
     let tool_arguments = json!({ "command": command }).to_string();
-    let chunk = json!({
-        "id": "provider-run-1",
-        "model": "vendor/model-large",
-        "choices": [{
-            "index": 0,
-            "delta": {
-                "tool_calls": [{
-                    "index": 0,
-                    "id": provider_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": "bash",
-                        "arguments": tool_arguments
-                    }
-                }]
-            },
-            "finish_reason": null
-        }]
-    });
-    vec![
-        provider_sse_chunk(&chunk.to_string()),
-        provider_sse_chunk(
-            r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
-        ),
-        "data: [DONE]\n\n".to_string(),
-    ]
+    tool_call_chunks("bash", provider_call_id, &tool_arguments)
 }
 
 fn write_tool_call_chunks(provider_call_id: &str, tool_arguments: &str) -> Vec<String> {
+    tool_call_chunks("write", provider_call_id, tool_arguments)
+}
+
+fn edit_tool_call_chunks(provider_call_id: &str, tool_arguments: &str) -> Vec<String> {
+    tool_call_chunks("edit", provider_call_id, tool_arguments)
+}
+
+fn tool_call_chunks(tool_name: &str, provider_call_id: &str, tool_arguments: &str) -> Vec<String> {
     let chunk = json!({
         "id": "provider-run-1",
         "model": "vendor/model-large",
@@ -1635,7 +1684,7 @@ fn write_tool_call_chunks(provider_call_id: &str, tool_arguments: &str) -> Vec<S
                     "id": provider_call_id,
                     "type": "function",
                     "function": {
-                        "name": "write",
+                        "name": tool_name,
                         "arguments": tool_arguments
                     }
                 }]
