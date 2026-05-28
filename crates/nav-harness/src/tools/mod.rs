@@ -6,6 +6,7 @@
 pub mod bash;
 pub mod ls;
 pub mod read;
+pub mod ripgrep;
 pub mod truncation;
 
 use std::collections::{BTreeMap, BTreeSet};
