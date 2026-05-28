@@ -1,4 +1,4 @@
-import React, {useState} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {Box, Text} from 'ink';
 import {FileChangedCell} from './FileChangedCell.js';
 import {ToolCallCell} from './ToolCallCell.js';
@@ -8,6 +8,8 @@ import {Markdown} from '../../markdown/Markdown.js';
 import {theme} from '../../theme/index.js';
 import {ScrollViewport} from '../../ink-ext/ScrollViewport.js';
 import {useWheelScroll} from '../../ink-ext/use-wheel-scroll.js';
+
+const FOLLOW_TAIL_TOLERANCE = 1;
 
 type Props = {
 	messages: HistoryMessage[];
@@ -24,11 +26,28 @@ export function VirtualHistoryRegion({
 	const {scrollTop, setScrollTop} = useWheelScroll({
 		maxScrollTop: maxScrollTop ?? Number.POSITIVE_INFINITY,
 		onWheelScroll: event => {
-			if (event.direction === 'up') {
+			if (event.direction === 'up' && scrollTop > 0) {
 				setStickyBottom(false);
 			}
 		},
 	});
+	const previousScrollTopRef = useRef(scrollTop);
+	const atBottom = isAtBottom(scrollTop, knownMaxScrollTop);
+
+	useEffect(() => {
+		const previousScrollTop = previousScrollTopRef.current;
+		previousScrollTopRef.current = scrollTop;
+
+		if (scrollTop !== previousScrollTop && atBottom) {
+			setStickyBottom(true);
+		}
+	}, [atBottom, scrollTop]);
+
+	useEffect(() => {
+		if (stickyBottom && !atBottom) {
+			setScrollTop(knownMaxScrollTop);
+		}
+	}, [atBottom, knownMaxScrollTop, setScrollTop, stickyBottom]);
 
 	const indicatorVisible = scrollTop < knownMaxScrollTop;
 	const viewportHeight = Math.max(1, height - (indicatorVisible ? 1 : 0));
@@ -59,7 +78,7 @@ export function VirtualHistoryRegion({
 						scrollTop={scrollTop}
 						onScrollTopChange={nextScrollTop => {
 							setScrollTop(nextScrollTop);
-							if (nextScrollTop >= knownMaxScrollTop - 1) {
+							if (isAtBottom(nextScrollTop, knownMaxScrollTop)) {
 								setStickyBottom(true);
 							}
 						}}
@@ -82,6 +101,10 @@ export function VirtualHistoryRegion({
 			)}
 		</Box>
 	);
+}
+
+function isAtBottom(scrollTop: number, maxScrollTop: number): boolean {
+	return scrollTop >= maxScrollTop - FOLLOW_TAIL_TOLERANCE;
 }
 
 const MessageRow = React.memo(function MessageRow({
