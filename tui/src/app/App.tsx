@@ -247,7 +247,7 @@ export function App({backendPath = '', backendClient}: Props) {
 	function pushSystem(text: string) {
 		setMessages(previous => [
 			...previous,
-			{id: crypto.randomUUID(), role: 'system', text},
+			{id: crypto.randomUUID(), contentVersion: 1, role: 'system', text},
 		]);
 	}
 
@@ -257,8 +257,8 @@ export function App({backendPath = '', backendClient}: Props) {
 		setHint('Connecting…');
 		setMessages(previous => [
 			...previous,
-			{id: crypto.randomUUID(), role: 'user', text},
-			{id: assistantId, role: 'assistant', text: ''},
+			{id: crypto.randomUUID(), contentVersion: 1, role: 'user', text},
+			{id: assistantId, contentVersion: 1, role: 'assistant', text: ''},
 		]);
 
 		try {
@@ -271,7 +271,11 @@ export function App({backendPath = '', backendClient}: Props) {
 			setMessages(previous =>
 				previous.map(entry =>
 					entry.id === assistantId && entry.role === 'assistant'
-						? {...entry, text: message}
+						? {
+								...entry,
+								contentVersion: nextContentVersion(entry),
+								text: message,
+							}
 						: entry,
 				),
 			);
@@ -360,6 +364,7 @@ export function applyEventToHistory(
 				...withCall,
 				{
 					id: event.id || `${event.toolCallId}-failed`,
+					contentVersion: 1,
 					role: 'tool_result',
 					runId: event.runId,
 					toolCallId: event.toolCallId,
@@ -381,6 +386,7 @@ export function applyEventToHistory(
 				...messages,
 				{
 					id: event.fileChangeId || event.id,
+					contentVersion: 1,
 					role: 'file_changed',
 					path: event.path || '',
 					kind: event.kind,
@@ -460,7 +466,11 @@ function updateAssistantText(
 		return messages;
 	}
 
-	const updatedAssistant = {...assistant, text: updateText(assistant.text)};
+	const updatedAssistant = {
+		...assistant,
+		contentVersion: nextContentVersion(assistant),
+		text: updateText(assistant.text),
+	};
 	if (assistant.text === '' && index < messages.length - 1) {
 		return [
 			...messages.slice(0, index),
@@ -500,6 +510,7 @@ function upsertToolCall(
 
 	const buildMessage = (): ToolCallHistoryMessage => ({
 		id: toolCallId,
+		contentVersion: 1,
 		role: 'tool_call',
 		runId: event.runId,
 		toolCallId,
@@ -524,6 +535,7 @@ function upsertToolCall(
 
 		return {
 			...entry,
+			contentVersion: nextContentVersion(entry),
 			runId: event.runId || entry.runId,
 			name: update.name || entry.name,
 			arguments: updateToolArguments(entry.arguments, update),
@@ -562,4 +574,8 @@ function updateStreamingOutput(
 		return `${current ?? ''}${update.outputDelta}`;
 	}
 	return current;
+}
+
+function nextContentVersion(message: HistoryMessage): number {
+	return (message.contentVersion ?? 0) + 1;
 }
