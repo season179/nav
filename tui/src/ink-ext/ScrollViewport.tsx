@@ -41,6 +41,18 @@ type ViewportLayout = {
 	hasUnmeasuredRows: boolean;
 };
 
+type RowMeasurement = {
+	heightKey: string;
+	stableKey: string;
+	top: number;
+	height: number;
+};
+
+type StableRowMeasurement = {
+	top: number;
+	height: number;
+};
+
 const DEFAULT_ESTIMATED_HEIGHT = 4;
 const DEFAULT_OVERSCAN = 5;
 const DEFAULT_VIEWPORT_WIDTH = 80;
@@ -59,12 +71,15 @@ export function ScrollViewport({
 }: Props): React.JSX.Element {
 	const viewportWidth = useViewportWidth();
 	const heightCacheRef = useRef(new Map<string, number>());
+	const rowMeasurementCacheRef = useRef(new Map<string, StableRowMeasurement>());
+	const pendingAnchorScrollTopRef = useRef<number | undefined>(undefined);
 	const cachedWidthRef = useRef(viewportWidth);
 	const previousMaxScrollTopRef = useRef(0);
 	const [measureRevision, setMeasureRevision] = useState(0);
 
 	if (cachedWidthRef.current !== viewportWidth) {
 		heightCacheRef.current.clear();
+		rowMeasurementCacheRef.current.clear();
 		cachedWidthRef.current = viewportWidth;
 	}
 
@@ -134,21 +149,61 @@ export function ScrollViewport({
 
 	useLayoutEffect(() => {
 		pruneHeightCache(heightCacheRef.current, messages, viewportWidth);
+		pruneRowMeasurementCache(
+			rowMeasurementCacheRef.current,
+			messages,
+			viewportWidth,
+		);
 	}, [messages, viewportWidth]);
 
-	const handleMeasure = useCallback((cacheKey: string, height: number) => {
-		if (height <= 0) {
-			return;
-		}
+	useLayoutEffect(() => {
+		pendingAnchorScrollTopRef.current = undefined;
+	});
 
-		const cache = heightCacheRef.current;
-		if (cache.get(cacheKey) === height) {
-			return;
-		}
+	const handleMeasure = useCallback(
+		({heightKey, stableKey, top, height}: RowMeasurement) => {
+			if (height <= 0) {
+				return;
+			}
 
-		cache.set(cacheKey, height);
-		setMeasureRevision(revision => revision + 1);
-	}, []);
+			const rowMeasurementCache = rowMeasurementCacheRef.current;
+			const previousMeasurement = rowMeasurementCache.get(stableKey);
+			rowMeasurementCache.set(stableKey, {top, height});
+
+			const cache = heightCacheRef.current;
+			if (cache.get(heightKey) === height) {
+				return;
+			}
+
+			cache.set(heightKey, height);
+
+			if (
+				previousMeasurement !== undefined &&
+				previousMeasurement.height !== height
+			) {
+				const wasFollowingBottom =
+					stickyBottom &&
+					scrollTop >=
+					previousMaxScrollTopRef.current - STICKY_BOTTOM_TOLERANCE;
+				const rowWasAboveViewport =
+					previousMeasurement.top + previousMeasurement.height <= scrollTop;
+
+				if (!wasFollowingBottom && rowWasAboveViewport) {
+					const baseScrollTop =
+						pendingAnchorScrollTopRef.current ?? scrollTop;
+					const nextScrollTop = Math.max(
+						0,
+						baseScrollTop + height - previousMeasurement.height,
+					);
+					pendingAnchorScrollTopRef.current = nextScrollTop;
+					onScrollTopChange(nextScrollTop);
+				}
+			}
+
+			setMeasureRevision(revision => revision + 1);
+		},
+		[onScrollTopChange, scrollTop, stickyBottom],
+	);
 
 	return (
 		<Box
@@ -164,7 +219,9 @@ export function ScrollViewport({
 				{window.items.map(item => (
 					<MeasuredRow
 						key={item.key}
-						cacheKey={item.key}
+						heightKey={item.key}
+						stableKey={stableRowKey(item.message, viewportWidth)}
+						top={item.top}
 						onMeasure={handleMeasure}
 					>
 						{renderMessage(item.message)}
@@ -176,13 +233,17 @@ export function ScrollViewport({
 }
 
 function MeasuredRow({
-	cacheKey,
+	heightKey,
+	stableKey,
+	top,
 	children,
 	onMeasure,
 }: {
-	cacheKey: string;
+	heightKey: string;
+	stableKey: string;
+	top: number;
 	children: React.ReactNode;
-	onMeasure: (cacheKey: string, height: number) => void;
+	onMeasure: (measurement: RowMeasurement) => void;
 }): React.JSX.Element {
 	const ref = useRef<DOMElement | null>(null);
 
@@ -191,7 +252,12 @@ function MeasuredRow({
 			return;
 		}
 
-		onMeasure(cacheKey, measureElement(ref.current).height);
+		onMeasure({
+			heightKey,
+			stableKey,
+			top,
+			height: measureElement(ref.current).height,
+		});
 	});
 
 	return (
@@ -217,7 +283,7 @@ function buildLayout({
 	let totalHeight = 0;
 	let hasUnmeasuredRows = false;
 	const items = messages.map(message => {
-		const key = cacheKey(message, viewportWidth);
+		const key = heightCacheKey(message, viewportWidth);
 		const cachedHeight = heightCache.get(key);
 		const height =
 			cachedHeight ?? normalizedEstimatedHeight(message, estimatedHeight);
@@ -293,12 +359,16 @@ function useViewportWidth(): number {
 	return width;
 }
 
-function cacheKey(message: HistoryMessage, viewportWidth: number): string {
+function heightCacheKey(message: HistoryMessage, viewportWidth: number): string {
 	return JSON.stringify([
 		message.id,
 		viewportWidth,
 		messageContentVersion(message),
 	]);
+}
+
+function stableRowKey(message: HistoryMessage, viewportWidth: number): string {
+	return JSON.stringify([message.id, viewportWidth]);
 }
 
 function messageContentVersion(message: HistoryMessage): number {
@@ -311,11 +381,26 @@ function pruneHeightCache(
 	viewportWidth: number,
 ): void {
 	const activeKeys = new Set(
-		messages.map(message => cacheKey(message, viewportWidth)),
+		messages.map(message => heightCacheKey(message, viewportWidth)),
 	);
 	for (const key of heightCache.keys()) {
 		if (!activeKeys.has(key)) {
 			heightCache.delete(key);
+		}
+	}
+}
+
+function pruneRowMeasurementCache(
+	rowMeasurementCache: Map<string, StableRowMeasurement>,
+	messages: HistoryMessage[],
+	viewportWidth: number,
+): void {
+	const activeKeys = new Set(
+		messages.map(message => stableRowKey(message, viewportWidth)),
+	);
+	for (const key of rowMeasurementCache.keys()) {
+		if (!activeKeys.has(key)) {
+			rowMeasurementCache.delete(key);
 		}
 	}
 }

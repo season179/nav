@@ -237,6 +237,45 @@ describe('ScrollViewport', () => {
 		view.unmount();
 	});
 
+	test('keeps sticky bottom pinned when an existing row grows after remeasurement', async () => {
+		const scrollChanges: number[] = [];
+		let messages = Array.from({length: 5}, (_value, index) =>
+			versionedMessage(`row-${index}`, 1),
+		);
+		const view = renderTest(
+			<StickyBottomProbe
+				messages={messages}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(scrollChanges).toContain(2);
+		});
+
+		messages = [
+			...messages.slice(0, 4),
+			versionedMessage('row-4', 6, 2),
+		];
+		view.rerender(
+			<StickyBottomProbe
+				messages={messages}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(scrollChanges).toContain(7);
+			expect(view.lastFrame()).toContain('row-4 line 6');
+		});
+
+		view.unmount();
+	});
+
 	test('invalidates cached heights when stdout columns change', async () => {
 		const stdout = new CaptureStream(100);
 		const stderr = new CaptureStream(100);
@@ -301,6 +340,152 @@ describe('ScrollViewport', () => {
 		expect(firstFrameLine).toContain('漢字🙂 long line 5');
 		expect(firstNonEmptyLine(view.lastFrame() ?? '')).toContain(
 			'漢字🙂 long line 5',
+		);
+
+		view.unmount();
+	});
+
+	test('preserves the visible anchor when a measured row grows above the viewport', async () => {
+		let messages = Array.from({length: 8}, (_value, index) =>
+			versionedMessage(`row-${index}`, 1),
+		);
+		const scrollChanges: number[] = [];
+		const view = renderTest(
+			<AnchoredScrollProbe
+				messages={messages}
+				initialScrollTop={3}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(firstNonEmptyLine(view.lastFrame() ?? '')).toContain(
+				'row-3 line 1',
+			);
+		});
+
+		messages = [
+			versionedMessage('row-0', 5, 2),
+			...messages.slice(1),
+		];
+		view.rerender(
+			<AnchoredScrollProbe
+				messages={messages}
+				initialScrollTop={3}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(scrollChanges).toContain(7);
+			expect(firstNonEmptyLine(view.lastFrame() ?? '')).toContain(
+				'row-3 line 1',
+			);
+		});
+
+		view.unmount();
+	});
+
+	test('accumulates visible-anchor corrections from multiple growing rows', async () => {
+		let messages = Array.from({length: 8}, (_value, index) =>
+			versionedMessage(`row-${index}`, 1),
+		);
+		const scrollChanges: number[] = [];
+		const view = renderTest(
+			<AnchoredScrollProbe
+				messages={messages}
+				initialScrollTop={3}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(firstNonEmptyLine(view.lastFrame() ?? '')).toContain(
+				'row-3 line 1',
+			);
+		});
+
+		messages = [
+			versionedMessage('row-0', 5, 2),
+			versionedMessage('row-1', 4, 2),
+			...messages.slice(2),
+		];
+		view.rerender(
+			<AnchoredScrollProbe
+				messages={messages}
+				initialScrollTop={3}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(scrollChanges).toContain(10);
+			expect(firstNonEmptyLine(view.lastFrame() ?? '')).toContain(
+				'row-3 line 1',
+			);
+		});
+
+		view.unmount();
+	});
+
+	test('does not overcorrect when a partially visible row grows with an earlier row', async () => {
+		let messages = [
+			versionedMessage('row-0', 5),
+			versionedMessage('row-1', 5),
+			...Array.from({length: 6}, (_value, index) =>
+				versionedMessage(`row-${index + 2}`, 1),
+			),
+		];
+		const scrollChanges: number[] = [];
+		const view = renderTest(
+			<AnchoredScrollProbe
+				messages={messages}
+				initialScrollTop={6}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(firstNonEmptyLine(view.lastFrame() ?? '')).toContain(
+				'row-1 line 2',
+			);
+		});
+
+		messages = [
+			versionedMessage('row-0', 6, 2),
+			versionedMessage('row-1', 8, 2),
+			...messages.slice(2),
+		];
+		view.rerender(
+			<AnchoredScrollProbe
+				messages={messages}
+				initialScrollTop={6}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(scrollChanges).toContain(7);
+			expect(firstNonEmptyLine(view.lastFrame() ?? '')).toContain(
+				'row-1 line 2',
+			);
+		});
+		await settle();
+		expect(scrollChanges).not.toContain(10);
+		expect(firstNonEmptyLine(view.lastFrame() ?? '')).toContain(
+			'row-1 line 2',
 		);
 
 		view.unmount();
@@ -438,6 +623,33 @@ function StickyBottomProbe({
 				onScrollTopChange(next);
 				setScrollTop(next);
 			}}
+			estimatedHeight={() => 1}
+			renderMessage={message => <VariableHeightCell message={message} />}
+		/>
+	);
+}
+
+function AnchoredScrollProbe({
+	messages,
+	initialScrollTop,
+	onScrollTopChange,
+}: {
+	messages: HistoryMessage[];
+	initialScrollTop: number;
+	onScrollTopChange: (scrollTop: number) => void;
+}): React.JSX.Element {
+	const [scrollTop, setScrollTop] = useState(initialScrollTop);
+	return (
+		<ScrollViewport
+			messages={messages}
+			viewportHeight={3}
+			scrollTop={scrollTop}
+			onScrollTopChange={next => {
+				onScrollTopChange(next);
+				setScrollTop(next);
+			}}
+			overscan={10}
+			stickyBottom={false}
 			estimatedHeight={() => 1}
 			renderMessage={message => <VariableHeightCell message={message} />}
 		/>
