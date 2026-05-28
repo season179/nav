@@ -658,8 +658,9 @@ async function openConfirmationOverlay(
 	view.stdin.write('run command');
 	await settle();
 	view.stdin.write('\r');
-	await settle();
-	expect(view.lastFrame()).toContain('Confirm tool request');
+	await waitForExpectation(() => {
+		expect(view.lastFrame()).toContain('Confirm tool request');
+	});
 }
 
 async function waitForExpectation(expectation: () => void): Promise<void> {
