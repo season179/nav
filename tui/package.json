@@ -19,7 +19,8 @@
     "ink": "^6.7.0",
     "ink-text-input": "^6.0.0",
     "marked": "^18.0.4",
-    "react": "^19.2.0"
+    "react": "^19.2.0",
+    "signal-exit": "^3.0.7"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
