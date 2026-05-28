@@ -313,6 +313,111 @@ describe('applyEventToHistory', () => {
 		});
 		expect(warn).not.toHaveBeenCalled();
 	});
+
+	test('appends tool output deltas to the existing tool call row', () => {
+		const warn = mock(() => {});
+		let messages: HistoryMessage[] = [
+			{id: ASSISTANT_ID, role: 'assistant', text: ''},
+		];
+
+		messages = applyEventToHistory(
+			messages,
+			event('tool.call_started', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				name: 'bash',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		const rowCount = messages.length;
+
+		messages = applyEventToHistory(
+			messages,
+			event('tool.output_delta', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				stream: 'stdout',
+				chunk: 'one\n',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('tool.output_delta', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				stream: 'stdout',
+				chunk: 'two\n',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		expect(messages).toHaveLength(rowCount);
+		expect(messages.at(-1)).toMatchObject({
+			role: 'tool_call',
+			toolCallId: 'tool-1',
+			streamingOutput: 'one\ntwo\n',
+		});
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	test('stores final tool output and clears the streaming buffer on completion', () => {
+		const warn = mock(() => {});
+		let messages: HistoryMessage[] = [
+			{id: ASSISTANT_ID, role: 'assistant', text: ''},
+		];
+
+		messages = applyEventToHistory(
+			messages,
+			event('tool.call_started', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				name: 'bash',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('tool.output_delta', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				stream: 'stdout',
+				chunk: 'live\n',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('tool.call_completed', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				name: 'bash',
+				arguments: '{"command":"printf final"}',
+				output: 'final\n',
+				outputLossy: false,
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		const toolCall = messages.at(-1);
+		expect(toolCall).toMatchObject({
+			role: 'tool_call',
+			toolCallId: 'tool-1',
+			status: 'completed',
+			output: 'final\n',
+			outputLossy: false,
+		});
+		expect(
+			(toolCall as {streamingOutput?: string} | undefined)?.streamingOutput,
+		).toBeUndefined();
+		expect(warn).not.toHaveBeenCalled();
+	});
 });
 
 describe('App confirmation overlay', () => {

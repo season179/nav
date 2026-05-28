@@ -336,18 +336,25 @@ export function applyEventToHistory(
 				argumentsDelta: event.argumentsDelta,
 			});
 		case 'tool.output_delta':
-			return messages;
+			return upsertToolCall(messages, event, {
+				status: 'running',
+				outputDelta: event.chunk,
+			});
 		case 'tool.call_completed':
 			return upsertToolCall(messages, event, {
 				status: 'completed',
 				name: event.name,
 				arguments: event.arguments,
+				output: event.output,
+				outputLossy: event.outputLossy,
 			});
 		case 'tool.call_failed': {
 			const withCall = upsertToolCall(messages, event, {
 				status: 'failed',
 				name: event.name,
 				errorMessage: event.errorMessage,
+				output: event.output,
+				outputLossy: event.outputLossy,
 			});
 			return [
 				...withCall,
@@ -473,6 +480,9 @@ type ToolCallUpdate = {
 	argumentsDelta?: string;
 	approvalId?: string;
 	errorMessage?: string;
+	outputDelta?: string;
+	output?: string;
+	outputLossy?: boolean;
 };
 
 type ToolEvent = Extract<NavEvent, {toolCallId: string}>;
@@ -497,6 +507,9 @@ function upsertToolCall(
 		status: update.status,
 		approvalId: update.approvalId,
 		errorMessage: update.errorMessage,
+		streamingOutput: update.outputDelta,
+		output: update.output,
+		outputLossy: update.outputLossy,
 	});
 
 	if (index === -1) {
@@ -516,6 +529,9 @@ function upsertToolCall(
 			status: update.status,
 			approvalId: update.approvalId ?? entry.approvalId,
 			errorMessage: update.errorMessage ?? entry.errorMessage,
+			streamingOutput: updateStreamingOutput(entry.streamingOutput, update),
+			output: update.output ?? entry.output,
+			outputLossy: update.outputLossy ?? entry.outputLossy,
 		};
 	});
 }
@@ -530,6 +546,19 @@ function updateToolArguments(current: string, update: ToolCallUpdate): string {
 	}
 	if (update.argumentsDelta !== undefined) {
 		return current + update.argumentsDelta;
+	}
+	return current;
+}
+
+function updateStreamingOutput(
+	current: string | undefined,
+	update: ToolCallUpdate,
+): string | undefined {
+	if (update.output !== undefined) {
+		return undefined;
+	}
+	if (update.outputDelta !== undefined) {
+		return `${current ?? ''}${update.outputDelta}`;
 	}
 	return current;
 }

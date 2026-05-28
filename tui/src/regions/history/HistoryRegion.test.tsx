@@ -104,6 +104,48 @@ describe('HistoryRegion tool rendering', () => {
 		expect(frame).not.toContain('tool read');
 		expect(frame).toContain('↓ 2 hidden');
 	});
+
+	test('preserves scrollback while bash output updates the current tool row', async () => {
+		const assistantId = 'assistant-live';
+		let messages: HistoryMessage[] = [
+			{id: 'system-1', role: 'system', text: 'Earlier context'},
+			{id: 'user-1', role: 'user', text: 'First prompt'},
+			{id: 'assistant-1', role: 'assistant', text: 'First answer'},
+			{id: 'user-live', role: 'user', text: 'run a command'},
+			{id: assistantId, role: 'assistant', text: ''},
+		];
+		messages = applyEventToHistory(
+			messages,
+			navEvent('tool.call_started', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				name: 'bash',
+			}),
+			assistantId,
+		);
+
+		const view = render(<HistoryRegion messages={messages} height={4} />);
+		view.stdin.write('\u001B[A');
+		await settle();
+		const before = view.lastFrame() ?? '';
+		expect(before).toContain('First answer');
+		expect(before).toContain('↓ 1 hidden');
+
+		messages = applyEventToHistory(
+			messages,
+			navEvent('tool.output_delta', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				stream: 'stdout',
+				chunk: 'line 1\nline 2\n',
+			}),
+			assistantId,
+		);
+		view.rerender(<HistoryRegion messages={messages} height={4} />);
+		await settle();
+
+		expect(view.lastFrame()).toBe(before);
+	});
 });
 
 function applyEvents(
@@ -134,6 +176,15 @@ function protocolFixture(name: string): string {
 		),
 		'utf8',
 	);
+}
+
+function navEvent(type: string, overrides: Partial<NavEvent>): NavEvent {
+	return {
+		id: `${type}-id`,
+		type,
+		sessionId: 'session-1',
+		...overrides,
+	} as NavEvent;
 }
 
 async function settle(): Promise<void> {

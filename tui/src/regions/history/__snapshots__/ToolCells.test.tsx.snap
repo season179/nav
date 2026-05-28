@@ -19,6 +19,36 @@ error path escapes workspace
 "
 `;
 
+exports[`ToolCallCell snapshots running bash call shows an empty streaming output region 1`] = `
+"tool bash running
+args command: printf hello
+output
+(waiting for output)
+"
+`;
+
+exports[`ToolCallCell snapshots running bash call caps the visible streaming output lines 1`] = `
+"tool bash running
+args command: seq 5
+output
+line 3
+line 4
+line 5
+…2 more lines
+"
+`;
+
+exports[`ToolCallCell snapshots completed bash call renders the final output in full 1`] = `
+"tool bash success
+args command: seq 4
+output
+final line 1
+final line 2
+final line 3
+final line 4
+"
+`;
+
 exports[`ToolResultCell snapshots successful result shows a bounded snippet 1`] = `
 "tool read result completed
 1: alpha
