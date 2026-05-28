@@ -7,6 +7,7 @@ pub mod bash;
 pub mod file_queue;
 pub mod ls;
 pub mod read;
+pub mod ripgrep;
 pub mod truncation;
 pub mod write;
 
