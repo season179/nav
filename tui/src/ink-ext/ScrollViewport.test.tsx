@@ -369,6 +369,192 @@ describe('ScrollViewport', () => {
 	});
 });
 
+describe('ScrollViewport follow-tail streaming', () => {
+	test('auto-scrolls to bottom when content grows while at bottom', async () => {
+		const scrollChanges: number[] = [];
+		let messages = [
+			versionedMessage('stream-1', 3),
+			versionedMessage('stream-2', 3),
+		];
+		const view = renderTest(
+			<StickyBottomProbe
+				messages={messages}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(scrollChanges.length).toBeGreaterThan(0);
+		});
+
+		// Grow the last message with more content
+		messages = [
+			versionedMessage('stream-1', 3),
+			versionedMessage('stream-2', 10, 2),
+		];
+		view.rerender(
+			<StickyBottomProbe
+				messages={messages}
+				onScrollTopChange={next => {
+					scrollChanges.push(next);
+				}}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			const maxScrollTop = scrollChanges.at(-1)!;
+			expect(maxScrollTop).toBeGreaterThan(0);
+		});
+
+		view.unmount();
+	});
+
+	test('stops auto-following when user scrolls up', async () => {
+		const scrollChanges: number[] = [];
+		let scrollTop = 0;
+		let messages = Array.from({length: 10}, (_, index) =>
+			versionedMessage(`msg-${index}`, 2),
+		);
+		const view = renderTest(
+			<ScrollViewport
+				messages={messages}
+				viewportHeight={4}
+				scrollTop={scrollTop}
+				onScrollTopChange={next => {
+					scrollTop = next;
+					scrollChanges.push(next);
+				}}
+				stickyBottom={true}
+				estimatedHeight={() => 2}
+				renderMessage={message => <VariableHeightCell message={message} />}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(scrollChanges.length).toBeGreaterThan(0);
+		});
+
+		// Simulate scrolling up by setting stickyBottom to false
+		scrollTop = 5;
+		view.rerender(
+			<ScrollViewport
+				messages={messages}
+				viewportHeight={4}
+				scrollTop={scrollTop}
+				onScrollTopChange={next => {
+					scrollTop = next;
+					scrollChanges.push(next);
+				}}
+				stickyBottom={false}
+				estimatedHeight={() => 2}
+				renderMessage={message => <VariableHeightCell message={message} />}
+			/>,
+		);
+
+		await settle();
+
+		// Add more content - should NOT auto-scroll
+		messages = [
+			...messages,
+			versionedMessage('msg-10', 2),
+		];
+		view.rerender(
+			<ScrollViewport
+				messages={messages}
+				viewportHeight={4}
+				scrollTop={scrollTop}
+				onScrollTopChange={next => {
+					scrollTop = next;
+					scrollChanges.push(next);
+				}}
+				stickyBottom={false}
+				estimatedHeight={() => 2}
+				renderMessage={message => <VariableHeightCell message={message} />}
+			/>,
+		);
+
+		await settle();
+		expect(scrollTop).toBe(5);
+
+		view.unmount();
+	});
+
+	test('re-enables follow-tail when scrollTop reaches maxScrollTop', async () => {
+		const scrollChanges: number[] = [];
+		let scrollTop = 0;
+		let stickyBottom = true;
+		let messages = Array.from({length: 5}, (_, index) =>
+			versionedMessage(`msg-${index}`, 2),
+		);
+
+		function rerenderViewport(): void {
+			view.rerender(
+				<ScrollViewport
+					messages={messages}
+					viewportHeight={3}
+					scrollTop={scrollTop}
+					onScrollTopChange={next => {
+						scrollTop = next;
+						scrollChanges.push(next);
+					}}
+					stickyBottom={stickyBottom}
+					estimatedHeight={() => 2}
+					renderMessage={message => <VariableHeightCell message={message} />}
+				/>,
+			);
+		}
+
+		const view = renderTest(
+			<ScrollViewport
+				messages={messages}
+				viewportHeight={3}
+				scrollTop={scrollTop}
+				onScrollTopChange={next => {
+					scrollTop = next;
+					scrollChanges.push(next);
+				}}
+				stickyBottom={stickyBottom}
+				estimatedHeight={() => 2}
+				renderMessage={message => <VariableHeightCell message={message} />}
+			/>,
+		);
+
+		await waitForExpectation(() => {
+			expect(scrollChanges.length).toBeGreaterThan(0);
+		});
+
+		// Scroll up
+		scrollTop = 2;
+		stickyBottom = false;
+		rerenderViewport();
+
+		await settle();
+
+		// Scroll back to bottom
+		stickyBottom = true;
+		rerenderViewport();
+
+		await waitForExpectation(() => {
+			expect(scrollChanges.some(c => c >= 4)).toBe(true);
+		});
+
+		// Add new content - should auto-scroll
+		messages = [
+			...messages,
+			versionedMessage('msg-5', 2),
+		];
+		rerenderViewport();
+
+		await waitForExpectation(() => {
+			expect(scrollChanges.some(c => c >= 6)).toBe(true);
+		});
+
+		view.unmount();
+	});
+});
+
 function FixedHeightCell({
 	message,
 }: {
