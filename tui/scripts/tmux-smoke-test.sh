@@ -5,24 +5,48 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TUI="$ROOT/tui"
 SESSION="nav-ink-smoke"
 TMP="$(mktemp -d)"
-NAV_BACKEND="$ROOT/target/debug/nav-backend"
+REAL_NAV_BACKEND="$ROOT/target/debug/nav-backend"
+E2E_BACKEND="$TUI/scripts/nav-e2e-backend.ts"
+TMUX_WIDTH=120
+TMUX_HEIGHT=53
+NAV_E2E="${NAV_E2E:-1}"
+COMMANDS="$TMP/commands.txt"
 
 cleanup() {
 	tmux kill-session -t "$SESSION" 2>/dev/null || true
-	pkill -f "$NAV_BACKEND serve-http" 2>/dev/null || true
+	pkill -f "$REAL_NAV_BACKEND serve-http" 2>/dev/null || true
+	pkill -f "$E2E_BACKEND serve-http" 2>/dev/null || true
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
 
-echo "==> Building nav-backend"
-cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p nav-backend
-if [[ -n "${NAV_MODEL_SETTINGS:-}" ]]; then
-	echo "==> Using NAV_MODEL_SETTINGS=$NAV_MODEL_SETTINGS"
-elif [[ -f "${HOME}/.nav/settings.json" ]]; then
-	echo "==> Using ~/.nav/settings.json"
+bun run "$E2E_BACKEND" print-commands >"$COMMANDS"
+FINAL_TEXT_VALUE="$(bun run "$E2E_BACKEND" print-final-text)"
+WHEEL_REVEALED_VALUE="$(bun run "$E2E_BACKEND" print-wheel-revealed)"
+
+send_wheel_up() {
+	tmux send-keys -t "$SESSION" -H 1b 5b 3c 36 34 3b 31 3b 31 30 4d
+}
+
+send_wheel_down() {
+	tmux send-keys -t "$SESSION" -H 1b 5b 3c 36 35 3b 31 3b 31 30 4d
+}
+
+if [[ "$NAV_E2E" == "1" ]]; then
+	echo "==> Using deterministic NAV_E2E backend"
+	NAV_BACKEND="$E2E_BACKEND"
 else
-	echo "FAIL: no model settings found (set NAV_MODEL_SETTINGS or create ~/.nav/settings.json)" >&2
-	exit 1
+	echo "==> Building nav-backend"
+	cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p nav-backend
+	if [[ -n "${NAV_MODEL_SETTINGS:-}" ]]; then
+		echo "==> Using NAV_MODEL_SETTINGS=$NAV_MODEL_SETTINGS"
+	elif [[ -f "${HOME}/.nav/settings.json" ]]; then
+		echo "==> Using ~/.nav/settings.json"
+	else
+		echo "FAIL: no model settings found (set NAV_MODEL_SETTINGS or create ~/.nav/settings.json)" >&2
+		exit 1
+	fi
+	NAV_BACKEND="$REAL_NAV_BACKEND"
 fi
 
 echo "==> Checking backend bootstrap"
@@ -40,9 +64,9 @@ fi
 pkill -f "$NAV_BACKEND serve-http" 2>/dev/null || true
 sleep 0.3
 
-echo "==> Launching Ink TUI in tmux (${SESSION}, 80x24)"
+echo "==> Launching Ink TUI in tmux (${SESSION}, ${TMUX_WIDTH}x${TMUX_HEIGHT})"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-tmux new-session -d -s "$SESSION" -x 80 -y 24 \
+tmux new-session -d -s "$SESSION" -x "$TMUX_WIDTH" -y "$TMUX_HEIGHT" \
 	"cd \"$TUI\" && exec env NAV_BACKEND=\"$NAV_BACKEND\" bun run start"
 sleep 1
 
@@ -114,34 +138,60 @@ fi
 tmux send-keys -t "$SESSION" Escape
 sleep 0.2
 
-echo "==> Sending a prompt (real LLM)"
-tmux set-buffer -b nav-smoke 'Say exactly: ink-tmux-ok'
+echo "==> Sending residue prompt"
+if [[ "$NAV_E2E" == "1" ]]; then
+	tmux set-buffer -b nav-smoke 'Run the deterministic tmux residue smoke.'
+else
+	REAL_PROMPT="Run each command from this list with the bash tool, one at a time, then say exactly: $FINAL_TEXT_VALUE. Commands: $(paste -sd ';' "$COMMANDS")"
+	tmux set-buffer -b nav-smoke "$REAL_PROMPT"
+fi
 tmux paste-buffer -b nav-smoke -t "$SESSION" -p
 sleep 0.2
 tmux send-keys -t "$SESSION" Enter
 
-wait_for "ink-tmux-ok" 30 || fail "user message did not appear in history"
 wait_for "Running" 30 || true
 wait_gone "Running" 180 || fail "run did not finish within timeout"
 wait_for "Enter send" 30 || fail "composer did not return to ready after run"
-wait_for "ink-tmux-ok" 10 || fail "expected assistant reply text"
+
+echo "==> Settling viewport at bottom"
+for _ in $(seq 1 8); do
+	send_wheel_down
+done
+sleep 0.5
+wait_for "$FINAL_TEXT_VALUE" 30 || fail "expected assistant reply text"
 
 tmux capture-pane -p -t "$SESSION" -S -300 >"$OUT"
-USER_LINE="$(grep -n "ink-tmux-ok" "$OUT" | head -1 | cut -d: -f1 || true)"
-if [[ -z "$USER_LINE" ]]; then
-	fail "expected user message in history"
-fi
-if [[ "$USER_LINE" -ge "$COMPOSER_LINE" ]]; then
-	fail "user message should stay above the composer"
-fi
+COMPOSER_LINE="$(grep -n "Enter send" "$OUT" | tail -1 | cut -d: -f1)"
 if grep -Fq "Connection failed" "$OUT" || grep -Fq "backend exited" "$OUT"; then
 	fail "TUI reported a connection/backend error"
 fi
 
-# Require assistant reply text after the user message.
-if ! awk -v user="$USER_LINE" -v comp="$COMPOSER_LINE" 'NR > user && NR < comp && length($0) > 0 { found=1 } END { exit !found }' "$OUT"; then
-	fail "expected assistant text between user message and composer"
+if ! awk -v comp="$COMPOSER_LINE" -v final="$FINAL_TEXT_VALUE" 'index($0, final) { if (NR < comp) found=1 } END { exit !found }' "$OUT"; then
+	fail "expected assistant text above the composer"
 fi
+
+tmux capture-pane -p -t "$SESSION" -S -500 >"$OUT"
+
+echo "==> Injecting SGR wheel-up events"
+WHEEL_BEFORE="$TMP/wheel-before.txt"
+WHEEL_AFTER="$TMP/wheel-after.txt"
+tmux capture-pane -p -t "$SESSION" >"$WHEEL_BEFORE"
+for _ in $(seq 1 8); do
+	send_wheel_up
+done
+sleep 0.5
+tmux capture-pane -p -t "$SESSION" >"$WHEEL_AFTER"
+
+echo "==> Checking residue detector"
+PREDICTED_ROWS="$(tmux display-message -p -t "$SESSION" '#{pane_height}')"
+bun run "$TUI/scripts/tmux-residue-detector.ts" \
+	--capture "$OUT" \
+	--commands "$COMMANDS" \
+	--final-text "$FINAL_TEXT_VALUE" \
+	--predicted-rows "$PREDICTED_ROWS" \
+	--wheel-before "$WHEEL_BEFORE" \
+	--wheel-after "$WHEEL_AFTER" \
+	--wheel-revealed "$WHEEL_REVEALED_VALUE"
 
 echo "==> PASS: tmux smoke test succeeded"
 echo "--- final pane (redacted) ---"
