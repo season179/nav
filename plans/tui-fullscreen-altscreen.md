@@ -375,6 +375,47 @@ kill the gate when typical frames are fine):
 adjustment (larger overscan? lazy cell components?) before FS-03
 ships.
 
+### SPIKE-B — Virtualized ScrollViewport (issue #379)
+
+**Status:** PASS, with a measurement caveat for FS-03.
+
+**What was built:** `tui/scratch/spike-b/run.tsx` (gitignored) builds a
+throwaway Ink app with 200 mixed cells: short text, real `Markdown`, real
+`ToolResultCell` stdout blocks, real `FileChangedCell` rows, wide-char
+CJK/emoji content, and five 48+ row long stdout/markdown cells. The scratch
+`<ScrollViewport>` mounts only the visible window plus 5-row overscan, uses
+a height cache keyed by `(message.id, viewport.width, contentVersion)`, starts
+unknown cells at the required coarse 4-row estimate, evicts on streaming
+`contentVersion` changes, invalidates on width changes, clamps on row resize,
+and keeps the scroll anchor stable as measurements correct. One Ink-specific
+finding: a DOM-style positive top spacer is wrong here because it renders
+blank rows inside the clipped viewport; the scratch implementation instead
+mounts the window and applies a negative top margin for the logical row crop.
+
+**Evidence:** `bun run scratch/spike-b/run.tsx` passed on 2026-05-28.
+Virtualized Ink `metrics.renderTime`: median 1.74ms / p95 2.48ms / max
+3.47ms across 90 frames, with a max of 15 mounted cells out of 200. Render-all
+control Ink `metrics.renderTime`: median 5.19ms / p95 6.13ms / max 6.38ms
+across 50 frames, with all 200 cells mounted. End-to-end wheel update to
+`onRender` completion: virtualized median 3.24ms / p95 5.35ms / max 5.87ms;
+render-all median 10.41ms / p95 11.75ms / max 12.38ms. Correctness checks
+passed: initial visible cells measured with no zero-height cache entries,
+cell #25 grew from 3 to 10 lines and remeasured under a new content version,
+40x100 -> 25x80 -> 40x100 invalidated width-sensitive heights and clamped
+row offset, wide CJK/emoji content rendered and measured, and the first scroll
+through all five long cells had max same-step anchor movement of 0.
+
+**What is NOT yet verified:** this is still a synthetic scratch runner, not
+the production FS-03 component and not a tmux/manual run. The perf result is
+machine-local. Also, Ink's built-in `metrics.renderTime` only times output
+rendering; it does not by itself expose the React/Yoga work that makes the
+render-all control miss the 8ms median gate in end-to-end wheel timing.
+
+**Fail-mode trigger:** FS-03 should carry forward an action-to-`onRender`
+latency gate in addition to recording Ink `metrics.renderTime`; otherwise a
+render-all implementation can look falsely acceptable. FS-03 should also avoid
+the positive-top-spacer shape in Ink and use a cropped mounted window instead.
+
 ### SPIKE-C — End-to-end #374 prototype with automated residue check
 
 **Goal**: prove the corruption bug disappears with the proposed
