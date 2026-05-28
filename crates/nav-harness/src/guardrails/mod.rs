@@ -5,13 +5,12 @@
 //! small: hooks can allow, deny, or request confirmation without teaching the
 //! dispatcher a central tool-by-preset policy table.
 //!
-//! A [`BeforeToolCallDecision::RequestConfirmation`] fails closed today unless
-//! the runner has an explicit scripted approval policy. APR-02a/APR-02b can
-//! consume the same decision by emitting `tool.approval_requested`, pausing the
-//! run, and resuming with an approval policy after `tool.approve`; no central
-//! policy matrix is required. After hooks run on successful tool output before
-//! it is persisted or returned to the model, so first-party hooks can redact or
-//! normalize results at one boundary.
+//! A [`BeforeToolCallDecision::RequestConfirmation`] fails closed without an
+//! approval channel, can be auto-allowed by an explicit scripted policy, and can
+//! be surfaced by the dispatcher as `tool.approval_requested` for opt-in modes.
+//! After hooks run on successful tool output before it is persisted or returned
+//! to the model, so first-party hooks can redact or normalize results at one
+//! boundary.
 
 use std::error::Error;
 use std::fmt;
@@ -208,9 +207,6 @@ impl ToolGuardrailHook for WritePathPolicyHook {
 
 pub fn default_guardrails() -> GuardrailRunner {
     let mut guardrails = GuardrailRunner::default();
-    guardrails
-        .register_hook(BashConfirmationHook)
-        .expect("built-in bash confirmation hook should register");
     guardrails
         .register_hook(WritePathPolicyHook)
         .expect("built-in write path policy hook should register");
@@ -592,32 +588,23 @@ mod tests {
     }
 
     #[test]
-    fn default_guardrails_request_confirmation_for_bash_only() {
+    fn default_guardrails_allow_bash_without_confirmation() {
         let runner = default_guardrails();
 
-        let error = runner
+        runner
             .before_tool_call(&tool_call_context_for_tool(
                 "bash",
                 RiskClass::Exec,
                 json!({"command": "cargo test"}),
             ))
-            .expect_err("bash should request confirmation by default");
-
-        assert_eq!(
-            error,
-            GuardrailError::confirmation_required(
-                "default-bash-confirmation",
-                "bash command requires confirmation",
-                r#"{"command":"cargo test"}"#,
-            )
-        );
+            .expect("bash should be allowed by default guardrails");
         runner
             .before_tool_call(&tool_call_context_for_tool(
                 "read",
                 RiskClass::Read,
                 json!({"path": "Cargo.toml"}),
             ))
-            .expect("read should not be blocked by the bash confirmation hook");
+            .expect("read should be allowed by default guardrails");
     }
 
     #[test]
