@@ -992,7 +992,7 @@ mod tests {
     use crate::sessions::{ConfirmationDecision, PendingConfirmationRegistry, ToolCall};
     use crate::tools::{
         NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolError, ToolFuture, ToolOutput,
-        ToolRegistry, read, write,
+        ToolRegistry, edit, read, write,
     };
     use crate::workspace::path::WorkspacePathPolicy;
 
@@ -1406,6 +1406,51 @@ mod tests {
         assert!(
             !workspace.root.join("notes.md").exists(),
             "write must not mutate before before_tool_call hooks allow"
+        );
+    }
+
+    #[test]
+    fn dispatch_runs_edit_guardrails_before_mutation() {
+        let workspace = TestWorkspace::new("edit_guardrail_before_mutation");
+        fs::write(workspace.root.join("notes.md"), "old\n").expect("file should be written");
+        let mut registry = ToolRegistry::default();
+        edit::register(&mut registry).expect("edit should register");
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(DenyGuardrailHook)
+            .expect("deny hook should register");
+        let context = ToolContext::with_path_policy(workspace.policy()).with_guardrails(guardrails);
+        let tool_calls = vec![ToolCall {
+            id: "call_edit_denied".to_string(),
+            tool_call_id: None,
+            name: "edit".to_string(),
+            arguments: r#"{"path":"notes.md","old_text":"old","new_text":"new"}"#.to_string(),
+        }];
+
+        let result = dispatch_test(
+            &tool_calls,
+            &registry,
+            &context,
+            ToolCancellationToken::new(),
+            None,
+        );
+
+        let ToolDispatchResult::Completed(turns) = result else {
+            panic!("guardrail denial should complete with an error tool turn");
+        };
+        let error: Value = serde_json::from_str(&turns[0].text_content())
+            .expect("tool error should be structured JSON");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("denied")
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.root.join("notes.md"))
+                .expect("original file should remain readable"),
+            "old\n",
+            "edit must not mutate before before_tool_call hooks allow"
         );
     }
 

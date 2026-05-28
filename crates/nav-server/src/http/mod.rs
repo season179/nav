@@ -12,7 +12,7 @@ use nav_harness::sessions::{
     ConfirmationDecision, PendingConfirmation, PendingConfirmationError,
     PendingConfirmationReceiver, PendingConfirmationRegistry, SessionStore, Turn,
 };
-use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, bash, read, write};
+use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, bash, edit, read, write};
 use nav_harness::workspace::path::WorkspacePathPolicy;
 use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
@@ -82,6 +82,7 @@ impl HttpServer {
         let mut tool_registry = ToolRegistry::default();
         read::register(&mut tool_registry).expect("built-in read tool should register");
         bash::register(&mut tool_registry).expect("built-in bash tool should register");
+        edit::register(&mut tool_registry).expect("built-in edit tool should register");
         write::register(&mut tool_registry).expect("built-in write tool should register");
 
         Self {
