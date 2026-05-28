@@ -80,6 +80,178 @@ describe('VirtualHistoryRegion rendering', () => {
 	});
 });
 
+describe('VirtualHistoryRegion follow-tail streaming', () => {
+	test('keeps latest streamed assistant line visible when viewport starts at bottom', async () => {
+		let messages: HistoryMessage[] = [
+			{id: 'user-1', role: 'user', text: 'tell me a story'},
+			{id: 'assistant-1', role: 'assistant', text: 'Once upon a time', contentVersion: 1},
+		];
+		const {rerender, lastFrame} = render(
+			<MouseEventProvider emitter={new EventEmitter()}>
+				<VirtualHistoryRegion messages={messages} height={4} />
+			</MouseEventProvider>,
+		);
+		await waitForExpectation(() => {
+			expect(lastFrame()).toContain('Once upon a time');
+		});
+
+		// Grow the assistant message with more streamed content
+		messages = [
+			{id: 'user-1', role: 'user', text: 'tell me a story'},
+			{id: 'assistant-1', role: 'assistant', text: 'Once upon a time\nin a land far away\nwhere dragons roamed\nand heroes were born', contentVersion: 2},
+		];
+		rerender(
+			<MouseEventProvider emitter={new EventEmitter()}>
+				<VirtualHistoryRegion messages={messages} height={4} />
+			</MouseEventProvider>,
+		);
+
+		await waitForExpectation(() => {
+			expect(lastFrame()).toContain('and heroes were born');
+		});
+	});
+
+	test('keeps latest streaming tool output visible as it grows', async () => {
+		let messages: HistoryMessage[] = [
+			{id: 'user-1', role: 'user', text: 'run the build'},
+			{
+				id: 'tool-call-1',
+				role: 'tool_call',
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				name: 'bash',
+				arguments: JSON.stringify({command: 'bun run build'}),
+				status: 'running',
+				streamingOutput: 'line 1 output',
+				contentVersion: 1,
+			},
+		];
+		const {rerender, lastFrame} = render(
+			<MouseEventProvider emitter={new EventEmitter()}>
+				<VirtualHistoryRegion messages={messages} height={6} />
+			</MouseEventProvider>,
+		);
+		await waitForExpectation(() => {
+			expect(lastFrame()).toContain('line 1 output');
+		});
+
+		// Grow the tool output with more streaming content
+		messages = [
+			{id: 'user-1', role: 'user', text: 'run the build'},
+			{
+				id: 'tool-call-1',
+				role: 'tool_call',
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				name: 'bash',
+				arguments: JSON.stringify({command: 'bun run build'}),
+				status: 'running',
+				streamingOutput: 'line 1 output\nline 2 output\nline 3 output\nline 4 output\nline 5 output\nline 6 output\nline 7 output',
+				contentVersion: 2,
+			},
+		];
+		rerender(
+			<MouseEventProvider emitter={new EventEmitter()}>
+				<VirtualHistoryRegion messages={messages} height={6} />
+			</MouseEventProvider>,
+		);
+
+		await waitForExpectation(() => {
+			expect(lastFrame()).toContain('line 7 output');
+		});
+	});
+
+	test('scrolling up disables auto-follow so new content does not yank user to bottom', async () => {
+		const emitter = new EventEmitter();
+		let messages: HistoryMessage[] = Array.from({length: 12}, (_, index): HistoryMessage => ({
+			id: `message-${index}`,
+			role: 'assistant',
+			text: `assistant line ${index}`,
+			contentVersion: 1,
+		}));
+		const {rerender, lastFrame} = render(
+			<MouseEventProvider emitter={emitter}>
+				<VirtualHistoryRegion messages={messages} height={4} />
+			</MouseEventProvider>,
+		);
+		await waitForExpectation(() => {
+			expect(lastFrame()).toContain('assistant line 11');
+		});
+
+		// Scroll up to disable auto-follow
+		for (let index = 0; index < 5; index += 1) {
+			emitter.emit('wheel', wheelEvent('up'));
+		}
+		await waitForExpectation(() => {
+			expect(lastFrame()).not.toContain('assistant line 11');
+		});
+
+		// Add new streamed content
+		messages = [
+			...messages,
+			{id: 'message-12', role: 'assistant', text: 'assistant line 12', contentVersion: 1},
+		];
+		rerender(
+			<MouseEventProvider emitter={emitter}>
+				<VirtualHistoryRegion messages={messages} height={4} />
+			</MouseEventProvider>,
+		);
+		await settle();
+
+		// Viewport should NOT have jumped back to bottom
+		expect(lastFrame()).not.toContain('assistant line 12');
+	});
+
+	test('scrolling back to bottom re-enables follow-tail for subsequent content', async () => {
+		const emitter = new EventEmitter();
+		let messages: HistoryMessage[] = Array.from({length: 12}, (_, index): HistoryMessage => ({
+			id: `message-${index}`,
+			role: 'assistant',
+			text: `assistant line ${index}`,
+			contentVersion: 1,
+		}));
+		const {rerender, lastFrame} = render(
+			<MouseEventProvider emitter={emitter}>
+				<VirtualHistoryRegion messages={messages} height={4} />
+			</MouseEventProvider>,
+		);
+		await waitForExpectation(() => {
+			expect(lastFrame()).toContain('assistant line 11');
+		});
+
+		// Scroll up
+		for (let index = 0; index < 5; index += 1) {
+			emitter.emit('wheel', wheelEvent('up'));
+		}
+		await waitForExpectation(() => {
+			expect(lastFrame()).not.toContain('assistant line 11');
+		});
+
+		// Scroll back down to bottom
+		for (let index = 0; index < 10; index += 1) {
+			emitter.emit('wheel', wheelEvent('down'));
+		}
+		await waitForExpectation(() => {
+			expect(lastFrame()).toContain('assistant line 11');
+		});
+
+		// Add new streamed content - follow-tail should be re-enabled
+		messages = [
+			...messages,
+			{id: 'message-12', role: 'assistant', text: 'assistant line 12', contentVersion: 1},
+		];
+		rerender(
+			<MouseEventProvider emitter={emitter}>
+				<VirtualHistoryRegion messages={messages} height={4} />
+			</MouseEventProvider>,
+		);
+
+		await waitForExpectation(() => {
+			expect(lastFrame()).toContain('assistant line 12');
+		});
+	});
+});
+
 describe('VirtualHistoryRegion residue checks', () => {
 	test('renders tool commands as standalone rows without residue', async () => {
 		const predictedRowCount = 53;
