@@ -3,6 +3,8 @@
 pub mod api;
 pub mod compat;
 pub mod config;
+pub mod decode;
+pub mod encode;
 pub mod model;
 pub mod openai_completions;
 pub mod provider;
@@ -11,6 +13,8 @@ pub mod resolver;
 pub use api::ApiKind;
 pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
 pub use config::{ModelRef, ModelSettings};
+pub use decode::Decoder;
+pub use encode::Encoder;
 pub use model::{ModelConfig, ModelInput};
 pub use openai_completions::{
     ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessageRole,
