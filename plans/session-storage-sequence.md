@@ -31,7 +31,7 @@ parallel with summarisation once `CMP-00` lands.
 
 ## Wave 1 — Foundation crate (1 PR)
 
-▶ **#326 TYPES-01** [S] — `nav-types` crate, prefixed IDs, row-struct skeletons.
+▶ **#326 TYPES-01** [S] — `nav-types` storage-only IDs, cursors, row skeletons.
 
 *No blockers. Pick up first. Single-lane: touches workspace `Cargo.toml`.*
 
