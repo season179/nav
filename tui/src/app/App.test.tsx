@@ -1,4 +1,7 @@
 import {describe, expect, mock, test} from 'bun:test';
+import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
 import React from 'react';
 import {render} from 'ink-testing-library';
 import {App, applyEventToHistory, type AppBackendClient} from './App.js';
@@ -512,6 +515,69 @@ describe('App confirmation overlay', () => {
 	});
 });
 
+describe('App fullscreen runtime controls', () => {
+	test('Ctrl+C during an active stream aborts the turn and closes the backend', async () => {
+		const streamStarted = deferred<void>();
+		let streamSignal: AbortSignal | undefined;
+		const client = fakeApprovalClient();
+		client.streamMessage = mock(async function* (
+			_text: string,
+			options?: {signal: AbortSignal},
+		) {
+			streamSignal = options?.signal;
+			streamStarted.resolve();
+			await waitForAbort(options?.signal);
+		});
+		const view = render(<App backendClient={client} />);
+
+		view.stdin.write('run command');
+		await settle();
+		view.stdin.write('\r');
+		await streamStarted.promise;
+
+		expect(streamSignal).toBeDefined();
+
+		view.stdin.write('\x03');
+		await waitForExpectation(() => {
+			expect(streamSignal?.aborted).toBe(true);
+			expect(client.close).toHaveBeenCalled();
+		});
+
+		view.unmount();
+	});
+
+	test('Ctrl+C closes the backend while the model picker is open', async () => {
+		const client = fakeApprovalClient();
+		const {path: settingsPath, cleanup} = writeModelSettings();
+		const previousSettingsPath = process.env.NAV_MODEL_SETTINGS;
+		process.env.NAV_MODEL_SETTINGS = settingsPath;
+
+		try {
+			const view = render(<App backendClient={client} />);
+			view.stdin.write('/model');
+			await settle();
+			view.stdin.write('\r');
+			await waitForExpectation(() => {
+				expect(view.lastFrame()).toContain('Select model');
+			});
+
+			view.stdin.write('\x03');
+			await waitForExpectation(() => {
+				expect(client.close).toHaveBeenCalled();
+			});
+
+			view.unmount();
+		} finally {
+			if (previousSettingsPath === undefined) {
+				delete process.env.NAV_MODEL_SETTINGS;
+			} else {
+				process.env.NAV_MODEL_SETTINGS = previousSettingsPath;
+			}
+			cleanup();
+		}
+	});
+});
+
 function event(type: string, overrides: Partial<NavEvent> = {}): NavEvent {
 	if (type === 'future.event') {
 		return {
@@ -618,4 +684,44 @@ async function waitForExpectation(expectation: () => void): Promise<void> {
 
 async function settle(): Promise<void> {
 	await new Promise(resolve => setTimeout(resolve, 10));
+}
+
+async function waitForAbort(signal?: AbortSignal): Promise<void> {
+	if (!signal || signal.aborted) {
+		return;
+	}
+	await new Promise<void>(resolve => {
+		signal.addEventListener('abort', () => resolve(), {once: true});
+	});
+}
+
+function deferred<T>(): {
+	promise: Promise<T>;
+	resolve: (value: T | PromiseLike<T>) => void;
+} {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>(nextResolve => {
+		resolve = nextResolve;
+	});
+	return {promise, resolve};
+}
+
+function writeModelSettings(): {path: string; cleanup: () => void} {
+	const directory = mkdtempSync(path.join(tmpdir(), 'nav-app-test-'));
+	const filePath = path.join(directory, 'settings.json');
+	writeFileSync(
+		filePath,
+		JSON.stringify({
+			defaultModel: {provider: 'test', model: 'model-a'},
+			providers: {
+				test: {models: [{id: 'model-a'}]},
+			},
+		}),
+	);
+	return {
+		path: filePath,
+		cleanup() {
+			rmSync(directory, {recursive: true, force: true});
+		},
+	};
 }

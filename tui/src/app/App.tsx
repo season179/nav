@@ -5,7 +5,7 @@ import {
 	COMPOSER_HEIGHT,
 	ComposerRegion,
 } from '../regions/composer/ComposerRegion.js';
-import {HistoryRegion} from '../regions/history/HistoryRegion.js';
+import {VirtualHistoryRegion} from '../regions/history/VirtualHistoryRegion.js';
 import {ModelPickerOverlay} from '../overlays/model/ModelPickerOverlay.js';
 import {
 	ConfirmationOverlay,
@@ -17,6 +17,7 @@ import {
 	type ApprovalResult,
 	type NavEvent,
 	type SessionInfo,
+	type StreamMessageOptions,
 } from '../backend/client.js';
 import {parseSlashCommand} from '../commands/slash.js';
 import {
@@ -39,7 +40,10 @@ type Props = {
 };
 
 export type AppBackendClient = {
-	streamMessage(text: string): AsyncGenerator<NavEvent, void, void>;
+	streamMessage(
+		text: string,
+		options: StreamMessageOptions,
+	): AsyncGenerator<NavEvent, void, void>;
 	approveTool(approvalId: string): Promise<ApprovalResult>;
 	rejectTool(approvalId: string, reason?: string): Promise<ApprovalResult>;
 	reconnect(): Promise<SessionInfo>;
@@ -55,6 +59,7 @@ export function App({backendPath = '', backendClient}: Props) {
 		backendClient ?? new NavBackendClient(backendPath),
 	);
 	const approvalInFlightRef = useRef(false);
+	const activeTurnAbortRef = useRef<AbortController | null>(null);
 	const [messages, setMessages] = useState<HistoryMessage[]>([]);
 	const [input, setInput] = useState('');
 	const [busy, setBusy] = useState(false);
@@ -74,18 +79,19 @@ export function App({backendPath = '', backendClient}: Props) {
 
 	useInput(
 		(character, key) => {
-			if (modelPickerOpen) {
+			if (key.ctrl && character === 'c') {
+				activeTurnAbortRef.current?.abort();
+				void clientRef.current.close();
+				exit();
 				return;
 			}
-			if (key.ctrl && character === 'c') {
-				exit();
+			if (modelPickerOpen) {
 				return;
 			}
 			if (!busy && key.escape) {
 				setInput('');
 			}
 		},
-		{isActive: !modelPickerOpen},
 	);
 
 	const historyHeight = Math.max(1, rows - COMPOSER_HEIGHT);
@@ -162,7 +168,7 @@ export function App({backendPath = '', backendClient}: Props) {
 			);
 		}
 
-		return <HistoryRegion messages={messages} height={historyHeight} />;
+		return <VirtualHistoryRegion messages={messages} height={historyHeight} />;
 	}
 
 	async function runSlashCommand(
@@ -253,6 +259,8 @@ export function App({backendPath = '', backendClient}: Props) {
 
 	async function sendText(text: string) {
 		const assistantId = crypto.randomUUID();
+		const controller = new AbortController();
+		activeTurnAbortRef.current = controller;
 		setBusy(true);
 		setHint('Connecting…');
 		setMessages(previous => [
@@ -262,10 +270,15 @@ export function App({backendPath = '', backendClient}: Props) {
 		]);
 
 		try {
-			for await (const event of clientRef.current.streamMessage(text)) {
+			for await (const event of clientRef.current.streamMessage(text, {
+				signal: controller.signal,
+			})) {
 				applyEvent(event, assistantId);
 			}
 		} catch (caught) {
+			if (controller.signal.aborted) {
+				return;
+			}
 			const message =
 				caught instanceof Error ? caught.message : String(caught);
 			setMessages(previous =>
@@ -281,8 +294,13 @@ export function App({backendPath = '', backendClient}: Props) {
 			);
 			setHint('Error — Enter to retry');
 		} finally {
-			setBusy(false);
-			setHint(IDLE_HINT);
+			if (activeTurnAbortRef.current === controller) {
+				activeTurnAbortRef.current = null;
+			}
+			if (!controller.signal.aborted) {
+				setBusy(false);
+				setHint(IDLE_HINT);
+			}
 		}
 	}
 
