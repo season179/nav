@@ -9,7 +9,7 @@ use nav_harness::models::{
 use nav_harness::sessions::{PendingConfirmation, PendingConfirmationRegistry, SessionStore, Turn};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};
 use nav_protocol::{BackendEvent, EventEnvelope, ProviderEventMetadata};
-use nav_types::{ApprovalId, EventId, MessageId, RunId, SessionId, ToolCallId};
+use nav_types::{ApprovalId, EventId, FileChangeId, MessageId, RunId, SessionId, ToolCallId};
 
 use super::event_mapping::harness_events_to_backend_events;
 use super::event_store::ProtocolEventStore;
@@ -381,6 +381,10 @@ impl nav_harness::events::HarnessEventIdSource for SharedProtocolIdSource {
 
     fn next_approval_id(&mut self) -> ApprovalId {
         self.ids.lock().unwrap().next_approval_id()
+    }
+
+    fn next_file_change_id(&mut self) -> FileChangeId {
+        self.ids.lock().unwrap().next_file_change_id()
     }
 }
 

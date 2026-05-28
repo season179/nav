@@ -4,9 +4,11 @@
 //! Risky execution policy stays in guardrail hooks, outside individual tools.
 
 pub mod bash;
+pub mod file_queue;
 pub mod ls;
 pub mod read;
 pub mod truncation;
+pub mod write;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -89,14 +91,26 @@ impl ToolContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
     pub content: String,
+    pub file_changes: Vec<ToolFileChange>,
 }
 
 impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            file_changes: Vec::new(),
         }
     }
+
+    pub fn with_file_changed(mut self, path: impl Into<String>) -> Self {
+        self.file_changes.push(ToolFileChange { path: path.into() });
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFileChange {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

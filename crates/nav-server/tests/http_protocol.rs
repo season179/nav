@@ -486,7 +486,7 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
     assert_eq!(requests.len(), 2);
     assert_eq!(
         tool_names_from_request(&requests[0].body),
-        vec!["bash", "read"]
+        vec!["bash", "read", "write"]
     );
     assert_eq!(
         requests[1].body["messages"],
@@ -530,6 +530,90 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
             "message.completed",
             "run.completed",
         ]
+    );
+}
+
+#[test]
+fn session_send_message_executes_write_tool_and_publishes_file_changed() {
+    let workspace = TestWorkspace::new("write_tool_loop");
+    let tool_arguments = json!({
+        "path": "notes/agent.md",
+        "content": "hello from write\n",
+    })
+    .to_string();
+    let provider = SequencedProviderServer::start(vec![
+        write_tool_call_chunks("call_write_1", &tool_arguments),
+        successful_provider_chunks("write complete"),
+    ]);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session_with_cwd(&mut server, workspace.root());
+
+    let run_id = send_message_text(&mut server, &session_id, "write the note");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("notes/agent.md"))
+            .expect("write tool should create the requested file"),
+        "hello from write\n"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"],
+        json!([
+            { "role": "user", "content": "write the note" },
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_write_1",
+                    "type": "function",
+                    "function": {
+                        "name": "write",
+                        "arguments": tool_arguments
+                    }
+                }]
+            },
+            {
+                "role": "tool",
+                "content": "wrote notes/agent.md",
+                "tool_call_id": "call_write_1"
+            }
+        ])
+    );
+
+    let events = parse_sse(
+        server
+            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
+            .body(),
+    );
+    assert_eq!(
+        event_names(&events),
+        vec![
+            "session.created",
+            "run.started",
+            "tool.call_started",
+            "tool.call_delta",
+            "tool.call_completed",
+            "message.completed",
+            "file.changed",
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+        ]
+    );
+    let file_changed = events
+        .iter()
+        .find(|event| event.name == "file.changed")
+        .expect("write should publish file.changed");
+    assert_eq!(file_changed.data["path"], "notes/agent.md");
+    assert_uuid_v7(
+        file_changed.data["file_change_id"]
+            .as_str()
+            .expect("file.changed should include file_change_id"),
     );
 }
 
@@ -1440,6 +1524,35 @@ fn bash_tool_call_chunks(provider_call_id: &str, command: &str) -> Vec<String> {
                     "type": "function",
                     "function": {
                         "name": "bash",
+                        "arguments": tool_arguments
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    vec![
+        provider_sse_chunk(&chunk.to_string()),
+        provider_sse_chunk(
+            r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+}
+
+fn write_tool_call_chunks(provider_call_id: &str, tool_arguments: &str) -> Vec<String> {
+    let chunk = json!({
+        "id": "provider-run-1",
+        "model": "vendor/model-large",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": provider_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "write",
                         "arguments": tool_arguments
                     }
                 }]

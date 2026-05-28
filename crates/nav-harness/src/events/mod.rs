@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use nav_types::{ApprovalId, EventId, MessageId, RunId, ToolCallId};
+use nav_types::{ApprovalId, EventId, FileChangeId, MessageId, RunId, ToolCallId};
 
 use crate::models::{
     ChatCompletionStreamChoice, ChatCompletionStreamChunk, ChatCompletionStreamEvent,
@@ -77,6 +77,10 @@ pub enum HarnessEvent {
         arguments_summary: String,
         risk_class: Option<String>,
     },
+    FileChanged {
+        file_change_id: FileChangeId,
+        path: String,
+    },
     ProviderError {
         run_id: RunId,
         status: Option<u16>,
@@ -102,6 +106,7 @@ impl HarnessEvent {
             Self::ToolCallCompleted { .. } => "tool.call_completed",
             Self::ToolCallFailed { .. } => "tool.call_failed",
             Self::ToolApprovalRequested { .. } => "tool.approval_requested",
+            Self::FileChanged { .. } => "file.changed",
             Self::ProviderError { .. } => "provider.error",
             Self::RunCompleted { .. } => "run.completed",
         }
@@ -112,6 +117,11 @@ pub trait HarnessEventIdSource {
     fn next_event_id(&mut self) -> EventId;
     fn next_tool_call_id(&mut self) -> ToolCallId;
     fn next_approval_id(&mut self) -> ApprovalId;
+
+    fn next_file_change_id(&mut self) -> FileChangeId {
+        FileChangeId::try_new(self.next_event_id().to_string())
+            .expect("generated file change id should be UUIDv7")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

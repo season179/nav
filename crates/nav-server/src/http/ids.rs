@@ -1,7 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nav_harness::events::HarnessEventIdSource;
-use nav_types::{ApprovalId, EventId, MessageId, RequestId, RunId, SessionId, ToolCallId};
+use nav_types::{
+    ApprovalId, EventId, FileChangeId, MessageId, RequestId, RunId, SessionId, ToolCallId,
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct ProtocolIdSource {
@@ -55,6 +57,11 @@ impl ProtocolIdSource {
             .expect("generated approval id should be UUIDv7")
     }
 
+    pub(super) fn next_file_change_id(&mut self) -> FileChangeId {
+        FileChangeId::try_new(self.next_uuid_v7_string())
+            .expect("generated file change id should be UUIDv7")
+    }
+
     fn next_uuid_v7_string(&mut self) -> String {
         let timestamp = self.unix_ms & 0xffff_ffff_ffff;
         let sequence = self.sequence;
@@ -82,5 +89,9 @@ impl HarnessEventIdSource for ProtocolIdSource {
 
     fn next_approval_id(&mut self) -> ApprovalId {
         self.next_approval_id()
+    }
+
+    fn next_file_change_id(&mut self) -> FileChangeId {
+        self.next_file_change_id()
     }
 }

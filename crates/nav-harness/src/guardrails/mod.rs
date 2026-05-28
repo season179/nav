@@ -180,11 +180,40 @@ impl ToolGuardrailHook for BashConfirmationHook {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WritePathPolicyHook;
+
+impl ToolGuardrailHook for WritePathPolicyHook {
+    fn name(&self) -> &str {
+        "default-write-path-policy"
+    }
+
+    fn before_tool_call(
+        &self,
+        context: &ToolCallContext,
+    ) -> Result<BeforeToolCallDecision, GuardrailError> {
+        if context.tool_name != "write" {
+            return Ok(BeforeToolCallDecision::Allow);
+        }
+
+        if let Some(error) = context.path_resolution_errors.first() {
+            return Ok(BeforeToolCallDecision::Deny {
+                reason: error.error.clone(),
+            });
+        }
+
+        Ok(BeforeToolCallDecision::Allow)
+    }
+}
+
 pub fn default_guardrails() -> GuardrailRunner {
     let mut guardrails = GuardrailRunner::default();
     guardrails
         .register_hook(BashConfirmationHook)
         .expect("built-in bash confirmation hook should register");
+    guardrails
+        .register_hook(WritePathPolicyHook)
+        .expect("built-in write path policy hook should register");
     guardrails
 }
 
@@ -589,6 +618,43 @@ mod tests {
                 json!({"path": "Cargo.toml"}),
             ))
             .expect("read should not be blocked by the bash confirmation hook");
+    }
+
+    #[test]
+    fn default_guardrails_deny_write_when_path_policy_rejects_path() {
+        let workspace = TestWorkspace::new("default_write_path_policy");
+        let tool_context = ToolContext::with_path_policy(workspace.policy());
+        let context = ToolCallContext::new(ToolCallContextParams {
+            tool_name: "write",
+            raw_arguments: r#"{"path":"../secret.txt","content":"nope"}"#.to_string(),
+            parsed_arguments: json!({
+                "path": "../secret.txt",
+                "content": "nope",
+            }),
+            preset: ToolPreset::Coding,
+            risk_class: RiskClass::Mutate,
+            tool_context: &tool_context,
+            call_id: "call_write_1",
+            nav_tool_call_id: None,
+            run_id: RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001")
+                .expect("run id should parse"),
+        });
+
+        let error = default_guardrails()
+            .before_tool_call(&context)
+            .expect_err("write outside workspace should be denied by a default hook");
+
+        assert!(
+            matches!(
+                error,
+                GuardrailError::Denied {
+                    ref hook_name,
+                    ref reason
+                } if hook_name == "default-write-path-policy"
+                    && reason.contains("escapes workspace")
+            ),
+            "unexpected guardrail error: {error:?}"
+        );
     }
 
     #[test]
