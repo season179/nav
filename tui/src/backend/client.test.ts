@@ -289,9 +289,57 @@ function createClientWithFakeRpc(responses: FakeResponse[]) {
 	return {client, getRequests: () => requests};
 }
 
-// --- tool.approve / tool.reject client methods ---
+// --- NavBackendClient public methods ---
 
-describe('NavBackendClient tool approval methods', () => {
+describe('NavBackendClient public methods', () => {
+	test('streamMessage passes the abort signal to the events fetch', async () => {
+		const client = new NavBackendClient();
+		const controller = new AbortController();
+		let eventFetchSignal: AbortSignal | undefined;
+		(client as any).endpoint = 'http://fake';
+		(client as any).session = {
+			sessionId: 'test-session',
+			endpoint: 'http://fake',
+			cwd: '/tmp',
+		};
+		(client as any).fetchImpl = async (
+			url: string,
+			options: RequestInit = {},
+		) => {
+			if (url.endsWith('/rpc')) {
+				return jsonResponse({result: {runId: 'run-1'}});
+			}
+
+			eventFetchSignal = options.signal ?? undefined;
+			return {
+				ok: true,
+				status: 200,
+				text: async () => '',
+				body: byteStream(
+					sse('run.completed', {
+						event_id: 'evt-run-completed',
+						session_id: 'test-session',
+						type: 'run.completed',
+						run_id: 'run-1',
+					}),
+				),
+			};
+		};
+
+		const events: NavEvent[] = [];
+		for await (const event of client.streamMessage('hello', {
+			signal: controller.signal,
+		})) {
+			events.push(event);
+		}
+
+		expect(eventFetchSignal).toBe(controller.signal);
+		expect(events.at(-1)).toMatchObject({
+			type: 'run.completed',
+			runId: 'run-1',
+		});
+	});
+
 	test('approveTool sends tool.approve RPC and returns parsed result', async () => {
 		const {client, getRequests} = createClientWithFakeRpc([
 			{result: {approval_id: 'appr-1', outcome: 'approved'}},
@@ -430,3 +478,16 @@ describe('NavBackendClient tool approval methods', () => {
 		}
 	});
 });
+
+function jsonResponse(response: FakeResponse): Response {
+	return {
+		ok: true,
+		status: 200,
+		text: async () =>
+			JSON.stringify({
+				jsonrpc: '2.0',
+				id: 'response-id',
+				...(response.error ? {error: response.error} : {result: response.result}),
+			}),
+	} as Response;
+}

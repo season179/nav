@@ -188,6 +188,10 @@ export type ApprovalResult = {
 	outcome: 'approved' | 'rejected';
 };
 
+export type StreamMessageOptions = {
+	signal: AbortSignal;
+};
+
 export class RpcError extends Error {
 	constructor(
 		public readonly code: number,
@@ -262,7 +266,10 @@ export class NavBackendClient {
 		return this.session;
 	}
 
-	async *streamMessage(text: string): AsyncGenerator<NavEvent, void, void> {
+	async *streamMessage(
+		text: string,
+		options: StreamMessageOptions,
+	): AsyncGenerator<NavEvent, void, void> {
 		await this.connect();
 		const trimmed = text.trim();
 		if (!trimmed) {
@@ -278,7 +285,10 @@ export class NavBackendClient {
 			throw new Error('session.sendMessage returned an empty run id');
 		}
 
-		yield* this.streamEvents(event => isRunTerminal(event, send.runId!));
+		yield* this.streamEvents(
+			event => isRunTerminal(event, send.runId!),
+			options.signal,
+		);
 	}
 
 	async approveTool(approvalId: string): Promise<ApprovalResult> {
@@ -412,12 +422,13 @@ export class NavBackendClient {
 
 	private async *streamEvents(
 		stop: (event: NavEvent) => boolean,
+		signal?: AbortSignal,
 	): AsyncGenerator<NavEvent, void, void> {
 		for (;;) {
 			const previous = this.lastEventId;
 			let sawTerminal = false;
 
-			for await (const event of this.iterSessionEvents()) {
+			for await (const event of this.iterSessionEvents(signal)) {
 				yield event;
 				if (stop(event)) {
 					sawTerminal = true;
@@ -435,7 +446,9 @@ export class NavBackendClient {
 		}
 	}
 
-	private async *iterSessionEvents(): AsyncGenerator<NavEvent, void, void> {
+	private async *iterSessionEvents(
+		signal?: AbortSignal,
+	): AsyncGenerator<NavEvent, void, void> {
 		if (!this.session) {
 			throw new Error('session is not connected');
 		}
@@ -447,7 +460,7 @@ export class NavBackendClient {
 
 		const response = await this.fetchImpl(
 			`${this.endpoint}/sessions/${this.session.sessionId}/events`,
-			{headers},
+			{headers, signal},
 		);
 
 		if (!response.ok) {

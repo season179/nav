@@ -1,5 +1,5 @@
 import React, {useState} from 'react';
-import {Box, Text, useInput} from 'ink';
+import {Box, Text} from 'ink';
 import {FileChangedCell} from './FileChangedCell.js';
 import {ToolCallCell} from './ToolCallCell.js';
 import {ToolResultCell} from './ToolResultCell.js';
@@ -13,8 +13,6 @@ type Props = {
 	messages: HistoryMessage[];
 	height: number;
 };
-
-const SCROLL_STEP = 5;
 
 export function VirtualHistoryRegion({
 	messages,
@@ -30,29 +28,6 @@ export function VirtualHistoryRegion({
 				setStickyBottom(false);
 			}
 		},
-	});
-
-	useInput((_character, key) => {
-		const up = key.pageUp || key.upArrow;
-		const down = key.pageDown || key.downArrow;
-		if (!up && !down) {
-			return;
-		}
-
-		const step = key.pageUp || key.pageDown ? SCROLL_STEP : 1;
-		if (up) {
-			setStickyBottom(false);
-			setScrollTop(current => Math.max(0, current - step));
-			return;
-		}
-
-		setScrollTop(current => {
-			const next = current + step;
-			if (next >= knownMaxScrollTop - 1) {
-				setStickyBottom(true);
-			}
-			return next;
-		});
 	});
 
 	const indicatorVisible = scrollTop < knownMaxScrollTop;
@@ -99,7 +74,7 @@ export function VirtualHistoryRegion({
 					{indicatorVisible ? (
 						<Box justifyContent="center">
 							<Text color={theme.inactive}>
-								↓ {hiddenRows} hidden · PgDn reveal · PgUp older
+								↓ {hiddenRows} hidden · scroll to reveal
 							</Text>
 						</Box>
 					) : null}
