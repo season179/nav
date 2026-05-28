@@ -430,8 +430,9 @@ describe('App confirmation overlay', () => {
 		await openConfirmationOverlay(view);
 
 		view.stdin.write('a');
-		await settle();
-		expect(client.approveTool).toHaveBeenCalledWith('approval-1');
+		await waitForExpectation(() => {
+			expect(client.approveTool).toHaveBeenCalledWith('approval-1');
+		});
 
 		view.unmount();
 	});
@@ -443,8 +444,9 @@ describe('App confirmation overlay', () => {
 		await openConfirmationOverlay(view);
 
 		view.stdin.write('r');
-		await settle();
-		expect(client.rejectTool).toHaveBeenCalledWith('approval-1');
+		await waitForExpectation(() => {
+			expect(client.rejectTool).toHaveBeenCalledWith('approval-1');
+		});
 
 		view.unmount();
 	});
@@ -456,8 +458,9 @@ describe('App confirmation overlay', () => {
 		await openConfirmationOverlay(view);
 
 		view.stdin.write('\x1B');
-		await settle();
-		expect(client.rejectTool).toHaveBeenCalledWith('approval-1');
+		await waitForExpectation(() => {
+			expect(client.rejectTool).toHaveBeenCalledWith('approval-1');
+		});
 
 		view.unmount();
 	});
@@ -591,6 +594,26 @@ async function openConfirmationOverlay(
 	view.stdin.write('\r');
 	await settle();
 	expect(view.lastFrame()).toContain('Confirm tool request');
+}
+
+async function waitForExpectation(expectation: () => void): Promise<void> {
+	const deadline = Date.now() + 250;
+	let lastError: unknown;
+
+	while (Date.now() < deadline) {
+		try {
+			expectation();
+			return;
+		} catch (error) {
+			lastError = error;
+			await settle();
+		}
+	}
+
+	if (lastError) {
+		throw lastError;
+	}
+	expectation();
 }
 
 async function settle(): Promise<void> {
