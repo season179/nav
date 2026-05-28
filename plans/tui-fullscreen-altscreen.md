@@ -406,6 +406,46 @@ fake tool calls with realistic output. Run in tmux.
 **Fail mode**: if any residue assertion fails, the architecture
 doesn't fix #374. Redesign before filing issues.
 
+### SPIKE-C — End-to-end #374 residue check (issue #380)
+
+**Status:** PASS
+
+**What was built:** Disposable Ink harness in `tui/scratch/spike-c/`
+(gitignored). It composes a scratch `<AlternateScreen mouseTracking>`, raw
+stdin proxy with xterm SGR wheel parsing, row-virtualized `<ScrollViewport>`,
+and nav-shaped synthetic backend stream. The rendered history uses the real
+`ToolCallCell`, `ToolResultCell`, and `Markdown` components. The synthetic run
+streams six bash tool calls through running output, completed output, tool
+results, and a final assistant message, then holds at the composer prompt
+`Enter send`.
+
+**Evidence (residue assertions 1-5):** `bun run scratch/spike-c/run.ts` was run
+from `tui/` in a tmux session sized 120x53. It passed:
+1. `6/6` expected `args command: ...` lines appeared exactly.
+2. No captured row contained two `command:` substrings.
+3. No captured row contained both `output` and `command:`.
+4. Final assistant text appeared verbatim.
+5. Captured row count matched the height-cache prediction: `53` rows captured,
+`53` rows predicted.
+
+**Trackpad scroll smoke:** PASS. The runner injected six raw SGR wheel-up
+sequences through `tmux send-keys -H`; the visible viewport moved from
+`Earlier context 09: user asked about #374 residue.` to
+`Earlier context 01: user asked about #374 residue.`, proving the mouse parser
+and viewport state changed the captured pane rather than only rendering the
+bottom frame.
+
+**What is NOT yet verified:** This does not verify the future production
+`tui/src/ink-ext/` implementation, production backend SSE, real trackpad
+hardware events, or long-history performance. It proves the proposed
+alt-screen + stdin proxy + virtualized viewport shape can render the real nav
+cells without #374-style residue under automated tmux capture.
+
+**Fail-mode trigger:** Any future failure of
+`bun run scratch/spike-c/run.ts` on the same harness should block FS-04/FS-05
+until the architecture or detector is reworked; the failure means the
+fullscreen plan has not yet disproved #374.
+
 ---
 
 ## Stages
