@@ -5,14 +5,27 @@ import type {ToolCallHistoryMessage, ToolCallStatus} from './types.js';
 
 type Props = {
 	message: ToolCallHistoryMessage;
+	maxOutputLines?: number;
+};
+
+type RenderedToolOutput = {
+	text: string;
+	hiddenLines: number;
+	emptyLabel: string;
+	reserveHiddenLine?: boolean;
 };
 
 const MAX_ARGUMENT_SUMMARY = 120;
+const DEFAULT_MAX_OUTPUT_LINES = 20;
 
-export function ToolCallCell({message}: Props): React.JSX.Element {
+export function ToolCallCell({
+	message,
+	maxOutputLines = DEFAULT_MAX_OUTPUT_LINES,
+}: Props): React.JSX.Element {
 	const name = message.name || 'tool';
 	const status = toolCallStatus(message.status);
 	const argumentSummary = summarizeToolArguments(message.arguments);
+	const output = toolOutput(message, maxOutputLines);
 
 	return (
 		<Box flexDirection="column" marginBottom={1}>
@@ -29,6 +42,21 @@ export function ToolCallCell({message}: Props): React.JSX.Element {
 				<Text color={theme.error} wrap="wrap">
 					error {message.errorMessage}
 				</Text>
+			) : null}
+			{output ? (
+				<>
+					<Text color={theme.inactive}>output</Text>
+					<Text color={output.text ? theme.text : theme.inactive}>
+						{output.text || output.emptyLabel}
+					</Text>
+					{output.hiddenLines > 0 || output.reserveHiddenLine ? (
+						<Text color={theme.inactive}>
+							{output.hiddenLines > 0
+								? `…${output.hiddenLines} more lines`
+								: ' '}
+						</Text>
+					) : null}
+				</>
 			) : null}
 		</Box>
 	);
@@ -98,4 +126,76 @@ function truncate(value: string, maxCharacters: number): string {
 		return value;
 	}
 	return `${value.slice(0, maxCharacters - 3)}...`;
+}
+
+function streamingOutputWindow(
+	output: string,
+	maxOutputLines: number,
+	options: {padVisibleLines?: boolean} = {},
+): {text: string; hiddenLines: number} {
+	const lines = splitOutputLines(output);
+	const visibleLineCount = Math.max(1, maxOutputLines);
+	const hiddenLines = Math.max(0, lines.length - visibleLineCount);
+	const visibleLines = hiddenLines > 0 ? lines.slice(hiddenLines) : lines;
+	if (options.padVisibleLines) {
+		while (visibleLines.length < visibleLineCount) {
+			visibleLines.push('');
+		}
+	}
+
+	return {
+		text: visibleLines.join('\n'),
+		hiddenLines,
+	};
+}
+
+function toolOutput(
+	message: ToolCallHistoryMessage,
+	maxOutputLines: number,
+): RenderedToolOutput | null {
+	if (message.output !== undefined) {
+		return {
+			text: trimFinalOutput(message.output),
+			hiddenLines: 0,
+			emptyLabel: '(empty output)',
+		};
+	}
+
+	if (message.streamingOutput !== undefined) {
+		return {
+			...streamingOutputWindow(message.streamingOutput, maxOutputLines, {
+				padVisibleLines: true,
+			}),
+			emptyLabel: '(waiting for output)',
+			reserveHiddenLine: true,
+		};
+	}
+
+	if (message.status === 'running' && message.name === 'bash') {
+		return {
+			...streamingOutputWindow('', maxOutputLines),
+			emptyLabel: '(waiting for output)',
+		};
+	}
+
+	return null;
+}
+
+function trimFinalOutput(output: string): string {
+	if (output.endsWith('\n')) {
+		return output.slice(0, -1);
+	}
+	return output;
+}
+
+function splitOutputLines(output: string): string[] {
+	if (!output) {
+		return [];
+	}
+
+	const lines = output.split('\n');
+	if (lines.at(-1) === '') {
+		lines.pop();
+	}
+	return lines;
 }

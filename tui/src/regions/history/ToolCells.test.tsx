@@ -45,6 +45,88 @@ describe('ToolCallCell snapshots', () => {
 			).lastFrame(),
 		).toMatchSnapshot();
 	});
+
+	test('running bash call shows an empty streaming output region', () => {
+		const frame = render(
+			<ToolCallCell
+				message={toolCall({
+					name: 'bash',
+					status: 'running',
+					arguments: '{"command":"printf hello"}',
+				})}
+			/>,
+		).lastFrame();
+
+		expect(frame).toContain('output');
+		expect(frame).toMatchSnapshot();
+	});
+
+	test('running bash call caps the visible streaming output lines', () => {
+		const frame = render(
+			<ToolCallCell
+				message={toolCall({
+					name: 'bash',
+					status: 'running',
+					arguments: '{"command":"seq 5"}',
+					streamingOutput: 'line 1\nline 2\nline 3\nline 4\nline 5\n',
+				})}
+				maxOutputLines={3}
+			/>,
+		).lastFrame();
+
+		expect(frame).not.toContain('line 1');
+		expect(frame).toContain('line 3');
+		expect(frame).toContain('…2 more lines');
+		expect(frame).toMatchSnapshot();
+	});
+
+	test('running bash call keeps the streaming output window height stable', () => {
+		const oneLine = render(
+			<ToolCallCell
+				message={toolCall({
+					name: 'bash',
+					status: 'running',
+					arguments: '{"command":"seq 3"}',
+					streamingOutput: 'line 1\n',
+				})}
+				maxOutputLines={3}
+			/>,
+		).lastFrame();
+		const cappedLines = render(
+			<ToolCallCell
+				message={toolCall({
+					name: 'bash',
+					status: 'running',
+					arguments: '{"command":"seq 3"}',
+					streamingOutput: 'line 1\nline 2\nline 3\nline 4\n',
+				})}
+				maxOutputLines={3}
+			/>,
+		).lastFrame();
+
+		expect(frameLineCount(oneLine)).toBe(frameLineCount(cappedLines));
+	});
+
+	test('completed bash call renders the final output in full', () => {
+		const frame = render(
+			<ToolCallCell
+				message={toolCall({
+					name: 'bash',
+					status: 'completed',
+					arguments: '{"command":"seq 4"}',
+					streamingOutput: 'live line\n',
+					output: 'final line 1\nfinal line 2\nfinal line 3\nfinal line 4\n',
+				})}
+				maxOutputLines={2}
+			/>,
+		).lastFrame();
+
+		expect(frame).toContain('final line 1');
+		expect(frame).toContain('final line 4');
+		expect(frame).not.toContain('live line');
+		expect(frame).not.toContain('more lines');
+		expect(frame).toMatchSnapshot();
+	});
 });
 
 describe('ToolResultCell snapshots', () => {
@@ -156,4 +238,8 @@ function toolResult(
 
 async function settle(): Promise<void> {
 	await new Promise(resolve => setTimeout(resolve, 0));
+}
+
+function frameLineCount(frame: string | undefined): number {
+	return frame?.split('\n').length ?? 0;
 }

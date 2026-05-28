@@ -21,6 +21,9 @@ export type ToolCallHistoryMessage = {
 	status: ToolCallStatus;
 	approvalId?: string;
 	errorMessage?: string;
+	streamingOutput?: string;
+	output?: string;
+	outputLossy?: boolean;
 };
 
 export type ToolResultHistoryMessage = {
