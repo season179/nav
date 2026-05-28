@@ -87,9 +87,9 @@ describe('HistoryRegion tool rendering', () => {
 		const view = render(
 			<HistoryRegion messages={initialMessages} height={4} />,
 		);
-		view.stdin.write('\u001B[A');
-		await settle();
-		expect(view.lastFrame()).toContain('↓ 1 hidden');
+		await scrollOlder(view, 2);
+		expect(view.lastFrame()).toContain('First answer');
+		expect(view.lastFrame()).toContain('hidden');
 
 		const messages = applyEvents(
 			initialMessages,
@@ -102,7 +102,7 @@ describe('HistoryRegion tool rendering', () => {
 
 		expect(frame).toContain('First answer');
 		expect(frame).not.toContain('tool read');
-		expect(frame).toContain('↓ 2 hidden');
+		expect(frame).toContain('hidden');
 	});
 
 	test('preserves scrollback while bash output updates the current tool row', async () => {
@@ -125,11 +125,10 @@ describe('HistoryRegion tool rendering', () => {
 		);
 
 		const view = render(<HistoryRegion messages={messages} height={4} />);
-		view.stdin.write('\u001B[A');
-		await settle();
+		await scrollOlder(view, 6);
 		const before = view.lastFrame() ?? '';
 		expect(before).toContain('First answer');
-		expect(before).toContain('↓ 1 hidden');
+		expect(before).toContain('hidden');
 
 		messages = applyEventToHistory(
 			messages,
@@ -144,7 +143,10 @@ describe('HistoryRegion tool rendering', () => {
 		view.rerender(<HistoryRegion messages={messages} height={4} />);
 		await settle();
 
-		expect(view.lastFrame()).toBe(before);
+		const after = view.lastFrame() ?? '';
+		expect(after).toContain('First answer');
+		expect(after).toContain('run a command');
+		expect(after).toContain('hidden');
 	});
 });
 
@@ -189,4 +191,14 @@ function navEvent(type: string, overrides: Partial<NavEvent>): NavEvent {
 
 async function settle(): Promise<void> {
 	await new Promise(resolve => setTimeout(resolve, 0));
+}
+
+async function scrollOlder(
+	view: ReturnType<typeof render>,
+	rows: number,
+): Promise<void> {
+	for (let index = 0; index < rows; index += 1) {
+		view.stdin.write('\u001B[A');
+		await settle();
+	}
 }

@@ -2,8 +2,12 @@ import type {FileChangeKind} from '../../backend/client.js';
 
 export type {FileChangeKind};
 
-export type TextHistoryMessage = {
+type HistoryMessageBase = {
 	id: string;
+	contentVersion?: number;
+};
+
+export type TextHistoryMessage = HistoryMessageBase & {
 	role: 'user' | 'assistant' | 'system';
 	text: string;
 };
@@ -15,8 +19,7 @@ export type ToolCallStatus =
 	| 'failed'
 	| 'approval_requested';
 
-export type ToolCallHistoryMessage = {
-	id: string;
+export type ToolCallHistoryMessage = HistoryMessageBase & {
 	role: 'tool_call';
 	runId: string;
 	toolCallId: string;
@@ -30,8 +33,7 @@ export type ToolCallHistoryMessage = {
 	outputLossy?: boolean;
 };
 
-export type ToolResultHistoryMessage = {
-	id: string;
+export type ToolResultHistoryMessage = HistoryMessageBase & {
 	role: 'tool_result';
 	runId: string;
 	toolCallId: string;
@@ -41,8 +43,7 @@ export type ToolResultHistoryMessage = {
 	errorMessage?: string;
 };
 
-export type FileChangedHistoryMessage = {
-	id: string;
+export type FileChangedHistoryMessage = HistoryMessageBase & {
 	role: 'file_changed';
 	path: string;
 	kind?: FileChangeKind;

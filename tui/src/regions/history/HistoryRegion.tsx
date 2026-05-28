@@ -1,4 +1,4 @@
-import React, {useState, useEffect, useRef} from 'react';
+import React, {useState} from 'react';
 import {Box, Text, useInput} from 'ink';
 import {ToolCallCell} from './ToolCallCell.js';
 import {ToolResultCell} from './ToolResultCell.js';
@@ -6,6 +6,8 @@ import {FileChangedCell} from './FileChangedCell.js';
 import type {HistoryMessage} from './types.js';
 import {theme} from '../../theme/index.js';
 import {Markdown} from '../../markdown/Markdown.js';
+import {ScrollViewport} from '../../ink-ext/ScrollViewport.js';
+import {useWheelScroll} from '../../ink-ext/use-wheel-scroll.js';
 
 type Props = {
 	messages: HistoryMessage[];
@@ -16,48 +18,22 @@ type Props = {
 const SCROLL_STEP = 5;
 
 /**
- * Maximum scrollback position. When scrolled, the indicator takes one
- * row, leaving `height - 1` rows for visible messages. The max number
- * of hidden messages is `messages.length - (height - 1)`, which is the
- * most we can hide before running out of visible space.
- */
-function scrollbackLimit(messageCount: number, viewportHeight: number): number {
-	return Math.max(0, messageCount - viewportHeight);
-}
-
-/**
  * Scrollable message history.
  * Parent clips to fixed height via overflow:hidden — this component
  * relies on that clipping rather than managing its own height.
  */
 export function HistoryRegion({messages, height}: Props) {
-	const [scrollback, setScrollback] = useState(0);
-	const scrollbackRef = useRef(0);
-	const prevCountRef = useRef(messages.length);
-
-	useEffect(() => {
-		if (messages.length === 0) {
-			setScrollback(0);
-			scrollbackRef.current = 0;
-			prevCountRef.current = 0;
-			return;
-		}
-
-		const delta = messages.length - prevCountRef.current;
-		prevCountRef.current = messages.length;
-
-		if (delta > 0 && scrollbackRef.current > 0) {
-			scrollbackRef.current += delta;
-			setScrollback(scrollbackRef.current);
-		}
-
-		// Clamp if messages decreased or viewport shrank
-		const cap = scrollbackLimit(messages.length, height);
-		if (scrollbackRef.current > cap) {
-			scrollbackRef.current = cap;
-			setScrollback(cap);
-		}
-	}, [messages.length, height]);
+	const [maxScrollTop, setMaxScrollTop] = useState<number | undefined>();
+	const [stickyBottom, setStickyBottom] = useState(true);
+	const knownMaxScrollTop = maxScrollTop ?? 0;
+	const {scrollTop, setScrollTop} = useWheelScroll({
+		maxScrollTop: maxScrollTop ?? Number.POSITIVE_INFINITY,
+		onWheelScroll: event => {
+			if (event.direction === 'up') {
+				setStickyBottom(false);
+			}
+		},
+	});
 
 	useInput((_character, key) => {
 		const up = key.pageUp || key.upArrow;
@@ -65,21 +41,23 @@ export function HistoryRegion({messages, height}: Props) {
 		if (!up && !down) return;
 
 		const step = key.pageUp || key.pageDown ? SCROLL_STEP : 1;
-		const cap = scrollbackLimit(messages.length, height);
 		if (up) {
-			const next = Math.min(scrollbackRef.current + step, cap);
-			scrollbackRef.current = next;
-			setScrollback(next);
+			setStickyBottom(false);
+			setScrollTop(current => Math.max(0, current - step));
 		} else {
-			const next = Math.max(scrollbackRef.current - step, 0);
-			scrollbackRef.current = next;
-			setScrollback(next);
+			setScrollTop(current => {
+				const next = current + step;
+				if (next >= knownMaxScrollTop - 1) {
+					setStickyBottom(true);
+				}
+				return next;
+			});
 		}
 	});
 
-	const indicatorVisible = scrollback > 0;
-	const end = messages.length - scrollback;
-	const visibleMessages = messages.slice(0, Math.max(0, end));
+	const indicatorVisible = scrollTop < knownMaxScrollTop;
+	const viewportHeight = Math.max(1, height - (indicatorVisible ? 1 : 0));
+	const hiddenRows = Math.max(0, knownMaxScrollTop - scrollTop);
 
 	return (
 		<Box
@@ -100,13 +78,28 @@ export function HistoryRegion({messages, height}: Props) {
 				</Box>
 			) : (
 				<>
-					{visibleMessages.map(message => (
-						<MessageRow key={message.id} message={message} />
-					))}
+					<ScrollViewport
+						messages={messages}
+						renderMessage={message => <MessageRow message={message} />}
+						scrollTop={scrollTop}
+						onScrollTopChange={nextScrollTop => {
+							setScrollTop(nextScrollTop);
+							if (nextScrollTop >= knownMaxScrollTop - 1) {
+								setStickyBottom(true);
+							}
+						}}
+						onScrollMetricsChange={({maxScrollTop: nextMaxScrollTop}) => {
+							setMaxScrollTop(current =>
+								current === nextMaxScrollTop ? current : nextMaxScrollTop,
+							);
+						}}
+						viewportHeight={viewportHeight}
+						stickyBottom={stickyBottom}
+					/>
 					{indicatorVisible && (
 						<Box justifyContent="center">
 							<Text color={theme.inactive}>
-								↓ {scrollback} hidden · PgDn reveal · PgUp older
+								↓ {hiddenRows} hidden · PgDn reveal · PgUp older
 							</Text>
 						</Box>
 					)}
