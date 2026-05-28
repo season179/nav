@@ -131,7 +131,7 @@ fn reject_unknown_arguments(object: &serde_json::Map<String, Value>) -> Result<(
     Ok(())
 }
 
-fn is_obviously_binary(content: &str) -> bool {
+pub(super) fn is_obviously_binary(content: &str) -> bool {
     content.contains('\0')
 }
 
@@ -141,21 +141,21 @@ fn is_obviously_binary(content: &str) -> bool {
 /// path policy has already canonicalized the path) and falls through to
 /// `Modified` as a conservative default — only `Ok(false)` definitively
 /// proves the file is new.
-async fn file_change_kind(path: &Path) -> FileChangeKind {
+pub(super) async fn file_change_kind(path: &Path) -> FileChangeKind {
     match tokio::fs::try_exists(path).await {
         Ok(false) => FileChangeKind::Created,
         _ => FileChangeKind::Modified,
     }
 }
 
-fn display_changed_path(workspace_root: &Path, path: &Path) -> String {
+pub(super) fn display_changed_path(workspace_root: &Path, path: &Path) -> String {
     path.strip_prefix(workspace_root)
         .unwrap_or(path)
         .display()
         .to_string()
 }
 
-async fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ToolError> {
+pub(super) async fn atomic_write(path: &Path, content: &[u8]) -> Result<(), ToolError> {
     let temp_path = write_temp_file(path, content).await?;
 
     tokio::fs::rename(&temp_path, path).await.map_err(|error| {

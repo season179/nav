@@ -192,7 +192,7 @@ impl ToolGuardrailHook for WritePathPolicyHook {
         &self,
         context: &ToolCallContext,
     ) -> Result<BeforeToolCallDecision, GuardrailError> {
-        if context.tool_name != "write" {
+        if context.tool_name != "write" && context.tool_name != "edit" {
             return Ok(BeforeToolCallDecision::Allow);
         }
 
@@ -643,6 +643,45 @@ mod tests {
         let error = default_guardrails()
             .before_tool_call(&context)
             .expect_err("write outside workspace should be denied by a default hook");
+
+        assert!(
+            matches!(
+                error,
+                GuardrailError::Denied {
+                    ref hook_name,
+                    ref reason
+                } if hook_name == "default-write-path-policy"
+                    && reason.contains("escapes workspace")
+            ),
+            "unexpected guardrail error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn default_guardrails_deny_edit_when_path_policy_rejects_path() {
+        let workspace = TestWorkspace::new("default_edit_path_policy");
+        let tool_context = ToolContext::with_path_policy(workspace.policy());
+        let context = ToolCallContext::new(ToolCallContextParams {
+            tool_name: "edit",
+            raw_arguments: r#"{"path":"../secret.txt","old_text":"old","new_text":"new"}"#
+                .to_string(),
+            parsed_arguments: json!({
+                "path": "../secret.txt",
+                "old_text": "old",
+                "new_text": "new",
+            }),
+            preset: ToolPreset::Coding,
+            risk_class: RiskClass::Mutate,
+            tool_context: &tool_context,
+            call_id: "call_edit_1",
+            nav_tool_call_id: None,
+            run_id: RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001")
+                .expect("run id should parse"),
+        });
+
+        let error = default_guardrails()
+            .before_tool_call(&context)
+            .expect_err("edit outside workspace should be denied by a default hook");
 
         assert!(
             matches!(

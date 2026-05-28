@@ -4,6 +4,7 @@
 //! Risky execution policy stays in guardrail hooks, outside individual tools.
 
 pub mod bash;
+pub mod edit;
 pub mod file_queue;
 pub mod ls;
 pub mod read;
