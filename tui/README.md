@@ -54,6 +54,23 @@ bun test
 
 Update snapshots intentionally after visual changes: `bun test --update-snapshots`.
 
+## Smoke tests
+
+End-to-end checks that exercise the rendered terminal surface via tmux.
+Run from the repo root:
+
+```sh
+# Full residue + scroll smoke (height=53)
+NAV_E2E=1 bash tui/scripts/tmux-smoke-test.sh
+
+# Stream-tail visibility smoke (height=30, overflows viewport)
+bash tui/scripts/tmux-stream-tail-smoke.sh
+```
+
+Both use the deterministic e2e backend (`scripts/nav-e2e-backend.ts`) by default.
+The residue smoke also supports `NAV_E2E=0` with valid model settings to run
+against the real backend.
+
 ## Backend
 
 By default the UI spawns `cargo run -p nav-backend -- serve-http` from the
