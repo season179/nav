@@ -8,7 +8,7 @@ import {applyEventToHistory} from '../../app/App.js';
 import {parseSse, type NavEvent} from '../../backend/client.js';
 import {MouseEventProvider, type WheelMouseEvent} from '../../ink-ext/mouse.js';
 import {VirtualHistoryRegion} from './VirtualHistoryRegion.js';
-import type {HistoryMessage} from './types.js';
+import type {HistoryMessage, ToolCallHistoryMessage} from './types.js';
 
 describe('VirtualHistoryRegion rendering', () => {
 	test('keeps user, assistant, and system messages visible', () => {
@@ -161,6 +161,116 @@ describe('VirtualHistoryRegion residue checks', () => {
 		expect(after).toContain('hidden');
 		expect(after).not.toContain('assistant line 19');
 	});
+
+	test('restores follow-tail after wheel scrolling back to the bottom', async () => {
+		let messages = streamingConversation(3, 1);
+		const {emitter, view} = renderWithMouse(
+			<VirtualHistoryRegion messages={messages} height={5} />,
+		);
+		await waitForExpectation(() => {
+			expect(view.lastFrame()).toContain('stream line 3');
+		});
+
+		emitter.emit('wheel', wheelEvent('up'));
+		await waitForExpectation(() => {
+			const frame = view.lastFrame() ?? '';
+			expect(frame).toContain('hidden');
+			expect(frame).not.toContain('stream line 3');
+		});
+
+		emitter.emit('wheel', wheelEvent('down'));
+		await waitForExpectation(() => {
+			const frame = view.lastFrame() ?? '';
+			expect(frame).toContain('stream line 3');
+			expect(frame).not.toContain('hidden');
+		});
+
+		messages = streamingConversation(8, 2);
+		view.rerender(
+			<MouseEventProvider emitter={emitter}>
+				<VirtualHistoryRegion messages={messages} height={5} />
+			</MouseEventProvider>,
+		);
+
+		await waitForExpectation(() => {
+			expect(view.lastFrame()).toContain('stream line 8');
+		});
+	});
+
+	test('does not follow new assistant output after wheel scrolling away', async () => {
+		let messages = streamingConversation(3, 1);
+		const {emitter, view} = renderWithMouse(
+			<VirtualHistoryRegion messages={messages} height={5} />,
+		);
+		await waitForExpectation(() => {
+			expect(view.lastFrame()).toContain('stream line 3');
+		});
+
+		emitter.emit('wheel', wheelEvent('up'));
+		await waitForExpectation(() => {
+			const frame = view.lastFrame() ?? '';
+			expect(frame).toContain('hidden');
+			expect(frame).not.toContain('stream line 3');
+		});
+
+		messages = streamingConversation(8, 2);
+		view.rerender(
+			<MouseEventProvider emitter={emitter}>
+				<VirtualHistoryRegion messages={messages} height={5} />
+			</MouseEventProvider>,
+		);
+
+		await waitForExpectation(() => {
+			const frame = view.lastFrame() ?? '';
+			expect(frame).toContain('hidden');
+			expect(frame).not.toContain('stream line 8');
+		});
+	});
+
+	test('keeps following after wheel-up when there is no hidden history', async () => {
+		let messages = compactStreamingConversation(1, 1);
+		const {emitter, view} = renderWithMouse(
+			<VirtualHistoryRegion messages={messages} height={8} />,
+		);
+		await waitForExpectation(() => {
+			const frame = view.lastFrame() ?? '';
+			expect(frame).toContain('stream line 1');
+			expect(frame).not.toContain('hidden');
+		});
+
+		emitter.emit('wheel', wheelEvent('up'));
+		await settle();
+
+		messages = compactStreamingConversation(8, 2);
+		view.rerender(
+			<MouseEventProvider emitter={emitter}>
+				<VirtualHistoryRegion messages={messages} height={8} />
+			</MouseEventProvider>,
+		);
+
+		await waitForExpectation(() => {
+			expect(view.lastFrame()).toContain('stream line 8');
+		});
+	});
+
+	test('keeps running tool output tail visible while following bottom', async () => {
+		let messages = runningToolConversation(undefined, 1);
+		const view = render(
+			<VirtualHistoryRegion messages={messages} height={6} />,
+		);
+		await waitForExpectation(() => {
+			expect(view.lastFrame()).toContain('(waiting for output)');
+		});
+
+		messages = runningToolConversation(toolOutputLines(8), 2);
+		view.rerender(
+			<VirtualHistoryRegion messages={messages} height={6} />,
+		);
+
+		await waitForExpectation(() => {
+			expect(view.lastFrame()).toContain('tool output line 8');
+		});
+	});
 });
 
 function applyEvents(
@@ -230,6 +340,78 @@ function spikeResidueMessages(commands: string[]): HistoryMessage[] {
 	});
 
 	return messages;
+}
+
+function streamingConversation(
+	tailLineCount: number,
+	contentVersion: number,
+): HistoryMessage[] {
+	const messages = Array.from({length: 8}, (_value, index): HistoryMessage => ({
+		id: `context-${index + 1}`,
+		role: 'assistant',
+		text: `context line ${index + 1}`,
+	}));
+
+	messages.push({
+		id: 'assistant-streaming',
+		role: 'assistant',
+		text: numberedLines('stream line', tailLineCount),
+		contentVersion,
+	});
+
+	return messages;
+}
+
+function compactStreamingConversation(
+	tailLineCount: number,
+	contentVersion: number,
+): HistoryMessage[] {
+	return [
+		{id: 'context-1', role: 'assistant', text: 'context line 1'},
+		{
+			id: 'assistant-streaming',
+			role: 'assistant',
+			text: numberedLines('stream line', tailLineCount),
+			contentVersion,
+		},
+	];
+}
+
+function runningToolConversation(
+	streamingOutput: string | undefined,
+	contentVersion: number,
+): HistoryMessage[] {
+	const toolCall: ToolCallHistoryMessage = {
+		id: 'tool-call-streaming',
+		role: 'tool_call',
+		runId: 'run-streaming',
+		toolCallId: 'tool-streaming',
+		name: 'bash',
+		arguments: '{"command":"seq 8"}',
+		status: 'running',
+		contentVersion,
+	};
+
+	if (streamingOutput !== undefined) {
+		toolCall.streamingOutput = streamingOutput;
+	}
+
+	return [
+		{id: 'context-1', role: 'assistant', text: 'context line 1'},
+		{id: 'context-2', role: 'assistant', text: 'context line 2'},
+		toolCall,
+	];
+}
+
+function toolOutputLines(lineCount: number): string {
+	return numberedLines('tool output line', lineCount);
+}
+
+function numberedLines(label: string, lineCount: number): string {
+	return Array.from(
+		{length: lineCount},
+		(_value, index) => `${label} ${index + 1}`,
+	).join('\n');
 }
 
 function capturedRows(frame: string): string[] {

@@ -139,7 +139,7 @@ function streamingOutputWindow(
 	const visibleLines = hiddenLines > 0 ? lines.slice(hiddenLines) : lines;
 	if (options.padVisibleLines) {
 		while (visibleLines.length < visibleLineCount) {
-			visibleLines.push('');
+			visibleLines.unshift('');
 		}
 	}
 
