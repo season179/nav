@@ -290,6 +290,40 @@ and passes it to `render(..., {stdin: proxy})`. Run under tmux with
 **Fail mode**: if Ink's input pipeline breaks (typing nothing, or
 wheel chars leak into TextInput), the plan is invalid — redesign.
 
+**Spike confirmed (2026-05-28, issue #378)** — automated pass; interactive
+tmux run still needs operator sign-off before FS-02. Built in
+`tui/scratch/spike-a/`: `createStdinProxy(process.stdin)` attaches one `data`
+listener, walks the byte buffer, and on `ESC [ <` parses an xterm-1006 SGR
+mouse sequence through to its terminating `M`/`m`. Mouse bytes are routed to
+an `EventEmitter` (`wheel` and `mouse` events with shift/ctrl/meta modifiers
+decoded); all other bytes are `push()`ed into a `Readable` proxy. A 25 ms
+timer flushes stuck partials so a bare `Esc` press never wedges. `isTTY`,
+`setRawMode`, `ref`, `unref` delegate to real stdin; `setEncoding` is the
+inherited `Readable` method, so Ink's `stdin.setEncoding('utf8')` makes
+`stdin.read()` return strings as expected. Wired via
+`render(<App/>, { stdin: proxy })` — and 3 of the tests below mount through
+real Ink, so we know Ink accepts the custom `Readable`.
+
+Evidence — `bun test scratch/spike-a/` → **20/20 pass**. Coverage maps 1:1 to
+the pass criteria above: typing passthrough; Enter / bare-Esc / Backspace /
+Ctrl+C survive; wheel up/down land on the emitter and never on the readable
+side; SGR split across two chunks reassembles; multiple SGR per chunk all
+parse; interleaved typing+SGR (`'foo'+wheel+'bar'+wheel+'baz'`) splits
+cleanly between consumers; modifier bits decode; non-SGR CSI (arrow keys)
+and ESC+letter (Alt-x) pass through; press/release mouse buttons emit as
+`mouse` events; partial junk (`ESC[<99;1`) flushes after timeout; the four
+TTY delegations all reach real stdin; per-byte fragmentation still parses;
+`dispose()` ends the stream cleanly. Three integration tests render `<Probe>`
+through real Ink with the proxy as `stdin` and confirm typing reaches
+`useInput`, wheel SGR never leaks into `useInput`, and an interleaved
+stream cleanly demuxes.
+
+Not yet verified by automation: a real tmux+xterm-1006 run. Recipe is in
+`tui/scratch/spike-a/README.md`. Operator confirms typing in the TextInput,
+wheel scroll bumps the on-screen `wheelDelta` counter, no `<…M` garbage
+leaks into the input field, and Ctrl+C exits cleanly. Until that lands,
+FS-02 stays gated.
+
 ### SPIKE-B — Virtualized ScrollViewport correctness + perf
 
 **Goal**: prove real virtualization (mount-only-visible + cache +
