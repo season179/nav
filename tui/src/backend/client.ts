@@ -62,9 +62,16 @@ export type NavEvent =
 			argumentsDelta: string;
 	  })
 	| (ToolScopedEvent & {
+			type: 'tool.output_delta';
+			stream: 'stdout' | 'stderr' | string;
+			chunk: string;
+	  })
+	| (ToolScopedEvent & {
 			type: 'tool.call_completed';
 			name: string;
 			arguments: string;
+			output?: string;
+			outputLossy?: boolean;
 	  })
 	| (ToolScopedEvent & {
 			type: 'tool.call_failed';
@@ -147,6 +154,10 @@ type EventPayload = {
 	name?: string;
 	arguments_delta?: string;
 	arguments?: string;
+	stream?: string;
+	chunk?: string;
+	output?: string;
+	output_lossy?: boolean;
 	error_message?: string;
 	approval_id?: string;
 	tool_name?: string;
@@ -781,6 +792,14 @@ function decodeSseEvent(event: SseEventFrame, dataLines: string[]): NavEvent {
 				...toolFields(payload),
 				argumentsDelta: payload.arguments_delta || '',
 			};
+		case 'tool.output_delta':
+			return {
+				...base,
+				type,
+				...toolFields(payload),
+				stream: payload.stream || '',
+				chunk: payload.chunk || '',
+			};
 		case 'tool.call_completed':
 			return {
 				...base,
@@ -788,6 +807,8 @@ function decodeSseEvent(event: SseEventFrame, dataLines: string[]): NavEvent {
 				...toolFields(payload),
 				name: payload.name || '',
 				arguments: payload.arguments || '',
+				output: payload.output,
+				outputLossy: payload.output_lossy,
 			};
 		case 'tool.call_failed':
 			return {

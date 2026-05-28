@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
@@ -638,6 +638,83 @@ fn session_send_message_approves_guarded_bash_tool_and_resumes_run() {
         "call_bash_approve"
     );
     assert_eq!(requests[1].body["messages"][2]["content"], "bash output");
+}
+
+#[test]
+fn approved_bash_tool_streams_output_deltas_before_completed_output() {
+    let workspace = TestWorkspace::new("bash_streaming");
+    let command = "printf 'first\\n'; sleep 0.15; printf 'second\\n'";
+    let provider = SequencedProviderServer::start(vec![
+        bash_tool_call_chunks("call_bash_stream", command),
+        successful_provider_chunks("bash streaming handled"),
+    ]);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_base_url(provider.base_url()),
+    )
+    .with_tool_registry(bash_tool_registry());
+    let session_id =
+        SessionId::try_new(create_session_with_cwd(&mut server, workspace.root())).unwrap();
+    let subscription = server
+        .subscribe_session_events(&session_id, None)
+        .expect("session event subscription should open");
+
+    let run_id = send_message_text(&mut server, session_id.as_str(), "run streaming bash");
+    let pending_events = receive_live_events(&subscription, 6);
+    assert_eq!(
+        envelope_event_names(&pending_events),
+        vec![
+            "run.started",
+            "tool.call_started",
+            "tool.call_delta",
+            "tool.call_completed",
+            "message.completed",
+            "tool.approval_requested",
+        ]
+    );
+    let approval_id = approval_id_from_event(&pending_events[5]);
+
+    let approved_at = Instant::now();
+    approve_tool_request(&mut server, &approval_id);
+
+    let first_delta = subscription
+        .recv_timeout(LIVE_EVENT_TIMEOUT)
+        .expect("first bash output delta should stream before completion");
+    assert!(
+        approved_at.elapsed() < Duration::from_millis(500),
+        "first output delta should not wait for command completion"
+    );
+    assert_eq!(first_delta.event_type(), "tool.output_delta");
+    assert_tool_output_delta(&first_delta, "stdout", "first\n");
+    assert_eq!(
+        server.run_status(&RunId::try_new(&run_id).unwrap()),
+        Some(RunStatus::Running)
+    );
+
+    let remaining_events = receive_live_events(&subscription, 5);
+    assert_eq!(
+        envelope_event_names(&remaining_events),
+        vec![
+            "tool.output_delta",
+            "tool.call_completed",
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+        ]
+    );
+    assert_tool_output_delta(&remaining_events[0], "stdout", "second\n");
+
+    let completed = serde_json::to_value(&remaining_events[1]).unwrap();
+    assert_eq!(completed["output"], "first\nsecond\n");
+    assert_eq!(completed["output_lossy"], false);
+
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"][2]["content"],
+        "first\nsecond\n"
+    );
 }
 
 #[test]
@@ -1353,6 +1430,12 @@ fn assert_model_text_delta(event: &EventEnvelope, expected: &str) {
         BackendEvent::ModelTextDelta { delta, .. } => assert_eq!(delta, expected),
         event => panic!("event = {event:?}, want model.text_delta"),
     }
+}
+
+fn assert_tool_output_delta(event: &EventEnvelope, expected_stream: &str, expected_chunk: &str) {
+    let payload = serde_json::to_value(event).expect("event should serialize");
+    assert_eq!(payload["stream"], expected_stream);
+    assert_eq!(payload["chunk"], expected_chunk);
 }
 
 fn approval_id_from_event(event: &EventEnvelope) -> String {

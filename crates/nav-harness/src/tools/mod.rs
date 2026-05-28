@@ -10,7 +10,7 @@ pub mod read;
 pub mod truncation;
 pub mod write;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -32,6 +32,10 @@ pub trait NavTool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
     fn risk_class(&self) -> RiskClass;
+
+    fn streams_output(&self) -> bool {
+        false
+    }
 
     fn execute<'a>(
         &'a self,
@@ -64,6 +68,7 @@ impl RiskClass {
 pub struct ToolContext {
     path_policy: Option<WorkspacePathPolicy>,
     guardrails: GuardrailRunner,
+    output_sink: Option<ToolOutputSink>,
 }
 
 impl ToolContext {
@@ -71,11 +76,17 @@ impl ToolContext {
         Self {
             path_policy: Some(path_policy),
             guardrails: GuardrailRunner::default(),
+            output_sink: None,
         }
     }
 
     pub fn with_guardrails(mut self, guardrails: GuardrailRunner) -> Self {
         self.guardrails = guardrails;
+        self
+    }
+
+    pub fn with_output_sink(mut self, output_sink: ToolOutputSink) -> Self {
+        self.output_sink = Some(output_sink);
         self
     }
 
@@ -85,6 +96,10 @@ impl ToolContext {
 
     pub fn guardrails(&self) -> &GuardrailRunner {
         &self.guardrails
+    }
+
+    pub fn output_sink(&self) -> Option<&ToolOutputSink> {
+        self.output_sink.as_ref()
     }
 }
 
@@ -111,6 +126,112 @@ impl ToolOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolFileChange {
     pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutputDelta {
+    pub stream: String,
+    pub chunk: String,
+}
+
+#[derive(Clone)]
+pub struct ToolOutputSink {
+    queue: Arc<ToolOutputQueue>,
+}
+
+#[derive(Clone)]
+pub struct ToolOutputReceiver {
+    queue: Arc<ToolOutputQueue>,
+}
+
+struct ToolOutputQueue {
+    state: std::sync::Mutex<ToolOutputQueueState>,
+    notify: Notify,
+    capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct ToolOutputQueueState {
+    deltas: VecDeque<ToolOutputDelta>,
+    lossy: bool,
+}
+
+impl fmt::Debug for ToolOutputSink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolOutputSink")
+    }
+}
+
+impl fmt::Debug for ToolOutputReceiver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ToolOutputReceiver")
+    }
+}
+
+impl ToolOutputSink {
+    pub fn bounded(capacity: usize) -> (Self, ToolOutputReceiver) {
+        let queue = Arc::new(ToolOutputQueue {
+            state: std::sync::Mutex::new(ToolOutputQueueState::default()),
+            notify: Notify::new(),
+            capacity,
+        });
+
+        (
+            Self {
+                queue: Arc::clone(&queue),
+            },
+            ToolOutputReceiver { queue },
+        )
+    }
+
+    pub fn push(&self, delta: ToolOutputDelta) {
+        let mut state = self.queue.state.lock().unwrap();
+        if self.queue.capacity == 0 {
+            state.lossy = true;
+            return;
+        }
+
+        if state.deltas.len() == self.queue.capacity {
+            state.deltas.pop_front();
+            state.lossy = true;
+        }
+
+        state.deltas.push_back(delta);
+        drop(state);
+        self.queue.notify.notify_one();
+    }
+
+    pub fn push_chunk(&self, stream: impl Into<String>, chunk: impl Into<String>) {
+        self.push(ToolOutputDelta {
+            stream: stream.into(),
+            chunk: chunk.into(),
+        });
+    }
+}
+
+impl ToolOutputReceiver {
+    pub async fn recv(&self) -> ToolOutputDelta {
+        loop {
+            if let Some(delta) = self.try_pop() {
+                return delta;
+            }
+
+            self.queue.notify.notified().await;
+        }
+    }
+
+    pub fn drain(&self) -> Vec<ToolOutputDelta> {
+        let mut state = self.queue.state.lock().unwrap();
+        state.deltas.drain(..).collect()
+    }
+
+    pub fn is_lossy(&self) -> bool {
+        self.queue.state.lock().unwrap().lossy
+    }
+
+    fn try_pop(&self) -> Option<ToolOutputDelta> {
+        self.queue.state.lock().unwrap().deltas.pop_front()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,9 +477,11 @@ impl Error for ToolRegistryError {}
 mod tests {
     use serde_json::{Value, json};
 
+    use crate::tools::{bash::BashTool, ls::LsTool, read::ReadTool};
+
     use super::{
-        NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput, ToolPreset,
-        ToolRegistry,
+        NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput,
+        ToolOutputDelta, ToolOutputSink, ToolPreset, ToolRegistry,
     };
 
     #[tokio::test]
@@ -461,6 +584,37 @@ mod tests {
         assert_eq!(RiskClass::Mutate.name(), "mutate");
         assert_eq!(RiskClass::Exec.name(), "exec");
         assert_eq!(RiskClass::Search.name(), "search");
+    }
+
+    #[test]
+    fn only_bash_opts_into_live_output_streaming() {
+        assert!(BashTool.streams_output());
+        assert!(!ReadTool.streams_output());
+        assert!(!LsTool.streams_output());
+    }
+
+    #[test]
+    fn output_sink_drops_oldest_pending_delta_and_marks_lossy() {
+        let (sink, receiver) = ToolOutputSink::bounded(2);
+
+        sink.push_chunk("stdout", "first");
+        sink.push_chunk("stdout", "second");
+        sink.push_chunk("stdout", "third");
+
+        assert_eq!(
+            receiver.drain(),
+            vec![
+                ToolOutputDelta {
+                    stream: "stdout".to_string(),
+                    chunk: "second".to_string(),
+                },
+                ToolOutputDelta {
+                    stream: "stdout".to_string(),
+                    chunk: "third".to_string(),
+                },
+            ]
+        );
+        assert!(receiver.is_lossy());
     }
 
     #[test]

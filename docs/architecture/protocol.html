@@ -276,9 +276,14 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
                 <td>Incremental tool arguments from a provider stream.</td>
               </tr>
               <tr>
+                <td><code>tool.output_delta</code></td>
+                <td><code>run_id</code>, <code>tool_call_id</code>, <code>stream</code>, <code>chunk</code></td>
+                <td>Live output from a streaming tool such as <code>bash</code>. Deltas are raw in v1; guardrail after-hook redaction applies to the final completion output.</td>
+              </tr>
+              <tr>
                 <td><code>tool.call_completed</code></td>
-                <td><code>run_id</code>, <code>tool_call_id</code>, <code>name?</code>, <code>arguments</code>, <code>metadata?</code></td>
-                <td>Tool call arguments are complete. Execution result events are separate future work.</td>
+                <td><code>run_id</code>, <code>tool_call_id</code>, <code>name?</code>, <code>arguments</code>, <code>output?</code>, <code>output_lossy?</code>, <code>metadata?</code></td>
+                <td>Tool call arguments are complete. Streaming tools may emit a second completion with the final, after-hook-processed output blob; <code>output_lossy</code> marks dropped output deltas.</td>
               </tr>
               <tr>
                 <td><code>tool.approval_requested</code></td>
@@ -373,7 +378,7 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
         <div>
           <h3>Already implemented</h3>
           <ul>
-            <li><code>initialize</code>, <code>session.create</code>, <code>session.sendMessage</code>, and <code>run.cancel</code> are routed by <code>crates/nav-server/src/http/mod.rs</code>.</li>
+            <li><code>initialize</code>, <code>session.create</code>, <code>session.sendMessage</code>, <code>run.cancel</code>, <code>tool.approve</code>, and <code>tool.reject</code> are routed by <code>crates/nav-server/src/http/mod.rs</code>.</li>
             <li><code>session.create</code> accepts optional <code>source</code> and <code>settingsJson</code> session metadata so the protocol event log can sit beside the future canonical <code>SessionStore</code>.</li>
             <li><code>GET /sessions/{sessionId}/events</code> replays retained events, then stays open for live events from <code>crates/nav-server/src/http/event_store.rs</code>.</li>
             <li><code>crates/nav-server/src/http/event_store.rs</code> keeps the in-memory protocol event projection used for replay and live subscriber fan-out.</li>
@@ -384,8 +389,8 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
         <div>
           <h3>Prototype limitations</h3>
           <ul>
-            <li><code>tool.approve</code>, <code>tool.reject</code>, and <code>session.close</code> are declared protocol targets but not yet routed by the HTTP server.</li>
-            <li>The method table above is the stable target. Declared-but-unrouted RPC structs still need wire-shape alignment before exposure, including camelCase approval/session params.</li>
+            <li><code>session.close</code> is a declared protocol target but is not yet routed by the HTTP server.</li>
+            <li>The method table above is the stable target. Any newly routed RPC structs still need fixture coverage before exposure.</li>
             <li>If <code>Last-Event-ID</code> is valid but unknown, the current server returns HTTP <code>409</code> so clients can resync from a future canonical session view.</li>
             <li>Protocol events are retained in memory only. They are delivery projections, not the canonical transcript ledger; <code>crates/nav-harness/src/sessions/mod.rs</code> is still a stub, so durable transcript storage, fork, compaction, and canonical replay remain backend storage work.</li>
             <li>The current run path is intentionally minimal and maps model output through a synthetic OpenAI-compatible stream before the full harness loop is wired.</li>

@@ -19,7 +19,12 @@ use crate::sessions::{
     ConfirmationDecision, PendingConfirmation, PendingConfirmationReceiver,
     PendingConfirmationRegistry, ToolCall, Turn,
 };
-use crate::tools::{ToolCancellationToken, ToolContext, ToolPreset, ToolRegistry};
+use crate::tools::{
+    NavTool, ToolCancellationToken, ToolContext, ToolOutputDelta, ToolOutputReceiver,
+    ToolOutputSink, ToolPreset, ToolRegistry, ToolResult,
+};
+
+const TOOL_OUTPUT_BUFFER: usize = 64;
 
 #[derive(Debug, Default)]
 pub struct AgentCatalog;
@@ -426,7 +431,24 @@ where
             }
         }
 
-        let result = runtime.block_on(tool.execute(context, args, cancel.clone()));
+        let (output_context, output_receiver) = tool_output_context(context, tool.streams_output());
+        let result = runtime.block_on(execute_tool_with_output_events(
+            ToolOutputExecutionRequest {
+                tool: tool.as_ref(),
+                context: &output_context,
+                args,
+                cancel: cancel.clone(),
+                output_receiver: output_receiver.as_ref(),
+                ids,
+                emit,
+                run_id,
+                tool_call,
+            },
+        ));
+        let output_lossy = output_receiver
+            .as_ref()
+            .is_some_and(ToolOutputReceiver::is_lossy);
+
         match result {
             Ok(output) => {
                 let file_changes = output.file_changes.clone();
@@ -441,6 +463,17 @@ where
                 {
                     Ok(output) => {
                         emit_file_changed_events(ids, emit, &file_changes);
+                        if output_receiver.is_some() {
+                            emit_tool_call_completed(
+                                ids,
+                                emit,
+                                run_id,
+                                tool_call,
+                                output.content.as_str(),
+                                output_lossy,
+                                base_metadata,
+                            );
+                        }
                         turns.push(Turn::tool_result(&tool_call.id, output.content));
                     }
                     Err(error) => {
@@ -492,6 +525,72 @@ fn emit_file_changed_events<Ids, Emit>(
             },
         }]);
     }
+}
+
+fn tool_output_context(
+    context: &ToolContext,
+    streams_output: bool,
+) -> (ToolContext, Option<ToolOutputReceiver>) {
+    if !streams_output {
+        return (context.clone(), None);
+    }
+
+    let (sink, receiver) = ToolOutputSink::bounded(TOOL_OUTPUT_BUFFER);
+    (context.clone().with_output_sink(sink), Some(receiver))
+}
+
+struct ToolOutputExecutionRequest<'a, Ids, Emit>
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    tool: &'a dyn NavTool,
+    context: &'a ToolContext,
+    args: serde_json::Value,
+    cancel: ToolCancellationToken,
+    output_receiver: Option<&'a ToolOutputReceiver>,
+    ids: &'a mut Ids,
+    emit: &'a mut Emit,
+    run_id: &'a RunId,
+    tool_call: &'a ToolCall,
+}
+
+async fn execute_tool_with_output_events<Ids, Emit>(
+    request: ToolOutputExecutionRequest<'_, Ids, Emit>,
+) -> ToolResult
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let ToolOutputExecutionRequest {
+        tool,
+        context,
+        args,
+        cancel,
+        output_receiver,
+        ids,
+        emit,
+        run_id,
+        tool_call,
+    } = request;
+    let execution = tool.execute(context, args, cancel);
+    tokio::pin!(execution);
+
+    if let Some(output_receiver) = output_receiver {
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    emit_drained_tool_output_events(ids, emit, run_id, tool_call, output_receiver);
+                    return result;
+                }
+                delta = output_receiver.recv() => {
+                    emit_tool_output_delta(ids, emit, run_id, tool_call, delta);
+                }
+            }
+        }
+    }
+
+    execution.await
 }
 
 fn tool_error_turn(tool_call: &ToolCall, message: impl Into<String>) -> Turn {
@@ -653,6 +752,76 @@ fn emit_tool_call_failed<Ids, Emit>(
         },
     };
     emit(vec![event]);
+}
+
+fn emit_drained_tool_output_events<Ids, Emit>(
+    ids: &mut Ids,
+    emit: &mut Emit,
+    run_id: &RunId,
+    tool_call: &ToolCall,
+    output_receiver: &ToolOutputReceiver,
+) where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    for delta in output_receiver.drain() {
+        emit_tool_output_delta(ids, emit, run_id, tool_call, delta);
+    }
+}
+
+fn emit_tool_output_delta<Ids, Emit>(
+    ids: &mut Ids,
+    emit: &mut Emit,
+    run_id: &RunId,
+    tool_call: &ToolCall,
+    delta: ToolOutputDelta,
+) where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let Some(nav_tool_call_id) = &tool_call.tool_call_id else {
+        return;
+    };
+
+    emit(vec![HarnessEventEnvelope {
+        event_id: ids.next_event_id(),
+        event: HarnessEvent::ToolOutputDelta {
+            run_id: run_id.clone(),
+            tool_call_id: nav_tool_call_id.clone(),
+            stream: delta.stream,
+            chunk: delta.chunk,
+        },
+    }]);
+}
+
+fn emit_tool_call_completed<Ids, Emit>(
+    ids: &mut Ids,
+    emit: &mut Emit,
+    run_id: &RunId,
+    tool_call: &ToolCall,
+    output: &str,
+    output_lossy: bool,
+    base_metadata: &ProviderEventMetadata,
+) where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let Some(nav_tool_call_id) = &tool_call.tool_call_id else {
+        return;
+    };
+
+    emit(vec![HarnessEventEnvelope {
+        event_id: ids.next_event_id(),
+        event: HarnessEvent::ToolCallCompleted {
+            run_id: run_id.clone(),
+            tool_call_id: nav_tool_call_id.clone(),
+            name: Some(tool_call.name.clone()),
+            arguments: tool_call.arguments.clone(),
+            output: Some(output.to_string()),
+            output_lossy: Some(output_lossy),
+            metadata: base_metadata.clone(),
+        },
+    }]);
 }
 
 struct ToolApprovalRequestedEvent<'a> {
@@ -1576,6 +1745,130 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_emits_streaming_tool_completion_after_after_guardrails() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(StreamingSecretTool)
+            .expect("streaming tool should register");
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(RedactStreamingAfterGuardrailHook)
+            .expect("redaction hook should register");
+        let context = ToolContext::default().with_guardrails(guardrails);
+        let tool_calls = vec![tool_call_with_nav_id(
+            "call_streaming_secret",
+            "streaming-secret",
+            "{}",
+        )];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let mut events: Vec<HarnessEventEnvelope> = Vec::new();
+        let metadata = test_metadata();
+
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &context,
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            pending_confirmations: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
+
+        assert_eq!(
+            result,
+            ToolDispatchResult::Completed(vec![Turn::tool_result(
+                "call_streaming_secret",
+                "token=[redacted]",
+            )])
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.event_type())
+                .collect::<Vec<_>>(),
+            vec!["tool.output_delta", "tool.call_completed"]
+        );
+        match &events[1].event {
+            HarnessEvent::ToolCallCompleted {
+                output,
+                output_lossy,
+                ..
+            } => {
+                assert_eq!(output.as_deref(), Some("token=[redacted]"));
+                assert_eq!(*output_lossy, Some(false));
+            }
+            event => panic!("expected tool completion, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_marks_streaming_tool_completion_lossy_after_output_queue_drops() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(BurstStreamingTool)
+            .expect("burst streaming tool should register");
+        let context = ToolContext::default();
+        let tool_calls = vec![tool_call_with_nav_id(
+            "call_burst_streaming",
+            "burst-streaming",
+            "{}",
+        )];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let mut events: Vec<HarnessEventEnvelope> = Vec::new();
+        let metadata = test_metadata();
+
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &context,
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            pending_confirmations: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
+
+        assert_eq!(
+            result,
+            ToolDispatchResult::Completed(vec![Turn::tool_result(
+                "call_burst_streaming",
+                "burst complete",
+            )])
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event.event_type() == "tool.output_delta")
+                .count(),
+            TOOL_OUTPUT_BUFFER
+        );
+        match &events
+            .last()
+            .expect("completion event should be emitted")
+            .event
+        {
+            HarnessEvent::ToolCallCompleted {
+                output,
+                output_lossy,
+                ..
+            } => {
+                assert_eq!(output.as_deref(), Some("burst complete"));
+                assert_eq!(*output_lossy, Some(true));
+            }
+            event => panic!("expected lossy tool completion, got {event:?}"),
+        }
+    }
+
+    #[test]
     fn dispatch_emits_tool_call_failed_event_for_unknown_tool() {
         let registry = ToolRegistry::default();
         let nav_id = NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap();
@@ -1772,6 +2065,75 @@ mod tests {
         }
     }
 
+    struct StreamingSecretTool;
+
+    impl NavTool for StreamingSecretTool {
+        fn name(&self) -> &str {
+            "streaming-secret"
+        }
+        fn description(&self) -> &str {
+            "Streams a secret."
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Exec
+        }
+        fn streams_output(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            ctx: &'a ToolContext,
+            _args: Value,
+            _cancel: ToolCancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                ctx.output_sink()
+                    .expect("streaming tool should receive an output sink")
+                    .push_chunk("stdout", "token=secret");
+                Ok(ToolOutput::text("token=secret"))
+            })
+        }
+    }
+
+    struct BurstStreamingTool;
+
+    impl NavTool for BurstStreamingTool {
+        fn name(&self) -> &str {
+            "burst-streaming"
+        }
+        fn description(&self) -> &str {
+            "Streams more output than the pending queue can retain."
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Exec
+        }
+        fn streams_output(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            ctx: &'a ToolContext,
+            _args: Value,
+            _cancel: ToolCancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                let sink = ctx
+                    .output_sink()
+                    .expect("streaming tool should receive an output sink");
+                for index in 0..(TOOL_OUTPUT_BUFFER + 1) {
+                    sink.push_chunk("stdout", format!("chunk-{index}\n"));
+                }
+                Ok(ToolOutput::text("burst complete"))
+            })
+        }
+    }
+
     #[derive(Debug)]
     struct DenyGuardrailHook;
 
@@ -1845,6 +2207,26 @@ mod tests {
         ) -> Result<ToolOutput, GuardrailError> {
             assert_eq!(context.tool_name, "write");
             Ok(ToolOutput::text("rewritten write output"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RedactStreamingAfterGuardrailHook;
+
+    impl ToolGuardrailHook for RedactStreamingAfterGuardrailHook {
+        fn name(&self) -> &str {
+            "redact-streaming-after-test"
+        }
+
+        fn after_tool_call(
+            &self,
+            context: &ToolCallContext,
+            output: ToolOutput,
+        ) -> Result<ToolOutput, GuardrailError> {
+            assert_eq!(context.tool_name, "streaming-secret");
+            Ok(ToolOutput::text(
+                output.content.replace("secret", "[redacted]"),
+            ))
         }
     }
 

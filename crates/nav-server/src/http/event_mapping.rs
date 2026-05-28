@@ -76,17 +76,32 @@ fn harness_event_to_backend_event(event: HarnessEvent) -> BackendEvent {
             arguments_delta,
             metadata: provider_metadata(metadata),
         },
+        HarnessEvent::ToolOutputDelta {
+            run_id,
+            tool_call_id,
+            stream,
+            chunk,
+        } => BackendEvent::ToolOutputDelta {
+            run_id,
+            tool_call_id,
+            stream,
+            chunk,
+        },
         HarnessEvent::ToolCallCompleted {
             run_id,
             tool_call_id,
             name,
             arguments,
+            output,
+            output_lossy,
             metadata,
         } => BackendEvent::ToolCallCompleted {
             run_id,
             tool_call_id,
             name,
             arguments,
+            output,
+            output_lossy,
             metadata: Some(provider_metadata(metadata)),
         },
         HarnessEvent::ToolCallFailed {
@@ -300,7 +315,15 @@ mod tests {
                 tool_call_id: tool_call_id(),
                 name: Some("read".to_string()),
                 arguments: "{\"path\":\"x\"}".to_string(),
+                output: None,
+                output_lossy: None,
                 metadata: harness_metadata(),
+            },
+            HarnessEvent::ToolOutputDelta {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                stream: "stdout".to_string(),
+                chunk: "hello\n".to_string(),
             },
             HarnessEvent::ToolCallFailed {
                 run_id: run_id(),
@@ -347,7 +370,7 @@ mod tests {
             .collect();
 
         let result = harness_events_to_backend_events(&session_id, envelopes);
-        assert_eq!(result.len(), 11);
+        assert_eq!(result.len(), 12);
         for envelope in &result {
             assert_eq!(envelope.session_id, session_id);
         }
