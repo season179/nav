@@ -20,7 +20,7 @@ use crate::sessions::{
     PendingConfirmationRegistry, ToolCall, Turn,
 };
 use crate::tools::{
-    NavTool, ToolCancellationToken, ToolContext, ToolOutputDelta, ToolOutputReceiver,
+    NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
     ToolOutputSink, ToolPreset, ToolRegistry, ToolResult,
 };
 
@@ -497,8 +497,46 @@ where
                 }
 
                 let message = error.message();
-                emit_tool_call_failed(ids, emit, run_id, tool_call, message, base_metadata);
-                turns.push(tool_error_turn(tool_call, message));
+                let output = match error.output() {
+                    Some(output) => match context
+                        .guardrails()
+                        .after_tool_call(&guardrail_context, ToolOutput::text(output))
+                    {
+                        Ok(output) => Some(output.content),
+                        Err(error) => {
+                            let message = error.message();
+                            emit_tool_call_failed(
+                                ids,
+                                emit,
+                                run_id,
+                                tool_call,
+                                &message,
+                                base_metadata,
+                            );
+                            turns.push(tool_error_turn(tool_call, message));
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                let output_lossy = output.as_ref().map(|_| output_lossy);
+                emit_tool_call_failed_with_output(
+                    ids,
+                    emit,
+                    ToolCallFailedEvent {
+                        run_id,
+                        tool_call,
+                        message,
+                        output: output.as_deref(),
+                        output_lossy,
+                        base_metadata,
+                    },
+                );
+                turns.push(tool_error_turn_with_output(
+                    tool_call,
+                    message,
+                    output.as_deref(),
+                ));
             }
         }
     }
@@ -594,7 +632,15 @@ where
 }
 
 fn tool_error_turn(tool_call: &ToolCall, message: impl Into<String>) -> Turn {
-    Turn::tool_result(&tool_call.id, structured_tool_error(message))
+    tool_error_turn_with_output(tool_call, message, None)
+}
+
+fn tool_error_turn_with_output(
+    tool_call: &ToolCall,
+    message: impl Into<String>,
+    output: Option<&str>,
+) -> Turn {
+    Turn::tool_result(&tool_call.id, structured_tool_error(message, output))
 }
 
 fn tool_rejected_turn(tool_call: &ToolCall, reason: Option<String>) -> Turn {
@@ -736,6 +782,45 @@ fn emit_tool_call_failed<Ids, Emit>(
     Ids: HarnessEventIdSource,
     Emit: FnMut(Vec<HarnessEventEnvelope>),
 {
+    emit_tool_call_failed_with_output(
+        ids,
+        emit,
+        ToolCallFailedEvent {
+            run_id,
+            tool_call,
+            message,
+            output: None,
+            output_lossy: None,
+            base_metadata,
+        },
+    );
+}
+
+struct ToolCallFailedEvent<'a> {
+    run_id: &'a RunId,
+    tool_call: &'a ToolCall,
+    message: &'a str,
+    output: Option<&'a str>,
+    output_lossy: Option<bool>,
+    base_metadata: &'a ProviderEventMetadata,
+}
+
+fn emit_tool_call_failed_with_output<Ids, Emit>(
+    ids: &mut Ids,
+    emit: &mut Emit,
+    request: ToolCallFailedEvent<'_>,
+) where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let ToolCallFailedEvent {
+        run_id,
+        tool_call,
+        message,
+        output,
+        output_lossy,
+        base_metadata,
+    } = request;
     let Some(nav_tool_call_id) = &tool_call.tool_call_id else {
         return;
     };
@@ -748,6 +833,8 @@ fn emit_tool_call_failed<Ids, Emit>(
             tool_call_id: nav_tool_call_id.clone(),
             name: Some(tool_call.name.clone()),
             error_message: message.to_string(),
+            output: output.map(str::to_string),
+            output_lossy,
             metadata: base_metadata.clone(),
         },
     };
@@ -860,14 +947,17 @@ fn emit_tool_approval_requested<Ids, Emit>(
     emit(vec![event]);
 }
 
-fn structured_tool_error(message: impl Into<String>) -> String {
-    serde_json::json!({
+fn structured_tool_error(message: impl Into<String>, output: Option<&str>) -> String {
+    let mut error = serde_json::json!({
         "ok": false,
         "error": {
             "message": message.into(),
         },
-    })
-    .to_string()
+    });
+    if let Some(output) = output {
+        error["output"] = serde_json::Value::String(output.to_string());
+    }
+    error.to_string()
 }
 
 fn structured_tool_rejection(reason: Option<String>) -> String {
@@ -901,7 +991,7 @@ mod tests {
     };
     use crate::sessions::{ConfirmationDecision, PendingConfirmationRegistry, ToolCall};
     use crate::tools::{
-        NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput,
+        NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolError, ToolFuture, ToolOutput,
         ToolRegistry, read, write,
     };
     use crate::workspace::path::WorkspacePathPolicy;
@@ -1869,6 +1959,64 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_preserves_streaming_tool_output_on_failure() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(FailingStreamingTool)
+            .expect("failing streaming tool should register");
+        let context = ToolContext::default();
+        let tool_calls = vec![tool_call_with_nav_id(
+            "call_failing_streaming",
+            "failing-streaming",
+            "{}",
+        )];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let mut events: Vec<HarnessEventEnvelope> = Vec::new();
+        let metadata = test_metadata();
+
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &context,
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            pending_confirmations: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
+
+        let ToolDispatchResult::Completed(turns) = result else {
+            panic!("tool failure should be returned to the model as a tool result");
+        };
+        let error: Value = serde_json::from_str(&turns[0].text_content())
+            .expect("tool failure should be structured JSON");
+        assert_eq!(error["error"]["message"], "streaming failed");
+        assert_eq!(error["output"], "partial output");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.event_type())
+                .collect::<Vec<_>>(),
+            vec!["tool.output_delta", "tool.call_failed"]
+        );
+        match &events[1].event {
+            HarnessEvent::ToolCallFailed {
+                output,
+                output_lossy,
+                ..
+            } => {
+                assert_eq!(output.as_deref(), Some("partial output"));
+                assert_eq!(*output_lossy, Some(false));
+            }
+            event => panic!("expected failed event with final output, got {event:?}"),
+        }
+    }
+
+    #[test]
     fn dispatch_emits_tool_call_failed_event_for_unknown_tool() {
         let registry = ToolRegistry::default();
         let nav_id = NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap();
@@ -2130,6 +2278,39 @@ mod tests {
                     sink.push_chunk("stdout", format!("chunk-{index}\n"));
                 }
                 Ok(ToolOutput::text("burst complete"))
+            })
+        }
+    }
+
+    struct FailingStreamingTool;
+
+    impl NavTool for FailingStreamingTool {
+        fn name(&self) -> &str {
+            "failing-streaming"
+        }
+        fn description(&self) -> &str {
+            "Streams output and then fails."
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Exec
+        }
+        fn streams_output(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            ctx: &'a ToolContext,
+            _args: Value,
+            _cancel: ToolCancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                ctx.output_sink()
+                    .expect("streaming tool should receive an output sink")
+                    .push_chunk("stdout", "partial output");
+                Err(ToolError::with_output("streaming failed", "partial output"))
             })
         }
     }

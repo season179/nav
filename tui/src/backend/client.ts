@@ -77,6 +77,8 @@ export type NavEvent =
 			type: 'tool.call_failed';
 			name: string;
 			errorMessage: string;
+			output?: string;
+			outputLossy?: boolean;
 	  })
 	| (ToolScopedEvent & {
 			type: 'tool.approval_requested';
@@ -817,6 +819,8 @@ function decodeSseEvent(event: SseEventFrame, dataLines: string[]): NavEvent {
 				...toolFields(payload),
 				name: payload.name || '',
 				errorMessage: payload.error_message || '',
+				output: payload.output,
+				outputLossy: payload.output_lossy,
 			};
 		case 'tool.approval_requested':
 			return {

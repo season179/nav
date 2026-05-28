@@ -146,6 +146,17 @@ describe('readSseStream', () => {
 					output: 'first\n',
 					output_lossy: false,
 				}),
+				sse('tool.call_failed', {
+					event_id: 'evt-failed',
+					session_id: 'session-1',
+					type: 'tool.call_failed',
+					run_id: 'run-1',
+					tool_call_id: 'tool-1',
+					name: 'bash',
+					error_message: 'command exited with status 7',
+					output: 'partial\n',
+					output_lossy: true,
+				}),
 			].join(''),
 		);
 
@@ -162,6 +173,14 @@ describe('readSseStream', () => {
 			arguments: '{"command":"printf first"}',
 			output: 'first\n',
 			outputLossy: false,
+		});
+		expect(events[2]).toMatchObject({
+			type: 'tool.call_failed',
+			toolCallId: 'tool-1',
+			name: 'bash',
+			errorMessage: 'command exited with status 7',
+			output: 'partial\n',
+			outputLossy: true,
 		});
 	});
 });

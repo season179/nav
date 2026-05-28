@@ -126,6 +126,10 @@ pub enum BackendEvent {
         name: Option<String>,
         error_message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_lossy: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<ProviderEventMetadata>,
     },
     #[serde(rename = "tool.approval_requested")]
@@ -303,6 +307,8 @@ mod tests {
                 tool_call_id: tool_call_id(),
                 name: Some("read".to_string()),
                 error_message: "file not found".to_string(),
+                output: None,
+                output_lossy: None,
                 metadata: Some(provider_metadata()),
             },
             BackendEvent::ToolApprovalRequested {

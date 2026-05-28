@@ -286,6 +286,11 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000102","session_id":"019f2f6f-
                 <td>Tool call arguments are complete. Streaming tools may emit a second completion with the final, after-hook-processed output blob; <code>output_lossy</code> marks dropped output deltas.</td>
               </tr>
               <tr>
+                <td><code>tool.call_failed</code></td>
+                <td><code>run_id</code>, <code>tool_call_id</code>, <code>name?</code>, <code>error_message</code>, <code>output?</code>, <code>output_lossy?</code>, <code>metadata?</code></td>
+                <td>Tool execution failed. Streaming tools may include final output and lossiness metadata when the command produced output before failing.</td>
+              </tr>
+              <tr>
                 <td><code>tool.approval_requested</code></td>
                 <td><code>run_id</code>, <code>tool_call_id</code>, <code>approval_id</code></td>
                 <td>Frontend must ask the user or an agent policy before calling <code>tool.approve</code> or <code>tool.reject</code>.</td>

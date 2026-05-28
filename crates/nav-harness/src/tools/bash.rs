@@ -96,28 +96,34 @@ async fn execute_bash(
     .await
     .map_err(|error| ToolError::new(error.to_string()))?;
 
+    let content = render_command_output(&output.stdout, &output.stderr);
+    let visible_content = render_bounded_command_output(&cwd, &content)?;
+
     match output.termination {
         ShellTermination::Exited => {}
         ShellTermination::TimedOut => {
-            return Err(ToolError::new(format!(
-                "command timed out after {}s",
-                timeout.expect("timeout termination should include timeout")
-            )));
+            return Err(ToolError::with_output(
+                format!(
+                    "command timed out after {}s",
+                    timeout.expect("timeout termination should include timeout")
+                ),
+                visible_content,
+            ));
         }
         ShellTermination::Cancelled => return Err(ToolError::new("tool call cancelled")),
     }
 
-    let content = render_command_output(&output.stdout, &output.stderr);
-    let visible_content = render_bounded_command_output(&cwd, &content)?;
     if output.status_code == Some(0) {
         return Ok(ToolOutput::text(visible_content));
     }
 
-    Err(ToolError::new(format!(
-        "command exited with status {}; {}",
-        render_status_code(output.status_code),
-        visible_content
-    )))
+    Err(ToolError::with_output(
+        format!(
+            "command exited with status {}",
+            render_status_code(output.status_code)
+        ),
+        visible_content,
+    ))
 }
 
 fn emit_shell_output_chunk(output_sink: Option<&super::ToolOutputSink>, chunk: ShellOutputChunk) {
@@ -291,9 +297,8 @@ mod tests {
             .await
             .expect_err("non-zero bash command should fail");
 
-        assert!(error.message().contains("command exited with status 7"));
-        assert!(error.message().contains("stdout"));
-        assert!(error.message().contains("stderr"));
+        assert_eq!(error.message(), "command exited with status 7");
+        assert_eq!(error.output(), Some("stdout:\nstdout\nstderr:\nstderr"));
     }
 
     #[tokio::test]

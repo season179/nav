@@ -76,6 +76,8 @@ pub enum HarnessEvent {
         tool_call_id: ToolCallId,
         name: Option<String>,
         error_message: String,
+        output: Option<String>,
+        output_lossy: Option<bool>,
         metadata: ProviderEventMetadata,
     },
     ToolApprovalRequested {

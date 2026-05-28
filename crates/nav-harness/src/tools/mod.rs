@@ -237,17 +237,31 @@ impl ToolOutputReceiver {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
     message: String,
+    output: Option<String>,
 }
 
 impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            output: None,
+        }
+    }
+
+    pub fn with_output(message: impl Into<String>, output: impl Into<String>) -> Self {
+        let output = output.into();
+        Self {
+            message: message.into(),
+            output: (!output.is_empty()).then_some(output),
         }
     }
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn output(&self) -> Option<&str> {
+        self.output.as_deref()
     }
 }
 

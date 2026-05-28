@@ -218,9 +218,13 @@ where
     let mut bytes = Vec::new();
     let mut pending = Vec::new();
     let mut read_buffer = [0; PIPE_READ_BUFFER_BYTES];
+    let flush = tokio::time::sleep(OUTPUT_FLUSH_INTERVAL);
+    tokio::pin!(flush);
+    let mut flush_active = false;
 
     loop {
         if pending.is_empty() {
+            flush_active = false;
             let read = pipe.read(&mut read_buffer).await?;
             if read == 0 {
                 return Ok(bytes);
@@ -229,25 +233,45 @@ where
             bytes.extend_from_slice(&read_buffer[..read]);
             pending.extend_from_slice(&read_buffer[..read]);
             flush_full_output_events(stream, &mut pending, &on_chunk);
+            if !pending.is_empty() {
+                flush
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + OUTPUT_FLUSH_INTERVAL);
+                flush_active = true;
+            }
             continue;
         }
 
-        let flush = tokio::time::sleep(OUTPUT_FLUSH_INTERVAL);
-        tokio::pin!(flush);
+        if !flush_active {
+            flush
+                .as_mut()
+                .reset(tokio::time::Instant::now() + OUTPUT_FLUSH_INTERVAL);
+            flush_active = true;
+        }
         tokio::select! {
             read = pipe.read(&mut read_buffer) => {
                 let read = read?;
                 if read == 0 {
-                    flush_pending_output(stream, &mut pending, &on_chunk);
+                    flush_remaining_output(stream, &mut pending, &on_chunk);
                     return Ok(bytes);
                 }
 
                 bytes.extend_from_slice(&read_buffer[..read]);
                 pending.extend_from_slice(&read_buffer[..read]);
                 flush_full_output_events(stream, &mut pending, &on_chunk);
+                if pending.is_empty() {
+                    flush_active = false;
+                }
             }
             _ = &mut flush => {
-                flush_pending_output(stream, &mut pending, &on_chunk);
+                flush_available_output(stream, &mut pending, &on_chunk);
+                if pending.is_empty() {
+                    flush_active = false;
+                } else {
+                    flush
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + OUTPUT_FLUSH_INTERVAL);
+                }
             }
         }
     }
@@ -258,21 +282,55 @@ where
     C: Fn(ShellOutputChunk),
 {
     while pending.len() >= OUTPUT_MAX_EVENT_BYTES {
-        let chunk = pending.drain(..OUTPUT_MAX_EVENT_BYTES).collect::<Vec<_>>();
+        let Some(chunk) = drain_output_chunk(pending, OUTPUT_MAX_EVENT_BYTES, false) else {
+            return;
+        };
         emit_output_chunk(stream, chunk, on_chunk);
     }
 }
 
-fn flush_pending_output<C>(stream: ShellOutputStream, pending: &mut Vec<u8>, on_chunk: &C)
+fn flush_available_output<C>(stream: ShellOutputStream, pending: &mut Vec<u8>, on_chunk: &C)
 where
     C: Fn(ShellOutputChunk),
 {
-    if pending.is_empty() {
-        return;
+    if let Some(chunk) = drain_output_chunk(pending, pending.len(), false) {
+        emit_output_chunk(stream, chunk, on_chunk);
+    }
+}
+
+fn flush_remaining_output<C>(stream: ShellOutputStream, pending: &mut Vec<u8>, on_chunk: &C)
+where
+    C: Fn(ShellOutputChunk),
+{
+    while !pending.is_empty() {
+        let chunk = drain_output_chunk(pending, pending.len(), true)
+            .expect("final output drain should always make progress");
+        emit_output_chunk(stream, chunk, on_chunk);
+    }
+}
+
+fn drain_output_chunk(pending: &mut Vec<u8>, max_len: usize, final_flush: bool) -> Option<Vec<u8>> {
+    let limit = max_len.min(pending.len());
+    let chunk_len = utf8_safe_chunk_len(&pending[..limit], final_flush)?;
+    Some(pending.drain(..chunk_len).collect())
+}
+
+fn utf8_safe_chunk_len(bytes: &[u8], final_flush: bool) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
     }
 
-    let chunk = std::mem::take(pending);
-    emit_output_chunk(stream, chunk, on_chunk);
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Some(bytes.len()),
+        Err(error) if error.valid_up_to() > 0 => Some(error.valid_up_to()),
+        Err(error) if final_flush => {
+            Some(error.error_len().unwrap_or(bytes.len()).min(bytes.len()))
+        }
+        Err(error) if error.error_len().is_some() => {
+            Some(error.error_len().unwrap().min(bytes.len()))
+        }
+        Err(_) => None,
+    }
 }
 
 fn emit_output_chunk<C>(stream: ShellOutputStream, chunk: Vec<u8>, on_chunk: &C)
@@ -379,6 +437,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_shell_output_uses_true_periodic_flush_window() {
+        let workspace = TestWorkspace::new("periodic_batches");
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let chunks_for_callback = Arc::clone(&chunks);
+
+        let output = run_shell_command_streaming_until(
+            ShellCommand {
+                command: "for i in {1..12}; do printf x; sleep 0.02; done".to_string(),
+                cwd: workspace.root.clone(),
+                timeout: None,
+            },
+            std::future::pending(),
+            move |chunk| chunks_for_callback.lock().unwrap().push(chunk),
+        )
+        .await
+        .expect("streaming shell command should run");
+
+        let stdout_chunks = stdout_chunks(&chunks.lock().unwrap());
+        assert_eq!(output.stdout, "x".repeat(12));
+        assert_eq!(stdout_chunks.concat(), output.stdout);
+        assert!(
+            stdout_chunks.len() >= 2,
+            "continuous output should flush before EOF rather than waiting for silence"
+        );
+    }
+
+    #[tokio::test]
     async fn streaming_shell_output_splits_events_at_max_size() {
         let workspace = TestWorkspace::new("max_size");
         let chunks = Arc::new(Mutex::new(Vec::new()));
@@ -405,6 +490,42 @@ mod tests {
             stdout_chunks
                 .iter()
                 .all(|chunk| chunk.len() <= OUTPUT_MAX_EVENT_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_shell_output_preserves_utf8_across_size_splits() {
+        let workspace = TestWorkspace::new("utf8_boundaries");
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let chunks_for_callback = Arc::clone(&chunks);
+
+        let output = run_shell_command_streaming_until(
+            ShellCommand {
+                command: format!(
+                    "printf '%0.sx' {{1..{}}}; printf '\\360\\237\\230\\200z'",
+                    OUTPUT_MAX_EVENT_BYTES - 1
+                ),
+                cwd: workspace.root.clone(),
+                timeout: None,
+            },
+            std::future::pending(),
+            move |chunk| chunks_for_callback.lock().unwrap().push(chunk),
+        )
+        .await
+        .expect("streaming shell command should run");
+
+        let mut expected = "x".repeat(OUTPUT_MAX_EVENT_BYTES - 1);
+        expected.push_str(std::str::from_utf8(&[0xf0, 0x9f, 0x98, 0x80]).unwrap());
+        expected.push('z');
+        let stdout_chunks = stdout_chunks(&chunks.lock().unwrap());
+
+        assert_eq!(output.stdout, expected);
+        assert_eq!(stdout_chunks.concat(), output.stdout);
+        assert!(
+            stdout_chunks
+                .iter()
+                .all(|chunk| !chunk.contains('\u{fffd}')),
+            "valid UTF-8 output should not be lossy because of chunk boundaries"
         );
     }
 
