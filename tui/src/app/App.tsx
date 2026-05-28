@@ -381,8 +381,9 @@ export function applyEventToHistory(
 				...messages,
 				{
 					id: event.fileChangeId || event.id,
-					role: 'system',
-					text: `Changed file: ${event.path || '(unknown)'}`,
+					role: 'file_changed',
+					path: event.path || '',
+					kind: event.kind,
 				},
 			];
 		case 'unknown':

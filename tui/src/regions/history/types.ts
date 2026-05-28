@@ -1,3 +1,7 @@
+import type {FileChangeKind} from '../../backend/client.js';
+
+export type {FileChangeKind};
+
 export type TextHistoryMessage = {
 	id: string;
 	role: 'user' | 'assistant' | 'system';
@@ -37,7 +41,15 @@ export type ToolResultHistoryMessage = {
 	errorMessage?: string;
 };
 
+export type FileChangedHistoryMessage = {
+	id: string;
+	role: 'file_changed';
+	path: string;
+	kind?: FileChangeKind;
+};
+
 export type HistoryMessage =
 	| TextHistoryMessage
 	| ToolCallHistoryMessage
-	| ToolResultHistoryMessage;
+	| ToolResultHistoryMessage
+	| FileChangedHistoryMessage;

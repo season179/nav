@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use nav_types::{ApprovalId, EventId, FileChangeId, MessageId, RunId, ToolCallId};
+use nav_types::{ApprovalId, EventId, FileChangeId, FileChangeKind, MessageId, RunId, ToolCallId};
 
 use crate::models::{
     ChatCompletionStreamChoice, ChatCompletionStreamChunk, ChatCompletionStreamEvent,
@@ -92,6 +92,7 @@ pub enum HarnessEvent {
     FileChanged {
         file_change_id: FileChangeId,
         path: String,
+        kind: FileChangeKind,
     },
     ProviderError {
         run_id: RunId,

@@ -230,13 +230,15 @@ describe('applyEventToHistory', () => {
 			event('file.changed', {
 				fileChangeId: 'change-1',
 				path: 'src/app.ts',
+				kind: 'modified',
 			}),
 			ASSISTANT_ID,
 			warn,
 		);
 		expect(messages.at(-1)).toMatchObject({
-			role: 'system',
-			text: 'Changed file: src/app.ts',
+			role: 'file_changed',
+			path: 'src/app.ts',
+			kind: 'modified',
 		});
 		expect(warn).not.toHaveBeenCalled();
 	});

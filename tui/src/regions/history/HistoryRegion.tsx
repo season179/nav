@@ -2,6 +2,7 @@ import React, {useState, useEffect, useRef} from 'react';
 import {Box, Text, useInput} from 'ink';
 import {ToolCallCell} from './ToolCallCell.js';
 import {ToolResultCell} from './ToolResultCell.js';
+import {FileChangedCell} from './FileChangedCell.js';
 import type {HistoryMessage} from './types.js';
 import {theme} from '../../theme/index.js';
 import {Markdown} from '../../markdown/Markdown.js';
@@ -151,6 +152,10 @@ const MessageRow = React.memo(function MessageRow({
 
 	if (message.role === 'tool_result') {
 		return <ToolResultCell message={message} />;
+	}
+
+	if (message.role === 'file_changed') {
+		return <FileChangedCell message={message} />;
 	}
 
 	return (

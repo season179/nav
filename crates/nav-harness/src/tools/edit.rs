@@ -113,7 +113,8 @@ async fn execute_edit(
     let next = apply_planned_edits(&original, &planned_edits);
     super::write::atomic_write(resolved.path(), next.as_bytes()).await?;
 
-    Ok(ToolOutput::text(format!("edited {}", args.path)).with_file_changed(changed_path))
+    Ok(ToolOutput::text(format!("edited {}", args.path))
+        .with_file_changed(changed_path, super::FileChangeKind::Modified))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
