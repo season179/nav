@@ -427,23 +427,42 @@ where
         }
 
         let result = runtime.block_on(tool.execute(context, args, cancel.clone()));
-        if cancel.is_cancelled() {
-            return ToolDispatchResult::Cancelled;
-        }
-
         match result {
-            Ok(output) => match context
-                .guardrails()
-                .after_tool_call(&guardrail_context, output)
-            {
-                Ok(output) => turns.push(Turn::tool_result(&tool_call.id, output.content)),
-                Err(error) => {
-                    let message = error.message();
-                    emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
-                    turns.push(tool_error_turn(tool_call, message));
+            Ok(output) => {
+                let file_changes = output.file_changes.clone();
+                if cancel.is_cancelled() {
+                    emit_file_changed_events(ids, emit, &file_changes);
+                    return ToolDispatchResult::Cancelled;
                 }
-            },
+
+                match context
+                    .guardrails()
+                    .after_tool_call(&guardrail_context, output)
+                {
+                    Ok(output) => {
+                        emit_file_changed_events(ids, emit, &file_changes);
+                        turns.push(Turn::tool_result(&tool_call.id, output.content));
+                    }
+                    Err(error) => {
+                        let message = error.message();
+                        emit_file_changed_events(ids, emit, &file_changes);
+                        emit_tool_call_failed(
+                            ids,
+                            emit,
+                            run_id,
+                            tool_call,
+                            &message,
+                            base_metadata,
+                        );
+                        turns.push(tool_error_turn(tool_call, message));
+                    }
+                }
+            }
             Err(error) => {
+                if cancel.is_cancelled() {
+                    return ToolDispatchResult::Cancelled;
+                }
+
                 let message = error.message();
                 emit_tool_call_failed(ids, emit, run_id, tool_call, message, base_metadata);
                 turns.push(tool_error_turn(tool_call, message));
@@ -452,6 +471,27 @@ where
     }
 
     ToolDispatchResult::Completed(turns)
+}
+
+fn emit_file_changed_events<Ids, Emit>(
+    ids: &mut Ids,
+    emit: &mut Emit,
+    file_changes: &[crate::tools::ToolFileChange],
+) where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    for file_change in file_changes {
+        let event_id = ids.next_event_id();
+        let file_change_id = ids.next_file_change_id();
+        emit(vec![HarnessEventEnvelope {
+            event_id,
+            event: HarnessEvent::FileChanged {
+                file_change_id,
+                path: file_change.path.clone(),
+            },
+        }]);
+    }
 }
 
 fn tool_error_turn(tool_call: &ToolCall, message: impl Into<String>) -> Turn {
@@ -693,7 +733,7 @@ mod tests {
     use crate::sessions::{ConfirmationDecision, PendingConfirmationRegistry, ToolCall};
     use crate::tools::{
         NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput,
-        ToolRegistry, read,
+        ToolRegistry, read, write,
     };
     use crate::workspace::path::WorkspacePathPolicy;
 
@@ -1066,6 +1106,182 @@ mod tests {
                 .expect("message should be a string")
                 .contains("blocked by test guardrail")
         );
+    }
+
+    #[test]
+    fn dispatch_runs_write_guardrails_before_mutation() {
+        let workspace = TestWorkspace::new("write_guardrail_before_mutation");
+        let mut registry = ToolRegistry::default();
+        write::register(&mut registry).expect("write should register");
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(DenyGuardrailHook)
+            .expect("deny hook should register");
+        let context = ToolContext::with_path_policy(workspace.policy()).with_guardrails(guardrails);
+        let tool_calls = vec![ToolCall {
+            id: "call_write_denied".to_string(),
+            tool_call_id: None,
+            name: "write".to_string(),
+            arguments: r#"{"path":"notes.md","content":"should not write"}"#.to_string(),
+        }];
+
+        let result = dispatch_test(
+            &tool_calls,
+            &registry,
+            &context,
+            ToolCancellationToken::new(),
+            None,
+        );
+
+        let ToolDispatchResult::Completed(turns) = result else {
+            panic!("guardrail denial should complete with an error tool turn");
+        };
+        let error: Value = serde_json::from_str(&turns[0].text_content())
+            .expect("tool error should be structured JSON");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("denied")
+        );
+        assert!(
+            !workspace.root.join("notes.md").exists(),
+            "write must not mutate before before_tool_call hooks allow"
+        );
+    }
+
+    #[test]
+    fn dispatch_emits_file_changed_after_successful_write() {
+        let workspace = TestWorkspace::new("write_file_changed_event");
+        let mut registry = ToolRegistry::default();
+        write::register(&mut registry).expect("write should register");
+        let context = ToolContext::with_path_policy(workspace.policy());
+        let tool_calls = vec![ToolCall {
+            id: "call_write_file_changed".to_string(),
+            tool_call_id: Some(
+                NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap(),
+            ),
+            name: "write".to_string(),
+            arguments: r#"{"path":"notes.md","content":"hello"}"#.to_string(),
+        }];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let metadata = test_metadata();
+        let mut events = Vec::new();
+
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &context,
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            pending_confirmations: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
+
+        assert!(matches!(result, ToolDispatchResult::Completed(_)));
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                HarnessEvent::FileChanged { path, .. } if path == "notes.md"
+            )
+        }));
+    }
+
+    #[test]
+    fn dispatch_preserves_file_changed_when_after_guardrail_rewrites_write_output() {
+        let workspace = TestWorkspace::new("write_file_changed_after_rewrite");
+        let mut registry = ToolRegistry::default();
+        write::register(&mut registry).expect("write should register");
+        let mut guardrails = GuardrailRunner::default();
+        guardrails
+            .register_hook(RewriteWriteAfterGuardrailHook)
+            .expect("rewrite hook should register");
+        let context = ToolContext::with_path_policy(workspace.policy()).with_guardrails(guardrails);
+        let tool_calls = vec![ToolCall {
+            id: "call_write_rewritten".to_string(),
+            tool_call_id: Some(
+                NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap(),
+            ),
+            name: "write".to_string(),
+            arguments: r#"{"path":"notes.md","content":"hello"}"#.to_string(),
+        }];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let metadata = test_metadata();
+        let mut events = Vec::new();
+
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &context,
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            pending_confirmations: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
+
+        assert_eq!(
+            result,
+            ToolDispatchResult::Completed(vec![Turn::tool_result(
+                "call_write_rewritten",
+                "rewritten write output"
+            )])
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                HarnessEvent::FileChanged { path, .. } if path == "notes.md"
+            )
+        }));
+    }
+
+    #[test]
+    fn dispatch_emits_file_changed_when_cancelled_after_mutation() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(CancelAfterFileChangeTool)
+            .expect("cancel-after-change should register");
+        let tool_calls = vec![ToolCall {
+            id: "call_cancel_after_change".to_string(),
+            tool_call_id: None,
+            name: "cancel-after-change".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
+        let mut ids = TestIdSource;
+        let metadata = test_metadata();
+        let mut events = Vec::new();
+
+        let result = dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: &tool_calls,
+            registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            context: &ToolContext::default(),
+            cancel: ToolCancellationToken::new(),
+            run_cancel: None,
+            pending_confirmations: None,
+            run_id: &run_id,
+            ids: &mut ids,
+            emit: &mut |envelopes| events.extend(envelopes),
+            base_metadata: &metadata,
+        });
+
+        assert_eq!(result, ToolDispatchResult::Cancelled);
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                HarnessEvent::FileChanged { path, .. } if path == "notes.md"
+            )
+        }));
     }
 
     #[test]
@@ -1503,6 +1719,34 @@ mod tests {
         }
     }
 
+    struct CancelAfterFileChangeTool;
+
+    impl NavTool for CancelAfterFileChangeTool {
+        fn name(&self) -> &str {
+            "cancel-after-change"
+        }
+        fn description(&self) -> &str {
+            "Cancels after reporting a file change."
+        }
+        fn parameters(&self) -> Value {
+            json!({ "type": "object", "properties": {}, "additionalProperties": false })
+        }
+        fn risk_class(&self) -> RiskClass {
+            RiskClass::Mutate
+        }
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+            _args: Value,
+            cancel: ToolCancellationToken,
+        ) -> ToolFuture<'a> {
+            Box::pin(async move {
+                cancel.cancel();
+                Ok(ToolOutput::text("mutated").with_file_changed("notes.md"))
+            })
+        }
+    }
+
     struct PanicIfExecutedTool;
 
     impl NavTool for PanicIfExecutedTool {
@@ -1583,6 +1827,24 @@ mod tests {
             Ok(ToolOutput::text(
                 output.content.replace("secret", "[redacted]"),
             ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct RewriteWriteAfterGuardrailHook;
+
+    impl ToolGuardrailHook for RewriteWriteAfterGuardrailHook {
+        fn name(&self) -> &str {
+            "rewrite-write-after-test"
+        }
+
+        fn after_tool_call(
+            &self,
+            context: &ToolCallContext,
+            _output: ToolOutput,
+        ) -> Result<ToolOutput, GuardrailError> {
+            assert_eq!(context.tool_name, "write");
+            Ok(ToolOutput::text("rewritten write output"))
         }
     }
 

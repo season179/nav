@@ -119,6 +119,13 @@ fn harness_event_to_backend_event(event: HarnessEvent) -> BackendEvent {
             arguments_summary,
             risk_class,
         },
+        HarnessEvent::FileChanged {
+            file_change_id,
+            path,
+        } => BackendEvent::FileChanged {
+            file_change_id,
+            path,
+        },
         HarnessEvent::ProviderError {
             run_id,
             status,
@@ -165,7 +172,7 @@ fn provider_usage(usage: HarnessProviderUsage) -> ProviderUsage {
 mod tests {
     use super::*;
     use nav_harness::events::ProviderEventMetadata as HMeta;
-    use nav_types::{ApprovalId, EventId, RunId, ToolCallId};
+    use nav_types::{ApprovalId, EventId, FileChangeId, RunId, ToolCallId};
 
     fn run_id() -> RunId {
         RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap()
@@ -311,6 +318,10 @@ mod tests {
                 arguments_summary: "{}".to_string(),
                 risk_class: Some("mutate".to_string()),
             },
+            HarnessEvent::FileChanged {
+                file_change_id: file_change_id(),
+                path: "notes.md".to_string(),
+            },
             HarnessEvent::ProviderError {
                 run_id: run_id(),
                 status: Some(500),
@@ -336,7 +347,7 @@ mod tests {
             .collect();
 
         let result = harness_events_to_backend_events(&session_id, envelopes);
-        assert_eq!(result.len(), 10);
+        assert_eq!(result.len(), 11);
         for envelope in &result {
             assert_eq!(envelope.session_id, session_id);
         }
@@ -344,5 +355,9 @@ mod tests {
 
     fn approval_id() -> ApprovalId {
         ApprovalId::try_new("019f2f6f-f178-7a72-9f28-000000000004").unwrap()
+    }
+
+    fn file_change_id() -> FileChangeId {
+        FileChangeId::try_new("019f2f6f-f178-7a72-9f28-000000000005").unwrap()
     }
 }
