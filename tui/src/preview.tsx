@@ -15,7 +15,7 @@ import {
 	COMPOSER_HEIGHT,
 	ComposerRegion,
 } from './regions/composer/ComposerRegion.js';
-import {HistoryRegion} from './regions/history/HistoryRegion.js';
+import {VirtualHistoryRegion} from './regions/history/VirtualHistoryRegion.js';
 import {ModelPickerOverlay} from './overlays/model/ModelPickerOverlay.js';
 import type {ModelOption, ModelRef} from './overlays/model/load-models.js';
 import type {HistoryMessage} from './regions/history/types.js';
@@ -70,7 +70,7 @@ function HistoryPreview() {
 	const {rows} = useTerminalSize();
 	return (
 		<PreviewFrame>
-			<HistoryRegion messages={CHAT_MESSAGES} height={rows} />
+			<VirtualHistoryRegion messages={CHAT_MESSAGES} height={rows} />
 		</PreviewFrame>
 	);
 }
@@ -167,7 +167,10 @@ function ShellPreview() {
 						onCancel={() => setModelOpen(false)}
 					/>
 				) : (
-					<HistoryRegion messages={messages} height={historyHeight - 1} />
+					<VirtualHistoryRegion
+						messages={messages}
+						height={historyHeight - 1}
+					/>
 				)}
 			</Box>
 			<ComposerRegion
