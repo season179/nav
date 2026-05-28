@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::tools::truncation::{TruncationOptions, TruncationStrategy, truncate_output};
-use crate::workspace::shell::{ShellCommand, ShellTermination, run_shell_command_until};
+use crate::workspace::shell::{
+    ShellCommand, ShellOutputChunk, ShellTermination, run_shell_command_streaming_until,
+};
 
 use super::{
     NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolError, ToolFuture, ToolOutput,
@@ -52,6 +54,10 @@ impl NavTool for BashTool {
         RiskClass::Exec
     }
 
+    fn streams_output(&self) -> bool {
+        true
+    }
+
     fn execute<'a>(
         &'a self,
         ctx: &'a ToolContext,
@@ -77,39 +83,53 @@ async fn execute_bash(
         .ok_or_else(|| ToolError::new("workspace path policy is not configured"))?
         .session_cwd()
         .to_path_buf();
-    let output = run_shell_command_until(
+    let output_sink = ctx.output_sink().cloned();
+    let output = run_shell_command_streaming_until(
         ShellCommand {
             command,
             cwd: cwd.clone(),
             timeout: timeout.map(|seconds| Duration::from_secs(seconds as u64)),
         },
         cancel.cancelled(),
+        move |chunk| emit_shell_output_chunk(output_sink.as_ref(), chunk),
     )
     .await
     .map_err(|error| ToolError::new(error.to_string()))?;
 
+    let content = render_command_output(&output.stdout, &output.stderr);
+    let visible_content = render_bounded_command_output(&cwd, &content)?;
+
     match output.termination {
         ShellTermination::Exited => {}
         ShellTermination::TimedOut => {
-            return Err(ToolError::new(format!(
-                "command timed out after {}s",
-                timeout.expect("timeout termination should include timeout")
-            )));
+            return Err(ToolError::with_output(
+                format!(
+                    "command timed out after {}s",
+                    timeout.expect("timeout termination should include timeout")
+                ),
+                visible_content,
+            ));
         }
         ShellTermination::Cancelled => return Err(ToolError::new("tool call cancelled")),
     }
 
-    let content = render_command_output(&output.stdout, &output.stderr);
-    let visible_content = render_bounded_command_output(&cwd, &content)?;
     if output.status_code == Some(0) {
         return Ok(ToolOutput::text(visible_content));
     }
 
-    Err(ToolError::new(format!(
-        "command exited with status {}; {}",
-        render_status_code(output.status_code),
-        visible_content
-    )))
+    Err(ToolError::with_output(
+        format!(
+            "command exited with status {}",
+            render_status_code(output.status_code)
+        ),
+        visible_content,
+    ))
+}
+
+fn emit_shell_output_chunk(output_sink: Option<&super::ToolOutputSink>, chunk: ShellOutputChunk) {
+    if let Some(output_sink) = output_sink {
+        output_sink.push_chunk(chunk.stream.name(), chunk.chunk);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,9 +297,8 @@ mod tests {
             .await
             .expect_err("non-zero bash command should fail");
 
-        assert!(error.message().contains("command exited with status 7"));
-        assert!(error.message().contains("stdout"));
-        assert!(error.message().contains("stderr"));
+        assert_eq!(error.message(), "command exited with status 7");
+        assert_eq!(error.output(), Some("stdout:\nstdout\nstderr:\nstderr"));
     }
 
     #[tokio::test]

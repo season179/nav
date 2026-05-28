@@ -335,6 +335,8 @@ export function applyEventToHistory(
 				status: 'running',
 				argumentsDelta: event.argumentsDelta,
 			});
+		case 'tool.output_delta':
+			return messages;
 		case 'tool.call_completed':
 			return upsertToolCall(messages, event, {
 				status: 'completed',

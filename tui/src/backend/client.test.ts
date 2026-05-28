@@ -122,6 +122,67 @@ describe('readSseStream', () => {
 			path: 'src/app.ts',
 		});
 	});
+
+	test('parses bash output deltas and final output fields', async () => {
+		const events = await collectEvents(
+			[
+				sse('tool.output_delta', {
+					event_id: 'evt-output',
+					session_id: 'session-1',
+					type: 'tool.output_delta',
+					run_id: 'run-1',
+					tool_call_id: 'tool-1',
+					stream: 'stdout',
+					chunk: 'first\n',
+				}),
+				sse('tool.call_completed', {
+					event_id: 'evt-completed',
+					session_id: 'session-1',
+					type: 'tool.call_completed',
+					run_id: 'run-1',
+					tool_call_id: 'tool-1',
+					name: 'bash',
+					arguments: '{"command":"printf first"}',
+					output: 'first\n',
+					output_lossy: false,
+				}),
+				sse('tool.call_failed', {
+					event_id: 'evt-failed',
+					session_id: 'session-1',
+					type: 'tool.call_failed',
+					run_id: 'run-1',
+					tool_call_id: 'tool-1',
+					name: 'bash',
+					error_message: 'command exited with status 7',
+					output: 'partial\n',
+					output_lossy: true,
+				}),
+			].join(''),
+		);
+
+		expect(events[0]).toMatchObject({
+			type: 'tool.output_delta',
+			toolCallId: 'tool-1',
+			stream: 'stdout',
+			chunk: 'first\n',
+		});
+		expect(events[1]).toMatchObject({
+			type: 'tool.call_completed',
+			toolCallId: 'tool-1',
+			name: 'bash',
+			arguments: '{"command":"printf first"}',
+			output: 'first\n',
+			outputLossy: false,
+		});
+		expect(events[2]).toMatchObject({
+			type: 'tool.call_failed',
+			toolCallId: 'tool-1',
+			name: 'bash',
+			errorMessage: 'command exited with status 7',
+			output: 'partial\n',
+			outputLossy: true,
+		});
+	});
 });
 
 function protocolFixture(name: string): string {

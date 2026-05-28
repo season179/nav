@@ -11,6 +11,7 @@ pub const BACKEND_EVENT_TYPES: &[&str] = &[
     "tool.call_requested",
     "tool.call_started",
     "tool.call_delta",
+    "tool.output_delta",
     "tool.call_completed",
     "tool.call_failed",
     "tool.approval_requested",
@@ -94,6 +95,15 @@ pub enum BackendEvent {
         arguments_delta: String,
         metadata: ProviderEventMetadata,
     },
+    /// Live bash output progress. Deltas are raw in v1; consumers that need
+    /// after-hook redaction should rely on `tool.call_completed.output`.
+    #[serde(rename = "tool.output_delta")]
+    ToolOutputDelta {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        stream: String,
+        chunk: String,
+    },
     #[serde(rename = "tool.call_completed")]
     ToolCallCompleted {
         run_id: RunId,
@@ -101,6 +111,10 @@ pub enum BackendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_lossy: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<ProviderEventMetadata>,
     },
@@ -111,6 +125,10 @@ pub enum BackendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         error_message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_lossy: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<ProviderEventMetadata>,
     },
@@ -194,6 +212,7 @@ impl BackendEvent {
             Self::ToolCallRequested { .. } => "tool.call_requested",
             Self::ToolCallStarted { .. } => "tool.call_started",
             Self::ToolCallDelta { .. } => "tool.call_delta",
+            Self::ToolOutputDelta { .. } => "tool.output_delta",
             Self::ToolCallCompleted { .. } => "tool.call_completed",
             Self::ToolCallFailed { .. } => "tool.call_failed",
             Self::ToolApprovalRequested { .. } => "tool.approval_requested",
@@ -268,11 +287,19 @@ mod tests {
                 arguments_delta: "{}".to_string(),
                 metadata: provider_metadata(),
             },
+            BackendEvent::ToolOutputDelta {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                stream: "stdout".to_string(),
+                chunk: "hello\n".to_string(),
+            },
             BackendEvent::ToolCallCompleted {
                 run_id: run_id(),
                 tool_call_id: tool_call_id(),
                 name: Some("read".to_string()),
                 arguments: "{}".to_string(),
+                output: None,
+                output_lossy: None,
                 metadata: Some(provider_metadata()),
             },
             BackendEvent::ToolCallFailed {
@@ -280,6 +307,8 @@ mod tests {
                 tool_call_id: tool_call_id(),
                 name: Some("read".to_string()),
                 error_message: "file not found".to_string(),
+                output: None,
+                output_lossy: None,
                 metadata: Some(provider_metadata()),
             },
             BackendEvent::ToolApprovalRequested {

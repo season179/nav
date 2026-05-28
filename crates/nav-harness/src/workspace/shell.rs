@@ -22,6 +22,9 @@ use tokio::task::{JoinError, JoinHandle};
 
 const SHELL_PATH: &str = "/bin/bash";
 const ALLOWED_ENV_VARS: [&str; 5] = ["PATH", "HOME", "USER", "LANG", "TERM"];
+const OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+const OUTPUT_MAX_EVENT_BYTES: usize = 4096;
+const PIPE_READ_BUFFER_BYTES: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct ShellCommand {
@@ -45,6 +48,27 @@ pub enum ShellTermination {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl ShellOutputStream {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOutputChunk {
+    pub stream: ShellOutputStream,
+    pub chunk: String,
+}
+
 pub async fn run_shell_command(command: ShellCommand) -> Result<ShellOutput, ShellError> {
     run_shell_command_until(command, std::future::pending()).await
 }
@@ -55,6 +79,18 @@ pub async fn run_shell_command_until<F>(
 ) -> Result<ShellOutput, ShellError>
 where
     F: Future<Output = ()>,
+{
+    run_shell_command_streaming_until(command, cancelled, |_| {}).await
+}
+
+pub async fn run_shell_command_streaming_until<F, C>(
+    command: ShellCommand,
+    cancelled: F,
+    on_chunk: C,
+) -> Result<ShellOutput, ShellError>
+where
+    F: Future<Output = ()>,
+    C: Fn(ShellOutputChunk) + Clone + Send + Sync + 'static,
 {
     let mut process = shell_command(&command.command, &command.cwd);
     configure_process_group(&mut process);
@@ -68,8 +104,12 @@ where
         .stderr
         .take()
         .ok_or(ShellError::PipeUnavailable("stderr"))?;
-    let stdout_task = tokio::spawn(read_pipe(stdout));
-    let stderr_task = tokio::spawn(read_pipe(stderr));
+    let stdout_task = tokio::spawn(read_pipe(
+        stdout,
+        ShellOutputStream::Stdout,
+        on_chunk.clone(),
+    ));
+    let stderr_task = tokio::spawn(read_pipe(stderr, ShellOutputStream::Stderr, on_chunk));
 
     let wait = wait_for_child(&mut child, command.timeout, cancelled).await?;
     let (status, termination) = match wait {
@@ -170,13 +210,137 @@ enum ChildWait {
     Cancelled,
 }
 
-async fn read_pipe<P>(mut pipe: P) -> io::Result<Vec<u8>>
+async fn read_pipe<P, C>(mut pipe: P, stream: ShellOutputStream, on_chunk: C) -> io::Result<Vec<u8>>
 where
     P: AsyncRead + Unpin,
+    C: Fn(ShellOutputChunk),
 {
     let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes).await?;
-    Ok(bytes)
+    let mut pending = Vec::new();
+    let mut read_buffer = [0; PIPE_READ_BUFFER_BYTES];
+    let flush = tokio::time::sleep(OUTPUT_FLUSH_INTERVAL);
+    tokio::pin!(flush);
+    let mut flush_active = false;
+
+    loop {
+        if pending.is_empty() {
+            flush_active = false;
+            let read = pipe.read(&mut read_buffer).await?;
+            if read == 0 {
+                return Ok(bytes);
+            }
+
+            bytes.extend_from_slice(&read_buffer[..read]);
+            pending.extend_from_slice(&read_buffer[..read]);
+            flush_full_output_events(stream, &mut pending, &on_chunk);
+            if !pending.is_empty() {
+                flush
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + OUTPUT_FLUSH_INTERVAL);
+                flush_active = true;
+            }
+            continue;
+        }
+
+        if !flush_active {
+            flush
+                .as_mut()
+                .reset(tokio::time::Instant::now() + OUTPUT_FLUSH_INTERVAL);
+            flush_active = true;
+        }
+        tokio::select! {
+            read = pipe.read(&mut read_buffer) => {
+                let read = read?;
+                if read == 0 {
+                    flush_remaining_output(stream, &mut pending, &on_chunk);
+                    return Ok(bytes);
+                }
+
+                bytes.extend_from_slice(&read_buffer[..read]);
+                pending.extend_from_slice(&read_buffer[..read]);
+                flush_full_output_events(stream, &mut pending, &on_chunk);
+                if pending.is_empty() {
+                    flush_active = false;
+                }
+            }
+            _ = &mut flush => {
+                flush_available_output(stream, &mut pending, &on_chunk);
+                if pending.is_empty() {
+                    flush_active = false;
+                } else {
+                    flush
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + OUTPUT_FLUSH_INTERVAL);
+                }
+            }
+        }
+    }
+}
+
+fn flush_full_output_events<C>(stream: ShellOutputStream, pending: &mut Vec<u8>, on_chunk: &C)
+where
+    C: Fn(ShellOutputChunk),
+{
+    while pending.len() >= OUTPUT_MAX_EVENT_BYTES {
+        let Some(chunk) = drain_output_chunk(pending, OUTPUT_MAX_EVENT_BYTES, false) else {
+            return;
+        };
+        emit_output_chunk(stream, chunk, on_chunk);
+    }
+}
+
+fn flush_available_output<C>(stream: ShellOutputStream, pending: &mut Vec<u8>, on_chunk: &C)
+where
+    C: Fn(ShellOutputChunk),
+{
+    if let Some(chunk) = drain_output_chunk(pending, pending.len(), false) {
+        emit_output_chunk(stream, chunk, on_chunk);
+    }
+}
+
+fn flush_remaining_output<C>(stream: ShellOutputStream, pending: &mut Vec<u8>, on_chunk: &C)
+where
+    C: Fn(ShellOutputChunk),
+{
+    while !pending.is_empty() {
+        let chunk = drain_output_chunk(pending, pending.len(), true)
+            .expect("final output drain should always make progress");
+        emit_output_chunk(stream, chunk, on_chunk);
+    }
+}
+
+fn drain_output_chunk(pending: &mut Vec<u8>, max_len: usize, final_flush: bool) -> Option<Vec<u8>> {
+    let limit = max_len.min(pending.len());
+    let chunk_len = utf8_safe_chunk_len(&pending[..limit], final_flush)?;
+    Some(pending.drain(..chunk_len).collect())
+}
+
+fn utf8_safe_chunk_len(bytes: &[u8], final_flush: bool) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Some(bytes.len()),
+        Err(error) if error.valid_up_to() > 0 => Some(error.valid_up_to()),
+        Err(error) if final_flush => {
+            Some(error.error_len().unwrap_or(bytes.len()).min(bytes.len()))
+        }
+        Err(error) if error.error_len().is_some() => {
+            Some(error.error_len().unwrap().min(bytes.len()))
+        }
+        Err(_) => None,
+    }
+}
+
+fn emit_output_chunk<C>(stream: ShellOutputStream, chunk: Vec<u8>, on_chunk: &C)
+where
+    C: Fn(ShellOutputChunk),
+{
+    on_chunk(ShellOutputChunk {
+        stream,
+        chunk: String::from_utf8_lossy(&chunk).to_string(),
+    });
 }
 
 async fn read_task_output(task: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, ShellError> {
@@ -235,3 +399,163 @@ impl fmt::Display for ShellError {
 }
 
 impl Error for ShellError {}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        OUTPUT_MAX_EVENT_BYTES, ShellCommand, ShellOutputChunk, ShellOutputStream,
+        run_shell_command_streaming_until,
+    };
+
+    #[tokio::test]
+    async fn streaming_shell_output_flushes_time_batched_chunks() {
+        let workspace = TestWorkspace::new("time_batches");
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let chunks_for_callback = Arc::clone(&chunks);
+
+        let output = run_shell_command_streaming_until(
+            ShellCommand {
+                command: "printf 'first\\n'; sleep 0.15; printf 'second\\n'".to_string(),
+                cwd: workspace.root.clone(),
+                timeout: None,
+            },
+            std::future::pending(),
+            move |chunk| chunks_for_callback.lock().unwrap().push(chunk),
+        )
+        .await
+        .expect("streaming shell command should run");
+
+        assert_eq!(output.stdout, "first\nsecond\n");
+        assert_eq!(
+            stdout_chunks(&chunks.lock().unwrap()),
+            vec!["first\n".to_string(), "second\n".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_shell_output_uses_true_periodic_flush_window() {
+        let workspace = TestWorkspace::new("periodic_batches");
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let chunks_for_callback = Arc::clone(&chunks);
+
+        let output = run_shell_command_streaming_until(
+            ShellCommand {
+                command: "for i in {1..12}; do printf x; sleep 0.02; done".to_string(),
+                cwd: workspace.root.clone(),
+                timeout: None,
+            },
+            std::future::pending(),
+            move |chunk| chunks_for_callback.lock().unwrap().push(chunk),
+        )
+        .await
+        .expect("streaming shell command should run");
+
+        let stdout_chunks = stdout_chunks(&chunks.lock().unwrap());
+        assert_eq!(output.stdout, "x".repeat(12));
+        assert_eq!(stdout_chunks.concat(), output.stdout);
+        assert!(
+            stdout_chunks.len() >= 2,
+            "continuous output should flush before EOF rather than waiting for silence"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_shell_output_splits_events_at_max_size() {
+        let workspace = TestWorkspace::new("max_size");
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let chunks_for_callback = Arc::clone(&chunks);
+
+        let output = run_shell_command_streaming_until(
+            ShellCommand {
+                command: "for i in {1..5000}; do printf x; done".to_string(),
+                cwd: workspace.root.clone(),
+                timeout: None,
+            },
+            std::future::pending(),
+            move |chunk| chunks_for_callback.lock().unwrap().push(chunk),
+        )
+        .await
+        .expect("streaming shell command should run");
+
+        let chunks = chunks.lock().unwrap();
+        let stdout_chunks = stdout_chunks(&chunks);
+        assert_eq!(output.stdout.len(), 5000);
+        assert_eq!(stdout_chunks.concat(), output.stdout);
+        assert!(stdout_chunks.len() >= 2);
+        assert!(
+            stdout_chunks
+                .iter()
+                .all(|chunk| chunk.len() <= OUTPUT_MAX_EVENT_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_shell_output_preserves_utf8_across_size_splits() {
+        let workspace = TestWorkspace::new("utf8_boundaries");
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let chunks_for_callback = Arc::clone(&chunks);
+
+        let output = run_shell_command_streaming_until(
+            ShellCommand {
+                command: format!(
+                    "printf '%0.sx' {{1..{}}}; printf '\\360\\237\\230\\200z'",
+                    OUTPUT_MAX_EVENT_BYTES - 1
+                ),
+                cwd: workspace.root.clone(),
+                timeout: None,
+            },
+            std::future::pending(),
+            move |chunk| chunks_for_callback.lock().unwrap().push(chunk),
+        )
+        .await
+        .expect("streaming shell command should run");
+
+        let mut expected = "x".repeat(OUTPUT_MAX_EVENT_BYTES - 1);
+        expected.push_str(std::str::from_utf8(&[0xf0, 0x9f, 0x98, 0x80]).unwrap());
+        expected.push('z');
+        let stdout_chunks = stdout_chunks(&chunks.lock().unwrap());
+
+        assert_eq!(output.stdout, expected);
+        assert_eq!(stdout_chunks.concat(), output.stdout);
+        assert!(
+            stdout_chunks
+                .iter()
+                .all(|chunk| !chunk.contains('\u{fffd}')),
+            "valid UTF-8 output should not be lossy because of chunk boundaries"
+        );
+    }
+
+    fn stdout_chunks(chunks: &[ShellOutputChunk]) -> Vec<String> {
+        chunks
+            .iter()
+            .filter(|chunk| chunk.stream == ShellOutputStream::Stdout)
+            .map(|chunk| chunk.chunk.clone())
+            .collect()
+    }
+
+    struct TestWorkspace {
+        root: PathBuf,
+    }
+
+    impl TestWorkspace {
+        fn new(name: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("nav-shell-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("workspace should be created");
+            Self {
+                root: fs::canonicalize(root).expect("workspace should canonicalize"),
+            }
+        }
+    }
+
+    impl Drop for TestWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+}

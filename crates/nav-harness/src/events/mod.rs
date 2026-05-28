@@ -54,11 +54,21 @@ pub enum HarnessEvent {
         arguments_delta: String,
         metadata: ProviderEventMetadata,
     },
+    /// Raw live tool output progress. Guardrail after-hooks are applied to the
+    /// final tool completion output, not to these latency-sensitive deltas.
+    ToolOutputDelta {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        stream: String,
+        chunk: String,
+    },
     ToolCallCompleted {
         run_id: RunId,
         tool_call_id: ToolCallId,
         name: Option<String>,
         arguments: String,
+        output: Option<String>,
+        output_lossy: Option<bool>,
         metadata: ProviderEventMetadata,
     },
     ToolCallFailed {
@@ -66,6 +76,8 @@ pub enum HarnessEvent {
         tool_call_id: ToolCallId,
         name: Option<String>,
         error_message: String,
+        output: Option<String>,
+        output_lossy: Option<bool>,
         metadata: ProviderEventMetadata,
     },
     ToolApprovalRequested {
@@ -103,6 +115,7 @@ impl HarnessEvent {
             Self::MessageCompleted { .. } => "message.completed",
             Self::ToolCallStarted { .. } => "tool.call_started",
             Self::ToolCallDelta { .. } => "tool.call_delta",
+            Self::ToolOutputDelta { .. } => "tool.output_delta",
             Self::ToolCallCompleted { .. } => "tool.call_completed",
             Self::ToolCallFailed { .. } => "tool.call_failed",
             Self::ToolApprovalRequested { .. } => "tool.approval_requested",
@@ -390,6 +403,8 @@ impl OpenAiStreamEventMapper {
                     tool_call_id: state.tool_call_id.clone(),
                     name: state.name.clone(),
                     arguments: state.arguments.clone(),
+                    output: None,
+                    output_lossy: None,
                     metadata: metadata
                         .with_provider_tool_call_id(state.provider_tool_call_id.clone()),
                 },

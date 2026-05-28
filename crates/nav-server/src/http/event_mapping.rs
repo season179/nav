@@ -76,17 +76,32 @@ fn harness_event_to_backend_event(event: HarnessEvent) -> BackendEvent {
             arguments_delta,
             metadata: provider_metadata(metadata),
         },
+        HarnessEvent::ToolOutputDelta {
+            run_id,
+            tool_call_id,
+            stream,
+            chunk,
+        } => BackendEvent::ToolOutputDelta {
+            run_id,
+            tool_call_id,
+            stream,
+            chunk,
+        },
         HarnessEvent::ToolCallCompleted {
             run_id,
             tool_call_id,
             name,
             arguments,
+            output,
+            output_lossy,
             metadata,
         } => BackendEvent::ToolCallCompleted {
             run_id,
             tool_call_id,
             name,
             arguments,
+            output,
+            output_lossy,
             metadata: Some(provider_metadata(metadata)),
         },
         HarnessEvent::ToolCallFailed {
@@ -94,12 +109,16 @@ fn harness_event_to_backend_event(event: HarnessEvent) -> BackendEvent {
             tool_call_id,
             name,
             error_message,
+            output,
+            output_lossy,
             metadata,
         } => BackendEvent::ToolCallFailed {
             run_id,
             tool_call_id,
             name,
             error_message,
+            output,
+            output_lossy,
             metadata: Some(provider_metadata(metadata)),
         },
         HarnessEvent::ToolApprovalRequested {
@@ -221,6 +240,8 @@ mod tests {
             tool_call_id: tool_call_id(),
             name: Some("read".to_string()),
             error_message: "file not found".to_string(),
+            output: Some("partial output".to_string()),
+            output_lossy: Some(true),
             metadata: harness_metadata(),
         });
 
@@ -230,12 +251,16 @@ mod tests {
                 tool_call_id: tcid,
                 name,
                 error_message,
+                output,
+                output_lossy,
                 metadata,
             } => {
                 assert_eq!(rid, run_id());
                 assert_eq!(tcid, tool_call_id());
                 assert_eq!(name, Some("read".to_string()));
                 assert_eq!(error_message, "file not found");
+                assert_eq!(output.as_deref(), Some("partial output"));
+                assert_eq!(output_lossy, Some(true));
                 let meta = metadata.expect("tool.call_failed should include metadata");
                 assert_eq!(meta.provider_id, "test-provider");
                 assert_eq!(meta.configured_model_id, "test-model");
@@ -300,13 +325,23 @@ mod tests {
                 tool_call_id: tool_call_id(),
                 name: Some("read".to_string()),
                 arguments: "{\"path\":\"x\"}".to_string(),
+                output: None,
+                output_lossy: None,
                 metadata: harness_metadata(),
+            },
+            HarnessEvent::ToolOutputDelta {
+                run_id: run_id(),
+                tool_call_id: tool_call_id(),
+                stream: "stdout".to_string(),
+                chunk: "hello\n".to_string(),
             },
             HarnessEvent::ToolCallFailed {
                 run_id: run_id(),
                 tool_call_id: tool_call_id(),
                 name: Some("read".to_string()),
                 error_message: "not found".to_string(),
+                output: None,
+                output_lossy: None,
                 metadata: harness_metadata(),
             },
             HarnessEvent::ToolApprovalRequested {
@@ -347,7 +382,7 @@ mod tests {
             .collect();
 
         let result = harness_events_to_backend_events(&session_id, envelopes);
-        assert_eq!(result.len(), 11);
+        assert_eq!(result.len(), 12);
         for envelope in &result {
             assert_eq!(envelope.session_id, session_id);
         }
