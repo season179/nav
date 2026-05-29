@@ -10,6 +10,7 @@ use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId};
 use serde_json::{Value, json};
 
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
+use crate::compaction::summary::CompactionSummaryAgent;
 use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
@@ -22,9 +23,9 @@ use crate::models::{
     ResolvedModelConfig,
 };
 use crate::sessions::{
-    ConfirmationDecision, ModelTurn, NewProviderPayload, OPENAI_CHAT_COMPLETIONS_DECODER_VERSION,
-    PendingConfirmation, PendingConfirmationReceiver, PendingConfirmationRegistry,
-    ProviderPayloadDirection, SessionStore, ToolCall,
+    CompactionConfig, ConfirmationDecision, ModelTurn, NewProviderPayload,
+    OPENAI_CHAT_COMPLETIONS_DECODER_VERSION, PendingConfirmation, PendingConfirmationReceiver,
+    PendingConfirmationRegistry, ProviderPayloadDirection, SessionStore, ToolCall,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
@@ -32,6 +33,13 @@ use crate::tools::{
 };
 
 const TOOL_OUTPUT_BUFFER: usize = 64;
+
+/// How many times a single run may recover from a context-limit overflow by
+/// force-compacting and replaying the continuation prompt before giving up.
+/// One attempt is enough to clear a window that pruning alone could not; a
+/// second consecutive overflow indicates compaction is not shrinking the
+/// request, so the run fails instead of looping.
+const MAX_OVERFLOW_ATTEMPTS: usize = 1;
 
 #[derive(Debug, Default)]
 pub struct AgentCatalog;
@@ -103,6 +111,7 @@ impl RunLoop {
             store,
         });
         let mut payload_sequence = 0;
+        let mut overflow_attempts = 0;
 
         loop {
             if let Some(journal) = journal {
@@ -142,6 +151,19 @@ impl RunLoop {
                     } = *stream_error;
                     if matches!(error, OpenAiCompletionsError::Cancelled) {
                         return RunLoopResult::Cancelled;
+                    }
+                    if matches!(error, OpenAiCompletionsError::ContextLimit(_))
+                        && let Some(journal) = journal
+                        && overflow_attempts < MAX_OVERFLOW_ATTEMPTS
+                    {
+                        overflow_attempts += 1;
+                        match self.recover_from_overflow(journal, model, request.run_id) {
+                            Ok(recovered_turns) => {
+                                turns = recovered_turns;
+                                continue;
+                            }
+                            Err(recovery_error) => return RunLoopResult::Failed(recovery_error),
+                        }
                     }
                     if let Some(journal) = journal
                         && let Err(journal_error) = self.flush_stream_error(
@@ -226,6 +248,47 @@ impl RunLoop {
                 ToolDispatchResult::Cancelled => return RunLoopResult::Cancelled,
             }
         }
+    }
+
+    /// Recover from a context-limit overflow: force-compact the session into a
+    /// summary, then replay a single synthetic continuation prompt so the next
+    /// attempt resumes from the summary instead of the oversized history.
+    ///
+    /// Returns the recompacted replay turns to retry with. Media is dropped as
+    /// a side effect of replay projection, so the retried request carries no
+    /// image payloads.
+    fn recover_from_overflow(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        run_id: &RunId,
+    ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
+        let session_id = journal.session_id;
+        let summary_request = journal
+            .store
+            .lock()
+            .unwrap()
+            .compaction_summary_request(session_id, CompactionConfig::default())
+            .map_err(persistence_error)?;
+        let summary = CompactionSummaryAgent::with_client(self.client.clone())
+            .generate(model, &summary_request)?;
+
+        {
+            let store = journal.store.lock().unwrap();
+            store
+                .compact_session_with_summary(session_id, &summary_request, summary)
+                .map_err(persistence_error)?;
+            store
+                .append_overflow_continuation(session_id, run_id)
+                .map_err(persistence_error)?;
+        }
+
+        journal
+            .store
+            .lock()
+            .unwrap()
+            .try_turns(session_id)
+            .map_err(persistence_error)
     }
 
     fn journal_request_payload(

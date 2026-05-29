@@ -2,6 +2,7 @@
 
 pub mod breaker;
 pub mod degrade;
+pub mod overflow;
 pub mod prune;
 pub mod replay;
 pub mod summary;
