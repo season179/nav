@@ -11,6 +11,33 @@ use crate::sessions::ModelTurn;
 use crate::tools::ToolRegistry;
 
 // ---------------------------------------------------------------------------
+// Cache-stable block structure
+// ---------------------------------------------------------------------------
+
+/// Marker that separates the three cache-stable blocks of the rendered system
+/// prompt. Request assembly splits the prompt on this sentinel to place
+/// `cache_control` breakpoints at the block boundaries (see
+/// plans/context-management.md §2.4); the splitter is responsible for dropping
+/// the marker so it never reaches the model.
+pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
+
+/// Block 1: static agent identity, tone, and tool-usage rules. This text is
+/// byte-identical across model swaps and session state — it deliberately
+/// contains no model name, date, cwd, or other volatile data so the cached
+/// prefix never churns.
+const STATIC_IDENTITY: &str = "\
+You are nav, an interactive CLI agent for software-engineering tasks.
+
+## Tone
+- Be concise, direct, and objective. Favor action over commentary.
+- Don't just agree; surface what is best for the project.
+
+## Tool usage
+- Prefer a dedicated tool over a shell command whenever one fits.
+- Read a file before editing it.
+- Never assume a library or framework is available; verify it is used in the project first.";
+
+// ---------------------------------------------------------------------------
 // Traits (injectable seams)
 // ---------------------------------------------------------------------------
 
@@ -63,6 +90,7 @@ pub struct SystemPromptBuilder<'a> {
     cwd: &'a dyn Cwd,
     conventions: Option<&'a str>,
     tools: Option<&'a ToolRegistry>,
+    git_status: Option<&'a str>,
 }
 
 impl<'a> SystemPromptBuilder<'a> {
@@ -72,6 +100,7 @@ impl<'a> SystemPromptBuilder<'a> {
             cwd,
             conventions: None,
             tools: None,
+            git_status: None,
         }
     }
 
@@ -85,33 +114,45 @@ impl<'a> SystemPromptBuilder<'a> {
         self
     }
 
+    /// Set the working tree's git status. Volatile, so it lands in Block 3.
+    pub fn git_status(mut self, status: &'a str) -> Self {
+        self.git_status = Some(status);
+        self
+    }
+
     /// Render the system prompt and return it as a `System`-role model turn.
     pub fn build(&self) -> ModelTurn {
         ModelTurn::system_text(self.render())
     }
 
     /// Render the system prompt to a String.
+    ///
+    /// The output is three cache-stable blocks joined by
+    /// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`]:
+    /// 1. static identity/tone/tool-usage rules (byte-identical across models),
+    /// 2. semi-static context (OS, cwd, tool list),
+    /// 3. volatile context (date, git status, project conventions).
     pub(crate) fn render(&self) -> String {
         let mut out = String::with_capacity(512);
 
-        // -- Environment section --
+        // Block 1 — static identity, tone, and tool-usage rules.
+        out.push_str(STATIC_IDENTITY);
+        out.push('\n');
+        out.push_str(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
+        self.write_semi_static(&mut out);
+        out.push_str(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
+        self.write_volatile(&mut out);
+
+        out
+    }
+
+    /// Block 2 — semi-static context: OS, cwd, and the active tool list.
+    fn write_semi_static(&self, out: &mut String) {
         writeln!(out, "## Environment").unwrap();
         writeln!(out, "- OS: {}", os_name()).unwrap();
         writeln!(out, "- cwd: {}", self.cwd.cwd()).unwrap();
-        writeln!(out, "- date: {}", self.clock.now_date()).unwrap();
         out.push('\n');
 
-        // -- Conventions (optional) --
-        if let Some(conv) = self.conventions {
-            writeln!(out, "## Project conventions").unwrap();
-            out.push_str(conv);
-            if !conv.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-
-        // -- Tools --
         writeln!(out, "## Tools").unwrap();
         let tool_names = self.tools.map(|r| r.tool_names()).unwrap_or_default();
         if tool_names.is_empty() {
@@ -121,14 +162,40 @@ impl<'a> SystemPromptBuilder<'a> {
                 writeln!(out, "- {name}").unwrap();
             }
         }
+    }
 
-        out
+    /// Block 3 — volatile context: date, git status, and project conventions.
+    fn write_volatile(&self, out: &mut String) {
+        writeln!(out, "## Session").unwrap();
+        writeln!(out, "- date: {}", self.clock.now_date()).unwrap();
+
+        if let Some(status) = self.git_status {
+            push_section(out, "Git status", status);
+        }
+        if let Some(conv) = self.conventions {
+            push_section(out, "Project conventions", conv);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Append a blank line, a `## {header}` heading, and `body` to `out`,
+/// normalizing `body` to end with exactly one newline. An empty `body` is
+/// skipped entirely so the prompt never carries a dangling heading.
+fn push_section(out: &mut String, header: &str, body: &str) {
+    if body.is_empty() {
+        return;
+    }
+    out.push('\n');
+    writeln!(out, "## {header}").unwrap();
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+}
 
 fn os_name() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -201,6 +268,128 @@ mod tests {
         }
     }
 
+    // -- Three-block structure tests -----------------------------------------
+
+    #[test]
+    fn render_emits_three_blocks_separated_by_boundary() {
+        let clock = FakeClock {
+            date: "2025-06-15".to_string(),
+        };
+        let cwd = FakeCwd {
+            dir: "/home/user/project".to_string(),
+        };
+
+        let rendered = SystemPromptBuilder::new(&clock, &cwd).render();
+        let blocks: Vec<&str> = rendered.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).collect();
+
+        assert_eq!(
+            blocks.len(),
+            3,
+            "expected exactly three blocks (two boundary markers): {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn block_one_is_byte_identical_across_session_state() {
+        let mut registry = ToolRegistry::default();
+        registry.register(PromptTool("read")).unwrap();
+
+        let a = SystemPromptBuilder::new(
+            &FakeClock {
+                date: "2025-06-15".to_string(),
+            },
+            &FakeCwd {
+                dir: "/home/alice".to_string(),
+            },
+        )
+        .tools(&registry)
+        .git_status(" M src/main.rs")
+        .conventions("Use conventional commits.")
+        .render();
+
+        let b = SystemPromptBuilder::new(
+            &FakeClock {
+                date: "1999-12-31".to_string(),
+            },
+            &FakeCwd {
+                dir: "/srv/bob".to_string(),
+            },
+        )
+        .render();
+
+        let block_a = a.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).next().unwrap();
+        let block_b = b.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).next().unwrap();
+
+        assert_eq!(
+            block_a, block_b,
+            "Block 1 must be byte-identical regardless of session state"
+        );
+    }
+
+    #[test]
+    fn volatile_data_confined_to_block_three() {
+        let rendered = SystemPromptBuilder::new(
+            &FakeClock {
+                date: "2025-06-15".to_string(),
+            },
+            &FakeCwd {
+                dir: "/home/user/project".to_string(),
+            },
+        )
+        .git_status(" M src/main.rs")
+        .render();
+
+        let blocks: Vec<&str> = rendered.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).collect();
+        assert_eq!(blocks.len(), 3);
+
+        for (i, block) in blocks[..2].iter().enumerate() {
+            assert!(
+                !block.contains("2025-06-15"),
+                "date leaked into block {}: {block:?}",
+                i + 1
+            );
+            assert!(
+                !block.contains("src/main.rs"),
+                "git status leaked into block {}: {block:?}",
+                i + 1
+            );
+        }
+
+        assert!(
+            blocks[2].contains("2025-06-15"),
+            "date missing from Block 3"
+        );
+        assert!(
+            blocks[2].contains("src/main.rs"),
+            "git status missing from Block 3"
+        );
+    }
+
+    #[test]
+    fn empty_optional_sections_are_omitted() {
+        let rendered = SystemPromptBuilder::new(
+            &FakeClock {
+                date: "2025-06-15".to_string(),
+            },
+            &FakeCwd {
+                dir: "/home/user/project".to_string(),
+            },
+        )
+        // A clean working tree yields empty `git status --porcelain`.
+        .git_status("")
+        .conventions("")
+        .render();
+
+        assert!(
+            !rendered.contains("## Git status"),
+            "empty git status should not emit a heading: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("## Project conventions"),
+            "empty conventions should not emit a heading: {rendered:?}"
+        );
+    }
+
     // -- Snapshot tests ------------------------------------------------------
 
     #[test]
@@ -228,14 +417,16 @@ mod tests {
 
         let expected = format!(
             "\
-## Environment
+{STATIC_IDENTITY}
+{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}## Environment
 - OS: {os}
 - cwd: /home/user/project
-- date: 2025-06-15
 
 \
 ## Tools
 (no tools available)
+{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}## Session
+- date: 2025-06-15
 "
         );
 
@@ -269,19 +460,21 @@ mod tests {
 
         let expected = format!(
             "\
-## Environment
+{STATIC_IDENTITY}
+{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}## Environment
 - OS: {os}
 - cwd: /app
+
+\
+## Tools
+(no tools available)
+{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}## Session
 - date: 2025-01-01
 
 \
 ## Project conventions
 Use conventional commits.
 No force-push.
-
-\
-## Tools
-(no tools available)
 "
         );
 
@@ -325,11 +518,11 @@ No force-push.
             .build();
 
         let text = prompt.text_content();
-        // The builder appends a newline after conventions, so the section
-        // separator before ## Tools should still be exactly one blank line.
+        // Conventions live in the volatile block; a missing trailing newline is
+        // normalized so the rendered prompt always ends with exactly one.
         assert!(
-            text.contains("No force-push.\n\n## Tools"),
-            "conventions without trailing newline should still separate from Tools: {text:?}"
+            text.ends_with("## Project conventions\nNo force-push.\n"),
+            "conventions without trailing newline should be normalized: {text:?}"
         );
     }
 
