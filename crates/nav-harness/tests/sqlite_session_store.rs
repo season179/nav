@@ -1059,6 +1059,55 @@ fn append_finished_run_with_turns_rolls_back_run_when_turn_insert_fails() {
 }
 
 #[test]
+fn append_finished_run_with_turns_compacting_rolls_back_when_a_part_is_missing() {
+    let db = TempDb::new("run-append-compacting-rollback");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000560");
+    let compaction_run_id = run_id("019e7000-0000-7000-8000-000000000561");
+    create_minimal_session(&store, session_id.clone());
+
+    // No turn carries this part id, so marking it must fail — and that failure
+    // has to unwind the summary turns written earlier in the same transaction.
+    let missing_part_id = PartId::new_unchecked("prt_0000018bcfe56800_000000000000beef");
+
+    let err = store
+        .append_finished_run_with_turns_compacting(
+            StartRun {
+                id: compaction_run_id.clone(),
+                session_id,
+                status: RunStatus::Running,
+                trigger: Some("compaction".to_string()),
+                started_at: 2_000,
+            },
+            &[(
+                Turn {
+                    id: message_id("019e7000-0000-7000-8000-000000000562"),
+                    run_id: compaction_run_id.clone(),
+                    seq: 0,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta::default(),
+                    created_at: 2_001,
+                },
+                vec![text_part("summary that must not survive")],
+            )],
+            2_002,
+            RunStatus::Completed,
+            None,
+            &[missing_part_id],
+        )
+        .expect_err("marking a missing part should abort the whole compaction write");
+
+    assert!(matches!(err, SqliteStoreError::WriteFailed(_)));
+    assert!(
+        matches!(
+            store.get_run(&compaction_run_id),
+            Err(SqliteStoreError::NotFound { .. })
+        ),
+        "the summary run must not be left behind after a rolled-back compaction"
+    );
+}
+
+#[test]
 fn append_finished_run_with_turns_rejects_turns_for_a_different_run() {
     let db = TempDb::new("run-append-mismatched-turn-run");
     let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
