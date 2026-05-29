@@ -4,6 +4,7 @@ export type {FileChangeKind};
 
 type HistoryMessageBase = {
 	id: string;
+	partId?: string;
 	contentVersion?: number;
 };
 

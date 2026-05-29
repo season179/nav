@@ -1,0 +1,14 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`VirtualHistoryRegion rendering renders recorded part text deltas as one assistant cell 1`] = `
+"
+
+
+   stream parts
+
+  hello from nav
+
+  tool call running
+  args path: fixture.txt
+"
+`;

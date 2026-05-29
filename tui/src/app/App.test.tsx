@@ -63,6 +63,89 @@ describe('applyEventToHistory', () => {
 		expect(warn).not.toHaveBeenCalled();
 	});
 
+	test('patches text part deltas into one assistant cell', () => {
+		const warn = mock(() => {});
+		let messages: HistoryMessage[] = [
+			{id: ASSISTANT_ID, role: 'assistant', text: ''},
+		];
+
+		messages = applyEventToHistory(
+			messages,
+			event('part.delta', {
+				turnId: 'turn-1',
+				partId: 'part-text-1',
+				field: 'text',
+				delta: 'hello',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('part.delta', {
+				turnId: 'turn-1',
+				partId: 'part-text-1',
+				field: 'text',
+				delta: ' from nav',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		const assistantMessages = messages.filter(
+			message => message.role === 'assistant',
+		);
+		expect(assistantMessages).toHaveLength(1);
+		expect(assistantMessages[0]).toMatchObject({
+			partId: 'part-text-1',
+			role: 'assistant',
+			text: 'hello from nav',
+		});
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	test('keeps late text part deltas after interleaved tool events', () => {
+		const warn = mock(() => {});
+		let messages: HistoryMessage[] = [
+			{id: ASSISTANT_ID, role: 'assistant', text: ''},
+		];
+
+		messages = applyEventToHistory(
+			messages,
+			event('part.delta', {
+				turnId: 'turn-1',
+				partId: 'part-tool-1',
+				field: 'arguments',
+				delta: '{}',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('part.delta', {
+				turnId: 'turn-1',
+				partId: 'part-text-1',
+				field: 'text',
+				delta: 'done',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		expect(messages.map(message => message.role)).toEqual([
+			'tool_call',
+			'assistant',
+		]);
+		expect(messages.at(-1)).toMatchObject({
+			id: ASSISTANT_ID,
+			partId: 'part-text-1',
+			role: 'assistant',
+			text: 'done',
+		});
+		expect(warn).not.toHaveBeenCalled();
+	});
+
 	test('replaces assistant text for error events', () => {
 		const warn = mock(() => {});
 
@@ -242,6 +325,83 @@ describe('applyEventToHistory', () => {
 			role: 'file_changed',
 			path: 'src/app.ts',
 			kind: 'modified',
+		});
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	test('patches tool argument part deltas into one call cell', () => {
+		const warn = mock(() => {});
+		let messages: HistoryMessage[] = [
+			{id: ASSISTANT_ID, role: 'assistant', text: ''},
+		];
+
+		messages = applyEventToHistory(
+			messages,
+			event('part.delta', {
+				turnId: 'turn-1',
+				partId: 'part-tool-1',
+				field: 'arguments',
+				delta: '{"path"',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('part.delta', {
+				turnId: 'turn-1',
+				partId: 'part-tool-1',
+				field: 'arguments',
+				delta: ':"fixture.txt"}',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		const toolCalls = messages.filter(message => message.role === 'tool_call');
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0]).toMatchObject({
+			id: 'part-tool-1',
+			partId: 'part-tool-1',
+			toolCallId: 'part-tool-1',
+			status: 'running',
+			arguments: '{"path":"fixture.txt"}',
+		});
+		expect(warn).not.toHaveBeenCalled();
+	});
+
+	test('marks a part-backed tool call completed', () => {
+		const warn = mock(() => {});
+		let messages: HistoryMessage[] = [
+			{id: ASSISTANT_ID, role: 'assistant', text: ''},
+		];
+
+		messages = applyEventToHistory(
+			messages,
+			event('part.delta', {
+				turnId: 'turn-1',
+				partId: 'part-tool-1',
+				field: 'arguments',
+				delta: '{}',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('part.completed', {
+				turnId: 'turn-1',
+				partId: 'part-tool-1',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		const toolCalls = messages.filter(message => message.role === 'tool_call');
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0]).toMatchObject({
+			partId: 'part-tool-1',
+			status: 'completed',
 		});
 		expect(warn).not.toHaveBeenCalled();
 	});

@@ -334,6 +334,10 @@ export function applyEventToHistory(
 		case 'message.delta':
 		case 'model.text_delta':
 			return appendAssistantText(messages, assistantId, eventText(event));
+		case 'part.delta':
+			return applyPartDelta(messages, event, assistantId);
+		case 'part.completed':
+			return completePart(messages, event);
 		case 'run.failed':
 		case 'error':
 		case 'provider.error':
@@ -459,6 +463,127 @@ function appendAssistantText(
 	return updateAssistantText(messages, assistantId, text => text + chunk);
 }
 
+function applyPartDelta(
+	messages: HistoryMessage[],
+	event: Extract<NavEvent, {type: 'part.delta'}>,
+	assistantId: string,
+): HistoryMessage[] {
+	switch (event.field) {
+		case 'text':
+			return appendTextPartDelta(
+				messages,
+				assistantId,
+				event.partId,
+				event.delta,
+			);
+		case 'arguments':
+			return upsertToolCall(
+				messages,
+				{...event, runId: '', toolCallId: event.partId},
+				{
+					status: 'running',
+					partId: event.partId,
+					argumentsDelta: event.delta,
+				},
+			);
+		default:
+			return messages;
+	}
+}
+
+function completePart(
+	messages: HistoryMessage[],
+	event: Extract<NavEvent, {type: 'part.completed'}>,
+): HistoryMessage[] {
+	const index = messages.findIndex(entry =>
+		isMatchingToolCall(entry, event.partId, event.partId),
+	);
+	if (index === -1) {
+		return messages;
+	}
+
+	return messages.map((entry, entryIndex) => {
+		if (entryIndex !== index || entry.role !== 'tool_call') {
+			return entry;
+		}
+		return {
+			...entry,
+			contentVersion: nextContentVersion(entry),
+			status: 'completed',
+		};
+	});
+}
+
+function appendTextPartDelta(
+	messages: HistoryMessage[],
+	assistantId: string,
+	partId: string,
+	delta: string,
+): HistoryMessage[] {
+	if (!partId || !delta) {
+		return messages;
+	}
+
+	const existingIndex = messages.findIndex(entry =>
+		isAssistantPart(entry, partId),
+	);
+	if (existingIndex !== -1) {
+		return messages.map((entry, entryIndex) => {
+			if (entryIndex !== existingIndex || entry.role !== 'assistant') {
+				return entry;
+			}
+			return {
+				...entry,
+				contentVersion: nextContentVersion(entry),
+				partId,
+				text: entry.text + delta,
+			};
+		});
+	}
+
+	const placeholderIndex = messages.findIndex(
+		entry =>
+			entry.id === assistantId &&
+			entry.role === 'assistant' &&
+			entry.text === '',
+	);
+	if (placeholderIndex !== -1) {
+		const placeholder = messages[placeholderIndex];
+		if (placeholder.role !== 'assistant') {
+			return messages;
+		}
+
+		const updatedPlaceholder = {
+			...placeholder,
+			partId,
+			contentVersion: nextContentVersion(placeholder),
+			text: delta,
+		};
+		if (placeholderIndex < messages.length - 1) {
+			return [
+				...messages.slice(0, placeholderIndex),
+				...messages.slice(placeholderIndex + 1),
+				updatedPlaceholder,
+			];
+		}
+
+		return messages.map((entry, entryIndex) =>
+			entryIndex === placeholderIndex ? updatedPlaceholder : entry,
+		);
+	}
+
+	return [
+		...messages,
+		{
+			id: partId,
+			partId,
+			contentVersion: 1,
+			role: 'assistant',
+			text: delta,
+		},
+	];
+}
+
 function replaceAssistantText(
 	messages: HistoryMessage[],
 	assistantId: string,
@@ -504,6 +629,7 @@ function updateAssistantText(
 
 type ToolCallUpdate = {
 	status: ToolCallStatus;
+	partId?: string;
 	name?: string;
 	arguments?: string;
 	argumentsDelta?: string;
@@ -514,7 +640,11 @@ type ToolCallUpdate = {
 	outputLossy?: boolean;
 };
 
-type ToolEvent = Extract<NavEvent, {toolCallId: string}>;
+type ToolEvent = {
+	id: string;
+	runId: string;
+	toolCallId: string;
+};
 
 function upsertToolCall(
 	messages: HistoryMessage[],
@@ -522,12 +652,13 @@ function upsertToolCall(
 	update: ToolCallUpdate,
 ): HistoryMessage[] {
 	const toolCallId = event.toolCallId || event.id;
-	const index = messages.findIndex(
-		entry => entry.role === 'tool_call' && entry.toolCallId === toolCallId,
+	const index = messages.findIndex(entry =>
+		isMatchingToolCall(entry, toolCallId, update.partId),
 	);
 
 	const buildMessage = (): ToolCallHistoryMessage => ({
 		id: toolCallId,
+		partId: update.partId,
 		contentVersion: 1,
 		role: 'tool_call',
 		runId: event.runId,
@@ -554,6 +685,7 @@ function upsertToolCall(
 		return {
 			...entry,
 			contentVersion: nextContentVersion(entry),
+			partId: update.partId ?? entry.partId,
 			runId: event.runId || entry.runId,
 			name: update.name || entry.name,
 			arguments: updateToolArguments(entry.arguments, update),
@@ -592,6 +724,28 @@ function updateStreamingOutput(
 		return `${current ?? ''}${update.outputDelta}`;
 	}
 	return current;
+}
+
+function isAssistantPart(entry: HistoryMessage, partId: string): boolean {
+	return (
+		entry.role === 'assistant' &&
+		(entry.partId === partId || entry.id === partId)
+	);
+}
+
+function isMatchingToolCall(
+	entry: HistoryMessage,
+	toolCallId: string,
+	partId?: string,
+): boolean {
+	if (entry.role !== 'tool_call') {
+		return false;
+	}
+
+	return (
+		entry.toolCallId === toolCallId ||
+		(partId !== undefined && (entry.partId === partId || entry.id === partId))
+	);
 }
 
 function nextContentVersion(message: HistoryMessage): number {

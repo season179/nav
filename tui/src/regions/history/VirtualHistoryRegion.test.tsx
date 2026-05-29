@@ -78,6 +78,28 @@ describe('VirtualHistoryRegion rendering', () => {
 			frame.indexOf('error handled'),
 		);
 	});
+
+	test('renders recorded part text deltas as one assistant cell', () => {
+		const assistantId = 'assistant-live';
+		const initialMessages: HistoryMessage[] = [
+			{id: 'user-live', role: 'user', text: 'stream parts'},
+			{id: assistantId, role: 'assistant', text: ''},
+		];
+		const messages = applyEvents(
+			initialMessages,
+			protocolFixture('part-delta.sse'),
+			assistantId,
+		);
+		const assistantMessages = messages.filter(
+			message => message.role === 'assistant',
+		);
+		const {lastFrame} = render(
+			<VirtualHistoryRegion messages={messages} height={10} />,
+		);
+
+		expect(assistantMessages).toHaveLength(1);
+		expect(lastFrame()).toMatchSnapshot();
+	});
 });
 
 describe('VirtualHistoryRegion follow-tail streaming', () => {

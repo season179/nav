@@ -1,0 +1,19 @@
+id: 019f2f6f-f178-7a72-9f28-000000000900
+event: session.created
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000900","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"session.created"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000901
+event: part.delta
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000901","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"part.delta","turn_id":"019f2f6f-f178-7a72-9f28-000000000102","part_id":"prt_0000018bcfe56800_0000000000000001","field":"text","delta":"hello"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000902
+event: part.delta
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000902","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"part.delta","turn_id":"019f2f6f-f178-7a72-9f28-000000000102","part_id":"prt_0000018bcfe56800_0000000000000001","field":"text","delta":" from nav"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000903
+event: part.delta
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000903","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"part.delta","turn_id":"019f2f6f-f178-7a72-9f28-000000000102","part_id":"prt_0000018bcfe56800_0000000000000002","field":"arguments","delta":"{\"path\":\"fixture.txt\"}"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000904
+event: part.completed
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000904","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"part.completed","turn_id":"019f2f6f-f178-7a72-9f28-000000000102","part_id":"prt_0000018bcfe56800_0000000000000001"}

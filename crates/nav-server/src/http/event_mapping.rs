@@ -54,6 +54,20 @@ fn harness_event_to_backend_event(event: HarnessEvent) -> BackendEvent {
             finish_reason,
             metadata: Some(provider_metadata(metadata)),
         },
+        HarnessEvent::PartDelta {
+            turn_id,
+            part_id,
+            field,
+            delta,
+        } => BackendEvent::PartDelta {
+            turn_id,
+            part_id,
+            field,
+            delta,
+        },
+        HarnessEvent::PartCompleted { turn_id, part_id } => {
+            BackendEvent::PartCompleted { turn_id, part_id }
+        }
         HarnessEvent::ToolCallStarted {
             run_id,
             tool_call_id,
@@ -193,7 +207,7 @@ fn provider_usage(usage: HarnessProviderUsage) -> ProviderUsage {
 mod tests {
     use super::*;
     use nav_harness::events::ProviderEventMetadata as HMeta;
-    use nav_types::{ApprovalId, EventId, FileChangeId, RunId, ToolCallId};
+    use nav_types::{ApprovalId, EventId, FileChangeId, MessageId, PartId, RunId, ToolCallId};
 
     fn run_id() -> RunId {
         RunId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap()
@@ -201,6 +215,10 @@ mod tests {
 
     fn tool_call_id() -> ToolCallId {
         ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000003").unwrap()
+    }
+
+    fn message_id() -> MessageId {
+        MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002").unwrap()
     }
 
     fn session_id() -> SessionId {
@@ -291,24 +309,31 @@ mod tests {
         let events = vec![
             HarnessEvent::ModelTextDelta {
                 run_id: run_id(),
-                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002")
-                    .unwrap(),
+                message_id: message_id(),
                 delta: "hi".to_string(),
                 metadata: harness_metadata(),
             },
             HarnessEvent::ModelReasoningDelta {
                 run_id: run_id(),
-                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002")
-                    .unwrap(),
+                message_id: message_id(),
                 delta: "think".to_string(),
                 metadata: harness_metadata(),
             },
             HarnessEvent::MessageCompleted {
                 run_id: run_id(),
-                message_id: nav_types::MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000002")
-                    .unwrap(),
+                message_id: message_id(),
                 finish_reason: Some("stop".to_string()),
                 metadata: harness_metadata(),
+            },
+            HarnessEvent::PartDelta {
+                turn_id: message_id(),
+                part_id: part_id(),
+                field: "text".to_string(),
+                delta: "hi".to_string(),
+            },
+            HarnessEvent::PartCompleted {
+                turn_id: message_id(),
+                part_id: part_id(),
             },
             HarnessEvent::ToolCallStarted {
                 run_id: run_id(),
@@ -385,7 +410,7 @@ mod tests {
             .collect();
 
         let result = harness_events_to_backend_events(&session_id, envelopes);
-        assert_eq!(result.len(), 12);
+        assert_eq!(result.len(), 14);
         for envelope in &result {
             assert_eq!(envelope.session_id, session_id);
         }
@@ -393,6 +418,10 @@ mod tests {
 
     fn approval_id() -> ApprovalId {
         ApprovalId::try_new("019f2f6f-f178-7a72-9f28-000000000004").unwrap()
+    }
+
+    fn part_id() -> PartId {
+        PartId::try_new("prt_0000018bcfe56800_0000000000000001").unwrap()
     }
 
     fn file_change_id() -> FileChangeId {
