@@ -1468,6 +1468,11 @@ fn ephemeral_db_path() -> PathBuf {
     ))
 }
 
+/// Mint a fresh session id, e.g. for a subagent's child session.
+pub fn new_session_id() -> SessionId {
+    SessionId::try_new(new_uuid_v7_string()).expect("generated session id should be UUIDv7")
+}
+
 fn new_message_id() -> MessageId {
     MessageId::try_new(new_uuid_v7_string()).expect("generated message id should be UUIDv7")
 }
