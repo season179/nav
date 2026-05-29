@@ -18,8 +18,8 @@ use crate::sessions::{ModelTurn, ModelTurnRole, ToolCall};
 use crate::tools::{NavTool, ToolPreset, ToolRegistry};
 
 use super::{
-    ApiKind, MaxTokensField, ProviderRoutingCompat, ResolveModelError, ResolvedModelConfig,
-    ThinkingFormat,
+    ApiKind, ContextLimitError, MaxTokensField, ProviderRoutingCompat, ResolveModelError,
+    ResolvedModelConfig, ThinkingFormat, classify_context_limit, classify_streamed_context_limit,
 };
 
 const OPENAI_COMPLETIONS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -396,6 +396,7 @@ pub enum OpenAiCompletionsError {
         body: String,
     },
     Cancelled,
+    ContextLimit(ContextLimitError),
     Provider(OpenAiCompletionsProviderError),
     ProviderStream(OpenAiCompletionsStreamProviderError),
     ModelResolution {
@@ -440,6 +441,11 @@ impl fmt::Display for OpenAiCompletionsError {
                 write!(formatter, "provider returned HTTP {status}: {body}")
             }
             Self::Cancelled => write!(formatter, "request cancelled"),
+            Self::ContextLimit(error) => write!(
+                formatter,
+                "provider returned HTTP {} (context limit exceeded): {}",
+                error.status, error.message
+            ),
             Self::Provider(error) => write!(
                 formatter,
                 "provider returned HTTP {}: {}",
@@ -1175,6 +1181,12 @@ fn routing_value(routing: &ProviderRoutingCompat) -> Option<Value> {
 fn parse_error_response(status: u16, body: &str, api_key: &str) -> OpenAiCompletionsError {
     let redacted_body = redact_secret(body, api_key);
 
+    if let Some(context_limit) =
+        classify_context_limit(ApiKind::OpenAiCompletions, status, &redacted_body)
+    {
+        return OpenAiCompletionsError::ContextLimit(context_limit);
+    }
+
     if let Ok(value) = serde_json::from_str::<Value>(&redacted_body)
         && let Some(error) = provider_error_from_value(status, &value)
     {
@@ -1200,6 +1212,11 @@ fn parse_stream_event(
     }
 
     let redacted_data = redact_secret(&data, api_key);
+    if let Some(context_limit) =
+        classify_streamed_context_limit(ApiKind::OpenAiCompletions, &redacted_data)
+    {
+        return Err(OpenAiCompletionsError::ContextLimit(context_limit));
+    }
     if let Ok(value) = serde_json::from_str::<Value>(&redacted_data)
         && let Some(error) = provider_stream_error_from_value(&value)
     {

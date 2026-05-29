@@ -547,6 +547,12 @@ impl ProviderErrorDetails {
                 error_type: None,
                 code: None,
             },
+            OpenAiCompletionsError::ContextLimit(context_limit) => Self {
+                status: Some(context_limit.status),
+                message: context_limit.message,
+                error_type: None,
+                code: context_limit.code,
+            },
             error => Self {
                 status: None,
                 message: error.to_string(),

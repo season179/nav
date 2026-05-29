@@ -590,6 +590,11 @@ fn error_payload_value(error: &OpenAiCompletionsError) -> Value {
             "status": status,
             "body": body,
         }),
+        OpenAiCompletionsError::ContextLimit(context_limit) => json!({
+            "status": context_limit.status,
+            "message": context_limit.message,
+            "code": context_limit.code,
+        }),
         error => json!({
             "message": error.to_string(),
         }),

@@ -3,6 +3,7 @@
 pub mod api;
 pub mod compat;
 pub mod config;
+pub mod context_limit;
 pub mod decode;
 pub mod encode;
 pub mod model;
@@ -13,6 +14,9 @@ pub mod resolver;
 pub use api::ApiKind;
 pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
 pub use config::{ModelRef, ModelSettings};
+pub use context_limit::{
+    ContextLimitError, classify_context_limit, classify_streamed_context_limit,
+};
 pub use decode::{
     AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
     ChatGptSubscriptionDecoder, DecodeError, DecodedPart, DecodedProviderPayload, DecodedTurn,
