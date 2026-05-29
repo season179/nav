@@ -16,8 +16,8 @@ use crate::models::{
     OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, ResolvedModelConfig,
 };
 use crate::sessions::{
-    ConfirmationDecision, PendingConfirmation, PendingConfirmationReceiver,
-    PendingConfirmationRegistry, ToolCall, Turn,
+    ConfirmationDecision, ModelTurn, PendingConfirmation, PendingConfirmationReceiver,
+    PendingConfirmationRegistry, ToolCall,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
@@ -38,7 +38,7 @@ pub struct RunLoop {
 pub struct RunLoopRequest<'a> {
     pub run_id: &'a RunId,
     pub message_id: &'a MessageId,
-    pub turns: &'a [Turn],
+    pub turns: &'a [ModelTurn],
     pub tool_registry: &'a ToolRegistry,
     pub tool_preset: ToolPreset,
     pub tool_context: &'a ToolContext,
@@ -48,7 +48,7 @@ pub struct RunLoopRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunLoopCompletion {
-    pub turns: Vec<Turn>,
+    pub turns: Vec<ModelTurn>,
     pub terminal_events: Vec<HarnessEventEnvelope>,
 }
 
@@ -219,7 +219,7 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelTurnOutput {
-    assistant_turn: Option<Turn>,
+    assistant_turn: Option<ModelTurn>,
     tool_calls: Vec<ToolCall>,
     terminal_events: Vec<HarnessEventEnvelope>,
 }
@@ -256,15 +256,15 @@ impl AssistantTurnCapture {
         }
     }
 
-    fn into_turn(self) -> Option<Turn> {
+    fn into_turn(self) -> Option<ModelTurn> {
         if self.tool_calls.is_empty() {
-            return (!self.text.is_empty()).then(|| Turn::assistant_text(self.text));
+            return (!self.text.is_empty()).then(|| ModelTurn::assistant_text(self.text));
         }
 
         if self.text.is_empty() {
-            Some(Turn::assistant_tool_calls(self.tool_calls))
+            Some(ModelTurn::assistant_tool_calls(self.tool_calls))
         } else {
-            Some(Turn::assistant_text_with_tool_calls(
+            Some(ModelTurn::assistant_text_with_tool_calls(
                 self.text,
                 self.tool_calls,
             ))
@@ -291,7 +291,7 @@ fn split_run_completion_events(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ToolDispatchResult {
-    Completed(Vec<Turn>),
+    Completed(Vec<ModelTurn>),
     Cancelled,
 }
 
@@ -474,7 +474,7 @@ where
                                 base_metadata,
                             );
                         }
-                        turns.push(Turn::tool_result(&tool_call.id, output.content));
+                        turns.push(ModelTurn::tool_result(&tool_call.id, output.content));
                     }
                     Err(error) => {
                         let message = error.message();
@@ -632,7 +632,7 @@ where
     execution.await
 }
 
-fn tool_error_turn(tool_call: &ToolCall, message: impl Into<String>) -> Turn {
+fn tool_error_turn(tool_call: &ToolCall, message: impl Into<String>) -> ModelTurn {
     tool_error_turn_with_output(tool_call, message, None)
 }
 
@@ -640,12 +640,12 @@ fn tool_error_turn_with_output(
     tool_call: &ToolCall,
     message: impl Into<String>,
     output: Option<&str>,
-) -> Turn {
-    Turn::tool_result(&tool_call.id, structured_tool_error(message, output))
+) -> ModelTurn {
+    ModelTurn::tool_result(&tool_call.id, structured_tool_error(message, output))
 }
 
-fn tool_rejected_turn(tool_call: &ToolCall, reason: Option<String>) -> Turn {
-    Turn::tool_result(&tool_call.id, structured_tool_rejection(reason))
+fn tool_rejected_turn(tool_call: &ToolCall, reason: Option<String>) -> ModelTurn {
+    ModelTurn::tool_result(&tool_call.id, structured_tool_rejection(reason))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1136,7 +1136,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolDispatchResult::Completed(vec![Turn::tool_result("call_echo_1", "hello")])
+            ToolDispatchResult::Completed(vec![ModelTurn::tool_result("call_echo_1", "hello")])
         );
     }
 
@@ -1170,8 +1170,8 @@ mod tests {
         assert_eq!(
             result,
             ToolDispatchResult::Completed(vec![
-                Turn::tool_result("call_echo_1", "first"),
-                Turn::tool_result("call_echo_2", "second"),
+                ModelTurn::tool_result("call_echo_1", "first"),
+                ModelTurn::tool_result("call_echo_2", "second"),
             ])
         );
     }
@@ -1537,7 +1537,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolDispatchResult::Completed(vec![Turn::tool_result(
+            ToolDispatchResult::Completed(vec![ModelTurn::tool_result(
                 "call_write_rewritten",
                 "rewritten write output"
             )])
@@ -1723,7 +1723,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolDispatchResult::Completed(vec![Turn::tool_result(
+            ToolDispatchResult::Completed(vec![ModelTurn::tool_result(
                 "call_confirm_approved",
                 "approved after rpc",
             )])
@@ -1841,7 +1841,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolDispatchResult::Completed(vec![Turn::tool_result(
+            ToolDispatchResult::Completed(vec![ModelTurn::tool_result(
                 "call_confirm_approved",
                 "approved",
             )])
@@ -1874,7 +1874,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolDispatchResult::Completed(vec![Turn::tool_result(
+            ToolDispatchResult::Completed(vec![ModelTurn::tool_result(
                 "call_echo_secret",
                 "token=[redacted]",
             )])
@@ -1918,7 +1918,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolDispatchResult::Completed(vec![Turn::tool_result(
+            ToolDispatchResult::Completed(vec![ModelTurn::tool_result(
                 "call_streaming_secret",
                 "token=[redacted]",
             )])
@@ -1976,7 +1976,7 @@ mod tests {
 
         assert_eq!(
             result,
-            ToolDispatchResult::Completed(vec![Turn::tool_result(
+            ToolDispatchResult::Completed(vec![ModelTurn::tool_result(
                 "call_burst_streaming",
                 "burst complete",
             )])

@@ -9,8 +9,8 @@ use std::thread;
 use nav_harness::guardrails::{GuardrailRunner, default_guardrails};
 use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
 use nav_harness::sessions::{
-    ConfirmationDecision, PendingConfirmation, PendingConfirmationError,
-    PendingConfirmationReceiver, PendingConfirmationRegistry, SessionStore, Turn,
+    ConfirmationDecision, ModelTurn, PendingConfirmation, PendingConfirmationError,
+    PendingConfirmationReceiver, PendingConfirmationRegistry, SessionStore,
 };
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, bash, edit, read, write};
 use nav_harness::workspace::path::WorkspacePathPolicy;
@@ -333,7 +333,10 @@ impl HttpServer {
 
         let turns = {
             let mut session_store = self.session_store.lock().unwrap();
-            session_store.append_turn(&params.session_id, Turn::user_text(params.text.clone()));
+            session_store.append_turn(
+                &params.session_id,
+                ModelTurn::user_text(params.text.clone()),
+            );
             session_store.turns(&params.session_id)
         };
         let run_id = self.next_run_id();
@@ -495,7 +498,7 @@ impl HttpServer {
         session_id: SessionId,
         run_id: RunId,
         message_id: nav_types::MessageId,
-        turns: Vec<Turn>,
+        turns: Vec<ModelTurn>,
         session_metadata: SessionMetadata,
         cancellation_token: OpenAiCompletionsCancellationToken,
     ) {

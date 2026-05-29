@@ -4,8 +4,8 @@
 //! layer: opening the connection with the agreed pragmas, falling back from
 //! WAL to a rollback journal on network filesystems, and serialising writes
 //! through `BEGIN IMMEDIATE` with jittered retry to avoid convoy effects.
-//! Artifact blob persistence also lives here; canonical turn row persistence
-//! lands in follow-up issues.
+//! Artifact blob persistence also lives here; higher-level turn/part
+//! persistence lands in follow-up issues.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use nav_types::{ArtifactId, ArtifactRow, PartId, SessionId};
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use nav_types::{ArtifactId, ArtifactRow, PartId, RunId, RunRow, SessionId, SessionRow};
+use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
 
 use super::migrate;
 
@@ -98,6 +98,84 @@ pub struct Artifact {
     pub reader: File,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSession {
+    pub title: Option<String>,
+    pub source: String,
+    pub workspace_root: Option<String>,
+    pub system_prompt: Option<String>,
+    pub settings_json: String,
+    pub parent_id: Option<SessionId>,
+    pub version: String,
+    pub slug: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettings {
+    pub settings_json: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl RunStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn is_startable(self) -> bool {
+        matches!(self, Self::Pending | Self::Running)
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartRun {
+    pub id: RunId,
+    pub session_id: SessionId,
+    pub status: RunStatus,
+    pub trigger: Option<String>,
+    pub started_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenDelta {
+    pub input: i64,
+    pub output: i64,
+    pub reasoning: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
+impl TokenDelta {
+    fn negated(self) -> Self {
+        Self {
+            input: -self.input,
+            output: -self.output,
+            reasoning: -self.reasoning,
+            cache_read: -self.cache_read,
+            cache_write: -self.cache_write,
+        }
+    }
+}
+
 impl SqliteSessionStore {
     /// Open (or create) a SQLite database at `path` and apply the standard
     /// pragmas (`journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`,
@@ -160,7 +238,7 @@ impl SqliteSessionStore {
                     id, session_id, part_id, kind, mime, sha256, path, size_bytes, created_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(sha256) DO NOTHING",
-                rusqlite::params![
+                params![
                     id.as_str(),
                     artifact.session_id.as_str(),
                     artifact.part_id.as_ref().map(PartId::as_str),
@@ -201,6 +279,241 @@ impl SqliteSessionStore {
             ))
         })?;
         Ok(Artifact { row, reader })
+    }
+
+    pub fn create_session(
+        &self,
+        session_id: SessionId,
+        session: CreateSession,
+    ) -> Result<(), SqliteStoreError> {
+        self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO sessions (
+                    id,
+                    title,
+                    source,
+                    workspace_root,
+                    system_prompt,
+                    settings_json,
+                    parent_id,
+                    version,
+                    slug,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                "#,
+                params![
+                    session_id.as_str(),
+                    session.title.as_deref(),
+                    session.source.as_str(),
+                    session.workspace_root.as_deref(),
+                    session.system_prompt.as_deref(),
+                    session.settings_json.as_str(),
+                    session.parent_id.as_ref().map(SessionId::as_str),
+                    session.version.as_str(),
+                    session.slug.as_deref(),
+                    session.created_at,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_session(&self, session_id: &SessionId) -> Result<SessionRow, SqliteStoreError> {
+        self.conn
+            .lock()
+            .expect("connection mutex poisoned")
+            .query_row(
+                r#"
+                SELECT
+                    id,
+                    title,
+                    source,
+                    workspace_root,
+                    system_prompt,
+                    settings_json,
+                    parent_id,
+                    version,
+                    slug,
+                    cost,
+                    tokens_input,
+                    tokens_output,
+                    tokens_reasoning,
+                    tokens_cache_read,
+                    tokens_cache_write,
+                    time_archived,
+                    time_compacting,
+                    revert_json,
+                    created_at,
+                    updated_at
+                FROM sessions
+                WHERE id = ?1
+                "#,
+                [session_id.as_str()],
+                read_session_row,
+            )
+            .map_err(|err| read_err(err, "session", session_id.as_str()))
+    }
+
+    pub fn update_session_settings(
+        &self,
+        session_id: &SessionId,
+        settings: SessionSettings,
+    ) -> Result<(), SqliteStoreError> {
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "UPDATE sessions SET settings_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![
+                    settings.settings_json.as_str(),
+                    settings.updated_at,
+                    session_id.as_str()
+                ],
+            )
+        })?;
+        ensure_row_changed(changed, "session", session_id.as_str())
+    }
+
+    pub fn update_session_cost(
+        &self,
+        session_id: &SessionId,
+        delta_cost: f64,
+        delta_tokens: TokenDelta,
+    ) -> Result<(), SqliteStoreError> {
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                UPDATE sessions
+                SET cost = cost + ?1,
+                    tokens_input = tokens_input + ?2,
+                    tokens_output = tokens_output + ?3,
+                    tokens_reasoning = tokens_reasoning + ?4,
+                    tokens_cache_read = tokens_cache_read + ?5,
+                    tokens_cache_write = tokens_cache_write + ?6
+                WHERE id = ?7
+                "#,
+                params![
+                    delta_cost,
+                    delta_tokens.input,
+                    delta_tokens.output,
+                    delta_tokens.reasoning,
+                    delta_tokens.cache_read,
+                    delta_tokens.cache_write,
+                    session_id.as_str(),
+                ],
+            )
+        })?;
+        ensure_row_changed(changed, "session", session_id.as_str())
+    }
+
+    pub fn reverse_session_cost(
+        &self,
+        session_id: &SessionId,
+        cost: f64,
+        tokens: TokenDelta,
+    ) -> Result<(), SqliteStoreError> {
+        self.update_session_cost(session_id, -cost, tokens.negated())
+    }
+
+    pub fn start_run(&self, run: StartRun) -> Result<(), SqliteStoreError> {
+        if !run.status.is_startable() {
+            return Err(invalid_run_status("start_run", run.status));
+        }
+
+        self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO runs (
+                    id,
+                    session_id,
+                    status,
+                    trigger,
+                    started_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    run.id.as_str(),
+                    run.session_id.as_str(),
+                    run.status.as_str(),
+                    run.trigger.as_deref(),
+                    run.started_at,
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
+    pub fn get_run(&self, run_id: &RunId) -> Result<RunRow, SqliteStoreError> {
+        self.conn
+            .lock()
+            .expect("connection mutex poisoned")
+            .query_row(
+                r#"
+                SELECT
+                    id,
+                    session_id,
+                    status,
+                    trigger,
+                    started_at,
+                    finished_at,
+                    error_json
+                FROM runs
+                WHERE id = ?1
+                "#,
+                [run_id.as_str()],
+                read_run_row,
+            )
+            .map_err(|err| read_err(err, "run", run_id.as_str()))
+    }
+
+    pub fn finish_run(
+        &self,
+        run_id: &RunId,
+        status: RunStatus,
+        finished_at: i64,
+        error_json: Option<String>,
+    ) -> Result<(), SqliteStoreError> {
+        if !status.is_terminal() {
+            return Err(invalid_run_status("finish_run", status));
+        }
+
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                UPDATE runs
+                SET status = ?1,
+                    finished_at = ?2,
+                    error_json = ?3
+                WHERE id = ?4
+                  AND status IN ('pending', 'running')
+                "#,
+                params![
+                    status.as_str(),
+                    finished_at,
+                    error_json.as_deref(),
+                    run_id.as_str(),
+                ],
+            )
+        })?;
+        if changed > 0 {
+            return Ok(());
+        }
+
+        match self.get_run(run_id) {
+            Ok(run) if is_terminal_status(&run.status) => {
+                Err(SqliteStoreError::InvalidRunTransition {
+                    id: run_id.to_string(),
+                    status: run.status,
+                })
+            }
+            Ok(_) => Err(SqliteStoreError::WriteFailed(format!(
+                "run `{run_id}` did not transition to {}",
+                status.as_str()
+            ))),
+            Err(err) => Err(err),
+        }
     }
 
     /// Run `op` inside a `BEGIN IMMEDIATE` transaction, committing on success.
@@ -556,7 +869,7 @@ fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
-fn artifact_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRow> {
+fn artifact_row_from_sql(row: &Row<'_>) -> rusqlite::Result<ArtifactRow> {
     let id: String = row.get(0)?;
     let session_id: String = row.get(1)?;
     let part_id: Option<String> = row.get(2)?;
@@ -575,6 +888,83 @@ fn artifact_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRo
     })
 }
 
+fn read_session_row(row: &Row<'_>) -> rusqlite::Result<SessionRow> {
+    let id: String = row.get("id")?;
+    let parent_id: Option<String> = row.get("parent_id")?;
+    Ok(SessionRow {
+        id: SessionId::new_unchecked(id),
+        title: row.get("title")?,
+        source: row.get("source")?,
+        workspace_root: row.get("workspace_root")?,
+        system_prompt: row.get("system_prompt")?,
+        settings_json: row.get("settings_json")?,
+        parent_id: parent_id.map(SessionId::new_unchecked),
+        version: row.get("version")?,
+        slug: row.get("slug")?,
+        cost: row.get("cost")?,
+        tokens_input: row.get("tokens_input")?,
+        tokens_output: row.get("tokens_output")?,
+        tokens_reasoning: row.get("tokens_reasoning")?,
+        tokens_cache_read: row.get("tokens_cache_read")?,
+        tokens_cache_write: row.get("tokens_cache_write")?,
+        time_archived: row.get("time_archived")?,
+        time_compacting: row.get("time_compacting")?,
+        revert_json: row.get("revert_json")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn read_run_row(row: &Row<'_>) -> rusqlite::Result<RunRow> {
+    let id: String = row.get("id")?;
+    let session_id: String = row.get("session_id")?;
+    Ok(RunRow {
+        id: RunId::new_unchecked(id),
+        session_id: SessionId::new_unchecked(session_id),
+        status: row.get("status")?,
+        trigger: row.get("trigger")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
+        error_json: row.get("error_json")?,
+    })
+}
+
+fn read_err(err: rusqlite::Error, entity: &'static str, id: &str) -> SqliteStoreError {
+    match err {
+        rusqlite::Error::QueryReturnedNoRows => SqliteStoreError::NotFound {
+            entity,
+            id: id.to_string(),
+        },
+        other => SqliteStoreError::ReadFailed(other.to_string()),
+    }
+}
+
+fn ensure_row_changed(
+    changed: usize,
+    entity: &'static str,
+    id: &str,
+) -> Result<(), SqliteStoreError> {
+    if changed == 0 {
+        Err(SqliteStoreError::NotFound {
+            entity,
+            id: id.to_string(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn invalid_run_status(operation: &'static str, status: RunStatus) -> SqliteStoreError {
+    SqliteStoreError::InvalidRunStatus {
+        operation,
+        status: status.as_str().to_string(),
+    }
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqliteStoreError {
     /// The database file could not be opened.
@@ -589,6 +979,15 @@ pub enum SqliteStoreError {
     ReadFailed(String),
     /// Schema migration or reconciliation failed.
     MigrationFailed(String),
+    /// A requested row does not exist.
+    NotFound { entity: &'static str, id: String },
+    /// The requested run status is not valid for this operation.
+    InvalidRunStatus {
+        operation: &'static str,
+        status: String,
+    },
+    /// A run has already reached a terminal status and cannot transition again.
+    InvalidRunTransition { id: String, status: String },
     /// An artifact row was not found.
     ArtifactNotFound(String),
     /// Artifact bytes could not be written to disk.
@@ -606,6 +1005,13 @@ impl std::fmt::Display for SqliteStoreError {
             Self::WriteFailed(msg) => write!(f, "write failed: {msg}"),
             Self::ReadFailed(msg) => write!(f, "read failed: {msg}"),
             Self::MigrationFailed(msg) => write!(f, "migration failed: {msg}"),
+            Self::NotFound { entity, id } => write!(f, "{entity} not found: {id}"),
+            Self::InvalidRunStatus { operation, status } => {
+                write!(f, "invalid run status for {operation}: {status}")
+            }
+            Self::InvalidRunTransition { id, status } => {
+                write!(f, "run is already terminal: {id} is {status}")
+            }
             Self::ArtifactNotFound(id) => write!(f, "artifact not found: {id}"),
             Self::BlobWriteFailed(msg) => write!(f, "blob write failed: {msg}"),
             Self::BlobReadFailed(msg) => write!(f, "blob read failed: {msg}"),
