@@ -62,10 +62,7 @@ export function VirtualHistoryRegion({
 			justifyContent="flex-end"
 		>
 			{messages.length === 0 ? (
-				<Box flexDirection="column" marginTop={1}>
-					<Text color={theme.accent} bold>
-						nav
-					</Text>
+				<Box marginTop={1}>
 					<Text color={theme.inactive}>
 						Ask a question, or type /model or /exit.
 					</Text>
