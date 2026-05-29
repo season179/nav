@@ -126,15 +126,22 @@ impl RunLoop {
                 emit: &mut emit,
             }) {
                 Ok(model_turn) => model_turn,
-                Err(OpenAiCompletionsError::Cancelled) => return RunLoopResult::Cancelled,
-                Err(error) => {
+                Err(stream_error) => {
+                    let ModelTurnStreamError {
+                        error,
+                        partial_output,
+                    } = *stream_error;
+                    if matches!(error, OpenAiCompletionsError::Cancelled) {
+                        return RunLoopResult::Cancelled;
+                    }
                     if let Some(journal) = journal
-                        && let Err(journal_error) = self.journal_error_payload(
+                        && let Err(journal_error) = self.flush_stream_error(
                             journal,
                             model,
-                            &error,
+                            partial_output,
                             request.run_id,
                             payload_sequence,
+                            &error,
                         )
                     {
                         return RunLoopResult::Failed(journal_error);
@@ -247,6 +254,63 @@ impl RunLoop {
         run_id: &RunId,
         sequence: u32,
     ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
+        self.journal_decoded_payload(
+            journal,
+            model,
+            output,
+            run_id,
+            sequence,
+            ProviderPayloadDirection::Response,
+        )
+    }
+
+    fn flush_stream_error(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        partial_output: Option<ModelTurnOutput>,
+        run_id: &RunId,
+        sequence: u32,
+        error: &OpenAiCompletionsError,
+    ) -> Result<(), OpenAiCompletionsError> {
+        let error_sequence = if let Some(partial_output) = partial_output {
+            self.journal_stream_batch_payload(journal, model, &partial_output, run_id, sequence)?;
+            sequence + 1
+        } else {
+            sequence
+        };
+
+        self.journal_error_payload(journal, model, error, run_id, error_sequence)?;
+        Ok(())
+    }
+
+    fn journal_stream_batch_payload(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        output: &ModelTurnOutput,
+        run_id: &RunId,
+        sequence: u32,
+    ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
+        self.journal_decoded_payload(
+            journal,
+            model,
+            output,
+            run_id,
+            sequence,
+            ProviderPayloadDirection::StreamBatch,
+        )
+    }
+
+    fn journal_decoded_payload(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        output: &ModelTurnOutput,
+        run_id: &RunId,
+        sequence: u32,
+        direction: ProviderPayloadDirection,
+    ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
         let raw_bytes = serde_json::to_vec(&output.response_payload).map_err(json_error)?;
         let created_at = next_turn_created_at(journal, run_id)?;
         let payload_id = append_provider_payload(
@@ -254,7 +318,7 @@ impl RunLoop {
             NewProviderPayload {
                 session_id: journal.session_id.clone(),
                 run_id: run_id.clone(),
-                direction: ProviderPayloadDirection::Response,
+                direction,
                 api_kind: api_kind_name(model).to_string(),
                 provider_id: Some(model.provider_id.clone()),
                 model_id: Some(model.model.id.clone()),
@@ -300,7 +364,7 @@ impl RunLoop {
     fn stream_model_turn<Ids, Emit>(
         &self,
         request: StreamModelTurnRequest<'_, Ids, Emit>,
-    ) -> Result<ModelTurnOutput, OpenAiCompletionsError>
+    ) -> Result<ModelTurnOutput, Box<ModelTurnStreamError>>
     where
         Ids: HarnessEventIdSource,
         Emit: FnMut(Vec<HarnessEventEnvelope>),
@@ -317,7 +381,7 @@ impl RunLoop {
         let mut capture = AssistantTurnCapture::default();
         let mut terminal_events = Vec::new();
 
-        runtime.block_on(self.client.stream_events_with_context(
+        let result = runtime.block_on(self.client.stream_events_with_context(
             model,
             completion_request,
             request_context,
@@ -331,18 +395,36 @@ impl RunLoop {
                     (emit)(stream_events);
                 }
             },
-        ))?;
+        ));
 
-        let tool_calls = capture.tool_calls.clone();
-        let response_payload = capture.response_payload();
-        let provider_response_id = capture.provider_response_id();
-        Ok(ModelTurnOutput {
-            assistant_turn: capture.to_turn(),
-            tool_calls,
-            terminal_events,
-            response_payload,
-            provider_response_id,
-        })
+        match result {
+            Ok(()) => Ok(capture.flush_completion(terminal_events)),
+            Err(error) => Err(Box::new(ModelTurnStreamError {
+                error,
+                partial_output: capture.flush_partial(),
+            })),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ModelTurnStreamError {
+    error: OpenAiCompletionsError,
+    partial_output: Option<ModelTurnOutput>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AssistantTurnFlushCursor {
+    flushed: bool,
+}
+
+impl AssistantTurnFlushCursor {
+    fn claim(&mut self) -> bool {
+        if self.flushed {
+            return false;
+        }
+        self.flushed = true;
+        true
     }
 }
 
@@ -536,6 +618,7 @@ struct AssistantTurnCapture {
     tool_calls: Vec<ToolCall>,
     finish_reason: Option<String>,
     metadata: Option<ProviderEventMetadata>,
+    flush_cursor: AssistantTurnFlushCursor,
 }
 
 impl AssistantTurnCapture {
@@ -592,6 +675,33 @@ impl AssistantTurnCapture {
                 self.text.clone(),
                 self.tool_calls.clone(),
             ))
+        }
+    }
+
+    fn flush_completion(&mut self, terminal_events: Vec<HarnessEventEnvelope>) -> ModelTurnOutput {
+        self.flush_cursor.claim();
+        self.output(terminal_events)
+    }
+
+    fn flush_partial(&mut self) -> Option<ModelTurnOutput> {
+        if !self.has_flushable_output() || !self.flush_cursor.claim() {
+            return None;
+        }
+
+        Some(self.output(Vec::new()))
+    }
+
+    fn has_flushable_output(&self) -> bool {
+        !self.text.is_empty() || !self.tool_calls.is_empty()
+    }
+
+    fn output(&self, terminal_events: Vec<HarnessEventEnvelope>) -> ModelTurnOutput {
+        ModelTurnOutput {
+            assistant_turn: self.to_turn(),
+            tool_calls: self.tool_calls.clone(),
+            terminal_events,
+            response_payload: self.response_payload(),
+            provider_response_id: self.provider_response_id(),
         }
     }
 

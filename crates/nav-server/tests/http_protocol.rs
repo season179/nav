@@ -512,13 +512,7 @@ fn completed_run_journals_provider_response_and_decoded_parts() {
         parts[0].provider_json_pointer.as_deref(),
         Some("/choices/0/message/content")
     );
-    assert_eq!(
-        parts[0].part,
-        Part::Text {
-            text: "journaled reply".to_string(),
-            synthetic: None,
-        }
-    );
+    assert_eq!(parts[0].part, text_part("journaled reply"));
 }
 
 #[test]
@@ -556,6 +550,87 @@ fn completed_run_journals_outgoing_provider_request_body() {
             .expect("request artifact should be JSON");
     assert_eq!(journaled_request, provider_request.body);
     assert_eq!(journaled_request["stream"], true);
+}
+
+#[test]
+fn completed_high_delta_stream_persists_one_assistant_part() {
+    let db = TestSessionDb::new("high-delta-stream-batch");
+    let deltas = (0..100)
+        .map(|index| format!("chunk-{index:03};"))
+        .collect::<Vec<_>>();
+    let mut chunks = deltas
+        .iter()
+        .map(|delta| {
+            provider_sse_chunk(
+                &json!({
+                    "id": "provider-run",
+                    "model": "vendor/model-large",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": delta },
+                        "finish_reason": null
+                    }]
+                })
+                .to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    chunks.push(provider_sse_chunk(
+        r#"{"id":"provider-run","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+    ));
+    chunks.push("data: [DONE]\n\n".to_string());
+    let provider = FakeProviderServer::start(200, "text/event-stream", chunks);
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let session_id = create_session(&mut server);
+
+    let run_id = send_message_text(&mut server, &session_id, "batch stream");
+
+    assert_eq!(provider.request().path, "/v1/chat/completions");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+    let events = parse_sse(
+        server
+            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
+            .body(),
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.name == "model.text_delta")
+            .count(),
+        deltas.len()
+    );
+    drop(server);
+
+    let expected_text = deltas.concat();
+    let store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    let run_id = RunId::try_new(run_id).expect("run id should parse");
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[1].1.len(), 1);
+    assert_eq!(turns[1].1[0].part, text_part(expected_text.clone()));
+
+    let payloads = store
+        .list_provider_payloads_for_run(&run_id)
+        .expect("provider payloads should list");
+    assert_eq!(
+        payloads
+            .iter()
+            .map(|payload| payload.direction.as_str())
+            .collect::<Vec<_>>(),
+        vec!["request", "response"]
+    );
+    let response_parts = store
+        .list_parts_for_provider_payload(&payloads[1].id)
+        .expect("response payload parts should list");
+    assert_eq!(response_parts.len(), 1);
+    assert_eq!(response_parts[0].part, text_part(expected_text));
 }
 
 #[test]
@@ -1345,6 +1420,71 @@ fn session_send_message_streams_delayed_provider_chunks_live_and_replays_midstre
 }
 
 #[test]
+fn streaming_delta_is_not_persisted_until_turn_boundary() {
+    let db = TestSessionDb::new("streaming-delta-turn-boundary");
+    let mut provider = delayed_chat_completions_provider();
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let session_id = SessionId::try_new(create_session(&mut server)).unwrap();
+    let subscription = server
+        .subscribe_session_events(&session_id, None)
+        .expect("session event subscription should open");
+
+    let run_id = send_message_text(&mut server, session_id.as_str(), "persist at boundary");
+    assert_eq!(provider.wait_for_request().path, "/v1/chat/completions");
+
+    let live_before_completion = receive_live_events(&subscription, 2);
+    assert_eq!(
+        envelope_event_names(&live_before_completion),
+        vec!["run.started", "model.text_delta"]
+    );
+    assert_model_text_delta(&live_before_completion[1], "hello ");
+
+    let store = SqliteSessionStore::open(db.path()).expect("store should open midstream");
+    let run_id = RunId::try_new(run_id).expect("run id should parse");
+    let midstream_turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should read midstream");
+    assert_eq!(midstream_turns.len(), 1);
+    assert_eq!(
+        midstream_turns[0].1[0].part,
+        text_part("persist at boundary")
+    );
+    let midstream_payloads = store
+        .list_provider_payloads_for_run(&run_id)
+        .expect("payloads should read midstream");
+    assert_eq!(
+        midstream_payloads
+            .iter()
+            .map(|payload| payload.direction.as_str())
+            .collect::<Vec<_>>(),
+        vec!["request"]
+    );
+    drop(store);
+
+    provider.release_completion();
+    let live_after_release = receive_live_events(&subscription, 3);
+    assert_eq!(
+        envelope_event_names(&live_after_release),
+        vec!["model.text_delta", "message.completed", "run.completed"]
+    );
+    assert_model_text_delta(&live_after_release[0], "Season");
+    wait_for_run_status(&server, run_id.as_str(), RunStatus::Completed);
+    drop(server);
+
+    let store = SqliteSessionStore::open(db.path()).expect("store should reopen after completion");
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should read after completion");
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[1].1[0].part, text_part("hello Season"));
+}
+
+#[test]
 fn session_send_message_publishes_provider_error_before_run_failed() {
     let db = TestSessionDb::new("provider-error-journal");
     let provider = FakeProviderServer::start(
@@ -1420,6 +1560,73 @@ fn session_send_message_publishes_provider_error_before_run_failed() {
     assert_eq!(error_payload["message"], "rate limit exceeded");
     assert_eq!(error_payload["error_type"], "rate_limit_error");
     assert_eq!(error_payload["code"], "rate_limit_exceeded");
+}
+
+#[test]
+fn stream_error_flushes_buffered_deltas_before_error_payload() {
+    let db = TestSessionDb::new("stream-error-flush");
+    let provider = FakeProviderServer::start(
+        200,
+        "text/event-stream",
+        vec![provider_sse_chunk(
+            r#"{"id":"provider-run","model":"vendor/model-large","choices":[{"index":0,"delta":{"content":"partial reply"},"finish_reason":null}]}"#,
+        )],
+    );
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let session_id = create_session(&mut server);
+
+    let run_id = send_message_text(&mut server, &session_id, "stream then fail");
+
+    assert_eq!(provider.request().path, "/v1/chat/completions");
+    wait_for_run_status(&server, &run_id, RunStatus::Failed);
+    let events = parse_sse(
+        server
+            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
+            .body(),
+    );
+    assert_eq!(
+        event_names(&events),
+        vec![
+            "session.created",
+            "run.started",
+            "model.text_delta",
+            "provider.error",
+            "run.failed",
+        ]
+    );
+    drop(server);
+
+    let store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    let run_id = RunId::try_new(run_id).expect("run id should parse");
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].1[0].part, text_part("stream then fail"));
+    assert_eq!(turns[1].1[0].part, text_part("partial reply"));
+
+    let payloads = store
+        .list_provider_payloads_for_run(&run_id)
+        .expect("provider payloads should list");
+    assert_eq!(
+        payloads
+            .iter()
+            .map(|payload| payload.direction.as_str())
+            .collect::<Vec<_>>(),
+        vec!["request", "stream_batch", "error"]
+    );
+    assert_eq!(payloads[1].decode_status, "decoded");
+    assert_eq!(payloads[2].decode_status, "pending");
+    let flushed_parts = store
+        .list_parts_for_provider_payload(&payloads[1].id)
+        .expect("flushed stream payload parts should list");
+    assert_eq!(flushed_parts.len(), 1);
+    assert_eq!(flushed_parts[0].part, text_part("partial reply"));
 }
 
 #[test]
@@ -2148,6 +2355,13 @@ fn artifact_bytes(store: &SqliteSessionStore, artifact_id: &nav_types::ArtifactI
         .read_to_end(&mut bytes)
         .expect("artifact bytes should read");
     bytes
+}
+
+fn text_part(text: impl Into<String>) -> Part {
+    Part::Text {
+        text: text.into(),
+        synthetic: None,
+    }
 }
 
 #[derive(Debug)]
