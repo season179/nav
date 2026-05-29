@@ -866,6 +866,21 @@ impl SqliteSessionStore {
         ensure_row_changed(changed, "session", session_id.as_str())
     }
 
+    pub fn update_session_title(
+        &self,
+        session_id: &SessionId,
+        title: &str,
+    ) -> Result<(), SqliteStoreError> {
+        let now = unix_millis();
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![title, now, session_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "session", session_id.as_str())
+    }
+
     pub fn update_session_cost(
         &self,
         session_id: &SessionId,
