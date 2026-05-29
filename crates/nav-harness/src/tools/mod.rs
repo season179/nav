@@ -10,12 +10,14 @@ pub mod ls;
 pub mod read;
 pub mod ripgrep;
 pub mod truncation;
+mod workspace_mutation;
 pub mod write;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +26,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 pub use nav_types::FileChangeKind;
+pub use workspace_mutation::WorkspaceMutationRecorder;
 
 use crate::guardrails::GuardrailRunner;
 use crate::workspace::path::WorkspacePathPolicy;
@@ -73,6 +76,7 @@ pub struct ToolContext {
     path_policy: Option<WorkspacePathPolicy>,
     guardrails: GuardrailRunner,
     output_sink: Option<ToolOutputSink>,
+    workspace_mutation_recorder: Option<WorkspaceMutationRecorder>,
 }
 
 impl ToolContext {
@@ -81,6 +85,7 @@ impl ToolContext {
             path_policy: Some(path_policy),
             guardrails: GuardrailRunner::default(),
             output_sink: None,
+            workspace_mutation_recorder: None,
         }
     }
 
@@ -94,6 +99,11 @@ impl ToolContext {
         self
     }
 
+    pub fn with_workspace_mutation_recorder(mut self, recorder: WorkspaceMutationRecorder) -> Self {
+        self.workspace_mutation_recorder = Some(recorder);
+        self
+    }
+
     pub fn path_policy(&self) -> Option<&WorkspacePathPolicy> {
         self.path_policy.as_ref()
     }
@@ -104,6 +114,22 @@ impl ToolContext {
 
     pub fn output_sink(&self) -> Option<&ToolOutputSink> {
         self.output_sink.as_ref()
+    }
+
+    pub fn capture_pre_workspace_mutation(&self, path: &Path) -> Result<(), ToolError> {
+        let Some(recorder) = &self.workspace_mutation_recorder else {
+            return Ok(());
+        };
+
+        recorder.capture_pre_mutation(path)
+    }
+
+    pub fn record_workspace_mutation_success(&self) -> Result<(), ToolError> {
+        let Some(recorder) = &self.workspace_mutation_recorder else {
+            return Ok(());
+        };
+
+        recorder.record_mutation_success()
     }
 }
 

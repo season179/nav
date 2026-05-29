@@ -88,7 +88,9 @@ async fn execute_write(
         return Err(ToolError::new("tool call cancelled"));
     }
     let kind = file_change_kind(resolved.path()).await;
+    ctx.capture_pre_workspace_mutation(resolved.path())?;
     atomic_write(resolved.path(), args.content.as_bytes()).await?;
+    ctx.record_workspace_mutation_success()?;
 
     Ok(ToolOutput::text(format!("wrote {}", args.path)).with_file_changed(changed_path, kind))
 }
@@ -228,13 +230,16 @@ fn temp_path_for(path: &Path) -> PathBuf {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
+    use nav_types::{MessageId, RunId, SessionId, ToolCallId};
     use serde_json::json;
 
     use super::WriteTool;
+    use crate::sessions::{CreateSession, ModelTurn, SessionStore, ToolCall};
     use crate::tools::{
         FileChangeKind, NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFileChange,
-        ToolPreset, ToolRegistry,
+        ToolPreset, ToolRegistry, WorkspaceMutationRecorder,
     };
     use crate::workspace::path::WorkspacePathPolicy;
 
@@ -333,6 +338,116 @@ mod tests {
             fs::read_to_string(workspace.root.join("notes.md"))
                 .expect("written file should be readable"),
             "new\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tool_records_snapshot_that_revert_restores_previous_file_contents() {
+        let workspace = TestWorkspace::new("snapshot_restore");
+        workspace.write("notes.md", "before\n");
+        let store = Arc::new(Mutex::new(SessionStore::default()));
+        let session_id = SessionId::try_new("019f2f6f-f178-7a72-9f28-000000000369").unwrap();
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000370").unwrap();
+        let assistant_message_id =
+            MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000371").unwrap();
+        let context = recorded_write_context(
+            &workspace,
+            &store,
+            &session_id,
+            run_id,
+            &assistant_message_id,
+            ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000372").unwrap(),
+        );
+
+        WriteTool
+            .execute(
+                &context,
+                json!({
+                    "path": "notes.md",
+                    "content": "after\n",
+                }),
+                ToolCancellationToken::new(),
+            )
+            .await
+            .expect("write should succeed");
+
+        assert_eq!(
+            fs::read_to_string(workspace.root.join("notes.md"))
+                .expect("written file should be readable"),
+            "after\n"
+        );
+        let revert_json = store
+            .lock()
+            .unwrap()
+            .get_session(&session_id)
+            .unwrap()
+            .revert_json
+            .expect("snapshot metadata should be recorded");
+        assert!(
+            revert_json.contains("art_"),
+            "revert metadata should reference a snapshot artifact: {revert_json}"
+        );
+
+        store.lock().unwrap().revert_to(&session_id).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(workspace.root.join("notes.md"))
+                .expect("reverted file should be readable"),
+            "before\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_tool_does_not_record_revert_metadata_when_write_fails_after_snapshot_capture() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TestWorkspace::new("snapshot_failed_write");
+        let locked_dir = workspace.root.join("locked");
+        fs::create_dir(&locked_dir).expect("locked directory should be created");
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o500))
+            .expect("locked directory should become unwritable");
+        let store = Arc::new(Mutex::new(SessionStore::default()));
+        let session_id = SessionId::try_new("019f2f6f-f178-7a72-9f28-000000000373").unwrap();
+        let run_id = RunId::try_new("019f2f6f-f178-7a72-9f28-000000000374").unwrap();
+        let assistant_message_id =
+            MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000375").unwrap();
+        let context = recorded_write_context(
+            &workspace,
+            &store,
+            &session_id,
+            run_id,
+            &assistant_message_id,
+            ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000376").unwrap(),
+        );
+
+        let result = WriteTool
+            .execute(
+                &context,
+                json!({
+                    "path": "locked/child.md",
+                    "content": "after\n",
+                }),
+                ToolCancellationToken::new(),
+            )
+            .await;
+
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o700))
+            .expect("locked directory permissions should be restored");
+        let error = result.expect_err("write should fail after snapshot capture");
+
+        assert!(
+            error.message().contains("failed to create temporary file"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_session(&session_id)
+                .unwrap()
+                .revert_json,
+            None
         );
     }
 
@@ -525,5 +640,61 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn recorded_write_context(
+        workspace: &TestWorkspace,
+        store: &Arc<Mutex<SessionStore>>,
+        session_id: &SessionId,
+        run_id: RunId,
+        assistant_message_id: &MessageId,
+        tool_call_id: ToolCallId,
+    ) -> ToolContext {
+        store
+            .lock()
+            .unwrap()
+            .create_session_with_record(
+                session_id.clone(),
+                CreateSession {
+                    title: None,
+                    source: "chat".to_string(),
+                    workspace_root: Some(workspace.root.display().to_string()),
+                    system_prompt: None,
+                    settings_json: "{}".to_string(),
+                    parent_id: None,
+                    version: "test".to_string(),
+                    slug: None,
+                    created_at: 1,
+                },
+            )
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .start_run(session_id, run_id.clone())
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .append_turn(
+                &run_id,
+                assistant_message_id.clone(),
+                ModelTurn::assistant_tool_calls(vec![ToolCall {
+                    id: "call_write".to_string(),
+                    tool_call_id: Some(tool_call_id),
+                    name: "write".to_string(),
+                    arguments: "{}".to_string(),
+                }]),
+            )
+            .unwrap();
+
+        ToolContext::with_path_policy(workspace.policy()).with_workspace_mutation_recorder(
+            WorkspaceMutationRecorder::new(
+                Arc::clone(store),
+                session_id.clone(),
+                assistant_message_id.clone(),
+                workspace.root.clone(),
+            ),
+        )
     }
 }

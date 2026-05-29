@@ -111,7 +111,9 @@ async fn execute_edit(
 
     let planned_edits = plan_edits(&original, &args)?;
     let next = apply_planned_edits(&original, &planned_edits);
+    ctx.capture_pre_workspace_mutation(resolved.path())?;
     super::write::atomic_write(resolved.path(), next.as_bytes()).await?;
+    ctx.record_workspace_mutation_success()?;
 
     Ok(ToolOutput::text(format!("edited {}", args.path))
         .with_file_changed(changed_path, super::FileChangeKind::Modified))

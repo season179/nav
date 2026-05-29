@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nav_types::{
-    MessageId, PartId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId, ToolCallId,
+    ArtifactId, MessageId, PartId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId,
+    ToolCallId,
 };
 use serde_json::{Value, json};
 
@@ -25,14 +26,15 @@ use crate::models::{
     ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
     OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
 };
+use crate::workspace::snapshot::{WORKSPACE_SNAPSHOT_MIME, WorkspaceSnapshot};
 
 use super::canonical::{
     ModelTurn, ModelTurnRole, Part, ToolCall, Turn, TurnMeta, TurnPart, TurnRole,
     canonical_tool_call_id_for_provider,
 };
 use super::sqlite::{
-    CreateSession, NewProviderPayload, ProviderState, RevertInfo, RunStatus, SqliteSessionStore,
-    SqliteStoreError, StartRun, StoredPart, StoredTurn,
+    Artifact, CreateSession, NewArtifact, NewProviderPayload, ProviderState, RevertInfo, RunStatus,
+    SqliteSessionStore, SqliteStoreError, StartRun, StoredPart, StoredTurn,
 };
 
 pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
@@ -241,6 +243,65 @@ impl SessionStore {
 
     pub fn clear_session_revert(&self, session_id: &SessionId) -> Result<(), SqliteStoreError> {
         self.sqlite.clear_session_revert(session_id)
+    }
+
+    pub fn put_artifact(
+        &self,
+        artifact: NewArtifact,
+        bytes: &[u8],
+    ) -> Result<ArtifactId, SqliteStoreError> {
+        self.sqlite.put_artifact(artifact, bytes)
+    }
+
+    pub fn get_artifact(&self, id: &ArtifactId) -> Result<Artifact, SqliteStoreError> {
+        self.sqlite.get_artifact(id)
+    }
+
+    pub fn revert_to(&self, session_id: &SessionId) -> Result<(), SqliteStoreError> {
+        let session = self.get_session(session_id)?;
+        let workspace_root = session.workspace_root.ok_or_else(|| {
+            SqliteStoreError::ReadFailed(format!(
+                "session `{session_id}` has no workspace root for revert"
+            ))
+        })?;
+        let workspace_root = Path::new(&workspace_root)
+            .canonicalize()
+            .map_err(|error| SqliteStoreError::ReadFailed(error.to_string()))?;
+        let revert_json = session
+            .revert_json
+            .ok_or_else(|| SqliteStoreError::NotFound {
+                entity: "session revert",
+                id: session_id.to_string(),
+            })?;
+        let revert = parse_revert_info(&revert_json)?;
+        let snapshot_id = revert.snapshot.ok_or_else(|| {
+            SqliteStoreError::ReadFailed(format!(
+                "session `{session_id}` revert metadata has no snapshot"
+            ))
+        })?;
+        let snapshot_id = ArtifactId::try_new(snapshot_id)
+            .map_err(|error| SqliteStoreError::ReadFailed(error.to_string()))?;
+        let mut artifact = self.get_artifact(&snapshot_id)?;
+        if artifact.row.session_id != *session_id {
+            return Err(SqliteStoreError::ReadFailed(format!(
+                "snapshot artifact `{snapshot_id}` does not belong to session `{session_id}`"
+            )));
+        }
+        if artifact.row.kind != "snapshot" || artifact.row.mime != WORKSPACE_SNAPSHOT_MIME {
+            return Err(SqliteStoreError::ReadFailed(format!(
+                "artifact `{snapshot_id}` is not a workspace snapshot"
+            )));
+        }
+        let mut bytes = Vec::new();
+        artifact
+            .reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| SqliteStoreError::BlobReadFailed(error.to_string()))?;
+        let snapshot = WorkspaceSnapshot::from_json_bytes(&bytes)
+            .map_err(|error| SqliteStoreError::ReadFailed(error.to_string()))?;
+        snapshot
+            .restore(&workspace_root)
+            .map_err(|error| SqliteStoreError::WriteFailed(error.to_string()))
     }
 
     pub fn compact_session(

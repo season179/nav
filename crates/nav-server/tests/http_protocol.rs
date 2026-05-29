@@ -1125,6 +1125,114 @@ fn session_send_message_executes_edit_tool_and_publishes_file_changed() {
 }
 
 #[test]
+fn session_send_message_records_snapshot_for_edit_write_sequence_and_revert_restores_workspace() {
+    let db = TestSessionDb::new("edit-write-revert");
+    let workspace = TestWorkspace::new("edit_write_revert");
+    workspace.write("agent.md", "hello\nold line\n");
+    let edit_arguments = json!({
+        "path": "agent.md",
+        "old_text": "old line",
+        "new_text": "new line",
+    })
+    .to_string();
+    let write_arguments = json!({
+        "path": "created/agent.md",
+        "content": "created by assistant\n",
+    })
+    .to_string();
+    let tool_call_chunk = json!({
+        "id": "provider-run-1",
+        "model": "vendor/model-large",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_edit_1",
+                        "type": "function",
+                        "function": {
+                            "name": "edit",
+                            "arguments": edit_arguments,
+                        },
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_write_1",
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "arguments": write_arguments,
+                        },
+                    },
+                ],
+            },
+            "finish_reason": null,
+        }],
+    });
+    let provider = SequencedProviderServer::start(vec![
+        vec![
+            provider_sse_chunk(&tool_call_chunk.to_string()),
+            provider_sse_chunk(
+                r#"{"id":"provider-run-1","model":"vendor/model-large","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ],
+        successful_provider_chunks("changes complete"),
+    ]);
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig {
+            session_db_path: Some(db.path().to_path_buf()),
+            ..HttpServerConfig::default()
+        },
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session_with_cwd(&mut server, workspace.root());
+
+    let run_id = send_message_text(&mut server, &session_id, "edit and write");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("agent.md"))
+            .expect("edit tool should update the existing file"),
+        "hello\nnew line\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("created/agent.md"))
+            .expect("write tool should create the requested file"),
+        "created by assistant\n"
+    );
+
+    let store = SessionStore::open(db.path()).expect("session store should reopen");
+    let parsed_session_id = SessionId::try_new(session_id).unwrap();
+    let revert_json = store
+        .get_session(&parsed_session_id)
+        .unwrap()
+        .revert_json
+        .expect("revert snapshot metadata should be recorded");
+    assert!(
+        revert_json.contains("art_"),
+        "revert metadata should reference a snapshot artifact: {revert_json}"
+    );
+
+    store.revert_to(&parsed_session_id).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(workspace.root().join("agent.md"))
+            .expect("reverted file should be readable"),
+        "hello\nold line\n"
+    );
+    assert!(
+        !workspace.root().join("created/agent.md").exists(),
+        "revert should remove files that did not exist before the assistant turn"
+    );
+    assert!(
+        !workspace.root().join("created").exists(),
+        "revert should remove parent directories created only for the assistant write"
+    );
+}
+
+#[test]
 fn session_send_message_approves_guarded_bash_tool_and_resumes_run() {
     let mut fixture = GuardedBashFixture::new("call_bash_approve", "bash handled");
     let (run_id, approval_id) = fixture.wait_for_approval_request();
