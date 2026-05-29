@@ -129,6 +129,32 @@ fn model_projection_skips_already_pruned_results_with_new_summary() {
 }
 
 #[test]
+fn model_projection_does_not_skip_content_that_looks_like_summary_but_is_not() {
+    // "[foo]: bar chars." has non-digit text before "chars." — should NOT be
+    // treated as a pruned summary and must be pruned normally.
+    // Use large content to exceed PRUNE_PROTECT_TOKENS.
+    let fake_summary = format!("[foo]: bar chars.{}", "x".repeat(10_000));
+    let mut turns = Vec::new();
+    for index in 0..20 {
+        let call_id = format!("call_{index}");
+        turns.push(ModelTurn::assistant_tool_calls(vec![tool_call(
+            &call_id, "bash",
+        )]));
+        turns.push(ModelTurn::tool_result(call_id, fake_summary.clone()));
+    }
+
+    project_model_turns_for_tool_result_pruning(&mut turns);
+
+    // At least some results should have been pruned with [bash] summary
+    let pruned_count = turns
+        .iter()
+        .flat_map(|t| t.parts.iter())
+        .filter(|p| matches!(p, TurnPart::ToolResult { content, .. } if content.starts_with("[bash]") && content != &fake_summary))
+        .count();
+    assert!(pruned_count > 0, "fake summaries should be pruned, not skipped");
+}
+
+#[test]
 fn model_projection_replaces_pruned_results_with_tool_summary() {
     let content = "a".repeat(12_000);
     let mut turns = Vec::new();

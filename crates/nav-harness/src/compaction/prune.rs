@@ -211,7 +211,21 @@ pub fn pruned_result_summary(tool_name: Option<&str>, content: &str) -> String {
 }
 
 fn is_pruned_summary(content: &str) -> bool {
-    content.starts_with('[')
-        && content.ends_with("chars.")
-        && content.contains("]:")
+    // Strict check: "[name]: <digits> chars."
+    let Some(rest) = content.strip_prefix('[') else {
+        return false;
+    };
+    let Some(after_bracket) = rest.find("]:") else {
+        return false;
+    };
+    if after_bracket == 0 {
+        return false; // empty tool name
+    }
+    let Some(after_sep) = rest[after_bracket..].strip_prefix("]: ") else {
+        return false;
+    };
+    let Some(digits) = after_sep.strip_suffix(" chars.") else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
