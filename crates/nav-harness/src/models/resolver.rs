@@ -111,6 +111,11 @@ impl ResolvedApiKey {
     pub fn expose_secret(&self) -> &str {
         &self.secret
     }
+
+    #[cfg(test)]
+    pub(crate) fn new(secret: impl Into<String>) -> Self {
+        Self { secret: secret.into() }
+    }
 }
 
 impl fmt::Debug for ResolvedApiKey {
