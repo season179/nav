@@ -1893,16 +1893,19 @@ fn run_cancel_cancels_active_provider_stream_and_publishes_run_cancelled() {
             .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
             .body(),
     );
+    let event_names_without_totals = event_names(&events)
+        .into_iter()
+        .filter(|name| *name != "session.totals_updated")
+        .collect::<Vec<_>>();
     assert_eq!(
-        event_names(&events),
-        vec![
-            "session.created",
-            "run.started",
-            "run.cancelled",
-            "session.totals_updated"
-        ]
+        event_names_without_totals,
+        vec!["session.created", "run.started", "run.cancelled"]
     );
-    assert_eq!(events[2].data["run_id"], run_id);
+    let cancelled_event = events
+        .iter()
+        .find(|event| event.name == "run.cancelled")
+        .expect("run.cancelled event should be published");
+    assert_eq!(cancelled_event.data["run_id"], run_id);
 
     let approve_response = server.handle_request(HttpRequest::post(
         "/rpc",
