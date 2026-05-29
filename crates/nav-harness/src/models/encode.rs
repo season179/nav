@@ -50,6 +50,12 @@ impl OpenAiChatCompletionsEncoder {
     }
 }
 
+impl Default for OpenAiChatCompletionsEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn encode_turn(turn: &Turn, parts: &[Part]) -> Vec<ChatCompletionRequestMessage> {
     let role = match turn.role {
         TurnRole::User => ChatCompletionMessageRole::User,

@@ -476,6 +476,7 @@ dependencies = [
  "anyhow",
  "nav-harness",
  "nav-server",
+ "nav-types",
  "serde_json",
 ]
 

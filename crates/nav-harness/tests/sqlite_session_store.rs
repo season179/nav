@@ -894,6 +894,38 @@ fn provider_payload_append_persists_pending_row_and_raw_bytes() {
 }
 
 #[test]
+fn request_provider_payload_append_is_ignored_by_default() {
+    let data_dir = TempDataDir::new("provider-payload-request-ignored");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000345");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000346");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    let payload_id = store
+        .append_provider_payload(NewProviderPayload {
+            session_id,
+            run_id,
+            direction: ProviderPayloadDirection::Request,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_request".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: br#"{"messages":[]}"#.to_vec(),
+            created_at: 3_000,
+        })
+        .expect("provider payload append should commit");
+
+    let row = store
+        .get_provider_payload(&payload_id)
+        .expect("provider payload row should be readable");
+    assert_eq!(row.direction, "request");
+    assert_eq!(row.decode_status, "ignored");
+    assert_eq!(row.decoder_version, None);
+}
+
+#[test]
 fn failed_provider_payload_append_does_not_commit_artifact_row() {
     let data_dir = TempDataDir::new("provider-payload-append-rollback");
     let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");

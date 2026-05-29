@@ -9,15 +9,15 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use nav_types::{
     ArtifactId, ArtifactRow, MessageId, PartId, ProviderPayloadId, ProviderPayloadRow, RunId,
     RunRow, SessionId, SessionRow, StorageCursor,
 };
-use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
 
 use crate::models::{DecodedProviderPayload, DecodedTurn};
 
@@ -139,6 +139,15 @@ impl DecodeStatus {
             Self::Failed => "failed",
             Self::Ignored => "ignored",
         }
+    }
+}
+
+fn initial_decode_status(direction: ProviderPayloadDirection) -> &'static str {
+    match direction {
+        ProviderPayloadDirection::Request => "ignored",
+        ProviderPayloadDirection::Response
+        | ProviderPayloadDirection::StreamBatch
+        | ProviderPayloadDirection::Error => "pending",
     }
 }
 
@@ -386,9 +395,10 @@ impl SqliteSessionStore {
                     provider_payload_id,
                     artifact_id,
                     sha256,
+                    decode_status,
                     created_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 "#,
                 params![
                     id.as_str(),
@@ -402,6 +412,7 @@ impl SqliteSessionStore {
                     payload.provider_payload_id.as_deref(),
                     stored_artifact_id.as_str(),
                     sha256.as_str(),
+                    initial_decode_status(payload.direction),
                     payload.created_at,
                 ],
             )
@@ -485,6 +496,80 @@ impl SqliteSessionStore {
         Ok(payloads)
     }
 
+    pub fn list_decoded_provider_payloads(
+        &self,
+    ) -> Result<Vec<ProviderPayloadRow>, SqliteStoreError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let mut statement = conn
+            .prepare(
+                r#"
+                SELECT
+                    id,
+                    session_id,
+                    run_id,
+                    direction,
+                    api_kind,
+                    provider_id,
+                    model_id,
+                    sequence,
+                    provider_payload_id,
+                    artifact_id,
+                    sha256,
+                    decoder_version,
+                    decode_status,
+                    error_json,
+                    created_at,
+                    decoded_at
+                FROM provider_payloads
+                WHERE decode_status IN ('decoded', 'decoded_with_unknowns')
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
+        let rows = statement
+            .query_map([], read_provider_payload_row)
+            .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
+
+        let mut payloads = Vec::new();
+        for row in rows {
+            payloads.push(row.map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?);
+        }
+        Ok(payloads)
+    }
+
+    pub fn list_parts_for_provider_payload(
+        &self,
+        id: &ProviderPayloadId,
+    ) -> Result<Vec<StoredPart>, SqliteStoreError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let mut statement = conn
+            .prepare(
+                r#"
+                SELECT
+                    turn_parts.id,
+                    turn_parts.data_json,
+                    turn_parts.provider_payload_id,
+                    turn_parts.provider_json_pointer,
+                    turn_parts.compacted_at,
+                    turn_parts.created_at
+                FROM turn_parts
+                JOIN turns ON turns.id = turn_parts.turn_id
+                WHERE turn_parts.provider_payload_id = ?1
+                ORDER BY turns.seq ASC, turn_parts.created_at ASC, turn_parts.id ASC
+                "#,
+            )
+            .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
+        let rows = statement
+            .query_map([id.as_str()], read_stored_part)
+            .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
+
+        let mut parts = Vec::new();
+        for row in rows {
+            parts.push(row.map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?);
+        }
+        Ok(parts)
+    }
+
     pub fn mark_provider_payload_decoded(
         &self,
         id: &ProviderPayloadId,
@@ -502,6 +587,49 @@ impl SqliteSessionStore {
                 WHERE id = ?4
                 "#,
                 params![decoder_version, status.as_str(), unix_millis(), id.as_str(),],
+            )
+        })?;
+        ensure_row_changed(changed, "provider payload", id.as_str())
+    }
+
+    pub fn mark_provider_payload_failed(
+        &self,
+        id: &ProviderPayloadId,
+        decoder_version: &str,
+        error_json: &str,
+    ) -> Result<(), SqliteStoreError> {
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                UPDATE provider_payloads
+                SET decoder_version = ?1,
+                    decode_status = 'failed',
+                    error_json = ?2,
+                    decoded_at = ?3
+                WHERE id = ?4
+                "#,
+                params![decoder_version, error_json, unix_millis(), id.as_str(),],
+            )
+        })?;
+        ensure_row_changed(changed, "provider payload", id.as_str())
+    }
+
+    pub fn mark_provider_payload_ignored(
+        &self,
+        id: &ProviderPayloadId,
+        reason_json: &str,
+    ) -> Result<(), SqliteStoreError> {
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                UPDATE provider_payloads
+                SET decoder_version = NULL,
+                    decode_status = 'ignored',
+                    error_json = ?1,
+                    decoded_at = ?2
+                WHERE id = ?3
+                "#,
+                params![reason_json, unix_millis(), id.as_str(),],
             )
         })?;
         ensure_row_changed(changed, "provider payload", id.as_str())
