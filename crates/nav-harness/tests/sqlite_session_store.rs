@@ -2,14 +2,15 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use nav_harness::models::{
-    Decoder, OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
+    DecodedPart, DecodedProviderPayload, DecodedTurn, Decoder, OpenAiChatCompletionsDecodeInput,
+    OpenAiChatCompletionsDecoder,
 };
 use nav_harness::sessions::{
-    CreateSession, DecodeStatus, NewProviderPayload, Part, ProviderPayloadDirection, RunStatus,
-    SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun, TokenDelta, Turn, TurnMeta,
-    TurnRole,
+    CreateSession, DecodeStatus, NewProviderPayload, Part, ProviderPayloadDirection, ProviderState,
+    RunStatus, SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun, TokenDelta,
+    TokenUsage, Turn, TurnMeta, TurnRole,
 };
-use nav_types::{MessageId, RunId, SessionId, ToolCallId};
+use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId, ToolCallId};
 
 struct TempDb {
     path: PathBuf,
@@ -95,6 +96,46 @@ fn text_part(text: impl Into<String>) -> Part {
     }
 }
 
+fn token_usage(
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> TokenUsage {
+    TokenUsage {
+        input,
+        output,
+        reasoning,
+        cache_read,
+        cache_write,
+    }
+}
+
+fn token_delta(
+    input: i64,
+    output: i64,
+    reasoning: i64,
+    cache_read: i64,
+    cache_write: i64,
+) -> TokenDelta {
+    TokenDelta {
+        input,
+        output,
+        reasoning,
+        cache_read,
+        cache_write,
+    }
+}
+
+fn provider_state(run_id: RunId, previous_response_id: &str) -> ProviderState {
+    ProviderState {
+        run_id,
+        api_kind: "openai_responses".to_string(),
+        state_json: format!(r#"{{"previous_response_id":"{previous_response_id}"}}"#),
+    }
+}
+
 fn create_minimal_session(store: &SqliteSessionStore, session_id: SessionId) {
     store
         .create_session(
@@ -131,6 +172,14 @@ fn count_artifacts(store: &SqliteSessionStore) -> i64 {
     store
         .execute_write(|tx| tx.query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0)))
         .expect("artifact count should be readable")
+}
+
+fn count_provider_state(store: &SqliteSessionStore) -> i64 {
+    store
+        .execute_write(|tx| {
+            tx.query_row("SELECT COUNT(*) FROM provider_state", [], |row| row.get(0))
+        })
+        .expect("provider_state count should be readable")
 }
 
 #[test]
@@ -377,6 +426,118 @@ fn update_part_replaces_stored_part_payload() {
             provider_hint: Some("reasoning".to_string()),
         }
     );
+}
+
+#[test]
+fn update_step_finish_part_rebalances_session_cost() {
+    let db = TempDb::new("turn-part-step-finish-update-cost");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000492");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000493");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000494");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id,
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_100,
+            },
+            vec![Part::StepFinish {
+                reason: "stop".to_string(),
+                cost: 0.10,
+                tokens: token_usage(1, 2, 3, 4, 5),
+                snapshot: None,
+            }],
+        )
+        .expect("turn append should commit");
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1[0]
+        .id
+        .clone();
+    store
+        .update_session_cost(&session_id, 0.10, token_delta(1, 2, 3, 4, 5))
+        .expect("initial cost should commit");
+
+    store
+        .update_part(
+            &part_id,
+            Part::StepFinish {
+                reason: "length".to_string(),
+                cost: 0.25,
+                tokens: token_usage(10, 20, 30, 40, 50),
+                snapshot: None,
+            },
+        )
+        .expect("step finish update should commit");
+
+    let session = store
+        .get_session(&session_id)
+        .expect("session should be readable after cost rebalance");
+    assert_eq!(session.cost, 0.25);
+    assert_eq!(session.tokens_input, 10);
+    assert_eq!(session.tokens_output, 20);
+    assert_eq!(session.tokens_reasoning, 30);
+    assert_eq!(session.tokens_cache_read, 40);
+    assert_eq!(session.tokens_cache_write, 50);
+}
+
+#[test]
+fn remove_step_finish_part_reverses_session_cost() {
+    let db = TempDb::new("turn-part-step-finish-remove-cost");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000495");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000496");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000497");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_200,
+            },
+            vec![Part::StepFinish {
+                reason: "stop".to_string(),
+                cost: 0.30,
+                tokens: token_usage(3, 6, 9, 12, 15),
+                snapshot: None,
+            }],
+        )
+        .expect("turn append should commit");
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1[0]
+        .id
+        .clone();
+    store
+        .update_session_cost(&session_id, 0.30, token_delta(3, 6, 9, 12, 15))
+        .expect("initial cost should commit");
+
+    store
+        .remove_part(&turn_id, &part_id)
+        .expect("step finish remove should commit");
+
+    let session = store
+        .get_session(&session_id)
+        .expect("session should be readable after cost reversal");
+    assert_eq!(session.cost, 0.0);
+    assert_eq!(session.tokens_input, 0);
+    assert_eq!(session.tokens_output, 0);
+    assert_eq!(session.tokens_reasoning, 0);
+    assert_eq!(session.tokens_cache_read, 0);
+    assert_eq!(session.tokens_cache_write, 0);
 }
 
 #[test]
@@ -1468,6 +1629,256 @@ fn decoded_provider_payload_appends_turn_parts_with_provenance_and_status() {
 }
 
 #[test]
+fn decoded_step_finish_parts_accumulate_session_cost() {
+    let data_dir = TempDataDir::new("provider-payload-cost-accumulation");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000487");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000488");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    let iterations = [
+        (0.01, token_usage(1, 2, 3, 4, 5)),
+        (0.02, token_usage(6, 7, 8, 9, 10)),
+        (0.03, token_usage(11, 12, 13, 14, 15)),
+        (0.04, token_usage(16, 17, 18, 19, 20)),
+        (0.05, token_usage(21, 22, 23, 24, 25)),
+    ];
+
+    for (index, (cost, tokens)) in iterations.iter().enumerate() {
+        let payload_id = append_test_response_payload(
+            &store,
+            session_id.clone(),
+            run_id.clone(),
+            index as u32,
+            3_000 + index as i64,
+        );
+        let decoded = decoded_step_finish_payload(
+            &payload_id,
+            &run_id,
+            4_000 + index as i64,
+            *cost,
+            tokens.clone(),
+        );
+
+        store
+            .append_decoded_provider_payload(
+                &payload_id,
+                "openai-chat-completions-decoder@1",
+                &decoded,
+            )
+            .expect("decoded iteration should commit");
+    }
+
+    let session = store
+        .get_session(&session_id)
+        .expect("session should be readable after cost accumulation");
+    assert!((session.cost - 0.15).abs() < f64::EPSILON);
+    assert_eq!(session.tokens_input, 55);
+    assert_eq!(session.tokens_output, 60);
+    assert_eq!(session.tokens_reasoning, 65);
+    assert_eq!(session.tokens_cache_read, 70);
+    assert_eq!(session.tokens_cache_write, 75);
+}
+
+#[test]
+fn decoded_payload_provider_state_failure_rolls_back_iteration() {
+    let data_dir = TempDataDir::new("provider-payload-iteration-rollback");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000489");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000490");
+    let missing_run_id = RunId::new_unchecked("019e7000-0000-7000-8000-000000000491");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    let payload_id =
+        append_test_response_payload(&store, session_id.clone(), run_id.clone(), 0, 3_000);
+    let decoded = decoded_step_finish_payload(
+        &payload_id,
+        &run_id,
+        4_000,
+        0.25,
+        token_usage(10, 20, 30, 40, 50),
+    );
+
+    let err = store
+        .append_decoded_provider_payload_with_provider_state(
+            &payload_id,
+            "openai-chat-completions-decoder@1",
+            &decoded,
+            Some(&provider_state(missing_run_id, "resp_bad")),
+        )
+        .expect_err("provider_state foreign key failure should roll back iteration");
+    assert!(
+        err.to_string()
+            .contains("does not match provider payload run"),
+        "unexpected error: {err}"
+    );
+
+    let payload = store
+        .get_provider_payload(&payload_id)
+        .expect("payload should remain readable after rollback");
+    assert_eq!(payload.decode_status, "pending");
+    assert_eq!(payload.decoder_version, None);
+    assert!(
+        store
+            .list_turns_for_run(&run_id)
+            .expect("turns should be readable after rollback")
+            .is_empty()
+    );
+    assert_eq!(count_provider_state(&store), 0);
+    let session = store
+        .get_session(&session_id)
+        .expect("session should be readable after rollback");
+    assert_eq!(session.cost, 0.0);
+    assert_eq!(session.tokens_input, 0);
+
+    store
+        .append_decoded_provider_payload_with_provider_state(
+            &payload_id,
+            "openai-chat-completions-decoder@1",
+            &decoded,
+            Some(&provider_state(run_id.clone(), "resp_ok")),
+        )
+        .expect("valid provider_state should commit with decoded iteration");
+
+    let provider_state = store
+        .get_provider_state(&run_id)
+        .expect("provider_state read should succeed")
+        .expect("provider_state should be present after commit");
+    assert_eq!(provider_state.api_kind, "openai_responses");
+    assert_eq!(
+        provider_state.state_json,
+        r#"{"previous_response_id":"resp_ok"}"#
+    );
+    let session = store
+        .get_session(&session_id)
+        .expect("session should be readable after commit");
+    assert_eq!(session.cost, 0.25);
+    assert_eq!(session.tokens_input, 10);
+}
+
+#[test]
+fn decoded_payload_rejects_provider_state_for_another_run() {
+    let data_dir = TempDataDir::new("provider-payload-provider-state-run-mismatch");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000498");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000499");
+    let other_run_id = RunId::new_unchecked("019e7000-0000-7000-8000-000000000500");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    store
+        .start_run(StartRun {
+            id: other_run_id.clone(),
+            session_id: session_id.clone(),
+            status: RunStatus::Running,
+            trigger: Some("other".to_string()),
+            started_at: 2_100,
+        })
+        .expect("other run start should commit");
+
+    let payload_id =
+        append_test_response_payload(&store, session_id.clone(), run_id.clone(), 0, 3_000);
+    let decoded = decoded_step_finish_payload(
+        &payload_id,
+        &run_id,
+        4_000,
+        0.25,
+        token_usage(10, 20, 30, 40, 50),
+    );
+
+    let err = store
+        .append_decoded_provider_payload_with_provider_state(
+            &payload_id,
+            "openai-chat-completions-decoder@1",
+            &decoded,
+            Some(&provider_state(other_run_id.clone(), "resp_wrong_run")),
+        )
+        .expect_err("provider_state for another run should be rejected");
+    assert!(
+        err.to_string()
+            .contains("does not match provider payload run"),
+        "unexpected error: {err}"
+    );
+
+    let payload = store
+        .get_provider_payload(&payload_id)
+        .expect("payload should remain readable after rollback");
+    assert_eq!(payload.decode_status, "pending");
+    assert!(
+        store
+            .list_turns_for_run(&run_id)
+            .expect("turns should be readable after rollback")
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_provider_state(&other_run_id)
+            .expect("provider_state read should succeed")
+            .is_none()
+    );
+}
+
+#[test]
+fn decoded_payload_rejects_turns_for_another_run() {
+    let data_dir = TempDataDir::new("provider-payload-decoded-turn-run-mismatch");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000501");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000502");
+    let other_run_id = RunId::new_unchecked("019e7000-0000-7000-8000-000000000503");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    store
+        .start_run(StartRun {
+            id: other_run_id.clone(),
+            session_id: session_id.clone(),
+            status: RunStatus::Running,
+            trigger: Some("other".to_string()),
+            started_at: 2_100,
+        })
+        .expect("other run start should commit");
+
+    let payload_id =
+        append_test_response_payload(&store, session_id.clone(), run_id.clone(), 0, 3_000);
+    let decoded = decoded_step_finish_payload(
+        &payload_id,
+        &other_run_id,
+        4_000,
+        0.25,
+        token_usage(10, 20, 30, 40, 50),
+    );
+
+    let err = store
+        .append_decoded_provider_payload_with_provider_state(
+            &payload_id,
+            "openai-chat-completions-decoder@1",
+            &decoded,
+            Some(&provider_state(run_id.clone(), "resp_ok")),
+        )
+        .expect_err("decoded turns for another run should be rejected");
+    assert!(
+        err.to_string().contains("decoded turn run_id")
+            && err
+                .to_string()
+                .contains("does not match provider payload run"),
+        "unexpected error: {err}"
+    );
+
+    let payload = store
+        .get_provider_payload(&payload_id)
+        .expect("payload should remain readable after rollback");
+    assert_eq!(payload.decode_status, "pending");
+    assert!(
+        store
+            .list_turns_for_run(&other_run_id)
+            .expect("other run turns should be readable after rollback")
+            .is_empty()
+    );
+    assert!(
+        store
+            .get_provider_state(&run_id)
+            .expect("provider_state read should succeed")
+            .is_none()
+    );
+}
+
+#[test]
 fn failed_provider_payload_decode_leaves_envelope_pending_without_turns() {
     let data_dir = TempDataDir::new("provider-payload-decode-failed");
     let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
@@ -1521,6 +1932,63 @@ fn failed_provider_payload_decode_leaves_envelope_pending_without_turns() {
             .expect("turns should be readable")
             .is_empty()
     );
+    assert_eq!(count_provider_state(&store), 0);
+}
+
+fn append_test_response_payload(
+    store: &SqliteSessionStore,
+    session_id: SessionId,
+    run_id: RunId,
+    sequence: u32,
+    created_at: i64,
+) -> ProviderPayloadId {
+    store
+        .append_provider_payload(NewProviderPayload {
+            session_id,
+            run_id,
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence,
+            provider_payload_id: Some(format!("chatcmpl_{sequence}")),
+            mime: "application/json".to_string(),
+            raw_bytes: format!(r#"{{"id":"chatcmpl_{sequence}","choices":[]}}"#).into_bytes(),
+            created_at,
+        })
+        .expect("provider payload append should commit")
+}
+
+fn decoded_step_finish_payload(
+    payload_id: &ProviderPayloadId,
+    run_id: &RunId,
+    created_at: i64,
+    cost: f64,
+    tokens: TokenUsage,
+) -> DecodedProviderPayload {
+    DecodedProviderPayload {
+        status: DecodeStatus::Decoded,
+        turns: vec![DecodedTurn {
+            turn: Turn {
+                id: message_id(&format!("019e7000-0000-7000-8000-{created_at:012}")),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at,
+            },
+            parts: vec![DecodedPart {
+                part: Part::StepFinish {
+                    reason: "stop".to_string(),
+                    cost,
+                    tokens,
+                    snapshot: None,
+                },
+                provider_payload_id: payload_id.clone(),
+                provider_json_pointer: "/choices/0/finish_reason".to_string(),
+            }],
+        }],
+    }
 }
 
 #[test]

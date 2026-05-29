@@ -18,8 +18,8 @@ use super::canonical::{
     ModelTurn, ModelTurnRole, Part, ToolCall, Turn, TurnMeta, TurnPart, TurnRole,
 };
 use super::sqlite::{
-    CreateSession, NewProviderPayload, RunStatus, SqliteSessionStore, SqliteStoreError, StartRun,
-    StoredPart, StoredTurn,
+    CreateSession, NewProviderPayload, ProviderState, RunStatus, SqliteSessionStore,
+    SqliteStoreError, StartRun, StoredPart, StoredTurn,
 };
 
 pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
@@ -189,6 +189,33 @@ impl SessionStore {
     ) -> Result<(), SqliteStoreError> {
         self.sqlite
             .append_decoded_provider_payload(id, decoder_version, decoded)
+    }
+
+    pub fn append_decoded_provider_payload_with_provider_state(
+        &self,
+        id: &ProviderPayloadId,
+        decoder_version: &str,
+        decoded: &DecodedProviderPayload,
+        provider_state: Option<&ProviderState>,
+    ) -> Result<(), SqliteStoreError> {
+        self.sqlite
+            .append_decoded_provider_payload_with_provider_state(
+                id,
+                decoder_version,
+                decoded,
+                provider_state,
+            )
+    }
+
+    pub fn get_provider_state(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<ProviderState>, SqliteStoreError> {
+        self.sqlite.get_provider_state(run_id)
+    }
+
+    pub fn set_provider_state(&self, state: ProviderState) -> Result<(), SqliteStoreError> {
+        self.sqlite.set_provider_state(state)
     }
 
     pub fn next_turn_created_at_for_run(

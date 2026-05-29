@@ -17,11 +17,11 @@ use nav_types::{
     ArtifactId, ArtifactRow, MessageId, PartId, ProviderPayloadId, ProviderPayloadRow, RunId,
     RunRow, SessionId, SessionRow, StorageCursor,
 };
-use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use crate::models::{DecodedProviderPayload, DecodedTurn};
 
-use super::canonical::{Part, Turn, TurnRole};
+use super::canonical::{Part, TokenUsage, Turn, TurnRole};
 use super::migrate;
 
 /// Maximum number of `BEGIN IMMEDIATE` retries before giving up on a busy DB.
@@ -242,6 +242,13 @@ impl TokenDelta {
             cache_write: -self.cache_write,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderState {
+    pub run_id: RunId,
+    pub api_kind: String,
+    pub state_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -683,15 +690,30 @@ impl SqliteSessionStore {
         decoder_version: &str,
         decoded: &DecodedProviderPayload,
     ) -> Result<(), SqliteStoreError> {
+        self.append_decoded_provider_payload_with_provider_state(id, decoder_version, decoded, None)
+    }
+
+    pub fn append_decoded_provider_payload_with_provider_state(
+        &self,
+        id: &ProviderPayloadId,
+        decoder_version: &str,
+        decoded: &DecodedProviderPayload,
+        provider_state: Option<&ProviderState>,
+    ) -> Result<(), SqliteStoreError> {
         ensure_decoded_payload_references_id(id, decoded)?;
         let prepared_turns = decoded
             .turns
             .iter()
             .map(prepare_decoded_turn)
             .collect::<Result<Vec<_>, _>>()?;
+        let cost_delta = cost_delta_from_decoded(decoded)?;
 
         self.execute_write(|tx| {
-            ensure_provider_payload_exists(tx, id)?;
+            let payload_context = provider_payload_context(tx, id)?;
+            if let Some(provider_state) = provider_state {
+                ensure_provider_state_matches_payload(provider_state, &payload_context.run_id)?;
+            }
+            ensure_decoded_turns_match_payload(&prepared_turns, &payload_context.run_id)?;
             for turn in &prepared_turns {
                 insert_turn(tx, turn)?;
             }
@@ -714,8 +736,39 @@ impl SqliteSessionStore {
             if changed == 0 {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
             }
+            if let Some(provider_state) = provider_state {
+                set_provider_state_in_tx(tx, provider_state)?;
+            }
+            if cost_delta.has_value() {
+                update_session_cost_in_tx(tx, &payload_context.session_id, cost_delta)?;
+            }
             Ok(())
         })?;
+        Ok(())
+    }
+
+    pub fn get_provider_state(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<ProviderState>, SqliteStoreError> {
+        self.conn
+            .lock()
+            .expect("connection mutex poisoned")
+            .query_row(
+                r#"
+                SELECT run_id, api_kind, state_json
+                FROM provider_state
+                WHERE run_id = ?1
+                "#,
+                [run_id.as_str()],
+                read_provider_state,
+            )
+            .optional()
+            .map_err(|err| read_err(err, "provider_state", run_id.as_str()))
+    }
+
+    pub fn set_provider_state(&self, state: ProviderState) -> Result<(), SqliteStoreError> {
+        self.execute_write(|tx| set_provider_state_in_tx(tx, &state))?;
         Ok(())
     }
 
@@ -1094,7 +1147,10 @@ impl SqliteSessionStore {
         let type_name = part.type_name().to_string();
         let data_json = serialize_json(&part)?;
         let changed = self.execute_write(|tx| {
-            tx.execute(
+            let Some(existing) = read_existing_part(tx, part_id)? else {
+                return Ok(0);
+            };
+            let changed = tx.execute(
                 r#"
                 UPDATE turn_parts
                 SET type = ?1,
@@ -1102,7 +1158,14 @@ impl SqliteSessionStore {
                 WHERE id = ?3
                 "#,
                 params![type_name.as_str(), data_json.as_str(), part_id.as_str()],
-            )
+            )?;
+            if changed > 0 {
+                let cost_delta = cost_delta_for_part_replacement(&existing.part, &part)?;
+                if cost_delta.has_value() {
+                    update_session_cost_in_tx(tx, &existing.session_id, cost_delta)?;
+                }
+            }
+            Ok(changed)
         })?;
         ensure_row_changed(changed, "turn_part", part_id.as_str())
     }
@@ -1150,10 +1213,20 @@ impl SqliteSessionStore {
         part_id: &PartId,
     ) -> Result<(), SqliteStoreError> {
         let changed = self.execute_write(|tx| {
-            tx.execute(
+            let Some(existing) = read_existing_part_for_turn(tx, turn_id, part_id)? else {
+                return Ok(0);
+            };
+            let changed = tx.execute(
                 "DELETE FROM turn_parts WHERE id = ?1 AND turn_id = ?2",
                 params![part_id.as_str(), turn_id.as_str()],
-            )
+            )?;
+            if changed > 0 {
+                let cost_delta = cost_delta_for_part_removal(&existing.part)?;
+                if cost_delta.has_value() {
+                    update_session_cost_in_tx(tx, &existing.session_id, cost_delta)?;
+                }
+            }
+            Ok(changed)
         })?;
         ensure_row_changed(changed, "turn_part", part_id.as_str())
     }
@@ -1345,6 +1418,68 @@ struct PreparedPart {
     created_at: i64,
 }
 
+struct ExistingPart {
+    session_id: String,
+    part: Part,
+}
+
+struct ProviderPayloadContext {
+    session_id: String,
+    run_id: RunId,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CostDelta {
+    cost: f64,
+    tokens: TokenDelta,
+}
+
+impl CostDelta {
+    fn has_value(self) -> bool {
+        self.cost != 0.0 || self.tokens != TokenDelta::default()
+    }
+
+    fn add_part(&mut self, part: &Part) -> Result<(), String> {
+        if let Part::StepFinish { cost, tokens, .. } = part {
+            self.cost += cost;
+            self.add_tokens(tokens)?;
+        }
+        Ok(())
+    }
+
+    fn subtract_part(&mut self, part: &Part) -> Result<(), String> {
+        if let Part::StepFinish { cost, tokens, .. } = part {
+            self.cost -= cost;
+            self.subtract_tokens(tokens)?;
+        }
+        Ok(())
+    }
+
+    fn add_tokens(&mut self, tokens: &TokenUsage) -> Result<(), String> {
+        self.tokens.input = checked_token_add(self.tokens.input, tokens.input, "input")?;
+        self.tokens.output = checked_token_add(self.tokens.output, tokens.output, "output")?;
+        self.tokens.reasoning =
+            checked_token_add(self.tokens.reasoning, tokens.reasoning, "reasoning")?;
+        self.tokens.cache_read =
+            checked_token_add(self.tokens.cache_read, tokens.cache_read, "cache_read")?;
+        self.tokens.cache_write =
+            checked_token_add(self.tokens.cache_write, tokens.cache_write, "cache_write")?;
+        Ok(())
+    }
+
+    fn subtract_tokens(&mut self, tokens: &TokenUsage) -> Result<(), String> {
+        self.tokens.input = checked_token_sub(self.tokens.input, tokens.input, "input")?;
+        self.tokens.output = checked_token_sub(self.tokens.output, tokens.output, "output")?;
+        self.tokens.reasoning =
+            checked_token_sub(self.tokens.reasoning, tokens.reasoning, "reasoning")?;
+        self.tokens.cache_read =
+            checked_token_sub(self.tokens.cache_read, tokens.cache_read, "cache_read")?;
+        self.tokens.cache_write =
+            checked_token_sub(self.tokens.cache_write, tokens.cache_write, "cache_write")?;
+        Ok(())
+    }
+}
+
 fn prepare_turn(turn: &Turn, parts: &[Part]) -> Result<PreparedTurn, SqliteStoreError> {
     Ok(PreparedTurn {
         turn: turn.clone(),
@@ -1392,15 +1527,178 @@ fn ensure_decoded_payload_references_id(
     )))
 }
 
-fn ensure_provider_payload_exists(
+fn cost_delta_from_decoded(
+    decoded: &DecodedProviderPayload,
+) -> Result<CostDelta, SqliteStoreError> {
+    let mut delta = CostDelta::default();
+    for decoded_turn in &decoded.turns {
+        for decoded_part in &decoded_turn.parts {
+            delta
+                .add_part(&decoded_part.part)
+                .map_err(SqliteStoreError::WriteFailed)?;
+        }
+    }
+    Ok(delta)
+}
+
+fn cost_delta_for_part_replacement(old: &Part, new: &Part) -> rusqlite::Result<CostDelta> {
+    let mut delta = CostDelta::default();
+    delta.subtract_part(old).map_err(from_sql_error)?;
+    delta.add_part(new).map_err(from_sql_error)?;
+    Ok(delta)
+}
+
+fn cost_delta_for_part_removal(part: &Part) -> rusqlite::Result<CostDelta> {
+    let mut delta = CostDelta::default();
+    delta.subtract_part(part).map_err(from_sql_error)?;
+    Ok(delta)
+}
+
+fn checked_token_add(current: i64, next: u64, field: &str) -> Result<i64, String> {
+    let next = token_delta_i64(next, field)?;
+    current
+        .checked_add(next)
+        .ok_or_else(|| format!("StepFinish {field} token total overflows i64"))
+}
+
+fn checked_token_sub(current: i64, next: u64, field: &str) -> Result<i64, String> {
+    let next = token_delta_i64(next, field)?;
+    current
+        .checked_sub(next)
+        .ok_or_else(|| format!("StepFinish {field} token total overflows i64"))
+}
+
+fn token_delta_i64(value: u64, field: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("StepFinish {field} token delta overflows i64"))
+}
+
+fn provider_payload_context(
     tx: &Transaction,
     id: &ProviderPayloadId,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<ProviderPayloadContext> {
     tx.query_row(
-        "SELECT 1 FROM provider_payloads WHERE id = ?1",
+        "SELECT session_id, run_id FROM provider_payloads WHERE id = ?1",
         [id.as_str()],
-        |_| Ok(()),
+        |row| {
+            let run_id: String = row.get("run_id")?;
+            Ok(ProviderPayloadContext {
+                session_id: row.get("session_id")?,
+                run_id: RunId::new_unchecked(run_id),
+            })
+        },
     )
+}
+
+fn ensure_provider_state_matches_payload(
+    provider_state: &ProviderState,
+    payload_run_id: &RunId,
+) -> rusqlite::Result<()> {
+    if provider_state.run_id == *payload_run_id {
+        return Ok(());
+    }
+
+    Err(from_sql_error(format!(
+        "provider_state run_id `{}` does not match provider payload run `{}`",
+        provider_state.run_id, payload_run_id
+    )))
+}
+
+fn ensure_decoded_turns_match_payload(
+    turns: &[PreparedTurn],
+    payload_run_id: &RunId,
+) -> rusqlite::Result<()> {
+    for prepared in turns {
+        if prepared.turn.run_id != *payload_run_id {
+            return Err(from_sql_error(format!(
+                "decoded turn run_id `{}` does not match provider payload run `{}`",
+                prepared.turn.run_id, payload_run_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn update_session_cost_in_tx(
+    tx: &Transaction,
+    session_id: &str,
+    delta: CostDelta,
+) -> rusqlite::Result<()> {
+    let changed = tx.execute(
+        r#"
+        UPDATE sessions
+        SET cost = cost + ?1,
+            tokens_input = tokens_input + ?2,
+            tokens_output = tokens_output + ?3,
+            tokens_reasoning = tokens_reasoning + ?4,
+            tokens_cache_read = tokens_cache_read + ?5,
+            tokens_cache_write = tokens_cache_write + ?6
+        WHERE id = ?7
+        "#,
+        params![
+            delta.cost,
+            delta.tokens.input,
+            delta.tokens.output,
+            delta.tokens.reasoning,
+            delta.tokens.cache_read,
+            delta.tokens.cache_write,
+            session_id,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
+fn read_existing_part(
+    tx: &Transaction,
+    part_id: &PartId,
+) -> rusqlite::Result<Option<ExistingPart>> {
+    tx.query_row(
+        "SELECT session_id, data_json FROM turn_parts WHERE id = ?1",
+        [part_id.as_str()],
+        read_existing_part_row,
+    )
+    .optional()
+}
+
+fn read_existing_part_for_turn(
+    tx: &Transaction,
+    turn_id: &MessageId,
+    part_id: &PartId,
+) -> rusqlite::Result<Option<ExistingPart>> {
+    tx.query_row(
+        "SELECT session_id, data_json FROM turn_parts WHERE id = ?1 AND turn_id = ?2",
+        params![part_id.as_str(), turn_id.as_str()],
+        read_existing_part_row,
+    )
+    .optional()
+}
+
+fn read_existing_part_row(row: &Row<'_>) -> rusqlite::Result<ExistingPart> {
+    let data_json: String = row.get("data_json")?;
+    Ok(ExistingPart {
+        session_id: row.get("session_id")?,
+        part: parse_json(&data_json)?,
+    })
+}
+
+fn set_provider_state_in_tx(tx: &Transaction, state: &ProviderState) -> rusqlite::Result<()> {
+    tx.execute(
+        r#"
+        INSERT INTO provider_state (run_id, api_kind, state_json)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(run_id) DO UPDATE SET
+            api_kind = excluded.api_kind,
+            state_json = excluded.state_json
+        "#,
+        params![
+            state.run_id.as_str(),
+            state.api_kind.as_str(),
+            state.state_json.as_str(),
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_turn(tx: &Transaction, prepared: &PreparedTurn) -> rusqlite::Result<()> {
@@ -1888,6 +2186,15 @@ fn read_provider_payload_row(row: &Row<'_>) -> rusqlite::Result<ProviderPayloadR
         error_json: row.get("error_json")?,
         created_at: row.get("created_at")?,
         decoded_at: row.get("decoded_at")?,
+    })
+}
+
+fn read_provider_state(row: &Row<'_>) -> rusqlite::Result<ProviderState> {
+    let run_id: String = row.get("run_id")?;
+    Ok(ProviderState {
+        run_id: RunId::new_unchecked(run_id),
+        api_kind: row.get("api_kind")?,
+        state_json: row.get("state_json")?,
     })
 }
 
@@ -2524,6 +2831,7 @@ mod tests {
         assert_table_exists(&conn, "turn_parts");
         assert_table_exists(&conn, "artifacts");
         assert_table_exists(&conn, "provider_payloads");
+        assert_table_exists(&conn, "provider_state");
 
         assert_index_exists(&conn, "idx_runs_session_started");
         assert_index_exists(&conn, "idx_turns_run_seq");
@@ -2645,6 +2953,7 @@ mod tests {
         assert_table_missing(&conn, "turn_parts");
         assert_table_missing(&conn, "artifacts");
         assert_table_missing(&conn, "provider_payloads");
+        assert_table_missing(&conn, "provider_state");
     }
 
     #[test]
