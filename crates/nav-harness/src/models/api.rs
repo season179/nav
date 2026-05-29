@@ -4,7 +4,12 @@ use serde::{Deserialize, Serialize};
 pub enum ApiKind {
     #[serde(rename = "openai-completions", alias = "openai_chat_completions")]
     OpenAiCompletions,
-    #[serde(rename = "chatgpt-subscription", alias = "chatgpt_subscription")]
+    #[serde(
+        rename = "chatgpt-subscription",
+        alias = "chatgpt_subscription",
+        alias = "codex-subscription",
+        alias = "codex_subscription"
+    )]
     ChatGptSubscription,
     #[serde(rename = "openai-responses", alias = "openai_responses")]
     OpenAiResponses,

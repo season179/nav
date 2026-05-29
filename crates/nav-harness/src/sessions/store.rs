@@ -11,7 +11,8 @@ use nav_types::{MessageId, ProviderPayloadId, ProviderPayloadRow, RunId, Session
 use serde_json::{Value, json};
 
 use crate::models::{
-    DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
+    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
+    ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
     OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
 };
 
@@ -25,7 +26,9 @@ use super::sqlite::{
 
 pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
     "openai-chat-completions-decoder@1";
+pub(crate) const CHATGPT_SUBSCRIPTION_DECODER_VERSION: &str = "chatgpt-subscription-decoder@1";
 pub(crate) const OPENAI_RESPONSES_DECODER_VERSION: &str = "openai-responses-decoder@1";
+pub(crate) const ANTHROPIC_MESSAGES_DECODER_VERSION: &str = "anthropic-messages-decoder@1";
 const UNKNOWN_DECODER_VERSION: &str = "unknown-decoder";
 
 const DEFAULT_PAYLOAD_DECODERS: &[PayloadDecoder] = &[
@@ -35,9 +38,24 @@ const DEFAULT_PAYLOAD_DECODERS: &[PayloadDecoder] = &[
         decode: decode_openai_chat_completions_payload,
     },
     PayloadDecoder {
+        api_kinds: &[
+            "chatgpt_subscription",
+            "chatgpt-subscription",
+            "codex_subscription",
+            "codex-subscription",
+        ],
+        version: CHATGPT_SUBSCRIPTION_DECODER_VERSION,
+        decode: decode_chatgpt_subscription_payload,
+    },
+    PayloadDecoder {
         api_kinds: &["openai_responses", "openai-responses"],
         version: OPENAI_RESPONSES_DECODER_VERSION,
         decode: decode_openai_responses_payload,
+    },
+    PayloadDecoder {
+        api_kinds: &["anthropic_messages", "anthropic-messages"],
+        version: ANTHROPIC_MESSAGES_DECODER_VERSION,
+        decode: decode_anthropic_messages_payload,
     },
 ];
 
@@ -479,12 +497,44 @@ fn decode_openai_chat_completions_payload(
         .map_err(|error| error.to_string())
 }
 
+fn decode_chatgpt_subscription_payload(
+    payload: &ProviderPayloadRow,
+    raw_json: Vec<u8>,
+) -> Result<DecodedProviderPayload, String> {
+    ChatGptSubscriptionDecoder::new()
+        .decode(&ChatGptSubscriptionDecodeInput {
+            provider_payload_id: payload.id.clone(),
+            raw_artifact_id: payload.artifact_id.clone(),
+            run_id: payload.run_id.clone(),
+            provider_id: payload.provider_id.clone(),
+            raw_json,
+            created_at: payload.created_at,
+        })
+        .map_err(|error| error.to_string())
+}
+
 fn decode_openai_responses_payload(
     payload: &ProviderPayloadRow,
     raw_json: Vec<u8>,
 ) -> Result<DecodedProviderPayload, String> {
     OpenAiResponsesDecoder::new()
         .decode(&OpenAiResponsesDecodeInput {
+            provider_payload_id: payload.id.clone(),
+            raw_artifact_id: payload.artifact_id.clone(),
+            run_id: payload.run_id.clone(),
+            provider_id: payload.provider_id.clone(),
+            raw_json,
+            created_at: payload.created_at,
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn decode_anthropic_messages_payload(
+    payload: &ProviderPayloadRow,
+    raw_json: Vec<u8>,
+) -> Result<DecodedProviderPayload, String> {
+    AnthropicMessagesDecoder::new()
+        .decode(&AnthropicMessagesDecodeInput {
             provider_payload_id: payload.id.clone(),
             raw_artifact_id: payload.artifact_id.clone(),
             run_id: payload.run_id.clone(),
@@ -809,6 +859,54 @@ mod tests {
     }
 
     #[test]
+    fn open_recovers_chatgpt_subscription_payload_and_keeps_raw_event_order() {
+        let raw_json = r#"{"events":[{"type":"response.created","response":{"id":"resp_sub_1","model":"gpt-5.1-codex"}},{"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":"enc_reasoning_1"}},{"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"hello "},{"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"Season"},{"type":"response.output_text.done","output_index":1,"content_index":0,"text":"hello Season"},{"type":"response.completed","response":{"id":"resp_sub_1","model":"gpt-5.1-codex","status":"completed"}}]}"#;
+        let (_data_dir, path, payload_id, run_id) = seed_provider_payload(
+            "pending-chatgpt-subscription-recovery",
+            "chatgpt-subscription",
+            ProviderPayloadDirection::StreamBatch,
+            raw_json.as_bytes().to_vec(),
+        );
+
+        let store = SessionStore::open(&path).expect("open should recover pending payloads");
+        let payload = store
+            .sqlite
+            .get_provider_payload(&payload_id)
+            .expect("payload should be readable after recovery");
+        assert_eq!(payload.decode_status, "decoded");
+        assert_eq!(
+            payload.decoder_version.as_deref(),
+            Some(CHATGPT_SUBSCRIPTION_DECODER_VERSION)
+        );
+
+        let turns = store
+            .sqlite
+            .list_turns_for_run(&run_id)
+            .expect("decoded turns should be readable");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].1.len(), 2);
+        assert_eq!(
+            turns[0].1[0].provider_json_pointer.as_deref(),
+            Some("/events/1/item/encrypted_content")
+        );
+        assert_eq!(
+            turns[0].1[1].provider_json_pointer.as_deref(),
+            Some("/events/4/text")
+        );
+
+        let mut artifact = store
+            .sqlite
+            .get_artifact(&payload.artifact_id)
+            .expect("raw payload artifact should be readable");
+        let mut recovered_raw = String::new();
+        artifact
+            .reader
+            .read_to_string(&mut recovered_raw)
+            .expect("raw payload artifact should be utf-8");
+        assert_eq!(recovered_raw, raw_json);
+    }
+
+    #[test]
     fn open_recovers_pending_provider_payloads_with_unknowns() {
         let (_data_dir, path, payload_id, run_id) = seed_provider_payload(
             "pending-decode-recovery-unknowns",
@@ -865,6 +963,40 @@ mod tests {
             turns[0].1[1].part,
             Part::Text {
                 text: "recovered responses".to_string(),
+                synthetic: None,
+            }
+        );
+    }
+
+    #[test]
+    fn open_recovers_pending_anthropic_messages_payloads() {
+        let (_data_dir, path, payload_id, run_id) = seed_provider_payload(
+            "pending-anthropic-messages-decode-recovery",
+            "anthropic-messages",
+            ProviderPayloadDirection::Response,
+            br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"recovered anthropic"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":3}}"#.to_vec(),
+        );
+
+        let store = SessionStore::open(&path).expect("open should recover pending payloads");
+        let payload = store
+            .sqlite
+            .get_provider_payload(&payload_id)
+            .expect("payload should be readable after recovery");
+        assert_eq!(payload.decode_status, "decoded");
+        assert_eq!(
+            payload.decoder_version.as_deref(),
+            Some(ANTHROPIC_MESSAGES_DECODER_VERSION)
+        );
+
+        let turns = store
+            .sqlite
+            .list_turns_for_run(&run_id)
+            .expect("decoded turns should be readable");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].1[1].part,
+            Part::Text {
+                text: "recovered anthropic".to_string(),
                 synthetic: None,
             }
         );
