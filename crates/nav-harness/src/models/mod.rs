@@ -14,17 +14,17 @@ pub use api::ApiKind;
 pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
 pub use config::{ModelRef, ModelSettings};
 pub use decode::Decoder;
-pub use encode::Encoder;
+pub use encode::{Encoder, OpenAiChatCompletionsEncoder};
 pub use model::{ModelConfig, ModelInput};
 pub use openai_completions::{
     ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessageRole,
     ChatCompletionRequestMessage, ChatCompletionRequestPlan, ChatCompletionResponse,
     ChatCompletionStreamChoice, ChatCompletionStreamChunk, ChatCompletionStreamEvent,
     ChatCompletionToolCall, ChatCompletionToolCallDelta, ChatCompletionToolCallFunction,
-    ChatCompletionToolCallFunctionDelta, ChatCompletionUsage, OpenAiCompletionsCancellationToken,
-    OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsProviderError,
-    OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, OpenAiCompletionsResponseParser,
-    OpenAiCompletionsStreamProviderError, ReasoningEffort,
+    ChatCompletionToolCallFunctionDelta, ChatCompletionToolDefinition, ChatCompletionUsage,
+    OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, OpenAiCompletionsError,
+    OpenAiCompletionsProviderError, OpenAiCompletionsRequest, OpenAiCompletionsRequestContext,
+    OpenAiCompletionsResponseParser, OpenAiCompletionsStreamProviderError, ReasoningEffort,
 };
 pub use provider::{ApiKeyConfig, ProviderConfig};
 pub use resolver::{ModelResolver, ResolveModelError, ResolvedApiKey, ResolvedModelConfig};

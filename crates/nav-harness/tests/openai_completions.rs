@@ -239,7 +239,7 @@ fn can_use_developer_role_for_non_reasoning_models_when_compat_allows_it() {
             &resolved,
             &OpenAiCompletionsRequest::new(vec![ChatCompletionRequestMessage {
                 role: ChatCompletionMessageRole::System,
-                content: Some("Use developer rules.".to_string()),
+                content: Some(serde_json::json!("Use developer rules.")),
                 tool_calls: None,
                 tool_call_id: None,
             }]),
