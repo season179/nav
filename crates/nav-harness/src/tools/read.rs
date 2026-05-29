@@ -2,7 +2,7 @@ use std::fs;
 
 use serde_json::{Value, json};
 
-use crate::tools::truncation::{TruncationOptions, truncate_output};
+use crate::tools::truncation::{TruncationOptions, truncate_output, READ_MAX_CHARS};
 
 use super::{
     NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput, ToolRegistry,
@@ -90,7 +90,14 @@ fn execute_read(
 
     let numbered = render_numbered_lines(&content, args.offset, args.limit);
     Ok(ToolOutput::text(
-        truncate_output(&numbered, TruncationOptions::default()).render(),
+        truncate_output(
+            &numbered,
+            TruncationOptions {
+                max_chars: READ_MAX_CHARS,
+                ..TruncationOptions::default()
+            },
+        )
+        .render(),
     ))
 }
 
@@ -199,6 +206,42 @@ mod tests {
         );
         assert!(output.content.contains("1: line 1"));
         assert!(!output.content.contains("2100: line 2100"));
+    }
+
+    #[tokio::test]
+    async fn read_tool_caps_output_at_read_max_chars() {
+        let workspace = TestWorkspace::new("read_char_cap");
+        // 5 lines × ~1000 chars each = ~5000 chars, well over READ_MAX_CHARS (4000)
+        let content = (1..=5)
+            .map(|i| format!("line_{i}: {}", "x".repeat(993)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        workspace.write("wide.txt", &content);
+        let context = ToolContext::with_path_policy(workspace.policy());
+
+        let output = ReadTool
+            .execute(
+                &context,
+                json!({ "path": "wide.txt" }),
+                ToolCancellationToken::new(),
+            )
+            .await
+            .expect("read should succeed");
+
+        // Truncation stops before exceeding max_chars; render() adds the marker
+        assert!(
+            output.content.chars().count() <= crate::tools::truncation::READ_MAX_CHARS + 20,
+            "read output should be capped near READ_MAX_CHARS, got {} chars",
+            output.content.chars().count()
+        );
+        assert!(
+            output
+                .content
+                .contains(crate::tools::truncation::TRUNCATED_MARKER),
+            "output should be truncated"
+        );
+        // First line should still be present (Head strategy)
+        assert!(output.content.contains("1: line_1:"));
     }
 
     struct TestWorkspace {
