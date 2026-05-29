@@ -367,6 +367,14 @@ impl HttpServer {
                     format!("failed to persist message: {error}"),
                 );
             }
+            if let Err(error) = session_store.clear_session_revert(&params.session_id) {
+                fail_started_run(&session_store, &run_id);
+                return rpc_error(
+                    request.id,
+                    -32603,
+                    format!("failed to clear revert metadata: {error}"),
+                );
+            }
             match session_store.try_turns(&params.session_id) {
                 Ok(turns) => turns,
                 Err(error) => {
@@ -590,23 +598,23 @@ impl HttpServer {
 
             // Auto-title generation after first successful exchange
             // This is done after the run status is updated so it doesn't block completion
-            if final_status == RunStatus::Completed {
-                if let Ok(model) = model_resolver.resolve_default() {
-                    let store_clone = Arc::clone(&session_store);
-                    let sid = session_id.clone();
-                    // Load the full turn history to check if this is the first exchange
-                    let all_turns = session_store
-                        .lock()
-                        .unwrap()
-                        .try_turns(&session_id)
-                        .unwrap_or_default();
-                    nav_harness::agents::auto_title::generate_session_title_after_first_exchange(
-                        &store_clone,
-                        &sid,
-                        &model,
-                        &all_turns,
-                    );
-                }
+            if final_status == RunStatus::Completed
+                && let Ok(model) = model_resolver.resolve_default()
+            {
+                let store_clone = Arc::clone(&session_store);
+                let sid = session_id.clone();
+                // Load the full turn history to check if this is the first exchange
+                let all_turns = session_store
+                    .lock()
+                    .unwrap()
+                    .try_turns(&session_id)
+                    .unwrap_or_default();
+                nav_harness::agents::auto_title::generate_session_title_after_first_exchange(
+                    &store_clone,
+                    &sid,
+                    &model,
+                    &all_turns,
+                );
             }
         });
     }

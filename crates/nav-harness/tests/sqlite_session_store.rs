@@ -7,10 +7,10 @@ use nav_harness::models::{
 };
 use nav_harness::sessions::{
     CreateSession, DecodeStatus, NewProviderPayload, Part, ProviderPayloadDirection, ProviderState,
-    RunStatus, SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun, TokenDelta,
-    TokenUsage, Turn, TurnMeta, TurnRole,
+    RevertInfo, RunStatus, SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun,
+    TokenDelta, TokenUsage, Turn, TurnMeta, TurnRole,
 };
-use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId, ToolCallId};
+use nav_types::{MessageId, PartId, ProviderPayloadId, RunId, SessionId, ToolCallId};
 
 struct TempDb {
     path: PathBuf,
@@ -830,6 +830,64 @@ fn sessions_can_be_created_read_and_settings_updated() {
     assert_eq!(updated.settings_json, r#"{"model":"new"}"#);
     assert_eq!(updated.created_at, 1_000);
     assert_eq!(updated.updated_at, 1_500);
+}
+
+#[test]
+fn update_session_revert_persists_reversible_assistant_turn_metadata() {
+    let db = TempDb::new("session-revert");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000538");
+    create_minimal_session(&store, session_id.clone());
+    let revert = RevertInfo {
+        message_id: message_id("019e7000-0000-7000-8000-000000000539"),
+        part_id: Some(PartId::new_unchecked(
+            "prt_0000018bcfe56800_0000000000000539",
+        )),
+        snapshot: Some("snapshot-before-assistant-turn".to_string()),
+        diff: Some("diff --git a/file.txt b/file.txt\n+assistant change\n".to_string()),
+    };
+
+    store
+        .update_session_revert(&session_id, &revert)
+        .expect("revert metadata update should commit");
+
+    let session = store
+        .get_session(&session_id)
+        .expect("updated session should be readable");
+    let revert_json = session
+        .revert_json
+        .expect("revert metadata should be present");
+    let stored: RevertInfo =
+        serde_json::from_str(&revert_json).expect("revert metadata should decode");
+
+    assert_eq!(stored, revert);
+}
+
+#[test]
+fn clear_session_revert_removes_reversible_assistant_turn_metadata() {
+    let db = TempDb::new("session-revert-clear");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000540");
+    create_minimal_session(&store, session_id.clone());
+    let revert = RevertInfo {
+        message_id: message_id("019e7000-0000-7000-8000-000000000541"),
+        part_id: None,
+        snapshot: Some("snapshot-before-continue".to_string()),
+        diff: Some("diff --git a/file.txt b/file.txt\n+assistant change\n".to_string()),
+    };
+    store
+        .update_session_revert(&session_id, &revert)
+        .expect("revert metadata update should commit");
+
+    store
+        .clear_session_revert(&session_id)
+        .expect("revert metadata clear should commit");
+
+    let session = store
+        .get_session(&session_id)
+        .expect("updated session should be readable");
+
+    assert_eq!(session.revert_json, None);
 }
 
 #[test]
