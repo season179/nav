@@ -22,6 +22,10 @@ use serde_json::Value;
 
 use crate::tools::{RiskClass, ToolContext, ToolOutput, ToolPreset};
 
+pub mod doom_loop;
+
+pub use doom_loop::{DoomLoopError, DoomLoopGuard};
+
 pub type GuardrailEngine = GuardrailRunner;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
