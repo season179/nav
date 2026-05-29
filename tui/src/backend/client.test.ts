@@ -65,6 +65,37 @@ describe('parseSse', () => {
 			}),
 		]);
 	});
+
+	test('parses session.totals_updated payload from SSE', () => {
+		const events: NavEvent[] = [];
+
+		parseSse(
+			[
+				'id: evt-totals',
+				'event: session.totals_updated',
+				'data: {"event_id":"evt-totals","session_id":"session-1","type":"session.totals_updated","cost":0.0523,"tokens_input":1500,"tokens_output":800,"tokens_reasoning":0,"tokens_cache_read":200,"tokens_cache_write":100}',
+				'',
+				'',
+			].join('\n'),
+			event => {
+				events.push(event);
+				return false;
+			},
+		);
+
+		expect(events).toEqual([
+			expect.objectContaining({
+				type: 'session.totals_updated',
+				sessionId: 'session-1',
+				cost: 0.0523,
+				tokensInput: 1500,
+				tokensOutput: 800,
+				tokensReasoning: 0,
+				tokensCacheRead: 200,
+				tokensCacheWrite: 100,
+			}),
+		]);
+	});
 });
 
 describe('readSseStream', () => {

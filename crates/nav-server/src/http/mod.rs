@@ -11,7 +11,7 @@ use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancell
 use nav_harness::sessions::{
     ConfirmationDecision, CreateSession, ModelTurn, PendingConfirmation, PendingConfirmationError,
     PendingConfirmationReceiver, PendingConfirmationRegistry, RunStatus as StoredRunStatus,
-    SessionStore, SqliteStoreError,
+    SessionStore, SessionTotals, SqliteStoreError,
 };
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, bash, edit, read, write};
 use nav_harness::workspace::path::WorkspacePathPolicy;
@@ -19,7 +19,8 @@ use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     JsonRpcVersion, ProtocolCapabilities, RunCancelParams, RunCancelResult, SessionCreateParams,
-    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, SettingsReloadResult,
+    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult,
+    SessionTotalsParams, SessionTotalsResult, SettingsReloadResult,
     ToolApproveParams, ToolConfirmationOutcome, ToolConfirmationResult, ToolRejectParams,
     ToolsPreset, methods,
 };
@@ -238,6 +239,7 @@ impl HttpServer {
             methods::INITIALIZE => self.handle_initialize(request),
             methods::SESSION_CREATE => self.handle_session_create(request),
             methods::SESSION_SEND_MESSAGE => self.handle_session_send_message(request),
+            methods::SESSION_TOTALS => self.handle_session_totals(request),
             methods::RUN_CANCEL => self.handle_run_cancel(request),
             methods::TOOL_APPROVE => self.handle_tool_approve(request),
             methods::TOOL_REJECT => self.handle_tool_reject(request),
@@ -318,6 +320,27 @@ impl HttpServer {
         self.append_event(event);
 
         rpc_result(request.id, SessionCreateResult { session_id })
+    }
+
+    fn handle_session_totals(&self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
+        let params = match parse_params::<SessionTotalsParams>(request.params) {
+            Ok(params) => params,
+            Err(error) => return rpc_error(request.id, -32602, error),
+        };
+
+        match self
+            .session_store
+            .lock()
+            .unwrap()
+            .get_session_totals(&params.session_id)
+        {
+            Ok(totals) => rpc_result(request.id, session_totals_result(totals)),
+            Err(error) => rpc_error(
+                request.id,
+                -32603,
+                format!("failed to get session totals: {error}"),
+            ),
+        }
     }
 
     fn handle_session_send_message(
@@ -562,6 +585,9 @@ impl HttpServer {
         let tool_preset = harness_tool_preset(session_metadata.tools_preset());
 
         thread::spawn(move || {
+            let ids_clone = Arc::clone(&ids);
+            let event_store_clone = Arc::clone(&event_store);
+
             let final_status = model_run_service.run(
                 &model_resolver,
                 ModelRunState::new(
@@ -595,6 +621,19 @@ impl HttpServer {
                 .lock()
                 .unwrap()
                 .finish_run(&run_id, stored_status);
+
+            // Emit session totals after each run completes
+            if let Ok(totals) = session_store
+                .lock()
+                .unwrap()
+                .get_session_totals(&session_id)
+            {
+                event_store_clone.lock().unwrap().append(EventEnvelope {
+                    event_id: ids_clone.lock().unwrap().next_event_id(),
+                    session_id: session_id.clone(),
+                    event: totals_updated_event(totals),
+                });
+            }
 
             // Auto-title generation after first successful exchange
             // This is done after the run status is updated so it doesn't block completion
@@ -812,6 +851,28 @@ fn stored_run_status(status: RunStatus) -> StoredRunStatus {
         RunStatus::Completed => StoredRunStatus::Completed,
         RunStatus::Failed => StoredRunStatus::Failed,
         RunStatus::Cancelled => StoredRunStatus::Cancelled,
+    }
+}
+
+fn totals_updated_event(totals: SessionTotals) -> BackendEvent {
+    BackendEvent::SessionTotalsUpdated {
+        cost: totals.cost,
+        tokens_input: totals.tokens_input,
+        tokens_output: totals.tokens_output,
+        tokens_reasoning: totals.tokens_reasoning,
+        tokens_cache_read: totals.tokens_cache_read,
+        tokens_cache_write: totals.tokens_cache_write,
+    }
+}
+
+fn session_totals_result(totals: SessionTotals) -> SessionTotalsResult {
+    SessionTotalsResult {
+        cost: totals.cost,
+        tokens_input: totals.tokens_input,
+        tokens_output: totals.tokens_output,
+        tokens_reasoning: totals.tokens_reasoning,
+        tokens_cache_read: totals.tokens_cache_read,
+        tokens_cache_write: totals.tokens_cache_write,
     }
 }
 

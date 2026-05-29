@@ -10,6 +10,7 @@ export type FileChangeKind = 'created' | 'modified' | 'deleted';
 
 const RPC_SESSION_CREATE = 'session.create';
 const RPC_SESSION_SEND_MESSAGE = 'session.sendMessage';
+const RPC_SESSION_TOTALS = 'session.totals';
 
 type SessionCreateParams = {
 	cwd?: string;
@@ -41,6 +42,15 @@ type ToolScopedEvent = RunScopedEvent & {
 
 export type NavEvent =
 	| (NavEventBase & {type: 'session.created'})
+	| (NavEventBase & {
+			type: 'session.totals_updated';
+			cost: number;
+			tokensInput: number;
+			tokensOutput: number;
+			tokensReasoning: number;
+			tokensCacheRead: number;
+			tokensCacheWrite: number;
+	  })
 	| (RunScopedEvent & {
 			type: 'run.started' | 'run.completed' | 'run.cancelled';
 	  })
@@ -133,6 +143,15 @@ export type SessionInfo = {
 	sessionId: string;
 	endpoint: string;
 	cwd: string;
+};
+
+export type SessionTotals = {
+	cost: number;
+	tokensInput: number;
+	tokensOutput: number;
+	tokensReasoning: number;
+	tokensCacheRead: number;
+	tokensCacheWrite: number;
 };
 
 type JsonRpcRequest = {
@@ -315,6 +334,16 @@ export class NavBackendClient {
 		const params: Record<string, string> = {approval_id: approvalId};
 		if (reason) params.reason = reason;
 		return this.callApprovalRpc(RPC_TOOL_REJECT, params);
+	}
+
+	async sessionTotals(): Promise<SessionTotals> {
+		if (!this.session) {
+			throw new Error('session is not connected');
+		}
+		const raw = (await this.callRpc(RPC_SESSION_TOTALS, {
+			sessionId: this.session.sessionId,
+		})) as Record<string, unknown>;
+		return parseSessionTotals(raw);
 	}
 
 	private async callApprovalRpc(
@@ -888,6 +917,17 @@ function decodeSseEvent(event: SseEventFrame, dataLines: string[]): NavEvent {
 				path: payload.path || '',
 				kind: fileChangeKind(payload.kind),
 			};
+		case 'session.totals_updated':
+			return {
+				...base,
+				type,
+				cost: payload.cost ?? 0,
+				tokensInput: payload.tokens_input ?? 0,
+				tokensOutput: payload.tokens_output ?? 0,
+				tokensReasoning: payload.tokens_reasoning ?? 0,
+				tokensCacheRead: payload.tokens_cache_read ?? 0,
+				tokensCacheWrite: payload.tokens_cache_write ?? 0,
+			};
 		case 'run.failed':
 			return {
 				...base,
@@ -962,4 +1002,15 @@ function fileChangeKind(kind: string | undefined): FileChangeKind | undefined {
 		return kind;
 	}
 	return undefined;
+}
+
+function parseSessionTotals(raw: Record<string, unknown>): SessionTotals {
+	return {
+		cost: (raw.cost as number) ?? 0,
+		tokensInput: (raw.tokensInput as number) ?? 0,
+		tokensOutput: (raw.tokensOutput as number) ?? 0,
+		tokensReasoning: (raw.tokensReasoning as number) ?? 0,
+		tokensCacheRead: (raw.tokensCacheRead as number) ?? 0,
+		tokensCacheWrite: (raw.tokensCacheWrite as number) ?? 0,
+	};
 }

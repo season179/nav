@@ -54,13 +54,13 @@ pub struct RunLoopRequest<'a> {
     pub cancellation_token: OpenAiCompletionsCancellationToken,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RunLoopCompletion {
     pub turns: Vec<ModelTurn>,
     pub terminal_events: Vec<HarnessEventEnvelope>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RunLoopResult {
     Completed(RunLoopCompletion),
     Cancelled,
@@ -615,7 +615,7 @@ where
     emit: &'a mut Emit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ModelTurnOutput {
     assistant_turn: Option<ModelTurn>,
     tool_calls: Vec<ToolCall>,

@@ -447,6 +447,7 @@ fn session_send_message_starts_run_and_streams_typed_sse_events() {
             "model.text_delta",
             "message.completed",
             "run.completed",
+            "session.totals_updated",
         ]
     );
     assert_protocol_event_ids(&events, session_id);
@@ -476,7 +477,7 @@ fn session_send_message_starts_run_and_streams_typed_sse_events() {
     let replayed_events = parse_sse(replay_response.body());
     assert_eq!(
         event_names(&replayed_events),
-        vec!["model.text_delta", "message.completed", "run.completed"]
+        vec!["model.text_delta", "message.completed", "run.completed", "session.totals_updated"]
     );
     assert_protocol_event_ids(&replayed_events, session_id);
 }
@@ -729,6 +730,7 @@ fn session_send_message_posts_provider_stream_and_publishes_provider_events() {
             "model.text_delta",
             "message.completed",
             "run.completed",
+            "session.totals_updated",
         ]
     );
     assert_eq!(events[2].data["delta"], "hello ");
@@ -877,6 +879,7 @@ fn session_send_message_returns_structured_tool_error_for_unknown_tool() {
             "model.text_delta",
             "message.completed",
             "run.completed",
+            "session.totals_updated",
         ]
     );
 
@@ -960,6 +963,7 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
             "model.text_delta",
             "message.completed",
             "run.completed",
+            "session.totals_updated",
         ]
     );
 }
@@ -1034,6 +1038,7 @@ fn session_send_message_executes_write_tool_and_publishes_file_changed() {
             "model.text_delta",
             "message.completed",
             "run.completed",
+            "session.totals_updated",
         ]
     );
     let file_changed = events
@@ -1184,7 +1189,7 @@ fn default_bash_tool_streams_output_deltas_without_confirmation() {
         Some(RunStatus::Running)
     );
 
-    let remaining_events = receive_live_events(&subscription, 5);
+    let remaining_events = receive_live_events(&subscription, 6);
     assert_eq!(
         envelope_event_names(&remaining_events),
         vec![
@@ -1193,6 +1198,7 @@ fn default_bash_tool_streams_output_deltas_without_confirmation() {
             "model.text_delta",
             "message.completed",
             "run.completed",
+            "session.totals_updated",
         ]
     );
     assert_tool_output_delta(&remaining_events[0], "stdout", "second\n");
@@ -1451,17 +1457,17 @@ fn session_send_message_streams_delayed_provider_chunks_live_and_replays_midstre
 
     provider.release_completion();
 
-    let live_after_release = receive_live_events(&subscription, 3);
+    let live_after_release = receive_live_events(&subscription, 4);
     assert_eq!(
         envelope_event_names(&live_after_release),
-        vec!["model.text_delta", "message.completed", "run.completed"]
+        vec!["model.text_delta", "message.completed", "run.completed", "session.totals_updated"]
     );
     assert_model_text_delta(&live_after_release[0], "Season");
 
-    let replay_after_release = receive_live_events(&replay_after_run_started, 3);
+    let replay_after_release = receive_live_events(&replay_after_run_started, 4);
     assert_eq!(
         envelope_event_names(&replay_after_release),
-        vec!["model.text_delta", "message.completed", "run.completed"]
+        vec!["model.text_delta", "message.completed", "run.completed", "session.totals_updated"]
     );
     assert_model_text_delta(&replay_after_release[0], "Season");
     wait_for_run_status(&server, &run_id, RunStatus::Completed);
@@ -1515,10 +1521,10 @@ fn streaming_delta_is_not_persisted_until_turn_boundary() {
     drop(store);
 
     provider.release_completion();
-    let live_after_release = receive_live_events(&subscription, 3);
+    let live_after_release = receive_live_events(&subscription, 4);
     assert_eq!(
         envelope_event_names(&live_after_release),
-        vec!["model.text_delta", "message.completed", "run.completed"]
+        vec!["model.text_delta", "message.completed", "run.completed", "session.totals_updated"]
     );
     assert_model_text_delta(&live_after_release[0], "Season");
     wait_for_run_status(&server, run_id.as_str(), RunStatus::Completed);
@@ -1567,6 +1573,7 @@ fn session_send_message_publishes_provider_error_before_run_failed() {
             "run.started",
             "provider.error",
             "run.failed",
+            "session.totals_updated",
         ]
     );
     let provider_error = &events[2].data;
@@ -1645,6 +1652,7 @@ fn stream_error_flushes_buffered_deltas_before_error_payload() {
             "model.text_delta",
             "provider.error",
             "run.failed",
+            "session.totals_updated",
         ]
     );
     drop(server);
@@ -1695,7 +1703,7 @@ fn session_send_message_marks_transport_failure_as_run_failed() {
     );
     assert_eq!(
         event_names(&events),
-        vec!["session.created", "run.started", "run.failed"]
+        vec!["session.created", "run.started", "run.failed", "session.totals_updated"]
     );
     let failed = &events[2].data;
     assert_eq!(failed["run_id"], run_id);
@@ -1754,7 +1762,7 @@ fn run_cancel_cancels_active_provider_stream_and_publishes_run_cancelled() {
     );
     assert_eq!(
         event_names(&events),
-        vec!["session.created", "run.started", "run.cancelled"]
+        vec!["session.created", "run.started", "run.cancelled", "session.totals_updated"]
     );
     assert_eq!(events[2].data["run_id"], run_id);
 
@@ -1811,7 +1819,7 @@ fn session_event_subscriber_receives_events_appended_after_subscription() {
 
     let run_id = send_message(&mut server, session_id.as_str());
     assert_eq!(provider.request().path, "/v1/chat/completions");
-    let live_events = receive_live_events(&subscription, 4);
+    let live_events = receive_live_events(&subscription, 5);
 
     assert_eq!(
         envelope_event_names(&live_events),
@@ -1820,6 +1828,7 @@ fn session_event_subscriber_receives_events_appended_after_subscription() {
             "model.text_delta",
             "message.completed",
             "run.completed",
+            "session.totals_updated",
         ]
     );
     assert!(
@@ -1930,7 +1939,7 @@ fn session_send_message_streams_run_failed_when_default_model_cannot_resolve() {
     );
     assert_eq!(
         event_names(&events),
-        vec!["session.created", "run.started", "run.failed"]
+        vec!["session.created", "run.started", "run.failed", "session.totals_updated"]
     );
 
     let failed = events

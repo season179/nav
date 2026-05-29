@@ -9,3 +9,7 @@ data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000201","session_id":"019f2f6f-
 id: 019f2f6f-f178-7a72-9f28-000000000205
 event: run.failed
 data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000205","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"run.failed","run_id":"019f2f6f-f178-7a72-9f28-000000000101","message":"MissingApiKey: compatible-gateway requires an API key"}
+
+id: 019f2f6f-f178-7a72-9f28-000000000206
+event: session.totals_updated
+data: {"event_id":"019f2f6f-f178-7a72-9f28-000000000206","session_id":"019f2f6f-f178-7a72-9f28-000000000100","type":"session.totals_updated","cost":0.0,"tokens_input":0,"tokens_output":0,"tokens_reasoning":0,"tokens_cache_read":0,"tokens_cache_write":0}

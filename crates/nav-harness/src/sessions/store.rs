@@ -100,6 +100,16 @@ pub struct ProviderPayloadDiff {
     pub decoded_parts_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionTotals {
+    pub cost: f64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_reasoning: i64,
+    pub tokens_cache_read: i64,
+    pub tokens_cache_write: i64,
+}
+
 #[derive(Debug)]
 pub struct SessionStore {
     sqlite: SqliteSessionStore,
@@ -131,6 +141,21 @@ impl SessionStore {
         session_id: &SessionId,
     ) -> Result<nav_types::SessionRow, SqliteStoreError> {
         self.sqlite.get_session(session_id)
+    }
+
+    pub fn get_session_totals(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionTotals, SqliteStoreError> {
+        let row = self.sqlite.get_session(session_id)?;
+        Ok(SessionTotals {
+            cost: row.cost,
+            tokens_input: row.tokens_input,
+            tokens_output: row.tokens_output,
+            tokens_reasoning: row.tokens_reasoning,
+            tokens_cache_read: row.tokens_cache_read,
+            tokens_cache_write: row.tokens_cache_write,
+        })
     }
 
     pub fn update_session_title(
