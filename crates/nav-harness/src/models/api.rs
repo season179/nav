@@ -6,4 +6,6 @@ pub enum ApiKind {
     OpenAiCompletions,
     #[serde(rename = "openai-responses", alias = "openai_responses")]
     OpenAiResponses,
+    #[serde(rename = "anthropic-messages", alias = "anthropic_messages")]
+    AnthropicMessages,
 }
