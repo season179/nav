@@ -1,0 +1,39 @@
+{
+  "id": "gen-1711234568-openrouter",
+  "object": "chat.completion",
+  "created": 1711234568,
+  "model": "anthropic/claude-sonnet-4",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Let me read that file for you.",
+        "tool_calls": [
+          {
+            "id": "call_read_1",
+            "type": "function",
+            "function": {
+              "name": "read",
+              "arguments": "{\"path\":\"Cargo.toml\"}"
+            }
+          }
+        ],
+        "anthropic_metadata": {
+          "cache_creation_input_tokens": 50,
+          "cache_read_input_tokens": 200
+        }
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 100,
+    "completion_tokens": 25,
+    "total_tokens": 125
+  },
+  "system_fingerprint": "fp_gateway_xyz",
+  "service_tier": "priority",
+  "x_openrouter_provider": "anthropic",
+  "x_openrouter_model_id": "claude-sonnet-4-20250514"
+}
