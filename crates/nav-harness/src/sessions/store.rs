@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nav_types::{MessageId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId, ToolCallId};
 use serde_json::{Value, json};
 
+use crate::compaction::prune::tool_result_part_ids_to_prune;
 use crate::compaction::replay::project_for_replay;
 use crate::models::{
     AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
@@ -19,6 +20,7 @@ use crate::models::{
 
 use super::canonical::{
     ModelTurn, ModelTurnRole, Part, ToolCall, Turn, TurnMeta, TurnPart, TurnRole,
+    canonical_tool_call_id_for_provider,
 };
 use super::sqlite::{
     CreateSession, NewProviderPayload, ProviderState, RevertInfo, RunStatus, SqliteSessionStore,
@@ -189,6 +191,7 @@ impl SessionStore {
     }
 
     pub fn try_turns(&self, session_id: &SessionId) -> Result<Vec<ModelTurn>, SqliteStoreError> {
+        self.prune_tool_results_for_session(session_id)?;
         let mut page = self
             .sqlite
             .list_turns_for_session(session_id, None, usize::MAX)?
@@ -216,6 +219,7 @@ impl SessionStore {
     }
 
     pub fn try_turns_for_run(&self, run_id: &RunId) -> Result<Vec<ModelTurn>, SqliteStoreError> {
+        self.prune_tool_results_for_run(run_id)?;
         let turns = self.sqlite.list_turns_for_run(run_id)?;
         Ok(model_turns_for_replay(&turns))
     }
@@ -285,6 +289,29 @@ impl SessionStore {
         self.sqlite.next_turn_created_at_for_run(run_id, now)
     }
 
+    pub fn prune_tool_results_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SqliteStoreError> {
+        let turns = self
+            .sqlite
+            .list_turns_for_session(session_id, None, usize::MAX)?
+            .items;
+        self.prune_tool_results(turns)
+    }
+
+    fn prune_tool_results_for_run(&self, run_id: &RunId) -> Result<(), SqliteStoreError> {
+        let turns = self.sqlite.list_turns_for_run(run_id)?;
+        self.prune_tool_results(turns)
+    }
+
+    fn prune_tool_results(&self, turns: Vec<StoredTurn>) -> Result<(), SqliteStoreError> {
+        for part_id in tool_result_part_ids_to_prune(&turns) {
+            self.sqlite.compact_part(&part_id)?;
+        }
+        Ok(())
+    }
+
     fn append_turns_with_first_id(
         &self,
         run_id: &RunId,
@@ -301,7 +328,7 @@ impl SessionStore {
                 continue;
             };
             let message_id = first_message_id.take().unwrap_or_else(new_message_id);
-            let parts = model_parts(&model_turn.parts, &mut tool_call_ids);
+            let parts = model_parts(run_id, &model_turn.parts, &mut tool_call_ids);
             stored_turns.push((
                 Turn {
                     id: message_id,
@@ -625,14 +652,22 @@ fn stored_role(role: ModelTurnRole) -> Option<TurnRole> {
     }
 }
 
-fn model_parts(parts: &[TurnPart], tool_call_ids: &mut HashMap<String, ToolCallId>) -> Vec<Part> {
+fn model_parts(
+    run_id: &RunId,
+    parts: &[TurnPart],
+    tool_call_ids: &mut HashMap<String, ToolCallId>,
+) -> Vec<Part> {
     parts
         .iter()
-        .map(|part| model_part(part, tool_call_ids))
+        .map(|part| model_part(run_id, part, tool_call_ids))
         .collect()
 }
 
-fn model_part(part: &TurnPart, tool_call_ids: &mut HashMap<String, ToolCallId>) -> Part {
+fn model_part(
+    run_id: &RunId,
+    part: &TurnPart,
+    tool_call_ids: &mut HashMap<String, ToolCallId>,
+) -> Part {
     match part {
         TurnPart::Text(text) => Part::Text {
             text: text.clone(),
@@ -642,7 +677,7 @@ fn model_part(part: &TurnPart, tool_call_ids: &mut HashMap<String, ToolCallId>) 
             let id = tool_call
                 .tool_call_id
                 .clone()
-                .unwrap_or_else(new_tool_call_id);
+                .unwrap_or_else(|| canonical_tool_call_id_for_provider(run_id, &tool_call.id));
             tool_call_ids.insert(tool_call.id.clone(), id.clone());
             Part::ToolCall {
                 id,
@@ -655,7 +690,7 @@ fn model_part(part: &TurnPart, tool_call_ids: &mut HashMap<String, ToolCallId>) 
             tool_call_id,
             content,
         } => {
-            let call_id = stored_tool_call_id(tool_call_id, tool_call_ids);
+            let call_id = stored_tool_call_id(run_id, tool_call_id, tool_call_ids);
             Part::ToolResult {
                 call_id,
                 content: content.clone(),
@@ -667,6 +702,7 @@ fn model_part(part: &TurnPart, tool_call_ids: &mut HashMap<String, ToolCallId>) 
 }
 
 fn stored_tool_call_id(
+    run_id: &RunId,
     provider_tool_call_id: &str,
     tool_call_ids: &HashMap<String, ToolCallId>,
 ) -> ToolCallId {
@@ -674,7 +710,7 @@ fn stored_tool_call_id(
         .get(provider_tool_call_id)
         .cloned()
         .or_else(|| ToolCallId::try_new(provider_tool_call_id.to_string()).ok())
-        .unwrap_or_else(new_tool_call_id)
+        .unwrap_or_else(|| canonical_tool_call_id_for_provider(run_id, provider_tool_call_id))
 }
 
 fn tool_call_arguments(arguments: &str) -> Value {
@@ -809,10 +845,6 @@ fn new_message_id() -> MessageId {
     MessageId::try_new(new_uuid_v7_string()).expect("generated message id should be UUIDv7")
 }
 
-fn new_tool_call_id() -> ToolCallId {
-    ToolCallId::try_new(new_uuid_v7_string()).expect("generated tool call id should be UUIDv7")
-}
-
 fn new_uuid_v7_string() -> String {
     static NEXT_UUID: AtomicU64 = AtomicU64::new(0);
 
@@ -858,7 +890,9 @@ fn stored_tool_call_arguments(arguments: Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::sqlite::{NewProviderPayload, ProviderPayloadDirection};
+    use super::super::sqlite::{
+        ArtifactKind, NewArtifact, NewProviderPayload, ProviderPayloadDirection,
+    };
     use super::*;
 
     struct TempDataDir {
@@ -998,6 +1032,67 @@ mod tests {
     }
 
     #[test]
+    fn try_turns_prunes_old_tool_results_to_protect_budget_without_deleting_rows() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let large_output = "tok ".repeat(10_000);
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turns(
+                &run_id,
+                (0..20)
+                    .map(|index| {
+                        ModelTurn::tool_result(
+                            tool_call_id_string(100 + index),
+                            large_output.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        let raw_before = store.sqlite.list_turns_for_run(&run_id).unwrap();
+        assert_eq!(raw_before.len(), 20);
+
+        let reloaded = store.try_turns(&session_id).unwrap();
+        let placeholder = "[Old tool result content cleared]";
+        let placeholder_count = reloaded
+            .iter()
+            .flat_map(|turn| turn.parts.iter())
+            .filter(|part| {
+                matches!(
+                    part,
+                    TurnPart::ToolResult { content, .. } if content == placeholder
+                )
+            })
+            .count();
+        assert_eq!(placeholder_count, 16);
+
+        let raw_after = store.sqlite.list_turns_for_run(&run_id).unwrap();
+        assert_eq!(raw_after.len(), 20);
+        assert_eq!(
+            raw_after
+                .iter()
+                .flat_map(|(_, parts)| parts)
+                .filter(|part| part.compacted_at.is_some())
+                .count(),
+            16
+        );
+        assert!(
+            raw_after
+                .iter()
+                .flat_map(|(_, parts)| parts)
+                .all(|part| matches!(
+                    &part.part,
+                    Part::ToolResult { content, .. } if content == &large_output
+                ))
+        );
+    }
+
+    #[test]
     fn try_turns_after_revert_restores_in_memory_state_before_target_part() {
         let store = SessionStore::default();
         let session_id = session_id();
@@ -1084,6 +1179,188 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(store.try_turns(&session_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn try_turns_keeps_protected_skill_tool_results_visible_when_old() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let skill_call_id = ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000060").unwrap();
+        let protected_output = "skill ".repeat(50_000);
+        let large_output = "tok ".repeat(10_000);
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        let mut turns = vec![
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "provider-skill-call".to_string(),
+                tool_call_id: Some(skill_call_id.clone()),
+                name: "skill".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ModelTurn::tool_result("provider-skill-call", protected_output.clone()),
+        ];
+        turns.extend((0..20).map(|index| {
+            ModelTurn::tool_result(tool_call_id_string(200 + index), large_output.clone())
+        }));
+        store.append_turns(&run_id, turns).unwrap();
+
+        let reloaded = store.try_turns(&session_id).unwrap();
+
+        assert!(reloaded.iter().flat_map(|turn| turn.parts.iter()).any(|part| {
+            matches!(
+                part,
+                TurnPart::ToolResult { tool_call_id, content }
+                    if tool_call_id == skill_call_id.as_str() && content == &protected_output
+            )
+        }));
+
+        let raw_after = store.sqlite.list_turns_for_run(&run_id).unwrap();
+        let protected_part = raw_after
+            .iter()
+            .flat_map(|(_, parts)| parts)
+            .find(|part| {
+                matches!(
+                    &part.part,
+                    Part::ToolResult { call_id, .. } if call_id == &skill_call_id
+                )
+            })
+            .expect("protected tool result should still be stored");
+        assert!(protected_part.compacted_at.is_none());
+    }
+
+    #[test]
+    fn try_turns_keeps_protected_skill_result_visible_after_separate_tool_write() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let protected_output = "skill ".repeat(50_000);
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        append_decoded_skill_tool_call(&store, &session_id, &run_id, "provider-skill-call");
+        store
+            .append_turns(
+                &run_id,
+                vec![ModelTurn::tool_result(
+                    "provider-skill-call",
+                    protected_output.clone(),
+                )],
+            )
+            .unwrap();
+
+        let reloaded = store.try_turns(&session_id).unwrap();
+
+        assert!(
+            reloaded
+                .iter()
+                .flat_map(|turn| turn.parts.iter())
+                .any(|part| {
+                    matches!(
+                        part,
+                        TurnPart::ToolResult { content, .. } if content == &protected_output
+                    )
+                })
+        );
+    }
+
+    #[test]
+    fn try_turns_keeps_protected_skill_result_visible_when_provider_id_is_uuid() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let provider_tool_call_id = "019f2f6f-f178-7a72-9f28-000000000062";
+        let protected_output = "skill ".repeat(50_000);
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        append_decoded_skill_tool_call(&store, &session_id, &run_id, provider_tool_call_id);
+        store
+            .append_turns(
+                &run_id,
+                vec![ModelTurn::tool_result(
+                    provider_tool_call_id,
+                    protected_output.clone(),
+                )],
+            )
+            .unwrap();
+
+        let reloaded = store.try_turns(&session_id).unwrap();
+
+        assert!(
+            reloaded
+                .iter()
+                .flat_map(|turn| turn.parts.iter())
+                .any(|part| {
+                    matches!(
+                        part,
+                        TurnPart::ToolResult { content, .. } if content == &protected_output
+                    )
+                })
+        );
+    }
+
+    #[test]
+    fn try_turns_pruning_keeps_raw_tool_result_artifact_readable() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let call_id = ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000061").unwrap();
+        let full_output = "full raw tool output bytes";
+        let visible_output = "tok ".repeat(50_000);
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        let artifact_id = store
+            .sqlite
+            .put_artifact(
+                NewArtifact {
+                    session_id: session_id.clone(),
+                    part_id: None,
+                    kind: ArtifactKind::ToolOutput,
+                    mime: "text/plain".to_string(),
+                    created_at: 1_000,
+                },
+                full_output.as_bytes(),
+            )
+            .unwrap();
+        store
+            .sqlite
+            .append_turn(
+                Turn {
+                    id: new_message_id(),
+                    run_id: run_id.clone(),
+                    seq: 0,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta::default(),
+                    created_at: 2_000,
+                },
+                vec![Part::ToolResult {
+                    call_id,
+                    content: visible_output,
+                    raw_artifact_id: Some(artifact_id.clone()),
+                    is_error: false,
+                }],
+            )
+            .unwrap();
+
+        let reloaded = store.try_turns(&session_id).unwrap();
+        let raw_after = store.sqlite.list_turns_for_run(&run_id).unwrap();
+        let Part::ToolResult {
+            raw_artifact_id, ..
+        } = &raw_after[0].1[0].part
+        else {
+            panic!("expected stored tool result");
+        };
+        let mut artifact = store.sqlite.get_artifact(&artifact_id).unwrap();
+        let mut artifact_bytes = String::new();
+        artifact.reader.read_to_string(&mut artifact_bytes).unwrap();
+
+        assert_eq!(reloaded.len(), 1);
+        assert!(raw_after[0].1[0].compacted_at.is_some());
+        assert_eq!(raw_artifact_id.as_ref(), Some(&artifact_id));
+        assert_eq!(artifact_bytes, full_output);
     }
 
     #[test]
@@ -1372,6 +1649,69 @@ mod tests {
 
     fn run_id() -> RunId {
         RunId::try_new("019f2f6f-f178-7a72-9f28-000000000002").unwrap()
+    }
+
+    fn tool_call_id_string(suffix: u64) -> String {
+        format!("019f2f6f-f178-7a72-9f28-{suffix:012x}")
+    }
+
+    fn append_decoded_skill_tool_call(
+        store: &SessionStore,
+        session_id: &SessionId,
+        run_id: &RunId,
+        provider_tool_call_id: &str,
+    ) {
+        let raw_json = json!({
+            "id": "chatcmpl_1",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": provider_tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "skill",
+                            "arguments": "{}",
+                        },
+                    }],
+                },
+            }],
+        });
+        let raw_bytes = serde_json::to_vec(&raw_json).unwrap();
+        let payload_id = store
+            .append_provider_payload(NewProviderPayload {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                direction: ProviderPayloadDirection::Response,
+                api_kind: "openai_chat_completions".to_string(),
+                provider_id: Some("test".to_string()),
+                model_id: Some("test-model".to_string()),
+                sequence: 0,
+                provider_payload_id: Some("chatcmpl_1".to_string()),
+                mime: "application/json".to_string(),
+                raw_bytes: raw_bytes.clone(),
+                created_at: 3_000,
+            })
+            .unwrap();
+        let payload = store.get_provider_payload(&payload_id).unwrap();
+        let decoded = OpenAiChatCompletionsDecoder::new()
+            .decode(&OpenAiChatCompletionsDecodeInput {
+                provider_payload_id: payload_id.clone(),
+                raw_artifact_id: payload.artifact_id,
+                run_id: run_id.clone(),
+                provider_id: payload.provider_id,
+                raw_json: raw_bytes,
+                created_at: payload.created_at,
+            })
+            .unwrap();
+        store
+            .append_decoded_provider_payload(
+                &payload_id,
+                OPENAI_CHAT_COMPLETIONS_DECODER_VERSION,
+                &decoded,
+            )
+            .unwrap();
     }
 
     fn seed_provider_payload(

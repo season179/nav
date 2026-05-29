@@ -10,6 +10,7 @@ use serde_json::{Value, value::RawValue};
 use crate::models::ApiKind;
 use crate::sessions::{
     DecodeStatus, ImageSource, Part, RawJson, TokenUsage, Turn, TurnMeta, TurnRole,
+    canonical_tool_call_id_for_provider,
 };
 
 /// Converts a provider-specific response into canonical model output.
@@ -1642,7 +1643,14 @@ fn decode_tool_call(
 
     Ok(DecodedPart {
         part: Part::ToolCall {
-            id: derived_tool_call_id(input.provider_payload_id.as_str(), &pointer),
+            id: tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|provider_id| !provider_id.is_empty())
+                .map(|provider_id| canonical_tool_call_id_for_provider(&input.run_id, provider_id))
+                .unwrap_or_else(|| {
+                    derived_tool_call_id(input.provider_payload_id.as_str(), &pointer)
+                }),
             name: name.to_string(),
             arguments,
             raw_arguments_artifact_id: None,
