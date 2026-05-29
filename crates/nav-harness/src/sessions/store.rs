@@ -18,6 +18,7 @@ use crate::compaction::{
     prune::tool_result_part_ids_to_prune,
     replay::{DEFAULT_TAIL_TURNS, project_for_replay},
     summary::CompactionSummaryRequest,
+    validate::{SummaryValidationError, validate_compaction_summary},
 };
 use crate::models::{
     AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
@@ -140,6 +141,40 @@ pub struct CompactionBoundary {
     pub tail_start_id: Option<MessageId>,
 }
 
+/// Whether a compaction was triggered automatically or by the user. Manual
+/// compaction bypasses the failure breaker; the flag is recorded on the marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionKind {
+    Auto,
+    Manual,
+}
+
+impl CompactionKind {
+    fn is_auto(self) -> bool {
+        matches!(self, CompactionKind::Auto)
+    }
+}
+
+/// Why a validated compaction commit failed.
+#[derive(Debug)]
+pub enum CompactionCommitError {
+    /// The generated summary failed validation; nothing was committed.
+    InvalidSummary(SummaryValidationError),
+    /// The store rejected the write.
+    Store(SqliteStoreError),
+}
+
+impl std::fmt::Display for CompactionCommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSummary(error) => write!(f, "invalid compaction summary: {error}"),
+            Self::Store(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for CompactionCommitError {}
+
 #[derive(Debug)]
 pub struct SessionStore {
     sqlite: SqliteSessionStore,
@@ -219,6 +254,7 @@ impl SessionStore {
             session_id,
             tail_start_id,
             COMPACTION_SUMMARY_PLACEHOLDER.to_string(),
+            true,
             false,
         )
     }
@@ -246,7 +282,13 @@ impl SessionStore {
     ) -> Result<CompactionBoundary, SqliteStoreError> {
         let summary = summary.into();
 
-        self.write_compaction_summary(session_id, request.tail_start_id.clone(), summary, false)
+        self.write_compaction_summary(
+            session_id,
+            request.tail_start_id.clone(),
+            summary,
+            true,
+            false,
+        )
     }
 
     /// Last-resort fallback for unmappable old turns (ENC-10): write the
@@ -264,6 +306,7 @@ impl SessionStore {
             session_id,
             request.tail_start_id.clone(),
             summary.into(),
+            true,
             true,
         )
     }
@@ -303,11 +346,35 @@ impl SessionStore {
         )])
     }
 
+    /// Validate a generated summary and commit it only if it passes. On
+    /// validation failure nothing is written, so the original turns stay
+    /// replayable. Manual compaction is recorded with a non-auto marker.
+    pub fn compact_session_with_validated_summary(
+        &self,
+        session_id: &SessionId,
+        request: &CompactionSummaryRequest,
+        summary: impl Into<String>,
+        kind: CompactionKind,
+    ) -> Result<CompactionBoundary, CompactionCommitError> {
+        let summary = summary.into();
+        validate_compaction_summary(&summary).map_err(CompactionCommitError::InvalidSummary)?;
+
+        self.write_compaction_summary(
+            session_id,
+            request.tail_start_id.clone(),
+            summary,
+            kind.is_auto(),
+            false,
+        )
+        .map_err(CompactionCommitError::Store)
+    }
+
     fn write_compaction_summary(
         &self,
         session_id: &SessionId,
         tail_start_id: Option<MessageId>,
         summary: String,
+        auto: bool,
         supersede_head: bool,
     ) -> Result<CompactionBoundary, SqliteStoreError> {
         let page = self.session_turns_chronological(session_id)?;
@@ -351,7 +418,7 @@ impl SessionStore {
                 (
                     marker_turn,
                     vec![Part::Compaction {
-                        auto: true,
+                        auto,
                         tail_start_id: tail_start_id.clone(),
                     }],
                 ),
@@ -1570,6 +1637,133 @@ mod tests {
     }
 
     #[test]
+    fn validated_commit_rejects_invalid_summary_without_committing() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        for index in 0..4 {
+            store
+                .append_turn(
+                    &run_id,
+                    new_message_id(),
+                    ModelTurn::user_text(format!("turn {index}")),
+                )
+                .unwrap();
+        }
+
+        let before = store.try_turns(&session_id).unwrap();
+        let request = store
+            .compaction_summary_request(&session_id, CompactionConfig::default())
+            .unwrap();
+
+        let error = store
+            .compact_session_with_validated_summary(
+                &session_id,
+                &request,
+                "not a real summary",
+                CompactionKind::Auto,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, CompactionCommitError::InvalidSummary(_)));
+        // No compaction marker was written; original turns remain replayable.
+        let after = store.try_turns(&session_id).unwrap();
+        assert_eq!(before, after);
+        assert!(
+            !after
+                .iter()
+                .any(|turn| turn.text_content() == COMPACTION_REPLAY_TEXT)
+        );
+    }
+
+    #[test]
+    fn validated_commit_persists_valid_auto_summary() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        for index in 0..4 {
+            store
+                .append_turn(
+                    &run_id,
+                    new_message_id(),
+                    ModelTurn::user_text(format!("turn {index}")),
+                )
+                .unwrap();
+        }
+
+        let request = store
+            .compaction_summary_request(&session_id, CompactionConfig::default())
+            .unwrap();
+        let boundary = store
+            .compact_session_with_validated_summary(
+                &session_id,
+                &request,
+                valid_summary(),
+                CompactionKind::Auto,
+            )
+            .unwrap();
+
+        let marker = compaction_marker(&store, &session_id, &boundary.marker_id);
+        assert_eq!(
+            marker,
+            Part::Compaction {
+                auto: true,
+                tail_start_id: boundary.tail_start_id.clone(),
+            }
+        );
+        assert_eq!(
+            store.try_turns(&session_id).unwrap()[1].text_content(),
+            valid_summary()
+        );
+    }
+
+    #[test]
+    fn manual_compaction_marks_summary_as_non_auto() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        for index in 0..4 {
+            store
+                .append_turn(
+                    &run_id,
+                    new_message_id(),
+                    ModelTurn::user_text(format!("turn {index}")),
+                )
+                .unwrap();
+        }
+
+        let request = store
+            .compaction_summary_request(&session_id, CompactionConfig::default())
+            .unwrap();
+        let boundary = store
+            .compact_session_with_validated_summary(
+                &session_id,
+                &request,
+                valid_summary(),
+                CompactionKind::Manual,
+            )
+            .unwrap();
+
+        let marker = compaction_marker(&store, &session_id, &boundary.marker_id);
+        assert_eq!(
+            marker,
+            Part::Compaction {
+                auto: false,
+                tail_start_id: boundary.tail_start_id.clone(),
+            }
+        );
+    }
+
+    #[test]
     fn try_turns_after_revert_restores_in_memory_state_before_target_turn() {
         let store = SessionStore::default();
         let session_id = session_id();
@@ -2338,6 +2532,32 @@ mod tests {
 
     fn tool_call_id_string(suffix: u64) -> String {
         format!("019f2f6f-f178-7a72-9f28-{suffix:012x}")
+    }
+
+    fn valid_summary() -> String {
+        crate::compaction::validate::REQUIRED_SUMMARY_SECTIONS
+            .iter()
+            .map(|section| format!("{section}\nConcrete content for this section."))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn compaction_marker(
+        store: &SessionStore,
+        session_id: &SessionId,
+        marker_id: &MessageId,
+    ) -> Part {
+        store
+            .sqlite
+            .list_turns_for_session(session_id, None, usize::MAX)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|(turn, _)| &turn.id == marker_id)
+            .expect("marker turn should be stored")
+            .1[0]
+            .part
+            .clone()
     }
 
     fn append_decoded_skill_tool_call(
