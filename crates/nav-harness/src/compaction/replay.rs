@@ -5,10 +5,10 @@ use std::collections::HashSet;
 use nav_types::PartId;
 use serde_json::Value;
 
+use crate::compaction::prune::OLD_TOOL_RESULT_CONTENT_CLEARED;
 use crate::sessions::{Part, StoredPart, StoredTurn, Turn, TurnRole};
 use crate::tools::truncation::TRUNCATED_MARKER;
 
-const OLD_TOOL_RESULT_CONTENT_CLEARED: &str = "[Old tool result content cleared]";
 const DUPLICATE_TOOL_RESULT_CONTENT: &str = "[Duplicate — see more recent result]";
 const STRIPPED_IMAGE_CONTENT: &str = "[Attached image — stripped after compression]";
 const MAX_ARGUMENT_STRING_CHARS: usize = 1024;

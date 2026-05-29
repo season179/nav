@@ -9,6 +9,7 @@ use std::time::Duration;
 use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId};
 use serde_json::{Value, json};
 
+use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
 use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
@@ -104,6 +105,12 @@ impl RunLoop {
         let mut payload_sequence = 0;
 
         loop {
+            if let Some(journal) = journal {
+                if let Err(error) = prune_stored_tool_results_for_encoding(journal) {
+                    return RunLoopResult::Failed(error);
+                }
+                project_model_turns_for_tool_result_pruning(&mut turns);
+            }
             let completion_request =
                 encode_completion_request(&turns, request.tool_registry, request.tool_preset);
             if let Some(journal) = journal {
@@ -466,6 +473,17 @@ fn append_provider_payload(
         .lock()
         .unwrap()
         .append_provider_payload(payload)
+        .map_err(persistence_error)
+}
+
+fn prune_stored_tool_results_for_encoding(
+    journal: ProviderJournal<'_>,
+) -> Result<(), OpenAiCompletionsError> {
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .prune_tool_results_for_session(journal.session_id)
         .map_err(persistence_error)
 }
 

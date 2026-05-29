@@ -242,8 +242,7 @@ fn five_identical_tool_results_leave_one_full_copy_and_four_back_references() {
     );
 
     // Older 4 copies replaced with back-reference
-    for i in 0..4 {
-        let parts = &projected[i].1;
+    for (i, (_, parts)) in projected.iter().enumerate().take(4) {
         assert_eq!(
             parts[0],
             Part::ToolResult {

@@ -7,6 +7,42 @@ use serde_json::{Value, value::RawValue};
 
 use crate::models::api::ApiKind;
 
+pub(crate) fn canonical_tool_call_id_for_provider(
+    run_id: &RunId,
+    provider_tool_call_id: &str,
+) -> ToolCallId {
+    if let Ok(tool_call_id) = ToolCallId::try_new(provider_tool_call_id.to_string()) {
+        return tool_call_id;
+    }
+
+    ToolCallId::new_unchecked(derived_uuid_v7_string(
+        run_id.as_str(),
+        &format!("provider_tool_call:{provider_tool_call_id}"),
+    ))
+}
+
+fn derived_uuid_v7_string(namespace: &str, value: &str) -> String {
+    let hash = stable_hash64(namespace, value);
+    format!(
+        "019f2f6f-f178-7a72-9f28-{:012x}",
+        hash & 0x0000_ffff_ffff_ffff
+    )
+}
+
+fn stable_hash64(namespace: &str, value: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for bytes in [namespace.as_bytes(), b"\0", value.as_bytes()] {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    hash
+}
+
 /// Storage envelope for one persisted user or assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {
