@@ -51,6 +51,8 @@ fn builds_request_from_resolved_inline_key_without_exposing_secret() {
         temperature: Some(0.2),
         reasoning_effort: Some(ReasoningEffort::Low),
         stream: true,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     };
 
     let plan = OpenAiCompletionsClient::new()
@@ -68,6 +70,8 @@ fn builds_request_from_resolved_inline_key_without_exposing_secret() {
         json!({ "include_usage": true })
     );
     assert_eq!(plan.body["reasoning_effort"], "low");
+    assert!(plan.body.get("prompt_cache_key").is_none());
+    assert!(plan.body.get("prompt_cache_retention").is_none());
 
     let debug = format!("{plan:?}");
     assert!(!debug.contains("sk-inline-secret"));
@@ -146,6 +150,8 @@ fn omits_stream_usage_options_unless_compat_explicitly_enables_them() {
                 temperature: None,
                 reasoning_effort: None,
                 stream: true,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
             },
         )
         .expect("request should build");
@@ -191,6 +197,8 @@ fn builds_request_for_custom_endpoint_with_env_key_and_compat_quirks() {
                 temperature: None,
                 reasoning_effort: Some(ReasoningEffort::Medium),
                 stream: true,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
             },
         )
         .expect("request should build");
@@ -271,6 +279,8 @@ fn complete_rejects_streaming_requests_before_http() {
             temperature: None,
             reasoning_effort: None,
             stream: true,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         },
     ));
 

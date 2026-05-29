@@ -32,6 +32,8 @@ pub struct OpenAiCompletionsRequest {
     pub temperature: Option<f64>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub stream: bool,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<String>,
 }
 
 impl OpenAiCompletionsRequest {
@@ -43,6 +45,8 @@ impl OpenAiCompletionsRequest {
             temperature: None,
             reasoning_effort: None,
             stream: false,
+            prompt_cache_key: None,
+            prompt_cache_retention: Some("in_memory".to_string()),
         }
     }
 
@@ -1014,6 +1018,14 @@ fn request_body(model: &ResolvedModelConfig, request: &OpenAiCompletionsRequest)
         body.insert("provider".to_string(), routing);
     }
 
+    if let Some(key) = &request.prompt_cache_key {
+        body.insert("prompt_cache_key".to_string(), json!(key));
+    }
+
+    if let Some(retention) = &request.prompt_cache_retention {
+        body.insert("prompt_cache_retention".to_string(), json!(retention));
+    }
+
     Value::Object(body)
 }
 
@@ -1313,5 +1325,94 @@ fn redact_secret(value: &str, secret: &str) -> String {
         value.to_string()
     } else {
         value.replace(trimmed, "<redacted>")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ApiKeyConfig, ModelConfig, ProviderCompat, ProviderConfig, resolver::ResolvedApiKey};
+
+    fn resolved_model() -> ResolvedModelConfig {
+        ResolvedModelConfig {
+            compat: ProviderCompat::default(),
+            api: ApiKind::OpenAiCompletions,
+            base_url: "https://api.openai.com/v1".to_string(),
+            provider_id: "openai".to_string(),
+            provider: ProviderConfig {
+                name: None,
+                api: ApiKind::OpenAiCompletions,
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: ApiKeyConfig::Inline {
+                    inline: "sk-test".to_string(),
+                },
+                models: Vec::new(),
+                compat: ProviderCompat::default(),
+            },
+            model: ModelConfig {
+                id: "gpt-4o".to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: Vec::new(),
+                context_window: None,
+                max_tokens: None,
+                compat: ProviderCompat::default(),
+            },
+            api_key: ResolvedApiKey::new("sk-test"),
+        }
+    }
+
+    fn request_with_cache_fields(
+        cache_key: Option<&str>,
+        retention: Option<&str>,
+    ) -> OpenAiCompletionsRequest {
+        let mut request = OpenAiCompletionsRequest::from_user("hello");
+        if let Some(key) = cache_key {
+            request.prompt_cache_key = Some(key.to_owned());
+        }
+        if let Some(ret) = retention {
+            request.prompt_cache_retention = Some(ret.to_owned());
+        }
+        request
+    }
+
+    #[test]
+    fn body_contains_prompt_cache_key_when_set() {
+        let model = resolved_model();
+        let request = request_with_cache_fields(Some("session-123"), None);
+        let body = request_body(&model, &request);
+
+        assert_eq!(body["prompt_cache_key"], json!("session-123"));
+    }
+
+    #[test]
+    fn body_contains_prompt_cache_retention_when_set() {
+        let model = resolved_model();
+        let request = request_with_cache_fields(None, Some("24h"));
+        let body = request_body(&model, &request);
+
+        assert_eq!(body["prompt_cache_retention"], json!("24h"));
+    }
+
+    #[test]
+    fn body_omits_cache_key_when_not_set() {
+        let model = resolved_model();
+        let request = request_with_cache_fields(None, None);
+        let body = request_body(&model, &request);
+
+        assert!(body.get("prompt_cache_key").is_none());
+        assert_eq!(body["prompt_cache_retention"], json!("in_memory"));
+    }
+
+    #[test]
+    fn body_contains_both_cache_fields() {
+        let model = resolved_model();
+        let request = request_with_cache_fields(Some("session-abc"), Some("in_memory"));
+        let body = request_body(&model, &request);
+
+        assert_eq!(body["prompt_cache_key"], json!("session-abc"));
+        assert_eq!(body["prompt_cache_retention"], json!("in_memory"));
     }
 }
