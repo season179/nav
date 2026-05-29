@@ -1,10 +1,13 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use nav_harness::models::{
+    Decoder, OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
+};
 use nav_harness::sessions::{
     CreateSession, DecodeStatus, NewProviderPayload, Part, ProviderPayloadDirection, RunStatus,
     SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun, TokenDelta, Turn, TurnMeta,
-    TurnPartTextRow, TurnRole,
+    TurnRole,
 };
 use nav_types::{MessageId, RunId, SessionId, ToolCallId};
 
@@ -1116,10 +1119,7 @@ fn update_part_delta_on_text_keeps_projection_in_sync() {
         )
         .expect("turn append should commit");
 
-    let part_id = store
-        .list_turns_for_run(&run_id)
-        .expect("turns readable")[0]
-        .1[0]
+    let part_id = store.list_turns_for_run(&run_id).expect("turns readable")[0].1[0]
         .id
         .clone();
 
@@ -1154,16 +1154,11 @@ fn remove_part_cleans_up_turn_parts_text_projection() {
                 meta: TurnMeta::default(),
                 created_at: 8_300,
             },
-            vec![
-                text_part("will be removed"),
-                text_part("will stay"),
-            ],
+            vec![text_part("will be removed"), text_part("will stay")],
         )
         .expect("turn append should commit");
 
-    let parts = store
-        .list_turns_for_run(&run_id)
-        .expect("turns readable")[0]
+    let parts = store.list_turns_for_run(&run_id).expect("turns readable")[0]
         .1
         .clone();
 
@@ -1228,7 +1223,11 @@ fn tool_call_image_step_parts_are_excluded_from_text_projection() {
         .get_turn_parts_text(&session_id)
         .expect("projection should be readable");
 
-    assert_eq!(projections.len(), 0, "excluded types should not appear in projection");
+    assert_eq!(
+        projections.len(),
+        0,
+        "excluded types should not appear in projection"
+    );
 }
 
 #[test]
@@ -1288,9 +1287,7 @@ fn text_projection_round_trip_insert_update_remove() {
         )
         .expect("turn append should commit");
 
-    let parts = store
-        .list_turns_for_run(&run_id)
-        .expect("turns readable")[0]
+    let parts = store.list_turns_for_run(&run_id).expect("turns readable")[0]
         .1
         .clone();
     assert_eq!(store.get_turn_parts_text(&session_id).unwrap().len(), 2);
@@ -1301,7 +1298,10 @@ fn text_projection_round_trip_insert_update_remove() {
         .expect("delta should commit");
     let projections = store.get_turn_parts_text(&session_id).unwrap();
     assert_eq!(projections.len(), 2);
-    let revised = projections.iter().find(|p| p.text.contains("revised")).unwrap();
+    let revised = projections
+        .iter()
+        .find(|p| p.text.contains("revised"))
+        .unwrap();
     assert_eq!(revised.text, "draft revised");
 
     // Remove
@@ -1334,10 +1334,7 @@ fn update_part_type_change_removes_stale_text_projection() {
         )
         .expect("turn append should commit");
 
-    let part_id = store
-        .list_turns_for_run(&run_id)
-        .expect("turns readable")[0]
-        .1[0]
+    let part_id = store.list_turns_for_run(&run_id).expect("turns readable")[0].1[0]
         .id
         .clone();
 
@@ -1361,5 +1358,198 @@ fn update_part_type_change_removes_stale_text_projection() {
         projections.len(),
         0,
         "stale text projection should be removed after type change"
+    );
+}
+
+#[test]
+fn decoded_provider_payload_appends_turn_parts_with_provenance_and_status() {
+    let data_dir = TempDataDir::new("provider-payload-decoded-turns");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000381");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000382");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    let raw_bytes = br#"{"id":"chatcmpl_1","model":"gpt-5.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello","vendor_extra":{"nested":[true,false]}},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#.to_vec();
+    let payload_id = store
+        .append_provider_payload(NewProviderPayload {
+            session_id,
+            run_id: run_id.clone(),
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_1".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: raw_bytes.clone(),
+            created_at: 3_000,
+        })
+        .expect("provider payload append should commit");
+    let payload = store
+        .get_provider_payload(&payload_id)
+        .expect("payload row should be readable");
+    let decoded = OpenAiChatCompletionsDecoder::new()
+        .decode(&OpenAiChatCompletionsDecodeInput {
+            provider_payload_id: payload_id.clone(),
+            raw_artifact_id: payload.artifact_id.clone(),
+            run_id: run_id.clone(),
+            provider_id: payload.provider_id.clone(),
+            raw_json: raw_bytes,
+            created_at: payload.created_at,
+        })
+        .expect("provider payload should decode");
+
+    store
+        .append_decoded_provider_payload(&payload_id, "openai-chat-completions-decoder@1", &decoded)
+        .expect("decoded payload append should commit");
+
+    let updated = store
+        .get_provider_payload(&payload_id)
+        .expect("payload status should be readable");
+    assert_eq!(updated.decode_status, "decoded_with_unknowns");
+    assert_eq!(
+        updated.decoder_version.as_deref(),
+        Some("openai-chat-completions-decoder@1")
+    );
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("decoded turns should be readable");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].1.len(), 2);
+    assert_eq!(
+        turns[0].1[0].provider_payload_id.as_ref(),
+        Some(&payload_id)
+    );
+    assert_eq!(
+        turns[0].1[0].provider_json_pointer.as_deref(),
+        Some("/choices/0/message/content")
+    );
+    assert_eq!(
+        turns[0].1[1].provider_payload_id.as_ref(),
+        Some(&payload_id)
+    );
+    assert_eq!(
+        turns[0].1[1].provider_json_pointer.as_deref(),
+        Some("/choices/0/message/vendor_extra")
+    );
+}
+
+#[test]
+fn failed_provider_payload_decode_leaves_envelope_pending_without_turns() {
+    let data_dir = TempDataDir::new("provider-payload-decode-failed");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000383");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000384");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    let raw_bytes = br#"{"id":"chatcmpl_1","choices":["#.to_vec();
+    let payload_id = store
+        .append_provider_payload(NewProviderPayload {
+            session_id,
+            run_id: run_id.clone(),
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_1".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: raw_bytes.clone(),
+            created_at: 3_000,
+        })
+        .expect("provider payload append should commit");
+    let payload = store
+        .get_provider_payload(&payload_id)
+        .expect("payload row should be readable");
+
+    let decode_error = OpenAiChatCompletionsDecoder::new()
+        .decode(&OpenAiChatCompletionsDecodeInput {
+            provider_payload_id: payload_id.clone(),
+            raw_artifact_id: payload.artifact_id,
+            run_id: run_id.clone(),
+            provider_id: payload.provider_id,
+            raw_json: raw_bytes,
+            created_at: payload.created_at,
+        })
+        .expect_err("malformed provider JSON should fail before save");
+    assert!(
+        decode_error.to_string().contains("malformed JSON"),
+        "unexpected error: {decode_error}"
+    );
+
+    let row = store
+        .get_provider_payload(&payload_id)
+        .expect("payload should remain readable");
+    assert_eq!(row.decode_status, "pending");
+    assert_eq!(row.decoder_version, None);
+    assert!(
+        store
+            .list_turns_for_run(&run_id)
+            .expect("turns should be readable")
+            .is_empty()
+    );
+}
+
+#[test]
+fn decoded_provider_payload_save_failure_does_not_commit_turns() {
+    let data_dir = TempDataDir::new("provider-payload-save-rollback");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000385");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000386");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    let raw_bytes = br#"{"id":"chatcmpl_1","model":"gpt-5.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}"#.to_vec();
+    let payload_id = store
+        .append_provider_payload(NewProviderPayload {
+            session_id,
+            run_id: run_id.clone(),
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_1".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: raw_bytes.clone(),
+            created_at: 3_000,
+        })
+        .expect("provider payload append should commit");
+    let payload = store
+        .get_provider_payload(&payload_id)
+        .expect("payload row should be readable");
+    let decoded = OpenAiChatCompletionsDecoder::new()
+        .decode(&OpenAiChatCompletionsDecodeInput {
+            provider_payload_id: payload_id,
+            raw_artifact_id: payload.artifact_id,
+            run_id: run_id.clone(),
+            provider_id: payload.provider_id,
+            raw_json: raw_bytes,
+            created_at: payload.created_at,
+        })
+        .expect("provider payload should decode");
+    let missing_payload_id =
+        nav_types::ProviderPayloadId::try_new("pay_0000018bcfe56800_0000000000000099")
+            .expect("missing payload id should be shaped correctly");
+
+    let err = store
+        .append_decoded_provider_payload(
+            &missing_payload_id,
+            "openai-chat-completions-decoder@1",
+            &decoded,
+        )
+        .expect_err("missing payload row should reject the save");
+
+    assert!(
+        err.to_string().contains("different provider payload")
+            || err.to_string().contains("not found")
+            || err.to_string().contains("query returned no rows"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        store
+            .list_turns_for_run(&run_id)
+            .expect("turns should be readable")
+            .is_empty()
     );
 }
