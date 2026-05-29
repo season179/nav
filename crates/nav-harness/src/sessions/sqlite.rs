@@ -19,6 +19,8 @@ use nav_types::{
 };
 use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
 
+use crate::models::{DecodedProviderPayload, DecodedTurn};
+
 use super::canonical::{Part, Turn, TurnRole};
 use super::migrate;
 
@@ -237,6 +239,8 @@ impl TokenDelta {
 pub struct StoredPart {
     pub id: PartId,
     pub part: Part,
+    pub provider_payload_id: Option<ProviderPayloadId>,
+    pub provider_json_pointer: Option<String>,
     pub compacted_at: Option<i64>,
     pub created_at: i64,
 }
@@ -501,6 +505,48 @@ impl SqliteSessionStore {
             )
         })?;
         ensure_row_changed(changed, "provider payload", id.as_str())
+    }
+
+    pub fn append_decoded_provider_payload(
+        &self,
+        id: &ProviderPayloadId,
+        decoder_version: &str,
+        decoded: &DecodedProviderPayload,
+    ) -> Result<(), SqliteStoreError> {
+        ensure_decoded_payload_references_id(id, decoded)?;
+        let prepared_turns = decoded
+            .turns
+            .iter()
+            .map(prepare_decoded_turn)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.execute_write(|tx| {
+            ensure_provider_payload_exists(tx, id)?;
+            for turn in &prepared_turns {
+                insert_turn(tx, turn)?;
+            }
+            let changed = tx.execute(
+                r#"
+                UPDATE provider_payloads
+                SET decoder_version = ?1,
+                    decode_status = ?2,
+                    error_json = NULL,
+                    decoded_at = ?3
+                WHERE id = ?4
+                "#,
+                params![
+                    decoder_version,
+                    decoded.status.as_str(),
+                    unix_millis(),
+                    id.as_str(),
+                ],
+            )?;
+            if changed == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn create_session(
@@ -1097,6 +1143,8 @@ struct PreparedPart {
     id: PartId,
     type_name: String,
     data_json: String,
+    provider_payload_id: Option<ProviderPayloadId>,
+    provider_json_pointer: Option<String>,
     created_at: i64,
 }
 
@@ -1106,6 +1154,56 @@ fn prepare_turn(turn: &Turn, parts: &[Part]) -> Result<PreparedTurn, SqliteStore
         meta_json: serialize_json(&turn.meta)?,
         parts: prepare_parts(turn.created_at, parts)?,
     })
+}
+
+fn prepare_decoded_turn(decoded: &DecodedTurn) -> Result<PreparedTurn, SqliteStoreError> {
+    Ok(PreparedTurn {
+        turn: decoded.turn.clone(),
+        meta_json: serialize_json(&decoded.turn.meta)?,
+        parts: decoded
+            .parts
+            .iter()
+            .map(|part| {
+                Ok(PreparedPart {
+                    id: generate_part_id(decoded.turn.created_at),
+                    type_name: part.part.type_name().to_string(),
+                    data_json: serialize_json(&part.part)?,
+                    provider_payload_id: Some(part.provider_payload_id.clone()),
+                    provider_json_pointer: Some(part.provider_json_pointer.clone()),
+                    created_at: decoded.turn.created_at,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn ensure_decoded_payload_references_id(
+    id: &ProviderPayloadId,
+    decoded: &DecodedProviderPayload,
+) -> Result<(), SqliteStoreError> {
+    let all_parts_match = decoded.turns.iter().all(|turn| {
+        turn.parts
+            .iter()
+            .all(|part| part.provider_payload_id == *id)
+    });
+    if all_parts_match {
+        return Ok(());
+    }
+
+    Err(SqliteStoreError::WriteFailed(format!(
+        "decoded parts reference a different provider payload than `{id}`"
+    )))
+}
+
+fn ensure_provider_payload_exists(
+    tx: &Transaction,
+    id: &ProviderPayloadId,
+) -> rusqlite::Result<()> {
+    tx.query_row(
+        "SELECT 1 FROM provider_payloads WHERE id = ?1",
+        [id.as_str()],
+        |_| Ok(()),
+    )
 }
 
 fn insert_turn(tx: &Transaction, prepared: &PreparedTurn) -> rusqlite::Result<()> {
@@ -1152,9 +1250,11 @@ fn insert_turn(tx: &Transaction, prepared: &PreparedTurn) -> rusqlite::Result<()
                 session_id,
                 type,
                 data_json,
+                provider_payload_id,
+                provider_json_pointer,
                 created_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#,
             params![
                 part.id.as_str(),
@@ -1162,6 +1262,10 @@ fn insert_turn(tx: &Transaction, prepared: &PreparedTurn) -> rusqlite::Result<()
                 session_id.as_str(),
                 part.type_name.as_str(),
                 part.data_json.as_str(),
+                part.provider_payload_id
+                    .as_ref()
+                    .map(ProviderPayloadId::as_str),
+                part.provider_json_pointer.as_deref(),
                 part.created_at,
             ],
         )?;
@@ -1180,6 +1284,8 @@ fn prepare_parts(created_at: i64, parts: &[Part]) -> Result<Vec<PreparedPart>, S
                 id: generate_part_id(created_at),
                 type_name,
                 data_json,
+                provider_payload_id: None,
+                provider_json_pointer: None,
                 created_at,
             })
         })
@@ -1231,7 +1337,7 @@ fn collect_parts_for_turns(
     let mut part_stmt = conn
         .prepare(
             r#"
-            SELECT id, data_json, compacted_at, created_at
+            SELECT id, data_json, provider_payload_id, provider_json_pointer, compacted_at, created_at
             FROM turn_parts
             WHERE turn_id = ?1
             ORDER BY id ASC
@@ -1647,9 +1753,12 @@ fn read_turn(row: &Row<'_>) -> rusqlite::Result<Turn> {
 fn read_stored_part(row: &Row<'_>) -> rusqlite::Result<StoredPart> {
     let id: String = row.get("id")?;
     let data_json: String = row.get("data_json")?;
+    let provider_payload_id: Option<String> = row.get("provider_payload_id")?;
     Ok(StoredPart {
         id: PartId::new_unchecked(id),
         part: parse_json(&data_json)?,
+        provider_payload_id: provider_payload_id.map(ProviderPayloadId::new_unchecked),
+        provider_json_pointer: row.get("provider_json_pointer")?,
         compacted_at: row.get("compacted_at")?,
         created_at: row.get("created_at")?,
     })
