@@ -103,7 +103,7 @@ fn decode_openai_chat_completions(
         .map(ToOwned::to_owned);
     let usage = decode_usage(value.get("usage"));
 
-    let turns = choices
+    let mut turns = choices
         .iter()
         .enumerate()
         .map(|(index, choice)| {
@@ -119,6 +119,36 @@ fn decode_openai_chat_completions(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+
+    // Decode unmapped top-level response fields (gateway extras like
+    // system_fingerprint, service_tier, provider-specific metadata).
+    let response_extras = decode_unmapped_response_fields(input, &value)?;
+    if !response_extras.is_empty() {
+        if let Some(first) = turns.first_mut() {
+            first.parts.extend(response_extras);
+        } else {
+            // No choices — synthesize a turn so extras are not silently dropped.
+            turns.push(DecodedTurn {
+                turn: Turn {
+                    id: derived_message_id(
+                        input.provider_payload_id.as_str(),
+                        "response_extras",
+                    ),
+                    run_id: input.run_id.clone(),
+                    seq: 0,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta {
+                        model_provider: input.provider_id.clone(),
+                        model_id: model_id.clone(),
+                        api_kind: Some(ApiKind::OpenAiCompletions),
+                        ..TurnMeta::default()
+                    },
+                    created_at: input.created_at,
+                },
+                parts: response_extras,
+            });
+        }
+    }
 
     let status = if turns.iter().any(decoded_turn_has_unknowns) {
         DecodeStatus::DecodedWithUnknowns
@@ -226,6 +256,38 @@ fn decode_unmapped_message_fields(
         });
     }
     Ok(parts)
+}
+
+fn decode_unmapped_response_fields(
+    input: &OpenAiChatCompletionsDecodeInput,
+    response: &Value,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    let Some(fields) = response.as_object() else {
+        return Ok(Vec::new());
+    };
+
+    let mut parts = Vec::new();
+    for (name, payload) in fields {
+        if chat_response_field_is_mapped(name) {
+            continue;
+        }
+
+        let pointer = format!("/{}", json_pointer_token(name));
+        let raw_payload = raw_json_from_value(payload)?;
+        parts.push(DecodedPart {
+            part: provider_opaque_part(input, format!("response.{name}"), raw_payload),
+            provider_payload_id: input.provider_payload_id.clone(),
+            provider_json_pointer: pointer,
+        });
+    }
+    Ok(parts)
+}
+
+fn chat_response_field_is_mapped(name: &str) -> bool {
+    matches!(
+        name,
+        "id" | "object" | "created" | "model" | "choices" | "usage"
+    )
 }
 
 fn chat_message_field_is_mapped(name: &str, payload: &Value) -> bool {
