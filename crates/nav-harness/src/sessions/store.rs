@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nav_types::{MessageId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId, ToolCallId};
 use serde_json::{Value, json};
 
+use crate::compaction::replay::project_for_replay;
 use crate::models::{
     DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
     OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
@@ -20,7 +21,7 @@ use super::canonical::{
 };
 use super::sqlite::{
     CreateSession, NewProviderPayload, ProviderState, RunStatus, SqliteSessionStore,
-    SqliteStoreError, StartRun, StoredPart, StoredTurn,
+    SqliteStoreError, StartRun,
 };
 
 pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
@@ -155,18 +156,17 @@ impl SessionStore {
             .list_turns_for_session(session_id, None, usize::MAX)?
             .items;
         page.reverse();
-        Ok(page
+        Ok(project_for_replay(&page)
             .into_iter()
-            .filter_map(model_turn_from_stored_turn)
+            .filter_map(model_turn_from_projected_turn)
             .collect())
     }
 
     pub fn try_turns_for_run(&self, run_id: &RunId) -> Result<Vec<ModelTurn>, SqliteStoreError> {
-        Ok(self
-            .sqlite
-            .list_turns_for_run(run_id)?
+        let turns = self.sqlite.list_turns_for_run(run_id)?;
+        Ok(project_for_replay(&turns)
             .into_iter()
-            .filter_map(model_turn_from_stored_turn)
+            .filter_map(model_turn_from_projected_turn)
             .collect())
     }
 
@@ -599,11 +599,10 @@ fn tool_call_arguments(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
-fn model_turn_from_stored_turn((turn, parts): StoredTurn) -> Option<ModelTurn> {
+fn model_turn_from_projected_turn((turn, parts): (Turn, Vec<Part>)) -> Option<ModelTurn> {
     let model_parts = parts
         .into_iter()
-        .filter(|part| part.compacted_at.is_none())
-        .filter_map(model_part_from_stored_part)
+        .filter_map(model_part_from_projected_part)
         .collect::<Vec<_>>();
 
     if model_parts.is_empty() {
@@ -628,8 +627,8 @@ fn model_turn_from_stored_turn((turn, parts): StoredTurn) -> Option<ModelTurn> {
     })
 }
 
-fn model_part_from_stored_part(part: StoredPart) -> Option<TurnPart> {
-    match part.part {
+fn model_part_from_projected_part(part: Part) -> Option<TurnPart> {
+    match part {
         Part::Text { text, .. } => Some(TurnPart::Text(text)),
         Part::ToolCall {
             id,
@@ -772,6 +771,41 @@ mod tests {
             reloaded[0].tool_calls()[0].arguments,
             "{invalid json".to_string()
         );
+    }
+
+    #[test]
+    fn try_turns_replays_compacted_tool_result_placeholder() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let tool_call_id = ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000051").unwrap();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turns(
+                &run_id,
+                vec![ModelTurn::tool_result(
+                    tool_call_id.as_str(),
+                    "large output",
+                )],
+            )
+            .unwrap();
+        let part_id = store.sqlite.list_turns_for_run(&run_id).unwrap()[0].1[0]
+            .id
+            .clone();
+
+        store.sqlite.compact_part(&part_id).unwrap();
+
+        let reloaded = store.try_turns(&session_id).unwrap();
+        let run_reloaded = store.try_turns_for_run(&run_id).unwrap();
+        let expected_parts = vec![TurnPart::ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: "[Old tool result content cleared]".to_string(),
+        }];
+
+        assert_eq!(reloaded[0].parts, expected_parts);
+        assert_eq!(run_reloaded[0].parts, expected_parts);
     }
 
     #[test]
