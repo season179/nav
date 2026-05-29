@@ -7,10 +7,10 @@ use nav_types::{PartId, ToolCallId};
 use crate::sessions::{ModelTurn, Part, StoredTurn, TurnPart};
 
 pub const PRUNE_PROTECT_TOKENS: usize = 40_000;
-pub const OLD_TOOL_RESULT_CONTENT_CLEARED: &str = "[Old tool result content cleared]";
+const OLD_TOOL_RESULT_CONTENT_CLEARED: &str = "[Old tool result content cleared]";
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
-const PROTECTED_TOOL_NAMES: &[&str] = &["skill"];
+const PROTECTED_TOOL_NAMES: &[&str] = &["skill", "todo"];
 
 #[derive(Debug)]
 struct ToolResultCandidate {
@@ -76,8 +76,13 @@ pub fn project_model_turns_for_tool_result_pruning(turns: &mut [ModelTurn]) {
     }
 
     for (turn_index, part_index) in pruned_positions {
-        if let TurnPart::ToolResult { content, .. } = &mut turns[turn_index].parts[part_index] {
-            *content = OLD_TOOL_RESULT_CONTENT_CLEARED.to_string();
+        if let TurnPart::ToolResult {
+            tool_call_id,
+            content,
+        } = &mut turns[turn_index].parts[part_index]
+        {
+            let tool_name = tool_names.get(tool_call_id.as_str()).map(String::as_str);
+            *content = pruned_result_summary(tool_name, content);
         }
     }
 }
@@ -167,7 +172,7 @@ fn model_tool_result_candidates(
                 continue;
             };
 
-            if content == OLD_TOOL_RESULT_CONTENT_CLEARED {
+            if content == OLD_TOOL_RESULT_CONTENT_CLEARED || is_pruned_summary(content) {
                 continue;
             }
 
@@ -195,4 +200,18 @@ fn approximate_tokens(text: &str) -> usize {
     }
 
     text.chars().count().div_ceil(APPROX_CHARS_PER_TOKEN)
+}
+
+pub fn pruned_result_summary(tool_name: Option<&str>, content: &str) -> String {
+    let char_count = content.chars().count();
+    match tool_name {
+        Some(name) => format!("[{name}]: {char_count} chars."),
+        None => format!("[unknown tool]: {char_count} chars."),
+    }
+}
+
+fn is_pruned_summary(content: &str) -> bool {
+    content.starts_with('[')
+        && content.ends_with("chars.")
+        && content.contains("]:")
 }

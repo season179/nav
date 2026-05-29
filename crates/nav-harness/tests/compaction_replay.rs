@@ -305,7 +305,56 @@ fn compacted_tool_result_replays_placeholder_content() {
         projected[0].1,
         vec![Part::ToolResult {
             call_id,
-            content: "[Old tool result content cleared]".to_string(),
+            content: "[unknown tool]: 12 chars.".to_string(),
+            raw_artifact_id: None,
+            is_error: false,
+        }]
+    );
+}
+
+#[test]
+fn compacted_tool_result_replays_summary_with_tool_name() {
+    let call_id = tool_call_id(80);
+    let content = "x".repeat(5_000);
+    let turns = vec![
+        turn(
+            TurnRole::Assistant,
+            1,
+            vec![stored_part(
+                part_id(80),
+                Part::ToolCall {
+                    id: call_id.clone(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"command": "ls -la"}),
+                    raw_arguments_artifact_id: None,
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::Assistant,
+            2,
+            vec![stored_part(
+                part_id(81),
+                Part::ToolResult {
+                    call_id: call_id.clone(),
+                    content: content.clone(),
+                    raw_artifact_id: None,
+                    is_error: false,
+                },
+                Some(1_700_000_000_999),
+            )],
+        ),
+    ];
+
+    let projected = project_all(&turns);
+
+    assert_eq!(projected.len(), 2);
+    assert_eq!(
+        projected[1].1,
+        vec![Part::ToolResult {
+            call_id,
+            content: format!("[bash]: {} chars.", content.len()),
             raw_artifact_id: None,
             is_error: false,
         }]
@@ -519,7 +568,7 @@ fn compacted_parts_excluded_from_hash_dedup() {
         projected[0].1[0],
         Part::ToolResult {
             call_id: tool_call_id(70),
-            content: "[Old tool result content cleared]".to_string(),
+            content: "[unknown tool]: 13 chars.".to_string(),
             raw_artifact_id: None,
             is_error: false,
         }
@@ -655,8 +704,9 @@ fn tool_call_argument_projection_never_expands_barely_long_strings() {
 
 #[test]
 fn image_projection_strips_images_before_latest_image_bearing_user_turn() {
-    let older_artifact_id = artifact_id(1);
-    let newer_artifact_id = artifact_id(2);
+    let oldest_artifact_id = artifact_id(1);
+    let middle_artifact_id = artifact_id(2);
+    let newest_artifact_id = artifact_id(3);
     let turns = vec![
         turn(
             TurnRole::User,
@@ -666,7 +716,7 @@ fn image_projection_strips_images_before_latest_image_bearing_user_turn() {
                 Part::Image {
                     mime: "image/png".to_string(),
                     source: ImageSource::FileRef {
-                        artifact_id: older_artifact_id,
+                        artifact_id: oldest_artifact_id,
                     },
                 },
                 None,
@@ -680,7 +730,21 @@ fn image_projection_strips_images_before_latest_image_bearing_user_turn() {
                 Part::Image {
                     mime: "image/png".to_string(),
                     source: ImageSource::FileRef {
-                        artifact_id: newer_artifact_id.clone(),
+                        artifact_id: middle_artifact_id.clone(),
+                    },
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::User,
+            3,
+            vec![stored_part(
+                part_id(3),
+                Part::Image {
+                    mime: "image/png".to_string(),
+                    source: ImageSource::FileRef {
+                        artifact_id: newest_artifact_id.clone(),
                     },
                 },
                 None,
@@ -690,22 +754,68 @@ fn image_projection_strips_images_before_latest_image_bearing_user_turn() {
 
     let projected = project_all(&turns);
 
+    // Oldest image stripped (outside keep_media_turns=2 window)
     assert_eq!(
         projected[0].1,
         vec![Part::Text {
-            text: "[Attached image — stripped after compression]".to_string(),
+            text: "[image elided]".to_string(),
             synthetic: Some(true),
         }]
     );
+    // Middle and newest images kept (within window)
     assert_eq!(
         projected[1].1,
         vec![Part::Image {
             mime: "image/png".to_string(),
             source: ImageSource::FileRef {
-                artifact_id: newer_artifact_id,
+                artifact_id: middle_artifact_id,
             },
         }]
     );
+    assert_eq!(
+        projected[2].1,
+        vec![Part::Image {
+            mime: "image/png".to_string(),
+            source: ImageSource::FileRef {
+                artifact_id: newest_artifact_id,
+            },
+        }]
+    );
+}
+
+#[test]
+fn image_stripping_keeps_last_keep_media_turns_images() {
+    let art_1 = artifact_id(1);
+    let art_2 = artifact_id(2);
+    let art_3 = artifact_id(3);
+    let turns = vec![
+        image_user_turn(1, "first screenshot", art_1.clone()),
+        image_user_turn(2, "second screenshot", art_2.clone()),
+        image_user_turn(3, "third screenshot", art_3.clone()),
+    ];
+
+    // With the default keep_media_turns=2, the last 2 image-bearing turns
+    // keep their images; the oldest is stripped.
+    let projected = project_for_replay(&turns, DEFAULT_TAIL_TURNS);
+
+    let stripped = Part::Text {
+        text: "[image elided]".to_string(),
+        synthetic: Some(true),
+    };
+    // First turn: image stripped
+    assert_eq!(projected[0].1.len(), 2);
+    assert_eq!(projected[0].1[0], Part::Text { text: "first screenshot".to_string(), synthetic: None });
+    assert_eq!(projected[0].1[1], stripped);
+    // Second turn: image kept (within last 2)
+    assert_eq!(projected[1].1[1], Part::Image {
+        mime: "image/png".to_string(),
+        source: ImageSource::FileRef { artifact_id: art_2 },
+    });
+    // Third turn: image kept (within last 2)
+    assert_eq!(projected[2].1[1], Part::Image {
+        mime: "image/png".to_string(),
+        source: ImageSource::FileRef { artifact_id: art_3 },
+    });
 }
 
 #[test]
@@ -715,7 +825,7 @@ fn three_image_conversation_preserves_only_the_most_recent_image() {
     let newest_artifact_id = artifact_id(3);
     let turns = vec![
         image_user_turn(1, "first screenshot", oldest_artifact_id),
-        image_user_turn(2, "second screenshot", middle_artifact_id),
+        image_user_turn(2, "second screenshot", middle_artifact_id.clone()),
         image_user_turn(3, "third screenshot", newest_artifact_id.clone()),
     ];
 
@@ -726,9 +836,10 @@ fn three_image_conversation_preserves_only_the_most_recent_image() {
 
     // Surrounding text survives in every turn; only the image part changes.
     let stripped = Part::Text {
-        text: "[Attached image — stripped after compression]".to_string(),
+        text: "[image elided]".to_string(),
         synthetic: Some(true),
     };
+    // Oldest image stripped (outside keep_media_turns=2 window)
     assert_eq!(
         projected[0].1,
         vec![
@@ -736,9 +847,10 @@ fn three_image_conversation_preserves_only_the_most_recent_image() {
                 text: "first screenshot".to_string(),
                 synthetic: None,
             },
-            stripped.clone(),
+            stripped,
         ]
     );
+    // Middle and newest images kept (within window)
     assert_eq!(
         projected[1].1,
         vec![
@@ -746,10 +858,14 @@ fn three_image_conversation_preserves_only_the_most_recent_image() {
                 text: "second screenshot".to_string(),
                 synthetic: None,
             },
-            stripped,
+            Part::Image {
+                mime: "image/png".to_string(),
+                source: ImageSource::FileRef {
+                    artifact_id: middle_artifact_id,
+                },
+            },
         ]
     );
-    // Only the most recent image-bearing turn keeps its image bytes.
     assert_eq!(
         projected[2].1,
         vec![
@@ -766,7 +882,7 @@ fn three_image_conversation_preserves_only_the_most_recent_image() {
         ]
     );
 
-    // The Anthropic request carries exactly one image block.
+    // The Anthropic request carries two image blocks (middle + newest).
     let request = AnthropicMessagesEncoder::new()
         .encode(&projected)
         .expect("projected turns should encode");
@@ -776,7 +892,7 @@ fn three_image_conversation_preserves_only_the_most_recent_image() {
         .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
         .filter(|block| block["type"] == "image")
         .count();
-    assert_eq!(image_blocks, 1, "only the most recent image should survive");
+    assert_eq!(image_blocks, 2, "last 2 image-bearing turns should survive");
 }
 
 #[test]
@@ -832,7 +948,7 @@ fn projected_turns_reencode_to_chat_completions_request() {
     );
     assert_eq!(
         request.messages[1].content,
-        Some(serde_json::json!("[Old tool result content cleared]"))
+        Some(serde_json::json!("[read]: 12 chars."))
     );
 }
 
@@ -852,7 +968,7 @@ fn projected_turns_reencode_to_responses_request() {
     assert_eq!(request.input[1]["call_id"], call_id.as_str());
     assert_eq!(
         request.input[1]["output"],
-        "[Old tool result content cleared]"
+        "[read]: 12 chars."
     );
 }
 
@@ -875,7 +991,7 @@ fn projected_turns_reencode_to_anthropic_messages_request() {
     );
     assert_eq!(
         request.messages[1]["content"][0]["content"],
-        "[Old tool result content cleared]"
+        "[read]: 12 chars."
     );
 }
 

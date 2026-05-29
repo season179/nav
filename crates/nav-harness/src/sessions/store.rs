@@ -1523,7 +1523,7 @@ mod tests {
         let run_reloaded = store.try_turns_for_run(&run_id).unwrap();
         let expected_parts = vec![TurnPart::ToolResult {
             tool_call_id: tool_call_id.to_string(),
-            content: "[Old tool result content cleared]".to_string(),
+            content: "[unknown tool]: 12 chars.".to_string(),
         }];
 
         assert_eq!(reloaded[0].parts, expected_parts);
@@ -1897,18 +1897,17 @@ mod tests {
         assert_eq!(raw_before.len(), 20);
 
         let reloaded = store.try_turns(&session_id).unwrap();
-        let placeholder = "[Old tool result content cleared]";
-        let placeholder_count = reloaded
+        let pruned_count = reloaded
             .iter()
             .flat_map(|turn| turn.parts.iter())
             .filter(|part| {
                 matches!(
                     part,
-                    TurnPart::ToolResult { content, .. } if content == placeholder
+                    TurnPart::ToolResult { content, .. } if content.starts_with("[unknown tool]")
                 )
             })
             .count();
-        assert_eq!(placeholder_count, 16);
+        assert_eq!(pruned_count, 16);
 
         let raw_after = store.sqlite.list_turns_for_run(&run_id).unwrap();
         assert_eq!(raw_after.len(), 20);
@@ -2256,14 +2255,22 @@ mod tests {
         // replay path rather than a tail-disabled special case.
         let projected = project_for_replay(&stored, DEFAULT_TAIL_TURNS);
 
-        // Older two turns lose their image bytes to the placeholder.
+        // Oldest turn loses its image bytes to the placeholder (outside keep_media_turns=2 window).
         let stripped = Part::Text {
-            text: "[Attached image — stripped after compression]".to_string(),
+            text: "[image elided]".to_string(),
             synthetic: Some(true),
         };
-        assert_eq!(projected[0].1, vec![stripped.clone()]);
-        assert_eq!(projected[1].1, vec![stripped]);
-        // The most recent image is preserved verbatim.
+        assert_eq!(projected[0].1, vec![stripped]);
+        // The two most recent images are preserved verbatim.
+        assert_eq!(
+            projected[1].1,
+            vec![Part::Image {
+                mime: "image/png".to_string(),
+                source: ImageSource::FileRef {
+                    artifact_id: artifact_ids[1].clone(),
+                },
+            }]
+        );
         assert_eq!(
             projected[2].1,
             vec![Part::Image {
