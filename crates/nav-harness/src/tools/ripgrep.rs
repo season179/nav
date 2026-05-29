@@ -231,11 +231,7 @@ fn build_rg_command(binary: &str, args: &RipgrepArgs, search_path: &Path) -> Str
 }
 
 fn apply_limit(content: &str, limit: usize) -> String {
-    content
-        .lines()
-        .take(limit)
-        .collect::<Vec<_>>()
-        .join("\n")
+    content.lines().take(limit).collect::<Vec<_>>().join("\n")
 }
 
 fn shell_quote_arg(arg: &str) -> String {
@@ -285,8 +281,7 @@ impl RipgrepArgs {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let context =
-            super::parse_optional_positive_usize(object.get("context"), "context")?;
+        let context = super::parse_optional_positive_usize(object.get("context"), "context")?;
 
         let limit =
             super::parse_optional_positive_usize(object.get("limit"), "limit")?.unwrap_or(100);
@@ -304,12 +299,16 @@ impl RipgrepArgs {
 }
 
 const KNOWN_ARGUMENTS: &[&str] = &[
-    "pattern", "path", "glob", "ignore_case", "literal", "context", "limit",
+    "pattern",
+    "path",
+    "glob",
+    "ignore_case",
+    "literal",
+    "context",
+    "limit",
 ];
 
-fn reject_unknown_arguments(
-    object: &serde_json::Map<String, Value>,
-) -> Result<(), ToolError> {
+fn reject_unknown_arguments(object: &serde_json::Map<String, Value>) -> Result<(), ToolError> {
     for name in object.keys() {
         if !KNOWN_ARGUMENTS.contains(&name.as_str()) {
             return Err(ToolError::new(format!("unknown ripgrep argument `{name}`")));
@@ -324,7 +323,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::RipgrepTool;
-    use crate::tools::{NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolPreset, ToolRegistry};
+    use crate::tools::{
+        NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolPreset, ToolRegistry,
+    };
     use crate::workspace::path::WorkspacePathPolicy;
     use serde_json::json;
 
@@ -340,15 +341,22 @@ mod tests {
         super::register(&mut registry).expect("ripgrep should register");
 
         assert!(
-            registry.preset_tool_names(ToolPreset::Coding).contains(&"ripgrep".to_string()),
+            registry
+                .preset_tool_names(ToolPreset::Coding)
+                .contains(&"ripgrep".to_string()),
             "ripgrep should be in coding preset"
         );
         assert!(
-            registry.preset_tool_names(ToolPreset::Readonly).contains(&"ripgrep".to_string()),
+            registry
+                .preset_tool_names(ToolPreset::Readonly)
+                .contains(&"ripgrep".to_string()),
             "ripgrep should be in readonly preset"
         );
         assert_eq!(
-            registry.get("ripgrep").expect("ripgrep should be registered").risk_class(),
+            registry
+                .get("ripgrep")
+                .expect("ripgrep should be registered")
+                .risk_class(),
             RiskClass::Search,
         );
     }
@@ -380,11 +388,7 @@ mod tests {
         let context = ToolContext::with_path_policy(workspace.policy());
 
         let error = rg_tool()
-            .execute(
-                &context,
-                json!({}),
-                ToolCancellationToken::new(),
-            )
+            .execute(&context, json!({}), ToolCancellationToken::new())
             .await
             .expect_err("missing pattern should fail");
 
@@ -418,11 +422,7 @@ mod tests {
         cancel.cancel();
 
         let error = rg_tool()
-            .execute(
-                &context,
-                json!({ "pattern": "test" }),
-                cancel,
-            )
+            .execute(&context, json!({ "pattern": "test" }), cancel)
             .await
             .expect_err("cancelled token should fail immediately");
 
@@ -434,7 +434,10 @@ mod tests {
     #[tokio::test]
     async fn literal_match_returns_results() {
         let workspace = TestWorkspace::new("literal_match");
-        workspace.write("src/main.rs", "fn hello() {\n    println!(\"hello world\");\n}\n");
+        workspace.write(
+            "src/main.rs",
+            "fn hello() {\n    println!(\"hello world\");\n}\n",
+        );
         workspace.write("src/lib.rs", "fn goodbye() {\n    println!(\"bye\");\n}\n");
         let context = ToolContext::with_path_policy(workspace.policy());
 
@@ -447,8 +450,15 @@ mod tests {
             .await
             .expect("ripgrep should succeed");
 
-        assert!(output.content.contains("hello"), "output should contain match: got {:?}", output.content);
-        assert!(!output.content.contains("bye"), "output should not contain non-match");
+        assert!(
+            output.content.contains("hello"),
+            "output should contain match: got {:?}",
+            output.content
+        );
+        assert!(
+            !output.content.contains("bye"),
+            "output should not contain non-match"
+        );
     }
 
     // --- Regex match ---
@@ -456,7 +466,10 @@ mod tests {
     #[tokio::test]
     async fn regex_match_returns_results() {
         let workspace = TestWorkspace::new("regex_match");
-        workspace.write("app.log", "error: disk full\ninfo: started\nerror: timeout\n");
+        workspace.write(
+            "app.log",
+            "error: disk full\ninfo: started\nerror: timeout\n",
+        );
         let context = ToolContext::with_path_policy(workspace.policy());
 
         let output = rg_tool()
@@ -468,9 +481,20 @@ mod tests {
             .await
             .expect("ripgrep should succeed");
 
-        assert!(output.content.contains("disk full"), "should match first error: {:?}", output.content);
-        assert!(output.content.contains("timeout"), "should match second error: {:?}", output.content);
-        assert!(!output.content.contains("started"), "should not match info line");
+        assert!(
+            output.content.contains("disk full"),
+            "should match first error: {:?}",
+            output.content
+        );
+        assert!(
+            output.content.contains("timeout"),
+            "should match second error: {:?}",
+            output.content
+        );
+        assert!(
+            !output.content.contains("started"),
+            "should not match info line"
+        );
     }
 
     // --- Glob filter ---
@@ -491,8 +515,15 @@ mod tests {
             .await
             .expect("ripgrep should succeed");
 
-        assert!(output.content.contains("main.rs"), "should find rust file: {:?}", output.content);
-        assert!(!output.content.contains("notes.txt"), "should not find txt file");
+        assert!(
+            output.content.contains("main.rs"),
+            "should find rust file: {:?}",
+            output.content
+        );
+        assert!(
+            !output.content.contains("notes.txt"),
+            "should not find txt file"
+        );
     }
 
     // --- Context lines ---
@@ -512,11 +543,25 @@ mod tests {
             .await
             .expect("ripgrep should succeed");
 
-        assert!(output.content.contains("line2"), "should include 1 line before: {:?}", output.content);
+        assert!(
+            output.content.contains("line2"),
+            "should include 1 line before: {:?}",
+            output.content
+        );
         assert!(output.content.contains("TARGET"), "should include match");
-        assert!(output.content.contains("line4"), "should include 1 line after: {:?}", output.content);
-        assert!(!output.content.contains("line1"), "should not include 2 lines before");
-        assert!(!output.content.contains("line5"), "should not include 2 lines after");
+        assert!(
+            output.content.contains("line4"),
+            "should include 1 line after: {:?}",
+            output.content
+        );
+        assert!(
+            !output.content.contains("line1"),
+            "should not include 2 lines before"
+        );
+        assert!(
+            !output.content.contains("line5"),
+            "should not include 2 lines after"
+        );
     }
 
     // --- Limit truncation ---
@@ -538,7 +583,12 @@ mod tests {
             .expect("ripgrep should succeed");
 
         let result_lines: Vec<&str> = output.content.lines().collect();
-        assert_eq!(result_lines.len(), 5, "limit should cap to 5 lines: got {:?}", output.content);
+        assert_eq!(
+            result_lines.len(),
+            5,
+            "limit should cap to 5 lines: got {:?}",
+            output.content
+        );
     }
 
     // --- No matches returns empty result ---
@@ -580,8 +630,16 @@ mod tests {
             .await
             .expect_err("missing rg should return an error");
 
-        assert!(error.message().contains("rg"), "error should mention rg: {:?}", error.message());
-        assert!(error.message().contains("brew install ripgrep"), "error should include install hint: {:?}", error.message());
+        assert!(
+            error.message().contains("rg"),
+            "error should mention rg: {:?}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("brew install ripgrep"),
+            "error should include install hint: {:?}",
+            error.message()
+        );
     }
 
     // --- Ignore case ---
@@ -601,7 +659,11 @@ mod tests {
             .await
             .expect("ripgrep should succeed");
 
-        assert!(output.content.contains("Hello World"), "should find case-insensitive match: {:?}", output.content);
+        assert!(
+            output.content.contains("Hello World"),
+            "should find case-insensitive match: {:?}",
+            output.content
+        );
     }
 
     // --- Path outside workspace rejected ---
@@ -621,7 +683,11 @@ mod tests {
             .await
             .expect_err("path outside workspace should be rejected");
 
-        assert!(error.message().contains("outside allowed roots"), "should mention policy violation: {:?}", error.message());
+        assert!(
+            error.message().contains("outside allowed roots"),
+            "should mention policy violation: {:?}",
+            error.message()
+        );
     }
 
     // --- Test workspace helper ---

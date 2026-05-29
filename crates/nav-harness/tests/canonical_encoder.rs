@@ -2,12 +2,12 @@
 //!
 //! Each test covers one canonical-Part → wire-format mapping.
 
+use nav_harness::models::ApiKind;
 use nav_harness::models::{
-    ChatCompletionMessageRole, ChatCompletionToolDefinition, OpenAiCompletionsRequest,
-    OpenAiChatCompletionsEncoder,
+    ChatCompletionMessageRole, ChatCompletionToolDefinition, OpenAiChatCompletionsEncoder,
+    OpenAiCompletionsRequest,
 };
 use nav_harness::sessions::{ImageSource, Part, RawJson, Turn, TurnMeta, TurnRole};
-use nav_harness::models::ApiKind;
 use nav_types::{ArtifactId, MessageId, ToolCallId};
 
 // ---------------------------------------------------------------------------
@@ -57,8 +57,14 @@ fn text_part_on_assistant_turn_produces_assistant_message_with_content() {
     let request = encode(&turns);
 
     assert_eq!(request.messages.len(), 1);
-    assert_eq!(request.messages[0].role, ChatCompletionMessageRole::Assistant);
-    assert_eq!(request.messages[0].content, Some(serde_json::json!("Hello, world!")));
+    assert_eq!(
+        request.messages[0].role,
+        ChatCompletionMessageRole::Assistant
+    );
+    assert_eq!(
+        request.messages[0].content,
+        Some(serde_json::json!("Hello, world!"))
+    );
 }
 
 #[test]
@@ -76,7 +82,10 @@ fn text_part_on_user_turn_produces_user_message() {
 
     assert_eq!(request.messages.len(), 1);
     assert_eq!(request.messages[0].role, ChatCompletionMessageRole::User);
-    assert_eq!(request.messages[0].content, Some(serde_json::json!("What is Rust?")));
+    assert_eq!(
+        request.messages[0].content,
+        Some(serde_json::json!("What is Rust?"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -100,8 +109,14 @@ fn tool_call_part_produces_assistant_message_with_tool_calls() {
     let request = encode(&turns);
 
     assert_eq!(request.messages.len(), 1);
-    assert_eq!(request.messages[0].role, ChatCompletionMessageRole::Assistant);
-    let tool_calls = request.messages[0].tool_calls.as_ref().expect("should have tool_calls");
+    assert_eq!(
+        request.messages[0].role,
+        ChatCompletionMessageRole::Assistant
+    );
+    let tool_calls = request.messages[0]
+        .tool_calls
+        .as_ref()
+        .expect("should have tool_calls");
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0].id, call_id.as_str());
     assert_eq!(tool_calls[0].function.name, "read");
@@ -130,8 +145,14 @@ fn tool_result_part_produces_tool_role_message() {
 
     assert_eq!(request.messages.len(), 1);
     assert_eq!(request.messages[0].role, ChatCompletionMessageRole::Tool);
-    assert_eq!(request.messages[0].tool_call_id.as_deref(), Some(call_id.as_str()));
-    assert_eq!(request.messages[0].content, Some(serde_json::json!("1: [package]\n2: name = \"nav\"")));
+    assert_eq!(
+        request.messages[0].tool_call_id.as_deref(),
+        Some(call_id.as_str())
+    );
+    assert_eq!(
+        request.messages[0].content,
+        Some(serde_json::json!("1: [package]\n2: name = \"nav\""))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -146,9 +167,7 @@ fn image_part_produces_user_message_with_content_array() {
         1,
         vec![Part::Image {
             mime: "image/png".to_string(),
-            source: ImageSource::FileRef {
-                artifact_id,
-            },
+            source: ImageSource::FileRef { artifact_id },
         }],
     )];
 
@@ -158,11 +177,21 @@ fn image_part_produces_user_message_with_content_array() {
     assert_eq!(request.messages[0].role, ChatCompletionMessageRole::User);
 
     // Content should be a JSON array with image_url type.
-    let content = request.messages[0].content.as_ref().expect("should have content");
-    let arr = content.as_array().expect("content should be array for image");
+    let content = request.messages[0]
+        .content
+        .as_ref()
+        .expect("should have content");
+    let arr = content
+        .as_array()
+        .expect("content should be array for image");
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["type"], "image_url");
-    assert!(arr[0]["image_url"]["url"].as_str().unwrap().starts_with("artifact://"));
+    assert!(
+        arr[0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("artifact://")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +245,9 @@ fn compaction_part_produces_synthetic_user_text_message() {
         1,
         vec![Part::Compaction {
             auto: true,
-            tail_start_id: Some(MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000099").unwrap()),
+            tail_start_id: Some(
+                MessageId::try_new("019f2f6f-f178-7a72-9f28-000000000099").unwrap(),
+            ),
         }],
     )];
 
@@ -224,7 +255,10 @@ fn compaction_part_produces_synthetic_user_text_message() {
 
     assert_eq!(request.messages.len(), 1);
     assert_eq!(request.messages[0].role, ChatCompletionMessageRole::User);
-    let content = request.messages[0].content.as_ref().expect("should have content");
+    let content = request.messages[0]
+        .content
+        .as_ref()
+        .expect("should have content");
     assert!(
         content.as_str().unwrap().contains("compacted"),
         "should mention compaction"
@@ -249,10 +283,17 @@ fn provider_opaque_part_produces_synthetic_text_message() {
     let request = encode(&turns);
 
     assert_eq!(request.messages.len(), 1);
-    assert_eq!(request.messages[0].role, ChatCompletionMessageRole::Assistant);
-    let content = request.messages[0].content.as_ref().expect("should have content");
+    assert_eq!(
+        request.messages[0].role,
+        ChatCompletionMessageRole::Assistant
+    );
+    let content = request.messages[0]
+        .content
+        .as_ref()
+        .expect("should have content");
     assert!(
-        content.as_str().unwrap().contains("provider") || content.as_str().unwrap().contains("opaque"),
+        content.as_str().unwrap().contains("provider")
+            || content.as_str().unwrap().contains("opaque"),
         "should mention provider opaque"
     );
 }
@@ -286,7 +327,10 @@ fn assistant_turn_with_text_and_tool_calls_produces_single_message() {
     assert_eq!(request.messages.len(), 1);
     let msg = &request.messages[0];
     assert_eq!(msg.role, ChatCompletionMessageRole::Assistant);
-    assert_eq!(msg.content, Some(serde_json::json!("Let me read that file.")));
+    assert_eq!(
+        msg.content,
+        Some(serde_json::json!("Let me read that file."))
+    );
     let tool_calls = msg.tool_calls.as_ref().expect("should have tool_calls");
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0].function.name, "read");
@@ -316,10 +360,19 @@ fn assistant_turn_with_text_and_tool_result_produces_two_messages() {
 
     // Text part → assistant message, ToolResult → tool message.
     assert_eq!(request.messages.len(), 2);
-    assert_eq!(request.messages[0].role, ChatCompletionMessageRole::Assistant);
-    assert_eq!(request.messages[0].content, Some(serde_json::json!("Here is the result:")));
+    assert_eq!(
+        request.messages[0].role,
+        ChatCompletionMessageRole::Assistant
+    );
+    assert_eq!(
+        request.messages[0].content,
+        Some(serde_json::json!("Here is the result:"))
+    );
     assert_eq!(request.messages[1].role, ChatCompletionMessageRole::Tool);
-    assert_eq!(request.messages[1].tool_call_id.as_deref(), Some(call_id.as_str()));
+    assert_eq!(
+        request.messages[1].tool_call_id.as_deref(),
+        Some(call_id.as_str())
+    );
 }
 
 #[test]
@@ -348,10 +401,22 @@ fn multiple_tool_results_in_one_turn_produce_separate_messages() {
     let request = encode(&turns);
 
     assert_eq!(request.messages.len(), 2);
-    assert_eq!(request.messages[0].tool_call_id.as_deref(), Some(call_a.as_str()));
-    assert_eq!(request.messages[0].content, Some(serde_json::json!("result A")));
-    assert_eq!(request.messages[1].tool_call_id.as_deref(), Some(call_b.as_str()));
-    assert_eq!(request.messages[1].content, Some(serde_json::json!("result B")));
+    assert_eq!(
+        request.messages[0].tool_call_id.as_deref(),
+        Some(call_a.as_str())
+    );
+    assert_eq!(
+        request.messages[0].content,
+        Some(serde_json::json!("result A"))
+    );
+    assert_eq!(
+        request.messages[1].tool_call_id.as_deref(),
+        Some(call_b.as_str())
+    );
+    assert_eq!(
+        request.messages[1].content,
+        Some(serde_json::json!("result B"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -373,10 +438,14 @@ fn encoder_with_tools_includes_them_in_request() {
     }];
 
     let encoder = OpenAiChatCompletionsEncoder::new().with_tools(tools);
-    let turns = vec![turn(TurnRole::User, 1, vec![Part::Text {
-        text: "Read Cargo.toml".to_string(),
-        synthetic: None,
-    }])];
+    let turns = vec![turn(
+        TurnRole::User,
+        1,
+        vec![Part::Text {
+            text: "Read Cargo.toml".to_string(),
+            synthetic: None,
+        }],
+    )];
 
     let request = encoder.encode(&turns).expect("should encode");
 
@@ -386,10 +455,14 @@ fn encoder_with_tools_includes_them_in_request() {
 
 #[test]
 fn encoder_without_tools_produces_empty_tools() {
-    let turns = vec![turn(TurnRole::User, 1, vec![Part::Text {
-        text: "hello".to_string(),
-        synthetic: None,
-    }])];
+    let turns = vec![turn(
+        TurnRole::User,
+        1,
+        vec![Part::Text {
+            text: "hello".to_string(),
+            synthetic: None,
+        }],
+    )];
 
     let request = encode(&turns);
 
@@ -402,10 +475,14 @@ fn encoder_without_tools_produces_empty_tools() {
 
 #[test]
 fn encoder_produces_request_without_provider_state() {
-    let turns = vec![turn(TurnRole::User, 1, vec![Part::Text {
-        text: "hello".to_string(),
-        synthetic: None,
-    }])];
+    let turns = vec![turn(
+        TurnRole::User,
+        1,
+        vec![Part::Text {
+            text: "hello".to_string(),
+            synthetic: None,
+        }],
+    )];
 
     let request = encode(&turns);
 
@@ -507,14 +584,19 @@ fn full_request_body_matches_known_good_fixture() {
     // Message 0: user with text + image (multimodal content array)
     assert_eq!(request.messages[0].role, ChatCompletionMessageRole::User);
     let content0 = request.messages[0].content.as_ref().unwrap();
-    let arr0 = content0.as_array().expect("multimodal content should be array");
+    let arr0 = content0
+        .as_array()
+        .expect("multimodal content should be array");
     assert_eq!(arr0.len(), 2);
     assert_eq!(arr0[0]["type"], "text");
     assert_eq!(arr0[0]["text"], "Read Cargo.toml");
     assert_eq!(arr0[1]["type"], "image_url");
 
     // Message 1: assistant with text + tool_calls (Thinking dropped)
-    assert_eq!(request.messages[1].role, ChatCompletionMessageRole::Assistant);
+    assert_eq!(
+        request.messages[1].role,
+        ChatCompletionMessageRole::Assistant
+    );
     assert_eq!(
         request.messages[1].content,
         Some(serde_json::json!("Let me read that."))
@@ -525,11 +607,22 @@ fn full_request_body_matches_known_good_fixture() {
 
     // Message 2: tool result
     assert_eq!(request.messages[2].role, ChatCompletionMessageRole::Tool);
-    assert_eq!(request.messages[2].tool_call_id.as_deref(), Some(call_id.as_str()));
+    assert_eq!(
+        request.messages[2].tool_call_id.as_deref(),
+        Some(call_id.as_str())
+    );
 
     // Message 3: compaction + text combined (synthetic + real text)
-    assert_eq!(request.messages[3].role, ChatCompletionMessageRole::Assistant);
-    let content3 = request.messages[3].content.as_ref().unwrap().as_str().unwrap();
+    assert_eq!(
+        request.messages[3].role,
+        ChatCompletionMessageRole::Assistant
+    );
+    let content3 = request.messages[3]
+        .content
+        .as_ref()
+        .unwrap()
+        .as_str()
+        .unwrap();
     assert!(content3.contains("compacted"));
     assert!(content3.contains("Here is the file."));
 

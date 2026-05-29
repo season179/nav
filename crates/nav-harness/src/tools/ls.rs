@@ -239,8 +239,7 @@ mod tests {
 
     impl TestWorkspace {
         fn new(name: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("nav-ls-{name}-{}", std::process::id()));
+            let root = std::env::temp_dir().join(format!("nav-ls-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("workspace should be created");
             Self {
@@ -256,8 +255,7 @@ mod tests {
         }
 
         fn create_dir(&self, relative_path: &str) {
-            fs::create_dir_all(self.root.join(relative_path))
-                .expect("directory should be created");
+            fs::create_dir_all(self.root.join(relative_path)).expect("directory should be created");
         }
 
         #[cfg(unix)]
@@ -286,11 +284,7 @@ mod tests {
         let context = ToolContext::with_path_policy(workspace.policy());
 
         let output = LsTool
-            .execute(
-                &context,
-                json!({}),
-                ToolCancellationToken::new(),
-            )
+            .execute(&context, json!({}), ToolCancellationToken::new())
             .await
             .expect("ls should succeed");
 
@@ -316,7 +310,10 @@ mod tests {
             .await
             .expect("ls should succeed");
 
-        assert_eq!(output.content, "", "empty directory should produce empty output");
+        assert_eq!(
+            output.content, "",
+            "empty directory should produce empty output"
+        );
     }
 
     #[tokio::test]
@@ -389,11 +386,15 @@ mod tests {
         super::register(&mut registry).expect("ls should register");
 
         assert!(
-            registry.preset_tool_names(ToolPreset::Coding).contains(&"ls".to_string()),
+            registry
+                .preset_tool_names(ToolPreset::Coding)
+                .contains(&"ls".to_string()),
             "ls should be in coding preset"
         );
         assert!(
-            registry.preset_tool_names(ToolPreset::Readonly).contains(&"ls".to_string()),
+            registry
+                .preset_tool_names(ToolPreset::Readonly)
+                .contains(&"ls".to_string()),
             "ls should be in readonly preset"
         );
     }
@@ -409,11 +410,7 @@ mod tests {
         let context = ToolContext::with_path_policy(policy);
 
         let output = LsTool
-            .execute(
-                &context,
-                json!({}),
-                ToolCancellationToken::new(),
-            )
+            .execute(&context, json!({}), ToolCancellationToken::new())
             .await
             .expect("ls should succeed");
 
@@ -433,11 +430,7 @@ mod tests {
         let context = ToolContext::with_path_policy(workspace.policy());
 
         let output = LsTool
-            .execute(
-                &context,
-                json!({}),
-                ToolCancellationToken::new(),
-            )
+            .execute(&context, json!({}), ToolCancellationToken::new())
             .await
             .expect("ls should succeed");
 

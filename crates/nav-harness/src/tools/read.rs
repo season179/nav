@@ -112,7 +112,8 @@ impl ReadArgs {
             .filter(|path| !path.trim().is_empty())
             .ok_or_else(|| super::ToolError::new("read argument `path` is required"))?
             .to_string();
-        let offset = super::parse_optional_positive_usize(object.get("offset"), "offset")?.unwrap_or(1);
+        let offset =
+            super::parse_optional_positive_usize(object.get("offset"), "offset")?.unwrap_or(1);
         let limit = super::parse_optional_positive_usize(object.get("limit"), "limit")?;
 
         Ok(Self {

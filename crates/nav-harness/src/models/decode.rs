@@ -130,10 +130,7 @@ fn decode_openai_chat_completions(
             // No choices — synthesize a turn so extras are not silently dropped.
             turns.push(DecodedTurn {
                 turn: Turn {
-                    id: derived_message_id(
-                        input.provider_payload_id.as_str(),
-                        "response_extras",
-                    ),
+                    id: derived_message_id(input.provider_payload_id.as_str(), "response_extras"),
                     run_id: input.run_id.clone(),
                     seq: 0,
                     role: TurnRole::Assistant,

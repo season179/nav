@@ -1,9 +1,9 @@
 use std::env;
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
-use nav_harness::sessions::SessionStore;
+use anyhow::{Context, Result, bail};
 use nav_harness::Harness;
+use nav_harness::sessions::SessionStore;
 use nav_server::http::{HttpServer, HttpServerConfig};
 
 mod config;

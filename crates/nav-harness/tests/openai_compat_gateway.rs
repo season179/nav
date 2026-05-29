@@ -78,9 +78,18 @@ fn top_level_extras_become_provider_opaque_parts() {
 
     // Top-level extras should surface as ProviderOpaque parts.
     let kinds = opaque_kinds(&decoded);
-    assert!(kinds.contains(&"response.system_fingerprint"), "expected system_fingerprint, got: {kinds:?}");
-    assert!(kinds.contains(&"response.service_tier"), "expected service_tier, got: {kinds:?}");
-    assert!(kinds.contains(&"response.x_gw_provider_request_id"), "expected x_gw_provider_request_id, got: {kinds:?}");
+    assert!(
+        kinds.contains(&"response.system_fingerprint"),
+        "expected system_fingerprint, got: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"response.service_tier"),
+        "expected service_tier, got: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"response.x_gw_provider_request_id"),
+        "expected x_gw_provider_request_id, got: {kinds:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -107,20 +116,41 @@ fn top_level_extra_json_pointers_are_response_level() {
     let decoded = decode(&fixture("text_with_extras"));
 
     for part in &decoded.turns[0].parts {
-        let Part::ProviderOpaque { .. } = &part.part else { continue; };
-        assert!(part.provider_json_pointer.starts_with("/"), "pointer should be absolute, got: {}", part.provider_json_pointer);
-        assert!(!part.provider_json_pointer.starts_with("/choices/"), "top-level extra should not be under /choices/, got: {}", part.provider_json_pointer);
+        let Part::ProviderOpaque { .. } = &part.part else {
+            continue;
+        };
+        assert!(
+            part.provider_json_pointer.starts_with("/"),
+            "pointer should be absolute, got: {}",
+            part.provider_json_pointer
+        );
+        assert!(
+            !part.provider_json_pointer.starts_with("/choices/"),
+            "top-level extra should not be under /choices/, got: {}",
+            part.provider_json_pointer
+        );
     }
 
-    let pointers: Vec<&str> = decoded.turns[0].parts.iter()
+    let pointers: Vec<&str> = decoded.turns[0]
+        .parts
+        .iter()
         .filter_map(|p| match &p.part {
             Part::ProviderOpaque { .. } => Some(p.provider_json_pointer.as_str()),
             _ => None,
         })
         .collect();
-    assert!(pointers.contains(&"/system_fingerprint"), "expected /system_fingerprint, got: {pointers:?}");
-    assert!(pointers.contains(&"/service_tier"), "expected /service_tier, got: {pointers:?}");
-    assert!(pointers.contains(&"/x_gw_provider_request_id"), "expected /x_gw_provider_request_id, got: {pointers:?}");
+    assert!(
+        pointers.contains(&"/system_fingerprint"),
+        "expected /system_fingerprint, got: {pointers:?}"
+    );
+    assert!(
+        pointers.contains(&"/service_tier"),
+        "expected /service_tier, got: {pointers:?}"
+    );
+    assert!(
+        pointers.contains(&"/x_gw_provider_request_id"),
+        "expected /x_gw_provider_request_id, got: {pointers:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -211,15 +241,32 @@ fn tool_call_fixture_decodes_text_and_tool_call_with_all_extras() {
     assert_eq!(decoded.turns.len(), 1);
 
     let parts = &decoded.turns[0].parts;
-    let text_count = parts.iter().filter(|p| matches!(p.part, Part::Text { .. })).count();
-    let tool_count = parts.iter().filter(|p| matches!(p.part, Part::ToolCall { .. })).count();
-    let opaque_count = parts.iter().filter(|p| matches!(p.part, Part::ProviderOpaque { .. })).count();
+    let text_count = parts
+        .iter()
+        .filter(|p| matches!(p.part, Part::Text { .. }))
+        .count();
+    let tool_count = parts
+        .iter()
+        .filter(|p| matches!(p.part, Part::ToolCall { .. }))
+        .count();
+    let opaque_count = parts
+        .iter()
+        .filter(|p| matches!(p.part, Part::ProviderOpaque { .. }))
+        .count();
 
     assert_eq!(text_count, 1, "should have 1 text part");
     assert_eq!(tool_count, 1, "should have 1 tool call");
-    assert!(opaque_count >= 5, "should have at least 5 opaque parts (1 message-level + 4 top-level), got: {opaque_count}");
+    assert!(
+        opaque_count >= 5,
+        "should have at least 5 opaque parts (1 message-level + 4 top-level), got: {opaque_count}"
+    );
 
-    let Part::ToolCall { name, .. } = &parts.iter().find(|p| matches!(p.part, Part::ToolCall { .. })).unwrap().part else {
+    let Part::ToolCall { name, .. } = &parts
+        .iter()
+        .find(|p| matches!(p.part, Part::ToolCall { .. }))
+        .unwrap()
+        .part
+    else {
         panic!("expected tool call");
     };
     assert_eq!(name, "read");
@@ -230,7 +277,10 @@ fn tool_call_fixture_has_both_message_and_response_level_extras() {
     let decoded = decode(&fixture("tool_call_with_extras"));
     let kinds = opaque_kinds(&decoded);
 
-    assert!(kinds.contains(&"message.anthropic_metadata"), "expected message-level anthropic_metadata, got: {kinds:?}");
+    assert!(
+        kinds.contains(&"message.anthropic_metadata"),
+        "expected message-level anthropic_metadata, got: {kinds:?}"
+    );
     assert!(kinds.contains(&"response.system_fingerprint"));
     assert!(kinds.contains(&"response.service_tier"));
     assert!(kinds.contains(&"response.x_openrouter_provider"));
@@ -247,10 +297,17 @@ fn empty_choices_with_extras_synthesizes_turn_for_opaque_parts() {
     let decoded = decode(raw);
 
     assert_eq!(decoded.status, DecodeStatus::DecodedWithUnknowns);
-    assert_eq!(decoded.turns.len(), 1, "should synthesize a turn for extras");
+    assert_eq!(
+        decoded.turns.len(),
+        1,
+        "should synthesize a turn for extras"
+    );
 
     let kinds = opaque_kinds(&decoded);
-    assert!(kinds.contains(&"response.system_fingerprint"), "expected system_fingerprint, got: {kinds:?}");
+    assert!(
+        kinds.contains(&"response.system_fingerprint"),
+        "expected system_fingerprint, got: {kinds:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
