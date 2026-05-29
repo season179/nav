@@ -11,7 +11,7 @@ use nav_types::{MessageId, ProviderPayloadId, ProviderPayloadRow, RunId, Session
 use serde_json::{Value, json};
 
 use crate::compaction::prune::tool_result_part_ids_to_prune;
-use crate::compaction::replay::project_for_replay;
+use crate::compaction::replay::{project_for_replay, DEFAULT_TAIL_TURNS};
 use crate::models::{
     AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
     ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
@@ -771,7 +771,7 @@ fn model_turn_from_projected_turn((turn, parts): (Turn, Vec<Part>)) -> Option<Mo
 }
 
 fn model_turns_for_replay(turns: &[StoredTurn]) -> Vec<ModelTurn> {
-    project_for_replay(turns)
+    project_for_replay(turns, DEFAULT_TAIL_TURNS)
         .into_iter()
         .filter_map(model_turn_from_projected_turn)
         .collect()
