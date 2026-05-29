@@ -1173,6 +1173,15 @@ impl SqliteSessionStore {
             return Err(invalid_run_status("append_finished_run_with_turns", status));
         }
 
+        for (turn, _) in turns_with_parts {
+            if turn.run_id != run.id {
+                return Err(SqliteStoreError::WriteFailed(format!(
+                    "turn `{}` run_id `{}` does not match run `{}`",
+                    turn.id, turn.run_id, run.id
+                )));
+            }
+        }
+
         let prepared_turns = turns_with_parts
             .iter()
             .map(|(turn, parts)| prepare_turn(turn, parts))

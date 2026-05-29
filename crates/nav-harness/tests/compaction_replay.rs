@@ -1,7 +1,6 @@
 //! Replay projection tests for compaction-safe provider requests.
 
-use nav_harness::compaction::replay::project_for_replay;
-use nav_harness::compaction::replay::DEFAULT_TAIL_TURNS;
+use nav_harness::compaction::replay::{DEFAULT_TAIL_TURNS, project_for_replay};
 use nav_harness::models::{
     AnthropicMessagesEncoder, ApiKind, ChatCompletionMessageRole, OpenAiChatCompletionsEncoder,
     OpenAiResponsesEncoder,
@@ -108,7 +107,7 @@ fn compaction_marker_replays_summary_then_tail() {
         )],
     ));
 
-    let projected = project_for_replay(&turns);
+    let projected = project_for_replay(&turns, DEFAULT_TAIL_TURNS);
     let projected_ids = projected
         .iter()
         .map(|(turn, _)| turn.id.clone())
@@ -173,7 +172,7 @@ fn compaction_without_tail_still_replays_future_turns() {
         ),
     ];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_for_replay(&turns, DEFAULT_TAIL_TURNS);
     let projected_ids = projected
         .iter()
         .map(|(turn, _)| turn.id.clone())
@@ -182,6 +181,71 @@ fn compaction_without_tail_still_replays_future_turns() {
     assert_eq!(
         projected_ids,
         vec![message_id(1), message_id(2), message_id(3)]
+    );
+}
+
+#[test]
+fn compaction_with_missing_tail_start_does_not_replay_full_history() {
+    let turns = vec![
+        turn(
+            TurnRole::User,
+            1,
+            vec![stored_part(
+                part_id(1),
+                Part::Text {
+                    text: "old user turn".to_string(),
+                    synthetic: None,
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::User,
+            2,
+            vec![stored_part(
+                part_id(2),
+                Part::Compaction {
+                    auto: true,
+                    tail_start_id: Some(message_id(99)),
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::Assistant,
+            3,
+            vec![stored_part(
+                part_id(3),
+                Part::Text {
+                    text: "summary pending".to_string(),
+                    synthetic: Some(true),
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::User,
+            4,
+            vec![stored_part(
+                part_id(4),
+                Part::Text {
+                    text: "future user turn".to_string(),
+                    synthetic: None,
+                },
+                None,
+            )],
+        ),
+    ];
+
+    let projected = project_for_replay(&turns, DEFAULT_TAIL_TURNS);
+    let projected_ids = projected
+        .iter()
+        .map(|(turn, _)| turn.id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        projected_ids,
+        vec![message_id(2), message_id(3), message_id(4)]
     );
 }
 
@@ -773,22 +837,37 @@ fn protected_tail_turns_skip_argument_truncation() {
     let projected = project_for_replay(&turns, 1);
 
     // Turn 1 (outside tail) — truncated
-    let Part::ToolCall { arguments: args1, .. } = &projected[0].1[0] else {
+    let Part::ToolCall {
+        arguments: args1, ..
+    } = &projected[0].1[0]
+    else {
         panic!("expected tool call");
     };
     let body1 = args1["body"].as_str().unwrap();
-    assert!(body1.ends_with("... [truncated]"), "old turn should be truncated");
+    assert!(
+        body1.ends_with("... [truncated]"),
+        "old turn should be truncated"
+    );
     assert!(body1.len() < 3_000);
 
     // Turn 2 (outside tail) — truncated
-    let Part::ToolCall { arguments: args2, .. } = &projected[1].1[0] else {
+    let Part::ToolCall {
+        arguments: args2, ..
+    } = &projected[1].1[0]
+    else {
         panic!("expected tool call");
     };
     let body2 = args2["body"].as_str().unwrap();
-    assert!(body2.ends_with("... [truncated]"), "middle turn should be truncated");
+    assert!(
+        body2.ends_with("... [truncated]"),
+        "middle turn should be truncated"
+    );
 
     // Turn 3 (inside protected tail) — NOT truncated
-    let Part::ToolCall { arguments: args3, .. } = &projected[2].1[0] else {
+    let Part::ToolCall {
+        arguments: args3, ..
+    } = &projected[2].1[0]
+    else {
         panic!("expected tool call");
     };
     let body3 = args3["body"].as_str().unwrap();
@@ -804,25 +883,23 @@ fn default_tail_turns_is_two() {
 #[test]
 fn fifty_kb_write_file_argument_is_truncated_outside_protected_tail() {
     let big_body = "a".repeat(50 * 1024);
-    let turns = vec![
-        turn(
-            TurnRole::Assistant,
-            1,
-            vec![stored_part(
-                part_id(1),
-                Part::ToolCall {
-                    id: tool_call_id(63),
-                    name: "write_file".to_string(),
-                    arguments: serde_json::json!({
-                        "path": "src/main.rs",
-                        "content": big_body,
-                    }),
-                    raw_arguments_artifact_id: Some(artifact_id(10)),
-                },
-                None,
-            )],
-        ),
-    ];
+    let turns = vec![turn(
+        TurnRole::Assistant,
+        1,
+        vec![stored_part(
+            part_id(1),
+            Part::ToolCall {
+                id: tool_call_id(63),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/main.rs",
+                    "content": big_body,
+                }),
+                raw_arguments_artifact_id: Some(artifact_id(10)),
+            },
+            None,
+        )],
+    )];
 
     // With tail_turns = 0 (all turns eligible), the 50 KB content is truncated
     let projected = project_for_replay(&turns, 0);
@@ -849,25 +926,23 @@ fn fifty_kb_write_file_argument_is_truncated_outside_protected_tail() {
 #[test]
 fn fifty_kb_write_file_argument_preserved_inside_protected_tail() {
     let big_body = "a".repeat(50 * 1024);
-    let turns = vec![
-        turn(
-            TurnRole::Assistant,
-            1,
-            vec![stored_part(
-                part_id(1),
-                Part::ToolCall {
-                    id: tool_call_id(64),
-                    name: "write_file".to_string(),
-                    arguments: serde_json::json!({
-                        "path": "src/main.rs",
-                        "content": big_body.clone(),
-                    }),
-                    raw_arguments_artifact_id: Some(artifact_id(11)),
-                },
-                None,
-            )],
-        ),
-    ];
+    let turns = vec![turn(
+        TurnRole::Assistant,
+        1,
+        vec![stored_part(
+            part_id(1),
+            Part::ToolCall {
+                id: tool_call_id(64),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "src/main.rs",
+                    "content": big_body.clone(),
+                }),
+                raw_arguments_artifact_id: Some(artifact_id(11)),
+            },
+            None,
+        )],
+    )];
 
     // With tail_turns = 2 (default), this single turn is in the protected tail
     let projected = project_for_replay(&turns, 2);

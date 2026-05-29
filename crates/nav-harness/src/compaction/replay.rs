@@ -70,7 +70,8 @@ fn compacted_replay_window(projected: &[(Turn, Vec<Part>)]) -> Option<Vec<(Turn,
     let tail_start_index = match tail_start_id {
         Some(tail_start_id) => projected
             .iter()
-            .position(|(turn, _)| turn.id == tail_start_id)?,
+            .position(|(turn, _)| turn.id == tail_start_id)
+            .unwrap_or_else(|| summary_index.saturating_add(1)),
         None => summary_index.saturating_add(1),
     };
     replay.extend(

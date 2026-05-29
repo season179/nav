@@ -970,6 +970,63 @@ fn append_finished_run_with_turns_rolls_back_run_when_turn_insert_fails() {
 }
 
 #[test]
+fn append_finished_run_with_turns_rejects_turns_for_a_different_run() {
+    let db = TempDb::new("run-append-mismatched-turn-run");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000554");
+    let other_run_id = run_id("019e7000-0000-7000-8000-000000000555");
+    let compaction_run_id = run_id("019e7000-0000-7000-8000-000000000556");
+    create_minimal_session(&store, session_id.clone());
+    store
+        .start_run(StartRun {
+            id: other_run_id.clone(),
+            session_id: session_id.clone(),
+            status: RunStatus::Running,
+            trigger: Some("user".to_string()),
+            started_at: 2_000,
+        })
+        .expect("other run start should commit");
+
+    let err = store
+        .append_finished_run_with_turns(
+            StartRun {
+                id: compaction_run_id.clone(),
+                session_id,
+                status: RunStatus::Running,
+                trigger: Some("compaction".to_string()),
+                started_at: 2_100,
+            },
+            &[(
+                Turn {
+                    id: message_id("019e7000-0000-7000-8000-000000000557"),
+                    run_id: other_run_id.clone(),
+                    seq: 0,
+                    role: TurnRole::User,
+                    meta: TurnMeta::default(),
+                    created_at: 2_101,
+                },
+                vec![text_part("wrong run")],
+            )],
+            2_102,
+            RunStatus::Completed,
+            None,
+        )
+        .expect_err("turns for another run should be rejected");
+
+    assert!(matches!(err, SqliteStoreError::WriteFailed(_)));
+    assert!(matches!(
+        store.get_run(&compaction_run_id),
+        Err(SqliteStoreError::NotFound { .. })
+    ));
+    assert!(
+        store
+            .list_turns_for_run(&other_run_id)
+            .expect("other run should remain readable")
+            .is_empty()
+    );
+}
+
+#[test]
 fn terminal_runs_cannot_be_finished_again() {
     let db = TempDb::new("run-terminal");
     let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
