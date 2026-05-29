@@ -14,9 +14,9 @@ pub use api::ApiKind;
 pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
 pub use config::{ModelRef, ModelSettings};
 pub use decode::{
-    DecodeError, DecodedPart, DecodedProviderPayload, DecodedTurn, Decoder,
-    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput,
-    OpenAiResponsesDecoder,
+    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, DecodeError, DecodedPart,
+    DecodedProviderPayload, DecodedTurn, Decoder, OpenAiChatCompletionsDecodeInput,
+    OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
 };
 pub use encode::{
     AnthropicMessagesEncoder, AnthropicMessagesRequest, AnthropicToolDefinition, Encoder,

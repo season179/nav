@@ -2,12 +2,15 @@
 
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose};
 use nav_types::{ArtifactId, MessageId, ProviderPayloadId, RunId, ToolCallId};
 use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 
 use crate::models::ApiKind;
-use crate::sessions::{DecodeStatus, Part, RawJson, TokenUsage, Turn, TurnMeta, TurnRole};
+use crate::sessions::{
+    DecodeStatus, ImageSource, Part, RawJson, TokenUsage, Turn, TurnMeta, TurnRole,
+};
 
 /// Converts a provider-specific response into canonical model output.
 ///
@@ -33,6 +36,16 @@ pub struct OpenAiChatCompletionsDecodeInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiResponsesDecodeInput {
+    pub provider_payload_id: ProviderPayloadId,
+    pub raw_artifact_id: ArtifactId,
+    pub run_id: RunId,
+    pub provider_id: Option<String>,
+    pub raw_json: Vec<u8>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnthropicMessagesDecodeInput {
     pub provider_payload_id: ProviderPayloadId,
     pub raw_artifact_id: ArtifactId,
     pub run_id: RunId,
@@ -113,6 +126,387 @@ impl Decoder for OpenAiResponsesDecoder {
     fn decode(&self, response: &Self::Response) -> Result<Self::Output, Self::Error> {
         decode_openai_responses(response)
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicMessagesDecoder;
+
+impl AnthropicMessagesDecoder {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decoder for AnthropicMessagesDecoder {
+    type Response = AnthropicMessagesDecodeInput;
+    type Output = DecodedProviderPayload;
+    type Error = DecodeError;
+
+    fn decode(&self, response: &Self::Response) -> Result<Self::Output, Self::Error> {
+        decode_anthropic_messages(response)
+    }
+}
+
+fn decode_anthropic_messages(
+    input: &AnthropicMessagesDecodeInput,
+) -> Result<DecodedProviderPayload, DecodeError> {
+    let value: Value = serde_json::from_slice(&input.raw_json)
+        .map_err(|error| DecodeError::MalformedJson(error.to_string()))?;
+    let raw_response = serde_json::from_slice::<RawAnthropicMessagesResponse>(&input.raw_json).ok();
+    let content = value
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| DecodeError::MalformedResponse("missing content array".to_string()))?;
+
+    let model_id = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let stop_reason = value
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let usage = decode_anthropic_usage(value.get("usage"));
+
+    let mut parts = Vec::new();
+    for (index, block) in content.iter().enumerate() {
+        let pointer = format!("/content/{index}");
+        let is_final_block = index + 1 == content.len();
+        parts.push(anthropic_step_start_part(input, &pointer));
+        parts.extend(decode_anthropic_content_block(
+            input,
+            index,
+            block,
+            raw_anthropic_content_block(raw_response.as_ref(), index),
+        )?);
+        parts.push(anthropic_step_finish_part(
+            input,
+            &pointer,
+            block,
+            is_final_block,
+            stop_reason.as_deref(),
+            usage.as_ref(),
+        ));
+    }
+
+    let turn = DecodedTurn {
+        turn: Turn {
+            id: derived_message_id(input.provider_payload_id.as_str(), "anthropic_message"),
+            run_id: input.run_id.clone(),
+            seq: 0,
+            role: TurnRole::Assistant,
+            meta: TurnMeta {
+                model_provider: input.provider_id.clone(),
+                model_id,
+                api_kind: Some(ApiKind::AnthropicMessages),
+                finish_reason: stop_reason,
+                usage,
+                parent_id: None,
+            },
+            created_at: input.created_at,
+        },
+        parts,
+    };
+
+    let status = if decoded_turn_has_unknowns(&turn) {
+        DecodeStatus::DecodedWithUnknowns
+    } else {
+        DecodeStatus::Decoded
+    };
+
+    Ok(DecodedProviderPayload {
+        status,
+        turns: vec![turn],
+    })
+}
+
+fn decode_anthropic_content_block(
+    input: &AnthropicMessagesDecodeInput,
+    index: usize,
+    block: &Value,
+    raw_block: Option<&RawValue>,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            let text = block.get("text").and_then(Value::as_str).ok_or_else(|| {
+                DecodeError::MalformedResponse(format!("missing text at /content/{index}/text"))
+            })?;
+            Ok(vec![anthropic_decoded_part(
+                input,
+                Part::Text {
+                    text: text.to_string(),
+                    synthetic: None,
+                },
+                format!("/content/{index}/text"),
+            )])
+        }
+        Some("tool_use") => {
+            let id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
+                DecodeError::MalformedResponse(format!("missing tool_use id at /content/{index}"))
+            })?;
+            let name = block.get("name").and_then(Value::as_str).ok_or_else(|| {
+                DecodeError::MalformedResponse(format!("missing tool_use name at /content/{index}"))
+            })?;
+            let arguments = block.get("input").cloned().unwrap_or(Value::Null);
+            Ok(vec![anthropic_decoded_part(
+                input,
+                Part::ToolCall {
+                    id: derived_anthropic_tool_call_id(input.provider_payload_id.as_str(), id),
+                    name: name.to_string(),
+                    arguments,
+                    raw_arguments_artifact_id: None,
+                },
+                format!("/content/{index}"),
+            )])
+        }
+        Some("tool_result") => {
+            let tool_use_id = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    DecodeError::MalformedResponse(format!(
+                        "missing tool_result tool_use_id at /content/{index}"
+                    ))
+                })?;
+            let content = block.get("content").ok_or_else(|| {
+                DecodeError::MalformedResponse(format!(
+                    "missing tool_result content at /content/{index}"
+                ))
+            })?;
+            Ok(vec![anthropic_decoded_part(
+                input,
+                Part::ToolResult {
+                    call_id: derived_anthropic_tool_call_id(
+                        input.provider_payload_id.as_str(),
+                        tool_use_id,
+                    ),
+                    content: anthropic_tool_result_content(content),
+                    raw_artifact_id: None,
+                    is_error: block
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                },
+                format!("/content/{index}/content"),
+            )])
+        }
+        Some("thinking") => {
+            let text = block
+                .get("thinking")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    DecodeError::MalformedResponse(format!(
+                        "missing thinking text at /content/{index}/thinking"
+                    ))
+                })?;
+            Ok(vec![anthropic_decoded_part(
+                input,
+                Part::Thinking {
+                    text: text.to_string(),
+                    provider_hint: Some("thinking".to_string()),
+                },
+                format!("/content/{index}/thinking"),
+            )])
+        }
+        Some("redacted_thinking") => {
+            let text = block.get("data").and_then(Value::as_str).ok_or_else(|| {
+                DecodeError::MalformedResponse(format!(
+                    "missing redacted_thinking data at /content/{index}/data"
+                ))
+            })?;
+            Ok(vec![anthropic_decoded_part(
+                input,
+                Part::Thinking {
+                    text: text.to_string(),
+                    provider_hint: Some("redacted_thinking".to_string()),
+                },
+                format!("/content/{index}/data"),
+            )])
+        }
+        Some("image") => decode_anthropic_image_block(input, index, block, raw_block),
+        Some(content_type) => Ok(vec![anthropic_provider_opaque_part(
+            input,
+            format!("message.content.{content_type}"),
+            format!("/content/{index}"),
+            raw_anthropic_content_block_payload(raw_block, block)?,
+        )]),
+        None => Ok(vec![anthropic_provider_opaque_part(
+            input,
+            "message.content.unknown".to_string(),
+            format!("/content/{index}"),
+            raw_anthropic_content_block_payload(raw_block, block)?,
+        )]),
+    }
+}
+
+fn decode_anthropic_image_block(
+    input: &AnthropicMessagesDecodeInput,
+    index: usize,
+    block: &Value,
+    raw_block: Option<&RawValue>,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    let Some(source) = block.get("source") else {
+        return Err(DecodeError::MalformedResponse(format!(
+            "missing image source at /content/{index}"
+        )));
+    };
+
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return Ok(vec![anthropic_provider_opaque_part(
+            input,
+            "message.content.image".to_string(),
+            format!("/content/{index}"),
+            raw_anthropic_content_block_payload(raw_block, block)?,
+        )]);
+    }
+
+    let mime = source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DecodeError::MalformedResponse(format!(
+                "missing image media_type at /content/{index}/source"
+            ))
+        })?;
+    let data = source.get("data").and_then(Value::as_str).ok_or_else(|| {
+        DecodeError::MalformedResponse(format!("missing image data at /content/{index}/source"))
+    })?;
+    let bytes = general_purpose::STANDARD.decode(data).map_err(|error| {
+        DecodeError::MalformedResponse(format!(
+            "image data is not valid base64 at /content/{index}/source/data: {error}"
+        ))
+    })?;
+
+    Ok(vec![anthropic_decoded_part(
+        input,
+        Part::Image {
+            mime: mime.to_string(),
+            source: ImageSource::InlineBytes { bytes },
+        },
+        format!("/content/{index}/source/data"),
+    )])
+}
+
+fn anthropic_tool_result_content(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+
+    let Some(blocks) = content.as_array() else {
+        return content.to_string();
+    };
+
+    blocks
+        .iter()
+        .map(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| block.to_string())
+        })
+        .collect()
+}
+
+fn anthropic_step_start_part(input: &AnthropicMessagesDecodeInput, pointer: &str) -> DecodedPart {
+    anthropic_decoded_part(input, Part::StepStart { snapshot: None }, pointer)
+}
+
+fn anthropic_step_finish_part(
+    input: &AnthropicMessagesDecodeInput,
+    pointer: &str,
+    block: &Value,
+    is_final: bool,
+    stop_reason: Option<&str>,
+    usage: Option<&TokenUsage>,
+) -> DecodedPart {
+    let tokens = if is_final {
+        usage.cloned().unwrap_or_default()
+    } else {
+        TokenUsage::default()
+    };
+
+    anthropic_decoded_part(
+        input,
+        Part::StepFinish {
+            reason: anthropic_step_reason(block, is_final, stop_reason),
+            cost: 0.0,
+            tokens,
+            snapshot: None,
+        },
+        pointer,
+    )
+}
+
+fn anthropic_step_reason(block: &Value, is_final: bool, stop_reason: Option<&str>) -> String {
+    if is_final {
+        return stop_reason.unwrap_or("end_turn").to_string();
+    }
+
+    block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("content")
+        .to_string()
+}
+
+fn anthropic_provider_opaque_part(
+    input: &AnthropicMessagesDecodeInput,
+    kind: String,
+    provider_json_pointer: String,
+    raw_payload: RawJson,
+) -> DecodedPart {
+    anthropic_decoded_part(
+        input,
+        Part::ProviderOpaque {
+            api_kind: ApiKind::AnthropicMessages,
+            kind,
+            raw_artifact_id: input.raw_artifact_id.clone(),
+            raw_payload: Some(raw_payload),
+        },
+        provider_json_pointer,
+    )
+}
+
+fn raw_anthropic_content_block_payload(
+    raw_block: Option<&RawValue>,
+    block: &Value,
+) -> Result<RawJson, DecodeError> {
+    raw_block
+        .map(|raw| raw_json_from_str(raw.get()))
+        .unwrap_or_else(|| raw_json_from_value(block))
+}
+
+fn raw_anthropic_content_block(
+    raw_response: Option<&RawAnthropicMessagesResponse>,
+    index: usize,
+) -> Option<&RawValue> {
+    raw_response
+        .and_then(|response| response.content.get(index))
+        .map(Box::as_ref)
+}
+
+fn anthropic_decoded_part(
+    input: &AnthropicMessagesDecodeInput,
+    part: Part,
+    provider_json_pointer: impl Into<String>,
+) -> DecodedPart {
+    DecodedPart {
+        part,
+        provider_payload_id: input.provider_payload_id.clone(),
+        provider_json_pointer: provider_json_pointer.into(),
+    }
+}
+
+fn decode_anthropic_usage(value: Option<&Value>) -> Option<TokenUsage> {
+    let usage = value?;
+    Some(TokenUsage {
+        input: optional_u64_field(usage, "input_tokens"),
+        output: optional_u64_field(usage, "output_tokens"),
+        reasoning: 0,
+        cache_read: optional_u64_field(usage, "cache_read_input_tokens"),
+        cache_write: optional_u64_field(usage, "cache_creation_input_tokens"),
+    })
 }
 
 fn decode_openai_responses(
@@ -921,6 +1315,13 @@ fn derived_responses_tool_call_id(payload_id: &str, call_id: &str) -> ToolCallId
     ))
 }
 
+fn derived_anthropic_tool_call_id(payload_id: &str, tool_use_id: &str) -> ToolCallId {
+    ToolCallId::new_unchecked(derived_uuid_v7_string(
+        payload_id,
+        &format!("anthropic_tool_use:{tool_use_id}"),
+    ))
+}
+
 fn derived_uuid_v7_string(payload_id: &str, pointer: &str) -> String {
     let hash = stable_hash64(payload_id, pointer);
     format!(
@@ -956,6 +1357,11 @@ struct RawChatCompletionChoice {
 #[derive(Deserialize)]
 struct RawOpenAiResponsesResponse {
     output: Vec<Box<RawValue>>,
+}
+
+#[derive(Deserialize)]
+struct RawAnthropicMessagesResponse {
+    content: Vec<Box<RawValue>>,
 }
 
 #[cfg(test)]
