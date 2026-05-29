@@ -251,6 +251,17 @@ pub struct ProviderState {
     pub state_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevertInfo {
+    pub message_id: MessageId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_id: Option<PartId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredPart {
     pub id: PartId,
@@ -876,6 +887,31 @@ impl SqliteSessionStore {
             tx.execute(
                 "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
                 params![title, now, session_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "session", session_id.as_str())
+    }
+
+    pub fn update_session_revert(
+        &self,
+        session_id: &SessionId,
+        revert: &RevertInfo,
+    ) -> Result<(), SqliteStoreError> {
+        let revert_json = serialize_json(revert)?;
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "UPDATE sessions SET revert_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![revert_json.as_str(), unix_millis(), session_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "session", session_id.as_str())
+    }
+
+    pub fn clear_session_revert(&self, session_id: &SessionId) -> Result<(), SqliteStoreError> {
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "UPDATE sessions SET revert_json = NULL, updated_at = ?1 WHERE id = ?2",
+                params![unix_millis(), session_id.as_str()],
             )
         })?;
         ensure_row_changed(changed, "session", session_id.as_str())

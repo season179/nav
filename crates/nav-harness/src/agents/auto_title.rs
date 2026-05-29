@@ -145,8 +145,7 @@ Assistant: {assistant_text}"#
 
 fn strip_surrounding_quotes(s: &str) -> String {
     if s.len() > 1
-        && ((s.starts_with('"') && s.ends_with('"'))
-            || (s.starts_with('\'') && s.ends_with('\'')))
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
     {
         s[1..s.len() - 1].to_string()
     } else {
@@ -163,8 +162,16 @@ mod tests {
     fn skips_when_session_already_has_title() {
         let store = Arc::new(Mutex::new(SessionStore::default()));
         let session_id = SessionId::try_new("019f2f6f-f178-7a72-9f28-000000000001").unwrap();
-        store.lock().unwrap().create_session(session_id.clone()).unwrap();
-        store.lock().unwrap().update_session_title(&session_id, "Existing Title").unwrap();
+        store
+            .lock()
+            .unwrap()
+            .create_session(session_id.clone())
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .update_session_title(&session_id, "Existing Title")
+            .unwrap();
 
         assert!(session_has_title(&store, &session_id));
     }
@@ -216,10 +223,7 @@ mod tests {
 
     #[test]
     fn returns_none_for_empty_text() {
-        let turns = vec![
-            ModelTurn::user_text(""),
-            ModelTurn::assistant_text(""),
-        ];
+        let turns = vec![ModelTurn::user_text(""), ModelTurn::assistant_text("")];
         assert!(extract_exchange_text(&turns).is_none());
     }
 
@@ -240,7 +244,9 @@ mod tests {
         let session_id = SessionId::try_new("019f2f6f-f178-7a72-9f28-000000000002").unwrap();
         store.create_session(session_id.clone()).unwrap();
 
-        store.update_session_title(&session_id, "Test Title").unwrap();
+        store
+            .update_session_title(&session_id, "Test Title")
+            .unwrap();
 
         let session = store.get_session(&session_id).unwrap();
         assert_eq!(session.title, Some("Test Title".to_string()));

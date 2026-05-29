@@ -10,14 +10,16 @@ use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
-use nav_harness::sessions::{Part, PendingConfirmation, SqliteSessionStore};
+use nav_harness::sessions::{
+    Part, PendingConfirmation, RevertInfo, SessionStore, SqliteSessionStore,
+};
 use nav_harness::tools::{ToolRegistry, bash};
 use nav_protocol::rpc::{SessionSource, ToolsPreset};
 use nav_protocol::{BackendEvent, EventEnvelope};
 use nav_server::http::{
     HttpRequest, HttpServer, HttpServerConfig, ProtocolEventSubscription, RunStatus,
 };
-use nav_types::{ApprovalId, RunId, SessionId, ToolCallId};
+use nav_types::{ApprovalId, MessageId, PartId, RunId, SessionId, ToolCallId};
 use serde_json::{Value, json};
 
 mod support;
@@ -513,6 +515,52 @@ fn completed_run_journals_provider_response_and_decoded_parts() {
         Some("/choices/0/message/content")
     );
     assert_eq!(parts[0].part, text_part("journaled reply"));
+}
+
+#[test]
+fn session_send_message_clears_pending_revert_metadata() {
+    let db = TestSessionDb::new("send-clears-revert");
+    let provider = successful_provider_with_text("continued after undo point");
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let session_id = create_session(&mut server);
+    let parsed_session_id = SessionId::try_new(session_id.clone()).unwrap();
+    let revert = RevertInfo {
+        message_id: MessageId::new_unchecked("019e7000-0000-7000-8000-000000000542"),
+        part_id: Some(PartId::new_unchecked(
+            "prt_0000018bcfe56800_0000000000000542",
+        )),
+        snapshot: Some("snapshot-before-continue".to_string()),
+        diff: Some("diff --git a/file.txt b/file.txt\n+assistant change\n".to_string()),
+    };
+    {
+        let store = SessionStore::open(db.path()).expect("store should open");
+        store
+            .update_session_revert(&parsed_session_id, &revert)
+            .expect("revert metadata update should commit");
+        assert!(
+            store
+                .get_session(&parsed_session_id)
+                .expect("session should be readable")
+                .revert_json
+                .is_some()
+        );
+    }
+
+    let run_id = send_message_text(&mut server, &session_id, "continue after undo point");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+    drop(server);
+
+    let store = SessionStore::open(db.path()).expect("store should reopen");
+    let session = store
+        .get_session(&parsed_session_id)
+        .expect("session should be readable");
+
+    assert_eq!(session.revert_json, None);
 }
 
 #[test]
