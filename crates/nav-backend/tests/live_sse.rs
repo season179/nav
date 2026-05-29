@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::Duration;
 use std::{env, fs};
 
+use nav_harness::sessions::SqliteSessionStore;
+use nav_types::SessionId;
 use serde_json::{Value, json};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -12,6 +18,7 @@ const MAX_EVENTS_PER_RUN: usize = 8;
 const NAV_MODEL: &str = "NAV_MODEL";
 const NAV_MODEL_PROVIDER: &str = "NAV_MODEL_PROVIDER";
 const NAV_MODEL_SETTINGS: &str = "NAV_MODEL_SETTINGS";
+const NAV_DATA_DIR: &str = "NAV_DATA_DIR";
 
 #[test]
 fn live_sse_clients_receive_future_events_and_replay_can_resume_later() {
@@ -61,6 +68,107 @@ fn live_sse_clients_receive_future_events_and_replay_can_resume_later() {
     );
 }
 
+#[test]
+fn serve_http_data_dir_persists_sessions_across_backend_restarts() {
+    let data_dir = TestDataDir::new("cli-data-dir");
+    let mut first_backend = BackendProcess::spawn_with_data_dir(data_dir.path());
+    let session_id = create_session(&first_backend.addr);
+    first_backend.stop();
+
+    assert!(
+        data_dir.db_path().is_file(),
+        "serve-http should create nav.db in the requested data dir"
+    );
+
+    let second_backend = BackendProcess::spawn_with_data_dir(data_dir.path());
+    let send_body = post_rpc(
+        &second_backend.addr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(3),
+            "method": "session.sendMessage",
+            "params": { "sessionId": session_id, "text": "after restart" }
+        }),
+    );
+
+    assert!(
+        send_body.get("result").is_some(),
+        "persisted session should be found after restart: {send_body}"
+    );
+}
+
+#[test]
+fn serve_http_processes_with_same_data_dir_interleave_session_writes() {
+    const WRITES_PER_BACKEND: usize = 8;
+
+    let data_dir = TestDataDir::new("shared-data-dir");
+    let first_backend = BackendProcess::spawn_with_data_dir(data_dir.path());
+    let second_backend = BackendProcess::spawn_with_data_dir(data_dir.path());
+    let first_addr = first_backend.addr.clone();
+    let second_addr = second_backend.addr.clone();
+
+    let first_writer = thread::spawn(move || create_sessions(&first_addr, WRITES_PER_BACKEND));
+    let second_writer = thread::spawn(move || create_sessions(&second_addr, WRITES_PER_BACKEND));
+    let mut session_ids = first_writer
+        .join()
+        .expect("first backend writer should not panic");
+    session_ids.extend(
+        second_writer
+            .join()
+            .expect("second backend writer should not panic"),
+    );
+
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("shared DB should open");
+    for session_id in session_ids {
+        let session_id = SessionId::try_new(&session_id).expect("session id should parse");
+        store
+            .get_session(&session_id)
+            .expect("concurrently created session should persist");
+    }
+}
+
+#[test]
+fn serve_http_nav_data_dir_env_selects_session_store() {
+    let data_dir = TestDataDir::new("env-data-dir");
+    let _backend = BackendProcess::spawn_with_env_data_dir(data_dir.path());
+
+    assert!(
+        data_dir.db_path().is_file(),
+        "NAV_DATA_DIR should select the nav.db location"
+    );
+}
+
+#[test]
+fn serve_http_defaults_to_home_nav_data_dir_with_private_permissions() {
+    let home = TestDataDir::new("home-default");
+    fs::create_dir_all(home.path()).expect("test home should be created");
+    let _backend = BackendProcess::spawn_with_home(home.path());
+
+    let nav_dir = home.path().join(".nav");
+    let db_path = nav_dir.join("nav.db");
+    assert!(db_path.is_file(), "serve-http should create ~/.nav/nav.db");
+
+    #[cfg(unix)]
+    {
+        assert_eq!(mode(&nav_dir), 0o700);
+        assert_eq!(mode(&db_path), 0o600);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_http_keeps_existing_data_dir_permissions_unchanged() {
+    let data_dir = TestDataDir::new("existing-data-dir");
+    fs::create_dir_all(data_dir.path()).expect("data dir should be created");
+    fs::set_permissions(data_dir.path(), fs::Permissions::from_mode(0o755))
+        .expect("test should set data dir permissions");
+
+    let _backend = BackendProcess::spawn_with_data_dir(data_dir.path());
+
+    assert_eq!(mode(data_dir.path()), 0o755);
+    assert_eq!(mode(&data_dir.db_path()), 0o600);
+}
+
 struct BackendProcess {
     child: Child,
     addr: String,
@@ -68,11 +176,42 @@ struct BackendProcess {
 
 impl BackendProcess {
     fn spawn() -> Self {
+        Self::spawn_with_args(vec!["serve-http".to_string()], vec![])
+    }
+
+    fn spawn_with_data_dir(data_dir: &Path) -> Self {
+        Self::spawn_with_args(
+            vec![
+                "serve-http".to_string(),
+                "--data-dir".to_string(),
+                data_dir.display().to_string(),
+            ],
+            vec![],
+        )
+    }
+
+    fn spawn_with_env_data_dir(data_dir: &Path) -> Self {
+        Self::spawn_with_args(
+            vec!["serve-http".to_string()],
+            vec![(NAV_DATA_DIR, data_dir.display().to_string())],
+        )
+    }
+
+    fn spawn_with_home(home: &Path) -> Self {
+        Self::spawn_with_args(
+            vec!["serve-http".to_string()],
+            vec![("HOME", home.display().to_string())],
+        )
+    }
+
+    fn spawn_with_args(args: Vec<String>, envs: Vec<(&'static str, String)>) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_nav-backend"))
-            .arg("serve-http")
+            .args(args)
             .env(NAV_MODEL_SETTINGS, missing_settings_path())
             .env_remove(NAV_MODEL)
             .env_remove(NAV_MODEL_PROVIDER)
+            .env_remove(NAV_DATA_DIR)
+            .envs(envs)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -107,6 +246,36 @@ impl BackendProcess {
     }
 }
 
+struct TestDataDir {
+    path: PathBuf,
+}
+
+impl TestDataDir {
+    fn new(name: &str) -> Self {
+        let path = env::temp_dir().join(format!(
+            "nav-backend-{name}-{}-{}",
+            std::process::id(),
+            request_id(998)
+        ));
+        let _ = fs::remove_dir_all(&path);
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.path.join("nav.db")
+    }
+}
+
+impl Drop for TestDataDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 impl Drop for BackendProcess {
     fn drop(&mut self) {
         self.stop();
@@ -127,6 +296,10 @@ fn create_session(addr: &str) -> String {
         .as_str()
         .expect("session.create should return a sessionId")
         .to_string()
+}
+
+fn create_sessions(addr: &str, count: usize) -> Vec<String> {
+    (0..count).map(|_| create_session(addr)).collect()
 }
 
 fn post_rpc(addr: &str, body: Value) -> Value {
@@ -289,6 +462,15 @@ fn event_names(events: &[SseFrame]) -> Vec<&str> {
 
 fn is_terminal_run_event(event_name: &str) -> bool {
     matches!(event_name, "run.completed" | "run.failed" | "run.cancelled")
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    fs::metadata(path)
+        .expect("path metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 fn request_id(index: u64) -> String {

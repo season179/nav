@@ -1,15 +1,21 @@
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     env, fs,
+    fs::OpenOptions,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use nav_harness::models::{ModelRef, ModelSettings};
 
+const NAV_DATA_DIR: &str = "NAV_DATA_DIR";
 const NAV_MODEL_SETTINGS: &str = "NAV_MODEL_SETTINGS";
 const NAV_MODEL_PROVIDER: &str = "NAV_MODEL_PROVIDER";
 const NAV_MODEL: &str = "NAV_MODEL";
+const DEFAULT_NAV_DATA_DIR: &str = "~/.nav";
 const DEFAULT_NAV_SETTINGS: &str = "~/.nav/settings.json";
+const SESSION_DB_FILE: &str = "nav.db";
 
 pub fn load_model_settings() -> Result<ModelSettings> {
     let path = settings_path();
@@ -21,6 +27,52 @@ pub fn load_model_settings() -> Result<ModelSettings> {
 
 pub fn settings_path() -> PathBuf {
     env_path(NAV_MODEL_SETTINGS).unwrap_or_else(|| expand_home(PathBuf::from(DEFAULT_NAV_SETTINGS)))
+}
+
+pub fn session_db_path(data_dir_arg: Option<PathBuf>) -> Result<PathBuf> {
+    let data_dir = data_dir_arg
+        .map(expand_home)
+        .or_else(|| env_path(NAV_DATA_DIR))
+        .unwrap_or_else(|| expand_home(PathBuf::from(DEFAULT_NAV_DATA_DIR)));
+    prepare_data_dir(&data_dir)?;
+    Ok(data_dir.join(SESSION_DB_FILE))
+}
+
+fn prepare_data_dir(data_dir: &Path) -> Result<()> {
+    let should_set_permissions = !data_dir.exists();
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("create nav data dir {}", data_dir.display()))?;
+    if should_set_permissions {
+        set_private_dir_permissions(data_dir)?;
+    }
+
+    let db_path = data_dir.join(SESSION_DB_FILE);
+    ensure_private_db_file(&db_path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("set private permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn ensure_private_db_file(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("create nav database {}", path.display())),
+    }
 }
 
 fn read_nav_model_settings(path: &Path) -> Result<Option<ModelSettings>> {
