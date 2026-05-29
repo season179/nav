@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
 libc = "0.2"
 nav-types = { path = "../nav-types" }
 reqwest.workspace = true

@@ -538,6 +538,7 @@ fn persisted_api_kind_name(api: crate::models::ApiKind) -> &'static str {
         // event payloads are journaled here.
         crate::models::ApiKind::ChatGptSubscription => "openai-completions",
         crate::models::ApiKind::OpenAiResponses => "openai-responses",
+        crate::models::ApiKind::AnthropicMessages => "anthropic-messages",
     }
 }
 

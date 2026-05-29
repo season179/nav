@@ -1,10 +1,11 @@
-//! Fixture-driven tests for the OpenAI Chat Completions canonical decoder.
+//! Fixture-driven tests for canonical provider decoders.
 
 use nav_harness::models::{
-    ApiKind, Decoder, OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
-    OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
+    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ApiKind, Decoder,
+    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput,
+    OpenAiResponsesDecoder,
 };
-use nav_harness::sessions::{DecodeStatus, Part, TokenUsage, TurnRole};
+use nav_harness::sessions::{DecodeStatus, ImageSource, Part, TokenUsage, TurnRole};
 use nav_types::{ArtifactId, ProviderPayloadId, RunId, ToolCallId};
 
 fn provider_payload_id() -> ProviderPayloadId {
@@ -62,6 +63,20 @@ fn decode_responses(raw_json: &str) -> nav_harness::models::DecodedProviderPaylo
         .expect("fixture should decode")
 }
 
+fn decode_anthropic(raw_json: &str) -> nav_harness::models::DecodedProviderPayload {
+    let decoder = AnthropicMessagesDecoder::new();
+    decoder
+        .decode(&AnthropicMessagesDecodeInput {
+            provider_payload_id: provider_payload_id(),
+            raw_artifact_id: artifact_id(),
+            run_id: run_id(),
+            provider_id: Some("anthropic".to_string()),
+            raw_json: raw_json.as_bytes().to_vec(),
+            created_at: 1_700_000_000_000,
+        })
+        .expect("fixture should decode")
+}
+
 fn decoded_part_snapshot(parts: &[nav_harness::models::DecodedPart]) -> serde_json::Value {
     serde_json::Value::Array(
         parts
@@ -74,6 +89,393 @@ fn decoded_part_snapshot(parts: &[nav_harness::models::DecodedPart]) -> serde_js
             })
             .collect(),
     )
+}
+
+#[test]
+fn api_kind_accepts_anthropic_messages_spellings() {
+    let hyphenated: ApiKind = serde_json::from_str(r#""anthropic-messages""#).unwrap();
+    let underscored: ApiKind = serde_json::from_str(r#""anthropic_messages""#).unwrap();
+
+    assert_eq!(hyphenated, ApiKind::AnthropicMessages);
+    assert_eq!(underscored, ApiKind::AnthropicMessages);
+}
+
+#[test]
+fn anthropic_text_decodes_with_provenance_and_turn_meta() {
+    let decoded = decode_anthropic(include_str!("fixtures/anthropic-messages/text.json"));
+
+    assert_eq!(decoded.status, DecodeStatus::Decoded);
+    assert_eq!(decoded.turns.len(), 1);
+
+    let turn = &decoded.turns[0].turn;
+    assert_eq!(turn.run_id, run_id());
+    assert_eq!(turn.seq, 0);
+    assert_eq!(turn.role, TurnRole::Assistant);
+    assert_eq!(turn.meta.model_provider.as_deref(), Some("anthropic"));
+    assert_eq!(turn.meta.model_id.as_deref(), Some("claude-sonnet-4-5"));
+    assert_eq!(turn.meta.api_kind, Some(ApiKind::AnthropicMessages));
+    assert_eq!(turn.meta.finish_reason.as_deref(), Some("end_turn"));
+    assert_eq!(
+        turn.meta.usage,
+        Some(TokenUsage {
+            input: 12,
+            output: 6,
+            reasoning: 0,
+            cache_read: 3,
+            cache_write: 2,
+        })
+    );
+
+    let parts = &decoded.turns[0].parts;
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0].part, Part::StepStart { snapshot: None });
+    assert_eq!(parts[0].provider_json_pointer, "/content/0");
+    assert_eq!(
+        parts[1].part,
+        Part::Text {
+            text: "Hello from Claude.".to_string(),
+            synthetic: None,
+        }
+    );
+    assert_eq!(parts[1].provider_json_pointer, "/content/0/text");
+    assert_eq!(
+        parts[2].part,
+        Part::StepFinish {
+            reason: "end_turn".to_string(),
+            cost: 0.0,
+            tokens: TokenUsage {
+                input: 12,
+                output: 6,
+                reasoning: 0,
+                cache_read: 3,
+                cache_write: 2,
+            },
+            snapshot: None,
+        }
+    );
+}
+
+#[test]
+fn anthropic_tool_use_decodes_to_canonical_tool_call() {
+    let decoded = decode_anthropic(include_str!("fixtures/anthropic-messages/tool_use.json"));
+
+    assert_eq!(decoded.status, DecodeStatus::Decoded);
+    let parts = &decoded.turns[0].parts;
+    assert_eq!(parts.len(), 3);
+
+    let Part::ToolCall {
+        id,
+        name,
+        arguments,
+        raw_arguments_artifact_id,
+    } = &parts[1].part
+    else {
+        panic!("expected tool call part, got {:?}", parts[1].part);
+    };
+
+    ToolCallId::try_new(id.as_str()).expect("decoded tool call id should be UUIDv7-shaped");
+    assert_eq!(name, "read");
+    assert_eq!(arguments, &serde_json::json!({"path": "Cargo.toml"}));
+    assert_eq!(raw_arguments_artifact_id, &None);
+    assert_eq!(parts[1].provider_json_pointer, "/content/0");
+    assert_eq!(
+        parts[2].part,
+        Part::StepFinish {
+            reason: "tool_use".to_string(),
+            cost: 0.0,
+            tokens: TokenUsage {
+                input: 20,
+                output: 8,
+                reasoning: 0,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            snapshot: None,
+        }
+    );
+}
+
+#[test]
+fn anthropic_tool_result_decodes_to_matching_canonical_tool_result() {
+    let decoded = decode_anthropic(include_str!(
+        "fixtures/anthropic-messages/tool_use_and_result.json"
+    ));
+
+    assert_eq!(decoded.status, DecodeStatus::Decoded);
+    let parts = &decoded.turns[0].parts;
+    assert_eq!(parts.len(), 6);
+
+    let Part::ToolCall {
+        id: tool_call_id, ..
+    } = &parts[1].part
+    else {
+        panic!("expected tool call part, got {:?}", parts[1].part);
+    };
+
+    assert_eq!(
+        parts[4].part,
+        Part::ToolResult {
+            call_id: tool_call_id.clone(),
+            content: "1: [package]\n2: name = \"nav\"".to_string(),
+            raw_artifact_id: None,
+            is_error: false,
+        }
+    );
+    assert_eq!(parts[4].provider_json_pointer, "/content/1/content");
+    assert_eq!(
+        parts[5].part,
+        Part::StepFinish {
+            reason: "end_turn".to_string(),
+            cost: 0.0,
+            tokens: TokenUsage {
+                input: 31,
+                output: 13,
+                reasoning: 0,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            snapshot: None,
+        }
+    );
+}
+
+#[test]
+fn anthropic_thinking_decodes_to_canonical_thinking_part() {
+    let decoded = decode_anthropic(include_str!("fixtures/anthropic-messages/thinking.json"));
+
+    assert_eq!(decoded.status, DecodeStatus::Decoded);
+    let parts = &decoded.turns[0].parts;
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        parts[1].part,
+        Part::Thinking {
+            text: "I should inspect the requested file first.".to_string(),
+            provider_hint: Some("thinking".to_string()),
+        }
+    );
+    assert_eq!(parts[1].provider_json_pointer, "/content/0/thinking");
+}
+
+#[test]
+fn anthropic_redacted_thinking_decodes_to_canonical_thinking_part() {
+    let decoded = decode_anthropic(
+        r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"redacted_thinking","data":"encrypted-redacted-thinking"}],"stop_reason":"end_turn"}"#,
+    );
+
+    assert_eq!(decoded.status, DecodeStatus::Decoded);
+    let parts = &decoded.turns[0].parts;
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        parts[1].part,
+        Part::Thinking {
+            text: "encrypted-redacted-thinking".to_string(),
+            provider_hint: Some("redacted_thinking".to_string()),
+        }
+    );
+    assert_eq!(parts[1].provider_json_pointer, "/content/0/data");
+}
+
+#[test]
+fn anthropic_image_decodes_to_inline_bytes_part() {
+    let decoded = decode_anthropic(include_str!("fixtures/anthropic-messages/image.json"));
+
+    assert_eq!(decoded.status, DecodeStatus::Decoded);
+    let parts = &decoded.turns[0].parts;
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        parts[1].part,
+        Part::Image {
+            mime: "image/png".to_string(),
+            source: ImageSource::InlineBytes {
+                bytes: b"hello".to_vec(),
+            },
+        }
+    );
+    assert_eq!(parts[1].provider_json_pointer, "/content/0/source/data");
+}
+
+#[test]
+fn anthropic_multi_step_response_matches_snapshot() {
+    let decoded = decode_anthropic(include_str!("fixtures/anthropic-messages/multi_step.json"));
+    let snapshot = decoded_part_snapshot(&decoded.turns[0].parts);
+
+    assert_eq!(
+        serde_json::to_string_pretty(&snapshot).expect("snapshot should serialize"),
+        r#"[
+  {
+    "part": {
+      "type": "step_start"
+    },
+    "pointer": "/content/0"
+  },
+  {
+    "part": {
+      "provider_hint": "thinking",
+      "text": "I need to read the manifest first.",
+      "type": "thinking"
+    },
+    "pointer": "/content/0/thinking"
+  },
+  {
+    "part": {
+      "cost": 0.0,
+      "reason": "thinking",
+      "tokens": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "reasoning": 0
+      },
+      "type": "step_finish"
+    },
+    "pointer": "/content/0"
+  },
+  {
+    "part": {
+      "type": "step_start"
+    },
+    "pointer": "/content/1"
+  },
+  {
+    "part": {
+      "arguments": {
+        "path": "Cargo.toml"
+      },
+      "id": "019f2f6f-f178-7a72-9f28-57d364be4fc2",
+      "name": "read",
+      "type": "tool_call"
+    },
+    "pointer": "/content/1"
+  },
+  {
+    "part": {
+      "cost": 0.0,
+      "reason": "tool_use",
+      "tokens": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "reasoning": 0
+      },
+      "type": "step_finish"
+    },
+    "pointer": "/content/1"
+  },
+  {
+    "part": {
+      "type": "step_start"
+    },
+    "pointer": "/content/2"
+  },
+  {
+    "part": {
+      "call_id": "019f2f6f-f178-7a72-9f28-57d364be4fc2",
+      "content": "1: [package]\n2: name = \"nav\"",
+      "is_error": false,
+      "type": "tool_result"
+    },
+    "pointer": "/content/2/content"
+  },
+  {
+    "part": {
+      "cost": 0.0,
+      "reason": "tool_result",
+      "tokens": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "reasoning": 0
+      },
+      "type": "step_finish"
+    },
+    "pointer": "/content/2"
+  },
+  {
+    "part": {
+      "type": "step_start"
+    },
+    "pointer": "/content/3"
+  },
+  {
+    "part": {
+      "text": "The manifest belongs to nav.",
+      "type": "text"
+    },
+    "pointer": "/content/3/text"
+  },
+  {
+    "part": {
+      "cost": 0.0,
+      "reason": "end_turn",
+      "tokens": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 50,
+        "output": 25,
+        "reasoning": 0
+      },
+      "type": "step_finish"
+    },
+    "pointer": "/content/3"
+  }
+]"#
+    );
+}
+
+#[test]
+fn anthropic_unknown_content_block_preserves_raw_payload_bytes() {
+    let decoded = decode_anthropic(
+        r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{  "type" : "custom_block", "payload" : { "x" : [ true, false ] } }],"stop_reason":"end_turn"}"#,
+    );
+
+    assert_eq!(decoded.status, DecodeStatus::DecodedWithUnknowns);
+    let opaque = &decoded.turns[0].parts[1].part;
+    let Part::ProviderOpaque {
+        api_kind,
+        kind,
+        raw_artifact_id,
+        raw_payload: Some(raw_payload),
+    } = opaque
+    else {
+        panic!("expected provider opaque raw payload, got {opaque:?}");
+    };
+
+    assert_eq!(*api_kind, ApiKind::AnthropicMessages);
+    assert_eq!(kind, "message.content.custom_block");
+    assert_eq!(raw_artifact_id, &artifact_id());
+    assert_eq!(
+        raw_payload.get(),
+        r#"{  "type" : "custom_block", "payload" : { "x" : [ true, false ] } }"#
+    );
+}
+
+#[test]
+fn anthropic_unsupported_image_source_preserves_raw_payload_bytes() {
+    let decoded = decode_anthropic(
+        r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{  "type" : "image", "source" : { "type" : "url", "url" : "https://example.test/image.png" } }],"stop_reason":"end_turn"}"#,
+    );
+
+    assert_eq!(decoded.status, DecodeStatus::DecodedWithUnknowns);
+    let opaque = &decoded.turns[0].parts[1].part;
+    let Part::ProviderOpaque {
+        api_kind,
+        kind,
+        raw_payload: Some(raw_payload),
+        ..
+    } = opaque
+    else {
+        panic!("expected provider opaque raw payload, got {opaque:?}");
+    };
+
+    assert_eq!(*api_kind, ApiKind::AnthropicMessages);
+    assert_eq!(kind, "message.content.image");
+    assert_eq!(
+        raw_payload.get(),
+        r#"{  "type" : "image", "source" : { "type" : "url", "url" : "https://example.test/image.png" } }"#
+    );
 }
 
 #[test]

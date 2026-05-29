@@ -14,12 +14,14 @@ pub use api::ApiKind;
 pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
 pub use config::{ModelRef, ModelSettings};
 pub use decode::{
-    ChatGptSubscriptionDecodeInput, ChatGptSubscriptionDecoder, DecodeError, DecodedPart,
-    DecodedProviderPayload, DecodedTurn, Decoder, OpenAiChatCompletionsDecodeInput,
-    OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
+    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
+    ChatGptSubscriptionDecoder, DecodeError, DecodedPart, DecodedProviderPayload, DecodedTurn,
+    Decoder, OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
+    OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
 };
 pub use encode::{
-    Encoder, OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
+    AnthropicMessagesEncoder, AnthropicMessagesRequest, AnthropicToolDefinition, Encoder,
+    OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
 };
 pub use model::{ModelConfig, ModelInput};
 pub use openai_completions::{
