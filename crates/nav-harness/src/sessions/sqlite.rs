@@ -6,6 +6,7 @@
 //! through `BEGIN IMMEDIATE` with jittered retry to avoid convoy effects.
 //! Artifact blob persistence and canonical turn/part persistence also live here.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ const JITTER_MAX_MS: u64 = 150;
 /// Run `wal_checkpoint(PASSIVE)` once every this many committed writes.
 const CHECKPOINT_INTERVAL: u64 = 50;
 static PART_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static FORK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Journal mode the connection ended up using after [`SqliteSessionStore::open`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1007,6 +1009,168 @@ impl SqliteSessionStore {
         }
     }
 
+    /// Fork `source` into a brand-new session, copying its turns (and their
+    /// parts) up to and including `through_message`. When `through_message` is
+    /// `None` the whole transcript is copied.
+    ///
+    /// The fork is a fresh replay ledger: every session, run, turn, and part
+    /// gets a new id, the session's `parent_id` chains back to `source` so the
+    /// lineage is walkable, and the source's settings (model selection) are
+    /// copied while cost/token aggregates reset to zero. `TurnMeta.parent_id`
+    /// references are remapped to the new message ids so the message chain
+    /// stays internally consistent inside the fork.
+    ///
+    /// Parts are copied by value: their provider-payload linkage
+    /// (`provider_payload_id`/`provider_json_pointer`) and compaction state are
+    /// intentionally dropped, because the `provider_payloads` rows belong to the
+    /// source session and are not cloned. The fork is a clean canonical ledger,
+    /// not a replica of the source's provider journal.
+    pub fn fork_session(
+        &self,
+        source: &SessionId,
+        through_message: Option<&MessageId>,
+    ) -> Result<SessionRow, SqliteStoreError> {
+        let source_row = self.get_session(source)?;
+        let copied = self.turns_through_message(source, through_message)?;
+
+        // Stamp every minted id with one timestamp so they sort in allocation
+        // order. Turns that share a `created_at` are otherwise tie-broken by id
+        // in `list_turns_for_session`, so minting in chronological copy order
+        // keeps the forked transcript in the same order as the source.
+        let now = current_time_millis();
+        let new_session_id = SessionId::new_unchecked(mint_uuid_v7(now));
+
+        // Map source ids to freshly minted ids, preserving run order of first
+        // appearance so the copied runs keep their original sequencing.
+        let mut new_run_ids: HashMap<RunId, RunId> = HashMap::new();
+        let mut run_order: Vec<RunId> = Vec::new();
+        let mut new_message_ids: HashMap<MessageId, MessageId> = HashMap::new();
+        for (turn, _) in &copied {
+            if !new_run_ids.contains_key(&turn.run_id) {
+                new_run_ids.insert(turn.run_id.clone(), RunId::new_unchecked(mint_uuid_v7(now)));
+                run_order.push(turn.run_id.clone());
+            }
+            new_message_ids
+                .entry(turn.id.clone())
+                .or_insert_with(|| MessageId::new_unchecked(mint_uuid_v7(now)));
+        }
+
+        let source_runs = run_order
+            .iter()
+            .map(|run_id| self.get_run(run_id))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let prepared_turns = copied
+            .iter()
+            .map(|(turn, parts)| {
+                let mut forked = turn.clone();
+                forked.id = new_message_ids[&turn.id].clone();
+                forked.run_id = new_run_ids[&turn.run_id].clone();
+                forked.meta.parent_id = turn
+                    .meta
+                    .parent_id
+                    .as_ref()
+                    .and_then(|parent| new_message_ids.get(parent).cloned());
+                let part_values = parts
+                    .iter()
+                    .map(|stored| stored.part.clone())
+                    .collect::<Vec<_>>();
+                prepare_turn(&forked, &part_values)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                INSERT INTO sessions (
+                    id,
+                    title,
+                    source,
+                    workspace_root,
+                    system_prompt,
+                    settings_json,
+                    parent_id,
+                    version,
+                    slug,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9)
+                "#,
+                params![
+                    new_session_id.as_str(),
+                    source_row.title.as_deref(),
+                    source_row.source.as_str(),
+                    source_row.workspace_root.as_deref(),
+                    source_row.system_prompt.as_deref(),
+                    source_row.settings_json.as_str(),
+                    source.as_str(),
+                    source_row.version.as_str(),
+                    now as i64,
+                ],
+            )?;
+
+            for run in &source_runs {
+                tx.execute(
+                    r#"
+                    INSERT INTO runs (
+                        id,
+                        session_id,
+                        status,
+                        trigger,
+                        started_at,
+                        finished_at,
+                        error_json
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "#,
+                    params![
+                        new_run_ids[&run.id].as_str(),
+                        new_session_id.as_str(),
+                        run.status.as_str(),
+                        run.trigger.as_deref(),
+                        run.started_at,
+                        run.finished_at,
+                        run.error_json.as_deref(),
+                    ],
+                )?;
+            }
+
+            for prepared in &prepared_turns {
+                insert_turn(tx, prepared)?;
+            }
+            Ok(())
+        })?;
+
+        self.get_session(&new_session_id)
+    }
+
+    /// Read `source`'s turns in chronological order, truncated to include
+    /// `through_message` when given. Errors if `through_message` is not part of
+    /// the session.
+    fn turns_through_message(
+        &self,
+        source: &SessionId,
+        through_message: Option<&MessageId>,
+    ) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+        let mut turns = self.list_turns_for_session(source, None, usize::MAX)?.items;
+        turns.reverse();
+
+        let Some(through_message) = through_message else {
+            return Ok(turns);
+        };
+
+        let cutoff = turns
+            .iter()
+            .position(|(turn, _)| turn.id == *through_message)
+            .ok_or_else(|| SqliteStoreError::NotFound {
+                entity: "message",
+                id: through_message.to_string(),
+            })?;
+        turns.truncate(cutoff + 1);
+        Ok(turns)
+    }
+
     pub fn append_turn(&self, turn: Turn, parts: Vec<Part>) -> Result<(), SqliteStoreError> {
         self.append_turns(&[(turn, parts)])
     }
@@ -1801,6 +1965,38 @@ fn generate_part_id(created_at: i64) -> PartId {
     PartId::new_unchecked(format!("prt_{timestamp:016x}_{entropy:016x}"))
 }
 
+/// Mint a fresh UUIDv7 string for forked sessions, runs, and messages, stamped
+/// with the caller-supplied `timestamp_ms`.
+///
+/// Ids minted with the same timestamp sort in allocation order: the process id
+/// lands in the high (`rand_a`) bits so concurrent processes writing the same
+/// database do not collide, and a per-process monotonic counter lands in the
+/// low (`rand_b`) bits so back-to-back ids stay strictly increasing. A single
+/// `fork_session` call passes one timestamp for every id it mints, so the copy
+/// order is preserved when turns sharing a `created_at` are tie-broken by id.
+///
+/// The counter occupies the low 62 bits of `rand_b`; ordering and uniqueness
+/// hold until it wraps at 2^62 (~146k years at 1M ids/sec), so do not widen its
+/// role assuming 64-bit headroom. Cross-process uniqueness is best-effort (only
+/// the low 12 pid bits separate processes), so concurrent forks of the same
+/// database rely on the insert's PRIMARY KEY conflict rolling the transaction
+/// back cleanly, not on globally unique ids.
+fn mint_uuid_v7(timestamp_ms: u64) -> String {
+    let timestamp = timestamp_ms & 0xffff_ffff_ffff;
+    let counter = FORK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let rand_a = (u64::from(std::process::id()) & 0x0fff) as u16;
+    let rand_b_high = ((counter >> 48) & 0x3fff) as u16;
+    let rand_b_low = counter & 0xffff_ffff_ffff;
+    format!(
+        "{:08x}-{:04x}-7{:03x}-{:04x}-{:012x}",
+        (timestamp >> 16) as u32,
+        (timestamp & 0xffff) as u16,
+        rand_a,
+        0x8000 | rand_b_high,
+        rand_b_low
+    )
+}
+
 fn current_time_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2394,6 +2590,29 @@ impl std::error::Error for SqliteStoreError {}
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn mint_uuid_v7_is_monotonic_within_one_timestamp() {
+        let timestamp = 1_700_000_000_000;
+        let ids: Vec<String> = (0..1_000).map(|_| mint_uuid_v7(timestamp)).collect();
+
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            ids, sorted,
+            "ids minted with one timestamp must sort in allocation order"
+        );
+
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "minted ids must be unique");
+
+        for id in &ids {
+            assert!(
+                nav_types::SessionId::try_new(id.clone()).is_ok(),
+                "minted id {id} must be a valid UUIDv7"
+            );
+        }
+    }
 
     /// A unique temp database path that removes the file and its WAL sidecars
     /// (`-wal`, `-shm`) on drop — even if the test panics. Declare it before the
