@@ -201,3 +201,95 @@ FTS5 search is substantially implemented and well-tested at the storage layer, b
 |---|---|---|
 | 🟡 partial | turn_parts_fts as content= external-content table over turn_parts | Plan DDL: plans/session-storage.md:785-789 specifies `CREATE VIRTUAL TABLE turn_parts_fts USING fts5(content, content='turn_parts', content_rowid='rowid')` (external-content over turn_parts). Implementation: crates/nav-harness/src/sessions/migrate.rs:192-197 creates `turn_parts_fts USING fts5(part_i |
 | 🟡 partial | Search endpoints | Query-layer primitives EXIST and are correct: crates/nav-harness/src/sessions/sqlite.rs:1559 search_turn_parts, :1567 search_turn_parts_trigram, :1575 search_turn_parts_with_index, :1605 get_anchored_view, plus struct TurnPartSearchHit (sqlite.rs:295) and row reader read_search_hit (sqlite.rs:2992). |
+
+---
+
+# Remediation issues & dependency map
+
+All gaps above are filed as GitHub issues **#454–#486** (33 total), each linking
+back to its finding. Labels reuse the repo vocabulary: `weak-model` /
+`strong-model` (capability), `ready` (no open blockers — the parallel pool),
+`area/context` · `area/model`, `needs-triage`. Dependencies live in each issue's
+`## Blocked by`; "grabbable now" = `ready` **and** no overlap in `Files touched:`.
+
+**Weak-agent pool query:** `gh issue list --label ready,weak-model`
+
+## Wave 0 — `ready`, fan out now (files disjoint → all parallel-safe)
+
+| # | ID | Model | Files |
+|---|---|---|---|
+| 454 | CMP-10 prune/replay projections | weak | `compaction/{prune,replay}.rs` |
+| 455 | TOOL-01 per-tool output caps | weak | `tools/{read,bash,truncation}.rs` |
+| 456 | CMP-12 `## Files` in template | weak | `compaction/summary.rs` |
+| 457 | CMP-13 `keep_recent_tokens` | weak | `sessions/store.rs` |
+| 458 | CMP-15 breaker cooldown | weak | `compaction/breaker.rs` |
+| 459 | CTX-03 OpenAI cache key/retention | weak | `models/openai_completions.rs` |
+| 460 | CTX-07 memoize CLAUDE.md/AGENTS.md | weak | `context/` (new loader) |
+| 461 | BUD-01 token estimator + formula | strong | `context/budget.rs` (new) |
+| 462 | GUARD-01 doom-loop module | strong | `guardrails/doom_loop.rs` (new) |
+| 463 | GUARD-02 step-budget module | strong | `guardrails/step_budget.rs` (new) |
+| 464 | TASK-01 task tool skeleton | strong | `tools/task.rs` (new) |
+| 465 | CTX-01 3-block system prompt | strong | `context/system_prompt.rs` |
+| 466 | ENC-11 model_id + thinking signature | strong | `migrate/sqlite/canonical/decode/encode` |
+| 467 | LOOP-01 ApiKind dispatch | strong | `agents/mod.rs` (run-loop root) |
+
+## Wave 1 — gated on one Wave-0 primitive
+
+| # | ID | Model | Blocked by |
+|---|---|---|---|
+| 468 | BUD-02 image token estimate | strong | #461 |
+| 469 | BUD-03 two-scope budgeting | strong | #461 |
+| 470 | CMP-14 PTL retry | strong | #456 |
+| 471 | CMP-16 split-turn handling | strong | #456, #457 |
+| 472 | CTX-02 Anthropic cache_control breakpoints | strong | #465 |
+| 473 | CTX-04 tool-schema hash cache | weak | #472 |
+| 474 | CTX-05 progressive skill disclosure | strong | #465 |
+| 475 | CTX-06 `<system-reminder>` in last user msg | strong | #465 |
+| 476 | ENC-12 reasoning fidelity on model swap | strong | #466 |
+| 477 | TASK-02 subagent isolation/depth | strong | #464 |
+| 478 | TASK-03 reintegration envelope + cancel | strong | #464 |
+| 479 | FTS-06 expose FTS via facade + HTTP | strong | #457 |
+
+## Wave 2 — run-loop integration (serial chain on `agents/mod.rs`, one strong agent)
+
+| # | ID | Blocked by |
+|---|---|---|
+| 480 | LOOP-02 provider_state + session-model resolution | #467 |
+| 481 | LOOP-03 wire degrade + truncate | #467 |
+| 482 | LOOP-04 wire breakers + validated summary + verbatim overflow + Stage-5 | #467, #470 |
+| 483 | LOOP-05 wire step-budget + doom-loop guards | #467, #462, #463 |
+| 484 | LOOP-06 proactive budget compaction + 60% prune gate | #467, #469, #454 |
+| 485 | LOOP-07 wire compaction.model_override | #467, #456 |
+| 486 | LOOP-08 prefetch during streaming | #467, #474 |
+
+## Dependency graph
+
+```mermaid
+graph LR
+  subgraph Wave0["Wave 0 — ready"]
+    CMP10[454 CMP-10]; TOOL01[455 TOOL-01]; CMP12[456 CMP-12]; CMP13[457 CMP-13]
+    CMP15[458 CMP-15]; CTX03[459 CTX-03]; CTX07[460 CTX-07]; BUD01[461 BUD-01]
+    GUARD01[462 GUARD-01]; GUARD02[463 GUARD-02]; TASK01[464 TASK-01]
+    CTX01[465 CTX-01]; ENC11[466 ENC-11]; LOOP01[467 LOOP-01]
+  end
+  BUD01 --> BUD02[468 BUD-02]
+  BUD01 --> BUD03[469 BUD-03]
+  CMP12 --> CMP14[470 CMP-14]
+  CMP12 --> CMP16[471 CMP-16]
+  CMP13 --> CMP16
+  CTX01 --> CTX02[472 CTX-02]
+  CTX02 --> CTX04[473 CTX-04]
+  CTX01 --> CTX05[474 CTX-05]
+  CTX01 --> CTX06[475 CTX-06]
+  ENC11 --> ENC12[476 ENC-12]
+  TASK01 --> TASK02[477 TASK-02]
+  TASK01 --> TASK03[478 TASK-03]
+  CMP13 --> FTS06[479 FTS-06]
+  LOOP01 --> LOOP02[480 LOOP-02]
+  LOOP01 --> LOOP03[481 LOOP-03]
+  LOOP01 --> LOOP04[482 LOOP-04]; CMP14 --> LOOP04
+  LOOP01 --> LOOP05[483 LOOP-05]; GUARD01 --> LOOP05; GUARD02 --> LOOP05
+  LOOP01 --> LOOP06[484 LOOP-06]; BUD03 --> LOOP06; CMP10 --> LOOP06
+  LOOP01 --> LOOP07[485 LOOP-07]; CMP12 --> LOOP07
+  LOOP01 --> LOOP08[486 LOOP-08]; CTX05 --> LOOP08
+```
