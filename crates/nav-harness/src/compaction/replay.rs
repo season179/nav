@@ -187,7 +187,13 @@ fn project_stored_part(
             is_error,
         } => Part::ToolResult {
             call_id: call_id.clone(),
-            content: tool_result_content_for_replay(call_id, content, duplicate_tool_results, part, tool_names),
+            content: tool_result_content_for_replay(
+                call_id,
+                content,
+                duplicate_tool_results,
+                part,
+                tool_names,
+            ),
             raw_artifact_id: raw_artifact_id.clone(),
             is_error: *is_error,
         },

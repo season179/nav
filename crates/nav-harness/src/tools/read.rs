@@ -2,7 +2,7 @@ use std::fs;
 
 use serde_json::{Value, json};
 
-use crate::tools::truncation::{TruncationOptions, truncate_output, READ_MAX_CHARS};
+use crate::tools::truncation::{READ_MAX_CHARS, TruncationOptions, truncate_output};
 
 use super::{
     NavTool, RiskClass, ToolCancellationToken, ToolContext, ToolFuture, ToolOutput, ToolRegistry,

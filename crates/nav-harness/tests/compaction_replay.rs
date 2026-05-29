@@ -804,18 +804,30 @@ fn image_stripping_keeps_last_keep_media_turns_images() {
     };
     // First turn: image stripped
     assert_eq!(projected[0].1.len(), 2);
-    assert_eq!(projected[0].1[0], Part::Text { text: "first screenshot".to_string(), synthetic: None });
+    assert_eq!(
+        projected[0].1[0],
+        Part::Text {
+            text: "first screenshot".to_string(),
+            synthetic: None
+        }
+    );
     assert_eq!(projected[0].1[1], stripped);
     // Second turn: image kept (within last 2)
-    assert_eq!(projected[1].1[1], Part::Image {
-        mime: "image/png".to_string(),
-        source: ImageSource::FileRef { artifact_id: art_2 },
-    });
+    assert_eq!(
+        projected[1].1[1],
+        Part::Image {
+            mime: "image/png".to_string(),
+            source: ImageSource::FileRef { artifact_id: art_2 },
+        }
+    );
     // Third turn: image kept (within last 2)
-    assert_eq!(projected[2].1[1], Part::Image {
-        mime: "image/png".to_string(),
-        source: ImageSource::FileRef { artifact_id: art_3 },
-    });
+    assert_eq!(
+        projected[2].1[1],
+        Part::Image {
+            mime: "image/png".to_string(),
+            source: ImageSource::FileRef { artifact_id: art_3 },
+        }
+    );
 }
 
 #[test]
@@ -966,10 +978,7 @@ fn projected_turns_reencode_to_responses_request() {
     assert_eq!(request.input[0]["type"], "function_call");
     assert_eq!(request.input[1]["type"], "function_call_output");
     assert_eq!(request.input[1]["call_id"], call_id.as_str());
-    assert_eq!(
-        request.input[1]["output"],
-        "[read]: 12 chars."
-    );
+    assert_eq!(request.input[1]["output"], "[read]: 12 chars.");
 }
 
 #[test]

@@ -209,6 +209,12 @@ type EventPayload = {
 	kind?: string;
 	status?: number;
 	error_type?: string;
+	cost?: number;
+	tokens_input?: number;
+	tokens_output?: number;
+	tokens_reasoning?: number;
+	tokens_cache_read?: number;
+	tokens_cache_write?: number;
 	code?: string;
 	delta?: string;
 	text?: string;

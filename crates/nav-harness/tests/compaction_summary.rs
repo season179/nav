@@ -281,9 +281,7 @@ fn extract_cumulative_section<'a>(prompt: &'a str, name: &str) -> Option<&'a str
     let heading = format!("### {name}");
     let heading_start = tracking.find(&heading)?;
     let after_heading = &tracking[heading_start + heading.len()..];
-    let end = after_heading
-        .find("\n##")
-        .unwrap_or(after_heading.len());
+    let end = after_heading.find("\n##").unwrap_or(after_heading.len());
     Some(after_heading[..end].trim())
 }
 

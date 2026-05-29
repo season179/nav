@@ -151,7 +151,10 @@ fn model_projection_does_not_skip_content_that_looks_like_summary_but_is_not() {
         .flat_map(|t| t.parts.iter())
         .filter(|p| matches!(p, TurnPart::ToolResult { content, .. } if content.starts_with("[bash]") && content != &fake_summary))
         .count();
-    assert!(pruned_count > 0, "fake summaries should be pruned, not skipped");
+    assert!(
+        pruned_count > 0,
+        "fake summaries should be pruned, not skipped"
+    );
 }
 
 #[test]
@@ -185,21 +188,33 @@ fn model_projection_replaces_pruned_results_with_tool_summary() {
         .iter()
         .filter(|c| **c == content)
         .count();
-    assert!(original_count >= 2, "at least the newest results should stay verbatim");
+    assert!(
+        original_count >= 2,
+        "at least the newest results should stay verbatim"
+    );
 
     let summary_count = tool_result_contents
         .iter()
         .filter(|c| c.starts_with("[bash]"))
         .count();
-    assert!(summary_count > 0, "pruned results should have [tool_name] summary");
+    assert!(
+        summary_count > 0,
+        "pruned results should have [tool_name] summary"
+    );
 
     // Verify summary format: [tool_name]: M chars.
     let summary = tool_result_contents
         .iter()
         .find(|c| c.starts_with("[bash]"))
         .expect("should have at least one summary");
-    assert!(summary.ends_with("chars."), "summary should end with 'chars.'");
-    assert!(summary.contains(&content.len().to_string()), "summary should include original char count");
+    assert!(
+        summary.ends_with("chars."),
+        "summary should end with 'chars.'"
+    );
+    assert!(
+        summary.contains(&content.len().to_string()),
+        "summary should include original char count"
+    );
 }
 
 #[test]
@@ -221,15 +236,16 @@ fn model_projection_keeps_protected_todo_tool_results_visible() {
 
     project_model_turns_for_tool_result_pruning(&mut turns);
 
-    assert!(turns.iter().flat_map(|turn| turn.parts.iter()).any(|part| {
-        matches!(
-            part,
-            TurnPart::ToolResult {
-                tool_call_id,
-                content
-            } if tool_call_id == "call_todo_1" && content == &protected_output
-        )
-    }),
+    assert!(
+        turns.iter().flat_map(|turn| turn.parts.iter()).any(|part| {
+            matches!(
+                part,
+                TurnPart::ToolResult {
+                    tool_call_id,
+                    content
+                } if tool_call_id == "call_todo_1" && content == &protected_output
+            )
+        }),
         "todo tool results should not be pruned"
     );
 }

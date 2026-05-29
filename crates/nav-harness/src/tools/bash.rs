@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::tools::truncation::{TruncationOptions, TruncationStrategy, truncate_output, BASH_MAX_CHARS};
+use crate::tools::truncation::{
+    BASH_MAX_CHARS, TruncationOptions, TruncationStrategy, truncate_output,
+};
 use crate::workspace::shell::{
     ShellCommand, ShellOutputChunk, ShellTermination, run_shell_command_streaming_until,
 };

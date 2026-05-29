@@ -207,10 +207,7 @@ fn part_text(part: &TurnPart) -> String {
     }
 }
 
-fn collect_file_lists(
-    previous_summary: &str,
-    head_turns: &[ModelTurn],
-) -> (String, String) {
+fn collect_file_lists(previous_summary: &str, head_turns: &[ModelTurn]) -> (String, String) {
     let (mut read, mut modified) = parse_previous_files(previous_summary);
 
     for turn in head_turns {
@@ -260,9 +257,7 @@ fn parse_file_lines(section: &str, target: &mut BTreeSet<String>) {
 fn extract_subsection<'a>(section: &'a str, heading: &str) -> Option<&'a str> {
     let start = section.find(heading)?;
     let after_heading = &section[start + heading.len()..];
-    let end = after_heading
-        .find("##")
-        .unwrap_or(after_heading.len());
+    let end = after_heading.find("##").unwrap_or(after_heading.len());
     Some(after_heading[..end].trim())
 }
 

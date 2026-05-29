@@ -1187,8 +1187,8 @@ fn select_tail_start_id(turns: &[StoredTurn], config: CompactionConfig) -> Optio
 
     // Pick whichever mode retains more turns (smaller start index).
     // Token budget expands the tail but never shrinks it below tail_turns.
-    let by_turns = (config.tail_turns > 0)
-        .then(|| verbatim_turns.len().saturating_sub(config.tail_turns));
+    let by_turns =
+        (config.tail_turns > 0).then(|| verbatim_turns.len().saturating_sub(config.tail_turns));
     let by_tokens = tail_start_by_token_budget(&verbatim_turns, config.keep_recent_tokens);
 
     let tail_start_index = match (by_turns, by_tokens) {
@@ -1257,7 +1257,13 @@ impl EstimatedJsonLen for serde_json::Value {
     fn estimated_json_len(&self) -> usize {
         match self {
             Value::Null => 4,
-            Value::Bool(b) => if *b { 4 } else { 5 },
+            Value::Bool(b) => {
+                if *b {
+                    4
+                } else {
+                    5
+                }
+            }
             Value::Number(n) => n.to_string().len(),
             Value::String(s) => s.len() + 2, // +2 for quotes
             Value::Array(items) => {
