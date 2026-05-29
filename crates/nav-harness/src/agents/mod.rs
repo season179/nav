@@ -1,5 +1,7 @@
 //! Agent roles, loops, delegation, task state, and autonomy limits.
 
+pub mod auto_title;
+
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

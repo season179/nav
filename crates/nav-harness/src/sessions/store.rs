@@ -114,6 +114,14 @@ impl SessionStore {
         self.sqlite.get_session(session_id)
     }
 
+    pub fn update_session_title(
+        &self,
+        session_id: &SessionId,
+        title: &str,
+    ) -> Result<(), SqliteStoreError> {
+        self.sqlite.update_session_title(session_id, title)
+    }
+
     pub fn start_run(&self, session_id: &SessionId, run_id: RunId) -> Result<(), SqliteStoreError> {
         self.sqlite.start_run(StartRun {
             id: run_id,
