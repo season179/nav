@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use nav_harness::sessions::{
-    CreateSession, RunStatus, SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun,
-    TokenDelta,
+    CreateSession, Part, RunStatus, SessionSettings, SqliteSessionStore, SqliteStoreError,
+    StartRun, TokenDelta, Turn, TurnMeta, TurnRole,
 };
-use nav_types::{RunId, SessionId};
+use nav_types::{MessageId, RunId, SessionId, ToolCallId};
 
 struct TempDb {
     path: PathBuf,
@@ -46,6 +46,21 @@ fn run_id(value: &str) -> RunId {
     RunId::new_unchecked(value)
 }
 
+fn message_id(value: &str) -> MessageId {
+    MessageId::new_unchecked(value)
+}
+
+fn tool_call_id(value: &str) -> ToolCallId {
+    ToolCallId::new_unchecked(value)
+}
+
+fn text_part(text: impl Into<String>) -> Part {
+    Part::Text {
+        text: text.into(),
+        synthetic: None,
+    }
+}
+
 fn create_minimal_session(store: &SqliteSessionStore, session_id: SessionId) {
     store
         .create_session(
@@ -63,6 +78,496 @@ fn create_minimal_session(store: &SqliteSessionStore, session_id: SessionId) {
             },
         )
         .expect("session create should commit");
+}
+
+fn start_minimal_run(store: &SqliteSessionStore, session_id: SessionId, run_id: RunId) {
+    create_minimal_session(store, session_id.clone());
+    store
+        .start_run(StartRun {
+            id: run_id,
+            session_id,
+            status: RunStatus::Running,
+            trigger: Some("user".to_string()),
+            started_at: 2_000,
+        })
+        .expect("run start should commit");
+}
+
+#[test]
+fn append_turn_persists_turn_and_parts_with_transaction_assigned_seq() {
+    let db = TempDb::new("turn-append");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000339");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000340");
+    start_minimal_run(&store, session_id, run_id.clone());
+
+    let turn = Turn {
+        id: message_id("019e7000-0000-7000-8000-000000000341"),
+        run_id: run_id.clone(),
+        seq: 99,
+        role: TurnRole::User,
+        meta: TurnMeta::default(),
+        created_at: 3_000,
+    };
+
+    store
+        .append_turn(turn.clone(), vec![text_part("hello storage")])
+        .expect("turn append should commit");
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].0.id, turn.id);
+    assert_eq!(turns[0].0.seq, 0);
+    assert_eq!(turns[0].0.role, TurnRole::User);
+    assert_eq!(turns[0].1.len(), 1);
+    assert_eq!(turns[0].1[0].part, text_part("hello storage"));
+}
+
+#[test]
+fn append_turns_assigns_consecutive_seq_values_per_run() {
+    let db = TempDb::new("turn-append-batch");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000342");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000343");
+    start_minimal_run(&store, session_id, run_id.clone());
+
+    let turns_with_parts = vec![
+        (
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000344"),
+                run_id: run_id.clone(),
+                seq: 42,
+                role: TurnRole::User,
+                meta: TurnMeta::default(),
+                created_at: 3_100,
+            },
+            vec![text_part("first")],
+        ),
+        (
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000345"),
+                run_id: run_id.clone(),
+                seq: 42,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 3_200,
+            },
+            vec![text_part("second")],
+        ),
+    ];
+
+    store
+        .append_turns(&turns_with_parts)
+        .expect("batch append should commit");
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+    let seqs = turns.iter().map(|(turn, _)| turn.seq).collect::<Vec<_>>();
+    let texts = turns
+        .iter()
+        .map(|(_, parts)| match &parts[0].part {
+            Part::Text { text, .. } => text.as_str(),
+            other => panic!("expected text part, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(seqs, vec![0, 1]);
+    assert_eq!(texts, vec!["first", "second"]);
+}
+
+#[test]
+fn concurrent_append_turn_writers_assign_unique_monotonic_seq_values() {
+    const WRITERS: usize = 6;
+    const WRITES_EACH: usize = 8;
+
+    let db = TempDb::new("turn-append-concurrent");
+    let path = db.path().to_path_buf();
+    let session_id = session_id("019e7000-0000-7000-8000-000000000346");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000347");
+    let setup = SqliteSessionStore::open(&path).expect("setup open should succeed");
+    start_minimal_run(&setup, session_id, run_id.clone());
+    drop(setup);
+
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let path = path.clone();
+            let run_id = run_id.clone();
+            std::thread::spawn(move || {
+                let store = SqliteSessionStore::open(&path).expect("writer open should succeed");
+                for write in 0..WRITES_EACH {
+                    let suffix = writer * WRITES_EACH + write;
+                    store
+                        .append_turn(
+                            Turn {
+                                id: message_id(&format!("019e7000-0000-7000-8000-{suffix:012}")),
+                                run_id: run_id.clone(),
+                                seq: 0,
+                                role: TurnRole::User,
+                                meta: TurnMeta::default(),
+                                created_at: 4_000 + suffix as i64,
+                            },
+                            vec![text_part(format!("turn {suffix}"))],
+                        )
+                        .expect("append should survive writer contention");
+                }
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("writer thread should not panic");
+    }
+
+    let reader = SqliteSessionStore::open(&path).expect("reader open should succeed");
+    let turns = reader
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable after concurrent appends");
+    let seqs = turns.iter().map(|(turn, _)| turn.seq).collect::<Vec<_>>();
+    let expected = (0..(WRITERS * WRITES_EACH) as u32).collect::<Vec<_>>();
+
+    assert_eq!(seqs, expected);
+}
+
+#[test]
+fn list_turns_for_session_uses_stable_cursor_pagination() {
+    let db = TempDb::new("turn-pagination");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000348");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000349");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    for (index, created_at) in [3_000, 4_000, 5_000].into_iter().enumerate() {
+        store
+            .append_turn(
+                Turn {
+                    id: message_id(&format!("019e7000-0000-7000-8000-00000000035{index}")),
+                    run_id: run_id.clone(),
+                    seq: 0,
+                    role: TurnRole::User,
+                    meta: TurnMeta::default(),
+                    created_at,
+                },
+                vec![text_part(format!("turn {index}"))],
+            )
+            .expect("turn append should commit");
+    }
+
+    let first_page = store
+        .list_turns_for_session(&session_id, None, 2)
+        .expect("first page should be readable");
+    assert_eq!(first_page.items.len(), 2);
+    assert!(first_page.more);
+    assert_eq!(first_page.items[0].0.created_at, 5_000);
+    assert_eq!(first_page.items[1].0.created_at, 4_000);
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000360"),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::User,
+                meta: TurnMeta::default(),
+                created_at: 6_000,
+            },
+            vec![text_part("newer insert")],
+        )
+        .expect("newer concurrent insert should commit");
+
+    let second_page = store
+        .list_turns_for_session(&session_id, first_page.cursor, 2)
+        .expect("second page should be readable");
+
+    assert!(!second_page.more);
+    assert_eq!(second_page.cursor, None);
+    assert_eq!(second_page.items.len(), 1);
+    assert_eq!(second_page.items[0].0.created_at, 3_000);
+}
+
+#[test]
+fn update_part_replaces_stored_part_payload() {
+    let db = TempDb::new("turn-part-update");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000361");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000362");
+    start_minimal_run(&store, session_id, run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000363");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id,
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_000,
+            },
+            vec![text_part("draft")],
+        )
+        .expect("turn append should commit");
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1[0]
+        .id
+        .clone();
+
+    store
+        .update_part(
+            &part_id,
+            Part::Thinking {
+                text: "replaced".to_string(),
+                provider_hint: Some("reasoning".to_string()),
+            },
+        )
+        .expect("part update should commit");
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+    assert_eq!(
+        turns[0].1[0].part,
+        Part::Thinking {
+            text: "replaced".to_string(),
+            provider_hint: Some("reasoning".to_string()),
+        }
+    );
+}
+
+#[test]
+fn update_part_delta_appends_to_json_string_field() {
+    let db = TempDb::new("turn-part-delta");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000364");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000365");
+    start_minimal_run(&store, session_id, run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000366");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_100,
+            },
+            vec![text_part("hel")],
+        )
+        .expect("turn append should commit");
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1[0]
+        .id
+        .clone();
+
+    store
+        .update_part_delta(&turn_id, &part_id, "text", "lo")
+        .expect("part delta should commit");
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+    assert_eq!(turns[0].1[0].part, text_part("hello"));
+}
+
+#[test]
+fn update_part_delta_appends_to_tool_result_content_field() {
+    let db = TempDb::new("turn-part-delta-content");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000377");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000378");
+    start_minimal_run(&store, session_id, run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000379");
+    let call_id = tool_call_id("019e7000-0000-7000-8000-000000000380");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_125,
+            },
+            vec![Part::ToolResult {
+                call_id: call_id.clone(),
+                content: "out".to_string(),
+                raw_artifact_id: None,
+                is_error: false,
+            }],
+        )
+        .expect("turn append should commit");
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1[0]
+        .id
+        .clone();
+
+    store
+        .update_part_delta(&turn_id, &part_id, "content", "put")
+        .expect("part delta should commit");
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+    assert_eq!(
+        turns[0].1[0].part,
+        Part::ToolResult {
+            call_id,
+            content: "output".to_string(),
+            raw_artifact_id: None,
+            is_error: false,
+        }
+    );
+}
+
+#[test]
+fn update_part_delta_rejects_non_streaming_field_without_mutating_part() {
+    let db = TempDb::new("turn-part-delta-type");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000374");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000375");
+    start_minimal_run(&store, session_id, run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000376");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_150,
+            },
+            vec![text_part("stable")],
+        )
+        .expect("turn append should commit");
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1[0]
+        .id
+        .clone();
+
+    let err = store
+        .update_part_delta(&turn_id, &part_id, "type", "_corrupt")
+        .expect_err("non-streaming deltas should be rejected");
+    assert!(err
+        .to_string()
+        .contains("cannot append delta to non-streaming JSON field"));
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should remain readable");
+    assert_eq!(turns[0].1[0].part, text_part("stable"));
+}
+
+#[test]
+fn compact_part_marks_part_without_changing_payload() {
+    let db = TempDb::new("turn-part-compact");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000367");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000368");
+    start_minimal_run(&store, session_id, run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000369"),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_200,
+            },
+            vec![Part::ToolResult {
+                call_id: tool_call_id("019e7000-0000-7000-8000-000000000370"),
+                content: "large output".to_string(),
+                raw_artifact_id: None,
+                is_error: false,
+            }],
+        )
+        .expect("turn append should commit");
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1[0]
+        .id
+        .clone();
+
+    store
+        .compact_part(&part_id)
+        .expect("part compact should commit");
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+    assert!(turns[0].1[0].compacted_at.is_some());
+    assert_eq!(
+        turns[0].1[0].part,
+        Part::ToolResult {
+            call_id: tool_call_id("019e7000-0000-7000-8000-000000000370"),
+            content: "large output".to_string(),
+            raw_artifact_id: None,
+            is_error: false,
+        }
+    );
+}
+
+#[test]
+fn remove_part_deletes_only_the_target_part() {
+    let db = TempDb::new("turn-part-remove");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000371");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000372");
+    start_minimal_run(&store, session_id, run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000373");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_300,
+            },
+            vec![
+                text_part("keep"),
+                Part::Thinking {
+                    text: "remove".to_string(),
+                    provider_hint: None,
+                },
+            ],
+        )
+        .expect("turn append should commit");
+    let parts = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1
+        .clone();
+
+    store
+        .remove_part(&turn_id, &parts[1].id)
+        .expect("part removal should commit");
+
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable");
+    assert_eq!(turns[0].1.len(), 1);
+    assert_eq!(turns[0].1[0].part, text_part("keep"));
 }
 
 #[test]

@@ -4,19 +4,21 @@
 //! layer: opening the connection with the agreed pragmas, falling back from
 //! WAL to a rollback journal on network filesystems, and serialising writes
 //! through `BEGIN IMMEDIATE` with jittered retry to avoid convoy effects.
-//! Artifact blob persistence also lives here; higher-level turn/part
-//! persistence lands in follow-up issues.
+//! Artifact blob persistence and canonical turn/part persistence also live here.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use nav_types::{ArtifactId, ArtifactRow, PartId, RunId, RunRow, SessionId, SessionRow};
-use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
+use nav_types::{
+    ArtifactId, ArtifactRow, MessageId, PartId, RunId, RunRow, SessionId, SessionRow, StorageCursor,
+};
+use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
 
+use super::canonical::{Part, Turn, TurnRole};
 use super::migrate;
 
 /// Maximum number of `BEGIN IMMEDIATE` retries before giving up on a busy DB.
@@ -26,6 +28,7 @@ const JITTER_MIN_MS: u64 = 20;
 const JITTER_MAX_MS: u64 = 150;
 /// Run `wal_checkpoint(PASSIVE)` once every this many committed writes.
 const CHECKPOINT_INTERVAL: u64 = 50;
+static PART_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Journal mode the connection ended up using after [`SqliteSessionStore::open`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +177,23 @@ impl TokenDelta {
             cache_write: -self.cache_write,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredPart {
+    pub id: PartId,
+    pub part: Part,
+    pub compacted_at: Option<i64>,
+    pub created_at: i64,
+}
+
+pub type StoredTurn = (Turn, Vec<StoredPart>);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnPage {
+    pub items: Vec<StoredTurn>,
+    pub more: bool,
+    pub cursor: Option<StorageCursor>,
 }
 
 impl SqliteSessionStore {
@@ -516,6 +536,210 @@ impl SqliteSessionStore {
         }
     }
 
+    pub fn append_turn(&self, turn: Turn, parts: Vec<Part>) -> Result<(), SqliteStoreError> {
+        self.append_turns(&[(turn, parts)])
+    }
+
+    pub fn append_turns(
+        &self,
+        turns_with_parts: &[(Turn, Vec<Part>)],
+    ) -> Result<(), SqliteStoreError> {
+        if turns_with_parts.is_empty() {
+            return Ok(());
+        }
+
+        let prepared_turns = turns_with_parts
+            .iter()
+            .map(|(turn, parts)| prepare_turn(turn, parts))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.execute_write(|tx| {
+            for turn in &prepared_turns {
+                insert_turn(tx, turn)?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    pub fn list_turns_for_run(&self, run_id: &RunId) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let mut turn_stmt = conn
+            .prepare(
+                r#"
+                SELECT id, run_id, seq, role, meta_json, created_at
+                FROM turns
+                WHERE run_id = ?1
+                ORDER BY seq ASC
+                "#,
+            )
+            .map_err(read_query_err)?;
+        let turns = turn_stmt
+            .query_map([run_id.as_str()], read_turn)
+            .map_err(read_query_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(read_query_err)?;
+        drop(turn_stmt);
+
+        collect_parts_for_turns(&conn, turns)
+    }
+
+    pub fn list_turns_for_session(
+        &self,
+        session_id: &SessionId,
+        cursor: Option<StorageCursor>,
+        limit: usize,
+    ) -> Result<TurnPage, SqliteStoreError> {
+        if limit == 0 {
+            return Ok(TurnPage {
+                items: Vec::new(),
+                more: false,
+                cursor: None,
+            });
+        }
+
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut turns = match cursor {
+            Some(cursor) => {
+                let mut stmt = conn
+                    .prepare(
+                        r#"
+                        SELECT t.id, t.run_id, t.seq, t.role, t.meta_json, t.created_at
+                        FROM turns t
+                        JOIN runs r ON r.id = t.run_id
+                        WHERE r.session_id = ?1
+                          AND (
+                            t.created_at < ?2
+                            OR (t.created_at = ?2 AND t.id < ?3)
+                          )
+                        ORDER BY t.created_at DESC, t.id DESC
+                        LIMIT ?4
+                        "#,
+                    )
+                    .map_err(read_query_err)?;
+                stmt.query_map(
+                    params![
+                        session_id.as_str(),
+                        cursor.created_at,
+                        cursor.id.as_str(),
+                        query_limit,
+                    ],
+                    read_turn,
+                )
+                .map_err(read_query_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(read_query_err)?
+            }
+            None => {
+                let mut stmt = conn
+                    .prepare(
+                        r#"
+                        SELECT t.id, t.run_id, t.seq, t.role, t.meta_json, t.created_at
+                        FROM turns t
+                        JOIN runs r ON r.id = t.run_id
+                        WHERE r.session_id = ?1
+                        ORDER BY t.created_at DESC, t.id DESC
+                        LIMIT ?2
+                        "#,
+                    )
+                    .map_err(read_query_err)?;
+                stmt.query_map(params![session_id.as_str(), query_limit], read_turn)
+                    .map_err(read_query_err)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(read_query_err)?
+            }
+        };
+
+        let more = turns.len() > limit;
+        if more {
+            turns.truncate(limit);
+        }
+
+        let cursor = if more {
+            turns
+                .last()
+                .map(|turn| StorageCursor::new(turn.created_at, turn.id.to_string()))
+        } else {
+            None
+        };
+        let items = collect_parts_for_turns(&conn, turns)?;
+
+        Ok(TurnPage {
+            items,
+            more,
+            cursor,
+        })
+    }
+
+    pub fn update_part(&self, part_id: &PartId, part: Part) -> Result<(), SqliteStoreError> {
+        let type_name = part.type_name().to_string();
+        let data_json = serialize_json(&part)?;
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                UPDATE turn_parts
+                SET type = ?1,
+                    data_json = ?2
+                WHERE id = ?3
+                "#,
+                params![type_name.as_str(), data_json.as_str(), part_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "turn_part", part_id.as_str())
+    }
+
+    pub fn update_part_delta(
+        &self,
+        turn_id: &MessageId,
+        part_id: &PartId,
+        field: &str,
+        delta: &str,
+    ) -> Result<(), SqliteStoreError> {
+        let json_path = delta_json_path_for_field(field)?;
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                UPDATE turn_parts
+                SET data_json = json_set(
+                    data_json,
+                    ?1,
+                    COALESCE(json_extract(data_json, ?1), '') || ?2
+                )
+                WHERE id = ?3
+                  AND turn_id = ?4
+                "#,
+                params![json_path, delta, part_id.as_str(), turn_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "turn_part", part_id.as_str())
+    }
+
+    pub fn compact_part(&self, part_id: &PartId) -> Result<(), SqliteStoreError> {
+        let compacted_at = i64::try_from(current_time_millis()).unwrap_or(i64::MAX);
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "UPDATE turn_parts SET compacted_at = ?1 WHERE id = ?2",
+                params![compacted_at, part_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "turn_part", part_id.as_str())
+    }
+
+    pub fn remove_part(
+        &self,
+        turn_id: &MessageId,
+        part_id: &PartId,
+    ) -> Result<(), SqliteStoreError> {
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "DELETE FROM turn_parts WHERE id = ?1 AND turn_id = ?2",
+                params![part_id.as_str(), turn_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "turn_part", part_id.as_str())
+    }
+
     /// Run `op` inside a `BEGIN IMMEDIATE` transaction, committing on success.
     ///
     /// The immediate transaction acquires the write lock up front; on a busy
@@ -624,6 +848,171 @@ impl SqliteSessionStore {
             .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
             .expect("pragma query should succeed")
     }
+}
+
+struct PreparedTurn {
+    turn: Turn,
+    meta_json: String,
+    parts: Vec<PreparedPart>,
+}
+
+struct PreparedPart {
+    id: PartId,
+    type_name: String,
+    data_json: String,
+    created_at: i64,
+}
+
+fn prepare_turn(turn: &Turn, parts: &[Part]) -> Result<PreparedTurn, SqliteStoreError> {
+    Ok(PreparedTurn {
+        turn: turn.clone(),
+        meta_json: serialize_json(&turn.meta)?,
+        parts: prepare_parts(turn.created_at, parts)?,
+    })
+}
+
+fn insert_turn(tx: &Transaction, prepared: &PreparedTurn) -> rusqlite::Result<()> {
+    let turn = &prepared.turn;
+    let session_id: String = tx.query_row(
+        "SELECT session_id FROM runs WHERE id = ?1",
+        [turn.run_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let seq: u32 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM turns WHERE run_id = ?1",
+        [turn.run_id.as_str()],
+        |row| row.get(0),
+    )?;
+
+    tx.execute(
+        r#"
+        INSERT INTO turns (
+            id,
+            run_id,
+            seq,
+            role,
+            meta_json,
+            created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+        params![
+            turn.id.as_str(),
+            turn.run_id.as_str(),
+            seq,
+            turn_role_name(turn.role),
+            prepared.meta_json.as_str(),
+            turn.created_at,
+        ],
+    )?;
+
+    for part in &prepared.parts {
+        tx.execute(
+            r#"
+            INSERT INTO turn_parts (
+                id,
+                turn_id,
+                session_id,
+                type,
+                data_json,
+                created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                part.id.as_str(),
+                turn.id.as_str(),
+                session_id.as_str(),
+                part.type_name.as_str(),
+                part.data_json.as_str(),
+                part.created_at,
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn prepare_parts(created_at: i64, parts: &[Part]) -> Result<Vec<PreparedPart>, SqliteStoreError> {
+    parts
+        .iter()
+        .map(|part| {
+            let type_name = part.type_name().to_string();
+            let data_json = serialize_json(part)?;
+            Ok(PreparedPart {
+                id: generate_part_id(created_at),
+                type_name,
+                data_json,
+                created_at,
+            })
+        })
+        .collect()
+}
+
+fn serialize_json<T>(value: &T) -> Result<String, SqliteStoreError>
+where
+    T: serde::Serialize,
+{
+    serde_json::to_string(value).map_err(|err| SqliteStoreError::WriteFailed(err.to_string()))
+}
+
+fn generate_part_id(created_at: i64) -> PartId {
+    let timestamp = u64::try_from(created_at).unwrap_or(0);
+    let counter = PART_ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    let entropy = (u64::from(std::process::id()) << 32) | (counter & 0xffff_ffff);
+    PartId::new_unchecked(format!("prt_{timestamp:016x}_{entropy:016x}"))
+}
+
+fn current_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn delta_json_path_for_field(field: &str) -> Result<&'static str, SqliteStoreError> {
+    match field {
+        "text" => Ok("$.text"),
+        "content" => Ok("$.content"),
+        other => Err(SqliteStoreError::WriteFailed(format!(
+            "cannot append delta to non-streaming JSON field `{other}`"
+        ))),
+    }
+}
+
+fn turn_role_name(role: TurnRole) -> &'static str {
+    match role {
+        TurnRole::User => "user",
+        TurnRole::Assistant => "assistant",
+    }
+}
+
+fn collect_parts_for_turns(
+    conn: &Connection,
+    turns: Vec<Turn>,
+) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+    let mut part_stmt = conn
+        .prepare(
+            r#"
+            SELECT id, data_json, compacted_at, created_at
+            FROM turn_parts
+            WHERE turn_id = ?1
+            ORDER BY id ASC
+            "#,
+        )
+        .map_err(read_query_err)?;
+
+    turns
+        .into_iter()
+        .map(|turn| {
+            let parts = part_stmt
+                .query_map([turn.id.as_str()], read_stored_part)
+                .map_err(read_query_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(read_query_err)?;
+            Ok((turn, parts))
+        })
+        .collect()
 }
 
 /// Apply the durability/concurrency pragmas that do not vary by filesystem.
@@ -929,6 +1318,58 @@ fn read_run_row(row: &Row<'_>) -> rusqlite::Result<RunRow> {
     })
 }
 
+fn read_turn(row: &Row<'_>) -> rusqlite::Result<Turn> {
+    let id: String = row.get("id")?;
+    let run_id: String = row.get("run_id")?;
+    let role: String = row.get("role")?;
+    let meta_json: String = row.get("meta_json")?;
+    Ok(Turn {
+        id: MessageId::new_unchecked(id),
+        run_id: RunId::new_unchecked(run_id),
+        seq: row.get("seq")?,
+        role: parse_turn_role(&role)?,
+        meta: parse_json(&meta_json)?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn read_stored_part(row: &Row<'_>) -> rusqlite::Result<StoredPart> {
+    let id: String = row.get("id")?;
+    let data_json: String = row.get("data_json")?;
+    Ok(StoredPart {
+        id: PartId::new_unchecked(id),
+        part: parse_json(&data_json)?,
+        compacted_at: row.get("compacted_at")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+fn parse_turn_role(value: &str) -> rusqlite::Result<TurnRole> {
+    match value {
+        "user" => Ok(TurnRole::User),
+        "assistant" => Ok(TurnRole::Assistant),
+        other => Err(from_sql_error(format!("unknown turn role `{other}`"))),
+    }
+}
+
+fn parse_json<T>(value: &str) -> rusqlite::Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_str(value).map_err(|err| from_sql_error(err.to_string()))
+}
+
+fn from_sql_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    )
+}
+
 fn read_err(err: rusqlite::Error, entity: &'static str, id: &str) -> SqliteStoreError {
     match err {
         rusqlite::Error::QueryReturnedNoRows => SqliteStoreError::NotFound {
@@ -937,6 +1378,10 @@ fn read_err(err: rusqlite::Error, entity: &'static str, id: &str) -> SqliteStore
         },
         other => SqliteStoreError::ReadFailed(other.to_string()),
     }
+}
+
+fn read_query_err(err: rusqlite::Error) -> SqliteStoreError {
+    SqliteStoreError::ReadFailed(err.to_string())
 }
 
 fn ensure_row_changed(
