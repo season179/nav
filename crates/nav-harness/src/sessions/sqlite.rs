@@ -1172,6 +1172,29 @@ impl SqliteSessionStore {
         status: RunStatus,
         error_json: Option<String>,
     ) -> Result<(), SqliteStoreError> {
+        self.append_finished_run_with_turns_compacting(
+            run,
+            turns_with_parts,
+            finished_at,
+            status,
+            error_json,
+            &[],
+        )
+    }
+
+    /// Like [`Self::append_finished_run_with_turns`], but also marks
+    /// `compact_part_ids` as `compacted_at` inside the *same* transaction, so a
+    /// last-resort compaction (write summary + supersede the head) either
+    /// commits whole or rolls back whole.
+    pub fn append_finished_run_with_turns_compacting(
+        &self,
+        run: StartRun,
+        turns_with_parts: &[(Turn, Vec<Part>)],
+        finished_at: i64,
+        status: RunStatus,
+        error_json: Option<String>,
+        compact_part_ids: &[PartId],
+    ) -> Result<(), SqliteStoreError> {
         if !run.status.is_startable() {
             return Err(invalid_run_status(
                 "append_finished_run_with_turns",
@@ -1195,6 +1218,7 @@ impl SqliteSessionStore {
             .iter()
             .map(|(turn, parts)| prepare_turn(turn, parts))
             .collect::<Result<Vec<_>, _>>()?;
+        let compacted_at = i64::try_from(current_time_millis()).unwrap_or(i64::MAX);
 
         self.execute_write(|tx| {
             insert_run(tx, &run)?;
@@ -1205,6 +1229,15 @@ impl SqliteSessionStore {
                 finish_run_in_tx(tx, &run.id, status, finished_at, error_json.as_deref())?;
             if changed == 0 {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            for part_id in compact_part_ids {
+                let marked = tx.execute(
+                    "UPDATE turn_parts SET compacted_at = ?1 WHERE id = ?2",
+                    params![compacted_at, part_id.as_str()],
+                )?;
+                if marked == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
             }
             Ok(())
         })?;

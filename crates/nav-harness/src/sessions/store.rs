@@ -218,6 +218,7 @@ impl SessionStore {
             session_id,
             tail_start_id,
             COMPACTION_SUMMARY_PLACEHOLDER.to_string(),
+            false,
         )
     }
 
@@ -244,31 +245,26 @@ impl SessionStore {
     ) -> Result<CompactionBoundary, SqliteStoreError> {
         let summary = summary.into();
 
-        self.write_compaction_summary(session_id, request.tail_start_id.clone(), summary)
+        self.write_compaction_summary(session_id, request.tail_start_id.clone(), summary, false)
     }
 
     /// Last-resort fallback for unmappable old turns (ENC-10): write the
     /// compaction summary turn *and* mark every superseded head turn
     /// `compacted_at`, so history shrinks to [summary + verbatim tail] and the
-    /// dropped turns are visibly accounted for.
+    /// dropped turns are visibly accounted for. The summary write and the
+    /// part-marking commit in a single transaction.
     pub fn compact_session_last_resort(
         &self,
         session_id: &SessionId,
         request: &CompactionSummaryRequest,
         summary: impl Into<String>,
     ) -> Result<CompactionBoundary, SqliteStoreError> {
-        let page = self.session_turns_chronological(session_id)?;
-        let boundary = self.write_compaction_summary(
+        self.write_compaction_summary(
             session_id,
             request.tail_start_id.clone(),
             summary.into(),
-        )?;
-
-        for part_id in superseded_head_part_ids(&page, request.tail_start_id.as_ref()) {
-            self.sqlite.compact_part(&part_id)?;
-        }
-
-        Ok(boundary)
+            true,
+        )
     }
 
     fn write_compaction_summary(
@@ -276,9 +272,15 @@ impl SessionStore {
         session_id: &SessionId,
         tail_start_id: Option<MessageId>,
         summary: String,
+        supersede_head: bool,
     ) -> Result<CompactionBoundary, SqliteStoreError> {
         let page = self.session_turns_chronological(session_id)?;
         validate_tail_start_id(&page, tail_start_id.as_ref())?;
+        let superseded_part_ids = if supersede_head {
+            superseded_head_part_ids(&page, tail_start_id.as_ref())
+        } else {
+            Vec::new()
+        };
         let run_id = new_run_id();
         let marker_id = new_message_id();
         let summary_id = new_message_id();
@@ -301,7 +303,7 @@ impl SessionStore {
             created_at: created_at.saturating_add(1),
         };
 
-        self.sqlite.append_finished_run_with_turns(
+        self.sqlite.append_finished_run_with_turns_compacting(
             StartRun {
                 id: run_id.clone(),
                 session_id: session_id.clone(),
@@ -328,6 +330,7 @@ impl SessionStore {
             created_at.saturating_add(2),
             RunStatus::Completed,
             None,
+            &superseded_part_ids,
         )?;
 
         Ok(CompactionBoundary {

@@ -29,6 +29,17 @@ pub struct DialectCaps {
 
 impl DialectCaps {
     /// Capabilities for a concrete provider API shape.
+    ///
+    /// `supports_thinking` tracks whether the matching encoder can carry a
+    /// `Thinking` part onto the wire at all, so it stays in lockstep with the
+    /// encoders (the source of truth):
+    /// - Anthropic Messages emits `thinking` content blocks.
+    /// - OpenAI Responses emits an encrypted `reasoning` item (the encoder
+    ///   keeps encrypted thinking and drops the rest), so it *can* carry
+    ///   thinking — `true`.
+    /// - Chat Completions and the ChatGPT subscription shape have no thinking
+    ///   representation; their encoders silently drop it — `false`, so we drop
+    ///   (and report) it here instead.
     pub fn for_api_kind(api_kind: ApiKind) -> Self {
         match api_kind {
             ApiKind::AnthropicMessages | ApiKind::OpenAiResponses => Self {
