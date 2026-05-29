@@ -6,7 +6,9 @@ use nav_harness::models::{
     ModelResolver, OpenAiCompletionsCancellationToken, OpenAiCompletionsError, ResolveModelError,
     ResolvedModelConfig,
 };
-use nav_harness::sessions::{PendingConfirmation, PendingConfirmationRegistry, SessionStore, Turn};
+use nav_harness::sessions::{
+    ModelTurn, PendingConfirmation, PendingConfirmationRegistry, SessionStore,
+};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};
 use nav_protocol::{BackendEvent, EventEnvelope, ProviderEventMetadata};
 use nav_types::{ApprovalId, EventId, FileChangeId, MessageId, RunId, SessionId, ToolCallId};
@@ -68,7 +70,7 @@ pub(super) struct ModelRunRequest<'a> {
     pub session_id: &'a SessionId,
     pub run_id: &'a RunId,
     pub message_id: &'a MessageId,
-    pub turns: &'a [Turn],
+    pub turns: &'a [ModelTurn],
     pub tool_registry: &'a ToolRegistry,
     pub tool_preset: ToolPreset,
     pub tool_context: &'a ToolContext,
@@ -207,7 +209,7 @@ fn publish_run_loop_completion(
     session_store: &Arc<Mutex<SessionStore>>,
     session_id: &SessionId,
     run_id: &RunId,
-    turns: Vec<Turn>,
+    turns: Vec<ModelTurn>,
     events: impl IntoIterator<Item = EventEnvelope>,
 ) -> bool {
     let mut runs = stores.runs.lock().unwrap();
@@ -575,13 +577,13 @@ mod tests {
             &session_store,
             &fixture.session_id,
             &fixture.run_id,
-            vec![Turn::assistant_text("assistant reply")],
+            vec![ModelTurn::assistant_text("assistant reply")],
             vec![fixture.run_completed_event()],
         );
 
         assert_eq!(
             session_store.lock().unwrap().turns(&fixture.session_id),
-            vec![Turn::assistant_text("assistant reply")]
+            vec![ModelTurn::assistant_text("assistant reply")]
         );
         assert_eq!(
             fixture.event_types(),
@@ -601,7 +603,7 @@ mod tests {
             &session_store,
             &fixture.session_id,
             &fixture.run_id,
-            vec![Turn::assistant_text("late assistant reply")],
+            vec![ModelTurn::assistant_text("late assistant reply")],
             vec![fixture.run_completed_event()],
         );
 

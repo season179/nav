@@ -1,13 +1,13 @@
 //! Deterministic system-prompt builder.
 //!
 //! Renders OS, cwd, date, optional user conventions, and a tool list into a
-//! `Turn::system_text(…)` ready to prepend to the model request. `Clock` and
+//! `ModelTurn::system_text(…)` ready to prepend to the model request. `Clock` and
 //! `Cwd` are injectable traits so tests are deterministic.
 
 use std::fmt::Write;
 use std::time::SystemTime;
 
-use crate::sessions::Turn;
+use crate::sessions::ModelTurn;
 use crate::tools::ToolRegistry;
 
 // ---------------------------------------------------------------------------
@@ -85,9 +85,9 @@ impl<'a> SystemPromptBuilder<'a> {
         self
     }
 
-    /// Render the system prompt and return it as a `System`-role `Turn`.
-    pub fn build(&self) -> Turn {
-        Turn::system_text(self.render())
+    /// Render the system prompt and return it as a `System`-role model turn.
+    pub fn build(&self) -> ModelTurn {
+        ModelTurn::system_text(self.render())
     }
 
     /// Render the system prompt to a String.
@@ -214,7 +214,7 @@ mod tests {
 
         let prompt = SystemPromptBuilder::new(&clock, &cwd).build();
 
-        assert_eq!(prompt.role, crate::sessions::TurnRole::System);
+        assert_eq!(prompt.role, crate::sessions::ModelTurnRole::System);
 
         let os = if cfg!(target_os = "macos") {
             "macOS"
@@ -255,7 +255,7 @@ mod tests {
             .conventions("Use conventional commits.\nNo force-push.\n")
             .build();
 
-        assert_eq!(prompt.role, crate::sessions::TurnRole::System);
+        assert_eq!(prompt.role, crate::sessions::ModelTurnRole::System);
 
         let os = if cfg!(target_os = "macos") {
             "macOS"
