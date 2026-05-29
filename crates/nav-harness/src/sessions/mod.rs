@@ -2,6 +2,7 @@
 
 pub mod canonical;
 pub mod confirmations;
+pub mod migrate;
 pub mod sqlite;
 pub mod store;
 
