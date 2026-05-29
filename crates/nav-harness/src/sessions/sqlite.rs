@@ -14,7 +14,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use nav_types::{ArtifactId, ArtifactRow, PartId, RunId, RunRow, SessionId, SessionRow};
+use nav_types::{
+    ArtifactId, ArtifactRow, PartId, ProviderPayloadId, ProviderPayloadRow, RunId, RunRow,
+    SessionId, SessionRow,
+};
 use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
 
 use super::migrate;
@@ -96,6 +99,59 @@ pub struct NewArtifact {
 pub struct Artifact {
     pub row: ArtifactRow,
     pub reader: File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderPayloadDirection {
+    Request,
+    Response,
+    StreamBatch,
+    Error,
+}
+
+impl ProviderPayloadDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+            Self::StreamBatch => "stream_batch",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStatus {
+    Decoded,
+    DecodedWithUnknowns,
+    Failed,
+    Ignored,
+}
+
+impl DecodeStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Decoded => "decoded",
+            Self::DecodedWithUnknowns => "decoded_with_unknowns",
+            Self::Failed => "failed",
+            Self::Ignored => "ignored",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewProviderPayload {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub direction: ProviderPayloadDirection,
+    pub api_kind: String,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub sequence: u32,
+    pub provider_payload_id: Option<String>,
+    pub mime: String,
+    pub raw_bytes: Vec<u8>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,30 +289,7 @@ impl SqliteSessionStore {
 
         let id = new_artifact_id();
         self.execute_write(|tx| {
-            tx.execute(
-                "INSERT INTO artifacts (
-                    id, session_id, part_id, kind, mime, sha256, path, size_bytes, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(sha256) DO NOTHING",
-                params![
-                    id.as_str(),
-                    artifact.session_id.as_str(),
-                    artifact.part_id.as_ref().map(PartId::as_str),
-                    artifact.kind.as_str(),
-                    artifact.mime,
-                    sha256,
-                    relative_path,
-                    bytes.len() as i64,
-                    artifact.created_at,
-                ],
-            )?;
-
-            let stored_id = tx.query_row(
-                "SELECT id FROM artifacts WHERE sha256 = ?1",
-                [&sha256],
-                |row| row.get::<_, String>(0),
-            )?;
-            Ok(ArtifactId::new_unchecked(stored_id))
+            insert_artifact_row(tx, &id, &artifact, &sha256, &relative_path, bytes.len())
         })
     }
 
@@ -279,6 +312,168 @@ impl SqliteSessionStore {
             ))
         })?;
         Ok(Artifact { row, reader })
+    }
+
+    pub fn append_provider_payload(
+        &self,
+        payload: NewProviderPayload,
+    ) -> Result<ProviderPayloadId, SqliteStoreError> {
+        let sha256 = sha256_hex(&payload.raw_bytes);
+        let relative_path = artifact_relative_path(&sha256);
+        self.write_blob_if_missing(&relative_path, &sha256, &payload.raw_bytes)?;
+
+        let artifact = NewArtifact {
+            session_id: payload.session_id.clone(),
+            part_id: None,
+            kind: ArtifactKind::ProviderEnvelope,
+            mime: payload.mime.clone(),
+            created_at: payload.created_at,
+        };
+
+        let artifact_id = new_artifact_id();
+        let id = new_provider_payload_id();
+        self.execute_write(|tx| {
+            let stored_artifact_id = insert_artifact_row(
+                tx,
+                &artifact_id,
+                &artifact,
+                &sha256,
+                &relative_path,
+                payload.raw_bytes.len(),
+            )?;
+            tx.execute(
+                r#"
+                INSERT INTO provider_payloads (
+                    id,
+                    session_id,
+                    run_id,
+                    direction,
+                    api_kind,
+                    provider_id,
+                    model_id,
+                    sequence,
+                    provider_payload_id,
+                    artifact_id,
+                    sha256,
+                    created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                "#,
+                params![
+                    id.as_str(),
+                    payload.session_id.as_str(),
+                    payload.run_id.as_str(),
+                    payload.direction.as_str(),
+                    payload.api_kind.as_str(),
+                    payload.provider_id.as_deref(),
+                    payload.model_id.as_deref(),
+                    i64::from(payload.sequence),
+                    payload.provider_payload_id.as_deref(),
+                    stored_artifact_id.as_str(),
+                    sha256.as_str(),
+                    payload.created_at,
+                ],
+            )
+        })?;
+        Ok(id)
+    }
+
+    pub fn get_provider_payload(
+        &self,
+        id: &ProviderPayloadId,
+    ) -> Result<ProviderPayloadRow, SqliteStoreError> {
+        self.conn
+            .lock()
+            .expect("connection mutex poisoned")
+            .query_row(
+                r#"
+                SELECT
+                    id,
+                    session_id,
+                    run_id,
+                    direction,
+                    api_kind,
+                    provider_id,
+                    model_id,
+                    sequence,
+                    provider_payload_id,
+                    artifact_id,
+                    sha256,
+                    decoder_version,
+                    decode_status,
+                    error_json,
+                    created_at,
+                    decoded_at
+                FROM provider_payloads
+                WHERE id = ?1
+                "#,
+                [id.as_str()],
+                read_provider_payload_row,
+            )
+            .map_err(|err| read_err(err, "provider payload", id.as_str()))
+    }
+
+    pub fn list_pending_provider_payloads(
+        &self,
+    ) -> Result<Vec<ProviderPayloadRow>, SqliteStoreError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let mut statement = conn
+            .prepare(
+                r#"
+                SELECT
+                    id,
+                    session_id,
+                    run_id,
+                    direction,
+                    api_kind,
+                    provider_id,
+                    model_id,
+                    sequence,
+                    provider_payload_id,
+                    artifact_id,
+                    sha256,
+                    decoder_version,
+                    decode_status,
+                    error_json,
+                    created_at,
+                    decoded_at
+                FROM provider_payloads
+                WHERE decode_status = 'pending'
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
+        let rows = statement
+            .query_map([], read_provider_payload_row)
+            .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
+
+        let mut payloads = Vec::new();
+        for row in rows {
+            payloads.push(row.map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?);
+        }
+        Ok(payloads)
+    }
+
+    pub fn mark_provider_payload_decoded(
+        &self,
+        id: &ProviderPayloadId,
+        decoder_version: &str,
+        status: DecodeStatus,
+    ) -> Result<(), SqliteStoreError> {
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                r#"
+                UPDATE provider_payloads
+                SET decoder_version = ?1,
+                    decode_status = ?2,
+                    error_json = NULL,
+                    decoded_at = ?3
+                WHERE id = ?4
+                "#,
+                params![decoder_version, status.as_str(), unix_millis(), id.as_str(),],
+            )
+        })?;
+        ensure_row_changed(changed, "provider payload", id.as_str())
     }
 
     pub fn create_session(
@@ -849,6 +1044,40 @@ fn temp_blob_path(path: &Path) -> PathBuf {
     ))
 }
 
+fn insert_artifact_row(
+    tx: &Transaction<'_>,
+    id: &ArtifactId,
+    artifact: &NewArtifact,
+    sha256: &str,
+    relative_path: &str,
+    size_bytes: usize,
+) -> rusqlite::Result<ArtifactId> {
+    tx.execute(
+        "INSERT INTO artifacts (
+            id, session_id, part_id, kind, mime, sha256, path, size_bytes, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(sha256) DO NOTHING",
+        params![
+            id.as_str(),
+            artifact.session_id.as_str(),
+            artifact.part_id.as_ref().map(PartId::as_str),
+            artifact.kind.as_str(),
+            artifact.mime.as_str(),
+            sha256,
+            relative_path,
+            size_bytes as i64,
+            artifact.created_at,
+        ],
+    )?;
+
+    let stored_id = tx.query_row(
+        "SELECT id FROM artifacts WHERE sha256 = ?1",
+        [sha256],
+        |row| row.get::<_, String>(0),
+    )?;
+    Ok(ArtifactId::new_unchecked(stored_id))
+}
+
 fn new_artifact_id() -> ArtifactId {
     static NEXT_ARTIFACT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -860,6 +1089,19 @@ fn new_artifact_id() -> ArtifactId {
         .unwrap_or(0);
     let entropy = (u64::from(std::process::id()) << 32) ^ counter ^ nanos;
     ArtifactId::new_unchecked(format!("art_{millis:016x}_{entropy:016x}"))
+}
+
+fn new_provider_payload_id() -> ProviderPayloadId {
+    static NEXT_PROVIDER_PAYLOAD_ID: AtomicU64 = AtomicU64::new(0);
+
+    let millis = unix_millis() as u64;
+    let counter = NEXT_PROVIDER_PAYLOAD_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()))
+        .unwrap_or(0);
+    let entropy = (u64::from(std::process::id()) << 32) ^ counter ^ nanos;
+    ProviderPayloadId::new_unchecked(format!("pay_{millis:016x}_{entropy:016x}"))
 }
 
 fn unix_millis() -> i64 {
@@ -885,6 +1127,33 @@ fn artifact_row_from_sql(row: &Row<'_>) -> rusqlite::Result<ArtifactRow> {
         path: row.get(6)?,
         size_bytes: size_bytes as u64,
         created_at: row.get(8)?,
+    })
+}
+
+fn read_provider_payload_row(row: &Row<'_>) -> rusqlite::Result<ProviderPayloadRow> {
+    let id: String = row.get("id")?;
+    let session_id: String = row.get("session_id")?;
+    let run_id: String = row.get("run_id")?;
+    let sequence: i64 = row.get("sequence")?;
+    let artifact_id: String = row.get("artifact_id")?;
+
+    Ok(ProviderPayloadRow {
+        id: ProviderPayloadId::new_unchecked(id),
+        session_id: SessionId::new_unchecked(session_id),
+        run_id: RunId::new_unchecked(run_id),
+        direction: row.get("direction")?,
+        api_kind: row.get("api_kind")?,
+        provider_id: row.get("provider_id")?,
+        model_id: row.get("model_id")?,
+        sequence: sequence as u32,
+        provider_payload_id: row.get("provider_payload_id")?,
+        artifact_id: ArtifactId::new_unchecked(artifact_id),
+        sha256: row.get("sha256")?,
+        decoder_version: row.get("decoder_version")?,
+        decode_status: row.get("decode_status")?,
+        error_json: row.get("error_json")?,
+        created_at: row.get("created_at")?,
+        decoded_at: row.get("decoded_at")?,
     })
 }
 
@@ -1461,12 +1730,15 @@ mod tests {
         assert_table_exists(&conn, "turns");
         assert_table_exists(&conn, "turn_parts");
         assert_table_exists(&conn, "artifacts");
+        assert_table_exists(&conn, "provider_payloads");
 
         assert_index_exists(&conn, "idx_runs_session_started");
         assert_index_exists(&conn, "idx_turns_run_seq");
         assert_index_exists(&conn, "idx_turn_parts_turn_id");
         assert_index_exists(&conn, "idx_turn_parts_session_id");
         assert_index_exists(&conn, "idx_artifacts_sha256");
+        assert_index_exists(&conn, "idx_provider_payloads_run_sequence");
+        assert_index_exists(&conn, "idx_provider_payloads_session");
 
         let (version, applied_at): (i64, i64) = conn
             .query_row(
@@ -1480,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn core_schema_accepts_rows_without_provider_payloads_table() {
+    fn core_schema_accepts_turn_parts_without_provider_payload_reference() {
         let db = TempDb::new("core-schema-insert");
 
         SqliteSessionStore::open(db.path()).expect("open should migrate");
@@ -1579,6 +1851,7 @@ mod tests {
         assert_table_missing(&conn, "turns");
         assert_table_missing(&conn, "turn_parts");
         assert_table_missing(&conn, "artifacts");
+        assert_table_missing(&conn, "provider_payloads");
     }
 
     #[test]
