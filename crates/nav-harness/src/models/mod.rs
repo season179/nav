@@ -17,7 +17,9 @@ pub use decode::{
     DecodeError, DecodedPart, DecodedProviderPayload, DecodedTurn, Decoder,
     OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
 };
-pub use encode::{Encoder, OpenAiChatCompletionsEncoder};
+pub use encode::{
+    Encoder, OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
+};
 pub use model::{ModelConfig, ModelInput};
 pub use openai_completions::{
     ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessageRole,
