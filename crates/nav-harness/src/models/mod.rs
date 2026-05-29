@@ -14,8 +14,9 @@ pub use api::ApiKind;
 pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
 pub use config::{ModelRef, ModelSettings};
 pub use decode::{
-    DecodeError, DecodedPart, DecodedProviderPayload, DecodedTurn, Decoder,
-    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
+    ChatGptSubscriptionDecodeInput, ChatGptSubscriptionDecoder, DecodeError, DecodedPart,
+    DecodedProviderPayload, DecodedTurn, Decoder, OpenAiChatCompletionsDecodeInput,
+    OpenAiChatCompletionsDecoder,
 };
 pub use encode::{Encoder, OpenAiChatCompletionsEncoder};
 pub use model::{ModelConfig, ModelInput};

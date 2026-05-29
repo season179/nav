@@ -1,6 +1,6 @@
 //! Decoder trait: provider response/envelope → canonical turns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nav_types::{ArtifactId, MessageId, ProviderPayloadId, RunId, ToolCallId};
 use serde::Deserialize;
@@ -23,6 +23,16 @@ pub trait Decoder {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenAiChatCompletionsDecodeInput {
+    pub provider_payload_id: ProviderPayloadId,
+    pub raw_artifact_id: ArtifactId,
+    pub run_id: RunId,
+    pub provider_id: Option<String>,
+    pub raw_json: Vec<u8>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGptSubscriptionDecodeInput {
     pub provider_payload_id: ProviderPayloadId,
     pub raw_artifact_id: ArtifactId,
     pub run_id: RunId,
@@ -83,6 +93,25 @@ impl Decoder for OpenAiChatCompletionsDecoder {
 
     fn decode(&self, response: &Self::Response) -> Result<Self::Output, Self::Error> {
         decode_openai_chat_completions(response)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatGptSubscriptionDecoder;
+
+impl ChatGptSubscriptionDecoder {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decoder for ChatGptSubscriptionDecoder {
+    type Response = ChatGptSubscriptionDecodeInput;
+    type Output = DecodedProviderPayload;
+    type Error = DecodeError;
+
+    fn decode(&self, response: &Self::Response) -> Result<Self::Output, Self::Error> {
+        decode_chatgpt_subscription(response)
     }
 }
 
@@ -154,6 +183,429 @@ fn decode_openai_chat_completions(
     };
 
     Ok(DecodedProviderPayload { status, turns })
+}
+
+fn decode_chatgpt_subscription(
+    input: &ChatGptSubscriptionDecodeInput,
+) -> Result<DecodedProviderPayload, DecodeError> {
+    let value: Value = serde_json::from_slice(&input.raw_json)
+        .map_err(|error| DecodeError::MalformedJson(error.to_string()))?;
+    let (events, pointer_prefix) = subscription_events(&value)?;
+    let mut state = SubscriptionDecodeState::new(input, pointer_prefix);
+
+    for (index, event) in events.iter().enumerate() {
+        state.apply_event(index, event)?;
+    }
+
+    Ok(state.finish())
+}
+
+fn subscription_events(value: &Value) -> Result<(&[Value], &'static str), DecodeError> {
+    if let Some(events) = value.get("events").and_then(Value::as_array) {
+        return Ok((events, "/events"));
+    }
+    if let Some(events) = value.as_array() {
+        return Ok((events, ""));
+    }
+    Err(DecodeError::MalformedResponse(
+        "missing subscription events array".to_string(),
+    ))
+}
+
+struct SubscriptionDecodeState<'a> {
+    input: &'a ChatGptSubscriptionDecodeInput,
+    pointer_prefix: &'static str,
+    model_id: Option<String>,
+    finish_reason: Option<String>,
+    usage: Option<TokenUsage>,
+    parts: Vec<DecodedPart>,
+    text_buffers: HashMap<(u64, u64), SubscriptionTextBuffer>,
+    text_order: Vec<(u64, u64)>,
+    completed_text_keys: HashSet<(u64, u64)>,
+    tool_arguments: HashMap<u64, String>,
+}
+
+struct SubscriptionTextBuffer {
+    text: String,
+    provider_json_pointer: String,
+}
+
+impl<'a> SubscriptionDecodeState<'a> {
+    fn new(input: &'a ChatGptSubscriptionDecodeInput, pointer_prefix: &'static str) -> Self {
+        Self {
+            input,
+            pointer_prefix,
+            model_id: None,
+            finish_reason: None,
+            usage: None,
+            parts: Vec::new(),
+            text_buffers: HashMap::new(),
+            text_order: Vec::new(),
+            completed_text_keys: HashSet::new(),
+            tool_arguments: HashMap::new(),
+        }
+    }
+
+    fn apply_event(&mut self, index: usize, event: &Value) -> Result<(), DecodeError> {
+        let event_type = event.get("type").and_then(Value::as_str).ok_or_else(|| {
+            DecodeError::MalformedResponse(format!("missing subscription event type at {index}"))
+        })?;
+
+        match event_type {
+            "response.created" | "response.completed" | "response.failed" => {
+                if let Some(response) = event.get("response") {
+                    self.capture_response_meta(response);
+                }
+            }
+            "response.output_text.delta" => self.apply_text_delta(index, event),
+            "response.output_text.done" => self.apply_text_done(index, event),
+            "response.function_call_arguments.delta" => {
+                self.apply_tool_arguments_delta(event);
+            }
+            "response.function_call_arguments.done" => {
+                self.apply_tool_arguments_done(event);
+            }
+            "response.output_item.done" => self.apply_output_item_done(index, event)?,
+            "response.output_item.added" | "response.content_part.added" => {}
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn capture_response_meta(&mut self, response: &Value) {
+        if let Some(model_id) = response.get("model").and_then(Value::as_str) {
+            self.model_id = Some(model_id.to_string());
+        }
+        if let Some(status) = response.get("status").and_then(Value::as_str) {
+            self.finish_reason = Some(status.to_string());
+        }
+        if let Some(usage) = decode_subscription_usage(response.get("usage")) {
+            self.usage = Some(usage);
+        }
+    }
+
+    fn apply_text_delta(&mut self, index: usize, event: &Value) {
+        let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        if delta.is_empty() {
+            return;
+        }
+
+        let key = text_event_key(event);
+        if !self.text_buffers.contains_key(&key) {
+            self.text_order.push(key);
+        }
+        let pointer = self.event_pointer(index, "/delta");
+        let buffer = self
+            .text_buffers
+            .entry(key)
+            .or_insert_with(|| SubscriptionTextBuffer {
+                text: String::new(),
+                provider_json_pointer: pointer.clone(),
+            });
+        buffer.text.push_str(delta);
+        buffer.provider_json_pointer = pointer;
+    }
+
+    fn apply_text_done(&mut self, index: usize, event: &Value) {
+        let key = text_event_key(event);
+        let buffered = self.text_buffers.remove(&key);
+        let text = event
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| buffered.map(|buffer| buffer.text));
+        if let Some(text) = text {
+            self.push_text_part(text, self.event_pointer(index, "/text"));
+            self.completed_text_keys.insert(key);
+        }
+    }
+
+    fn apply_tool_arguments_delta(&mut self, event: &Value) {
+        let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        let output_index = output_index(event);
+        self.tool_arguments
+            .entry(output_index)
+            .or_default()
+            .push_str(delta);
+    }
+
+    fn apply_tool_arguments_done(&mut self, event: &Value) {
+        let Some(arguments) = event.get("arguments").and_then(Value::as_str) else {
+            return;
+        };
+        let output_index = output_index(event);
+        if !arguments.trim().is_empty() || !self.tool_arguments.contains_key(&output_index) {
+            self.tool_arguments
+                .insert(output_index, arguments.to_string());
+        }
+    }
+
+    fn apply_output_item_done(&mut self, index: usize, event: &Value) -> Result<(), DecodeError> {
+        let item = event.get("item").ok_or_else(|| {
+            DecodeError::MalformedResponse(format!(
+                "missing subscription output item at event {index}"
+            ))
+        })?;
+        let item_type = item.get("type").and_then(Value::as_str).ok_or_else(|| {
+            DecodeError::MalformedResponse(format!(
+                "missing subscription output item type at event {index}"
+            ))
+        })?;
+
+        match item_type {
+            "reasoning" => self.apply_reasoning_item(index, item),
+            "function_call" => self.apply_function_call_item(index, event, item)?,
+            "message" => self.apply_message_item(index, event, item),
+            _ => self.push_subscription_opaque_part(
+                format!("output_item.{item_type}"),
+                raw_json_from_value(item)?,
+                self.event_pointer(index, "/item"),
+            ),
+        }
+
+        Ok(())
+    }
+
+    fn apply_reasoning_item(&mut self, index: usize, item: &Value) {
+        let Some((field, text)) = encrypted_reasoning_field(item) else {
+            return;
+        };
+
+        self.parts.push(DecodedPart {
+            part: Part::Thinking {
+                text: text.to_string(),
+                provider_hint: Some("encrypted".to_string()),
+            },
+            provider_payload_id: self.input.provider_payload_id.clone(),
+            provider_json_pointer: self.event_pointer(index, &format!("/item/{field}")),
+        });
+    }
+
+    fn apply_function_call_item(
+        &mut self,
+        index: usize,
+        event: &Value,
+        item: &Value,
+    ) -> Result<(), DecodeError> {
+        let name = item.get("name").and_then(Value::as_str).ok_or_else(|| {
+            DecodeError::MalformedResponse(format!(
+                "missing subscription function call name at event {index}"
+            ))
+        })?;
+        let output_index = output_index(event);
+        let coalesced_arguments = self.tool_arguments.remove(&output_index);
+        let item_arguments = item.get("arguments").and_then(Value::as_str);
+        let arguments = match (item_arguments, coalesced_arguments) {
+            (Some(arguments), _) if !arguments.trim().is_empty() => arguments.to_string(),
+            (_, Some(arguments)) => arguments,
+            (Some(arguments), None) => arguments.to_string(),
+            (None, None) => String::new(),
+        };
+        let pointer = self.event_pointer(index, "/item");
+
+        self.parts.push(DecodedPart {
+            part: Part::ToolCall {
+                id: derived_tool_call_id(self.input.provider_payload_id.as_str(), &pointer),
+                name: name.to_string(),
+                arguments: parse_subscription_tool_arguments(&arguments)?,
+                raw_arguments_artifact_id: None,
+            },
+            provider_payload_id: self.input.provider_payload_id.clone(),
+            provider_json_pointer: pointer,
+        });
+        Ok(())
+    }
+
+    fn apply_message_item(&mut self, index: usize, event: &Value, item: &Value) {
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            return;
+        };
+
+        for (content_index, part) in content.iter().enumerate() {
+            let key = (output_index(event), content_index as u64);
+            if self.completed_text_keys.contains(&key) {
+                continue;
+            }
+            let part_type = part.get("type").and_then(Value::as_str);
+            if !matches!(part_type, Some("output_text" | "text")) {
+                continue;
+            }
+            let Some(text) = part.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            self.push_text_part(
+                text.to_string(),
+                self.event_pointer(index, &format!("/item/content/{content_index}/text")),
+            );
+        }
+    }
+
+    fn finish(mut self) -> DecodedProviderPayload {
+        for key in self.text_order.clone() {
+            if let Some(buffer) = self.text_buffers.remove(&key) {
+                self.push_text_part(buffer.text, buffer.provider_json_pointer);
+            }
+        }
+
+        let status = if self.parts.iter().any(|part| {
+            matches!(
+                part.part,
+                Part::ProviderOpaque {
+                    api_kind: ApiKind::ChatGptSubscription,
+                    ..
+                }
+            )
+        }) {
+            DecodeStatus::DecodedWithUnknowns
+        } else {
+            DecodeStatus::Decoded
+        };
+
+        DecodedProviderPayload {
+            status,
+            turns: vec![DecodedTurn {
+                turn: Turn {
+                    id: derived_message_id(self.input.provider_payload_id.as_str(), "subscription"),
+                    run_id: self.input.run_id.clone(),
+                    seq: 0,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta {
+                        model_provider: self.input.provider_id.clone(),
+                        model_id: self.model_id,
+                        api_kind: Some(ApiKind::ChatGptSubscription),
+                        finish_reason: self.finish_reason,
+                        usage: self.usage,
+                        parent_id: None,
+                    },
+                    created_at: self.input.created_at,
+                },
+                parts: self.parts,
+            }],
+        }
+    }
+
+    fn push_text_part(&mut self, text: String, provider_json_pointer: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.parts.push(DecodedPart {
+            part: Part::Text {
+                text,
+                synthetic: None,
+            },
+            provider_payload_id: self.input.provider_payload_id.clone(),
+            provider_json_pointer,
+        });
+    }
+
+    fn push_subscription_opaque_part(
+        &mut self,
+        kind: String,
+        raw_payload: RawJson,
+        provider_json_pointer: String,
+    ) {
+        self.parts.push(DecodedPart {
+            part: Part::ProviderOpaque {
+                api_kind: ApiKind::ChatGptSubscription,
+                kind,
+                raw_artifact_id: self.input.raw_artifact_id.clone(),
+                raw_payload: Some(raw_payload),
+            },
+            provider_payload_id: self.input.provider_payload_id.clone(),
+            provider_json_pointer,
+        });
+    }
+
+    fn event_pointer(&self, index: usize, suffix: &str) -> String {
+        if self.pointer_prefix.is_empty() {
+            format!("/{index}{suffix}")
+        } else {
+            format!("{}/{index}{suffix}", self.pointer_prefix)
+        }
+    }
+}
+
+fn text_event_key(event: &Value) -> (u64, u64) {
+    (output_index(event), content_index(event))
+}
+
+fn output_index(event: &Value) -> u64 {
+    event
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn content_index(event: &Value) -> u64 {
+    event
+        .get("content_index")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn encrypted_reasoning_field(item: &Value) -> Option<(&'static str, &str)> {
+    [
+        "encrypted_content",
+        "encrypted_reasoning",
+        "encrypted_reasoning_content",
+    ]
+    .into_iter()
+    .find_map(|field| {
+        item.get(field)
+            .and_then(Value::as_str)
+            .map(|text| (field, text))
+    })
+}
+
+fn parse_subscription_tool_arguments(arguments: &str) -> Result<Value, DecodeError> {
+    if arguments.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    parse_tool_arguments(arguments)
+}
+
+fn decode_subscription_usage(value: Option<&Value>) -> Option<TokenUsage> {
+    let usage = value?;
+    Some(TokenUsage {
+        input: optional_u64_alias(usage, &["input_tokens", "prompt_tokens"]),
+        output: optional_u64_alias(usage, &["output_tokens", "completion_tokens"]),
+        reasoning: nested_optional_u64_alias(
+            usage,
+            &["output_tokens_details", "completion_tokens_details"],
+            "reasoning_tokens",
+        ),
+        cache_read: nested_optional_u64_alias(
+            usage,
+            &["input_tokens_details", "prompt_tokens_details"],
+            "cached_tokens",
+        ),
+        cache_write: 0,
+    })
+}
+
+fn optional_u64_alias(value: &Value, fields: &[&str]) -> u64 {
+    fields
+        .iter()
+        .find_map(|field| value.get(field).and_then(Value::as_u64))
+        .unwrap_or_default()
+}
+
+fn nested_optional_u64_alias(value: &Value, object_fields: &[&str], number_field: &str) -> u64 {
+    object_fields
+        .iter()
+        .find_map(|object_field| {
+            value
+                .get(object_field)
+                .and_then(|nested| nested.get(number_field))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or_default()
 }
 
 fn decode_choice(
