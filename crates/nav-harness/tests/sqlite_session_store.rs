@@ -2,8 +2,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use nav_harness::models::{
-    DecodedPart, DecodedProviderPayload, DecodedTurn, Decoder, OpenAiChatCompletionsDecodeInput,
-    OpenAiChatCompletionsDecoder,
+    ApiKind, DecodedPart, DecodedProviderPayload, DecodedTurn, Decoder,
+    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
 };
 use nav_harness::sessions::{
     CreateSession, DecodeStatus, NewProviderPayload, Part, ProviderPayloadDirection, ProviderState,
@@ -820,6 +820,7 @@ fn sessions_can_be_created_read_and_settings_updated() {
             SessionSettings {
                 settings_json: r#"{"model":"new"}"#.to_string(),
                 updated_at: 1_500,
+                api_kind: None,
             },
         )
         .expect("settings update should commit");
@@ -830,6 +831,94 @@ fn sessions_can_be_created_read_and_settings_updated() {
     assert_eq!(updated.settings_json, r#"{"model":"new"}"#);
     assert_eq!(updated.created_at, 1_000);
     assert_eq!(updated.updated_at, 1_500);
+}
+
+#[test]
+fn update_session_settings_invalidates_provider_state_when_api_kind_changes() {
+    let db = TempDb::new("settings-invalidate-provider-state");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-0000000005a0");
+    let run_id = run_id("019e7000-0000-7000-8000-0000000005a1");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    store
+        .set_provider_state(provider_state(run_id.clone(), "resp_cached"))
+        .expect("provider_state should persist");
+
+    store
+        .update_session_settings(
+            &session_id,
+            SessionSettings {
+                settings_json: r#"{"model":"claude"}"#.to_string(),
+                updated_at: 1_500,
+                api_kind: Some(ApiKind::AnthropicMessages),
+            },
+        )
+        .expect("settings update should commit");
+
+    assert_eq!(count_provider_state(&store), 0);
+    assert!(
+        store
+            .get_provider_state(&run_id)
+            .expect("provider_state read should succeed")
+            .is_none()
+    );
+}
+
+#[test]
+fn update_session_settings_keeps_provider_state_when_api_kind_unchanged() {
+    let db = TempDb::new("settings-keep-provider-state");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-0000000005a2");
+    let run_id = run_id("019e7000-0000-7000-8000-0000000005a3");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    store
+        .set_provider_state(provider_state(run_id.clone(), "resp_cached"))
+        .expect("provider_state should persist");
+
+    store
+        .update_session_settings(
+            &session_id,
+            SessionSettings {
+                settings_json: r#"{"model":"o3"}"#.to_string(),
+                updated_at: 1_500,
+                // `provider_state` helper stores the underscored alias; the
+                // dashed canonical `ApiKind` must compare equal to it.
+                api_kind: Some(ApiKind::OpenAiResponses),
+            },
+        )
+        .expect("settings update should commit");
+
+    assert_eq!(count_provider_state(&store), 1);
+    let kept = store
+        .get_provider_state(&run_id)
+        .expect("provider_state read should succeed")
+        .expect("matching provider_state should survive");
+    assert_eq!(kept.state_json, r#"{"previous_response_id":"resp_cached"}"#);
+}
+
+#[test]
+fn update_session_settings_without_api_kind_leaves_provider_state_intact() {
+    let db = TempDb::new("settings-no-api-kind");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-0000000005a4");
+    let run_id = run_id("019e7000-0000-7000-8000-0000000005a5");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    store
+        .set_provider_state(provider_state(run_id.clone(), "resp_cached"))
+        .expect("provider_state should persist");
+
+    store
+        .update_session_settings(
+            &session_id,
+            SessionSettings {
+                settings_json: r#"{"temperature":0.5}"#.to_string(),
+                updated_at: 1_500,
+                api_kind: None,
+            },
+        )
+        .expect("settings update should commit");
+
+    assert_eq!(count_provider_state(&store), 1);
 }
 
 #[test]

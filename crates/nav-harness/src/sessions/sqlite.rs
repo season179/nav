@@ -20,7 +20,7 @@ use nav_types::{
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
-use crate::models::{DecodedProviderPayload, DecodedTurn};
+use crate::models::{ApiKind, DecodedProviderPayload, DecodedTurn};
 
 use super::canonical::{Part, TokenUsage, Turn, TurnRole};
 use super::migrate;
@@ -185,6 +185,11 @@ pub struct CreateSession {
 pub struct SessionSettings {
     pub settings_json: String,
     pub updated_at: i64,
+    /// The `ApiKind` the new settings resolve to, when known. When it differs
+    /// from a stored `provider_state` row's dialect, that cached provider
+    /// continuation is invalidated so a mid-session model swap cannot replay a
+    /// stale `previous_response_id` (or similar) into a different provider.
+    pub api_kind: Option<ApiKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -839,14 +844,18 @@ impl SqliteSessionStore {
         settings: SessionSettings,
     ) -> Result<(), SqliteStoreError> {
         let changed = self.execute_write(|tx| {
-            tx.execute(
+            let changed = tx.execute(
                 "UPDATE sessions SET settings_json = ?1, updated_at = ?2 WHERE id = ?3",
                 params![
                     settings.settings_json.as_str(),
                     settings.updated_at,
                     session_id.as_str()
                 ],
-            )
+            )?;
+            if let Some(api_kind) = settings.api_kind {
+                invalidate_stale_provider_state(tx, session_id, api_kind)?;
+            }
+            Ok(changed)
         })?;
         ensure_row_changed(changed, "session", session_id.as_str())
     }
@@ -1864,6 +1873,46 @@ fn read_existing_part_row(row: &Row<'_>) -> rusqlite::Result<ExistingPart> {
         session_id: row.get("session_id")?,
         part: parse_json(&data_json)?,
     })
+}
+
+/// Drop cached provider continuations for `session_id` whose dialect no longer
+/// matches `api_kind`. A `provider_state` row whose stored `api_kind` is
+/// unrecognized is also dropped: it cannot be safely reused under a known
+/// dialect. Canonical turns are untouched — only the optional cache is cleared.
+fn invalidate_stale_provider_state(
+    tx: &Transaction,
+    session_id: &SessionId,
+    api_kind: ApiKind,
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare(
+        r#"
+        SELECT provider_state.run_id, provider_state.api_kind
+        FROM provider_state
+        JOIN runs ON runs.id = provider_state.run_id
+        WHERE runs.session_id = ?1
+        "#,
+    )?;
+    let cached: Vec<(String, String)> = stmt
+        .query_map([session_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    for (run_id, stored_api_kind) in cached {
+        if parse_api_kind(&stored_api_kind) != Some(api_kind) {
+            tx.execute(
+                "DELETE FROM provider_state WHERE run_id = ?1",
+                [run_id.as_str()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse a stored `provider_state.api_kind` string into [`ApiKind`], honoring
+/// the dashed and underscored aliases the serde enum accepts. Returns `None`
+/// for any value the current build does not recognize.
+fn parse_api_kind(raw: &str) -> Option<ApiKind> {
+    serde_json::from_value(serde_json::Value::String(raw.to_string())).ok()
 }
 
 fn set_provider_state_in_tx(tx: &Transaction, state: &ProviderState) -> rusqlite::Result<()> {
