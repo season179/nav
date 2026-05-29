@@ -1080,10 +1080,12 @@ fn stored_tool_call_arguments(arguments: Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::canonical::ImageSource;
     use super::super::sqlite::{
-        ArtifactKind, NewArtifact, NewProviderPayload, ProviderPayloadDirection,
+        ArtifactKind, NewArtifact, NewProviderPayload, ProviderPayloadDirection, StoredPart,
     };
     use super::*;
+    use nav_types::ArtifactId;
 
     struct TempDataDir {
         path: PathBuf,
@@ -1629,6 +1631,107 @@ mod tests {
         assert!(raw_after[0].1[0].compacted_at.is_some());
         assert_eq!(raw_artifact_id.as_ref(), Some(&artifact_id));
         assert_eq!(artifact_bytes, full_output);
+    }
+
+    #[test]
+    fn replay_strips_old_images_but_keeps_their_bytes_on_disk() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        // Three image-bearing user turns; only the most recent should survive
+        // in the replay projection, but every artifact stays readable on disk.
+        let image_bytes: [&[u8]; 3] = [b"oldest png", b"middle png", b"newest png bytes"];
+        let mut artifact_ids = Vec::new();
+        for (seq, bytes) in image_bytes.iter().enumerate() {
+            let artifact_id = store
+                .sqlite
+                .put_artifact(
+                    NewArtifact {
+                        session_id: session_id.clone(),
+                        part_id: None,
+                        kind: ArtifactKind::Media,
+                        mime: "image/png".to_string(),
+                        created_at: 1_000 + seq as i64,
+                    },
+                    bytes,
+                )
+                .unwrap();
+            store
+                .sqlite
+                .append_turn(
+                    Turn {
+                        id: new_message_id(),
+                        run_id: run_id.clone(),
+                        seq: seq as u32,
+                        role: TurnRole::User,
+                        meta: TurnMeta::default(),
+                        created_at: 2_000 + seq as i64,
+                    },
+                    vec![Part::Image {
+                        mime: "image/png".to_string(),
+                        source: ImageSource::FileRef {
+                            artifact_id: artifact_id.clone(),
+                        },
+                    }],
+                )
+                .unwrap();
+            artifact_ids.push(artifact_id);
+        }
+
+        let stored = store.sqlite.list_turns_for_run(&run_id).unwrap();
+        // Project with the production tail so the test reflects the real
+        // replay path rather than a tail-disabled special case.
+        let projected = project_for_replay(&stored, DEFAULT_TAIL_TURNS);
+
+        // Older two turns lose their image bytes to the placeholder.
+        let stripped = Part::Text {
+            text: "[Attached image — stripped after compression]".to_string(),
+            synthetic: Some(true),
+        };
+        assert_eq!(projected[0].1, vec![stripped.clone()]);
+        assert_eq!(projected[1].1, vec![stripped]);
+        // The most recent image is preserved verbatim.
+        assert_eq!(
+            projected[2].1,
+            vec![Part::Image {
+                mime: "image/png".to_string(),
+                source: ImageSource::FileRef {
+                    artifact_id: artifact_ids[2].clone(),
+                },
+            }]
+        );
+
+        // Every image — including the stripped older ones — is still on disk,
+        // followed through the FileRef persisted on each stored turn rather
+        // than the setup-time ids, so a broken FileRef would be caught here.
+        for ((_, parts), expected) in stored.iter().zip(image_bytes.iter()) {
+            let artifact_id = stored_image_artifact_id(parts);
+            assert_eq!(read_artifact_bytes(&store, &artifact_id), *expected);
+        }
+    }
+
+    fn stored_image_artifact_id(parts: &[StoredPart]) -> ArtifactId {
+        parts
+            .iter()
+            .find_map(|part| match &part.part {
+                Part::Image {
+                    source: ImageSource::FileRef { artifact_id },
+                    ..
+                } => Some(artifact_id.clone()),
+                _ => None,
+            })
+            .expect("stored turn should retain its image FileRef")
+    }
+
+    fn read_artifact_bytes(store: &SessionStore, artifact_id: &ArtifactId) -> Vec<u8> {
+        let mut artifact = store.sqlite.get_artifact(artifact_id).unwrap();
+        let mut bytes = Vec::new();
+        artifact.reader.read_to_end(&mut bytes).unwrap();
+        bytes
     }
 
     #[test]

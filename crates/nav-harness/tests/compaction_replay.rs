@@ -47,6 +47,37 @@ fn turn(role: TurnRole, seq: u32, parts: Vec<StoredPart>) -> (Turn, Vec<StoredPa
     )
 }
 
+fn image_user_turn(
+    seq: u32,
+    caption: &str,
+    image_artifact_id: ArtifactId,
+) -> (Turn, Vec<StoredPart>) {
+    turn(
+        TurnRole::User,
+        seq,
+        vec![
+            stored_part(
+                part_id(u64::from(seq) * 2),
+                Part::Text {
+                    text: caption.to_string(),
+                    synthetic: None,
+                },
+                None,
+            ),
+            stored_part(
+                part_id(u64::from(seq) * 2 + 1),
+                Part::Image {
+                    mime: "image/png".to_string(),
+                    source: ImageSource::FileRef {
+                        artifact_id: image_artifact_id,
+                    },
+                },
+                None,
+            ),
+        ],
+    )
+}
+
 fn stored_part(id: PartId, part: Part, compacted_at: Option<i64>) -> StoredPart {
     StoredPart {
         id,
@@ -675,6 +706,77 @@ fn image_projection_strips_images_before_latest_image_bearing_user_turn() {
             },
         }]
     );
+}
+
+#[test]
+fn three_image_conversation_preserves_only_the_most_recent_image() {
+    let oldest_artifact_id = artifact_id(1);
+    let middle_artifact_id = artifact_id(2);
+    let newest_artifact_id = artifact_id(3);
+    let turns = vec![
+        image_user_turn(1, "first screenshot", oldest_artifact_id),
+        image_user_turn(2, "second screenshot", middle_artifact_id),
+        image_user_turn(3, "third screenshot", newest_artifact_id.clone()),
+    ];
+
+    // Use the production tail (DEFAULT_TAIL_TURNS) so the test proves image
+    // stripping is anchored on the latest image-bearing turn independently of
+    // the protected-tail boundary used for argument truncation.
+    let projected = project_for_replay(&turns, DEFAULT_TAIL_TURNS);
+
+    // Surrounding text survives in every turn; only the image part changes.
+    let stripped = Part::Text {
+        text: "[Attached image — stripped after compression]".to_string(),
+        synthetic: Some(true),
+    };
+    assert_eq!(
+        projected[0].1,
+        vec![
+            Part::Text {
+                text: "first screenshot".to_string(),
+                synthetic: None,
+            },
+            stripped.clone(),
+        ]
+    );
+    assert_eq!(
+        projected[1].1,
+        vec![
+            Part::Text {
+                text: "second screenshot".to_string(),
+                synthetic: None,
+            },
+            stripped,
+        ]
+    );
+    // Only the most recent image-bearing turn keeps its image bytes.
+    assert_eq!(
+        projected[2].1,
+        vec![
+            Part::Text {
+                text: "third screenshot".to_string(),
+                synthetic: None,
+            },
+            Part::Image {
+                mime: "image/png".to_string(),
+                source: ImageSource::FileRef {
+                    artifact_id: newest_artifact_id,
+                },
+            },
+        ]
+    );
+
+    // The Anthropic request carries exactly one image block.
+    let request = AnthropicMessagesEncoder::new()
+        .encode(&projected)
+        .expect("projected turns should encode");
+    let image_blocks = request
+        .messages
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .filter(|block| block["type"] == "image")
+        .count();
+    assert_eq!(image_blocks, 1, "only the most recent image should survive");
 }
 
 #[test]
