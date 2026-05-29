@@ -15,7 +15,8 @@ pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, Thinking
 pub use config::{ModelRef, ModelSettings};
 pub use decode::{
     DecodeError, DecodedPart, DecodedProviderPayload, DecodedTurn, Decoder,
-    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
+    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput,
+    OpenAiResponsesDecoder,
 };
 pub use encode::{Encoder, OpenAiChatCompletionsEncoder};
 pub use model::{ModelConfig, ModelInput};
