@@ -52,6 +52,19 @@ cargo run --quiet --manifest-path Cargo.toml -p nav-backend -- serve-http
 
 Set `NAV_BACKEND=/path/to/nav-backend` to point the TUI at a prebuilt backend.
 
+### Session storage
+
+`nav-backend serve-http` stores sessions in `~/.nav/nav.db` by default. Override
+the data directory with either:
+
+```sh
+nav-backend serve-http --data-dir /path/to/nav-data
+NAV_DATA_DIR=/path/to/nav-data nav-backend serve-http
+```
+
+When the directory is created on Unix, nav uses `0700` for the directory and
+`0600` for the initial `nav.db` file.
+
 ### Model configuration
 
 `nav-backend serve-http` reads model settings before handling TUI prompts:

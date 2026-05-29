@@ -92,8 +92,10 @@ Responses exactly.
 crate as used elsewhere. SQL stays in `nav-harness`; `nav-server` opens the DB
 path or receives a `SessionStore` handle.
 
-**Database file:** `{data_dir}/nav.db` (e.g. `~/.nav/nav.db` or workspace
-`.nav/nav.db`). On open:
+**Database file:** `{data_dir}/nav.db`. `nav-backend serve-http` resolves
+`data_dir` as `--data-dir`, then `NAV_DATA_DIR`, then the default `~/.nav`.
+On first run it creates the directory and `nav.db`; Unix permissions are `0700`
+for the directory and `0600` for the initial database file. On open:
 
 ```sql
 PRAGMA journal_mode = WAL;
@@ -889,7 +891,6 @@ Storage work is not complete until these cases pass with fixtures:
 
 ## Open questions
 
-- Default `data_dir` resolution: global vs per-workspace DB.
 - Whether `list_turns_for_session` spans all runs or only the active run for UI.
 - Retention policy for old runs/artifacts (not required for v1).
 - How long to keep provider payload artifacts after successful re-decode
