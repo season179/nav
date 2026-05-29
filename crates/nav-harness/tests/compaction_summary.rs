@@ -12,7 +12,7 @@ use nav_harness::compaction::summary::{
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelRef, ModelResolver, ModelSettings, ProviderConfig,
 };
-use nav_harness::sessions::{CompactionConfig, ModelTurn, SessionStore};
+use nav_harness::sessions::{CompactionConfig, ModelTurn, SessionStore, ToolCall};
 use nav_types::{MessageId, RunId, SessionId};
 
 #[test]
@@ -47,6 +47,9 @@ fn summary_request_uses_structured_template_for_realistic_conversation() {
         "## Constraints & Preferences",
         "## Completed Actions",
         "## Active State",
+        "## Files",
+        "### Read",
+        "### Modified",
         "## In Progress",
         "## Blocked",
         "## Key Decisions",
@@ -60,6 +63,228 @@ fn summary_request_uses_structured_template_for_realistic_conversation() {
     assert!(prompt.contains("Work on issue #362 using TDD."));
     assert!(prompt.contains("I added the first failing test."));
     assert!(prompt.contains("Write every section with concrete, non-empty content."));
+}
+
+#[test]
+fn summary_prompt_includes_files_read_from_tool_calls() {
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: None,
+        head_turns: vec![
+            ModelTurn::user_text("Read the config file."),
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "tc1".to_string(),
+                tool_call_id: None,
+                name: "read".to_string(),
+                arguments: "{\"path\":\"src/config.rs\"}".to_string(),
+            }]),
+            ModelTurn::tool_result("tc1", "fn main() {}"),
+        ],
+        tail_start_id: None,
+    };
+    let request = build_compaction_summary_request(&summary_request);
+    let prompt = request.messages[1]
+        .content
+        .as_ref()
+        .expect("user prompt should have content")
+        .as_str()
+        .expect("user prompt content should be text");
+
+    let cumulative_read = extract_cumulative_section(prompt, "Read")
+        .expect("prompt should have cumulative Read section");
+    assert!(
+        cumulative_read.contains("src/config.rs"),
+        "cumulative Read should list src/config.rs but was:\n{cumulative_read}"
+    );
+}
+
+#[test]
+fn summary_prompt_includes_files_written_from_tool_calls() {
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: None,
+        head_turns: vec![
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "tc1".to_string(),
+                tool_call_id: None,
+                name: "write".to_string(),
+                arguments: "{\"path\":\"src/lib.rs\",\"content\":\"fn main() {}\"}".to_string(),
+            }]),
+            ModelTurn::tool_result("tc1", "written"),
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "tc2".to_string(),
+                tool_call_id: None,
+                name: "edit".to_string(),
+                arguments: "{\"path\":\"src/config.rs\",\"old\":\"a\",\"new\":\"b\"}".to_string(),
+            }]),
+            ModelTurn::tool_result("tc2", "edited"),
+        ],
+        tail_start_id: None,
+    };
+    let request = build_compaction_summary_request(&summary_request);
+    let prompt = request.messages[1]
+        .content
+        .as_ref()
+        .expect("user prompt should have content")
+        .as_str()
+        .expect("user prompt content should be text");
+
+    let cumulative_modified = extract_cumulative_section(prompt, "Modified")
+        .expect("prompt should have cumulative Modified section");
+    assert!(
+        cumulative_modified.contains("src/lib.rs"),
+        "cumulative Modified should list src/lib.rs but was:\n{cumulative_modified}"
+    );
+    assert!(
+        cumulative_modified.contains("src/config.rs"),
+        "cumulative Modified should list src/config.rs but was:\n{cumulative_modified}"
+    );
+}
+
+#[test]
+fn summary_prompt_merges_previous_files_with_new_files() {
+    let previous_summary = r#"## Files
+### Read
+src/old.rs
+
+### Modified
+src/lib.rs"#;
+
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: Some(previous_summary.to_string()),
+        head_turns: vec![
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "tc1".to_string(),
+                tool_call_id: None,
+                name: "read".to_string(),
+                arguments: "{\"path\":\"src/new.rs\"}".to_string(),
+            }]),
+            ModelTurn::tool_result("tc1", "content"),
+        ],
+        tail_start_id: None,
+    };
+    let request = build_compaction_summary_request(&summary_request);
+    let prompt = request.messages[1]
+        .content
+        .as_ref()
+        .expect("user prompt should have content")
+        .as_str()
+        .expect("user prompt content should be text");
+
+    let cumulative_read = extract_cumulative_section(prompt, "Read")
+        .expect("prompt should have cumulative Read section");
+    assert!(
+        cumulative_read.contains("src/old.rs"),
+        "cumulative Read should carry forward src/old.rs but was:\n{cumulative_read}"
+    );
+    assert!(
+        cumulative_read.contains("src/new.rs"),
+        "cumulative Read should include new src/new.rs but was:\n{cumulative_read}"
+    );
+
+    let cumulative_modified = extract_cumulative_section(prompt, "Modified")
+        .expect("prompt should have cumulative Modified section");
+    assert!(
+        cumulative_modified.contains("src/lib.rs"),
+        "cumulative Modified should carry forward src/lib.rs but was:\n{cumulative_modified}"
+    );
+}
+
+#[test]
+fn summary_prompt_shows_none_when_previous_summary_has_no_files_section() {
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: Some(summary_a()),
+        head_turns: vec![ModelTurn::user_text("do something")],
+        tail_start_id: None,
+    };
+    let request = build_compaction_summary_request(&summary_request);
+    let prompt = request.messages[1]
+        .content
+        .as_ref()
+        .expect("user prompt should have content")
+        .as_str()
+        .expect("user prompt content should be text");
+
+    let cumulative_read = extract_cumulative_section(prompt, "Read")
+        .expect("prompt should have cumulative Read section");
+    assert_eq!(
+        cumulative_read, "None",
+        "cumulative Read should be None when previous summary has no Files section"
+    );
+    let cumulative_modified = extract_cumulative_section(prompt, "Modified")
+        .expect("prompt should have cumulative Modified section");
+    assert_eq!(
+        cumulative_modified, "None",
+        "cumulative Modified should be None when previous summary has no Files section"
+    );
+}
+
+#[test]
+fn summary_prompt_does_not_duplicate_files_from_previous_summary() {
+    let previous_summary = r#"## Files
+### Read
+src/config.rs
+
+### Modified
+src/lib.rs"#;
+
+    // Same file appears in both previous summary and new tool calls
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: Some(previous_summary.to_string()),
+        head_turns: vec![
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "tc1".to_string(),
+                tool_call_id: None,
+                name: "read".to_string(),
+                arguments: "{\"path\":\"src/config.rs\"}".to_string(),
+            }]),
+            ModelTurn::tool_result("tc1", "content"),
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "tc2".to_string(),
+                tool_call_id: None,
+                name: "write".to_string(),
+                arguments: "{\"path\":\"src/lib.rs\",\"content\":\"x\"}".to_string(),
+            }]),
+            ModelTurn::tool_result("tc2", "written"),
+        ],
+        tail_start_id: None,
+    };
+    let request = build_compaction_summary_request(&summary_request);
+    let prompt = request.messages[1]
+        .content
+        .as_ref()
+        .expect("user prompt should have content")
+        .as_str()
+        .expect("user prompt content should be text");
+
+    let cumulative_read = extract_cumulative_section(prompt, "Read")
+        .expect("prompt should have cumulative Read section");
+    let read_count = cumulative_read.matches("src/config.rs").count();
+    assert_eq!(
+        read_count, 1,
+        "src/config.rs should appear once in cumulative Read but appeared {read_count} times:\n{cumulative_read}"
+    );
+
+    let cumulative_modified = extract_cumulative_section(prompt, "Modified")
+        .expect("prompt should have cumulative Modified section");
+    let modified_count = cumulative_modified.matches("src/lib.rs").count();
+    assert_eq!(
+        modified_count, 1,
+        "src/lib.rs should appear once in cumulative Modified but appeared {modified_count} times:\n{cumulative_modified}"
+    );
+}
+
+/// Extract the content under `### {name}` in the "Cumulative file tracking" section,
+/// skipping the template's placeholder version that comes earlier in the prompt.
+fn extract_cumulative_section<'a>(prompt: &'a str, name: &str) -> Option<&'a str> {
+    let marker = "Cumulative file tracking";
+    let tracking_start = prompt.find(marker)?;
+    let tracking = &prompt[tracking_start..];
+    let heading = format!("### {name}");
+    let heading_start = tracking.find(&heading)?;
+    let after_heading = &tracking[heading_start + heading.len()..];
+    let end = after_heading
+        .find("\n##")
+        .unwrap_or(after_heading.len());
+    Some(after_heading[..end].trim())
 }
 
 #[test]
