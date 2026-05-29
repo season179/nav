@@ -4,6 +4,12 @@ pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 pub const MAX_LINES: usize = 2000;
 pub const TRUNCATED_MARKER: &str = "... [truncated]";
 
+/// Per-tool char caps for model-visible output.
+///
+/// Counts Unicode scalar values (`.chars().count()`), not grapheme clusters.
+pub const READ_MAX_CHARS: usize = 4000;
+pub const BASH_MAX_CHARS: usize = 5000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncationStrategy {
     Head,
@@ -15,12 +21,14 @@ pub enum TruncationStrategy {
 pub enum TruncationLimit {
     Bytes,
     Lines,
+    Chars,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TruncationOptions {
     pub max_bytes: usize,
     pub max_lines: usize,
+    pub max_chars: usize,
     pub strategy: TruncationStrategy,
 }
 
@@ -29,6 +37,7 @@ impl Default for TruncationOptions {
         Self {
             max_bytes: DEFAULT_MAX_BYTES,
             max_lines: MAX_LINES,
+            max_chars: usize::MAX,
             strategy: TruncationStrategy::Head,
         }
     }
@@ -128,6 +137,7 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncatedOutp
 
     let mut output_lines = Vec::new();
     let mut output_bytes = 0;
+    let mut output_chars = 0;
     let mut truncated_by = TruncationLimit::Lines;
 
     for (index, line) in content.split('\n').enumerate() {
@@ -136,13 +146,22 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncatedOutp
         }
 
         let line_bytes = line.len() + usize::from(index > 0);
+        let line_chars = line.chars().count() + usize::from(index > 0);
         if output_bytes + line_bytes > options.max_bytes {
             truncated_by = TruncationLimit::Bytes;
+            break;
+        }
+        if output_chars + line_chars > options.max_chars {
+            truncated_by = TruncationLimit::Chars;
+            if output_lines.is_empty() {
+                output_lines.push(take_char_head(line, options.max_chars));
+            }
             break;
         }
 
         output_lines.push(line);
         output_bytes += line_bytes;
+        output_chars += line_chars;
     }
 
     let output = output_lines.join("\n");
@@ -163,6 +182,7 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncatedOutp
     let mut lines = split_lines_for_tail(content);
     let mut output_lines = Vec::new();
     let mut output_bytes = 0;
+    let mut output_chars = 0;
     let mut truncated_by = TruncationLimit::Lines;
 
     while let Some(line) = lines.pop() {
@@ -171,6 +191,7 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncatedOutp
         }
 
         let line_bytes = line.len() + usize::from(!output_lines.is_empty());
+        let line_chars = line.chars().count() + usize::from(!output_lines.is_empty());
         if output_bytes + line_bytes > options.max_bytes {
             truncated_by = TruncationLimit::Bytes;
             if output_lines.is_empty() {
@@ -178,9 +199,17 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncatedOutp
             }
             break;
         }
+        if output_chars + line_chars > options.max_chars {
+            truncated_by = TruncationLimit::Chars;
+            if output_lines.is_empty() {
+                output_lines.push(take_char_tail(line, options.max_chars).to_string());
+            }
+            break;
+        }
 
         output_lines.push(line.to_string());
         output_bytes += line_bytes;
+        output_chars += line_chars;
     }
 
     output_lines.reverse();
@@ -208,6 +237,7 @@ pub fn truncate_head_tail(content: &str, options: TruncationOptions) -> Truncate
         TruncationOptions {
             max_bytes: head_bytes,
             max_lines: head_lines,
+            max_chars: options.max_chars / 2,
             strategy: TruncationStrategy::Head,
         },
     )
@@ -217,12 +247,15 @@ pub fn truncate_head_tail(content: &str, options: TruncationOptions) -> Truncate
         TruncationOptions {
             max_bytes: tail_bytes,
             max_lines: tail_lines,
+            max_chars: options.max_chars.saturating_sub(options.max_chars / 2),
             strategy: TruncationStrategy::Tail,
         },
     )
     .content();
     let truncated_by = if total.bytes > options.max_bytes {
         TruncationLimit::Bytes
+    } else if total.chars > options.max_chars {
+        TruncationLimit::Chars
     } else {
         TruncationLimit::Lines
     };
@@ -239,6 +272,7 @@ pub fn truncate_head_tail(content: &str, options: TruncationOptions) -> Truncate
 struct ContentStats {
     lines: usize,
     bytes: usize,
+    chars: usize,
 }
 
 impl ContentStats {
@@ -246,11 +280,14 @@ impl ContentStats {
         Self {
             lines: count_lines(content),
             bytes: content.len(),
+            chars: content.chars().count(),
         }
     }
 
     fn within(self, options: TruncationOptions) -> bool {
-        self.lines <= options.max_lines && self.bytes <= options.max_bytes
+        self.lines <= options.max_lines
+            && self.bytes <= options.max_bytes
+            && self.chars <= options.max_chars
     }
 }
 
@@ -320,6 +357,32 @@ fn take_utf8_tail(content: &str, max_bytes: usize) -> &str {
     &content[start..]
 }
 
+fn take_char_head(content: &str, max_chars: usize) -> &str {
+    if content.chars().count() <= max_chars {
+        return content;
+    }
+
+    let end = content
+        .char_indices()
+        .nth(max_chars)
+        .map_or(content.len(), |(i, _)| i);
+    &content[..end]
+}
+
+fn take_char_tail(content: &str, max_chars: usize) -> &str {
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
+        return content;
+    }
+
+    let skip = total_chars - max_chars;
+    let start = content
+        .char_indices()
+        .nth(skip)
+        .map_or(content.len(), |(i, _)| i);
+    &content[start..]
+}
+
 fn append_marker(content: &str) -> String {
     if content.is_empty() {
         TRUNCATED_MARKER.to_string()
@@ -353,6 +416,69 @@ mod tests {
     };
 
     #[test]
+    fn truncates_head_output_at_char_limit() {
+        let content = "aaaa\nbbbb\ncccc\ndddd";
+        let output = truncate_output(
+            content,
+            TruncationOptions {
+                max_bytes: 1000,
+                max_lines: 10,
+                max_chars: 10,
+                strategy: TruncationStrategy::Head,
+            },
+        );
+
+        // "aaaa" (4) + "\n" (1) + "bbbb" (4) = 9 chars; next line would make 14
+        assert_eq!(output.content(), "aaaa\nbbbb");
+        assert!(output.truncated());
+        assert_eq!(output.truncated_by(), Some(TruncationLimit::Chars));
+    }
+
+    #[test]
+    fn char_limit_falls_back_to_partial_line_for_head() {
+        let content = "abcdefghij\nsecond line";
+        let output = truncate_output(
+            content,
+            TruncationOptions {
+                max_bytes: 1000,
+                max_lines: 10,
+                max_chars: 5,
+                strategy: TruncationStrategy::Head,
+            },
+        );
+
+        // First line alone exceeds 5 chars — take char head of first line
+        assert_eq!(output.content(), "abcde");
+        assert!(output.truncated());
+        assert_eq!(output.truncated_by(), Some(TruncationLimit::Chars));
+    }
+
+    #[test]
+    fn char_limit_falls_back_to_partial_line_for_tail() {
+        let content = "first line\nabcdefghij";
+        let output = truncate_output(
+            content,
+            TruncationOptions {
+                max_bytes: 1000,
+                max_lines: 10,
+                max_chars: 5,
+                strategy: TruncationStrategy::Tail,
+            },
+        );
+
+        // Last line alone exceeds 5 chars — take char tail of last line
+        assert_eq!(output.content(), "fghij");
+        assert!(output.truncated());
+        assert_eq!(output.truncated_by(), Some(TruncationLimit::Chars));
+    }
+
+    #[test]
+    fn max_chars_defaults_to_no_limit() {
+        let options = TruncationOptions::default();
+        assert_eq!(options.max_chars, usize::MAX);
+    }
+
+    #[test]
     fn exposes_pi_default_limits() {
         assert_eq!(DEFAULT_MAX_BYTES, 50 * 1024);
         assert_eq!(MAX_LINES, 2000);
@@ -369,6 +495,7 @@ mod tests {
             TruncationOptions {
                 max_bytes: 100,
                 max_lines: 10,
+                max_chars: usize::MAX,
                 strategy: TruncationStrategy::Head,
             },
         );
@@ -385,6 +512,7 @@ mod tests {
             TruncationOptions {
                 max_bytes: 4,
                 max_lines: 10,
+                max_chars: usize::MAX,
                 strategy: TruncationStrategy::Head,
             },
         );
@@ -402,6 +530,7 @@ mod tests {
             TruncationOptions {
                 max_bytes: 100,
                 max_lines: 2,
+                max_chars: usize::MAX,
                 strategy: TruncationStrategy::Head,
             },
         );
@@ -419,6 +548,7 @@ mod tests {
             TruncationOptions {
                 max_bytes: 100,
                 max_lines: 1,
+                max_chars: usize::MAX,
                 strategy: TruncationStrategy::Tail,
             },
         );
@@ -434,6 +564,7 @@ mod tests {
             TruncationOptions {
                 max_bytes: 100,
                 max_lines: 4,
+                max_chars: usize::MAX,
                 strategy: TruncationStrategy::HeadTail,
             },
         );
@@ -454,6 +585,7 @@ mod tests {
             TruncationOptions {
                 max_bytes: 3,
                 max_lines: 10,
+                max_chars: usize::MAX,
                 strategy: TruncationStrategy::Head,
             },
         );

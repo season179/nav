@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::tools::truncation::{TruncationOptions, TruncationStrategy, truncate_output};
+use crate::tools::truncation::{TruncationOptions, TruncationStrategy, truncate_output, BASH_MAX_CHARS};
 use crate::workspace::shell::{
     ShellCommand, ShellOutputChunk, ShellTermination, run_shell_command_streaming_until,
 };
@@ -168,6 +168,7 @@ fn reject_unknown_arguments(object: &serde_json::Map<String, Value>) -> Result<(
 
 fn bash_truncation_options() -> TruncationOptions {
     TruncationOptions {
+        max_chars: BASH_MAX_CHARS,
         strategy: TruncationStrategy::Tail,
         ..TruncationOptions::default()
     }
@@ -346,6 +347,41 @@ mod tests {
         let full_output = fs::read_to_string(spill_path).expect("spill file should be readable");
         assert!(full_output.contains("line0001 abcdefghijklmnopqrstuvwxyz"));
         assert!(full_output.contains("line6000 abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[tokio::test]
+    async fn bash_tool_caps_output_at_bash_max_chars() {
+        let workspace = TestWorkspace::new("char_cap");
+        let context = ToolContext::with_path_policy(workspace.policy());
+
+        // Generate ~10KB of output — well over BASH_MAX_CHARS (5000)
+        let output = BashTool
+            .execute(
+                &context,
+                json!({
+                    "command": "for i in {1..200}; do printf '%0200d\n' \"$i\"; done"
+                }),
+                ToolCancellationToken::new(),
+            )
+            .await
+            .expect("large bash output should succeed");
+
+        // The visible output portion (before spill reference) should be capped
+        let visible = output
+            .content
+            .split("\nFull output:")
+            .next()
+            .unwrap_or(&output.content);
+        assert!(
+            visible.chars().count() <= crate::tools::truncation::BASH_MAX_CHARS + 30,
+            "bash visible output should be capped near BASH_MAX_CHARS, got {} chars",
+            visible.chars().count()
+        );
+        assert!(
+            output
+                .content
+                .contains(crate::tools::truncation::TRUNCATED_MARKER)
+        );
     }
 
     #[cfg(unix)]
