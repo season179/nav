@@ -710,7 +710,8 @@ fn model_turn_from_projected_turn((turn, parts): (Turn, Vec<Part>)) -> Option<Mo
 }
 
 fn model_turns_for_replay(turns: &[StoredTurn]) -> Vec<ModelTurn> {
-    project_for_replay(turns)
+    // TODO(#359): wire protected_tail_turns from session config once available
+    project_for_replay(turns, 0)
         .into_iter()
         .filter_map(model_turn_from_projected_turn)
         .collect()

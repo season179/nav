@@ -13,20 +13,32 @@ const DUPLICATE_TOOL_RESULT_CONTENT: &str = "[Duplicate — see more recent resu
 const STRIPPED_IMAGE_CONTENT: &str = "[Attached image — stripped after compression]";
 const MAX_ARGUMENT_STRING_CHARS: usize = 1024;
 
-pub fn project_for_replay(turns: &[StoredTurn]) -> Vec<(Turn, Vec<Part>)> {
+pub fn project_for_replay(
+    turns: &[StoredTurn],
+    protected_tail_turns: usize,
+) -> Vec<(Turn, Vec<Part>)> {
     let duplicate_tool_results = duplicate_tool_result_part_ids(turns);
     let latest_image_turn_index = latest_image_bearing_user_turn_index(turns);
+    let protected_indices = protected_tail_assistant_indices(turns, protected_tail_turns);
 
     turns
         .iter()
         .enumerate()
         .map(|(index, (turn, parts))| {
             let strip_images = latest_image_turn_index.is_some_and(|latest| index < latest);
+            let truncate_arguments = !protected_indices.contains(&index);
             (
                 turn.clone(),
                 parts
                     .iter()
-                    .map(|part| project_stored_part(part, &duplicate_tool_results, strip_images))
+                    .map(|part| {
+                        project_stored_part(
+                            part,
+                            &duplicate_tool_results,
+                            strip_images,
+                            truncate_arguments,
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )
         })
@@ -65,10 +77,23 @@ fn latest_image_bearing_user_turn_index(turns: &[StoredTurn]) -> Option<usize> {
     })
 }
 
+/// Returns the indices of the last `n` assistant turns (by turn index).
+fn protected_tail_assistant_indices(turns: &[StoredTurn], n: usize) -> HashSet<usize> {
+    turns
+        .iter()
+        .enumerate()
+        .filter(|(_, (turn, _))| turn.role == TurnRole::Assistant)
+        .map(|(index, _)| index)
+        .rev()
+        .take(n)
+        .collect()
+}
+
 fn project_stored_part(
     part: &StoredPart,
     duplicate_tool_results: &HashSet<PartId>,
     strip_images: bool,
+    truncate_arguments: bool,
 ) -> Part {
     match &part.part {
         Part::ToolResult {
@@ -90,7 +115,11 @@ fn project_stored_part(
         } => Part::ToolCall {
             id: id.clone(),
             name: name.clone(),
-            arguments: truncate_argument_strings(arguments),
+            arguments: if truncate_arguments {
+                truncate_argument_strings(arguments)
+            } else {
+                arguments.clone()
+            },
             raw_arguments_artifact_id: raw_arguments_artifact_id.clone(),
         },
         Part::Image { .. } if strip_images => Part::Text {
@@ -144,10 +173,6 @@ fn truncate_argument_string(text: &str) -> String {
     }
 
     let marker_chars = TRUNCATED_MARKER.chars().count();
-    if marker_chars >= MAX_ARGUMENT_STRING_CHARS {
-        return TRUNCATED_MARKER.to_string();
-    }
-
     let mut truncated = text
         .chars()
         .take(MAX_ARGUMENT_STRING_CHARS - marker_chars)
