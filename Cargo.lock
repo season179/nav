@@ -486,6 +486,7 @@ dependencies = [
  "libc",
  "nav-types",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

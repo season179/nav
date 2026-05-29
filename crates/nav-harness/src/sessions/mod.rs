@@ -9,4 +9,5 @@ pub mod store;
 // Re-export everything so existing callers (`use nav_harness::sessions::*`) keep working.
 pub use canonical::*;
 pub use confirmations::*;
+pub use sqlite::*;
 pub use store::*;

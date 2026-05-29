@@ -76,6 +76,20 @@ CREATE TABLE IF NOT EXISTS turn_parts (
 
 CREATE INDEX IF NOT EXISTS idx_turn_parts_turn_id ON turn_parts(turn_id, id);
 CREATE INDEX IF NOT EXISTS idx_turn_parts_session_id ON turn_parts(session_id);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    id              TEXT PRIMARY KEY NOT NULL,
+    session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    part_id         TEXT REFERENCES turn_parts(id) ON DELETE SET NULL,
+    kind            TEXT NOT NULL,
+    mime            TEXT NOT NULL,
+    sha256          TEXT NOT NULL,
+    path            TEXT NOT NULL,
+    size_bytes      INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_sha256 ON artifacts(sha256);
 "#;
 
 struct TableSchema {
@@ -414,6 +428,55 @@ const TABLES: &[TableSchema] = &[
             ),
         ],
     },
+    TableSchema {
+        name: "artifacts",
+        columns: &[
+            column(
+                "id",
+                "id TEXT PRIMARY KEY NOT NULL",
+                "TEXT",
+                true,
+                None,
+                true,
+            ),
+            column(
+                "session_id",
+                "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "part_id",
+                "part_id TEXT REFERENCES turn_parts(id) ON DELETE SET NULL",
+                "TEXT",
+                false,
+                None,
+                false,
+            ),
+            column("kind", "kind TEXT NOT NULL", "TEXT", true, None, false),
+            column("mime", "mime TEXT NOT NULL", "TEXT", true, None, false),
+            column("sha256", "sha256 TEXT NOT NULL", "TEXT", true, None, false),
+            column("path", "path TEXT NOT NULL", "TEXT", true, None, false),
+            column(
+                "size_bytes",
+                "size_bytes INTEGER NOT NULL",
+                "INTEGER",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "created_at",
+                "created_at INTEGER NOT NULL",
+                "INTEGER",
+                true,
+                None,
+                false,
+            ),
+        ],
+    },
 ];
 
 const INDEXES: &[IndexSchema] = &[
@@ -436,6 +499,11 @@ const INDEXES: &[IndexSchema] = &[
         name: "idx_turn_parts_session_id",
         table: "turn_parts",
         sql: "CREATE INDEX idx_turn_parts_session_id ON turn_parts(session_id)",
+    },
+    IndexSchema {
+        name: "idx_artifacts_sha256",
+        table: "artifacts",
+        sql: "CREATE UNIQUE INDEX idx_artifacts_sha256 ON artifacts(sha256)",
     },
 ];
 

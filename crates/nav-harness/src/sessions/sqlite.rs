@@ -4,13 +4,17 @@
 //! layer: opening the connection with the agreed pragmas, falling back from
 //! WAL to a rollback journal on network filesystems, and serialising writes
 //! through `BEGIN IMMEDIATE` with jittered retry to avoid convoy effects.
-//! Schema and row persistence land in follow-up issues.
+//! Artifact blob persistence also lives here; canonical turn row persistence
+//! lands in follow-up issues.
 
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use nav_types::{ArtifactId, ArtifactRow, PartId, SessionId};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use super::migrate;
@@ -51,8 +55,47 @@ impl JournalMode {
 #[derive(Debug)]
 pub struct SqliteSessionStore {
     conn: Mutex<Connection>,
+    data_dir: PathBuf,
     journal_mode: JournalMode,
     writes: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    Media,
+    ToolInput,
+    ToolOutput,
+    Snapshot,
+    ProviderEnvelope,
+    Other,
+}
+
+impl ArtifactKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Media => "media",
+            Self::ToolInput => "tool_input",
+            Self::ToolOutput => "tool_output",
+            Self::Snapshot => "snapshot",
+            Self::ProviderEnvelope => "provider_envelope",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewArtifact {
+    pub session_id: SessionId,
+    pub part_id: Option<PartId>,
+    pub kind: ArtifactKind,
+    pub mime: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug)]
+pub struct Artifact {
+    pub row: ArtifactRow,
+    pub reader: File,
 }
 
 impl SqliteSessionStore {
@@ -85,6 +128,7 @@ impl SqliteSessionStore {
             .map_err(|err| SqliteStoreError::MigrationFailed(err.to_string()))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            data_dir: data_dir_for(path),
             journal_mode,
             writes: AtomicU64::new(0),
         })
@@ -98,6 +142,65 @@ impl SqliteSessionStore {
     /// Number of writes that have committed through [`Self::execute_write`].
     pub fn write_count(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
+    }
+
+    pub fn put_artifact(
+        &self,
+        artifact: NewArtifact,
+        bytes: &[u8],
+    ) -> Result<ArtifactId, SqliteStoreError> {
+        let sha256 = sha256_hex(bytes);
+        let relative_path = artifact_relative_path(&sha256);
+        self.write_blob_if_missing(&relative_path, &sha256, bytes)?;
+
+        let id = new_artifact_id();
+        self.execute_write(|tx| {
+            tx.execute(
+                "INSERT INTO artifacts (
+                    id, session_id, part_id, kind, mime, sha256, path, size_bytes, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(sha256) DO NOTHING",
+                rusqlite::params![
+                    id.as_str(),
+                    artifact.session_id.as_str(),
+                    artifact.part_id.as_ref().map(PartId::as_str),
+                    artifact.kind.as_str(),
+                    artifact.mime,
+                    sha256,
+                    relative_path,
+                    bytes.len() as i64,
+                    artifact.created_at,
+                ],
+            )?;
+
+            let stored_id = tx.query_row(
+                "SELECT id FROM artifacts WHERE sha256 = ?1",
+                [&sha256],
+                |row| row.get::<_, String>(0),
+            )?;
+            Ok(ArtifactId::new_unchecked(stored_id))
+        })
+    }
+
+    pub fn get_artifact(&self, id: &ArtifactId) -> Result<Artifact, SqliteStoreError> {
+        let row = self.read_artifact_row(id)?;
+        let path = self.data_dir.join(&row.path);
+        if !blob_matches(&path, &row.sha256, row.size_bytes)? {
+            return Err(SqliteStoreError::BlobReadFailed(format!(
+                "artifact blob {} at {} does not match stored sha256",
+                id,
+                path.display()
+            )));
+        }
+
+        let reader = File::open(&path).map_err(|err| {
+            SqliteStoreError::BlobReadFailed(format!(
+                "missing or unreadable artifact blob {} at {}: {err}",
+                id,
+                path.display()
+            ))
+        })?;
+        Ok(Artifact { row, reader })
     }
 
     /// Run `op` inside a `BEGIN IMMEDIATE` transaction, committing on success.
@@ -140,6 +243,63 @@ impl SqliteSessionStore {
             .lock()
             .expect("connection mutex poisoned")
             .execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+    }
+
+    fn read_artifact_row(&self, id: &ArtifactId) -> Result<ArtifactRow, SqliteStoreError> {
+        self.conn
+            .lock()
+            .expect("connection mutex poisoned")
+            .query_row(
+                "SELECT id, session_id, part_id, kind, mime, sha256, path, size_bytes, created_at
+                 FROM artifacts
+                 WHERE id = ?1",
+                [id.as_str()],
+                artifact_row_from_sql,
+            )
+            .map_err(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    SqliteStoreError::ArtifactNotFound(id.to_string())
+                }
+                other => SqliteStoreError::ReadFailed(other.to_string()),
+            })
+    }
+
+    fn write_blob_if_missing(
+        &self,
+        relative_path: &str,
+        sha256: &str,
+        bytes: &[u8],
+    ) -> Result<(), SqliteStoreError> {
+        let path = self.data_dir.join(relative_path);
+        if blob_matches(&path, sha256, bytes.len() as u64)? {
+            return Ok(());
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| SqliteStoreError::BlobWriteFailed(err.to_string()))?;
+        }
+
+        let temp_path = temp_blob_path(&path);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(mut file) => {
+                if let Err(err) = file.write_all(bytes) {
+                    let _ = fs::remove_file(&temp_path);
+                    return Err(SqliteStoreError::BlobWriteFailed(err.to_string()));
+                }
+
+                drop(file);
+                fs::rename(&temp_path, &path).map_err(|err| {
+                    let _ = fs::remove_file(&temp_path);
+                    SqliteStoreError::BlobWriteFailed(err.to_string())
+                })
+            }
+            Err(err) => Err(SqliteStoreError::BlobWriteFailed(err.to_string())),
+        }
     }
 
     /// Read an integer-valued pragma. Test-only diagnostic helper.
@@ -301,6 +461,120 @@ fn pragma_err(err: rusqlite::Error) -> SqliteStoreError {
     SqliteStoreError::PragmaFailed(err.to_string())
 }
 
+fn data_dir_for(db_path: &Path) -> PathBuf {
+    let data_dir = db_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf())
+}
+
+fn artifact_relative_path(sha256: &str) -> String {
+    format!("blobs/{}/{}", &sha256[..2], sha256)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    digest_hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut output = String::with_capacity(64);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn blob_matches(path: &Path, sha256: &str, size_bytes: u64) -> Result<bool, SqliteStoreError> {
+    let Ok(file) = File::open(path) else {
+        return Ok(false);
+    };
+
+    let metadata = file
+        .metadata()
+        .map_err(|err| SqliteStoreError::BlobReadFailed(err.to_string()))?;
+    if metadata.len() != size_bytes {
+        return Ok(false);
+    }
+
+    let digest = file_sha256_hex(file)?;
+    Ok(digest == sha256)
+}
+
+fn file_sha256_hex(mut file: File) -> Result<String, SqliteStoreError> {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0; 8192];
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|err| SqliteStoreError::BlobReadFailed(err.to_string()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        context.update(&buffer[..bytes_read]);
+    }
+    Ok(digest_hex(context.finish().as_ref()))
+}
+
+fn temp_blob_path(path: &Path) -> PathBuf {
+    static NEXT_TEMP_BLOB: AtomicU64 = AtomicU64::new(0);
+
+    let counter = NEXT_TEMP_BLOB.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("blob");
+    path.with_file_name(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        counter
+    ))
+}
+
+fn new_artifact_id() -> ArtifactId {
+    static NEXT_ARTIFACT_ID: AtomicU64 = AtomicU64::new(0);
+
+    let millis = unix_millis() as u64;
+    let counter = NEXT_ARTIFACT_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()))
+        .unwrap_or(0);
+    let entropy = (u64::from(std::process::id()) << 32) ^ counter ^ nanos;
+    ArtifactId::new_unchecked(format!("art_{millis:016x}_{entropy:016x}"))
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn artifact_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRow> {
+    let id: String = row.get(0)?;
+    let session_id: String = row.get(1)?;
+    let part_id: Option<String> = row.get(2)?;
+    let size_bytes: i64 = row.get(7)?;
+
+    Ok(ArtifactRow {
+        id: ArtifactId::new_unchecked(id),
+        session_id: SessionId::new_unchecked(session_id),
+        part_id: part_id.map(PartId::new_unchecked),
+        kind: row.get(3)?,
+        mime: row.get(4)?,
+        sha256: row.get(5)?,
+        path: row.get(6)?,
+        size_bytes: size_bytes as u64,
+        created_at: row.get(8)?,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SqliteStoreError {
     /// The database file could not be opened.
@@ -311,8 +585,16 @@ pub enum SqliteStoreError {
     Locking(String),
     /// A write transaction failed or exhausted its retry budget.
     WriteFailed(String),
+    /// A read query failed.
+    ReadFailed(String),
     /// Schema migration or reconciliation failed.
     MigrationFailed(String),
+    /// An artifact row was not found.
+    ArtifactNotFound(String),
+    /// Artifact bytes could not be written to disk.
+    BlobWriteFailed(String),
+    /// Artifact bytes could not be opened from disk.
+    BlobReadFailed(String),
 }
 
 impl std::fmt::Display for SqliteStoreError {
@@ -322,7 +604,11 @@ impl std::fmt::Display for SqliteStoreError {
             Self::PragmaFailed(msg) => write!(f, "pragma failed: {msg}"),
             Self::Locking(msg) => write!(f, "locking protocol error: {msg}"),
             Self::WriteFailed(msg) => write!(f, "write failed: {msg}"),
+            Self::ReadFailed(msg) => write!(f, "read failed: {msg}"),
             Self::MigrationFailed(msg) => write!(f, "migration failed: {msg}"),
+            Self::ArtifactNotFound(id) => write!(f, "artifact not found: {id}"),
+            Self::BlobWriteFailed(msg) => write!(f, "blob write failed: {msg}"),
+            Self::BlobReadFailed(msg) => write!(f, "blob read failed: {msg}"),
         }
     }
 }
@@ -332,6 +618,7 @@ impl std::error::Error for SqliteStoreError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     /// A unique temp database path that removes the file and its WAL sidecars
     /// (`-wal`, `-shm`) on drop — even if the test panics. Declare it before the
@@ -366,6 +653,245 @@ mod tests {
                 let _ = std::fs::remove_file(std::path::PathBuf::from(name));
             }
         }
+    }
+
+    struct TempDataDir {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDataDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "nav-sqlite-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            std::fs::create_dir(&path).expect("temp data dir should be created");
+            Self { path }
+        }
+
+        fn db_path(&self) -> std::path::PathBuf {
+            self.path.join("nav.db")
+        }
+    }
+
+    impl Drop for TempDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn insert_test_session(store: &SqliteSessionStore, session_id: &nav_types::SessionId) {
+        store
+            .execute_write(|tx| {
+                tx.execute(
+                    "INSERT INTO sessions (id, version, created_at, updated_at)
+                     VALUES (?1, 'test', 1, 1)",
+                    [session_id.as_str()],
+                )
+            })
+            .expect("session setup");
+    }
+
+    #[test]
+    fn relative_database_paths_capture_absolute_data_dir() {
+        let data_dir = data_dir_for(Path::new("nav.db"));
+
+        assert!(data_dir.is_absolute());
+        assert_eq!(
+            data_dir,
+            std::env::current_dir().expect("current dir should be readable")
+        );
+    }
+
+    #[test]
+    fn artifact_round_trip_returns_metadata_and_exact_bytes() {
+        let data_dir = TempDataDir::new("artifact-round-trip");
+        let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+        let session_id =
+            nav_types::SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000001");
+        insert_test_session(&store, &session_id);
+
+        let artifact_id = store
+            .put_artifact(
+                NewArtifact {
+                    session_id: session_id.clone(),
+                    part_id: None,
+                    kind: ArtifactKind::ToolOutput,
+                    mime: "text/plain".to_string(),
+                    created_at: 123,
+                },
+                b"hello artifact bytes",
+            )
+            .expect("put artifact");
+
+        let mut artifact = store
+            .get_artifact(&artifact_id)
+            .expect("artifact should be readable");
+        let mut bytes = Vec::new();
+        artifact
+            .reader
+            .read_to_end(&mut bytes)
+            .expect("artifact reader should stream bytes");
+
+        assert_eq!(artifact.row.id, artifact_id);
+        assert_eq!(artifact.row.session_id, session_id);
+        assert_eq!(artifact.row.kind, "tool_output");
+        assert_eq!(artifact.row.mime, "text/plain");
+        assert_eq!(artifact.row.size_bytes, 20);
+        assert_eq!(bytes, b"hello artifact bytes");
+    }
+
+    #[test]
+    fn duplicate_artifact_put_returns_existing_id() {
+        let data_dir = TempDataDir::new("artifact-dedup");
+        let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+        let session_id =
+            nav_types::SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000001");
+        insert_test_session(&store, &session_id);
+
+        let first_id = store
+            .put_artifact(
+                NewArtifact {
+                    session_id: session_id.clone(),
+                    part_id: None,
+                    kind: ArtifactKind::ToolOutput,
+                    mime: "text/plain".to_string(),
+                    created_at: 123,
+                },
+                b"same bytes",
+            )
+            .expect("first put");
+        let second_id = store
+            .put_artifact(
+                NewArtifact {
+                    session_id,
+                    part_id: None,
+                    kind: ArtifactKind::Other,
+                    mime: "application/octet-stream".to_string(),
+                    created_at: 124,
+                },
+                b"same bytes",
+            )
+            .expect("second put");
+
+        assert_eq!(second_id, first_id);
+    }
+
+    #[test]
+    fn missing_artifact_blob_is_a_hard_read_error() {
+        let data_dir = TempDataDir::new("artifact-missing-blob");
+        let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+        let session_id =
+            nav_types::SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000001");
+        insert_test_session(&store, &session_id);
+
+        let artifact_id = store
+            .put_artifact(
+                NewArtifact {
+                    session_id,
+                    part_id: None,
+                    kind: ArtifactKind::ToolOutput,
+                    mime: "text/plain".to_string(),
+                    created_at: 123,
+                },
+                b"bytes that should disappear",
+            )
+            .expect("put artifact");
+        let artifact = store
+            .get_artifact(&artifact_id)
+            .expect("artifact should be readable before deletion");
+        let blob_path = data_dir.path.join(&artifact.row.path);
+        drop(artifact);
+
+        std::fs::remove_file(blob_path).expect("blob should be removed");
+
+        let err = store
+            .get_artifact(&artifact_id)
+            .expect_err("missing blob must not read as empty bytes");
+        assert!(
+            err.to_string().contains("blob read failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn corrupt_artifact_blob_is_a_hard_read_error() {
+        let data_dir = TempDataDir::new("artifact-corrupt-read");
+        let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+        let session_id =
+            nav_types::SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000001");
+        insert_test_session(&store, &session_id);
+
+        let artifact_id = store
+            .put_artifact(
+                NewArtifact {
+                    session_id,
+                    part_id: None,
+                    kind: ArtifactKind::ToolOutput,
+                    mime: "text/plain".to_string(),
+                    created_at: 123,
+                },
+                b"original bytes",
+            )
+            .expect("put artifact");
+        let artifact = store
+            .get_artifact(&artifact_id)
+            .expect("artifact should be readable before corruption");
+        let blob_path = data_dir.path.join(&artifact.row.path);
+        drop(artifact);
+        std::fs::write(blob_path, b"corrupt bytes").expect("blob should be overwritten");
+
+        let err = store
+            .get_artifact(&artifact_id)
+            .expect_err("corrupt blob must not read as original bytes");
+        assert!(
+            err.to_string().contains("does not match stored sha256"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn put_artifact_repairs_corrupt_blob_at_sha256_path() {
+        let data_dir = TempDataDir::new("artifact-corrupt-blob");
+        let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+        let session_id =
+            nav_types::SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000001");
+        insert_test_session(&store, &session_id);
+        let bytes = b"correct artifact bytes";
+        let blob_path = data_dir
+            .path
+            .join(artifact_relative_path(&sha256_hex(bytes)));
+        std::fs::create_dir_all(blob_path.parent().expect("blob should have parent"))
+            .expect("blob parent should be created");
+        std::fs::write(&blob_path, b"stale partial bytes").expect("corrupt blob setup");
+
+        let artifact_id = store
+            .put_artifact(
+                NewArtifact {
+                    session_id,
+                    part_id: None,
+                    kind: ArtifactKind::ToolOutput,
+                    mime: "text/plain".to_string(),
+                    created_at: 123,
+                },
+                bytes,
+            )
+            .expect("put artifact should repair blob");
+
+        let mut artifact = store
+            .get_artifact(&artifact_id)
+            .expect("artifact should be readable");
+        let mut stored_bytes = Vec::new();
+        artifact
+            .reader
+            .read_to_end(&mut stored_bytes)
+            .expect("artifact bytes should read");
+
+        assert_eq!(stored_bytes, bytes);
     }
 
     #[test]
@@ -528,11 +1054,13 @@ mod tests {
         assert_table_exists(&conn, "runs");
         assert_table_exists(&conn, "turns");
         assert_table_exists(&conn, "turn_parts");
+        assert_table_exists(&conn, "artifacts");
 
         assert_index_exists(&conn, "idx_runs_session_started");
         assert_index_exists(&conn, "idx_turns_run_seq");
         assert_index_exists(&conn, "idx_turn_parts_turn_id");
         assert_index_exists(&conn, "idx_turn_parts_session_id");
+        assert_index_exists(&conn, "idx_artifacts_sha256");
 
         let (version, applied_at): (i64, i64) = conn
             .query_row(
@@ -644,6 +1172,7 @@ mod tests {
         assert_table_missing(&conn, "runs");
         assert_table_missing(&conn, "turns");
         assert_table_missing(&conn, "turn_parts");
+        assert_table_missing(&conn, "artifacts");
     }
 
     #[test]
