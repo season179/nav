@@ -11,4 +11,6 @@ pub enum ApiKind {
         alias = "codex_subscription"
     )]
     ChatGptSubscription,
+    #[serde(rename = "openai-responses", alias = "openai_responses")]
+    OpenAiResponses,
 }

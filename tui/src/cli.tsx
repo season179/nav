@@ -17,7 +17,10 @@ type StartCliOptions = {
 	stdin?: NodeJS.ReadableStream;
 	renderApp?: RenderApp;
 	createProxy?: CreateProxy;
+	mouseTracking?: boolean;
 };
+
+const NAV_TUI_MOUSE = 'NAV_TUI_MOUSE';
 
 export function resolveBackendPath(
 	argv: string[] = process.argv,
@@ -30,17 +33,25 @@ export function resolveBackendPath(
 	return env.NAV_BACKEND ?? '';
 }
 
+export function resolveMouseTracking(
+	env: NodeJS.ProcessEnv = process.env,
+): boolean {
+	const value = env[NAV_TUI_MOUSE]?.trim().toLowerCase();
+	return value === '1' || value === 'true' || value === 'yes' || value === 'on';
+}
+
 export function startCli({
 	backendPath,
 	stdin = process.stdin,
 	renderApp = render,
 	createProxy = createStdinProxy,
+	mouseTracking = false,
 }: StartCliOptions): Instance {
 	const {proxy, mouseEvents, dispose} = createProxy(stdin);
 	let app: Instance;
 	try {
 		app = renderApp(
-			<AlternateScreen mouseTracking>
+			<AlternateScreen mouseTracking={mouseTracking}>
 				<MouseEventProvider emitter={mouseEvents}>
 					<App backendPath={backendPath} />
 				</MouseEventProvider>
@@ -57,5 +68,8 @@ export function startCli({
 }
 
 if (import.meta.main) {
-	startCli({backendPath: resolveBackendPath()});
+	startCli({
+		backendPath: resolveBackendPath(),
+		mouseTracking: resolveMouseTracking(),
+	});
 }

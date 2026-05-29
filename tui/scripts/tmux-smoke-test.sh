@@ -67,7 +67,7 @@ sleep 0.3
 echo "==> Launching Ink TUI in tmux (${SESSION}, ${TMUX_WIDTH}x${TMUX_HEIGHT})"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -x "$TMUX_WIDTH" -y "$TMUX_HEIGHT" \
-	"cd \"$TUI\" && exec env NAV_BACKEND=\"$NAV_BACKEND\" bun run start"
+	"cd \"$TUI\" && exec env NAV_BACKEND=\"$NAV_BACKEND\" NAV_TUI_MOUSE=1 bun run start"
 sleep 1
 
 OUT="$TMP/pane.txt"

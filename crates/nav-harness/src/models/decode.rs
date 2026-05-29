@@ -41,6 +41,16 @@ pub struct ChatGptSubscriptionDecodeInput {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAiResponsesDecodeInput {
+    pub provider_payload_id: ProviderPayloadId,
+    pub raw_artifact_id: ArtifactId,
+    pub run_id: RunId,
+    pub provider_id: Option<String>,
+    pub raw_json: Vec<u8>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodedProviderPayload {
     pub status: DecodeStatus,
@@ -113,6 +123,439 @@ impl Decoder for ChatGptSubscriptionDecoder {
     fn decode(&self, response: &Self::Response) -> Result<Self::Output, Self::Error> {
         decode_chatgpt_subscription(response)
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenAiResponsesDecoder;
+
+impl OpenAiResponsesDecoder {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decoder for OpenAiResponsesDecoder {
+    type Response = OpenAiResponsesDecodeInput;
+    type Output = DecodedProviderPayload;
+    type Error = DecodeError;
+
+    fn decode(&self, response: &Self::Response) -> Result<Self::Output, Self::Error> {
+        decode_openai_responses(response)
+    }
+}
+
+fn decode_openai_responses(
+    input: &OpenAiResponsesDecodeInput,
+) -> Result<DecodedProviderPayload, DecodeError> {
+    let value: Value = serde_json::from_slice(&input.raw_json)
+        .map_err(|error| DecodeError::MalformedJson(error.to_string()))?;
+    let raw_response = serde_json::from_slice::<RawOpenAiResponsesResponse>(&input.raw_json).ok();
+    let output = value
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| DecodeError::MalformedResponse("missing output array".to_string()))?;
+
+    let model_id = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let usage = decode_responses_usage(value.get("usage"));
+
+    let mut parts = Vec::new();
+    for (index, item) in output.iter().enumerate() {
+        let pointer = format!("/output/{index}");
+        parts.push(responses_step_start_part(input, &pointer));
+        parts.extend(decode_responses_output_item(
+            input,
+            index,
+            item,
+            raw_responses_item(raw_response.as_ref(), index),
+        )?);
+        parts.push(responses_step_finish_part(
+            input,
+            &pointer,
+            item,
+            status.as_deref(),
+            responses_step_tokens(index, output.len(), usage.as_ref()),
+        ));
+    }
+
+    let turn = DecodedTurn {
+        turn: Turn {
+            id: derived_message_id(input.provider_payload_id.as_str(), "response"),
+            run_id: input.run_id.clone(),
+            seq: 0,
+            role: TurnRole::Assistant,
+            meta: TurnMeta {
+                model_provider: input.provider_id.clone(),
+                model_id,
+                api_kind: Some(ApiKind::OpenAiResponses),
+                finish_reason: status,
+                usage,
+                parent_id: None,
+            },
+            created_at: input.created_at,
+        },
+        parts,
+    };
+
+    let status = if decoded_turn_has_unknowns(&turn) {
+        DecodeStatus::DecodedWithUnknowns
+    } else {
+        DecodeStatus::Decoded
+    };
+
+    Ok(DecodedProviderPayload {
+        status,
+        turns: vec![turn],
+    })
+}
+
+fn decode_responses_output_item(
+    input: &OpenAiResponsesDecodeInput,
+    index: usize,
+    item: &Value,
+    raw_item: Option<&RawValue>,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => decode_responses_message(input, index, item),
+        Some("function_call") => decode_responses_function_call(input, index, item),
+        Some("function_call_output") => decode_responses_function_call_output(input, index, item),
+        Some("reasoning") => decode_responses_reasoning(input, index, item),
+        unknown_type => {
+            decode_unknown_responses_output_item(input, index, item, raw_item, unknown_type)
+        }
+    }
+}
+
+fn decode_unknown_responses_output_item(
+    input: &OpenAiResponsesDecodeInput,
+    index: usize,
+    item: &Value,
+    raw_item: Option<&RawValue>,
+    item_type: Option<&str>,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    let kind = format!("response.output_item.{}", item_type.unwrap_or("unknown"));
+    Ok(vec![responses_provider_opaque_part(
+        input,
+        kind,
+        format!("/output/{index}"),
+        raw_responses_item_payload(raw_item, item)?,
+    )])
+}
+
+fn decode_responses_function_call(
+    input: &OpenAiResponsesDecodeInput,
+    output_index: usize,
+    item: &Value,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    let pointer = format!("/output/{output_index}");
+    let call_id = responses_call_id(item, &pointer)?;
+    let name = item.get("name").and_then(Value::as_str).ok_or_else(|| {
+        DecodeError::MalformedResponse(format!("missing function call name at {pointer}"))
+    })?;
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(parse_tool_arguments)
+        .transpose()?
+        .unwrap_or(Value::Null);
+
+    Ok(vec![DecodedPart {
+        part: Part::ToolCall {
+            id: derived_responses_tool_call_id(input.provider_payload_id.as_str(), call_id),
+            name: name.to_string(),
+            arguments,
+            raw_arguments_artifact_id: None,
+        },
+        provider_payload_id: input.provider_payload_id.clone(),
+        provider_json_pointer: pointer,
+    }])
+}
+
+fn decode_responses_function_call_output(
+    input: &OpenAiResponsesDecodeInput,
+    output_index: usize,
+    item: &Value,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    let pointer = format!("/output/{output_index}");
+    let call_id = responses_call_id(item, &pointer)?;
+    let output = item.get("output").ok_or_else(|| {
+        DecodeError::MalformedResponse(format!("missing function call output at {pointer}"))
+    })?;
+
+    Ok(vec![DecodedPart {
+        part: Part::ToolResult {
+            call_id: derived_responses_tool_call_id(input.provider_payload_id.as_str(), call_id),
+            content: response_output_content(output),
+            raw_artifact_id: None,
+            is_error: item
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status == "failed" || status == "incomplete"),
+        },
+        provider_payload_id: input.provider_payload_id.clone(),
+        provider_json_pointer: format!("{pointer}/output"),
+    }])
+}
+
+fn decode_responses_reasoning(
+    input: &OpenAiResponsesDecodeInput,
+    output_index: usize,
+    item: &Value,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    let mut parts = Vec::new();
+
+    if let Some(encrypted_content) = item.get("encrypted_content").and_then(Value::as_str) {
+        parts.push(responses_thinking_part(
+            input,
+            encrypted_content,
+            "encrypted",
+            format!("/output/{output_index}/encrypted_content"),
+        ));
+    }
+
+    parts.extend(decode_responses_reasoning_text_items(
+        input,
+        output_index,
+        item,
+        "content",
+        "reasoning_text",
+    )?);
+    parts.extend(decode_responses_reasoning_text_items(
+        input,
+        output_index,
+        item,
+        "summary",
+        "summary_text",
+    )?);
+
+    Ok(parts)
+}
+
+fn responses_call_id<'a>(item: &'a Value, pointer: &str) -> Result<&'a str, DecodeError> {
+    item.get("call_id").and_then(Value::as_str).ok_or_else(|| {
+        DecodeError::MalformedResponse(format!("missing function call_id at {pointer}"))
+    })
+}
+
+fn response_output_content(output: &Value) -> String {
+    output
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| output.to_string())
+}
+
+fn decode_responses_reasoning_text_items(
+    input: &OpenAiResponsesDecodeInput,
+    output_index: usize,
+    item: &Value,
+    field: &str,
+    expected_type: &str,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    let Some(items) = item.get(field).and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    let mut parts = Vec::new();
+    for (item_index, text_item) in items.iter().enumerate() {
+        let pointer = format!("/output/{output_index}/{field}/{item_index}");
+        if text_item.get("type").and_then(Value::as_str) == Some(expected_type) {
+            let text = text_item
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    DecodeError::MalformedResponse(format!("missing reasoning text at {pointer}"))
+                })?;
+            parts.push(responses_thinking_part(
+                input,
+                text,
+                expected_type,
+                format!("{pointer}/text"),
+            ));
+        } else {
+            parts.push(responses_provider_opaque_part(
+                input,
+                format!("response.reasoning_{field}.unknown"),
+                pointer,
+                raw_json_from_value(text_item)?,
+            ));
+        }
+    }
+
+    Ok(parts)
+}
+
+fn responses_thinking_part(
+    input: &OpenAiResponsesDecodeInput,
+    text: &str,
+    provider_hint: &str,
+    provider_json_pointer: String,
+) -> DecodedPart {
+    DecodedPart {
+        part: Part::Thinking {
+            text: text.to_string(),
+            provider_hint: Some(provider_hint.to_string()),
+        },
+        provider_payload_id: input.provider_payload_id.clone(),
+        provider_json_pointer,
+    }
+}
+
+fn decode_responses_message(
+    input: &OpenAiResponsesDecodeInput,
+    output_index: usize,
+    item: &Value,
+) -> Result<Vec<DecodedPart>, DecodeError> {
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DecodeError::MalformedResponse(format!(
+                "missing message content array at /output/{output_index}"
+            ))
+        })?;
+
+    let mut parts = Vec::new();
+    for (content_index, content_item) in content.iter().enumerate() {
+        match content_item.get("type").and_then(Value::as_str) {
+            Some("output_text") => {
+                let text = content_item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        DecodeError::MalformedResponse(format!(
+                            "missing output_text text at /output/{output_index}/content/{content_index}"
+                        ))
+                    })?;
+                parts.push(DecodedPart {
+                    part: Part::Text {
+                        text: text.to_string(),
+                        synthetic: None,
+                    },
+                    provider_payload_id: input.provider_payload_id.clone(),
+                    provider_json_pointer: format!(
+                        "/output/{output_index}/content/{content_index}/text"
+                    ),
+                });
+            }
+            Some(content_type) => {
+                parts.push(responses_provider_opaque_part(
+                    input,
+                    format!("response.message_content.{content_type}"),
+                    format!("/output/{output_index}/content/{content_index}"),
+                    raw_json_from_value(content_item)?,
+                ));
+            }
+            None => {
+                parts.push(responses_provider_opaque_part(
+                    input,
+                    "response.message_content.unknown".to_string(),
+                    format!("/output/{output_index}/content/{content_index}"),
+                    raw_json_from_value(content_item)?,
+                ));
+            }
+        }
+    }
+    Ok(parts)
+}
+
+fn responses_step_reason(item: &Value, response_status: Option<&str>) -> String {
+    item.get("status")
+        .and_then(Value::as_str)
+        .or(response_status)
+        .unwrap_or("completed")
+        .to_string()
+}
+
+fn responses_step_start_part(input: &OpenAiResponsesDecodeInput, pointer: &str) -> DecodedPart {
+    DecodedPart {
+        part: Part::StepStart { snapshot: None },
+        provider_payload_id: input.provider_payload_id.clone(),
+        provider_json_pointer: pointer.to_string(),
+    }
+}
+
+fn responses_step_finish_part(
+    input: &OpenAiResponsesDecodeInput,
+    pointer: &str,
+    item: &Value,
+    response_status: Option<&str>,
+    tokens: TokenUsage,
+) -> DecodedPart {
+    DecodedPart {
+        part: Part::StepFinish {
+            reason: responses_step_reason(item, response_status),
+            cost: 0.0,
+            tokens,
+            snapshot: None,
+        },
+        provider_payload_id: input.provider_payload_id.clone(),
+        provider_json_pointer: pointer.to_string(),
+    }
+}
+
+fn responses_step_tokens(
+    index: usize,
+    output_len: usize,
+    usage: Option<&TokenUsage>,
+) -> TokenUsage {
+    if index + 1 == output_len {
+        return usage.cloned().unwrap_or_default();
+    }
+
+    TokenUsage::default()
+}
+
+fn responses_provider_opaque_part(
+    input: &OpenAiResponsesDecodeInput,
+    kind: String,
+    provider_json_pointer: String,
+    raw_payload: RawJson,
+) -> DecodedPart {
+    DecodedPart {
+        part: Part::ProviderOpaque {
+            api_kind: ApiKind::OpenAiResponses,
+            kind,
+            raw_artifact_id: input.raw_artifact_id.clone(),
+            raw_payload: Some(raw_payload),
+        },
+        provider_payload_id: input.provider_payload_id.clone(),
+        provider_json_pointer,
+    }
+}
+
+fn raw_responses_item_payload(
+    raw_item: Option<&RawValue>,
+    item: &Value,
+) -> Result<RawJson, DecodeError> {
+    raw_item
+        .map(|raw| raw_json_from_str(raw.get()))
+        .unwrap_or_else(|| raw_json_from_value(item))
+}
+
+fn raw_responses_item(
+    raw_response: Option<&RawOpenAiResponsesResponse>,
+    index: usize,
+) -> Option<&RawValue> {
+    raw_response
+        .and_then(|response| response.output.get(index))
+        .map(Box::as_ref)
+}
+
+fn decode_responses_usage(value: Option<&Value>) -> Option<TokenUsage> {
+    let usage = value?;
+    Some(TokenUsage {
+        input: optional_u64_field(usage, "input_tokens"),
+        output: optional_u64_field(usage, "output_tokens"),
+        reasoning: nested_optional_u64_field(usage, "output_tokens_details", "reasoning_tokens"),
+        cache_read: nested_optional_u64_field(usage, "input_tokens_details", "cached_tokens"),
+        cache_write: 0,
+    })
 }
 
 fn decode_openai_chat_completions(
@@ -923,6 +1366,13 @@ fn derived_tool_call_id(payload_id: &str, pointer: &str) -> ToolCallId {
     ToolCallId::new_unchecked(derived_uuid_v7_string(payload_id, pointer))
 }
 
+fn derived_responses_tool_call_id(payload_id: &str, call_id: &str) -> ToolCallId {
+    ToolCallId::new_unchecked(derived_uuid_v7_string(
+        payload_id,
+        &format!("responses_call:{call_id}"),
+    ))
+}
+
 fn derived_uuid_v7_string(payload_id: &str, pointer: &str) -> String {
     let hash = stable_hash64(payload_id, pointer);
     format!(
@@ -953,6 +1403,11 @@ struct RawChatCompletionResponse {
 #[derive(Deserialize)]
 struct RawChatCompletionChoice {
     message: Box<RawValue>,
+}
+
+#[derive(Deserialize)]
+struct RawOpenAiResponsesResponse {
+    output: Vec<Box<RawValue>>,
 }
 
 #[cfg(test)]

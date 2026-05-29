@@ -16,9 +16,11 @@ pub use config::{ModelRef, ModelSettings};
 pub use decode::{
     ChatGptSubscriptionDecodeInput, ChatGptSubscriptionDecoder, DecodeError, DecodedPart,
     DecodedProviderPayload, DecodedTurn, Decoder, OpenAiChatCompletionsDecodeInput,
-    OpenAiChatCompletionsDecoder,
+    OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
 };
-pub use encode::{Encoder, OpenAiChatCompletionsEncoder};
+pub use encode::{
+    Encoder, OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
+};
 pub use model::{ModelConfig, ModelInput};
 pub use openai_completions::{
     ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessageRole,

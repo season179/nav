@@ -51,6 +51,9 @@ cargo run --quiet --manifest-path Cargo.toml -p nav-backend -- serve-http
 ```
 
 Set `NAV_BACKEND=/path/to/nav-backend` to point the TUI at a prebuilt backend.
+By default, nav leaves terminal mouse reporting off so normal drag-to-select
+works in the TUI. Set `NAV_TUI_MOUSE=1` to opt into wheel scrolling; when
+enabled, text selection follows your terminal or tmux mouse-reporting modifier.
 
 ### Session storage
 
