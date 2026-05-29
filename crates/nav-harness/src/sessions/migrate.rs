@@ -110,6 +110,78 @@ CREATE TABLE IF NOT EXISTS provider_payloads (
 
 CREATE INDEX IF NOT EXISTS idx_provider_payloads_run_sequence ON provider_payloads(run_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_provider_payloads_session ON provider_payloads(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS turn_parts_text (
+    part_id     TEXT PRIMARY KEY NOT NULL REFERENCES turn_parts(id) ON DELETE CASCADE,
+    turn_id     TEXT NOT NULL,
+    part_type   TEXT NOT NULL,
+    text        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_parts_text_turn_id ON turn_parts_text(turn_id);
+
+-- Projection rules for turn_parts_text (FTS-01a):
+--   • 'text'        → extracts $.text        (user/assistant text content)
+--   • 'tool_result' → extracts $.content      (tool output for search)
+--   • 'thinking'    → extracts $.text          (model reasoning traces)
+--   • All other types (tool_call, image, step_start, step_finish,
+--     compaction, retry, snapshot, provider_opaque) are EXCLUDED.
+--     tool_call.arguments is JSON structure, not displayable text;
+--     image is binary; step/compaction/retry/snapshot/opaque are metadata.
+--
+-- Triggers keep this table in lockstep with turn_parts writes:
+--   INSERT  → project if type is included and text is non-empty
+--   UPDATE  → unconditionally delete old projection, then re-project if type is included
+--   DELETE  → cascade via FK + explicit trigger cleanup
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_text_insert
+AFTER INSERT ON turn_parts
+BEGIN
+    INSERT OR REPLACE INTO turn_parts_text (part_id, turn_id, part_type, text)
+    SELECT NEW.id, NEW.turn_id, NEW.type,
+        CASE NEW.type
+            WHEN 'text' THEN json_extract(NEW.data_json, '$.text')
+            WHEN 'tool_result' THEN json_extract(NEW.data_json, '$.content')
+            WHEN 'thinking' THEN json_extract(NEW.data_json, '$.text')
+        END
+    WHERE NEW.type IN ('text', 'tool_result', 'thinking')
+      AND COALESCE(
+          CASE NEW.type
+              WHEN 'text' THEN json_extract(NEW.data_json, '$.text')
+              WHEN 'tool_result' THEN json_extract(NEW.data_json, '$.content')
+              WHEN 'thinking' THEN json_extract(NEW.data_json, '$.text')
+          END,
+          ''
+      ) != '';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_text_update
+AFTER UPDATE ON turn_parts
+BEGIN
+    DELETE FROM turn_parts_text WHERE part_id = NEW.id;
+    INSERT OR REPLACE INTO turn_parts_text (part_id, turn_id, part_type, text)
+    SELECT NEW.id, NEW.turn_id, NEW.type,
+        CASE NEW.type
+            WHEN 'text' THEN json_extract(NEW.data_json, '$.text')
+            WHEN 'tool_result' THEN json_extract(NEW.data_json, '$.content')
+            WHEN 'thinking' THEN json_extract(NEW.data_json, '$.text')
+        END
+    WHERE NEW.type IN ('text', 'tool_result', 'thinking')
+      AND COALESCE(
+          CASE NEW.type
+              WHEN 'text' THEN json_extract(NEW.data_json, '$.text')
+              WHEN 'tool_result' THEN json_extract(NEW.data_json, '$.content')
+              WHEN 'thinking' THEN json_extract(NEW.data_json, '$.text')
+          END,
+          ''
+      ) != '';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_text_delete
+AFTER DELETE ON turn_parts
+BEGIN
+    DELETE FROM turn_parts_text WHERE part_id = OLD.id;
+END;
 "#;
 
 struct TableSchema {
@@ -609,6 +681,43 @@ const TABLES: &[TableSchema] = &[
             ),
         ],
     },
+    TableSchema {
+        name: "turn_parts_text",
+        columns: &[
+            column(
+                "part_id",
+                "part_id TEXT PRIMARY KEY NOT NULL REFERENCES turn_parts(id) ON DELETE CASCADE",
+                "TEXT",
+                true,
+                None,
+                true,
+            ),
+            column(
+                "turn_id",
+                "turn_id TEXT NOT NULL",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "part_type",
+                "part_type TEXT NOT NULL",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "text",
+                "text TEXT NOT NULL",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+        ],
+    },
 ];
 
 const INDEXES: &[IndexSchema] = &[
@@ -646,6 +755,11 @@ const INDEXES: &[IndexSchema] = &[
         name: "idx_provider_payloads_session",
         table: "provider_payloads",
         sql: "CREATE INDEX idx_provider_payloads_session ON provider_payloads(session_id, created_at)",
+    },
+    IndexSchema {
+        name: "idx_turn_parts_text_turn_id",
+        table: "turn_parts_text",
+        sql: "CREATE INDEX idx_turn_parts_text_turn_id ON turn_parts_text(turn_id)",
     },
 ];
 

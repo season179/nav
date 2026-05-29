@@ -243,6 +243,15 @@ pub struct StoredPart {
 
 pub type StoredTurn = (Turn, Vec<StoredPart>);
 
+/// A row from the `turn_parts_text` projection table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnPartTextRow {
+    pub part_id: PartId,
+    pub turn_id: MessageId,
+    pub part_type: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnPage {
     pub items: Vec<StoredTurn>,
@@ -931,6 +940,41 @@ impl SqliteSessionStore {
             )
         })?;
         ensure_row_changed(changed, "turn_part", part_id.as_str())
+    }
+
+    /// Query the `turn_parts_text` projection for a session.
+    ///
+    /// Returns one row per `turn_parts` row that has a non-empty text
+    /// projection (currently `text`, `tool_result`, and `thinking` types).
+    pub fn get_turn_parts_text(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<TurnPartTextRow>, SqliteStoreError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT tpt.part_id, tpt.turn_id, tpt.part_type, tpt.text
+                FROM turn_parts_text tpt
+                JOIN turn_parts tp ON tp.id = tpt.part_id
+                WHERE tp.session_id = ?1
+                ORDER BY tpt.part_id ASC
+                "#,
+            )
+            .map_err(read_query_err)?;
+        let rows = stmt
+            .query_map(params![session_id.as_str()], |row| {
+                Ok(TurnPartTextRow {
+                    part_id: PartId::new_unchecked(row.get::<_, String>(0)?),
+                    turn_id: MessageId::new_unchecked(row.get::<_, String>(1)?),
+                    part_type: row.get(2)?,
+                    text: row.get(3)?,
+                })
+            })
+            .map_err(read_query_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(read_query_err)?;
+        Ok(rows)
     }
 
     /// Run `op` inside a `BEGIN IMMEDIATE` transaction, committing on success.
