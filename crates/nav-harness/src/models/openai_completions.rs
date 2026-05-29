@@ -131,7 +131,7 @@ pub struct ChatCompletionToolCallFunction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatCompletionRequestMessage {
     pub role: ChatCompletionMessageRole,
-    pub content: Option<String>,
+    pub content: Option<Value>,
     pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
     pub tool_call_id: Option<String>,
 }
@@ -140,7 +140,7 @@ impl ChatCompletionRequestMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: ChatCompletionMessageRole::System,
-            content: Some(content.into()),
+            content: Some(json!(content.into())),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -149,7 +149,7 @@ impl ChatCompletionRequestMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: ChatCompletionMessageRole::User,
-            content: Some(content.into()),
+            content: Some(json!(content.into())),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -158,7 +158,7 @@ impl ChatCompletionRequestMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: ChatCompletionMessageRole::Assistant,
-            content: Some(content.into()),
+            content: Some(json!(content.into())),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -179,7 +179,7 @@ impl ChatCompletionRequestMessage {
     ) -> Self {
         Self {
             role: ChatCompletionMessageRole::Assistant,
-            content: Some(content.into()),
+            content: Some(json!(content.into())),
             tool_calls: Some(tool_calls),
             tool_call_id: None,
         }
@@ -188,7 +188,7 @@ impl ChatCompletionRequestMessage {
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: ChatCompletionMessageRole::Tool,
-            content: Some(content.into()),
+            content: Some(json!(content.into())),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
         }
@@ -1036,7 +1036,7 @@ fn message_value(model: &ResolvedModelConfig, message: &ChatCompletionRequestMes
         ChatCompletionMessageRole::Tool => "tool",
     };
 
-    let content = message.content.as_deref().map_or(Value::Null, |c| json!(c));
+    let content = message.content.clone().unwrap_or(Value::Null);
 
     let mut obj = json!({
         "role": role,
