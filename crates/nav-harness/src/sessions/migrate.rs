@@ -188,6 +188,71 @@ AFTER DELETE ON turn_parts
 BEGIN
     DELETE FROM turn_parts_text WHERE part_id = OLD.id;
 END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS turn_parts_fts USING fts5(
+    part_id UNINDEXED,
+    turn_id UNINDEXED,
+    text,
+    tokenize='unicode61'
+);
+"#;
+
+const CREATE_TRIGRAM_FTS_SQL: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS turn_parts_fts_trigram USING fts5(
+    part_id UNINDEXED,
+    turn_id UNINDEXED,
+    text,
+    tokenize='trigram'
+);
+"#;
+
+const CREATE_TRIGRAM_FTS_FALLBACK_SQL: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS turn_parts_fts_trigram USING fts5(
+    part_id UNINDEXED,
+    turn_id UNINDEXED,
+    text
+);
+"#;
+
+const FTS_SYNC_SQL: &str = r#"
+INSERT INTO turn_parts_fts (rowid, part_id, turn_id, text)
+SELECT tpt.rowid, tpt.part_id, tpt.turn_id, tpt.text
+FROM turn_parts_text tpt
+LEFT JOIN turn_parts_fts fts ON fts.rowid = tpt.rowid
+WHERE fts.rowid IS NULL;
+
+INSERT INTO turn_parts_fts_trigram (rowid, part_id, turn_id, text)
+SELECT tpt.rowid, tpt.part_id, tpt.turn_id, tpt.text
+FROM turn_parts_text tpt
+LEFT JOIN turn_parts_fts_trigram fts ON fts.rowid = tpt.rowid
+WHERE fts.rowid IS NULL;
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_fts_insert
+AFTER INSERT ON turn_parts_text
+BEGIN
+    INSERT INTO turn_parts_fts (rowid, part_id, turn_id, text)
+    VALUES (NEW.rowid, NEW.part_id, NEW.turn_id, NEW.text);
+    INSERT INTO turn_parts_fts_trigram (rowid, part_id, turn_id, text)
+    VALUES (NEW.rowid, NEW.part_id, NEW.turn_id, NEW.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_fts_update
+AFTER UPDATE ON turn_parts_text
+BEGIN
+    DELETE FROM turn_parts_fts WHERE rowid = OLD.rowid;
+    DELETE FROM turn_parts_fts_trigram WHERE rowid = OLD.rowid;
+    INSERT INTO turn_parts_fts (rowid, part_id, turn_id, text)
+    VALUES (NEW.rowid, NEW.part_id, NEW.turn_id, NEW.text);
+    INSERT INTO turn_parts_fts_trigram (rowid, part_id, turn_id, text)
+    VALUES (NEW.rowid, NEW.part_id, NEW.turn_id, NEW.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_fts_delete
+AFTER DELETE ON turn_parts_text
+BEGIN
+    DELETE FROM turn_parts_fts WHERE rowid = OLD.rowid;
+    DELETE FROM turn_parts_fts_trigram WHERE rowid = OLD.rowid;
+END;
 "#;
 
 struct TableSchema {
@@ -830,12 +895,43 @@ pub fn migrate(conn: &Connection) -> Result<(), MigrationError> {
 
 fn migrate_inner(conn: &Connection) -> Result<(), MigrationError> {
     conn.execute_batch(CORE_SCHEMA_SQL)?;
+    create_trigram_fts_table(conn)?;
+    conn.execute_batch(FTS_SYNC_SQL)?;
     reconcile_declared_schema(conn)?;
     conn.execute(
         "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
         params![SCHEMA_VERSION, unix_millis()],
     )?;
     Ok(())
+}
+
+fn create_trigram_fts_table(conn: &Connection) -> Result<(), MigrationError> {
+    create_trigram_fts_table_with_sql(conn, CREATE_TRIGRAM_FTS_SQL)
+}
+
+fn create_trigram_fts_table_with_sql(
+    conn: &Connection,
+    trigram_sql: &str,
+) -> Result<(), MigrationError> {
+    match conn.execute_batch(trigram_sql) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            warn_trigram_fallback_once(&err);
+            conn.execute_batch(CREATE_TRIGRAM_FTS_FALLBACK_SQL)?;
+            Ok(())
+        }
+    }
+}
+
+fn warn_trigram_fallback_once(err: &rusqlite::Error) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let message = err.to_string();
+    ONCE.call_once(|| {
+        eprintln!(
+            "nav: SQLite FTS5 trigram tokenizer unavailable ({message}); \
+             falling back to default FTS tokenizer for turn_parts_fts_trigram"
+        );
+    });
 }
 
 fn reconcile_declared_schema(conn: &Connection) -> Result<(), MigrationError> {
@@ -1064,4 +1160,52 @@ fn unix_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigram_fts_creation_falls_back_when_tokenizer_is_unavailable() {
+        let conn = Connection::open_in_memory().expect("in-memory connection should open");
+        create_trigram_fts_table_with_sql(
+            &conn,
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS turn_parts_fts_trigram USING fts5(
+                part_id UNINDEXED,
+                turn_id UNINDEXED,
+                text,
+                tokenize='nav_missing_tokenizer'
+            );
+            "#,
+        )
+        .expect("fallback FTS table should be created");
+
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'turn_parts_fts_trigram'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fallback FTS table should be present");
+        assert!(table_sql.contains("turn_parts_fts_trigram"));
+
+        conn.execute(
+            "INSERT INTO turn_parts_fts_trigram (rowid, part_id, turn_id, text)
+             VALUES (1, 'part', 'turn', 'fallback search text')",
+            [],
+        )
+        .expect("fallback FTS table should accept rows");
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM turn_parts_fts_trigram
+                 WHERE turn_parts_fts_trigram MATCH 'fallback'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("fallback FTS table should be searchable");
+
+        assert_eq!(hits, 1);
+    }
 }

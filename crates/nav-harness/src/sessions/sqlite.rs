@@ -290,6 +290,59 @@ pub struct TurnPartTextRow {
     pub text: String,
 }
 
+/// A full-text search hit from the projected turn-part text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnPartSearchHit {
+    pub session_id: SessionId,
+    pub turn_id: MessageId,
+    pub part_id: PartId,
+    pub rank: f64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FtsIndex {
+    Unicode,
+    Trigram,
+}
+
+impl FtsIndex {
+    fn search_sql(self) -> &'static str {
+        match self {
+            Self::Unicode => {
+                r#"
+                SELECT
+                    tp.session_id,
+                    turn_parts_fts.turn_id,
+                    turn_parts_fts.part_id,
+                    bm25(turn_parts_fts) AS rank,
+                    turn_parts_fts.text
+                FROM turn_parts_fts
+                JOIN turn_parts tp ON tp.id = turn_parts_fts.part_id
+                WHERE turn_parts_fts MATCH ?1
+                ORDER BY rank ASC, tp.created_at ASC, turn_parts_fts.part_id ASC
+                LIMIT ?2
+                "#
+            }
+            Self::Trigram => {
+                r#"
+                SELECT
+                    tp.session_id,
+                    turn_parts_fts_trigram.turn_id,
+                    turn_parts_fts_trigram.part_id,
+                    bm25(turn_parts_fts_trigram) AS rank,
+                    turn_parts_fts_trigram.text
+                FROM turn_parts_fts_trigram
+                JOIN turn_parts tp ON tp.id = turn_parts_fts_trigram.part_id
+                WHERE turn_parts_fts_trigram MATCH ?1
+                ORDER BY rank ASC, tp.created_at ASC, turn_parts_fts_trigram.part_id ASC
+                LIMIT ?2
+                "#
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnPage {
     pub items: Vec<StoredTurn>,
@@ -1501,6 +1554,148 @@ impl SqliteSessionStore {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(read_query_err)?;
         Ok(rows)
+    }
+
+    pub fn search_turn_parts(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TurnPartSearchHit>, SqliteStoreError> {
+        self.search_turn_parts_with_index(FtsIndex::Unicode, query, limit)
+    }
+
+    pub fn search_turn_parts_trigram(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TurnPartSearchHit>, SqliteStoreError> {
+        self.search_turn_parts_with_index(FtsIndex::Trigram, query, limit)
+    }
+
+    fn search_turn_parts_with_index(
+        &self,
+        index: FtsIndex,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TurnPartSearchHit>, SqliteStoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let Some(match_query) = fts_literal_query(query) else {
+            return Ok(Vec::new());
+        };
+
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let mut stmt = conn.prepare(index.search_sql()).map_err(read_query_err)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    match_query.as_str(),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                read_search_hit,
+            )
+            .map_err(read_query_err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(read_query_err)?;
+        Ok(rows)
+    }
+
+    pub fn get_anchored_view(
+        &self,
+        hit: &TurnPartSearchHit,
+        n_around: usize,
+    ) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let n_around = i64::try_from(n_around).unwrap_or(i64::MAX);
+        let mut stmt = conn
+            .prepare(
+                r#"
+                WITH session_turns AS (
+                    SELECT
+                        t.id,
+                        t.run_id,
+                        t.seq,
+                        t.role,
+                        t.meta_json,
+                        t.created_at,
+                        ROW_NUMBER() OVER (ORDER BY t.created_at ASC, t.id ASC) AS position
+                    FROM turns t
+                    JOIN runs r ON r.id = t.run_id
+                    WHERE r.session_id = ?1
+                ),
+                anchor AS (
+                    SELECT position
+                    FROM session_turns
+                    WHERE id = ?2
+                ),
+                bookend_ids AS (
+                    SELECT id
+                    FROM (
+                        SELECT
+                            id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY role
+                                ORDER BY created_at ASC, id ASC
+                            ) AS first_for_role,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY role
+                                ORDER BY created_at DESC, id DESC
+                            ) AS last_for_role
+                        FROM session_turns
+                    )
+                    WHERE (first_for_role = 1 OR last_for_role = 1)
+                      AND EXISTS (SELECT 1 FROM anchor)
+                ),
+                selected_ids(id) AS (
+                    SELECT st.id
+                    FROM session_turns st
+                    CROSS JOIN anchor a
+                    WHERE ABS(st.position - a.position) <= ?3
+                    UNION
+                    SELECT id
+                    FROM bookend_ids
+                )
+                SELECT
+                    st.id AS turn_id,
+                    st.run_id AS turn_run_id,
+                    st.seq AS turn_seq,
+                    st.role AS turn_role,
+                    st.meta_json AS turn_meta_json,
+                    st.created_at AS turn_created_at,
+                    tp.id AS part_id,
+                    tp.data_json AS part_data_json,
+                    tp.provider_payload_id AS part_provider_payload_id,
+                    tp.provider_json_pointer AS part_provider_json_pointer,
+                    tp.compacted_at AS part_compacted_at,
+                    tp.created_at AS part_created_at
+                FROM session_turns st
+                JOIN selected_ids selected ON selected.id = st.id
+                LEFT JOIN turn_parts tp ON tp.turn_id = st.id
+                ORDER BY st.created_at ASC, st.id ASC, tp.id ASC
+                "#,
+            )
+            .map_err(read_query_err)?;
+        let mut rows = stmt
+            .query(params![
+                hit.session_id.as_str(),
+                hit.turn_id.as_str(),
+                n_around
+            ])
+            .map_err(read_query_err)?;
+        let turns = read_joined_stored_turns(&mut rows).map_err(read_query_err)?;
+        drop(rows);
+        drop(stmt);
+
+        if turns.is_empty() {
+            return Err(SqliteStoreError::NotFound {
+                entity: "message",
+                id: hit.turn_id.to_string(),
+            });
+        }
+
+        Ok(turns)
     }
 
     pub fn next_turn_created_at_for_run(
@@ -2739,6 +2934,88 @@ fn read_stored_part(row: &Row<'_>) -> rusqlite::Result<StoredPart> {
         compacted_at: row.get("compacted_at")?,
         created_at: row.get("created_at")?,
     })
+}
+
+fn read_joined_stored_turns(rows: &mut rusqlite::Rows<'_>) -> rusqlite::Result<Vec<StoredTurn>> {
+    let mut turns: Vec<StoredTurn> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let turn = read_joined_turn(row)?;
+        let starts_new_turn = turns
+            .last()
+            .map(|(stored, _)| stored.id != turn.id)
+            .unwrap_or(true);
+        if starts_new_turn {
+            turns.push((turn, Vec::new()));
+        }
+
+        if let Some(part) = read_joined_part(row)? {
+            let (_, parts) = turns
+                .last_mut()
+                .expect("joined part should have a turn to attach to");
+            parts.push(part);
+        }
+    }
+    Ok(turns)
+}
+
+fn read_joined_turn(row: &Row<'_>) -> rusqlite::Result<Turn> {
+    let id: String = row.get("turn_id")?;
+    let run_id: String = row.get("turn_run_id")?;
+    let role: String = row.get("turn_role")?;
+    let meta_json: String = row.get("turn_meta_json")?;
+    Ok(Turn {
+        id: MessageId::new_unchecked(id),
+        run_id: RunId::new_unchecked(run_id),
+        seq: row.get("turn_seq")?,
+        role: parse_turn_role(&role)?,
+        meta: parse_json(&meta_json)?,
+        created_at: row.get("turn_created_at")?,
+    })
+}
+
+fn read_joined_part(row: &Row<'_>) -> rusqlite::Result<Option<StoredPart>> {
+    let Some(id) = row.get::<_, Option<String>>("part_id")? else {
+        return Ok(None);
+    };
+    let data_json: String = row.get("part_data_json")?;
+    let provider_payload_id: Option<String> = row.get("part_provider_payload_id")?;
+    Ok(Some(StoredPart {
+        id: PartId::new_unchecked(id),
+        part: parse_json(&data_json)?,
+        provider_payload_id: provider_payload_id.map(ProviderPayloadId::new_unchecked),
+        provider_json_pointer: row.get("part_provider_json_pointer")?,
+        compacted_at: row.get("part_compacted_at")?,
+        created_at: row.get("part_created_at")?,
+    }))
+}
+
+fn read_search_hit(row: &Row<'_>) -> rusqlite::Result<TurnPartSearchHit> {
+    let session_id: String = row.get("session_id")?;
+    let turn_id: String = row.get("turn_id")?;
+    let part_id: String = row.get("part_id")?;
+    Ok(TurnPartSearchHit {
+        session_id: SessionId::new_unchecked(session_id),
+        turn_id: MessageId::new_unchecked(turn_id),
+        part_id: PartId::new_unchecked(part_id),
+        rank: row.get("rank")?,
+        text: row.get("text")?,
+    })
+}
+
+fn fts_literal_query(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .map(quote_fts_literal)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
+
+fn quote_fts_literal(term: &str) -> String {
+    format!("\"{}\"", term.replace('"', "\"\""))
 }
 
 fn parse_turn_role(value: &str) -> rusqlite::Result<TurnRole> {
