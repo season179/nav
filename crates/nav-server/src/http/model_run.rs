@@ -133,14 +133,23 @@ impl ModelRunService {
                         completion.terminal_events,
                     ));
                 pending_provider_errors.extend(provider_errors);
-                publish_run_loop_completion(
+                if !publish_run_loop_completion(
                     state.publication_stores(),
                     &state.session_store,
-                    request.session_id,
                     request.run_id,
                     completion.turns,
                     terminal_events,
-                );
+                ) {
+                    publish_run_failure(
+                        &state.ids,
+                        state.publication_stores(),
+                        request.session_id,
+                        request.run_id,
+                        "failed to persist completed run".to_string(),
+                        pending_provider_errors,
+                    );
+                    return RunStatus::Failed;
+                }
                 RunStatus::Completed
             }
             RunLoopResult::Cancelled => RunStatus::Cancelled,
@@ -207,7 +216,6 @@ fn publish_run_loop_events(
 fn publish_run_loop_completion(
     stores: RunPublicationStores<'_>,
     session_store: &Arc<Mutex<SessionStore>>,
-    session_id: &SessionId,
     run_id: &RunId,
     turns: Vec<ModelTurn>,
     events: impl IntoIterator<Item = EventEnvelope>,
@@ -221,11 +229,13 @@ fn publish_run_loop_completion(
         return false;
     }
 
+    if session_store
+        .lock()
+        .unwrap()
+        .append_turns(run_id, turns)
+        .is_err()
     {
-        let mut session_store = session_store.lock().unwrap();
-        for turn in turns {
-            session_store.append_turn(session_id, turn);
-        }
+        return false;
     }
     run.status = RunStatus::Completed;
     stores
@@ -575,7 +585,6 @@ mod tests {
         publish_run_loop_completion(
             fixture.publication_stores(&pending_confirmations),
             &session_store,
-            &fixture.session_id,
             &fixture.run_id,
             vec![ModelTurn::assistant_text("assistant reply")],
             vec![fixture.run_completed_event()],
@@ -601,7 +610,6 @@ mod tests {
         publish_run_loop_completion(
             fixture.publication_stores(&pending_confirmations),
             &session_store,
-            &fixture.session_id,
             &fixture.run_id,
             vec![ModelTurn::assistant_text("late assistant reply")],
             vec![fixture.run_completed_event()],
@@ -633,7 +641,6 @@ mod tests {
         publish_run_loop_completion(
             fixture.publication_stores(&pending_confirmations),
             &session_store,
-            &fixture.session_id,
             &fixture.run_id,
             Vec::new(),
             vec![fixture.run_completed_event()],
@@ -734,8 +741,13 @@ mod tests {
         }
 
         fn session_store(&self) -> Arc<Mutex<SessionStore>> {
-            let mut store = SessionStore::default();
-            store.create_session(self.session_id.clone());
+            let store = SessionStore::default();
+            store
+                .create_session(self.session_id.clone())
+                .expect("session should create");
+            store
+                .start_run(&self.session_id, self.run_id.clone())
+                .expect("run should start");
             Arc::new(Mutex::new(store))
         }
 
