@@ -17,7 +17,7 @@ use crate::compaction::{
     COMPACTION_REPLAY_TEXT, COMPACTION_SUMMARY_PLACEHOLDER,
     overflow::OVERFLOW_CONTINUATION_TEXT,
     prune::tool_result_part_ids_to_prune,
-    replay::{DEFAULT_TAIL_TURNS, project_for_replay},
+    replay::{DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_TAIL_TURNS, project_for_replay},
     summary::CompactionSummaryRequest,
     validate::{SummaryValidationError, validate_compaction_summary},
 };
@@ -126,12 +126,14 @@ pub struct SessionTotals {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub tail_turns: usize,
+    pub keep_recent_tokens: usize,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             tail_turns: DEFAULT_TAIL_TURNS,
+            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
         }
     }
 }
@@ -310,7 +312,7 @@ impl SessionStore {
         config: CompactionConfig,
     ) -> Result<CompactionBoundary, SqliteStoreError> {
         let page = self.session_turns_chronological(session_id)?;
-        let tail_start_id = select_tail_start_id(&page, config.tail_turns);
+        let tail_start_id = select_tail_start_id(&page, config);
         self.write_compaction_summary(
             session_id,
             tail_start_id,
@@ -326,7 +328,7 @@ impl SessionStore {
         config: CompactionConfig,
     ) -> Result<CompactionSummaryRequest, SqliteStoreError> {
         let page = self.session_turns_chronological(session_id)?;
-        let tail_start_id = select_tail_start_id(&page, config.tail_turns);
+        let tail_start_id = select_tail_start_id(&page, config);
 
         Ok(CompactionSummaryRequest {
             previous_summary: latest_compaction_summary_text(&page),
@@ -1175,22 +1177,102 @@ fn validate_tail_start_id(
     }
 }
 
-fn select_tail_start_id(turns: &[StoredTurn], tail_turns: usize) -> Option<MessageId> {
-    if tail_turns == 0 {
-        return None;
-    }
-
+fn select_tail_start_id(turns: &[StoredTurn], config: CompactionConfig) -> Option<MessageId> {
     let verbatim_turns = turns
         .iter()
         .enumerate()
         .filter(|(index, _)| is_verbatim_replay_turn(turns, *index))
         .map(|(_, turn)| turn)
         .collect::<Vec<_>>();
-    let tail_start_index = verbatim_turns.len().saturating_sub(tail_turns);
+
+    // Pick whichever mode retains more turns (smaller start index).
+    // Token budget expands the tail but never shrinks it below tail_turns.
+    let by_turns = (config.tail_turns > 0)
+        .then(|| verbatim_turns.len().saturating_sub(config.tail_turns));
+    let by_tokens = tail_start_by_token_budget(&verbatim_turns, config.keep_recent_tokens);
+
+    let tail_start_index = match (by_turns, by_tokens) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return None,
+    };
 
     verbatim_turns
         .get(tail_start_index)
         .map(|(turn, _)| turn.id.clone())
+}
+
+/// Walk backwards from the most recent turn, accumulating an approximate
+/// token count until the budget is exceeded. Returns the index into
+/// `verbatim_turns` where the tail starts.
+fn tail_start_by_token_budget(
+    verbatim_turns: &[&StoredTurn],
+    keep_recent_tokens: usize,
+) -> Option<usize> {
+    if keep_recent_tokens == 0 || verbatim_turns.is_empty() {
+        return None;
+    }
+
+    let mut accumulated_tokens = 0usize;
+    for (reverse_idx, (_, parts)) in verbatim_turns.iter().rev().enumerate() {
+        let turn_tokens = estimate_turn_tokens(parts);
+        accumulated_tokens = accumulated_tokens.saturating_add(turn_tokens);
+        if accumulated_tokens > keep_recent_tokens {
+            // We've exceeded the budget — the tail starts at the next turn
+            // (i.e. the one *after* this one in forward order).
+            let forward_idx = verbatim_turns.len() - reverse_idx;
+            return Some(forward_idx);
+        }
+    }
+
+    // Budget covers all turns — keep everything.
+    None
+}
+
+/// Rough token estimate for a stored turn (~4 chars per token).
+fn estimate_turn_tokens(parts: &[StoredPart]) -> usize {
+    let char_count: usize = parts
+        .iter()
+        .map(|part| match &part.part {
+            Part::Text { text, .. } => text.len(),
+            Part::ToolCall { arguments, .. } => arguments.estimated_json_len(),
+            Part::ToolResult { content, .. } => content.len(),
+            _ => 0,
+        })
+        .sum();
+    char_count.div_ceil(4).max(1)
+}
+
+/// Estimate the serialized byte length of a JSON `Value` without allocating.
+///
+/// This is a rough approximation that recurses through the value structure,
+/// summing string/number/bool/null byte representation lengths plus structural
+/// overhead (colons, commas, quotes, brackets). For a heuristic token count
+/// this is more than accurate enough.
+trait EstimatedJsonLen {
+    fn estimated_json_len(&self) -> usize;
+}
+
+impl EstimatedJsonLen for serde_json::Value {
+    fn estimated_json_len(&self) -> usize {
+        match self {
+            Value::Null => 4,
+            Value::Bool(b) => if *b { 4 } else { 5 },
+            Value::Number(n) => n.to_string().len(),
+            Value::String(s) => s.len() + 2, // +2 for quotes
+            Value::Array(items) => {
+                let inner: usize = items.iter().map(|v| v.estimated_json_len()).sum();
+                inner + items.len().saturating_sub(1) + 2 // commas + brackets
+            }
+            Value::Object(map) => {
+                let inner: usize = map
+                    .iter()
+                    .map(|(k, v)| k.len() + 2 + 1 + v.estimated_json_len()) // "key": value
+                    .sum();
+                inner + map.len().saturating_sub(1) + 2 // commas + braces
+            }
+        }
+    }
 }
 
 fn is_verbatim_replay_turn(turns: &[StoredTurn], index: usize) -> bool {
@@ -2761,5 +2843,206 @@ mod tests {
                 }],
             }],
         })
+    }
+
+    // --- CMP-13: keep_recent_tokens tests ---
+
+    #[test]
+    fn compaction_config_default_has_keep_recent_tokens_20k() {
+        let config = CompactionConfig::default();
+        assert_eq!(config.tail_turns, DEFAULT_TAIL_TURNS);
+        assert_eq!(config.keep_recent_tokens, DEFAULT_KEEP_RECENT_TOKENS);
+    }
+
+    #[test]
+    fn select_tail_start_id_prefers_larger_tail_when_token_budget_exceeds_turns() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let mut message_ids = Vec::new();
+        // 10 turns, each ~200 chars = ~50 estimated tokens each.
+        for index in 0..10 {
+            let message_id = new_message_id();
+            let turn = if index % 2 == 0 {
+                ModelTurn::user_text(format!("user {index}: {}", "x".repeat(200)))
+            } else {
+                ModelTurn::assistant_text(format!("assistant {index}: {}", "y".repeat(200)))
+            };
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let page = store.session_turns_chronological(&session_id).unwrap();
+
+        // tail_turns=1 would keep only the last turn.
+        // keep_recent_tokens=250 should keep ~5 turns (250 tokens / 50 per turn).
+        let config = CompactionConfig {
+            tail_turns: 1,
+            keep_recent_tokens: 250,
+        };
+        let tail_start = select_tail_start_id(&page, config);
+
+        // Token budget of 250 keeps turns 6-9 → tail starts at index 6.
+        assert_eq!(
+            tail_start,
+            Some(message_ids[6].clone()),
+            "token budget should keep more turns than tail_turns=1"
+        );
+    }
+
+    #[test]
+    fn select_tail_start_id_prefers_turn_count_when_more_conservative() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let mut message_ids = Vec::new();
+        for index in 0..10 {
+            let message_id = new_message_id();
+            let turn = if index % 2 == 0 {
+                ModelTurn::user_text(format!("user {index}"))
+            } else {
+                ModelTurn::assistant_text(format!("assistant {index}"))
+            };
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let page = store.session_turns_chronological(&session_id).unwrap();
+
+        // tail_turns=4 would keep 4 turns.
+        // keep_recent_tokens=10 is tiny — only ~1 turn.
+        // Should prefer tail_turns since it keeps more.
+        let config = CompactionConfig {
+            tail_turns: 4,
+            keep_recent_tokens: 10,
+        };
+        let tail_start = select_tail_start_id(&page, config);
+
+        assert_eq!(
+            tail_start,
+            Some(message_ids[6].clone()),
+            "tail_turns=4 should win over token budget of 10"
+        );
+    }
+
+    #[test]
+    fn select_tail_start_id_default_config_unchanged() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let mut message_ids = Vec::new();
+        for index in 0..10 {
+            let message_id = new_message_id();
+            let turn = if index % 2 == 0 {
+                ModelTurn::user_text(format!("user {index}"))
+            } else {
+                ModelTurn::assistant_text(format!("assistant {index}"))
+            };
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let page = store.session_turns_chronological(&session_id).unwrap();
+        let tail_start = select_tail_start_id(&page, CompactionConfig::default());
+
+        // Default is tail_turns=2 → keep turns 8-9.
+        assert_eq!(
+            tail_start,
+            Some(message_ids[8].clone()),
+            "default config should keep last 2 turns"
+        );
+    }
+
+    #[test]
+    fn keep_recent_tokens_zero_degrades_to_turn_count_only() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let mut message_ids = Vec::new();
+        for index in 0..6 {
+            let message_id = new_message_id();
+            let turn = ModelTurn::user_text(format!("turn {index}"));
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let page = store.session_turns_chronological(&session_id).unwrap();
+
+        // keep_recent_tokens=0 disables token-based tail; fall back to tail_turns=2.
+        let config = CompactionConfig {
+            tail_turns: 2,
+            keep_recent_tokens: 0,
+        };
+        let tail_start = select_tail_start_id(&page, config);
+
+        assert_eq!(
+            tail_start,
+            Some(message_ids[4].clone()),
+            "zero token budget should fall back to tail_turns=2"
+        );
+    }
+
+    #[test]
+    fn compact_session_uses_token_budget_tail() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let mut message_ids = Vec::new();
+        // 10 turns, each ~200 chars = ~50 estimated tokens each.
+        for index in 0..10 {
+            let message_id = new_message_id();
+            let turn = if index % 2 == 0 {
+                ModelTurn::user_text(format!("user {index}: {}", "x".repeat(200)))
+            } else {
+                ModelTurn::assistant_text(format!("assistant {index}: {}", "y".repeat(200)))
+            };
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        // Use compact_session (public API) with tail_turns=1 but a generous
+        // token budget that should retain more turns.
+        let config = CompactionConfig {
+            tail_turns: 1,
+            keep_recent_tokens: 250,
+        };
+        let boundary = store.compact_session(&session_id, config).unwrap();
+
+        // Token budget expands the tail beyond tail_turns=1.
+        assert_eq!(
+            boundary.tail_start_id,
+            Some(message_ids[6].clone()),
+            "compact_session should respect token-based tail expansion"
+        );
     }
 }

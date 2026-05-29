@@ -17,6 +17,10 @@ const STRIPPED_IMAGE_CONTENT: &str = "[image elided]";
 pub const KEEP_MEDIA_TURNS: usize = 2;
 const MAX_ARGUMENT_STRING_CHARS: usize = 1024;
 
+/// Default token budget for the retained tail when `keep_recent_tokens` is
+/// active.  Approximate token count using a rough heuristic (chars / 4).
+pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 20_000;
+
 /// Number of trailing turns whose `ToolCall.arguments` are left untouched
 /// during replay projection.  Set to 2 so the user's most recent tool calls
 /// stay fully visible in the context window.
