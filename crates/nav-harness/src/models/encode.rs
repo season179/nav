@@ -6,8 +6,9 @@ use crate::models::openai_completions::{
     ChatCompletionMessageRole, ChatCompletionRequestMessage, ChatCompletionToolCall,
     ChatCompletionToolCallFunction, ChatCompletionToolDefinition, OpenAiCompletionsRequest,
 };
-use crate::sessions::canonical::{ImageSource, Part, Turn, TurnRole};
 use crate::sessions::ModelTurn;
+use crate::sessions::canonical::{ImageSource, Part, Turn, TurnRole};
+use crate::tools::{ToolPreset, ToolRegistry};
 
 /// Converts model request turns into a provider-specific request.
 ///
@@ -38,13 +39,36 @@ impl OpenAiChatCompletionsEncoder {
         self
     }
 
-    pub fn encode(&self, turns: &[(Turn, Vec<Part>)]) -> Result<OpenAiCompletionsRequest, std::convert::Infallible> {
+    pub fn with_tool_registry(mut self, registry: &ToolRegistry, preset: ToolPreset) -> Self {
+        self.tools = registry
+            .preset_tools(preset)
+            .into_iter()
+            .map(|tool| ChatCompletionToolDefinition::from_tool(tool.as_ref()))
+            .collect();
+        self
+    }
+
+    pub fn encode(
+        &self,
+        turns: &[(Turn, Vec<Part>)],
+    ) -> Result<OpenAiCompletionsRequest, std::convert::Infallible> {
         let messages: Vec<ChatCompletionRequestMessage> = turns
             .iter()
             .flat_map(|(turn, parts)| encode_turn(turn, parts))
             .collect();
 
         let mut request = OpenAiCompletionsRequest::new(messages);
+        request.tools = self.tools.clone();
+        Ok(request)
+    }
+}
+
+impl Encoder for OpenAiChatCompletionsEncoder {
+    type Request = OpenAiCompletionsRequest;
+    type Error = std::convert::Infallible;
+
+    fn encode(&self, turns: &[ModelTurn]) -> Result<Self::Request, Self::Error> {
+        let mut request = OpenAiCompletionsRequest::from_turns(turns);
         request.tools = self.tools.clone();
         Ok(request)
     }
@@ -66,7 +90,9 @@ fn encode_turn(turn: &Turn, parts: &[Part]) -> Vec<ChatCompletionRequestMessage>
         .iter()
         .filter_map(|part| match part {
             Part::Text { text, .. } => Some(text.as_str()),
-            Part::Compaction { .. } => Some("Context was compacted. Previous conversation history has been summarized."),
+            Part::Compaction { .. } => {
+                Some("Context was compacted. Previous conversation history has been summarized.")
+            }
             Part::ProviderOpaque { .. } => Some("[Provider-specific content: opaque]"),
             _ => None,
         })
@@ -93,7 +119,12 @@ fn encode_turn(turn: &Turn, parts: &[Part]) -> Vec<ChatCompletionRequestMessage>
     let tool_calls: Vec<ChatCompletionToolCall> = parts
         .iter()
         .filter_map(|part| match part {
-            Part::ToolCall { id, name, arguments, .. } => Some(ChatCompletionToolCall {
+            Part::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => Some(ChatCompletionToolCall {
                 id: id.to_string(),
                 function: ChatCompletionToolCallFunction {
                     name: name.clone(),
@@ -107,7 +138,9 @@ fn encode_turn(turn: &Turn, parts: &[Part]) -> Vec<ChatCompletionRequestMessage>
     let tool_results: Vec<ChatCompletionRequestMessage> = parts
         .iter()
         .filter_map(|part| match part {
-            Part::ToolResult { call_id, content, .. } => Some(ChatCompletionRequestMessage {
+            Part::ToolResult {
+                call_id, content, ..
+            } => Some(ChatCompletionRequestMessage {
                 role: ChatCompletionMessageRole::Tool,
                 content: Some(json!(content.clone())),
                 tool_calls: None,
@@ -134,7 +167,11 @@ fn encode_turn(turn: &Turn, parts: &[Part]) -> Vec<ChatCompletionRequestMessage>
         messages.push(ChatCompletionRequestMessage {
             role,
             content,
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
             tool_call_id: None,
         });
     }

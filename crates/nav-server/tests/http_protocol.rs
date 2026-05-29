@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -9,7 +10,7 @@ use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelInput, ModelRef, ModelSettings, ProviderCompat,
     ProviderConfig,
 };
-use nav_harness::sessions::PendingConfirmation;
+use nav_harness::sessions::{Part, PendingConfirmation, SqliteSessionStore};
 use nav_harness::tools::{ToolRegistry, bash};
 use nav_protocol::rpc::{SessionSource, ToolsPreset};
 use nav_protocol::{BackendEvent, EventEnvelope};
@@ -479,6 +480,85 @@ fn session_send_message_starts_run_and_streams_typed_sse_events() {
 }
 
 #[test]
+fn completed_run_journals_provider_response_and_decoded_parts() {
+    let db = TestSessionDb::new("provider-response-journal");
+    let provider = successful_provider_with_text("journaled reply");
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let session_id = create_session(&mut server);
+
+    let run_id = send_message_text(&mut server, &session_id, "persist the envelope");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+    drop(server);
+
+    let store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    let payloads = store
+        .list_decoded_provider_payloads()
+        .expect("provider payloads should list");
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].direction, "response");
+    assert_eq!(payloads[0].decode_status, "decoded");
+
+    let parts = store
+        .list_parts_for_provider_payload(&payloads[0].id)
+        .expect("decoded parts should list");
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].provider_payload_id, Some(payloads[0].id.clone()));
+    assert_eq!(
+        parts[0].provider_json_pointer.as_deref(),
+        Some("/choices/0/message/content")
+    );
+    assert_eq!(
+        parts[0].part,
+        Part::Text {
+            text: "journaled reply".to_string(),
+            synthetic: None,
+        }
+    );
+}
+
+#[test]
+fn completed_run_journals_outgoing_provider_request_body() {
+    let db = TestSessionDb::new("provider-request-journal");
+    let provider = successful_provider_with_text("request journaled");
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let session_id = create_session(&mut server);
+
+    let run_id = send_message_text(&mut server, &session_id, "persist the request");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+    let provider_request = provider.request();
+    drop(server);
+
+    let store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    let run_id = RunId::try_new(run_id).expect("run id should parse");
+    let payloads = store
+        .list_provider_payloads_for_run(&run_id)
+        .expect("provider payloads should list");
+    let directions = payloads
+        .iter()
+        .map(|payload| payload.direction.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(directions, vec!["request", "response"]);
+
+    let request_payload = &payloads[0];
+    assert_eq!(request_payload.decode_status, "ignored");
+    let journaled_request: Value =
+        serde_json::from_slice(&artifact_bytes(&store, &request_payload.artifact_id))
+            .expect("request artifact should be JSON");
+    assert_eq!(journaled_request, provider_request.body);
+    assert_eq!(journaled_request["stream"], true);
+}
+
+#[test]
 fn session_send_message_posts_provider_stream_and_publishes_provider_events() {
     let provider = FakeProviderServer::start(
         200,
@@ -609,6 +689,18 @@ fn session_history_survives_backend_restart_for_next_run() {
             { "role": "user", "content": "second after restart" },
         ])
     );
+    drop(second_server);
+
+    let store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    let second_run_id = RunId::try_new(second_run_id).expect("second run id should parse");
+    let payloads = store
+        .list_provider_payloads_for_run(&second_run_id)
+        .expect("provider payloads should list");
+    assert_eq!(payloads[0].direction, "request");
+    let journaled_request: Value =
+        serde_json::from_slice(&artifact_bytes(&store, &payloads[0].artifact_id))
+            .expect("request artifact should be JSON");
+    assert_eq!(journaled_request, requests[1].body);
 }
 
 #[test]
@@ -1254,6 +1346,7 @@ fn session_send_message_streams_delayed_provider_chunks_live_and_replays_midstre
 
 #[test]
 fn session_send_message_publishes_provider_error_before_run_failed() {
+    let db = TestSessionDb::new("provider-error-journal");
     let provider = FakeProviderServer::start(
         429,
         "application/json",
@@ -1262,10 +1355,12 @@ fn session_send_message_publishes_provider_error_before_run_failed() {
                 .to_string(),
         ],
     );
-    let mut server = HttpServer::with_model_settings(
-        HttpServerConfig::default(),
-        model_settings_with_base_url(provider.base_url()),
-    );
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
     let session_id = create_session(&mut server);
 
     let run_id = send_message(&mut server, &session_id);
@@ -1301,9 +1396,30 @@ fn session_send_message_publishes_provider_error_before_run_failed() {
     assert_eq!(failed["run_id"], run_id);
     assert_eq!(failed["message"], "provider error: rate limit exceeded");
     assert_eq!(
-        server.run_status(&RunId::try_new(run_id).unwrap()),
+        server.run_status(&RunId::try_new(&run_id).unwrap()),
         Some(RunStatus::Failed)
     );
+    drop(server);
+
+    let store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    let run_id = RunId::try_new(run_id).expect("run id should parse");
+    let payloads = store
+        .list_provider_payloads_for_run(&run_id)
+        .expect("provider payloads should list");
+    let directions = payloads
+        .iter()
+        .map(|payload| payload.direction.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(directions, vec!["request", "error"]);
+    assert_eq!(payloads[1].decode_status, "pending");
+
+    let error_payload: Value =
+        serde_json::from_slice(&artifact_bytes(&store, &payloads[1].artifact_id))
+            .expect("error artifact should be JSON");
+    assert_eq!(error_payload["status"], 429);
+    assert_eq!(error_payload["message"], "rate limit exceeded");
+    assert_eq!(error_payload["error_type"], "rate_limit_error");
+    assert_eq!(error_payload["code"], "rate_limit_exceeded");
 }
 
 #[test]
@@ -2020,6 +2136,18 @@ fn remove_sqlite_files(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(path.with_extension("db-wal"));
     let _ = fs::remove_file(path.with_extension("db-shm"));
+}
+
+fn artifact_bytes(store: &SqliteSessionStore, artifact_id: &nav_types::ArtifactId) -> Vec<u8> {
+    let mut artifact = store
+        .get_artifact(artifact_id)
+        .expect("artifact should be readable");
+    let mut bytes = Vec::new();
+    artifact
+        .reader
+        .read_to_end(&mut bytes)
+        .expect("artifact bytes should read");
+    bytes
 }
 
 #[derive(Debug)]

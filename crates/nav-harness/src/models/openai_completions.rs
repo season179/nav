@@ -82,7 +82,7 @@ pub struct ChatCompletionToolDefinition {
 }
 
 impl ChatCompletionToolDefinition {
-    fn from_tool(tool: &dyn NavTool) -> Self {
+    pub(crate) fn from_tool(tool: &dyn NavTool) -> Self {
         Self {
             name: tool.name().to_string(),
             description: tool.description().to_string(),

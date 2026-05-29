@@ -106,12 +106,14 @@ impl ModelRunService {
         let run_loop_result = self.run_loop.run(
             &model,
             RunLoopRequest {
+                session_id: request.session_id,
                 run_id: request.run_id,
                 message_id: request.message_id,
                 turns: request.turns,
                 tool_registry: request.tool_registry,
                 tool_preset: request.tool_preset,
                 tool_context: request.tool_context,
+                session_store: Some(&state.session_store),
                 pending_confirmations: Some(&state.pending_confirmations),
                 cancellation_token,
             },
