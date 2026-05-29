@@ -135,8 +135,10 @@ impl CompactionFailureBreaker {
     }
 
     pub fn with_threshold(threshold: u32) -> Self {
+        // A zero threshold would disable auto-compaction for fresh sessions and
+        // never surface the one-time trip warning; clamp to a minimum of one.
         Self {
-            threshold,
+            threshold: threshold.max(1),
             failures: HashMap::new(),
         }
     }

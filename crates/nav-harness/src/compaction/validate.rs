@@ -104,7 +104,7 @@ pub fn validate_compaction_summary(summary: &str) -> Result<(), SummaryValidatio
 
     let missing: Vec<String> = REQUIRED_SUMMARY_SECTIONS
         .iter()
-        .filter(|section| !summary.contains(**section))
+        .filter(|section| !summary.lines().any(|line| line.trim() == **section))
         .map(|section| (*section).to_string())
         .collect();
     if !missing.is_empty() {
@@ -122,12 +122,18 @@ pub fn validate_compaction_summary(summary: &str) -> Result<(), SummaryValidatio
     Ok(())
 }
 
-/// Count non-whitespace characters once the required template headings are
-/// stripped, so a skeleton of empty sections reads as having no content.
+/// Count non-whitespace characters in the body, excluding the required template
+/// heading lines, so a skeleton of empty sections reads as having no content.
 fn summary_content_chars(summary: &str) -> usize {
-    let mut content = summary.to_string();
-    for section in REQUIRED_SUMMARY_SECTIONS {
-        content = content.replace(section, "");
-    }
-    content.chars().filter(|c| !c.is_whitespace()).count()
+    summary
+        .lines()
+        .filter(|line| !is_section_heading(line))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .count()
+}
+
+/// Whether a line is exactly one of the required template headings.
+fn is_section_heading(line: &str) -> bool {
+    REQUIRED_SUMMARY_SECTIONS.contains(&line.trim())
 }

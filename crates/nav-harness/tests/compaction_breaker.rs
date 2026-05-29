@@ -271,6 +271,20 @@ fn failure_counts_are_isolated_per_session() {
     assert_eq!(breaker.consecutive_failures(&session(2)), 0);
 }
 
+#[test]
+fn zero_threshold_is_clamped_to_trip_on_the_first_failure() {
+    let mut breaker = CompactionFailureBreaker::with_threshold(0);
+    let session = session(99);
+
+    assert!(breaker.auto_compaction_enabled(&session));
+    assert_eq!(
+        breaker.record_failure(&session),
+        BreakerEvent::Tripped { consecutive: 1 }
+    );
+    assert!(!breaker.auto_compaction_enabled(&session));
+    assert_eq!(breaker.consecutive_failures(&session), 1);
+}
+
 fn session(suffix: u64) -> SessionId {
     SessionId::try_new(format!("019f2f6f-f178-7a72-9f28-{suffix:012x}")).unwrap()
 }

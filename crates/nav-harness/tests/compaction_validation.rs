@@ -67,6 +67,23 @@ fn model_error_detection_ignores_case() {
     ));
 }
 
+#[test]
+fn section_name_in_body_text_does_not_satisfy_the_section() {
+    // The heading only appears as inline body text (e.g. quoted), not as its own
+    // heading line, so the section must still count as missing.
+    let without_heading = well_formed_summary().replace(
+        "## Blocked\nNone",
+        "We are not yet at the ## Blocked stage of the work.",
+    );
+
+    let error = validate_compaction_summary(&without_heading).unwrap_err();
+
+    assert_eq!(
+        error,
+        SummaryValidationError::MissingSections(vec!["## Blocked".to_string()])
+    );
+}
+
 fn well_formed_summary() -> String {
     r#"## Active Task
 Work on issue #366 using TDD.
