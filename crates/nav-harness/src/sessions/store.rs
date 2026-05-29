@@ -14,6 +14,7 @@ use crate::compaction::{
     COMPACTION_REPLAY_TEXT, COMPACTION_SUMMARY_PLACEHOLDER,
     prune::tool_result_part_ids_to_prune,
     replay::{DEFAULT_TAIL_TURNS, project_for_replay},
+    summary::CompactionSummaryRequest,
 };
 use crate::models::{
     AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
@@ -209,13 +210,49 @@ impl SessionStore {
         session_id: &SessionId,
         config: CompactionConfig,
     ) -> Result<CompactionBoundary, SqliteStoreError> {
-        let mut page = self
-            .sqlite
-            .list_turns_for_session(session_id, None, usize::MAX)?
-            .items;
-        page.reverse();
-
+        let page = self.session_turns_chronological(session_id)?;
         let tail_start_id = select_tail_start_id(&page, config.tail_turns);
+        self.write_compaction_summary(
+            session_id,
+            tail_start_id,
+            COMPACTION_SUMMARY_PLACEHOLDER.to_string(),
+        )
+    }
+
+    pub fn compaction_summary_request(
+        &self,
+        session_id: &SessionId,
+        config: CompactionConfig,
+    ) -> Result<CompactionSummaryRequest, SqliteStoreError> {
+        let page = self.session_turns_chronological(session_id)?;
+        let tail_start_id = select_tail_start_id(&page, config.tail_turns);
+
+        Ok(CompactionSummaryRequest {
+            previous_summary: latest_compaction_summary_text(&page),
+            head_turns: compaction_head_turns(&page, tail_start_id.as_ref(), config.tail_turns),
+            tail_start_id,
+        })
+    }
+
+    pub fn compact_session_with_summary(
+        &self,
+        session_id: &SessionId,
+        request: &CompactionSummaryRequest,
+        summary: impl Into<String>,
+    ) -> Result<CompactionBoundary, SqliteStoreError> {
+        let summary = summary.into();
+
+        self.write_compaction_summary(session_id, request.tail_start_id.clone(), summary)
+    }
+
+    fn write_compaction_summary(
+        &self,
+        session_id: &SessionId,
+        tail_start_id: Option<MessageId>,
+        summary: String,
+    ) -> Result<CompactionBoundary, SqliteStoreError> {
+        let page = self.session_turns_chronological(session_id)?;
+        validate_tail_start_id(&page, tail_start_id.as_ref())?;
         let run_id = new_run_id();
         let marker_id = new_message_id();
         let summary_id = new_message_id();
@@ -257,7 +294,7 @@ impl SessionStore {
                 (
                     summary_turn,
                     vec![Part::Text {
-                        text: COMPACTION_SUMMARY_PLACEHOLDER.to_string(),
+                        text: summary,
                         synthetic: Some(true),
                     }],
                 ),
@@ -272,6 +309,18 @@ impl SessionStore {
             summary_id,
             tail_start_id,
         })
+    }
+
+    fn session_turns_chronological(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+        let mut page = self
+            .sqlite
+            .list_turns_for_session(session_id, None, usize::MAX)?
+            .items;
+        page.reverse();
+        Ok(page)
     }
 
     pub fn start_run(&self, session_id: &SessionId, run_id: RunId) -> Result<(), SqliteStoreError> {
@@ -871,6 +920,55 @@ fn model_turns_for_replay(turns: &[StoredTurn]) -> Vec<ModelTurn> {
         .collect()
 }
 
+fn compaction_head_turns(
+    turns: &[StoredTurn],
+    tail_start_id: Option<&MessageId>,
+    tail_turns: usize,
+) -> Vec<ModelTurn> {
+    let previous_summary_id = latest_compaction_summary_turn_id(turns);
+    let mut head_turns = Vec::new();
+
+    for (turn, parts) in project_for_replay(turns, tail_turns) {
+        if tail_start_id.is_some_and(|id| id == &turn.id) {
+            break;
+        }
+
+        if previous_summary_id
+            .as_ref()
+            .is_some_and(|id| id == &turn.id)
+            || parts
+                .iter()
+                .any(|part| matches!(part, Part::Compaction { .. }))
+        {
+            continue;
+        }
+
+        if let Some(model_turn) = model_turn_from_projected_turn((turn, parts)) {
+            head_turns.push(model_turn);
+        }
+    }
+
+    head_turns
+}
+
+fn validate_tail_start_id(
+    turns: &[StoredTurn],
+    tail_start_id: Option<&MessageId>,
+) -> Result<(), SqliteStoreError> {
+    let Some(tail_start_id) = tail_start_id else {
+        return Ok(());
+    };
+
+    if turns.iter().any(|(turn, _)| turn.id == *tail_start_id) {
+        Ok(())
+    } else {
+        Err(SqliteStoreError::NotFound {
+            entity: "compaction tail turn",
+            id: tail_start_id.to_string(),
+        })
+    }
+}
+
 fn select_tail_start_id(turns: &[StoredTurn], tail_turns: usize) -> Option<MessageId> {
     if tail_turns == 0 {
         return None;
@@ -924,6 +1022,42 @@ fn is_compaction_summary_turn(turns: &[StoredTurn], index: usize) -> bool {
                 ..
             }
         )
+}
+
+fn latest_compaction_summary_turn_id(turns: &[StoredTurn]) -> Option<MessageId> {
+    turns
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, _)| is_compaction_summary_turn(turns, *index))
+        .map(|(_, (turn, _))| turn.id.clone())
+}
+
+fn latest_compaction_summary_text(turns: &[StoredTurn]) -> Option<String> {
+    turns
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(index, _)| is_compaction_summary_turn(turns, *index))
+        .find_map(|(_, (_, parts))| synthetic_text(parts))
+}
+
+fn synthetic_text(parts: &[StoredPart]) -> Option<String> {
+    let text = parts
+        .iter()
+        .filter_map(|part| match &part.part {
+            Part::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let text = text.trim();
+
+    if text.is_empty() || text == COMPACTION_SUMMARY_PLACEHOLDER {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 fn next_compaction_created_at(turns: &[StoredTurn]) -> i64 {
