@@ -8,6 +8,7 @@ license.workspace = true
 libc = "0.2"
 nav-types = { path = "../nav-types" }
 reqwest.workspace = true
+ring = "0.17.14"
 # `bundled` compiles SQLite from source with FTS5 + JSON1 enabled (libsqlite3-sys
 # defaults), so no separate json1/fts5 feature flags are required.
 rusqlite = { version = "0.40", features = ["bundled"] }
