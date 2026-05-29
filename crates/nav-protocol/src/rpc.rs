@@ -197,6 +197,7 @@ pub enum ToolConfirmationOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionTotalsParams {
     pub session_id: SessionId,
 }
