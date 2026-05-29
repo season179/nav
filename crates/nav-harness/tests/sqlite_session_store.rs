@@ -2488,25 +2488,72 @@ fn fork_session_through_message_copies_partial_later_run() {
     );
 }
 
+fn provider_payload_links(store: &SqliteSessionStore, session: &SessionId) -> usize {
+    store
+        .list_turns_for_session(session, None, usize::MAX)
+        .expect("turns should be readable")
+        .items
+        .into_iter()
+        .flat_map(|(_, parts)| parts)
+        .filter(|part| part.provider_payload_id.is_some() || part.provider_json_pointer.is_some())
+        .count()
+}
+
 #[test]
 fn fork_session_drops_provider_payload_linkage_on_copied_parts() {
-    let db = TempDb::new("fork-drops-linkage");
-    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
-    let (source, _messages) = seed_forkable_session(&store);
+    let data_dir = TempDataDir::new("fork-drops-linkage");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let source = session_id("019e7000-0000-7000-8000-0000000005d0");
+    let run = run_id("019e7000-0000-7000-8000-0000000005d1");
+    start_minimal_run(&store, source.clone(), run.clone());
+
+    // Seed a real decoded turn whose parts carry provider-payload provenance,
+    // so this test fails if fork_session ever preserves that linkage.
+    let raw_bytes = br#"{"id":"chatcmpl_1","model":"gpt-5.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#.to_vec();
+    let payload_id = store
+        .append_provider_payload(NewProviderPayload {
+            session_id: source.clone(),
+            run_id: run.clone(),
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_1".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: raw_bytes.clone(),
+            created_at: 3_000,
+        })
+        .expect("provider payload append should commit");
+    let payload = store
+        .get_provider_payload(&payload_id)
+        .expect("payload row should be readable");
+    let decoded = OpenAiChatCompletionsDecoder::new()
+        .decode(&OpenAiChatCompletionsDecodeInput {
+            provider_payload_id: payload_id.clone(),
+            raw_artifact_id: payload.artifact_id.clone(),
+            run_id: run.clone(),
+            provider_id: payload.provider_id.clone(),
+            raw_json: raw_bytes,
+            created_at: payload.created_at,
+        })
+        .expect("provider payload should decode");
+    store
+        .append_decoded_provider_payload(&payload_id, "openai-chat-completions-decoder@1", &decoded)
+        .expect("decoded payload append should commit");
+
+    assert!(
+        provider_payload_links(&store, &source) > 0,
+        "seed must produce provider-linked parts for this test to be meaningful"
+    );
 
     let fork = store
         .fork_session(&source, None)
         .expect("fork should commit");
 
-    let parts_have_no_provider_link = store
-        .list_turns_for_session(&fork.id, None, usize::MAX)
-        .expect("forked turns should be readable")
-        .items
-        .into_iter()
-        .flat_map(|(_, parts)| parts)
-        .all(|part| part.provider_payload_id.is_none() && part.provider_json_pointer.is_none());
-    assert!(
-        parts_have_no_provider_link,
+    assert_eq!(
+        provider_payload_links(&store, &fork.id),
+        0,
         "forked parts must not reference the source's provider payloads"
     );
 }

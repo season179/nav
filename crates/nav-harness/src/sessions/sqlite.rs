@@ -815,39 +815,11 @@ impl SqliteSessionStore {
     }
 
     pub fn get_session(&self, session_id: &SessionId) -> Result<SessionRow, SqliteStoreError> {
-        self.conn
-            .lock()
-            .expect("connection mutex poisoned")
-            .query_row(
-                r#"
-                SELECT
-                    id,
-                    title,
-                    source,
-                    workspace_root,
-                    system_prompt,
-                    settings_json,
-                    parent_id,
-                    version,
-                    slug,
-                    cost,
-                    tokens_input,
-                    tokens_output,
-                    tokens_reasoning,
-                    tokens_cache_read,
-                    tokens_cache_write,
-                    time_archived,
-                    time_compacting,
-                    revert_json,
-                    created_at,
-                    updated_at
-                FROM sessions
-                WHERE id = ?1
-                "#,
-                [session_id.as_str()],
-                read_session_row,
-            )
-            .map_err(|err| read_err(err, "session", session_id.as_str()))
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        read_session_row_by_id(&conn, session_id)?.ok_or_else(|| SqliteStoreError::NotFound {
+            entity: "session",
+            id: session_id.to_string(),
+        })
     }
 
     pub fn update_session_settings(
@@ -939,26 +911,11 @@ impl SqliteSessionStore {
     }
 
     pub fn get_run(&self, run_id: &RunId) -> Result<RunRow, SqliteStoreError> {
-        self.conn
-            .lock()
-            .expect("connection mutex poisoned")
-            .query_row(
-                r#"
-                SELECT
-                    id,
-                    session_id,
-                    status,
-                    trigger,
-                    started_at,
-                    finished_at,
-                    error_json
-                FROM runs
-                WHERE id = ?1
-                "#,
-                [run_id.as_str()],
-                read_run_row,
-            )
-            .map_err(|err| read_err(err, "run", run_id.as_str()))
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        read_run_row_by_id(&conn, run_id)?.ok_or_else(|| SqliteStoreError::NotFound {
+            entity: "run",
+            id: run_id.to_string(),
+        })
     }
 
     pub fn finish_run(
@@ -1030,56 +987,59 @@ impl SqliteSessionStore {
         source: &SessionId,
         through_message: Option<&MessageId>,
     ) -> Result<SessionRow, SqliteStoreError> {
-        let source_row = self.get_session(source)?;
-        let copied = self.turns_through_message(source, through_message)?;
-
         // Stamp every minted id with one timestamp so they sort in allocation
         // order. Turns that share a `created_at` are otherwise tie-broken by id
         // in `list_turns_for_session`, so minting in chronological copy order
         // keeps the forked transcript in the same order as the source.
         let now = current_time_millis();
-        let new_session_id = SessionId::new_unchecked(mint_uuid_v7(now));
 
-        // Map source ids to freshly minted ids, preserving run order of first
-        // appearance so the copied runs keep their original sequencing.
-        let mut new_run_ids: HashMap<RunId, RunId> = HashMap::new();
-        let mut run_order: Vec<RunId> = Vec::new();
-        let mut new_message_ids: HashMap<MessageId, MessageId> = HashMap::new();
-        for (turn, _) in &copied {
-            if !new_run_ids.contains_key(&turn.run_id) {
-                new_run_ids.insert(turn.run_id.clone(), RunId::new_unchecked(mint_uuid_v7(now)));
-                run_order.push(turn.run_id.clone());
+        // `validation` carries a typed error out of the write closure: the
+        // closure can only return `rusqlite::Error`, which `execute_write`
+        // flattens into `WriteFailed`, so domain failures (missing session,
+        // missing message) are stashed here and restored after the call.
+        let mut validation: Option<SqliteStoreError> = None;
+        let forked = self.execute_write(|tx| {
+            validation = None; // execute_write may retry on a busy database.
+
+            // Read the whole source snapshot inside the write transaction so
+            // the fork is point-in-time consistent: BEGIN IMMEDIATE holds the
+            // write lock, so no concurrent writer can change a run or part
+            // between reading the transcript and copying it.
+            let source_row = match read_session_row_by_id(tx, source) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    return fork_abort(
+                        &mut validation,
+                        SqliteStoreError::NotFound {
+                            entity: "session",
+                            id: source.to_string(),
+                        },
+                    );
+                }
+                Err(err) => return fork_abort(&mut validation, err),
+            };
+            let copied = match read_turns_for_fork(tx, source, through_message) {
+                Ok(turns) => turns,
+                Err(err) => return fork_abort(&mut validation, err),
+            };
+
+            // Map source ids to freshly minted ids, preserving run order of
+            // first appearance so the copied runs keep their original sequencing.
+            let new_session_id = SessionId::new_unchecked(mint_uuid_v7(now));
+            let mut new_run_ids: HashMap<RunId, RunId> = HashMap::new();
+            let mut run_order: Vec<RunId> = Vec::new();
+            let mut new_message_ids: HashMap<MessageId, MessageId> = HashMap::new();
+            for (turn, _) in &copied {
+                if !new_run_ids.contains_key(&turn.run_id) {
+                    new_run_ids
+                        .insert(turn.run_id.clone(), RunId::new_unchecked(mint_uuid_v7(now)));
+                    run_order.push(turn.run_id.clone());
+                }
+                new_message_ids
+                    .entry(turn.id.clone())
+                    .or_insert_with(|| MessageId::new_unchecked(mint_uuid_v7(now)));
             }
-            new_message_ids
-                .entry(turn.id.clone())
-                .or_insert_with(|| MessageId::new_unchecked(mint_uuid_v7(now)));
-        }
 
-        let source_runs = run_order
-            .iter()
-            .map(|run_id| self.get_run(run_id))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let prepared_turns = copied
-            .iter()
-            .map(|(turn, parts)| {
-                let mut forked = turn.clone();
-                forked.id = new_message_ids[&turn.id].clone();
-                forked.run_id = new_run_ids[&turn.run_id].clone();
-                forked.meta.parent_id = turn
-                    .meta
-                    .parent_id
-                    .as_ref()
-                    .and_then(|parent| new_message_ids.get(parent).cloned());
-                let part_values = parts
-                    .iter()
-                    .map(|stored| stored.part.clone())
-                    .collect::<Vec<_>>();
-                prepare_turn(&forked, &part_values)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        self.execute_write(|tx| {
             tx.execute(
                 r#"
                 INSERT INTO sessions (
@@ -1110,7 +1070,20 @@ impl SqliteSessionStore {
                 ],
             )?;
 
-            for run in &source_runs {
+            for source_run_id in &run_order {
+                let run = match read_run_row_by_id(tx, source_run_id) {
+                    Ok(Some(run)) => run,
+                    Ok(None) => {
+                        return fork_abort(
+                            &mut validation,
+                            SqliteStoreError::NotFound {
+                                entity: "run",
+                                id: source_run_id.to_string(),
+                            },
+                        );
+                    }
+                    Err(err) => return fork_abort(&mut validation, err),
+                };
                 tx.execute(
                     r#"
                     INSERT INTO runs (
@@ -1125,7 +1098,7 @@ impl SqliteSessionStore {
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                     "#,
                     params![
-                        new_run_ids[&run.id].as_str(),
+                        new_run_ids[source_run_id].as_str(),
                         new_session_id.as_str(),
                         run.status.as_str(),
                         run.trigger.as_deref(),
@@ -1136,39 +1109,34 @@ impl SqliteSessionStore {
                 )?;
             }
 
-            for prepared in &prepared_turns {
-                insert_turn(tx, prepared)?;
+            for (turn, parts) in &copied {
+                let mut forked = turn.clone();
+                forked.id = new_message_ids[&turn.id].clone();
+                forked.run_id = new_run_ids[&turn.run_id].clone();
+                forked.meta.parent_id = turn
+                    .meta
+                    .parent_id
+                    .as_ref()
+                    .and_then(|parent| new_message_ids.get(parent).cloned());
+                let part_values = parts
+                    .iter()
+                    .map(|stored| stored.part.clone())
+                    .collect::<Vec<_>>();
+                let prepared = match prepare_turn(&forked, &part_values) {
+                    Ok(prepared) => prepared,
+                    Err(err) => return fork_abort(&mut validation, err),
+                };
+                insert_turn(tx, &prepared)?;
             }
-            Ok(())
-        })?;
 
-        self.get_session(&new_session_id)
-    }
+            Ok(new_session_id)
+        });
 
-    /// Read `source`'s turns in chronological order, truncated to include
-    /// `through_message` when given. Errors if `through_message` is not part of
-    /// the session.
-    fn turns_through_message(
-        &self,
-        source: &SessionId,
-        through_message: Option<&MessageId>,
-    ) -> Result<Vec<StoredTurn>, SqliteStoreError> {
-        let mut turns = self.list_turns_for_session(source, None, usize::MAX)?.items;
-        turns.reverse();
-
-        let Some(through_message) = through_message else {
-            return Ok(turns);
+        let new_session_id = match forked {
+            Ok(id) => id,
+            Err(write_err) => return Err(validation.unwrap_or(write_err)),
         };
-
-        let cutoff = turns
-            .iter()
-            .position(|(turn, _)| turn.id == *through_message)
-            .ok_or_else(|| SqliteStoreError::NotFound {
-                entity: "message",
-                id: through_message.to_string(),
-            })?;
-        turns.truncate(cutoff + 1);
-        Ok(turns)
+        self.get_session(&new_session_id)
     }
 
     pub fn append_turn(&self, turn: Turn, parts: Vec<Part>) -> Result<(), SqliteStoreError> {
@@ -2392,6 +2360,128 @@ fn read_provider_state(row: &Row<'_>) -> rusqlite::Result<ProviderState> {
         api_kind: row.get("api_kind")?,
         state_json: row.get("state_json")?,
     })
+}
+
+/// Read a single session row by id from any connection (locked handle or open
+/// transaction). Returns `Ok(None)` when no such session exists.
+fn read_session_row_by_id(
+    conn: &Connection,
+    session_id: &SessionId,
+) -> Result<Option<SessionRow>, SqliteStoreError> {
+    conn.query_row(
+        r#"
+        SELECT
+            id,
+            title,
+            source,
+            workspace_root,
+            system_prompt,
+            settings_json,
+            parent_id,
+            version,
+            slug,
+            cost,
+            tokens_input,
+            tokens_output,
+            tokens_reasoning,
+            tokens_cache_read,
+            tokens_cache_write,
+            time_archived,
+            time_compacting,
+            revert_json,
+            created_at,
+            updated_at
+        FROM sessions
+        WHERE id = ?1
+        "#,
+        [session_id.as_str()],
+        read_session_row,
+    )
+    .optional()
+    .map_err(read_query_err)
+}
+
+/// Read a single run row by id from any connection. Returns `Ok(None)` when no
+/// such run exists.
+fn read_run_row_by_id(
+    conn: &Connection,
+    run_id: &RunId,
+) -> Result<Option<RunRow>, SqliteStoreError> {
+    conn.query_row(
+        r#"
+        SELECT
+            id,
+            session_id,
+            status,
+            trigger,
+            started_at,
+            finished_at,
+            error_json
+        FROM runs
+        WHERE id = ?1
+        "#,
+        [run_id.as_str()],
+        read_run_row,
+    )
+    .optional()
+    .map_err(read_query_err)
+}
+
+/// Read `source`'s turns (with parts) in chronological order, truncated to
+/// include `through_message` when given. This is the read half of
+/// [`SqliteSessionStore::fork_session`]; it runs against the open fork
+/// transaction so the snapshot is consistent with the inserts. Errors with
+/// `NotFound` when `through_message` is not part of the session.
+fn read_turns_for_fork(
+    conn: &Connection,
+    source: &SessionId,
+    through_message: Option<&MessageId>,
+) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT t.id, t.run_id, t.seq, t.role, t.meta_json, t.created_at
+            FROM turns t
+            JOIN runs r ON r.id = t.run_id
+            WHERE r.session_id = ?1
+            ORDER BY t.created_at ASC, t.id ASC
+            "#,
+        )
+        .map_err(read_query_err)?;
+    let turns = stmt
+        .query_map([source.as_str()], read_turn)
+        .map_err(read_query_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(read_query_err)?;
+    drop(stmt);
+    let mut turns = collect_parts_for_turns(conn, turns)?;
+
+    let Some(through_message) = through_message else {
+        return Ok(turns);
+    };
+    let cutoff = turns
+        .iter()
+        .position(|(turn, _)| turn.id == *through_message)
+        .ok_or_else(|| SqliteStoreError::NotFound {
+            entity: "message",
+            id: through_message.to_string(),
+        })?;
+    turns.truncate(cutoff + 1);
+    Ok(turns)
+}
+
+/// Stash a typed error for [`SqliteSessionStore::fork_session`] to restore after
+/// the write transaction, and return a sentinel `rusqlite::Error` so the
+/// transaction rolls back. The sentinel text never surfaces — the caller
+/// returns the stashed error instead.
+fn fork_abort<T>(
+    slot: &mut Option<SqliteStoreError>,
+    error: SqliteStoreError,
+) -> rusqlite::Result<T> {
+    *slot = Some(error);
+    // Any non-busy error rolls the transaction back without a retry. The text
+    // is never read: the caller restores the stashed error from `slot`.
+    Err(rusqlite::Error::InvalidQuery)
 }
 
 fn read_session_row(row: &Row<'_>) -> rusqlite::Result<SessionRow> {
