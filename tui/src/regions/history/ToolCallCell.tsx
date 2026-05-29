@@ -22,7 +22,7 @@ export function ToolCallCell({
 	message,
 	maxOutputLines = DEFAULT_MAX_OUTPUT_LINES,
 }: Props): React.JSX.Element {
-	const name = message.name || 'tool';
+	const name = message.name || 'call';
 	const status = toolCallStatus(message.status);
 	const argumentSummary = summarizeToolArguments(message.arguments);
 	const output = toolOutput(message, maxOutputLines);

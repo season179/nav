@@ -1,5 +1,6 @@
 use nav_types::{
-    ApprovalId, EventId, FileChangeId, FileChangeKind, MessageId, RunId, SessionId, ToolCallId,
+    ApprovalId, EventId, FileChangeId, FileChangeKind, MessageId, PartId, RunId, SessionId,
+    ToolCallId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +10,8 @@ pub const BACKEND_EVENT_TYPES: &[&str] = &[
     "model.text_delta",
     "model.reasoning_delta",
     "message.delta",
+    "part.delta",
+    "part.completed",
     "message.completed",
     "tool.call_requested",
     "tool.call_started",
@@ -66,6 +69,15 @@ pub enum BackendEvent {
         message_id: MessageId,
         text: String,
     },
+    #[serde(rename = "part.delta")]
+    PartDelta {
+        turn_id: MessageId,
+        part_id: PartId,
+        field: String,
+        delta: String,
+    },
+    #[serde(rename = "part.completed")]
+    PartCompleted { turn_id: MessageId, part_id: PartId },
     #[serde(rename = "message.completed")]
     MessageCompleted {
         run_id: RunId,
@@ -211,6 +223,8 @@ impl BackendEvent {
             Self::ModelTextDelta { .. } => "model.text_delta",
             Self::ModelReasoningDelta { .. } => "model.reasoning_delta",
             Self::MessageDelta { .. } => "message.delta",
+            Self::PartDelta { .. } => "part.delta",
+            Self::PartCompleted { .. } => "part.completed",
             Self::MessageCompleted { .. } => "message.completed",
             Self::ToolCallRequested { .. } => "tool.call_requested",
             Self::ToolCallStarted { .. } => "tool.call_started",
@@ -289,6 +303,16 @@ mod tests {
                 run_id: run_id(),
                 message_id: message_id(),
                 text: "hello".to_string(),
+            },
+            BackendEvent::PartDelta {
+                turn_id: message_id(),
+                part_id: part_id(),
+                field: "text".to_string(),
+                delta: "hello".to_string(),
+            },
+            BackendEvent::PartCompleted {
+                turn_id: message_id(),
+                part_id: part_id(),
             },
             BackendEvent::MessageCompleted {
                 run_id: run_id(),
@@ -384,6 +408,10 @@ mod tests {
 
     fn tool_call_id() -> ToolCallId {
         ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000003").unwrap()
+    }
+
+    fn part_id() -> PartId {
+        PartId::try_new("prt_0000018bcfe56800_0000000000000001").unwrap()
     }
 
     fn approval_id() -> ApprovalId {

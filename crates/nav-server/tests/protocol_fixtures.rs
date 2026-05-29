@@ -8,7 +8,7 @@ use nav_harness::models::{
 use nav_harness::sessions::{ConfirmationDecision, PendingConfirmation};
 use nav_protocol::{EventEnvelope, JsonRpcRequest, JsonRpcResponse};
 use nav_server::http::{HttpRequest, HttpServer, HttpServerConfig, RunStatus, sse};
-use nav_types::{ApprovalId, FileChangeKind, RunId, ToolCallId};
+use nav_types::{ApprovalId, FileChangeKind, PartId, RunId, ToolCallId};
 use serde_json::{Value, json};
 
 mod support;
@@ -44,6 +44,7 @@ const SSE_FIXTURES: &[&str] = &[
     "event-streams/tool-call-failed.sse",
     "event-streams/tool-approval-requested.sse",
     "event-streams/file-changed.sse",
+    "event-streams/part-delta.sse",
 ];
 
 #[test]
@@ -83,6 +84,8 @@ fn sse_fixtures_are_valid_typed_protocol_events() {
     let mut saw_tool_call_completed = false;
     let mut saw_tool_call_failed = false;
     let mut saw_tool_approval_requested = false;
+    let mut saw_part_delta = false;
+    let mut saw_part_completed = false;
 
     for fixture in SSE_FIXTURES {
         let events = parse_sse(&fixture_text(fixture));
@@ -104,6 +107,8 @@ fn sse_fixtures_are_valid_typed_protocol_events() {
                 "tool.call_completed" => saw_tool_call_completed = true,
                 "tool.call_failed" => saw_tool_call_failed = true,
                 "tool.approval_requested" => saw_tool_approval_requested = true,
+                "part.delta" => saw_part_delta = true,
+                "part.completed" => saw_part_completed = true,
                 _ => {}
             }
         }
@@ -126,6 +131,8 @@ fn sse_fixtures_are_valid_typed_protocol_events() {
         saw_tool_approval_requested,
         "fixtures should cover tool.approval_requested"
     );
+    assert!(saw_part_delta, "fixtures should cover part.delta");
+    assert!(saw_part_completed, "fixtures should cover part.completed");
 }
 
 #[test]
@@ -636,7 +643,11 @@ fn file_changed_fixture_round_trips_every_kind() {
     let kinds: Vec<&str> = events
         .iter()
         .filter(|event| event.name == "file.changed")
-        .map(|event| event.data["kind"].as_str().expect("kind should be a string"))
+        .map(|event| {
+            event.data["kind"]
+                .as_str()
+                .expect("kind should be a string")
+        })
         .collect();
     assert_eq!(kinds, vec!["created", "modified", "deleted"]);
 
@@ -659,6 +670,65 @@ fn file_changed_fixture_round_trips_every_kind() {
             FileChangeKind::Modified,
             FileChangeKind::Deleted,
         ]
+    );
+}
+
+#[test]
+fn part_delta_fixture_round_trips_through_sse_encoder() {
+    let fixture = "event-streams/part-delta.sse";
+    let fixture_body = fixture_text(fixture);
+    let events = parse_sse(&fixture_body);
+
+    let event_sequence: Vec<&str> = events.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        event_sequence,
+        vec![
+            "session.created",
+            "part.delta",
+            "part.delta",
+            "part.delta",
+            "part.completed",
+        ]
+    );
+
+    let envelopes = event_envelopes(events);
+    let encoded = sse::encode_events(&envelopes)
+        .unwrap_or_else(|error| panic!("{fixture} should encode: {error}"));
+    assert_eq!(encoded, fixture_body_with_final_separator(&fixture_body));
+
+    let deltas: Vec<_> = envelopes
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            nav_protocol::BackendEvent::PartDelta {
+                turn_id,
+                part_id,
+                field,
+                delta,
+            } => Some((turn_id, part_id, field.as_str(), delta.as_str())),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(deltas.len(), 3);
+    assert_eq!(deltas[0].2, "text");
+    assert_eq!(deltas[0].3, "hello");
+    assert_eq!(deltas[1].2, "text");
+    assert_eq!(deltas[1].3, " from nav");
+    assert_eq!(deltas[2].2, "arguments");
+    assert_eq!(deltas[2].3, r#"{"path":"fixture.txt"}"#);
+    assert_eq!(deltas[0].0, deltas[1].0);
+    assert_eq!(deltas[0].1, deltas[1].1);
+
+    let completed = envelopes
+        .iter()
+        .find_map(|envelope| match &envelope.event {
+            nav_protocol::BackendEvent::PartCompleted { part_id, .. } => Some(part_id),
+            _ => None,
+        })
+        .expect("fixture should include part.completed");
+    assert_eq!(
+        completed,
+        &PartId::try_new("prt_0000018bcfe56800_0000000000000001").unwrap()
     );
 }
 

@@ -30,6 +30,11 @@ type MessageScopedEvent = RunScopedEvent & {
 	messageId: string;
 };
 
+type PartScopedEvent = NavEventBase & {
+	turnId: string;
+	partId: string;
+};
+
 type ToolScopedEvent = RunScopedEvent & {
 	toolCallId: string;
 };
@@ -46,6 +51,14 @@ export type NavEvent =
 	| (MessageScopedEvent & {
 			type: 'message.delta';
 			text: string;
+	  })
+	| (PartScopedEvent & {
+			type: 'part.delta';
+			field: string;
+			delta: string;
+	  })
+	| (PartScopedEvent & {
+			type: 'part.completed';
 	  })
 	| (MessageScopedEvent & {
 			type: 'message.completed';
@@ -153,6 +166,9 @@ type EventPayload = {
 	type?: string;
 	run_id?: string;
 	message_id?: string;
+	turn_id?: string;
+	part_id?: string;
+	field?: string;
 	finish_reason?: string;
 	tool_call_id?: string;
 	name?: string;
@@ -486,6 +502,8 @@ export function eventText(event: NavEvent): string {
 	switch (event.type) {
 		case 'message.delta':
 			return event.text;
+		case 'part.delta':
+			return event.field === 'text' ? event.delta : '';
 		case 'model.text_delta':
 			return event.delta;
 		case 'model.reasoning_delta':
@@ -787,6 +805,20 @@ function decodeSseEvent(event: SseEventFrame, dataLines: string[]): NavEvent {
 				...messageFields(payload),
 				text: payload.text || '',
 			};
+		case 'part.delta':
+			return {
+				...base,
+				type,
+				...partFields(payload),
+				field: payload.field || '',
+				delta: payload.delta || '',
+			};
+		case 'part.completed':
+			return {
+				...base,
+				type,
+				...partFields(payload),
+			};
 		case 'message.completed':
 			return {
 				...base,
@@ -904,6 +936,15 @@ function messageFields(
 	return {
 		...runFields(payload),
 		messageId: payload.message_id || '',
+	};
+}
+
+function partFields(
+	payload: EventPayload,
+): Pick<PartScopedEvent, 'turnId' | 'partId'> {
+	return {
+		turnId: payload.turn_id || payload.message_id || '',
+		partId: payload.part_id || '',
 	};
 }
 

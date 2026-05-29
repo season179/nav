@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use nav_types::{ApprovalId, EventId, FileChangeId, FileChangeKind, MessageId, RunId, ToolCallId};
+use nav_types::{
+    ApprovalId, EventId, FileChangeId, FileChangeKind, MessageId, PartId, RunId, ToolCallId,
+};
 
 use crate::models::{
     ChatCompletionStreamChoice, ChatCompletionStreamChunk, ChatCompletionStreamEvent,
@@ -41,6 +43,16 @@ pub enum HarnessEvent {
         message_id: MessageId,
         finish_reason: Option<String>,
         metadata: ProviderEventMetadata,
+    },
+    PartDelta {
+        turn_id: MessageId,
+        part_id: PartId,
+        field: String,
+        delta: String,
+    },
+    PartCompleted {
+        turn_id: MessageId,
+        part_id: PartId,
     },
     ToolCallStarted {
         run_id: RunId,
@@ -114,6 +126,8 @@ impl HarnessEvent {
             Self::ModelTextDelta { .. } => "model.text_delta",
             Self::ModelReasoningDelta { .. } => "model.reasoning_delta",
             Self::MessageCompleted { .. } => "message.completed",
+            Self::PartDelta { .. } => "part.delta",
+            Self::PartCompleted { .. } => "part.completed",
             Self::ToolCallStarted { .. } => "tool.call_started",
             Self::ToolCallDelta { .. } => "tool.call_delta",
             Self::ToolOutputDelta { .. } => "tool.output_delta",

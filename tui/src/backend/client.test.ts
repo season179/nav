@@ -38,6 +38,33 @@ describe('parseSse', () => {
 			}),
 		]);
 	});
+
+	test('parses legacy message delta payloads', () => {
+		const events: NavEvent[] = [];
+
+		parseSse(
+			[
+				'id: evt-message-delta',
+				'event: message.delta',
+				'data: {"event_id":"evt-message-delta","session_id":"session-1","type":"message.delta","run_id":"run-1","message_id":"message-1","text":"legacy text"}',
+				'',
+				'',
+			].join('\n'),
+			event => {
+				events.push(event);
+				return false;
+			},
+		);
+
+		expect(events).toEqual([
+			expect.objectContaining({
+				type: 'message.delta',
+				runId: 'run-1',
+				messageId: 'message-1',
+				text: 'legacy text',
+			}),
+		]);
+	});
 });
 
 describe('readSseStream', () => {
@@ -181,6 +208,35 @@ describe('readSseStream', () => {
 			errorMessage: 'command exited with status 7',
 			output: 'partial\n',
 			outputLossy: true,
+		});
+	});
+
+	test('parses part deltas and completion from recorded SSE bytes', async () => {
+		const events = await collectEvents(protocolFixture('part-delta.sse'));
+
+		expect(events.map(event => event.type)).toEqual([
+			'session.created',
+			'part.delta',
+			'part.delta',
+			'part.delta',
+			'part.completed',
+		]);
+		expect(events[1]).toMatchObject({
+			type: 'part.delta',
+			turnId: '019f2f6f-f178-7a72-9f28-000000000102',
+			partId: 'prt_0000018bcfe56800_0000000000000001',
+			field: 'text',
+			delta: 'hello',
+		});
+		expect(events[3]).toMatchObject({
+			type: 'part.delta',
+			partId: 'prt_0000018bcfe56800_0000000000000002',
+			field: 'arguments',
+			delta: '{"path":"fixture.txt"}',
+		});
+		expect(events[4]).toMatchObject({
+			type: 'part.completed',
+			partId: 'prt_0000018bcfe56800_0000000000000001',
 		});
 	});
 });
