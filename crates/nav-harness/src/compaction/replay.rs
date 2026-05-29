@@ -34,7 +34,7 @@ pub fn project_for_replay(turns: &[StoredTurn]) -> Vec<(Turn, Vec<Part>)> {
 }
 
 fn duplicate_tool_result_part_ids(turns: &[StoredTurn]) -> HashSet<PartId> {
-    let mut seen_content: HashSet<&str> = HashSet::new();
+    let mut seen_hashes: HashSet<[u8; 32]> = HashSet::new();
     let mut duplicate_part_ids = HashSet::new();
 
     for (_, parts) in turns.iter().rev() {
@@ -47,7 +47,12 @@ fn duplicate_tool_result_part_ids(turns: &[StoredTurn]) -> HashSet<PartId> {
                 continue;
             };
 
-            if !seen_content.insert(content.as_str()) {
+            let hash: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, content.as_bytes())
+                .as_ref()
+                .try_into()
+                .expect("sha256 is always 32 bytes");
+
+            if !seen_hashes.insert(hash) {
                 duplicate_part_ids.insert(part.id.clone());
             }
         }

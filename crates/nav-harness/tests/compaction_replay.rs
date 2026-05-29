@@ -148,6 +148,174 @@ fn duplicate_tool_result_replays_placeholder_on_older_copy() {
 }
 
 #[test]
+fn different_tool_result_contents_are_not_deduped() {
+    let turns = vec![
+        turn(
+            TurnRole::Assistant,
+            1,
+            vec![stored_part(
+                part_id(1),
+                Part::ToolResult {
+                    call_id: tool_call_id(60),
+                    content: "file version A".to_string(),
+                    raw_artifact_id: None,
+                    is_error: false,
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::Assistant,
+            2,
+            vec![stored_part(
+                part_id(2),
+                Part::ToolResult {
+                    call_id: tool_call_id(61),
+                    content: "file version B".to_string(),
+                    raw_artifact_id: None,
+                    is_error: false,
+                },
+                None,
+            )],
+        ),
+    ];
+
+    let projected = project_for_replay(&turns);
+
+    // Both should be kept as full content — not deduped
+    assert_eq!(
+        projected[0].1[0],
+        Part::ToolResult {
+            call_id: tool_call_id(60),
+            content: "file version A".to_string(),
+            raw_artifact_id: None,
+            is_error: false,
+        }
+    );
+    assert_eq!(
+        projected[1].1[0],
+        Part::ToolResult {
+            call_id: tool_call_id(61),
+            content: "file version B".to_string(),
+            raw_artifact_id: None,
+            is_error: false,
+        }
+    );
+}
+
+#[test]
+fn five_identical_tool_results_leave_one_full_copy_and_four_back_references() {
+    let file_content = "fn main() { println!(\"hello\"); }";
+    let mut stored_turns = Vec::new();
+    for i in 0..5u64 {
+        let call_id = tool_call_id(100 + i);
+        let raw_artifact_id = artifact_id(100 + i);
+        stored_turns.push(turn(
+            TurnRole::Assistant,
+            i as u32,
+            vec![stored_part(
+                part_id(100 + i),
+                Part::ToolResult {
+                    call_id: call_id.clone(),
+                    content: file_content.to_string(),
+                    raw_artifact_id: Some(raw_artifact_id),
+                    is_error: false,
+                },
+                None,
+            )],
+        ));
+    }
+
+    let projected = project_for_replay(&stored_turns);
+
+    // Newest (last) copy kept as full content
+    let last_parts = &projected[4].1;
+    assert_eq!(
+        last_parts[0],
+        Part::ToolResult {
+            call_id: tool_call_id(104),
+            content: file_content.to_string(),
+            raw_artifact_id: Some(artifact_id(104)),
+            is_error: false,
+        },
+        "newest copy should retain full content"
+    );
+
+    // Older 4 copies replaced with back-reference
+    for i in 0..4 {
+        let parts = &projected[i].1;
+        assert_eq!(
+            parts[0],
+            Part::ToolResult {
+                call_id: tool_call_id(100 + i as u64),
+                content: "[Duplicate — see more recent result]".to_string(),
+                raw_artifact_id: Some(artifact_id(100 + i as u64)),
+                is_error: false,
+            },
+            "older copy {i} should be a back-reference"
+        );
+    }
+}
+
+#[test]
+fn compacted_parts_excluded_from_hash_dedup() {
+    let file_content = "shared output";
+    let turns = vec![
+        turn(
+            TurnRole::Assistant,
+            1,
+            vec![stored_part(
+                part_id(1),
+                Part::ToolResult {
+                    call_id: tool_call_id(70),
+                    content: file_content.to_string(),
+                    raw_artifact_id: None,
+                    is_error: false,
+                },
+                Some(1_700_000_000_999), // compacted
+            )],
+        ),
+        turn(
+            TurnRole::Assistant,
+            2,
+            vec![stored_part(
+                part_id(2),
+                Part::ToolResult {
+                    call_id: tool_call_id(71),
+                    content: file_content.to_string(),
+                    raw_artifact_id: None,
+                    is_error: false,
+                },
+                None, // live
+            )],
+        ),
+    ];
+
+    let projected = project_for_replay(&turns);
+
+    // Compacted part gets the compacted placeholder, not the dedup placeholder
+    assert_eq!(
+        projected[0].1[0],
+        Part::ToolResult {
+            call_id: tool_call_id(70),
+            content: "[Old tool result content cleared]".to_string(),
+            raw_artifact_id: None,
+            is_error: false,
+        }
+    );
+    // Live part keeps full content (not marked as duplicate)
+    assert_eq!(
+        projected[1].1[0],
+        Part::ToolResult {
+            call_id: tool_call_id(71),
+            content: file_content.to_string(),
+            raw_artifact_id: None,
+            is_error: false,
+        }
+    );
+}
+
+#[test]
 fn tool_call_argument_projection_truncates_long_strings_without_changing_json_shape() {
     let call_id = tool_call_id(53);
     let raw_arguments_artifact_id = artifact_id(1);
