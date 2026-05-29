@@ -190,6 +190,7 @@ impl ChatGptSubscriptionEncoder {
         &self,
         turns: &[(Turn, Vec<Part>)],
     ) -> Result<ChatGptSubscriptionRequest, std::convert::Infallible> {
+        let metadata = ChatGptSubscriptionMetadata::from_turns(turns);
         let items = turns
             .iter()
             .flat_map(|(turn, parts)| encode_subscription_turn(turn, parts))
@@ -197,20 +198,23 @@ impl ChatGptSubscriptionEncoder {
 
         Ok(ChatGptSubscriptionRequest {
             items,
-            metadata: ChatGptSubscriptionMetadata::from_turns(turns),
-            previous_response_id: self.previous_response_id_for_turns(turns),
+            previous_response_id: self.previous_response_id_for_metadata(&metadata),
+            metadata,
         })
     }
 
-    fn previous_response_id_for_turns(&self, turns: &[(Turn, Vec<Part>)]) -> Option<String> {
-        if self.previous_response_id.is_some() {
-            return self.previous_response_id.clone();
-        }
-
-        let run_id = &turns.first()?.0.run_id;
-        self.provider_state
-            .as_ref()
-            .and_then(|state| previous_response_id_from_provider_state_for_run(state, run_id))
+    fn previous_response_id_for_metadata(
+        &self,
+        metadata: &ChatGptSubscriptionMetadata,
+    ) -> Option<String> {
+        self.previous_response_id.clone().or_else(|| {
+            let run_id = metadata.run_id.as_deref()?;
+            self.provider_state.as_ref().and_then(|state| {
+                (state.run_id.as_str() == run_id)
+                    .then(|| previous_response_id_from_provider_state(state))
+                    .flatten()
+            })
+        })
     }
 }
 
@@ -225,6 +229,7 @@ impl Encoder for ChatGptSubscriptionEncoder {
     type Error = std::convert::Infallible;
 
     fn encode(&self, turns: &[ModelTurn]) -> Result<Self::Request, Self::Error> {
+        let metadata = ChatGptSubscriptionMetadata::from_model_turns(turns);
         let items = turns
             .iter()
             .flat_map(encode_subscription_model_turn)
@@ -232,16 +237,8 @@ impl Encoder for ChatGptSubscriptionEncoder {
 
         Ok(ChatGptSubscriptionRequest {
             items,
-            metadata: ChatGptSubscriptionMetadata {
-                run_id: None,
-                turn_count: turns.len(),
-                last_turn_id: None,
-            },
-            previous_response_id: self.previous_response_id.clone().or_else(|| {
-                self.provider_state
-                    .as_ref()
-                    .and_then(previous_response_id_from_provider_state)
-            }),
+            previous_response_id: self.previous_response_id_for_metadata(&metadata),
+            metadata,
         })
     }
 }
@@ -269,6 +266,14 @@ impl ChatGptSubscriptionMetadata {
             run_id: turns.first().map(|(turn, _)| turn.run_id.to_string()),
             turn_count: turns.len(),
             last_turn_id: turns.last().map(|(turn, _)| turn.id.to_string()),
+        }
+    }
+
+    fn from_model_turns(turns: &[ModelTurn]) -> Self {
+        Self {
+            run_id: None,
+            turn_count: turns.len(),
+            last_turn_id: None,
         }
     }
 }
@@ -475,17 +480,6 @@ fn previous_response_id_from_provider_state(provider_state: &ProviderState) -> O
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
-}
-
-fn previous_response_id_from_provider_state_for_run(
-    provider_state: &ProviderState,
-    run_id: &nav_types::RunId,
-) -> Option<String> {
-    if provider_state.run_id != *run_id {
-        return None;
-    }
-
-    previous_response_id_from_provider_state(provider_state)
 }
 
 fn is_chatgpt_subscription_api_kind(api_kind: &str) -> bool {

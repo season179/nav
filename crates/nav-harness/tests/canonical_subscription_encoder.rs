@@ -333,6 +333,48 @@ fn encoder_trait_preserves_system_turn_role() {
 }
 
 #[test]
+fn encoder_trait_does_not_chain_provider_state_without_run_id() {
+    let provider_state = ProviderState {
+        run_id: run_id(),
+        api_kind: "chatgpt_subscription".to_string(),
+        state_json: r#"{"previous_response_id":"resp_stale"}"#.to_string(),
+    };
+    let turns = vec![ModelTurn::user_text("continue")];
+
+    let request = Encoder::encode(
+        &ChatGptSubscriptionEncoder::new().with_provider_state(Some(&provider_state)),
+        &turns,
+    )
+    .expect("encoding should succeed");
+
+    assert_eq!(request.metadata.run_id, None);
+    assert_eq!(request.previous_response_id, None);
+}
+
+#[test]
+fn encoder_trait_preserves_explicit_previous_response_id_without_run_id() {
+    let provider_state = ProviderState {
+        run_id: run_id(),
+        api_kind: "chatgpt_subscription".to_string(),
+        state_json: r#"{"previous_response_id":"resp_stale"}"#.to_string(),
+    };
+    let turns = vec![ModelTurn::user_text("continue")];
+
+    let request = Encoder::encode(
+        &ChatGptSubscriptionEncoder::new()
+            .with_provider_state(Some(&provider_state))
+            .with_previous_response_id("resp_explicit"),
+        &turns,
+    )
+    .expect("encoding should succeed");
+
+    assert_eq!(
+        request.previous_response_id.as_deref(),
+        Some("resp_explicit")
+    );
+}
+
+#[test]
 fn request_serializes_to_response_style_wire_shape() {
     let call_id =
         ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").expect("test tool call id");
