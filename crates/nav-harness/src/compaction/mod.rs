@@ -2,6 +2,7 @@
 
 pub mod prune;
 pub mod replay;
+pub mod summary;
 
 pub const COMPACTION_REPLAY_TEXT: &str =
     "Context was compacted. Previous conversation history has been summarized.";
