@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nav_types::{MessageId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId, ToolCallId};
+use nav_types::{
+    MessageId, PartId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId, ToolCallId,
+};
 use serde_json::{Value, json};
 
 use crate::compaction::{
@@ -243,6 +245,30 @@ impl SessionStore {
         let summary = summary.into();
 
         self.write_compaction_summary(session_id, request.tail_start_id.clone(), summary)
+    }
+
+    /// Last-resort fallback for unmappable old turns (ENC-10): write the
+    /// compaction summary turn *and* mark every superseded head turn
+    /// `compacted_at`, so history shrinks to [summary + verbatim tail] and the
+    /// dropped turns are visibly accounted for.
+    pub fn compact_session_last_resort(
+        &self,
+        session_id: &SessionId,
+        request: &CompactionSummaryRequest,
+        summary: impl Into<String>,
+    ) -> Result<CompactionBoundary, SqliteStoreError> {
+        let page = self.session_turns_chronological(session_id)?;
+        let boundary = self.write_compaction_summary(
+            session_id,
+            request.tail_start_id.clone(),
+            summary.into(),
+        )?;
+
+        for part_id in superseded_head_part_ids(&page, request.tail_start_id.as_ref()) {
+            self.sqlite.compact_part(&part_id)?;
+        }
+
+        Ok(boundary)
     }
 
     fn write_compaction_summary(
@@ -951,6 +977,19 @@ fn compaction_head_turns(
     head_turns
 }
 
+/// Part ids of every turn that precedes the retained tail. These are the turns
+/// the last-resort summary supersedes; with no tail every existing turn is head.
+fn superseded_head_part_ids(
+    turns: &[StoredTurn],
+    tail_start_id: Option<&MessageId>,
+) -> Vec<PartId> {
+    turns
+        .iter()
+        .take_while(|(turn, _)| tail_start_id != Some(&turn.id))
+        .flat_map(|(_, parts)| parts.iter().map(|part| part.id.clone()))
+        .collect()
+}
+
 fn validate_tail_start_id(
     turns: &[StoredTurn],
     tail_start_id: Option<&MessageId>,
@@ -1387,6 +1426,95 @@ mod tests {
                 "assistant 9",
             ]
         );
+    }
+
+    #[test]
+    fn compact_session_last_resort_marks_superseded_turns_and_replays_summary() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let mut message_ids = Vec::new();
+        for index in 0..6 {
+            let message_id = new_message_id();
+            let turn = if index % 2 == 0 {
+                ModelTurn::user_text(format!("user {index}"))
+            } else {
+                ModelTurn::assistant_text(format!("assistant {index}"))
+            };
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let request = store
+            .compaction_summary_request(&session_id, CompactionConfig::default())
+            .unwrap();
+        let tail_start_id = request.tail_start_id.clone();
+        assert_eq!(tail_start_id, Some(message_ids[4].clone()));
+
+        let boundary = store
+            .compact_session_last_resort(&session_id, &request, "LAST RESORT SUMMARY")
+            .unwrap();
+
+        // Every original head turn (before the retained tail) is marked compacted.
+        let stored_turns = store
+            .sqlite
+            .list_turns_for_session(&session_id, None, usize::MAX)
+            .unwrap()
+            .items;
+        let head_ids: Vec<&MessageId> = message_ids[..4].iter().collect();
+        for (turn, parts) in &stored_turns {
+            if head_ids.contains(&&turn.id) {
+                assert!(
+                    parts.iter().all(|part| part.compacted_at.is_some()),
+                    "superseded head turn {} must be marked compacted_at",
+                    turn.id
+                );
+            }
+        }
+        // The retained tail turns are untouched.
+        let tail = stored_turns
+            .iter()
+            .find(|(turn, _)| turn.id == message_ids[4])
+            .expect("tail-start turn should still exist");
+        assert!(tail.1.iter().all(|part| part.compacted_at.is_none()));
+
+        // Replay grounds in the synthetic summary and the verbatim tail.
+        let replay = store.try_turns(&session_id).unwrap();
+        let replay_text = replay
+            .iter()
+            .map(ModelTurn::text_content)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replay_text,
+            vec![
+                COMPACTION_REPLAY_TEXT,
+                "LAST RESORT SUMMARY",
+                "user 4",
+                "assistant 5",
+            ]
+        );
+
+        // The shrunken history still encodes into a valid provider request.
+        let encoder = crate::models::OpenAiChatCompletionsEncoder::new();
+        let encoded = crate::models::Encoder::encode(&encoder, &replay)
+            .expect("last-resort replay should encode for chat completions");
+        let wire = encoded
+            .messages
+            .iter()
+            .filter_map(|message| message.content.as_ref().map(ToString::to_string))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wire.contains("LAST RESORT SUMMARY"));
+        assert!(wire.contains("assistant 5"));
+
+        // The boundary reports what it superseded.
+        assert_eq!(boundary.tail_start_id, tail_start_id);
     }
 
     #[test]

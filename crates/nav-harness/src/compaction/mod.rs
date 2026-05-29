@@ -1,5 +1,6 @@
 //! Context compaction and replay projection.
 
+pub mod degrade;
 pub mod prune;
 pub mod replay;
 pub mod summary;
