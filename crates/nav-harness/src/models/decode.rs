@@ -1,8 +1,8 @@
-//! Decoder trait: provider response/envelope → canonical `Turn`s.
+//! Decoder trait: provider response/envelope → model request turns.
 
-use crate::sessions::Turn;
+use crate::sessions::ModelTurn;
 
-/// Converts a provider-specific response into canonical conversation turns.
+/// Converts a provider-specific response into model request turns.
 ///
 /// Implementations decide how to extract assistant text, tool calls, and
 /// other turn-level data from whatever envelope the provider returns.
@@ -10,7 +10,7 @@ pub trait Decoder {
     type Response;
     type Error;
 
-    fn decode(&self, response: &Self::Response) -> Result<Vec<Turn>, Self::Error>;
+    fn decode(&self, response: &Self::Response) -> Result<Vec<ModelTurn>, Self::Error>;
 }
 
 #[cfg(test)]
@@ -26,11 +26,13 @@ mod tests {
         type Response = ChatCompletionResponse;
         type Error = std::convert::Infallible;
 
-        fn decode(&self, response: &Self::Response) -> Result<Vec<Turn>, Self::Error> {
+        fn decode(&self, response: &Self::Response) -> Result<Vec<ModelTurn>, Self::Error> {
             Ok(response
                 .choices
                 .iter()
-                .map(|choice| Turn::assistant_text(choice.message.content.clone().unwrap_or_default()))
+                .map(|choice| {
+                    ModelTurn::assistant_text(choice.message.content.clone().unwrap_or_default())
+                })
                 .collect())
         }
     }

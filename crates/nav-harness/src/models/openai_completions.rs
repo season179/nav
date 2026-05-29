@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
-use crate::sessions::{ToolCall, Turn, TurnRole};
+use crate::sessions::{ModelTurn, ModelTurnRole, ToolCall};
 use crate::tools::{NavTool, ToolPreset, ToolRegistry};
 
 use super::{
@@ -50,7 +50,7 @@ impl OpenAiCompletionsRequest {
         Self::new(vec![ChatCompletionRequestMessage::user(content)])
     }
 
-    pub fn from_turns(turns: &[Turn]) -> Self {
+    pub fn from_turns(turns: &[ModelTurn]) -> Self {
         Self::new(
             turns
                 .iter()
@@ -60,7 +60,7 @@ impl OpenAiCompletionsRequest {
     }
 
     pub fn from_turns_with_tools(
-        turns: &[Turn],
+        turns: &[ModelTurn],
         registry: &ToolRegistry,
         preset: ToolPreset,
     ) -> Self {
@@ -194,11 +194,11 @@ impl ChatCompletionRequestMessage {
         }
     }
 
-    fn from_turn(turn: &Turn) -> Self {
+    fn from_turn(turn: &ModelTurn) -> Self {
         match turn.role {
-            TurnRole::System => Self::system(turn.text_content()),
-            TurnRole::User => Self::user(turn.text_content()),
-            TurnRole::Assistant => {
+            ModelTurnRole::System => Self::system(turn.text_content()),
+            ModelTurnRole::User => Self::user(turn.text_content()),
+            ModelTurnRole::Assistant => {
                 let tool_calls = turn
                     .tool_calls()
                     .into_iter()
@@ -213,7 +213,7 @@ impl ChatCompletionRequestMessage {
                     Self::assistant_with_content_and_tool_calls(content, tool_calls)
                 }
             }
-            TurnRole::Tool => {
+            ModelTurnRole::Tool => {
                 Self::tool(turn.tool_call_id().unwrap_or_default(), turn.text_content())
             }
         }

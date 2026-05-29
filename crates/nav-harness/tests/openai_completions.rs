@@ -19,6 +19,7 @@ use nav_harness::models::{
     ProviderCompat, ProviderConfig, ProviderRoutingCompat, ReasoningEffort, ResolveModelError,
     ThinkingFormat,
 };
+use nav_harness::sessions::{ModelTurn, ToolCall};
 use nav_harness::tools::{ToolPreset, ToolRegistry, read};
 use nav_types::{ApprovalId, EventId, MessageId, RunId, ToolCallId};
 use serde_json::json;
@@ -78,7 +79,7 @@ fn encodes_active_preset_tools_into_openai_request() {
     let mut registry = ToolRegistry::default();
     read::register(&mut registry).expect("read should register");
     let request = OpenAiCompletionsRequest::from_turns_with_tools(
-        &[nav_harness::sessions::Turn::user_text("Read Cargo.toml")],
+        &[ModelTurn::user_text("Read Cargo.toml")],
         &registry,
         ToolPreset::Coding,
     );
@@ -1071,8 +1072,8 @@ fn plain_assistant_message_serializes_with_content() {
 #[test]
 fn from_turns_maps_assistant_role_correctly() {
     let turns = vec![
-        nav_harness::sessions::Turn::user_text("Hello"),
-        nav_harness::sessions::Turn::assistant_text("Hi there!"),
+        ModelTurn::user_text("Hello"),
+        ModelTurn::assistant_text("Hi there!"),
     ];
     let request = OpenAiCompletionsRequest::from_turns(&turns);
 
@@ -1093,17 +1094,15 @@ fn from_turns_maps_assistant_role_correctly() {
 
 #[test]
 fn from_turns_maps_assistant_tool_calls_and_tool_results() {
-    use nav_harness::sessions::{ToolCall, Turn};
-
     let turns = vec![
-        Turn::user_text("Read Cargo.toml"),
-        Turn::assistant_tool_calls(vec![ToolCall {
+        ModelTurn::user_text("Read Cargo.toml"),
+        ModelTurn::assistant_tool_calls(vec![ToolCall {
             id: "call_read_1".to_string(),
             tool_call_id: None,
             name: "read".to_string(),
             arguments: r#"{"path":"Cargo.toml"}"#.to_string(),
         }]),
-        Turn::tool_result("call_read_1", "1: [package]\n2: name = \"nav\""),
+        ModelTurn::tool_result("call_read_1", "1: [package]\n2: name = \"nav\""),
     ];
     let request = OpenAiCompletionsRequest::from_turns(&turns);
 
