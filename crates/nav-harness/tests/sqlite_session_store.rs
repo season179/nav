@@ -1800,6 +1800,306 @@ fn update_part_type_change_removes_stale_text_projection() {
     );
 }
 
+// ── FTS-01b: Search indexes and anchored views ──────────────────────────────
+
+#[test]
+fn unicode_fts_search_returns_ranked_hits_across_sessions() {
+    let db = TempDb::new("fts-unicode-ranked");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let quiet_session = session_id("019e7000-0000-7000-8000-000000000480");
+    let quiet_run = run_id("019e7000-0000-7000-8000-000000000481");
+    let loud_session = session_id("019e7000-0000-7000-8000-000000000490");
+    let loud_run = run_id("019e7000-0000-7000-8000-000000000491");
+    start_minimal_run(&store, quiet_session.clone(), quiet_run.clone());
+    start_minimal_run(&store, loud_session.clone(), loud_run.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000482"),
+                run_id: quiet_run,
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_800,
+            },
+            vec![text_part("the nebula appears once")],
+        )
+        .expect("quiet turn append should commit");
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000492"),
+                run_id: loud_run,
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_900,
+            },
+            vec![text_part("nebula nebula nebula signal")],
+        )
+        .expect("loud turn append should commit");
+
+    let hits = store
+        .search_turn_parts("nebula", 10)
+        .expect("unicode search should return hits");
+
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].session_id, loud_session);
+    assert_eq!(hits[1].session_id, quiet_session);
+    assert!(
+        hits[0].rank <= hits[1].rank,
+        "hits should be sorted by best rank first: {hits:?}"
+    );
+    assert!(hits[0].text.contains("nebula"));
+}
+
+#[test]
+fn trigram_fts_search_matches_cjk_substrings() {
+    let db = TempDb::new("fts-trigram-cjk");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-0000000004a0");
+    let run_id = run_id("019e7000-0000-7000-8000-0000000004a1");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-0000000004a2"),
+                run_id,
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 9_000,
+            },
+            vec![text_part("我们在火星基地测试量子导航")],
+        )
+        .expect("turn append should commit");
+
+    let hits = store
+        .search_turn_parts_trigram("星基地", 10)
+        .expect("trigram search should return hits");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, session_id);
+    assert_eq!(hits[0].text, "我们在火星基地测试量子导航");
+}
+
+#[test]
+fn fts_search_stays_in_sync_when_projected_parts_change() {
+    let db = TempDb::new("fts-sync-update-delete");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-0000000004b0");
+    let run_id = run_id("019e7000-0000-7000-8000-0000000004b1");
+    let turn_id = message_id("019e7000-0000-7000-8000-0000000004b2");
+    start_minimal_run(&store, session_id, run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 9_100,
+            },
+            vec![text_part("alpha")],
+        )
+        .expect("turn append should commit");
+    let part_id = store.list_turns_for_run(&run_id).expect("turns readable")[0].1[0]
+        .id
+        .clone();
+
+    assert_eq!(store.search_turn_parts("alpha", 10).unwrap().len(), 1);
+
+    store
+        .update_part_delta(&turn_id, &part_id, "text", " beta")
+        .expect("delta should commit");
+
+    assert_eq!(store.search_turn_parts("beta", 10).unwrap().len(), 1);
+
+    store
+        .remove_part(&turn_id, &part_id)
+        .expect("part removal should commit");
+
+    assert_eq!(store.search_turn_parts("beta", 10).unwrap().len(), 0);
+}
+
+#[test]
+fn fts_indexes_are_searchable_after_reopen() {
+    let db = TempDb::new("fts-reopen");
+    let session_id = session_id("019e7000-0000-7000-8000-0000000004d0");
+    {
+        let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+        let run_id = run_id("019e7000-0000-7000-8000-0000000004d1");
+        start_minimal_run(&store, session_id.clone(), run_id.clone());
+        store
+            .append_turn(
+                Turn {
+                    id: message_id("019e7000-0000-7000-8000-0000000004d2"),
+                    run_id,
+                    seq: 0,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta::default(),
+                    created_at: 9_150,
+                },
+                vec![text_part("reopenable index content")],
+            )
+            .expect("turn append should commit");
+    }
+
+    let reopened = SqliteSessionStore::open(db.path()).expect("reopen should succeed");
+    let hits = reopened
+        .search_turn_parts("reopenable", 10)
+        .expect("reopened unicode index should be searchable");
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].session_id, session_id);
+}
+
+#[test]
+fn fts_search_treats_user_query_as_literal_text() {
+    let db = TempDb::new("fts-literal-query");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-0000000004e0");
+    let run_id = run_id("019e7000-0000-7000-8000-0000000004e1");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-0000000004e2"),
+                run_id,
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 9_175,
+            },
+            vec![text_part("debug the foo-bar C++ parser")],
+        )
+        .expect("turn append should commit");
+
+    let punctuation_hits = store
+        .search_turn_parts("foo-bar", 10)
+        .expect("punctuation query should not be parsed as FTS syntax");
+    let empty_hits = store
+        .search_turn_parts("  ", 10)
+        .expect("empty query should return no hits");
+
+    assert_eq!(punctuation_hits.len(), 1);
+    assert_eq!(punctuation_hits[0].session_id, session_id);
+    assert_eq!(empty_hits.len(), 0);
+}
+
+#[test]
+fn anchored_view_returns_hit_neighbors_and_session_bookends() {
+    let db = TempDb::new("fts-anchored-view");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-0000000004c0");
+    let run_id = run_id("019e7000-0000-7000-8000-0000000004c1");
+    start_minimal_run(&store, session_id, run_id.clone());
+    let messages = [
+        (
+            "019e7000-0000-7000-8000-0000000004c2",
+            TurnRole::User,
+            9_200,
+            "goal: understand storage",
+        ),
+        (
+            "019e7000-0000-7000-8000-0000000004c3",
+            TurnRole::Assistant,
+            9_201,
+            "opening assistant context",
+        ),
+        (
+            "019e7000-0000-7000-8000-0000000004c4",
+            TurnRole::User,
+            9_202,
+            "setup detail not selected",
+        ),
+        (
+            "019e7000-0000-7000-8000-0000000004c5",
+            TurnRole::Assistant,
+            9_203,
+            "before the target",
+        ),
+        (
+            "019e7000-0000-7000-8000-0000000004c6",
+            TurnRole::User,
+            9_204,
+            "needle problem statement",
+        ),
+        (
+            "019e7000-0000-7000-8000-0000000004c7",
+            TurnRole::Assistant,
+            9_205,
+            "after the target",
+        ),
+        (
+            "019e7000-0000-7000-8000-0000000004c8",
+            TurnRole::User,
+            9_206,
+            "resolution check",
+        ),
+        (
+            "019e7000-0000-7000-8000-0000000004c9",
+            TurnRole::Assistant,
+            9_207,
+            "resolution complete",
+        ),
+    ];
+    let turns_with_parts = messages
+        .into_iter()
+        .map(|(id, role, created_at, text)| {
+            (
+                Turn {
+                    id: message_id(id),
+                    run_id: run_id.clone(),
+                    seq: 0,
+                    role,
+                    meta: TurnMeta::default(),
+                    created_at,
+                },
+                vec![text_part(text)],
+            )
+        })
+        .collect::<Vec<_>>();
+
+    store
+        .append_turns(&turns_with_parts)
+        .expect("turn append should commit");
+
+    let hit = store
+        .search_turn_parts("needle", 1)
+        .expect("search should return hit")
+        .pop()
+        .expect("hit should exist");
+    let anchored = store
+        .get_anchored_view(&hit, 1)
+        .expect("anchored view should be readable");
+    let texts = anchored
+        .iter()
+        .map(|(_, parts)| match &parts[0].part {
+            Part::Text { text, .. } => text.as_str(),
+            other => panic!("expected text part, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        texts,
+        vec![
+            "goal: understand storage",
+            "opening assistant context",
+            "before the target",
+            "needle problem statement",
+            "after the target",
+            "resolution check",
+            "resolution complete",
+        ]
+    );
+}
+
 #[test]
 fn decoded_provider_payload_appends_turn_parts_with_provenance_and_status() {
     let data_dir = TempDataDir::new("provider-payload-decoded-turns");

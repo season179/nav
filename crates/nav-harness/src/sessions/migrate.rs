@@ -188,6 +188,59 @@ AFTER DELETE ON turn_parts
 BEGIN
     DELETE FROM turn_parts_text WHERE part_id = OLD.id;
 END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS turn_parts_fts USING fts5(
+    part_id UNINDEXED,
+    turn_id UNINDEXED,
+    text,
+    tokenize='unicode61'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS turn_parts_fts_trigram USING fts5(
+    part_id UNINDEXED,
+    turn_id UNINDEXED,
+    text,
+    tokenize='trigram'
+);
+
+INSERT INTO turn_parts_fts (rowid, part_id, turn_id, text)
+SELECT tpt.rowid, tpt.part_id, tpt.turn_id, tpt.text
+FROM turn_parts_text tpt
+LEFT JOIN turn_parts_fts fts ON fts.rowid = tpt.rowid
+WHERE fts.rowid IS NULL;
+
+INSERT INTO turn_parts_fts_trigram (rowid, part_id, turn_id, text)
+SELECT tpt.rowid, tpt.part_id, tpt.turn_id, tpt.text
+FROM turn_parts_text tpt
+LEFT JOIN turn_parts_fts_trigram fts ON fts.rowid = tpt.rowid
+WHERE fts.rowid IS NULL;
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_fts_insert
+AFTER INSERT ON turn_parts_text
+BEGIN
+    INSERT INTO turn_parts_fts (rowid, part_id, turn_id, text)
+    VALUES (NEW.rowid, NEW.part_id, NEW.turn_id, NEW.text);
+    INSERT INTO turn_parts_fts_trigram (rowid, part_id, turn_id, text)
+    VALUES (NEW.rowid, NEW.part_id, NEW.turn_id, NEW.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_fts_update
+AFTER UPDATE ON turn_parts_text
+BEGIN
+    DELETE FROM turn_parts_fts WHERE rowid = OLD.rowid;
+    DELETE FROM turn_parts_fts_trigram WHERE rowid = OLD.rowid;
+    INSERT INTO turn_parts_fts (rowid, part_id, turn_id, text)
+    VALUES (NEW.rowid, NEW.part_id, NEW.turn_id, NEW.text);
+    INSERT INTO turn_parts_fts_trigram (rowid, part_id, turn_id, text)
+    VALUES (NEW.rowid, NEW.part_id, NEW.turn_id, NEW.text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_turn_parts_fts_delete
+AFTER DELETE ON turn_parts_text
+BEGIN
+    DELETE FROM turn_parts_fts WHERE rowid = OLD.rowid;
+    DELETE FROM turn_parts_fts_trigram WHERE rowid = OLD.rowid;
+END;
 "#;
 
 struct TableSchema {
