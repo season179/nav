@@ -1,6 +1,7 @@
 //! Replay projection tests for compaction-safe provider requests.
 
 use nav_harness::compaction::replay::project_for_replay;
+use nav_harness::compaction::replay::DEFAULT_TAIL_TURNS;
 use nav_harness::models::{
     AnthropicMessagesEncoder, ApiKind, ChatCompletionMessageRole, OpenAiChatCompletionsEncoder,
     OpenAiResponsesEncoder,
@@ -76,7 +77,7 @@ fn compacted_tool_result_replays_placeholder_content() {
         )],
     )];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
 
     assert_eq!(projected.len(), 1);
     assert_eq!(
@@ -125,7 +126,7 @@ fn duplicate_tool_result_replays_placeholder_on_older_copy() {
         ),
     ];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
 
     assert_eq!(
         projected[0].1,
@@ -180,7 +181,7 @@ fn different_tool_result_contents_are_not_deduped() {
         ),
     ];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
 
     // Both should be kept as full content — not deduped
     assert_eq!(
@@ -226,7 +227,7 @@ fn five_identical_tool_results_leave_one_full_copy_and_four_back_references() {
         ));
     }
 
-    let projected = project_for_replay(&stored_turns);
+    let projected = project_all(&stored_turns);
 
     // Newest (last) copy kept as full content
     let last_parts = &projected[4].1;
@@ -290,7 +291,7 @@ fn compacted_parts_excluded_from_hash_dedup() {
         ),
     ];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
 
     // Compacted part gets the compacted placeholder, not the dedup placeholder
     assert_eq!(
@@ -340,7 +341,7 @@ fn tool_call_argument_projection_truncates_long_strings_without_changing_json_sh
         )],
     )];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
     let Part::ToolCall {
         id,
         name,
@@ -387,7 +388,7 @@ fn tool_call_argument_projection_truncates_unspilled_long_strings() {
         )],
     )];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
     let Part::ToolCall { arguments, .. } = &projected[0].1[0] else {
         panic!("expected projected tool call");
     };
@@ -419,7 +420,7 @@ fn tool_call_argument_projection_never_expands_barely_long_strings() {
         )],
     )];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
     let Part::ToolCall { arguments, .. } = &projected[0].1[0] else {
         panic!("expected projected tool call");
     };
@@ -466,7 +467,7 @@ fn image_projection_strips_images_before_latest_image_bearing_user_turn() {
         ),
     ];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
 
     assert_eq!(
         projected[0].1,
@@ -504,7 +505,7 @@ fn provider_opaque_projection_includes_kind_and_artifact_back_reference() {
         )],
     )];
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
 
     assert_eq!(
         projected[0].1,
@@ -522,7 +523,7 @@ fn projected_turns_reencode_to_chat_completions_request() {
     let call_id = tool_call_id(54);
     let turns = tool_call_then_compacted_result_turns(call_id.clone());
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
     let request = OpenAiChatCompletionsEncoder::new()
         .encode(&projected)
         .expect("projected turns should encode");
@@ -548,7 +549,7 @@ fn projected_turns_reencode_to_responses_request() {
     let call_id = tool_call_id(56);
     let turns = tool_call_then_compacted_result_turns(call_id.clone());
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
     let request = OpenAiResponsesEncoder::new()
         .encode(&projected)
         .expect("projected turns should encode");
@@ -568,7 +569,7 @@ fn projected_turns_reencode_to_anthropic_messages_request() {
     let call_id = tool_call_id(57);
     let turns = tool_call_then_compacted_result_turns(call_id.clone());
 
-    let projected = project_for_replay(&turns);
+    let projected = project_all(&turns);
     let request = AnthropicMessagesEncoder::new()
         .encode(&projected)
         .expect("projected turns should encode");
@@ -583,6 +584,177 @@ fn projected_turns_reencode_to_anthropic_messages_request() {
     assert_eq!(
         request.messages[1]["content"][0]["content"],
         "[Old tool result content cleared]"
+    );
+}
+
+/// Helper: call `project_for_replay` with zero tail so all turns are eligible
+/// for compaction transforms (matches the behaviour before the protected-tail
+/// parameter was added).
+fn project_all(turns: &[(Turn, Vec<StoredPart>)]) -> Vec<(Turn, Vec<Part>)> {
+    project_for_replay(turns, 0)
+}
+
+#[test]
+fn protected_tail_turns_skip_argument_truncation() {
+    let long_body = "x".repeat(3_000);
+    // 3 assistant turns, each with a long argument.  tail_turns = 1 means only
+    // the last turn is protected.
+    let turns = vec![
+        turn(
+            TurnRole::Assistant,
+            1,
+            vec![stored_part(
+                part_id(1),
+                Part::ToolCall {
+                    id: tool_call_id(60),
+                    name: "write".to_string(),
+                    arguments: serde_json::json!({"body": long_body.clone()}),
+                    raw_arguments_artifact_id: None,
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::Assistant,
+            2,
+            vec![stored_part(
+                part_id(2),
+                Part::ToolCall {
+                    id: tool_call_id(61),
+                    name: "write".to_string(),
+                    arguments: serde_json::json!({"body": long_body.clone()}),
+                    raw_arguments_artifact_id: None,
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::Assistant,
+            3,
+            vec![stored_part(
+                part_id(3),
+                Part::ToolCall {
+                    id: tool_call_id(62),
+                    name: "write".to_string(),
+                    arguments: serde_json::json!({"body": long_body.clone()}),
+                    raw_arguments_artifact_id: None,
+                },
+                None,
+            )],
+        ),
+    ];
+
+    let projected = project_for_replay(&turns, 1);
+
+    // Turn 1 (outside tail) — truncated
+    let Part::ToolCall { arguments: args1, .. } = &projected[0].1[0] else {
+        panic!("expected tool call");
+    };
+    let body1 = args1["body"].as_str().unwrap();
+    assert!(body1.ends_with("... [truncated]"), "old turn should be truncated");
+    assert!(body1.len() < 3_000);
+
+    // Turn 2 (outside tail) — truncated
+    let Part::ToolCall { arguments: args2, .. } = &projected[1].1[0] else {
+        panic!("expected tool call");
+    };
+    let body2 = args2["body"].as_str().unwrap();
+    assert!(body2.ends_with("... [truncated]"), "middle turn should be truncated");
+
+    // Turn 3 (inside protected tail) — NOT truncated
+    let Part::ToolCall { arguments: args3, .. } = &projected[2].1[0] else {
+        panic!("expected tool call");
+    };
+    let body3 = args3["body"].as_str().unwrap();
+    assert_eq!(body3.len(), 3_000, "tail turn should be untouched");
+    assert!(!body3.ends_with("... [truncated]"));
+}
+
+#[test]
+fn default_tail_turns_is_two() {
+    assert_eq!(DEFAULT_TAIL_TURNS, 2);
+}
+
+#[test]
+fn fifty_kb_write_file_argument_is_truncated_outside_protected_tail() {
+    let big_body = "a".repeat(50 * 1024);
+    let turns = vec![
+        turn(
+            TurnRole::Assistant,
+            1,
+            vec![stored_part(
+                part_id(1),
+                Part::ToolCall {
+                    id: tool_call_id(63),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "src/main.rs",
+                        "content": big_body,
+                    }),
+                    raw_arguments_artifact_id: Some(artifact_id(10)),
+                },
+                None,
+            )],
+        ),
+    ];
+
+    // With tail_turns = 0 (all turns eligible), the 50 KB content is truncated
+    let projected = project_for_replay(&turns, 0);
+
+    let Part::ToolCall {
+        arguments,
+        raw_arguments_artifact_id,
+        ..
+    } = &projected[0].1[0]
+    else {
+        panic!("expected tool call");
+    };
+
+    let content = arguments["content"].as_str().unwrap();
+    assert!(
+        content.ends_with("... [truncated]"),
+        "50 KB content should be truncated"
+    );
+    assert!(content.len() < 50 * 1024);
+    // Original bytes still retrievable via artifact
+    assert!(raw_arguments_artifact_id.is_some());
+}
+
+#[test]
+fn fifty_kb_write_file_argument_preserved_inside_protected_tail() {
+    let big_body = "a".repeat(50 * 1024);
+    let turns = vec![
+        turn(
+            TurnRole::Assistant,
+            1,
+            vec![stored_part(
+                part_id(1),
+                Part::ToolCall {
+                    id: tool_call_id(64),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "src/main.rs",
+                        "content": big_body.clone(),
+                    }),
+                    raw_arguments_artifact_id: Some(artifact_id(11)),
+                },
+                None,
+            )],
+        ),
+    ];
+
+    // With tail_turns = 2 (default), this single turn is in the protected tail
+    let projected = project_for_replay(&turns, 2);
+
+    let Part::ToolCall { arguments, .. } = &projected[0].1[0] else {
+        panic!("expected tool call");
+    };
+
+    let content = arguments["content"].as_str().unwrap();
+    assert_eq!(
+        content.len(),
+        50 * 1024,
+        "50 KB content inside protected tail should be untouched"
     );
 }
 

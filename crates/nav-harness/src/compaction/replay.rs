@@ -13,20 +13,43 @@ const DUPLICATE_TOOL_RESULT_CONTENT: &str = "[Duplicate — see more recent resu
 const STRIPPED_IMAGE_CONTENT: &str = "[Attached image — stripped after compression]";
 const MAX_ARGUMENT_STRING_CHARS: usize = 1024;
 
-pub fn project_for_replay(turns: &[StoredTurn]) -> Vec<(Turn, Vec<Part>)> {
+/// Number of trailing turns whose `ToolCall.arguments` are left untouched
+/// during replay projection.  Set to 2 so the user's most recent tool calls
+/// stay fully visible in the context window.
+pub const DEFAULT_TAIL_TURNS: usize = 2;
+
+/// Project stored turns into replay-ready turns.
+///
+/// `tail_turns` controls how many trailing turns are protected from
+/// argument truncation.  Pass `0` to truncate all turns (useful in tests);
+/// pass [`DEFAULT_TAIL_TURNS`] for the normal production default.
+///
+/// Note: image stripping (replacing old images with placeholders) and
+/// deduplication of tool results operate independently of `tail_turns` —
+/// they apply to the entire turn history based on content, not position.
+pub fn project_for_replay(turns: &[StoredTurn], tail_turns: usize) -> Vec<(Turn, Vec<Part>)> {
     let duplicate_tool_results = duplicate_tool_result_part_ids(turns);
     let latest_image_turn_index = latest_image_bearing_user_turn_index(turns);
+    let truncate_boundary = turns.len().saturating_sub(tail_turns);
 
     turns
         .iter()
         .enumerate()
         .map(|(index, (turn, parts))| {
             let strip_images = latest_image_turn_index.is_some_and(|latest| index < latest);
+            let truncate_arguments = index < truncate_boundary;
             (
                 turn.clone(),
                 parts
                     .iter()
-                    .map(|part| project_stored_part(part, &duplicate_tool_results, strip_images))
+                    .map(|part| {
+                        project_stored_part(
+                            part,
+                            &duplicate_tool_results,
+                            strip_images,
+                            truncate_arguments,
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )
         })
@@ -74,6 +97,7 @@ fn project_stored_part(
     part: &StoredPart,
     duplicate_tool_results: &HashSet<PartId>,
     strip_images: bool,
+    truncate_arguments: bool,
 ) -> Part {
     match &part.part {
         Part::ToolResult {
@@ -95,7 +119,11 @@ fn project_stored_part(
         } => Part::ToolCall {
             id: id.clone(),
             name: name.clone(),
-            arguments: truncate_argument_strings(arguments),
+            arguments: if truncate_arguments {
+                truncate_argument_strings(arguments)
+            } else {
+                arguments.clone()
+            },
             raw_arguments_artifact_id: raw_arguments_artifact_id.clone(),
         },
         Part::Image { .. } if strip_images => Part::Text {
