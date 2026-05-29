@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use nav_harness::sessions::{
     CreateSession, DecodeStatus, NewProviderPayload, Part, ProviderPayloadDirection, RunStatus,
     SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun, TokenDelta, Turn, TurnMeta,
-    TurnRole,
+    TurnPartTextRow, TurnRole,
 };
 use nav_types::{MessageId, RunId, SessionId, ToolCallId};
 
@@ -1022,4 +1022,344 @@ fn pending_provider_payloads_survive_restart_before_decode() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, payload_id);
     assert_eq!(pending[0].decode_status, "pending");
+}
+
+// ── FTS-01a: Text projection layer ──────────────────────────────────────────
+
+#[test]
+fn inserting_text_part_populates_turn_parts_text_projection() {
+    let db = TempDb::new("text-proj-insert-text");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000400");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000401");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000402"),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::User,
+                meta: TurnMeta::default(),
+                created_at: 8_000,
+            },
+            vec![text_part("hello FTS projection")],
+        )
+        .expect("turn append should commit");
+
+    let projections = store
+        .get_turn_parts_text(&session_id)
+        .expect("projection should be readable");
+
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].part_type, "text");
+    assert_eq!(projections[0].text, "hello FTS projection");
+}
+
+#[test]
+fn inserting_tool_result_part_populates_turn_parts_text_with_content() {
+    let db = TempDb::new("text-proj-insert-tool-result");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000410");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000411");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000412"),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_100,
+            },
+            vec![Part::ToolResult {
+                call_id: tool_call_id("019e7000-0000-7000-8000-000000000413"),
+                content: "file contents here".to_string(),
+                raw_artifact_id: None,
+                is_error: false,
+            }],
+        )
+        .expect("turn append should commit");
+
+    let projections = store
+        .get_turn_parts_text(&session_id)
+        .expect("projection should be readable");
+
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].part_type, "tool_result");
+    assert_eq!(projections[0].text, "file contents here");
+}
+
+#[test]
+fn update_part_delta_on_text_keeps_projection_in_sync() {
+    let db = TempDb::new("text-proj-delta");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000420");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000421");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000422");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_200,
+            },
+            vec![text_part("hel")],
+        )
+        .expect("turn append should commit");
+
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns readable")[0]
+        .1[0]
+        .id
+        .clone();
+
+    store
+        .update_part_delta(&turn_id, &part_id, "text", "lo world")
+        .expect("delta should commit");
+
+    let projections = store
+        .get_turn_parts_text(&session_id)
+        .expect("projection should be readable");
+
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].text, "hello world");
+}
+
+#[test]
+fn remove_part_cleans_up_turn_parts_text_projection() {
+    let db = TempDb::new("text-proj-remove");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000430");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000431");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000432");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_300,
+            },
+            vec![
+                text_part("will be removed"),
+                text_part("will stay"),
+            ],
+        )
+        .expect("turn append should commit");
+
+    let parts = store
+        .list_turns_for_run(&run_id)
+        .expect("turns readable")[0]
+        .1
+        .clone();
+
+    // Both parts should be in the projection
+    let projections = store
+        .get_turn_parts_text(&session_id)
+        .expect("projection readable before remove");
+    assert_eq!(projections.len(), 2);
+
+    store
+        .remove_part(&turn_id, &parts[0].id)
+        .expect("part removal should commit");
+
+    let projections = store
+        .get_turn_parts_text(&session_id)
+        .expect("projection readable after remove");
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].text, "will stay");
+}
+
+#[test]
+fn tool_call_image_step_parts_are_excluded_from_text_projection() {
+    let db = TempDb::new("text-proj-excluded");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000440");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000441");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000442"),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_400,
+            },
+            vec![
+                Part::ToolCall {
+                    id: tool_call_id("019e7000-0000-7000-8000-000000000443"),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"cmd": "ls"}),
+                    raw_arguments_artifact_id: None,
+                },
+                Part::StepStart { snapshot: None },
+                Part::StepFinish {
+                    reason: "stop".to_string(),
+                    cost: 0.01,
+                    tokens: nav_harness::sessions::TokenUsage::default(),
+                    snapshot: None,
+                },
+                Part::Compaction {
+                    auto: true,
+                    tail_start_id: None,
+                },
+            ],
+        )
+        .expect("turn append should commit");
+
+    let projections = store
+        .get_turn_parts_text(&session_id)
+        .expect("projection should be readable");
+
+    assert_eq!(projections.len(), 0, "excluded types should not appear in projection");
+}
+
+#[test]
+fn thinking_part_populates_turn_parts_text_with_text_field() {
+    let db = TempDb::new("text-proj-thinking");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000450");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000451");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-000000000452"),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_500,
+            },
+            vec![Part::Thinking {
+                text: "let me reason about this".to_string(),
+                provider_hint: Some("reasoning".to_string()),
+            }],
+        )
+        .expect("turn append should commit");
+
+    let projections = store
+        .get_turn_parts_text(&session_id)
+        .expect("projection should be readable");
+
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].part_type, "thinking");
+    assert_eq!(projections[0].text, "let me reason about this");
+}
+
+#[test]
+fn text_projection_round_trip_insert_update_remove() {
+    let db = TempDb::new("text-proj-round-trip");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000460");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000461");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000462");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_600,
+            },
+            vec![text_part("draft"), text_part("other")],
+        )
+        .expect("turn append should commit");
+
+    let parts = store
+        .list_turns_for_run(&run_id)
+        .expect("turns readable")[0]
+        .1
+        .clone();
+    assert_eq!(store.get_turn_parts_text(&session_id).unwrap().len(), 2);
+
+    // Update via delta
+    store
+        .update_part_delta(&turn_id, &parts[0].id, "text", " revised")
+        .expect("delta should commit");
+    let projections = store.get_turn_parts_text(&session_id).unwrap();
+    assert_eq!(projections.len(), 2);
+    let revised = projections.iter().find(|p| p.text.contains("revised")).unwrap();
+    assert_eq!(revised.text, "draft revised");
+
+    // Remove
+    store
+        .remove_part(&turn_id, &parts[1].id)
+        .expect("remove should commit");
+    assert_eq!(store.get_turn_parts_text(&session_id).unwrap().len(), 1);
+}
+
+#[test]
+fn update_part_type_change_removes_stale_text_projection() {
+    let db = TempDb::new("text-proj-type-change");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000470");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000471");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000472");
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 8_700,
+            },
+            vec![text_part("will become tool call")],
+        )
+        .expect("turn append should commit");
+
+    let part_id = store
+        .list_turns_for_run(&run_id)
+        .expect("turns readable")[0]
+        .1[0]
+        .id
+        .clone();
+
+    assert_eq!(store.get_turn_parts_text(&session_id).unwrap().len(), 1);
+
+    // Change from text (included) to tool_call (excluded)
+    store
+        .update_part(
+            &part_id,
+            Part::ToolCall {
+                id: tool_call_id("019e7000-0000-7000-8000-000000000473"),
+                name: "bash".to_string(),
+                arguments: serde_json::json!({"cmd": "ls"}),
+                raw_arguments_artifact_id: None,
+            },
+        )
+        .expect("part type change should commit");
+
+    let projections = store.get_turn_parts_text(&session_id).unwrap();
+    assert_eq!(
+        projections.len(),
+        0,
+        "stale text projection should be removed after type change"
+    );
 }
