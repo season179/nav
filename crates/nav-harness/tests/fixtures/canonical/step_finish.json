@@ -1,0 +1,1 @@
+{"type":"step_finish","reason":"tool_use","cost":0.125,"tokens":{"input":1,"output":2,"reasoning":3,"cache_read":5,"cache_write":8},"snapshot":"after"}

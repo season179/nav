@@ -249,3 +249,48 @@ fn run_id() -> RunId {
 fn tool_call_id() -> ToolCallId {
     ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap()
 }
+
+fn fixtures_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/canonical")
+}
+
+fn fixture_path(variant: &str) -> std::path::PathBuf {
+    fixtures_dir().join(format!("{}.json", variant))
+}
+
+#[test]
+#[ignore] // run with: cargo test --package nav-harness --test canonical_parts -- generate_fixtures --ignored --nocapture
+fn generate_fixtures() {
+    let dir = fixtures_dir();
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let parts = sample_parts();
+    assert_eq!(parts.len(), 11, "expected 11 sample parts");
+    for (part, variant) in parts.iter().zip(Part::TYPE_NAMES.iter()) {
+        let json = serde_json::to_string(part).expect("serialize");
+        let path = fixture_path(variant);
+        std::fs::write(&path, format!("{}\n", json)).expect("write fixture");
+        println!("wrote {}", path.display());
+    }
+}
+
+#[test]
+fn each_variant_fixture_round_trips_verbatim() {
+    for variant in &Part::TYPE_NAMES {
+        let path = fixture_path(variant);
+        let fixture = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("missing fixture: {}", path.display()));
+
+        let part: Part = serde_json::from_str(&fixture)
+            .unwrap_or_else(|e| panic!("deserialize failed for {}: {}", variant, e));
+
+        let round_tripped = serde_json::to_string(&part)
+            .unwrap_or_else(|e| panic!("serialize failed for {}: {}", variant, e));
+
+        assert_eq!(
+            fixture.trim(),
+            round_tripped,
+            "fixture {} does not survive round-trip",
+            variant,
+        );
+    }
+}
