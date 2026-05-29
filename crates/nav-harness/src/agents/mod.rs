@@ -1,5 +1,7 @@
 //! Agent roles, loops, delegation, task state, and autonomy limits.
 
+pub mod auto_title;
+
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -527,9 +529,18 @@ fn next_turn_created_at(
 }
 
 fn api_kind_name(model: &ResolvedModelConfig) -> &'static str {
-    match model.api {
+    persisted_api_kind_name(model.api)
+}
+
+fn persisted_api_kind_name(api: crate::models::ApiKind) -> &'static str {
+    match api {
         crate::models::ApiKind::OpenAiCompletions => "openai-completions",
+        // The run loop still journals chat-completions envelopes for this
+        // provider path; use the matching recovery decoder until subscription
+        // event payloads are journaled here.
+        crate::models::ApiKind::ChatGptSubscription => "openai-completions",
         crate::models::ApiKind::OpenAiResponses => "openai-responses",
+        crate::models::ApiKind::AnthropicMessages => "anthropic-messages",
     }
 }
 
@@ -1604,6 +1615,22 @@ mod tests {
             name: name.to_string(),
             arguments: arguments.to_string(),
         }
+    }
+
+    #[test]
+    fn persisted_api_kind_matches_journaled_payload_shape() {
+        assert_eq!(
+            persisted_api_kind_name(crate::models::ApiKind::OpenAiCompletions),
+            "openai-completions"
+        );
+        assert_eq!(
+            persisted_api_kind_name(crate::models::ApiKind::ChatGptSubscription),
+            "openai-completions"
+        );
+        assert_eq!(
+            persisted_api_kind_name(crate::models::ApiKind::OpenAiResponses),
+            "openai-responses"
+        );
     }
 
     #[test]

@@ -484,6 +484,7 @@ dependencies = [
 name = "nav-harness"
 version = "26.5.12"
 dependencies = [
+ "base64",
  "libc",
  "nav-types",
  "reqwest",

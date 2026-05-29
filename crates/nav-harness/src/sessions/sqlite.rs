@@ -6,6 +6,7 @@
 //! through `BEGIN IMMEDIATE` with jittered retry to avoid convoy effects.
 //! Artifact blob persistence and canonical turn/part persistence also live here.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ const JITTER_MAX_MS: u64 = 150;
 /// Run `wal_checkpoint(PASSIVE)` once every this many committed writes.
 const CHECKPOINT_INTERVAL: u64 = 50;
 static PART_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static FORK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Journal mode the connection ended up using after [`SqliteSessionStore::open`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +251,17 @@ pub struct ProviderState {
     pub run_id: RunId,
     pub api_kind: String,
     pub state_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RevertInfo {
+    pub message_id: MessageId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_id: Option<PartId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -813,39 +826,11 @@ impl SqliteSessionStore {
     }
 
     pub fn get_session(&self, session_id: &SessionId) -> Result<SessionRow, SqliteStoreError> {
-        self.conn
-            .lock()
-            .expect("connection mutex poisoned")
-            .query_row(
-                r#"
-                SELECT
-                    id,
-                    title,
-                    source,
-                    workspace_root,
-                    system_prompt,
-                    settings_json,
-                    parent_id,
-                    version,
-                    slug,
-                    cost,
-                    tokens_input,
-                    tokens_output,
-                    tokens_reasoning,
-                    tokens_cache_read,
-                    tokens_cache_write,
-                    time_archived,
-                    time_compacting,
-                    revert_json,
-                    created_at,
-                    updated_at
-                FROM sessions
-                WHERE id = ?1
-                "#,
-                [session_id.as_str()],
-                read_session_row,
-            )
-            .map_err(|err| read_err(err, "session", session_id.as_str()))
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        read_session_row_by_id(&conn, session_id)?.ok_or_else(|| SqliteStoreError::NotFound {
+            entity: "session",
+            id: session_id.to_string(),
+        })
     }
 
     pub fn update_session_settings(
@@ -861,6 +846,46 @@ impl SqliteSessionStore {
                     settings.updated_at,
                     session_id.as_str()
                 ],
+            )
+        })?;
+        ensure_row_changed(changed, "session", session_id.as_str())
+    }
+
+    pub fn update_session_title(
+        &self,
+        session_id: &SessionId,
+        title: &str,
+    ) -> Result<(), SqliteStoreError> {
+        let now = unix_millis();
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![title, now, session_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "session", session_id.as_str())
+    }
+
+    pub fn update_session_revert(
+        &self,
+        session_id: &SessionId,
+        revert: &RevertInfo,
+    ) -> Result<(), SqliteStoreError> {
+        let revert_json = serialize_json(revert)?;
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "UPDATE sessions SET revert_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![revert_json.as_str(), unix_millis(), session_id.as_str()],
+            )
+        })?;
+        ensure_row_changed(changed, "session", session_id.as_str())
+    }
+
+    pub fn clear_session_revert(&self, session_id: &SessionId) -> Result<(), SqliteStoreError> {
+        let changed = self.execute_write(|tx| {
+            tx.execute(
+                "UPDATE sessions SET revert_json = NULL, updated_at = ?1 WHERE id = ?2",
+                params![unix_millis(), session_id.as_str()],
             )
         })?;
         ensure_row_changed(changed, "session", session_id.as_str())
@@ -937,26 +962,11 @@ impl SqliteSessionStore {
     }
 
     pub fn get_run(&self, run_id: &RunId) -> Result<RunRow, SqliteStoreError> {
-        self.conn
-            .lock()
-            .expect("connection mutex poisoned")
-            .query_row(
-                r#"
-                SELECT
-                    id,
-                    session_id,
-                    status,
-                    trigger,
-                    started_at,
-                    finished_at,
-                    error_json
-                FROM runs
-                WHERE id = ?1
-                "#,
-                [run_id.as_str()],
-                read_run_row,
-            )
-            .map_err(|err| read_err(err, "run", run_id.as_str()))
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        read_run_row_by_id(&conn, run_id)?.ok_or_else(|| SqliteStoreError::NotFound {
+            entity: "run",
+            id: run_id.to_string(),
+        })
     }
 
     pub fn finish_run(
@@ -1005,6 +1015,179 @@ impl SqliteSessionStore {
             ))),
             Err(err) => Err(err),
         }
+    }
+
+    /// Fork `source` into a brand-new session, copying its turns (and their
+    /// parts) up to and including `through_message`. When `through_message` is
+    /// `None` the whole transcript is copied.
+    ///
+    /// The fork is a fresh replay ledger: every session, run, turn, and part
+    /// gets a new id, the session's `parent_id` chains back to `source` so the
+    /// lineage is walkable, and the source's settings (model selection) are
+    /// copied while cost/token aggregates reset to zero. `TurnMeta.parent_id`
+    /// references are remapped to the new message ids so the message chain
+    /// stays internally consistent inside the fork.
+    ///
+    /// Parts are copied by value: their provider-payload linkage
+    /// (`provider_payload_id`/`provider_json_pointer`) and compaction state are
+    /// intentionally dropped, because the `provider_payloads` rows belong to the
+    /// source session and are not cloned. The fork is a clean canonical ledger,
+    /// not a replica of the source's provider journal.
+    pub fn fork_session(
+        &self,
+        source: &SessionId,
+        through_message: Option<&MessageId>,
+    ) -> Result<SessionRow, SqliteStoreError> {
+        // Stamp every minted id with one timestamp so they sort in allocation
+        // order. Turns that share a `created_at` are otherwise tie-broken by id
+        // in `list_turns_for_session`, so minting in chronological copy order
+        // keeps the forked transcript in the same order as the source.
+        let now = current_time_millis();
+
+        // `validation` carries a typed error out of the write closure: the
+        // closure can only return `rusqlite::Error`, which `execute_write`
+        // flattens into `WriteFailed`, so domain failures (missing session,
+        // missing message) are stashed here and restored after the call.
+        let mut validation: Option<SqliteStoreError> = None;
+        let forked = self.execute_write(|tx| {
+            validation = None; // execute_write may retry on a busy database.
+
+            // Read the whole source snapshot inside the write transaction so
+            // the fork is point-in-time consistent: BEGIN IMMEDIATE holds the
+            // write lock, so no concurrent writer can change a run or part
+            // between reading the transcript and copying it.
+            let source_row = match read_session_row_by_id(tx, source) {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    return fork_abort(
+                        &mut validation,
+                        SqliteStoreError::NotFound {
+                            entity: "session",
+                            id: source.to_string(),
+                        },
+                    );
+                }
+                Err(err) => return fork_abort(&mut validation, err),
+            };
+            let copied = match read_turns_for_fork(tx, source, through_message) {
+                Ok(turns) => turns,
+                Err(err) => return fork_abort(&mut validation, err),
+            };
+
+            // Map source ids to freshly minted ids, preserving run order of
+            // first appearance so the copied runs keep their original sequencing.
+            let new_session_id = SessionId::new_unchecked(mint_uuid_v7(now));
+            let mut new_run_ids: HashMap<RunId, RunId> = HashMap::new();
+            let mut run_order: Vec<RunId> = Vec::new();
+            let mut new_message_ids: HashMap<MessageId, MessageId> = HashMap::new();
+            for (turn, _) in &copied {
+                if !new_run_ids.contains_key(&turn.run_id) {
+                    new_run_ids
+                        .insert(turn.run_id.clone(), RunId::new_unchecked(mint_uuid_v7(now)));
+                    run_order.push(turn.run_id.clone());
+                }
+                new_message_ids
+                    .entry(turn.id.clone())
+                    .or_insert_with(|| MessageId::new_unchecked(mint_uuid_v7(now)));
+            }
+
+            tx.execute(
+                r#"
+                INSERT INTO sessions (
+                    id,
+                    title,
+                    source,
+                    workspace_root,
+                    system_prompt,
+                    settings_json,
+                    parent_id,
+                    version,
+                    slug,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9)
+                "#,
+                params![
+                    new_session_id.as_str(),
+                    source_row.title.as_deref(),
+                    source_row.source.as_str(),
+                    source_row.workspace_root.as_deref(),
+                    source_row.system_prompt.as_deref(),
+                    source_row.settings_json.as_str(),
+                    source.as_str(),
+                    source_row.version.as_str(),
+                    now as i64,
+                ],
+            )?;
+
+            for source_run_id in &run_order {
+                let run = match read_run_row_by_id(tx, source_run_id) {
+                    Ok(Some(run)) => run,
+                    Ok(None) => {
+                        return fork_abort(
+                            &mut validation,
+                            SqliteStoreError::NotFound {
+                                entity: "run",
+                                id: source_run_id.to_string(),
+                            },
+                        );
+                    }
+                    Err(err) => return fork_abort(&mut validation, err),
+                };
+                tx.execute(
+                    r#"
+                    INSERT INTO runs (
+                        id,
+                        session_id,
+                        status,
+                        trigger,
+                        started_at,
+                        finished_at,
+                        error_json
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "#,
+                    params![
+                        new_run_ids[source_run_id].as_str(),
+                        new_session_id.as_str(),
+                        run.status.as_str(),
+                        run.trigger.as_deref(),
+                        run.started_at,
+                        run.finished_at,
+                        run.error_json.as_deref(),
+                    ],
+                )?;
+            }
+
+            for (turn, parts) in &copied {
+                let mut forked = turn.clone();
+                forked.id = new_message_ids[&turn.id].clone();
+                forked.run_id = new_run_ids[&turn.run_id].clone();
+                forked.meta.parent_id = turn
+                    .meta
+                    .parent_id
+                    .as_ref()
+                    .and_then(|parent| new_message_ids.get(parent).cloned());
+                let part_values = parts
+                    .iter()
+                    .map(|stored| stored.part.clone())
+                    .collect::<Vec<_>>();
+                let prepared = match prepare_turn(&forked, &part_values) {
+                    Ok(prepared) => prepared,
+                    Err(err) => return fork_abort(&mut validation, err),
+                };
+                insert_turn(tx, &prepared)?;
+            }
+
+            Ok(new_session_id)
+        });
+
+        let new_session_id = match forked {
+            Ok(id) => id,
+            Err(write_err) => return Err(validation.unwrap_or(write_err)),
+        };
+        self.get_session(&new_session_id)
     }
 
     pub fn append_turn(&self, turn: Turn, parts: Vec<Part>) -> Result<(), SqliteStoreError> {
@@ -1801,6 +1984,38 @@ fn generate_part_id(created_at: i64) -> PartId {
     PartId::new_unchecked(format!("prt_{timestamp:016x}_{entropy:016x}"))
 }
 
+/// Mint a fresh UUIDv7 string for forked sessions, runs, and messages, stamped
+/// with the caller-supplied `timestamp_ms`.
+///
+/// Ids minted with the same timestamp sort in allocation order: the process id
+/// lands in the high (`rand_a`) bits so concurrent processes writing the same
+/// database do not collide, and a per-process monotonic counter lands in the
+/// low (`rand_b`) bits so back-to-back ids stay strictly increasing. A single
+/// `fork_session` call passes one timestamp for every id it mints, so the copy
+/// order is preserved when turns sharing a `created_at` are tie-broken by id.
+///
+/// The counter occupies the low 62 bits of `rand_b`; ordering and uniqueness
+/// hold until it wraps at 2^62 (~146k years at 1M ids/sec), so do not widen its
+/// role assuming 64-bit headroom. Cross-process uniqueness is best-effort (only
+/// the low 12 pid bits separate processes), so concurrent forks of the same
+/// database rely on the insert's PRIMARY KEY conflict rolling the transaction
+/// back cleanly, not on globally unique ids.
+fn mint_uuid_v7(timestamp_ms: u64) -> String {
+    let timestamp = timestamp_ms & 0xffff_ffff_ffff;
+    let counter = FORK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let rand_a = (u64::from(std::process::id()) & 0x0fff) as u16;
+    let rand_b_high = ((counter >> 48) & 0x3fff) as u16;
+    let rand_b_low = counter & 0xffff_ffff_ffff;
+    format!(
+        "{:08x}-{:04x}-7{:03x}-{:04x}-{:012x}",
+        (timestamp >> 16) as u32,
+        (timestamp & 0xffff) as u16,
+        rand_a,
+        0x8000 | rand_b_high,
+        rand_b_low
+    )
+}
+
 fn current_time_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2198,6 +2413,128 @@ fn read_provider_state(row: &Row<'_>) -> rusqlite::Result<ProviderState> {
     })
 }
 
+/// Read a single session row by id from any connection (locked handle or open
+/// transaction). Returns `Ok(None)` when no such session exists.
+fn read_session_row_by_id(
+    conn: &Connection,
+    session_id: &SessionId,
+) -> Result<Option<SessionRow>, SqliteStoreError> {
+    conn.query_row(
+        r#"
+        SELECT
+            id,
+            title,
+            source,
+            workspace_root,
+            system_prompt,
+            settings_json,
+            parent_id,
+            version,
+            slug,
+            cost,
+            tokens_input,
+            tokens_output,
+            tokens_reasoning,
+            tokens_cache_read,
+            tokens_cache_write,
+            time_archived,
+            time_compacting,
+            revert_json,
+            created_at,
+            updated_at
+        FROM sessions
+        WHERE id = ?1
+        "#,
+        [session_id.as_str()],
+        read_session_row,
+    )
+    .optional()
+    .map_err(read_query_err)
+}
+
+/// Read a single run row by id from any connection. Returns `Ok(None)` when no
+/// such run exists.
+fn read_run_row_by_id(
+    conn: &Connection,
+    run_id: &RunId,
+) -> Result<Option<RunRow>, SqliteStoreError> {
+    conn.query_row(
+        r#"
+        SELECT
+            id,
+            session_id,
+            status,
+            trigger,
+            started_at,
+            finished_at,
+            error_json
+        FROM runs
+        WHERE id = ?1
+        "#,
+        [run_id.as_str()],
+        read_run_row,
+    )
+    .optional()
+    .map_err(read_query_err)
+}
+
+/// Read `source`'s turns (with parts) in chronological order, truncated to
+/// include `through_message` when given. This is the read half of
+/// [`SqliteSessionStore::fork_session`]; it runs against the open fork
+/// transaction so the snapshot is consistent with the inserts. Errors with
+/// `NotFound` when `through_message` is not part of the session.
+fn read_turns_for_fork(
+    conn: &Connection,
+    source: &SessionId,
+    through_message: Option<&MessageId>,
+) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT t.id, t.run_id, t.seq, t.role, t.meta_json, t.created_at
+            FROM turns t
+            JOIN runs r ON r.id = t.run_id
+            WHERE r.session_id = ?1
+            ORDER BY t.created_at ASC, t.id ASC
+            "#,
+        )
+        .map_err(read_query_err)?;
+    let turns = stmt
+        .query_map([source.as_str()], read_turn)
+        .map_err(read_query_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(read_query_err)?;
+    drop(stmt);
+    let mut turns = collect_parts_for_turns(conn, turns)?;
+
+    let Some(through_message) = through_message else {
+        return Ok(turns);
+    };
+    let cutoff = turns
+        .iter()
+        .position(|(turn, _)| turn.id == *through_message)
+        .ok_or_else(|| SqliteStoreError::NotFound {
+            entity: "message",
+            id: through_message.to_string(),
+        })?;
+    turns.truncate(cutoff + 1);
+    Ok(turns)
+}
+
+/// Stash a typed error for [`SqliteSessionStore::fork_session`] to restore after
+/// the write transaction, and return a sentinel `rusqlite::Error` so the
+/// transaction rolls back. The sentinel text never surfaces — the caller
+/// returns the stashed error instead.
+fn fork_abort<T>(
+    slot: &mut Option<SqliteStoreError>,
+    error: SqliteStoreError,
+) -> rusqlite::Result<T> {
+    *slot = Some(error);
+    // Any non-busy error rolls the transaction back without a retry. The text
+    // is never read: the caller restores the stashed error from `slot`.
+    Err(rusqlite::Error::InvalidQuery)
+}
+
 fn read_session_row(row: &Row<'_>) -> rusqlite::Result<SessionRow> {
     let id: String = row.get("id")?;
     let parent_id: Option<String> = row.get("parent_id")?;
@@ -2394,6 +2731,29 @@ impl std::error::Error for SqliteStoreError {}
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn mint_uuid_v7_is_monotonic_within_one_timestamp() {
+        let timestamp = 1_700_000_000_000;
+        let ids: Vec<String> = (0..1_000).map(|_| mint_uuid_v7(timestamp)).collect();
+
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(
+            ids, sorted,
+            "ids minted with one timestamp must sort in allocation order"
+        );
+
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "minted ids must be unique");
+
+        for id in &ids {
+            assert!(
+                nav_types::SessionId::try_new(id.clone()).is_ok(),
+                "minted id {id} must be a valid UUIDv7"
+            );
+        }
+    }
 
     /// A unique temp database path that removes the file and its WAL sidecars
     /// (`-wal`, `-shm`) on drop — even if the test panics. Declare it before the

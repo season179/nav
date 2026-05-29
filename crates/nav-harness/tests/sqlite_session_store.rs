@@ -7,10 +7,10 @@ use nav_harness::models::{
 };
 use nav_harness::sessions::{
     CreateSession, DecodeStatus, NewProviderPayload, Part, ProviderPayloadDirection, ProviderState,
-    RunStatus, SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun, TokenDelta,
-    TokenUsage, Turn, TurnMeta, TurnRole,
+    RevertInfo, RunStatus, SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun,
+    TokenDelta, TokenUsage, Turn, TurnMeta, TurnRole,
 };
-use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId, ToolCallId};
+use nav_types::{MessageId, PartId, ProviderPayloadId, RunId, SessionId, ToolCallId};
 
 struct TempDb {
     path: PathBuf,
@@ -830,6 +830,64 @@ fn sessions_can_be_created_read_and_settings_updated() {
     assert_eq!(updated.settings_json, r#"{"model":"new"}"#);
     assert_eq!(updated.created_at, 1_000);
     assert_eq!(updated.updated_at, 1_500);
+}
+
+#[test]
+fn update_session_revert_persists_reversible_assistant_turn_metadata() {
+    let db = TempDb::new("session-revert");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000538");
+    create_minimal_session(&store, session_id.clone());
+    let revert = RevertInfo {
+        message_id: message_id("019e7000-0000-7000-8000-000000000539"),
+        part_id: Some(PartId::new_unchecked(
+            "prt_0000018bcfe56800_0000000000000539",
+        )),
+        snapshot: Some("snapshot-before-assistant-turn".to_string()),
+        diff: Some("diff --git a/file.txt b/file.txt\n+assistant change\n".to_string()),
+    };
+
+    store
+        .update_session_revert(&session_id, &revert)
+        .expect("revert metadata update should commit");
+
+    let session = store
+        .get_session(&session_id)
+        .expect("updated session should be readable");
+    let revert_json = session
+        .revert_json
+        .expect("revert metadata should be present");
+    let stored: RevertInfo =
+        serde_json::from_str(&revert_json).expect("revert metadata should decode");
+
+    assert_eq!(stored, revert);
+}
+
+#[test]
+fn clear_session_revert_removes_reversible_assistant_turn_metadata() {
+    let db = TempDb::new("session-revert-clear");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000540");
+    create_minimal_session(&store, session_id.clone());
+    let revert = RevertInfo {
+        message_id: message_id("019e7000-0000-7000-8000-000000000541"),
+        part_id: None,
+        snapshot: Some("snapshot-before-continue".to_string()),
+        diff: Some("diff --git a/file.txt b/file.txt\n+assistant change\n".to_string()),
+    };
+    store
+        .update_session_revert(&session_id, &revert)
+        .expect("revert metadata update should commit");
+
+    store
+        .clear_session_revert(&session_id)
+        .expect("revert metadata clear should commit");
+
+    let session = store
+        .get_session(&session_id)
+        .expect("updated session should be readable");
+
+    assert_eq!(session.revert_json, None);
 }
 
 #[test]
@@ -2051,5 +2109,509 @@ fn decoded_provider_payload_save_failure_does_not_commit_turns() {
             .list_turns_for_run(&run_id)
             .expect("turns should be readable")
             .is_empty()
+    );
+}
+
+// --- OPS-01: fork_session ---------------------------------------------------
+
+/// Seed a source session with two runs of conversation so fork tests have a
+/// realistic lineage to copy. Returns the source session id plus the ordered
+/// message ids that were appended.
+fn seed_forkable_session(store: &SqliteSessionStore) -> (SessionId, Vec<MessageId>) {
+    let source = session_id("019e7000-0000-7000-8000-0000000004a0");
+    store
+        .create_session(
+            source.clone(),
+            CreateSession {
+                title: Some("source".to_string()),
+                source: "cli".to_string(),
+                workspace_root: Some("/work".to_string()),
+                system_prompt: Some("be helpful".to_string()),
+                settings_json: r#"{"model":"claude-opus"}"#.to_string(),
+                parent_id: None,
+                version: "test-version".to_string(),
+                slug: Some("source-slug".to_string()),
+                created_at: 1_000,
+            },
+        )
+        .expect("source session create should commit");
+
+    let run_one = run_id("019e7000-0000-7000-8000-0000000004a1");
+    store
+        .start_run(StartRun {
+            id: run_one.clone(),
+            session_id: source.clone(),
+            status: RunStatus::Running,
+            trigger: Some("user".to_string()),
+            started_at: 2_000,
+        })
+        .expect("run one start should commit");
+
+    let user_one = message_id("019e7000-0000-7000-8000-0000000004b1");
+    let assistant_one = message_id("019e7000-0000-7000-8000-0000000004b2");
+    store
+        .append_turns(&[
+            (
+                Turn {
+                    id: user_one.clone(),
+                    run_id: run_one.clone(),
+                    seq: 0,
+                    role: TurnRole::User,
+                    meta: TurnMeta::default(),
+                    created_at: 3_000,
+                },
+                vec![text_part("hello")],
+            ),
+            (
+                Turn {
+                    id: assistant_one.clone(),
+                    run_id: run_one.clone(),
+                    seq: 0,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta {
+                        parent_id: Some(user_one.clone()),
+                        ..TurnMeta::default()
+                    },
+                    created_at: 3_100,
+                },
+                vec![text_part("hi there")],
+            ),
+        ])
+        .expect("run one turns should commit");
+
+    let run_two = run_id("019e7000-0000-7000-8000-0000000004a2");
+    store
+        .start_run(StartRun {
+            id: run_two.clone(),
+            session_id: source.clone(),
+            status: RunStatus::Running,
+            trigger: Some("user".to_string()),
+            started_at: 4_000,
+        })
+        .expect("run two start should commit");
+
+    let user_two = message_id("019e7000-0000-7000-8000-0000000004b3");
+    let assistant_two = message_id("019e7000-0000-7000-8000-0000000004b4");
+    store
+        .append_turns(&[
+            (
+                Turn {
+                    id: user_two.clone(),
+                    run_id: run_two.clone(),
+                    seq: 0,
+                    role: TurnRole::User,
+                    meta: TurnMeta::default(),
+                    created_at: 5_000,
+                },
+                vec![text_part("more")],
+            ),
+            (
+                Turn {
+                    id: assistant_two.clone(),
+                    run_id: run_two.clone(),
+                    seq: 0,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta {
+                        parent_id: Some(user_two.clone()),
+                        ..TurnMeta::default()
+                    },
+                    created_at: 5_100,
+                },
+                vec![text_part("even more")],
+            ),
+        ])
+        .expect("run two turns should commit");
+
+    // Cost on the source must not leak into the fork.
+    store
+        .update_session_cost(&source, 1.25, token_delta(10, 20, 0, 0, 0))
+        .expect("source cost update should commit");
+
+    (
+        source,
+        vec![user_one, assistant_one, user_two, assistant_two],
+    )
+}
+
+fn fork_turn_texts(store: &SqliteSessionStore, session: &SessionId) -> Vec<String> {
+    store
+        .list_turns_for_session(session, None, usize::MAX)
+        .expect("forked turns should be readable")
+        .items
+        .into_iter()
+        .rev()
+        .map(|(_, parts)| match &parts[0].part {
+            Part::Text { text, .. } => text.clone(),
+            other => panic!("expected text part, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn fork_session_copies_all_turns_and_chains_to_source() {
+    let db = TempDb::new("fork-copy-all");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let (source, _messages) = seed_forkable_session(&store);
+
+    let fork = store
+        .fork_session(&source, None)
+        .expect("fork should commit");
+
+    assert_eq!(fork.parent_id.as_ref(), Some(&source));
+    assert_eq!(fork.settings_json, r#"{"model":"claude-opus"}"#);
+    assert_eq!(fork.cost, 0.0);
+    assert_eq!(fork.tokens_input, 0);
+    assert_eq!(fork.tokens_output, 0);
+    assert_eq!(
+        fork_turn_texts(&store, &fork.id),
+        vec!["hello", "hi there", "more", "even more"]
+    );
+}
+
+#[test]
+fn fork_session_through_message_copies_only_turns_up_to_cutoff() {
+    let db = TempDb::new("fork-cutoff");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let (source, messages) = seed_forkable_session(&store);
+    let cutoff = &messages[1]; // first assistant reply
+
+    let fork = store
+        .fork_session(&source, Some(cutoff))
+        .expect("fork should commit");
+
+    assert_eq!(fork_turn_texts(&store, &fork.id), vec!["hello", "hi there"]);
+}
+
+#[test]
+fn fork_session_remaps_ids_and_keeps_lineage_walkable() {
+    let db = TempDb::new("fork-remap");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let (source, source_messages) = seed_forkable_session(&store);
+
+    let fork = store
+        .fork_session(&source, None)
+        .expect("fork should commit");
+
+    // The fork is a distinct session whose lineage walks back to the source.
+    assert_ne!(fork.id, source);
+    assert_eq!(fork.parent_id.as_ref(), Some(&source));
+    let parent = store
+        .get_session(fork.parent_id.as_ref().unwrap())
+        .expect("source should be reachable from the fork");
+    assert_eq!(parent.id, source);
+    assert_eq!(parent.parent_id, None);
+
+    // Every copied turn and run carries a freshly minted id.
+    let forked_turns = store
+        .list_turns_for_session(&fork.id, None, usize::MAX)
+        .expect("forked turns should be readable")
+        .items;
+    let forked_message_ids: Vec<MessageId> = forked_turns
+        .iter()
+        .map(|(turn, _)| turn.id.clone())
+        .collect();
+    for message in &source_messages {
+        assert!(
+            !forked_message_ids.contains(message),
+            "forked message id {message} collides with source"
+        );
+    }
+    let mut forked_run_ids: Vec<RunId> = forked_turns
+        .iter()
+        .map(|(turn, _)| turn.run_id.clone())
+        .collect();
+    forked_run_ids.dedup();
+    assert_eq!(
+        forked_run_ids.len(),
+        2,
+        "two source runs should map to two fork runs"
+    );
+}
+
+#[test]
+fn fork_session_remaps_turn_meta_parent_chain() {
+    let db = TempDb::new("fork-meta-chain");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let (source, _messages) = seed_forkable_session(&store);
+
+    let fork = store
+        .fork_session(&source, None)
+        .expect("fork should commit");
+
+    let turns: Vec<Turn> = store
+        .list_turns_for_session(&fork.id, None, usize::MAX)
+        .expect("forked turns should be readable")
+        .items
+        .into_iter()
+        .rev()
+        .map(|(turn, _)| turn)
+        .collect();
+    let fork_message_ids: Vec<MessageId> = turns.iter().map(|turn| turn.id.clone()).collect();
+
+    // The first assistant turn must point at the *forked* user turn, not the
+    // source's original message id.
+    let assistant = &turns[1];
+    let parent = assistant
+        .meta
+        .parent_id
+        .as_ref()
+        .expect("assistant turn should retain its parent link");
+    assert_eq!(parent, &turns[0].id);
+    assert!(
+        fork_message_ids.contains(parent),
+        "remapped parent must reference a turn inside the fork"
+    );
+}
+
+#[test]
+fn fork_session_rejects_unknown_source() {
+    let db = TempDb::new("fork-unknown-source");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let missing = session_id("019e7000-0000-7000-8000-0000000004ff");
+
+    let err = store
+        .fork_session(&missing, None)
+        .expect_err("forking a missing session should fail");
+
+    assert!(matches!(
+        err,
+        SqliteStoreError::NotFound {
+            entity: "session",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn fork_session_rejects_through_message_outside_source() {
+    let db = TempDb::new("fork-unknown-message");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let (source, _messages) = seed_forkable_session(&store);
+    let stranger = message_id("019e7000-0000-7000-8000-0000000004fe");
+
+    let err = store
+        .fork_session(&source, Some(&stranger))
+        .expect_err("forking through a foreign message should fail");
+
+    assert!(matches!(
+        err,
+        SqliteStoreError::NotFound {
+            entity: "message",
+            ..
+        }
+    ));
+
+    // The failed fork must not leave an orphan session behind.
+    let sessions: i64 = store
+        .execute_write(|tx| tx.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0)))
+        .expect("session count should be readable");
+    assert_eq!(sessions, 1);
+}
+
+#[test]
+fn forked_session_round_trips_and_continues_independently() {
+    let db = TempDb::new("fork-round-trip");
+    let fork_id = {
+        let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+        let (source, _messages) = seed_forkable_session(&store);
+        store
+            .fork_session(&source, None)
+            .expect("fork should commit")
+            .id
+    };
+
+    // Reopen the database: the forked transcript must survive on its own.
+    let store = SqliteSessionStore::open(db.path()).expect("reopen should succeed");
+    assert_eq!(
+        fork_turn_texts(&store, &fork_id),
+        vec!["hello", "hi there", "more", "even more"]
+    );
+
+    // The fork is a live session: a new run and turn append cleanly.
+    let new_run = run_id("019e7000-0000-7000-8000-0000000004c0");
+    store
+        .start_run(StartRun {
+            id: new_run.clone(),
+            session_id: fork_id.clone(),
+            status: RunStatus::Running,
+            trigger: Some("user".to_string()),
+            started_at: 6_000,
+        })
+        .expect("fork run start should commit");
+    store
+        .append_turn(
+            Turn {
+                id: message_id("019e7000-0000-7000-8000-0000000004c1"),
+                run_id: new_run,
+                seq: 0,
+                role: TurnRole::User,
+                meta: TurnMeta::default(),
+                created_at: 7_000,
+            },
+            vec![text_part("after the fork")],
+        )
+        .expect("fork turn append should commit");
+
+    assert_eq!(
+        fork_turn_texts(&store, &fork_id),
+        vec!["hello", "hi there", "more", "even more", "after the fork"]
+    );
+}
+
+#[test]
+fn fork_session_preserves_order_of_turns_sharing_created_at() {
+    let db = TempDb::new("fork-equal-created-at");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let source = session_id("019e7000-0000-7000-8000-0000000005a0");
+    create_minimal_session(&store, source.clone());
+    let run = run_id("019e7000-0000-7000-8000-0000000005a1");
+    store
+        .start_run(StartRun {
+            id: run.clone(),
+            session_id: source.clone(),
+            status: RunStatus::Running,
+            trigger: Some("user".to_string()),
+            started_at: 2_000,
+        })
+        .expect("run start should commit");
+
+    // Two turns that share a created_at: ordering must fall back to a stable
+    // tiebreak, and the fork must not scramble it when re-minting ids.
+    store
+        .append_turns(&[
+            (
+                Turn {
+                    id: message_id("019e7000-0000-7000-8000-0000000005b1"),
+                    run_id: run.clone(),
+                    seq: 0,
+                    role: TurnRole::User,
+                    meta: TurnMeta::default(),
+                    created_at: 9_000,
+                },
+                vec![text_part("first")],
+            ),
+            (
+                Turn {
+                    id: message_id("019e7000-0000-7000-8000-0000000005b2"),
+                    run_id: run.clone(),
+                    seq: 0,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta::default(),
+                    created_at: 9_000,
+                },
+                vec![text_part("second")],
+            ),
+        ])
+        .expect("turns should commit");
+
+    let source_order = fork_turn_texts(&store, &source);
+    let fork = store
+        .fork_session(&source, None)
+        .expect("fork should commit");
+
+    assert_eq!(fork_turn_texts(&store, &fork.id), source_order);
+    assert_eq!(fork_turn_texts(&store, &fork.id), vec!["first", "second"]);
+}
+
+#[test]
+fn fork_session_of_empty_source_creates_empty_chained_session() {
+    let db = TempDb::new("fork-empty-source");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let source = session_id("019e7000-0000-7000-8000-0000000005c0");
+    create_minimal_session(&store, source.clone());
+
+    let fork = store
+        .fork_session(&source, None)
+        .expect("forking an empty session should commit");
+
+    assert_eq!(fork.parent_id.as_ref(), Some(&source));
+    assert!(fork_turn_texts(&store, &fork.id).is_empty());
+}
+
+#[test]
+fn fork_session_through_message_copies_partial_later_run() {
+    let db = TempDb::new("fork-partial-run");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let (source, messages) = seed_forkable_session(&store);
+    let cutoff = &messages[2]; // user turn that opens the second run
+
+    let fork = store
+        .fork_session(&source, Some(cutoff))
+        .expect("fork should commit");
+
+    // Run one is copied whole; run two contributes only its user turn.
+    assert_eq!(
+        fork_turn_texts(&store, &fork.id),
+        vec!["hello", "hi there", "more"]
+    );
+}
+
+fn provider_payload_links(store: &SqliteSessionStore, session: &SessionId) -> usize {
+    store
+        .list_turns_for_session(session, None, usize::MAX)
+        .expect("turns should be readable")
+        .items
+        .into_iter()
+        .flat_map(|(_, parts)| parts)
+        .filter(|part| part.provider_payload_id.is_some() || part.provider_json_pointer.is_some())
+        .count()
+}
+
+#[test]
+fn fork_session_drops_provider_payload_linkage_on_copied_parts() {
+    let data_dir = TempDataDir::new("fork-drops-linkage");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let source = session_id("019e7000-0000-7000-8000-0000000005d0");
+    let run = run_id("019e7000-0000-7000-8000-0000000005d1");
+    start_minimal_run(&store, source.clone(), run.clone());
+
+    // Seed a real decoded turn whose parts carry provider-payload provenance,
+    // so this test fails if fork_session ever preserves that linkage.
+    let raw_bytes = br#"{"id":"chatcmpl_1","model":"gpt-5.1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#.to_vec();
+    let payload_id = store
+        .append_provider_payload(NewProviderPayload {
+            session_id: source.clone(),
+            run_id: run.clone(),
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_1".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: raw_bytes.clone(),
+            created_at: 3_000,
+        })
+        .expect("provider payload append should commit");
+    let payload = store
+        .get_provider_payload(&payload_id)
+        .expect("payload row should be readable");
+    let decoded = OpenAiChatCompletionsDecoder::new()
+        .decode(&OpenAiChatCompletionsDecodeInput {
+            provider_payload_id: payload_id.clone(),
+            raw_artifact_id: payload.artifact_id.clone(),
+            run_id: run.clone(),
+            provider_id: payload.provider_id.clone(),
+            raw_json: raw_bytes,
+            created_at: payload.created_at,
+        })
+        .expect("provider payload should decode");
+    store
+        .append_decoded_provider_payload(&payload_id, "openai-chat-completions-decoder@1", &decoded)
+        .expect("decoded payload append should commit");
+
+    assert!(
+        provider_payload_links(&store, &source) > 0,
+        "seed must produce provider-linked parts for this test to be meaningful"
+    );
+
+    let fork = store
+        .fork_session(&source, None)
+        .expect("fork should commit");
+
+    assert_eq!(
+        provider_payload_links(&store, &fork.id),
+        0,
+        "forked parts must not reference the source's provider payloads"
     );
 }

@@ -4,6 +4,7 @@
 //! or browser APIs. It is the backend's product brain, not its transport.
 
 pub mod agents;
+pub mod compaction;
 pub mod context;
 pub mod events;
 pub mod guardrails;

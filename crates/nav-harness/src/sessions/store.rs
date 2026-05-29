@@ -10,8 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nav_types::{MessageId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId, ToolCallId};
 use serde_json::{Value, json};
 
+use crate::compaction::replay::project_for_replay;
 use crate::models::{
-    DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
+    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
+    ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
     OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
 };
 
@@ -19,13 +21,15 @@ use super::canonical::{
     ModelTurn, ModelTurnRole, Part, ToolCall, Turn, TurnMeta, TurnPart, TurnRole,
 };
 use super::sqlite::{
-    CreateSession, NewProviderPayload, ProviderState, RunStatus, SqliteSessionStore,
-    SqliteStoreError, StartRun, StoredPart, StoredTurn,
+    CreateSession, NewProviderPayload, ProviderState, RevertInfo, RunStatus, SqliteSessionStore,
+    SqliteStoreError, StartRun, StoredTurn,
 };
 
 pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
     "openai-chat-completions-decoder@1";
+pub(crate) const CHATGPT_SUBSCRIPTION_DECODER_VERSION: &str = "chatgpt-subscription-decoder@1";
 pub(crate) const OPENAI_RESPONSES_DECODER_VERSION: &str = "openai-responses-decoder@1";
+pub(crate) const ANTHROPIC_MESSAGES_DECODER_VERSION: &str = "anthropic-messages-decoder@1";
 const UNKNOWN_DECODER_VERSION: &str = "unknown-decoder";
 
 const DEFAULT_PAYLOAD_DECODERS: &[PayloadDecoder] = &[
@@ -35,9 +39,24 @@ const DEFAULT_PAYLOAD_DECODERS: &[PayloadDecoder] = &[
         decode: decode_openai_chat_completions_payload,
     },
     PayloadDecoder {
+        api_kinds: &[
+            "chatgpt_subscription",
+            "chatgpt-subscription",
+            "codex_subscription",
+            "codex-subscription",
+        ],
+        version: CHATGPT_SUBSCRIPTION_DECODER_VERSION,
+        decode: decode_chatgpt_subscription_payload,
+    },
+    PayloadDecoder {
         api_kinds: &["openai_responses", "openai-responses"],
         version: OPENAI_RESPONSES_DECODER_VERSION,
         decode: decode_openai_responses_payload,
+    },
+    PayloadDecoder {
+        api_kinds: &["anthropic_messages", "anthropic-messages"],
+        version: ANTHROPIC_MESSAGES_DECODER_VERSION,
+        decode: decode_anthropic_messages_payload,
     },
 ];
 
@@ -139,6 +158,26 @@ impl SessionStore {
         })
     }
 
+    pub fn update_session_title(
+        &self,
+        session_id: &SessionId,
+        title: &str,
+    ) -> Result<(), SqliteStoreError> {
+        self.sqlite.update_session_title(session_id, title)
+    }
+
+    pub fn update_session_revert(
+        &self,
+        session_id: &SessionId,
+        revert: &RevertInfo,
+    ) -> Result<(), SqliteStoreError> {
+        self.sqlite.update_session_revert(session_id, revert)
+    }
+
+    pub fn clear_session_revert(&self, session_id: &SessionId) -> Result<(), SqliteStoreError> {
+        self.sqlite.clear_session_revert(session_id)
+    }
+
     pub fn start_run(&self, session_id: &SessionId, run_id: RunId) -> Result<(), SqliteStoreError> {
         self.sqlite.start_run(StartRun {
             id: run_id,
@@ -180,19 +219,30 @@ impl SessionStore {
             .list_turns_for_session(session_id, None, usize::MAX)?
             .items;
         page.reverse();
-        Ok(page
-            .into_iter()
-            .filter_map(model_turn_from_stored_turn)
-            .collect())
+        Ok(model_turns_for_replay(&page))
+    }
+
+    pub fn try_turns_after_revert(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<ModelTurn>, SqliteStoreError> {
+        let Some(revert_json) = self.get_session(session_id)?.revert_json else {
+            return self.try_turns(session_id);
+        };
+        let revert = parse_revert_info(&revert_json)?;
+        let mut page = self
+            .sqlite
+            .list_turns_for_session(session_id, None, usize::MAX)?
+            .items;
+        page.reverse();
+        let replayed = replay_revert(page, &revert)?;
+
+        Ok(model_turns_for_replay(&replayed))
     }
 
     pub fn try_turns_for_run(&self, run_id: &RunId) -> Result<Vec<ModelTurn>, SqliteStoreError> {
-        Ok(self
-            .sqlite
-            .list_turns_for_run(run_id)?
-            .into_iter()
-            .filter_map(model_turn_from_stored_turn)
-            .collect())
+        let turns = self.sqlite.list_turns_for_run(run_id)?;
+        Ok(model_turns_for_replay(&turns))
     }
 
     pub fn provider_payload_recovery_report(
@@ -504,12 +554,44 @@ fn decode_openai_chat_completions_payload(
         .map_err(|error| error.to_string())
 }
 
+fn decode_chatgpt_subscription_payload(
+    payload: &ProviderPayloadRow,
+    raw_json: Vec<u8>,
+) -> Result<DecodedProviderPayload, String> {
+    ChatGptSubscriptionDecoder::new()
+        .decode(&ChatGptSubscriptionDecodeInput {
+            provider_payload_id: payload.id.clone(),
+            raw_artifact_id: payload.artifact_id.clone(),
+            run_id: payload.run_id.clone(),
+            provider_id: payload.provider_id.clone(),
+            raw_json,
+            created_at: payload.created_at,
+        })
+        .map_err(|error| error.to_string())
+}
+
 fn decode_openai_responses_payload(
     payload: &ProviderPayloadRow,
     raw_json: Vec<u8>,
 ) -> Result<DecodedProviderPayload, String> {
     OpenAiResponsesDecoder::new()
         .decode(&OpenAiResponsesDecodeInput {
+            provider_payload_id: payload.id.clone(),
+            raw_artifact_id: payload.artifact_id.clone(),
+            run_id: payload.run_id.clone(),
+            provider_id: payload.provider_id.clone(),
+            raw_json,
+            created_at: payload.created_at,
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn decode_anthropic_messages_payload(
+    payload: &ProviderPayloadRow,
+    raw_json: Vec<u8>,
+) -> Result<DecodedProviderPayload, String> {
+    AnthropicMessagesDecoder::new()
+        .decode(&AnthropicMessagesDecodeInput {
             provider_payload_id: payload.id.clone(),
             raw_artifact_id: payload.artifact_id.clone(),
             run_id: payload.run_id.clone(),
@@ -624,11 +706,10 @@ fn tool_call_arguments(arguments: &str) -> Value {
     serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
 }
 
-fn model_turn_from_stored_turn((turn, parts): StoredTurn) -> Option<ModelTurn> {
+fn model_turn_from_projected_turn((turn, parts): (Turn, Vec<Part>)) -> Option<ModelTurn> {
     let model_parts = parts
         .into_iter()
-        .filter(|part| part.compacted_at.is_none())
-        .filter_map(model_part_from_stored_part)
+        .filter_map(model_part_from_projected_part)
         .collect::<Vec<_>>();
 
     if model_parts.is_empty() {
@@ -653,8 +734,69 @@ fn model_turn_from_stored_turn((turn, parts): StoredTurn) -> Option<ModelTurn> {
     })
 }
 
-fn model_part_from_stored_part(part: StoredPart) -> Option<TurnPart> {
-    match part.part {
+fn model_turns_for_replay(turns: &[StoredTurn]) -> Vec<ModelTurn> {
+    project_for_replay(turns)
+        .into_iter()
+        .filter_map(model_turn_from_projected_turn)
+        .collect()
+}
+
+fn parse_revert_info(value: &str) -> Result<RevertInfo, SqliteStoreError> {
+    serde_json::from_str(value).map_err(|error| SqliteStoreError::ReadFailed(error.to_string()))
+}
+
+fn replay_revert(
+    mut turns: Vec<StoredTurn>,
+    revert: &RevertInfo,
+) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+    let turn_index = turns
+        .iter()
+        .position(|(turn, _)| turn.id == revert.message_id)
+        .ok_or_else(|| SqliteStoreError::NotFound {
+            entity: "revert turn",
+            id: revert.message_id.to_string(),
+        })?;
+    let target_turn = &turns[turn_index].0;
+    if target_turn.role != TurnRole::Assistant {
+        return Err(SqliteStoreError::ReadFailed(format!(
+            "revert turn `{}` is {}, expected assistant",
+            target_turn.id,
+            turn_role_name(target_turn.role),
+        )));
+    }
+
+    let Some(part_id) = &revert.part_id else {
+        turns.truncate(turn_index);
+        return Ok(turns);
+    };
+
+    let part_index = turns[turn_index]
+        .1
+        .iter()
+        .position(|part| part.id == *part_id)
+        .ok_or_else(|| SqliteStoreError::NotFound {
+            entity: "revert turn_part",
+            id: part_id.to_string(),
+        })?;
+
+    turns[turn_index].1.truncate(part_index);
+    turns.truncate(turn_index + 1);
+    if turns[turn_index].1.is_empty() {
+        turns.truncate(turn_index);
+    }
+
+    Ok(turns)
+}
+
+fn turn_role_name(role: TurnRole) -> &'static str {
+    match role {
+        TurnRole::User => "user",
+        TurnRole::Assistant => "assistant",
+    }
+}
+
+fn model_part_from_projected_part(part: Part) -> Option<TurnPart> {
+    match part {
         Part::Text { text, .. } => Some(TurnPart::Text(text)),
         Part::ToolCall {
             id,
@@ -800,6 +942,176 @@ mod tests {
     }
 
     #[test]
+    fn try_turns_replays_compacted_tool_result_placeholder() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let tool_call_id = ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000051").unwrap();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turns(
+                &run_id,
+                vec![ModelTurn::tool_result(
+                    tool_call_id.as_str(),
+                    "large output",
+                )],
+            )
+            .unwrap();
+        let part_id = store.sqlite.list_turns_for_run(&run_id).unwrap()[0].1[0]
+            .id
+            .clone();
+
+        store.sqlite.compact_part(&part_id).unwrap();
+
+        let reloaded = store.try_turns(&session_id).unwrap();
+        let run_reloaded = store.try_turns_for_run(&run_id).unwrap();
+        let expected_parts = vec![TurnPart::ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: "[Old tool result content cleared]".to_string(),
+        }];
+
+        assert_eq!(reloaded[0].parts, expected_parts);
+        assert_eq!(run_reloaded[0].parts, expected_parts);
+    }
+
+    #[test]
+    fn try_turns_after_revert_restores_in_memory_state_before_target_turn() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let assistant_message_id = new_message_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turn(&run_id, new_message_id(), ModelTurn::user_text("before"))
+            .unwrap();
+        store
+            .append_turn(
+                &run_id,
+                assistant_message_id.clone(),
+                ModelTurn::assistant_text("assistant change"),
+            )
+            .unwrap();
+        store
+            .update_session_revert(
+                &session_id,
+                &RevertInfo {
+                    message_id: assistant_message_id,
+                    part_id: None,
+                    snapshot: Some("snapshot-before-assistant".to_string()),
+                    diff: Some("diff --git a/file.txt b/file.txt\n+assistant change\n".to_string()),
+                },
+            )
+            .unwrap();
+
+        let replayed = store.try_turns_after_revert(&session_id).unwrap();
+        let persisted = store.try_turns(&session_id).unwrap();
+
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].text_content(), "before");
+        assert_eq!(persisted.len(), 2);
+        assert!(
+            store
+                .get_session(&session_id)
+                .unwrap()
+                .revert_json
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn try_turns_after_revert_restores_in_memory_state_before_target_part() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let assistant_message_id = new_message_id();
+        let tool_call_id = ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000052").unwrap();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turn(&run_id, new_message_id(), ModelTurn::user_text("before"))
+            .unwrap();
+        store
+            .append_turn(
+                &run_id,
+                assistant_message_id.clone(),
+                ModelTurn::assistant_text_with_tool_calls(
+                    "kept prelude",
+                    vec![ToolCall {
+                        id: "provider-call-1".to_string(),
+                        tool_call_id: Some(tool_call_id),
+                        name: "write".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                ),
+            )
+            .unwrap();
+        let target_part_id = store.sqlite.list_turns_for_run(&run_id).unwrap()[1].1[1]
+            .id
+            .clone();
+        store
+            .update_session_revert(
+                &session_id,
+                &RevertInfo {
+                    message_id: assistant_message_id,
+                    part_id: Some(target_part_id),
+                    snapshot: Some("snapshot-before-tool".to_string()),
+                    diff: Some("diff --git a/file.txt b/file.txt\n+tool change\n".to_string()),
+                },
+            )
+            .unwrap();
+
+        let replayed = store.try_turns_after_revert(&session_id).unwrap();
+
+        assert_eq!(replayed.len(), 2);
+        assert_eq!(replayed[1].text_content(), "kept prelude");
+        assert!(replayed[1].tool_calls().is_empty());
+    }
+
+    #[test]
+    fn try_turns_after_revert_rejects_metadata_targeting_user_turn() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let user_message_id = new_message_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turn(
+                &run_id,
+                user_message_id.clone(),
+                ModelTurn::user_text("do not remove"),
+            )
+            .unwrap();
+        store
+            .update_session_revert(
+                &session_id,
+                &RevertInfo {
+                    message_id: user_message_id,
+                    part_id: None,
+                    snapshot: Some("snapshot-before-user".to_string()),
+                    diff: None,
+                },
+            )
+            .unwrap();
+
+        let err = store
+            .try_turns_after_revert(&session_id)
+            .expect_err("user-turn revert metadata should be rejected");
+
+        assert!(
+            err.to_string().contains("expected assistant"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(store.try_turns(&session_id).unwrap().len(), 1);
+    }
+
+    #[test]
     fn open_recovers_pending_provider_payloads() {
         let (_data_dir, path, payload_id, run_id) = seed_provider_payload(
             "pending-decode-recovery",
@@ -831,6 +1143,54 @@ mod tests {
                 synthetic: None,
             }
         );
+    }
+
+    #[test]
+    fn open_recovers_chatgpt_subscription_payload_and_keeps_raw_event_order() {
+        let raw_json = r#"{"events":[{"type":"response.created","response":{"id":"resp_sub_1","model":"gpt-5.1-codex"}},{"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":"enc_reasoning_1"}},{"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"hello "},{"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"Season"},{"type":"response.output_text.done","output_index":1,"content_index":0,"text":"hello Season"},{"type":"response.completed","response":{"id":"resp_sub_1","model":"gpt-5.1-codex","status":"completed"}}]}"#;
+        let (_data_dir, path, payload_id, run_id) = seed_provider_payload(
+            "pending-chatgpt-subscription-recovery",
+            "chatgpt-subscription",
+            ProviderPayloadDirection::StreamBatch,
+            raw_json.as_bytes().to_vec(),
+        );
+
+        let store = SessionStore::open(&path).expect("open should recover pending payloads");
+        let payload = store
+            .sqlite
+            .get_provider_payload(&payload_id)
+            .expect("payload should be readable after recovery");
+        assert_eq!(payload.decode_status, "decoded");
+        assert_eq!(
+            payload.decoder_version.as_deref(),
+            Some(CHATGPT_SUBSCRIPTION_DECODER_VERSION)
+        );
+
+        let turns = store
+            .sqlite
+            .list_turns_for_run(&run_id)
+            .expect("decoded turns should be readable");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].1.len(), 2);
+        assert_eq!(
+            turns[0].1[0].provider_json_pointer.as_deref(),
+            Some("/events/1/item/encrypted_content")
+        );
+        assert_eq!(
+            turns[0].1[1].provider_json_pointer.as_deref(),
+            Some("/events/4/text")
+        );
+
+        let mut artifact = store
+            .sqlite
+            .get_artifact(&payload.artifact_id)
+            .expect("raw payload artifact should be readable");
+        let mut recovered_raw = String::new();
+        artifact
+            .reader
+            .read_to_string(&mut recovered_raw)
+            .expect("raw payload artifact should be utf-8");
+        assert_eq!(recovered_raw, raw_json);
     }
 
     #[test]
@@ -890,6 +1250,40 @@ mod tests {
             turns[0].1[1].part,
             Part::Text {
                 text: "recovered responses".to_string(),
+                synthetic: None,
+            }
+        );
+    }
+
+    #[test]
+    fn open_recovers_pending_anthropic_messages_payloads() {
+        let (_data_dir, path, payload_id, run_id) = seed_provider_payload(
+            "pending-anthropic-messages-decode-recovery",
+            "anthropic-messages",
+            ProviderPayloadDirection::Response,
+            br#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[{"type":"text","text":"recovered anthropic"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":3}}"#.to_vec(),
+        );
+
+        let store = SessionStore::open(&path).expect("open should recover pending payloads");
+        let payload = store
+            .sqlite
+            .get_provider_payload(&payload_id)
+            .expect("payload should be readable after recovery");
+        assert_eq!(payload.decode_status, "decoded");
+        assert_eq!(
+            payload.decoder_version.as_deref(),
+            Some(ANTHROPIC_MESSAGES_DECODER_VERSION)
+        );
+
+        let turns = store
+            .sqlite
+            .list_turns_for_run(&run_id)
+            .expect("decoded turns should be readable");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].1[1].part,
+            Part::Text {
+                text: "recovered anthropic".to_string(),
                 synthetic: None,
             }
         );
