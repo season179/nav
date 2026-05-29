@@ -311,7 +311,7 @@ describe('VirtualHistoryRegion residue checks', () => {
 		expect(rows).toHaveLength(predictedRowCount);
 	});
 
-	test('ignores keyboard paging because wheel events own history scrolling', async () => {
+	test('scrolls history through keyboard paging without terminal mouse mode', async () => {
 		const messages = Array.from({length: 12}, (_, index): HistoryMessage => ({
 			id: `message-${index}`,
 			role: 'assistant',
@@ -323,11 +323,48 @@ describe('VirtualHistoryRegion residue checks', () => {
 		});
 		const before = view.lastFrame();
 
-		view.stdin.write('\u001B[A');
 		view.stdin.write('\u001B[5~');
-		await settle();
+		await waitForExpectation(() => {
+			const frame = view.lastFrame() ?? '';
+			expect(frame).not.toBe(before);
+			expect(frame).toContain('hidden');
+			expect(frame).not.toContain('assistant line 11');
+		});
 
-		expect(view.lastFrame()).toBe(before);
+		view.stdin.write('\u001B[6~');
+		await waitForExpectation(() => {
+			const frame = view.lastFrame() ?? '';
+			expect(frame).toContain('assistant line 11');
+			expect(frame).not.toContain('hidden');
+		});
+	});
+
+	test('continues keyboard paging from the current viewport position', async () => {
+		const messages = Array.from({length: 20}, (_, index): HistoryMessage => ({
+			id: `message-${index}`,
+			role: 'assistant',
+			text: `assistant line ${index}`,
+		}));
+		const view = render(<VirtualHistoryRegion messages={messages} height={4} />);
+		await waitForExpectation(() => {
+			expect(view.lastFrame()).toContain('assistant line 19');
+		});
+
+		view.stdin.write('\u001B[5~');
+		let firstHiddenRows = 0;
+		await waitForExpectation(() => {
+			const frame = view.lastFrame() ?? '';
+			firstHiddenRows = hiddenRowsInFrame(frame);
+			expect(firstHiddenRows).toBeGreaterThan(0);
+			expect(frame).not.toContain('assistant line 19');
+		});
+
+		view.stdin.write('\u001B[5~');
+		await waitForExpectation(() => {
+			expect(hiddenRowsInFrame(view.lastFrame() ?? '')).toBeGreaterThan(
+				firstHiddenRows,
+			);
+		});
 	});
 
 	test('scrolls history through wheel events', async () => {
@@ -614,6 +651,11 @@ function capturedRows(frame: string): string[] {
 
 function countSubstrings(value: string, search: string): number {
 	return value.split(search).length - 1;
+}
+
+function hiddenRowsInFrame(frame: string): number {
+	const match = /↓ (\d+) hidden/.exec(frame);
+	return match ? Number(match[1]) : 0;
 }
 
 async function waitForExpectation(assertion: () => void): Promise<void> {

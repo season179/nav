@@ -40,6 +40,10 @@ Accepted-by-fiat tradeoffs:
 
 - Mount: writes `\x1b[?1049h\x1b[2J\x1b[H` via `useStdout`. With
   `mouseTracking={true}` also writes `\x1b[?1000h\x1b[?1006h`.
+- Runtime default (2026-05-29): `cli.tsx` leaves mouse tracking off
+  unless `NAV_TUI_MOUSE=1` is set. The default path preserves native
+  terminal drag-to-select; the opt-in path keeps wheel-scroll smoke
+  coverage and terminal/tmux modifier-based selection behavior.
 - Unmount: writes `\x1b[?1000l\x1b[?1006l\x1b[?1049l` (must disable
   both `?1000` and `?1006` per Codex round-3 catch).
 - Cursor: **does not globally hide on mount.** Ink manages cursor
@@ -572,8 +576,9 @@ purely about flipping the entry point + swapping the component in
 
 `cli.tsx`:
 - Build stdin proxy via `createStdinProxy()`.
-- Wrap App in
-  `<AlternateScreen mouseTracking><MouseEventProvider>`.
+- Wrap App in `<AlternateScreen mouseTracking={...}>` with mouse
+  tracking disabled by default and enabled only when `NAV_TUI_MOUSE=1`
+  resolves true.
 - Pass `render(<…/>, { stdin: proxy, exitOnCtrlC: false })`.
   `exitOnCtrlC: false` is mandatory — without it Ink's default
   handler runs before App's `useInput` and Ctrl+C cleanup never
@@ -602,8 +607,10 @@ purely about flipping the entry point + swapping the component in
 Acceptance:
 - `bun run start` enters alt-screen on launch; restores main
   screen on `/exit`, Ctrl+C, kill -TERM, normal exit.
-- Trackpad scroll in tmux scrolls history; PgUp/PgDn/↑/↓ have no
-  effect on history scroll.
+- Default terminal drag-to-select works because DEC mouse reporting is
+  off. PgUp/PgDn/↑/↓ scroll history in the default path.
+- With `NAV_TUI_MOUSE=1`, trackpad scroll in tmux scrolls history;
+  selection follows the terminal/tmux mouse-reporting modifier.
 - Streaming a turn, then Ctrl+C: App's `useInput` fires (Ink
   doesn't pre-empt because `exitOnCtrlC: false`); controller
   aborts; SSE fetch aborts; backend cleanup runs; alt-screen
