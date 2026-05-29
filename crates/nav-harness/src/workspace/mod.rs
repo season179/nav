@@ -2,6 +2,7 @@
 
 pub mod path;
 pub mod shell;
+pub mod snapshot;
 
 #[derive(Debug, Default)]
 pub struct Workspace;

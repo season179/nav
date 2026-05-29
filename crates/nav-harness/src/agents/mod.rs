@@ -25,11 +25,11 @@ use crate::models::{
 use crate::sessions::{
     CompactionConfig, ConfirmationDecision, ModelTurn, NewProviderPayload,
     OPENAI_CHAT_COMPLETIONS_DECODER_VERSION, PendingConfirmation, PendingConfirmationReceiver,
-    PendingConfirmationRegistry, ProviderPayloadDirection, SessionStore, ToolCall,
+    PendingConfirmationRegistry, ProviderPayloadDirection, SessionStore, ToolCall, TurnRole,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
-    ToolOutputSink, ToolPreset, ToolRegistry, ToolResult,
+    ToolOutputSink, ToolPreset, ToolRegistry, ToolResult, WorkspaceMutationRecorder,
 };
 
 const TOOL_OUTPUT_BUFFER: usize = 64;
@@ -181,18 +181,22 @@ impl RunLoop {
                 }
             };
 
-            if let Some(journal) = journal {
-                if let Err(error) = self.journal_response_payload(
+            let revert_message_id = if let Some(journal) = journal {
+                let message_id = match self.journal_response_payload(
                     journal,
                     model,
                     &model_turn,
                     request.run_id,
                     payload_sequence,
                 ) {
-                    return RunLoopResult::Failed(error);
-                }
+                    Ok(message_id) => message_id,
+                    Err(error) => return RunLoopResult::Failed(error),
+                };
                 payload_sequence += 1;
-            }
+                message_id
+            } else {
+                None
+            };
 
             let tool_calls = model_turn.tool_calls;
             if let Some(turn) = model_turn.assistant_turn {
@@ -222,11 +226,13 @@ impl RunLoop {
                 provider_tool_call_id: None,
                 usage: None,
             };
+            let dispatch_context =
+                tool_context_with_revert_recorder(request.tool_context, journal, revert_message_id);
             match dispatch_tool_calls(ToolDispatchRequest {
                 tool_calls: &tool_calls,
                 registry: request.tool_registry,
                 tool_preset: request.tool_preset,
-                context: request.tool_context,
+                context: &dispatch_context,
                 cancel: tool_cancel,
                 run_cancel: Some(request.cancellation_token.clone()),
                 pending_confirmations: request.pending_confirmations,
@@ -325,7 +331,7 @@ impl RunLoop {
         output: &ModelTurnOutput,
         run_id: &RunId,
         sequence: u32,
-    ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
+    ) -> Result<Option<MessageId>, OpenAiCompletionsError> {
         self.journal_decoded_payload(
             journal,
             model,
@@ -334,6 +340,7 @@ impl RunLoop {
             sequence,
             ProviderPayloadDirection::Response,
         )
+        .map(|payload| payload.assistant_message_id)
     }
 
     fn flush_stream_error(
@@ -372,6 +379,7 @@ impl RunLoop {
             sequence,
             ProviderPayloadDirection::StreamBatch,
         )
+        .map(|payload| payload.id)
     }
 
     fn journal_decoded_payload(
@@ -382,7 +390,7 @@ impl RunLoop {
         run_id: &RunId,
         sequence: u32,
         direction: ProviderPayloadDirection,
-    ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
+    ) -> Result<JournaledProviderPayload, OpenAiCompletionsError> {
         let raw_bytes = serde_json::to_vec(&output.response_payload).map_err(json_error)?;
         let created_at = next_turn_created_at(journal, run_id)?;
         let payload_id = append_provider_payload(
@@ -401,9 +409,12 @@ impl RunLoop {
                 created_at,
             },
         )?;
-        append_decoded_response(journal, &payload_id, raw_bytes)
-            .map(|()| payload_id)
-            .map_err(persistence_error)
+        let assistant_message_id =
+            append_decoded_response(journal, &payload_id, raw_bytes).map_err(persistence_error)?;
+        Ok(JournaledProviderPayload {
+            id: payload_id,
+            assistant_message_id,
+        })
     }
 
     fn journal_error_payload(
@@ -485,6 +496,12 @@ struct ModelTurnStreamError {
     partial_output: Option<ModelTurnOutput>,
 }
 
+#[derive(Debug)]
+struct JournaledProviderPayload {
+    id: ProviderPayloadId,
+    assistant_message_id: Option<MessageId>,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct AssistantTurnFlushCursor {
     flushed: bool,
@@ -504,6 +521,31 @@ impl AssistantTurnFlushCursor {
 struct ProviderJournal<'a> {
     session_id: &'a SessionId,
     store: &'a Arc<Mutex<SessionStore>>,
+}
+
+fn tool_context_with_revert_recorder(
+    context: &ToolContext,
+    journal: Option<ProviderJournal<'_>>,
+    message_id: Option<MessageId>,
+) -> ToolContext {
+    let Some(journal) = journal else {
+        return context.clone();
+    };
+    let Some(message_id) = message_id else {
+        return context.clone();
+    };
+    let Some(path_policy) = context.path_policy() else {
+        return context.clone();
+    };
+
+    context
+        .clone()
+        .with_workspace_mutation_recorder(WorkspaceMutationRecorder::new(
+            Arc::clone(journal.store),
+            journal.session_id.clone(),
+            message_id,
+            path_policy.workspace_root().to_path_buf(),
+        ))
 }
 
 fn encode_completion_request(
@@ -554,7 +596,7 @@ fn append_decoded_response(
     journal: ProviderJournal<'_>,
     payload_id: &ProviderPayloadId,
     raw_bytes: Vec<u8>,
-) -> Result<(), String> {
+) -> Result<Option<MessageId>, String> {
     let payload = journal
         .store
         .lock()
@@ -571,6 +613,12 @@ fn append_decoded_response(
             created_at: payload.created_at,
         })
         .map_err(|error| error.to_string())?;
+    let assistant_message_id = decoded
+        .turns
+        .iter()
+        .rev()
+        .find(|turn| turn.turn.role == TurnRole::Assistant)
+        .map(|turn| turn.turn.id.clone());
 
     journal
         .store
@@ -581,7 +629,9 @@ fn append_decoded_response(
             OPENAI_CHAT_COMPLETIONS_DECODER_VERSION,
             &decoded,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+
+    Ok(assistant_message_id)
 }
 
 fn append_tool_turns(
