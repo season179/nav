@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use nav_types::PartId;
+use nav_types::{MessageId, PartId};
 use serde_json::Value;
 
 use crate::compaction::prune::OLD_TOOL_RESULT_CONTENT_CLEARED;
@@ -32,7 +32,7 @@ pub fn project_for_replay(turns: &[StoredTurn], tail_turns: usize) -> Vec<(Turn,
     let latest_image_turn_index = latest_image_bearing_user_turn_index(turns);
     let truncate_boundary = turns.len().saturating_sub(tail_turns);
 
-    turns
+    let projected = turns
         .iter()
         .enumerate()
         .map(|(index, (turn, parts))| {
@@ -53,7 +53,55 @@ pub fn project_for_replay(turns: &[StoredTurn], tail_turns: usize) -> Vec<(Turn,
                     .collect::<Vec<_>>(),
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    compacted_replay_window(&projected).unwrap_or(projected)
+}
+
+fn compacted_replay_window(projected: &[(Turn, Vec<Part>)]) -> Option<Vec<(Turn, Vec<Part>)>> {
+    let marker_index = latest_compaction_marker_index(projected)?;
+    let summary_index = marker_index.checked_add(1)?;
+    let tail_start_id = compaction_tail_start_id(&projected[marker_index].1)?;
+
+    let mut replay = Vec::new();
+    replay.push(projected[marker_index].clone());
+    replay.push(projected.get(summary_index)?.clone());
+
+    let tail_start_index = match tail_start_id {
+        Some(tail_start_id) => projected
+            .iter()
+            .position(|(turn, _)| turn.id == tail_start_id)?,
+        None => summary_index.saturating_add(1),
+    };
+    replay.extend(
+        projected
+            .iter()
+            .enumerate()
+            .skip(tail_start_index)
+            .filter(|(index, _)| *index != marker_index && *index != summary_index)
+            .map(|(_, turn)| turn.clone()),
+    );
+
+    Some(replay)
+}
+
+fn latest_compaction_marker_index(projected: &[(Turn, Vec<Part>)]) -> Option<usize> {
+    projected
+        .iter()
+        .rposition(|(_, parts)| has_compaction_marker(parts))
+}
+
+fn has_compaction_marker(parts: &[Part]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part, Part::Compaction { .. }))
+}
+
+fn compaction_tail_start_id(parts: &[Part]) -> Option<Option<MessageId>> {
+    parts.iter().find_map(|part| match part {
+        Part::Compaction { tail_start_id, .. } => Some(tail_start_id.clone()),
+        _ => None,
+    })
 }
 
 fn duplicate_tool_result_part_ids(turns: &[StoredTurn]) -> HashSet<PartId> {

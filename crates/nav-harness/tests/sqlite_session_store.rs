@@ -928,6 +928,48 @@ fn runs_can_be_started_and_finished() {
 }
 
 #[test]
+fn append_finished_run_with_turns_rolls_back_run_when_turn_insert_fails() {
+    let db = TempDb::new("run-append-rollback");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000550");
+    let compaction_run_id = run_id("019e7000-0000-7000-8000-000000000551");
+    let missing_run_id = run_id("019e7000-0000-7000-8000-000000000552");
+    create_minimal_session(&store, session_id.clone());
+
+    let err = store
+        .append_finished_run_with_turns(
+            StartRun {
+                id: compaction_run_id.clone(),
+                session_id,
+                status: RunStatus::Running,
+                trigger: Some("compaction".to_string()),
+                started_at: 2_000,
+            },
+            &[(
+                Turn {
+                    id: message_id("019e7000-0000-7000-8000-000000000553"),
+                    run_id: missing_run_id,
+                    seq: 0,
+                    role: TurnRole::User,
+                    meta: TurnMeta::default(),
+                    created_at: 2_001,
+                },
+                vec![text_part("should roll back")],
+            )],
+            2_002,
+            RunStatus::Completed,
+            None,
+        )
+        .expect_err("invalid turn run should abort the bundled run write");
+
+    assert!(matches!(err, SqliteStoreError::WriteFailed(_)));
+    assert!(matches!(
+        store.get_run(&compaction_run_id),
+        Err(SqliteStoreError::NotFound { .. })
+    ));
+}
+
+#[test]
 fn terminal_runs_cannot_be_finished_again() {
     let db = TempDb::new("run-terminal");
     let store = SqliteSessionStore::open(db.path()).expect("open should succeed");

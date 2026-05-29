@@ -937,27 +937,7 @@ impl SqliteSessionStore {
             return Err(invalid_run_status("start_run", run.status));
         }
 
-        self.execute_write(|tx| {
-            tx.execute(
-                r#"
-                INSERT INTO runs (
-                    id,
-                    session_id,
-                    status,
-                    trigger,
-                    started_at
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5)
-                "#,
-                params![
-                    run.id.as_str(),
-                    run.session_id.as_str(),
-                    run.status.as_str(),
-                    run.trigger.as_deref(),
-                    run.started_at,
-                ],
-            )
-        })?;
+        self.execute_write(|tx| insert_run(tx, &run))?;
         Ok(())
     }
 
@@ -981,22 +961,7 @@ impl SqliteSessionStore {
         }
 
         let changed = self.execute_write(|tx| {
-            tx.execute(
-                r#"
-                UPDATE runs
-                SET status = ?1,
-                    finished_at = ?2,
-                    error_json = ?3
-                WHERE id = ?4
-                  AND status IN ('pending', 'running')
-                "#,
-                params![
-                    status.as_str(),
-                    finished_at,
-                    error_json.as_deref(),
-                    run_id.as_str(),
-                ],
-            )
+            finish_run_in_tx(tx, run_id, status, finished_at, error_json.as_deref())
         })?;
         if changed > 0 {
             return Ok(());
@@ -1188,6 +1153,44 @@ impl SqliteSessionStore {
             Err(write_err) => return Err(validation.unwrap_or(write_err)),
         };
         self.get_session(&new_session_id)
+    }
+
+    pub fn append_finished_run_with_turns(
+        &self,
+        run: StartRun,
+        turns_with_parts: &[(Turn, Vec<Part>)],
+        finished_at: i64,
+        status: RunStatus,
+        error_json: Option<String>,
+    ) -> Result<(), SqliteStoreError> {
+        if !run.status.is_startable() {
+            return Err(invalid_run_status(
+                "append_finished_run_with_turns",
+                run.status,
+            ));
+        }
+        if !status.is_terminal() {
+            return Err(invalid_run_status("append_finished_run_with_turns", status));
+        }
+
+        let prepared_turns = turns_with_parts
+            .iter()
+            .map(|(turn, parts)| prepare_turn(turn, parts))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.execute_write(|tx| {
+            insert_run(tx, &run)?;
+            for turn in &prepared_turns {
+                insert_turn(tx, turn)?;
+            }
+            let changed =
+                finish_run_in_tx(tx, &run.id, status, finished_at, error_json.as_deref())?;
+            if changed == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
 
     pub fn append_turn(&self, turn: Turn, parts: Vec<Part>) -> Result<(), SqliteStoreError> {
@@ -1882,6 +1885,48 @@ fn set_provider_state_in_tx(tx: &Transaction, state: &ProviderState) -> rusqlite
         ],
     )?;
     Ok(())
+}
+
+fn insert_run(tx: &Transaction, run: &StartRun) -> rusqlite::Result<usize> {
+    tx.execute(
+        r#"
+        INSERT INTO runs (
+            id,
+            session_id,
+            status,
+            trigger,
+            started_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+        params![
+            run.id.as_str(),
+            run.session_id.as_str(),
+            run.status.as_str(),
+            run.trigger.as_deref(),
+            run.started_at,
+        ],
+    )
+}
+
+fn finish_run_in_tx(
+    tx: &Transaction,
+    run_id: &RunId,
+    status: RunStatus,
+    finished_at: i64,
+    error_json: Option<&str>,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        r#"
+        UPDATE runs
+        SET status = ?1,
+            finished_at = ?2,
+            error_json = ?3
+        WHERE id = ?4
+          AND status IN ('pending', 'running')
+        "#,
+        params![status.as_str(), finished_at, error_json, run_id.as_str(),],
+    )
 }
 
 fn insert_turn(tx: &Transaction, prepared: &PreparedTurn) -> rusqlite::Result<()> {

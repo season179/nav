@@ -60,6 +60,132 @@ fn stored_part(id: PartId, part: Part, compacted_at: Option<i64>) -> StoredPart 
 }
 
 #[test]
+fn compaction_marker_replays_summary_then_tail() {
+    let tail_start_id = message_id(9);
+    let mut turns = (1..=10)
+        .map(|seq| {
+            turn(
+                if seq % 2 == 0 {
+                    TurnRole::Assistant
+                } else {
+                    TurnRole::User
+                },
+                seq,
+                vec![stored_part(
+                    part_id(seq as u64),
+                    Part::Text {
+                        text: format!("turn {seq}"),
+                        synthetic: None,
+                    },
+                    None,
+                )],
+            )
+        })
+        .collect::<Vec<_>>();
+
+    turns.push(turn(
+        TurnRole::User,
+        11,
+        vec![stored_part(
+            part_id(11),
+            Part::Compaction {
+                auto: true,
+                tail_start_id: Some(tail_start_id.clone()),
+            },
+            None,
+        )],
+    ));
+    turns.push(turn(
+        TurnRole::Assistant,
+        12,
+        vec![stored_part(
+            part_id(12),
+            Part::Text {
+                text: "summary pending".to_string(),
+                synthetic: Some(true),
+            },
+            None,
+        )],
+    ));
+
+    let projected = project_for_replay(&turns);
+    let projected_ids = projected
+        .iter()
+        .map(|(turn, _)| turn.id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        projected_ids,
+        vec![
+            message_id(11),
+            message_id(12),
+            message_id(9),
+            message_id(10)
+        ]
+    );
+    assert_eq!(
+        projected[0].1,
+        vec![Part::Compaction {
+            auto: true,
+            tail_start_id: Some(tail_start_id),
+        }]
+    );
+}
+
+#[test]
+fn compaction_without_tail_still_replays_future_turns() {
+    let turns = vec![
+        turn(
+            TurnRole::User,
+            1,
+            vec![stored_part(
+                part_id(1),
+                Part::Compaction {
+                    auto: true,
+                    tail_start_id: None,
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::Assistant,
+            2,
+            vec![stored_part(
+                part_id(2),
+                Part::Text {
+                    text: "summary pending".to_string(),
+                    synthetic: Some(true),
+                },
+                None,
+            )],
+        ),
+        turn(
+            TurnRole::User,
+            3,
+            vec![stored_part(
+                part_id(3),
+                Part::Text {
+                    text: "future user turn".to_string(),
+                    synthetic: None,
+                },
+                None,
+            )],
+        ),
+    ];
+
+    let projected = project_for_replay(&turns);
+    let projected_ids = projected
+        .iter()
+        .map(|(turn, _)| turn.id.clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        projected_ids,
+        vec![message_id(1), message_id(2), message_id(3)]
+    );
+}
+
+#[test]
 fn compacted_tool_result_replays_placeholder_content() {
     let call_id = tool_call_id(50);
     let turns = vec![turn(

@@ -10,8 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nav_types::{MessageId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId, ToolCallId};
 use serde_json::{Value, json};
 
-use crate::compaction::prune::tool_result_part_ids_to_prune;
-use crate::compaction::replay::{project_for_replay, DEFAULT_TAIL_TURNS};
+use crate::compaction::{
+    COMPACTION_REPLAY_TEXT, COMPACTION_SUMMARY_PLACEHOLDER,
+    prune::tool_result_part_ids_to_prune,
+    replay::{DEFAULT_TAIL_TURNS, project_for_replay},
+};
 use crate::models::{
     AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
     ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
@@ -24,7 +27,7 @@ use super::canonical::{
 };
 use super::sqlite::{
     CreateSession, NewProviderPayload, ProviderState, RevertInfo, RunStatus, SqliteSessionStore,
-    SqliteStoreError, StartRun, StoredTurn,
+    SqliteStoreError, StartRun, StoredPart, StoredTurn,
 };
 
 pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
@@ -33,6 +36,7 @@ pub(crate) const CHATGPT_SUBSCRIPTION_DECODER_VERSION: &str = "chatgpt-subscript
 pub(crate) const OPENAI_RESPONSES_DECODER_VERSION: &str = "openai-responses-decoder@1";
 pub(crate) const ANTHROPIC_MESSAGES_DECODER_VERSION: &str = "anthropic-messages-decoder@1";
 const UNKNOWN_DECODER_VERSION: &str = "unknown-decoder";
+const COMPACTION_RUN_TRIGGER: &str = "compaction";
 
 const DEFAULT_PAYLOAD_DECODERS: &[PayloadDecoder] = &[
     PayloadDecoder {
@@ -112,6 +116,26 @@ pub struct SessionTotals {
     pub tokens_cache_write: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionConfig {
+    pub tail_turns: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            tail_turns: DEFAULT_TAIL_TURNS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionBoundary {
+    pub marker_id: MessageId,
+    pub summary_id: MessageId,
+    pub tail_start_id: Option<MessageId>,
+}
+
 #[derive(Debug)]
 pub struct SessionStore {
     sqlite: SqliteSessionStore,
@@ -180,9 +204,79 @@ impl SessionStore {
         self.sqlite.clear_session_revert(session_id)
     }
 
+    pub fn compact_session(
+        &self,
+        session_id: &SessionId,
+        config: CompactionConfig,
+    ) -> Result<CompactionBoundary, SqliteStoreError> {
+        let mut page = self
+            .sqlite
+            .list_turns_for_session(session_id, None, usize::MAX)?
+            .items;
+        page.reverse();
+
+        let tail_start_id = select_tail_start_id(&page, config.tail_turns);
+        let run_id = new_run_id();
+        let marker_id = new_message_id();
+        let summary_id = new_message_id();
+        let created_at = next_compaction_created_at(&page);
+
+        let marker_turn = Turn {
+            id: marker_id.clone(),
+            run_id: run_id.clone(),
+            seq: 0,
+            role: TurnRole::User,
+            meta: TurnMeta::default(),
+            created_at,
+        };
+        let summary_turn = Turn {
+            id: summary_id.clone(),
+            run_id: run_id.clone(),
+            seq: 0,
+            role: TurnRole::Assistant,
+            meta: TurnMeta::default(),
+            created_at: created_at.saturating_add(1),
+        };
+
+        self.sqlite.append_finished_run_with_turns(
+            StartRun {
+                id: run_id.clone(),
+                session_id: session_id.clone(),
+                status: RunStatus::Running,
+                trigger: Some(COMPACTION_RUN_TRIGGER.to_string()),
+                started_at: created_at,
+            },
+            &[
+                (
+                    marker_turn,
+                    vec![Part::Compaction {
+                        auto: true,
+                        tail_start_id: tail_start_id.clone(),
+                    }],
+                ),
+                (
+                    summary_turn,
+                    vec![Part::Text {
+                        text: COMPACTION_SUMMARY_PLACEHOLDER.to_string(),
+                        synthetic: Some(true),
+                    }],
+                ),
+            ],
+            created_at.saturating_add(2),
+            RunStatus::Completed,
+            None,
+        )?;
+
+        Ok(CompactionBoundary {
+            marker_id,
+            summary_id,
+            tail_start_id,
+        })
+    }
+
     pub fn start_run(&self, session_id: &SessionId, run_id: RunId) -> Result<(), SqliteStoreError> {
         self.sqlite.start_run(StartRun {
-            id: run_id,
+            id: run_id.clone(),
             session_id: session_id.clone(),
             status: RunStatus::Running,
             trigger: Some("session.sendMessage".to_string()),
@@ -777,6 +871,72 @@ fn model_turns_for_replay(turns: &[StoredTurn]) -> Vec<ModelTurn> {
         .collect()
 }
 
+fn select_tail_start_id(turns: &[StoredTurn], tail_turns: usize) -> Option<MessageId> {
+    if tail_turns == 0 {
+        return None;
+    }
+
+    let verbatim_turns = turns
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| is_verbatim_replay_turn(turns, *index))
+        .map(|(_, turn)| turn)
+        .collect::<Vec<_>>();
+    let tail_start_index = verbatim_turns.len().saturating_sub(tail_turns);
+
+    verbatim_turns
+        .get(tail_start_index)
+        .map(|(turn, _)| turn.id.clone())
+}
+
+fn is_verbatim_replay_turn(turns: &[StoredTurn], index: usize) -> bool {
+    let Some((_, parts)) = turns.get(index) else {
+        return false;
+    };
+
+    !has_compaction_marker(parts) && !is_compaction_summary_turn(turns, index)
+}
+
+fn has_compaction_marker(parts: &[StoredPart]) -> bool {
+    parts
+        .iter()
+        .any(|part| matches!(part.part, Part::Compaction { .. }))
+}
+
+fn is_compaction_summary_turn(turns: &[StoredTurn], index: usize) -> bool {
+    let Some((turn, parts)) = turns.get(index) else {
+        return false;
+    };
+    let Some(previous_index) = index.checked_sub(1) else {
+        return false;
+    };
+    let Some((_, previous_parts)) = turns.get(previous_index) else {
+        return false;
+    };
+
+    turn.role == TurnRole::Assistant
+        && parts.len() == 1
+        && has_compaction_marker(previous_parts)
+        && matches!(
+            &parts[0].part,
+            Part::Text {
+                synthetic: Some(true),
+                ..
+            }
+        )
+}
+
+fn next_compaction_created_at(turns: &[StoredTurn]) -> i64 {
+    let after_latest_turn = turns
+        .iter()
+        .map(|(turn, _)| turn.created_at)
+        .max()
+        .and_then(|created_at| created_at.checked_add(1))
+        .unwrap_or(0);
+
+    unix_millis().max(after_latest_turn)
+}
+
 fn parse_revert_info(value: &str) -> Result<RevertInfo, SqliteStoreError> {
     serde_json::from_str(value).map_err(|error| SqliteStoreError::ReadFailed(error.to_string()))
 }
@@ -851,6 +1011,7 @@ fn model_part_from_projected_part(part: Part) -> Option<TurnPart> {
             tool_call_id: call_id.to_string(),
             content,
         }),
+        Part::Compaction { .. } => Some(TurnPart::Text(COMPACTION_REPLAY_TEXT.to_string())),
         _ => None,
     }
 }
@@ -868,6 +1029,10 @@ fn ephemeral_db_path() -> PathBuf {
 
 fn new_message_id() -> MessageId {
     MessageId::try_new(new_uuid_v7_string()).expect("generated message id should be UUIDv7")
+}
+
+fn new_run_id() -> RunId {
+    RunId::try_new(new_uuid_v7_string()).expect("generated run id should be UUIDv7")
 }
 
 fn new_uuid_v7_string() -> String {
@@ -1008,6 +1173,84 @@ mod tests {
 
         assert_eq!(reloaded[0].parts, expected_parts);
         assert_eq!(run_reloaded[0].parts, expected_parts);
+    }
+
+    #[test]
+    fn compact_session_writes_marker_summary_and_replays_tail() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let mut message_ids = Vec::new();
+        for index in 0..10 {
+            let message_id = new_message_id();
+            let turn = if index % 2 == 0 {
+                ModelTurn::user_text(format!("user {index}"))
+            } else {
+                ModelTurn::assistant_text(format!("assistant {index}"))
+            };
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let boundary = store
+            .compact_session(&session_id, CompactionConfig::default())
+            .unwrap();
+
+        assert_eq!(boundary.tail_start_id, Some(message_ids[8].clone()));
+
+        let stored_turns = store
+            .sqlite
+            .list_turns_for_session(&session_id, None, usize::MAX)
+            .unwrap()
+            .items;
+        let marker = stored_turns
+            .iter()
+            .find(|(turn, _)| turn.id == boundary.marker_id)
+            .expect("marker turn should be stored");
+        assert_eq!(
+            marker.1[0].part,
+            Part::Compaction {
+                auto: true,
+                tail_start_id: Some(message_ids[8].clone()),
+            }
+        );
+        let compaction_run = store.sqlite.get_run(&marker.0.run_id).unwrap();
+        assert_eq!(compaction_run.status, "completed");
+        assert_eq!(compaction_run.finished_at, Some(marker.0.created_at + 2));
+
+        let summary = stored_turns
+            .iter()
+            .find(|(turn, _)| turn.id == boundary.summary_id)
+            .expect("summary turn should be stored");
+        assert_eq!(
+            summary.1[0].part,
+            Part::Text {
+                text: COMPACTION_SUMMARY_PLACEHOLDER.to_string(),
+                synthetic: Some(true),
+            }
+        );
+
+        let replay = store.try_turns(&session_id).unwrap();
+        let replay_text = replay
+            .iter()
+            .map(ModelTurn::text_content)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            replay_text,
+            vec![
+                COMPACTION_REPLAY_TEXT,
+                COMPACTION_SUMMARY_PLACEHOLDER,
+                "user 8",
+                "assistant 9",
+            ]
+        );
     }
 
     #[test]
