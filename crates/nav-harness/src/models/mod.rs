@@ -20,8 +20,11 @@ pub use decode::{
     OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
 };
 pub use encode::{
-    AnthropicMessagesEncoder, AnthropicMessagesRequest, AnthropicToolDefinition, Encoder,
-    OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
+    AnthropicMessagesEncoder, AnthropicMessagesRequest, AnthropicToolDefinition,
+    ChatGptSubscriptionContentPart, ChatGptSubscriptionEncoder, ChatGptSubscriptionItem,
+    ChatGptSubscriptionMessageItem, ChatGptSubscriptionMessageRole, ChatGptSubscriptionMetadata,
+    ChatGptSubscriptionRequest, ChatGptSubscriptionToolCallItem, ChatGptSubscriptionToolResultItem,
+    Encoder, OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
 };
 pub use model::{ModelConfig, ModelInput};
 pub use openai_completions::{
