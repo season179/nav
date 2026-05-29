@@ -3,6 +3,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::compaction::COMPACTION_REPLAY_TEXT;
 use crate::models::openai_completions::{
     ChatCompletionMessageRole, ChatCompletionRequestMessage, ChatCompletionToolCall,
     ChatCompletionToolCallFunction, ChatCompletionToolDefinition, OpenAiCompletionsRequest,
@@ -15,8 +16,7 @@ use crate::tools::{NavTool, ToolPreset, ToolRegistry};
 
 const CHATGPT_SUBSCRIPTION_API_KIND: &str = "chatgpt_subscription";
 const CHATGPT_SUBSCRIPTION_API_KIND_DASHED: &str = "chatgpt-subscription";
-const COMPACTION_TEXT: &str =
-    "Context was compacted. Previous conversation history has been summarized.";
+const COMPACTION_TEXT: &str = COMPACTION_REPLAY_TEXT;
 const PROVIDER_OPAQUE_TEXT: &str = "[Provider-specific content: opaque]";
 
 /// Converts model request turns into a provider-specific request.
