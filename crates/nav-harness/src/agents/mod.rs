@@ -531,6 +531,7 @@ fn api_kind_name(model: &ResolvedModelConfig) -> &'static str {
         crate::models::ApiKind::OpenAiCompletions => "openai-completions",
         crate::models::ApiKind::ChatGptSubscription => "chatgpt-subscription",
         crate::models::ApiKind::OpenAiResponses => "openai-responses",
+        crate::models::ApiKind::AnthropicMessages => "anthropic-messages",
     }
 }
 

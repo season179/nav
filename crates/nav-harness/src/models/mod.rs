@@ -19,6 +19,7 @@ pub use decode::{
     OpenAiResponsesDecoder,
 };
 pub use encode::{
+    AnthropicMessagesEncoder, AnthropicMessagesRequest, AnthropicToolDefinition,
     ChatGptSubscriptionContentPart, ChatGptSubscriptionEncoder, ChatGptSubscriptionItem,
     ChatGptSubscriptionMessageItem, ChatGptSubscriptionMessageRole, ChatGptSubscriptionMetadata,
     ChatGptSubscriptionRequest, ChatGptSubscriptionToolCallItem, ChatGptSubscriptionToolResultItem,

@@ -11,7 +11,7 @@ use crate::sessions::canonical::{ImageSource, Part, Turn, TurnRole};
 use crate::sessions::{
     ModelTurn, ModelTurnRole, ProviderState, ToolCall as ModelToolCall, TurnPart,
 };
-use crate::tools::{ToolPreset, ToolRegistry};
+use crate::tools::{NavTool, ToolPreset, ToolRegistry};
 
 const CHATGPT_SUBSCRIPTION_API_KIND: &str = "chatgpt_subscription";
 const CHATGPT_SUBSCRIPTION_API_KIND_DASHED: &str = "chatgpt-subscription";
@@ -158,6 +158,277 @@ impl Encoder for OpenAiResponsesEncoder {
         let input = turns.iter().flat_map(encode_responses_model_turn).collect();
         let mut request = self.request(input);
         apply_model_turn_instructions(turns, &mut request);
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnthropicMessagesRequest {
+    pub system: Option<String>,
+    pub messages: Vec<Value>,
+    pub tools: Vec<AnthropicToolDefinition>,
+}
+
+impl AnthropicMessagesRequest {
+    pub fn new(messages: Vec<Value>) -> Self {
+        Self {
+            system: None,
+            messages,
+            tools: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnthropicToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl AnthropicToolDefinition {
+    pub(crate) fn from_tool(tool: &dyn NavTool) -> Self {
+        Self {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            input_schema: tool.parameters(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AnthropicMessagesEncoder {
+    system: Option<String>,
+    tools: Vec<AnthropicToolDefinition>,
+}
+
+impl AnthropicMessagesEncoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
+    }
+
+    pub fn with_tools(mut self, tools: Vec<AnthropicToolDefinition>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn with_tool_registry(mut self, registry: &ToolRegistry, preset: ToolPreset) -> Self {
+        self.tools = registry
+            .preset_tools(preset)
+            .into_iter()
+            .map(|tool| AnthropicToolDefinition::from_tool(tool.as_ref()))
+            .collect();
+        self
+    }
+
+    pub fn encode(
+        &self,
+        turns: &[(Turn, Vec<Part>)],
+    ) -> Result<AnthropicMessagesRequest, std::convert::Infallible> {
+        let messages = turns
+            .iter()
+            .flat_map(|(turn, parts)| encode_anthropic_turn(turn.role, parts))
+            .collect();
+        Ok(self.request(messages))
+    }
+
+    fn request(&self, messages: Vec<Value>) -> AnthropicMessagesRequest {
+        AnthropicMessagesRequest {
+            system: self.system.clone(),
+            messages,
+            tools: self.tools.clone(),
+        }
+    }
+}
+
+fn encode_anthropic_turn(role: TurnRole, parts: &[Part]) -> Vec<Value> {
+    match role {
+        TurnRole::User => anthropic_user_messages(parts),
+        TurnRole::Assistant => anthropic_assistant_messages(parts),
+    }
+}
+
+fn anthropic_user_messages(parts: &[Part]) -> Vec<Value> {
+    let content: Vec<Value> = parts
+        .iter()
+        .filter_map(anthropic_user_content_block)
+        .collect();
+    anthropic_message("user", content)
+}
+
+fn anthropic_assistant_messages(parts: &[Part]) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut assistant_content = Vec::new();
+    let mut tool_result_content = Vec::new();
+
+    for part in parts {
+        if let Some(tool_result) = anthropic_tool_result_content_block(part) {
+            messages.extend(anthropic_message("assistant", assistant_content));
+            assistant_content = Vec::new();
+            tool_result_content.push(tool_result);
+            continue;
+        }
+
+        if let Some(block) = anthropic_assistant_content_block(part) {
+            messages.extend(anthropic_message("user", tool_result_content));
+            tool_result_content = Vec::new();
+            assistant_content.push(block);
+        }
+    }
+
+    messages.extend(anthropic_message("assistant", assistant_content));
+    messages.extend(anthropic_message("user", tool_result_content));
+    messages
+}
+
+fn anthropic_user_content_block(part: &Part) -> Option<Value> {
+    if let Part::Image { mime, source } = part {
+        return Some(anthropic_image_block(mime, source));
+    }
+
+    anthropic_text_content_block(part)
+}
+
+fn anthropic_assistant_content_block(part: &Part) -> Option<Value> {
+    if let Some(text) = anthropic_text_for_part(part) {
+        return Some(anthropic_text_block(text));
+    }
+
+    match part {
+        Part::ToolCall {
+            id,
+            name,
+            arguments,
+            ..
+        } => Some(json!({
+            "type": "tool_use",
+            "id": id.as_str(),
+            "name": name,
+            "input": arguments,
+        })),
+        Part::Thinking { text, .. } => Some(json!({
+            "type": "thinking",
+            "thinking": text,
+        })),
+        _ => None,
+    }
+}
+
+fn anthropic_text_content_block(part: &Part) -> Option<Value> {
+    anthropic_text_for_part(part).map(anthropic_text_block)
+}
+
+fn anthropic_tool_result_content_block(part: &Part) -> Option<Value> {
+    match part {
+        Part::ToolResult {
+            call_id,
+            content,
+            is_error,
+            ..
+        } => {
+            let mut block = json!({
+                "type": "tool_result",
+                "tool_use_id": call_id.as_str(),
+                "content": content,
+            });
+            if *is_error {
+                block["is_error"] = json!(true);
+            }
+            Some(block)
+        }
+        _ => None,
+    }
+}
+
+fn anthropic_text_for_part(part: &Part) -> Option<&str> {
+    match part {
+        Part::Text { text, .. } => Some(text.as_str()),
+        Part::Compaction { .. } => Some(COMPACTION_TEXT),
+        Part::ProviderOpaque { .. } => Some(PROVIDER_OPAQUE_TEXT),
+        _ => None,
+    }
+}
+
+fn anthropic_text_block(text: &str) -> Value {
+    json!({
+        "type": "text",
+        "text": text,
+    })
+}
+
+fn anthropic_image_block(mime: &str, source: &ImageSource) -> Value {
+    json!({
+        "type": "image",
+        "source": anthropic_image_source(mime, source),
+    })
+}
+
+fn anthropic_image_source(mime: &str, source: &ImageSource) -> Value {
+    match source {
+        ImageSource::InlineBytes { bytes } => json!({
+            "type": "base64",
+            "media_type": mime,
+            "data": base64_encode(bytes),
+        }),
+        ImageSource::FileRef { artifact_id } => json!({
+            "type": "url",
+            "url": format!("artifact://{artifact_id}"),
+        }),
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(ALPHABET[(((first & 0b0000_0011) << 4) | (second >> 4)) as usize] as char);
+
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(((second & 0b0000_1111) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(third & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
+}
+
+fn anthropic_message(role: &str, content: Vec<Value>) -> Vec<Value> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+
+    vec![json!({
+        "role": role,
+        "content": content,
+    })]
+}
+
+impl Encoder for AnthropicMessagesEncoder {
+    type Request = AnthropicMessagesRequest;
+    type Error = std::convert::Infallible;
+
+    fn encode(&self, turns: &[ModelTurn]) -> Result<Self::Request, Self::Error> {
+        let messages = turns.iter().filter_map(anthropic_model_message).collect();
+        let mut request = self.request(messages);
+        apply_model_turn_system(turns, &mut request);
         Ok(request)
     }
 }
@@ -727,6 +998,83 @@ fn apply_model_turn_instructions(turns: &[ModelTurn], request: &mut OpenAiRespon
         Some(existing) if !existing.is_empty() => Some(format!("{existing}\n\n{instructions}")),
         _ => Some(instructions),
     };
+}
+
+fn apply_model_turn_system(turns: &[ModelTurn], request: &mut AnthropicMessagesRequest) {
+    let system = turns
+        .iter()
+        .filter(|turn| turn.role == ModelTurnRole::System)
+        .map(ModelTurn::text_content)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if system.is_empty() {
+        return;
+    }
+
+    request.system = match &request.system {
+        Some(existing) if !existing.is_empty() => Some(format!("{existing}\n\n{system}")),
+        _ => Some(system),
+    };
+}
+
+fn anthropic_model_message(turn: &ModelTurn) -> Option<Value> {
+    if turn.role == ModelTurnRole::System {
+        return None;
+    }
+
+    let content: Vec<Value> = turn
+        .parts
+        .iter()
+        .filter_map(anthropic_model_content_block)
+        .collect();
+
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "role": anthropic_role(turn.role),
+        "content": content,
+    }))
+}
+
+fn anthropic_model_content_block(part: &TurnPart) -> Option<Value> {
+    match part {
+        TurnPart::Text(text) if !text.is_empty() => Some(anthropic_text_block(text)),
+        TurnPart::Text(_) => None,
+        TurnPart::ToolCall(tool_call) => Some(json!({
+            "type": "tool_use",
+            "id": model_tool_call_id(tool_call),
+            "name": tool_call.name,
+            "input": anthropic_tool_input(&tool_call.arguments),
+        })),
+        TurnPart::ToolResult {
+            tool_call_id,
+            content,
+        } => Some(json!({
+            "type": "tool_result",
+            "tool_use_id": tool_call_id,
+            "content": content,
+        })),
+    }
+}
+
+fn anthropic_tool_input(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| {
+        json!({
+            "arguments": arguments,
+        })
+    })
+}
+
+fn anthropic_role(role: ModelTurnRole) -> &'static str {
+    match role {
+        ModelTurnRole::User | ModelTurnRole::Tool => "user",
+        ModelTurnRole::Assistant => "assistant",
+        ModelTurnRole::System => unreachable!("system turns are top-level Anthropic system text"),
+    }
 }
 
 fn responses_input_text_message(text: String) -> Value {
