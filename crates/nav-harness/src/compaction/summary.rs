@@ -194,7 +194,7 @@ fn turn_text(turn: &ModelTurn) -> String {
 
 fn part_text(part: &TurnPart) -> String {
     match part {
-        TurnPart::Text(text) => text.clone(),
+        TurnPart::Text { text, .. } => text.clone(),
         TurnPart::ToolCall(tool_call) => {
             format!("[tool call: {} {}]", tool_call.name, tool_call.arguments)
         }

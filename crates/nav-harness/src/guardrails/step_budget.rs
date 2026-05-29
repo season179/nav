@@ -53,7 +53,9 @@ impl StepBudget {
         self.completed_steps = step_number;
         let final_step = step_number == self.max_steps;
         let synthetic_message = if final_step {
-            Some(ModelTurn::assistant_text(FINAL_STEP_SUMMARY_MESSAGE))
+            Some(ModelTurn::assistant_synthetic_text(
+                FINAL_STEP_SUMMARY_MESSAGE,
+            ))
         } else {
             None
         };

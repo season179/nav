@@ -1,5 +1,6 @@
 use nav_harness::guardrails::step_budget::{StepBudget, StepBudgetError};
-use nav_harness::sessions::ModelTurnRole;
+use nav_harness::sessions::{ModelTurnRole, SessionStore, TurnPart};
+use nav_types::{MessageId, RunId, SessionId};
 
 #[test]
 fn default_budget_allows_eighty_agent_steps() {
@@ -57,8 +58,61 @@ fn final_step_disables_tools_and_requests_text_only_summary() {
         .expect("final step should include a synthetic assistant message");
 
     assert_eq!(message.role, ModelTurnRole::Assistant);
+    assert!(
+        matches!(
+            message.parts.as_slice(),
+            [TurnPart::Text {
+                synthetic: Some(true),
+                ..
+            }]
+        ),
+        "final-step message should be marked synthetic"
+    );
     let text = message.text_content();
     assert!(text.contains("Tools are now disabled"));
     assert!(text.contains("text-only"));
     assert!(text.contains("summarize"));
+}
+
+#[test]
+fn final_step_synthetic_metadata_survives_session_store_roundtrip() {
+    let store = SessionStore::default();
+    let session_id = session_id();
+    let run_id = run_id();
+    store.create_session(session_id.clone()).unwrap();
+    store.start_run(&session_id, run_id.clone()).unwrap();
+
+    let mut budget = StepBudget::with_max_steps(1);
+    let message = budget
+        .next_step()
+        .unwrap()
+        .synthetic_message()
+        .expect("final step should include a synthetic assistant message")
+        .clone();
+
+    store.append_turn(&run_id, message_id(), message).unwrap();
+
+    let turns = store.try_turns(&session_id).unwrap();
+    assert!(
+        matches!(
+            turns[0].parts.as_slice(),
+            [TurnPart::Text {
+                synthetic: Some(true),
+                ..
+            }]
+        ),
+        "session replay should preserve synthetic text metadata"
+    );
+}
+
+fn session_id() -> SessionId {
+    SessionId::try_new("019f2f6f-f178-7a72-9f28-000000000463").unwrap()
+}
+
+fn run_id() -> RunId {
+    RunId::try_new("019f2f6f-f178-7a72-9f28-000000000464").unwrap()
+}
+
+fn message_id() -> MessageId {
+    MessageId::try_new("019f2f6f-f178-7a72-9f29-000000000465").unwrap()
 }
