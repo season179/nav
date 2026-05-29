@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use nav_harness::compaction::breaker::{
     AntiThrashingBreaker, AutoCompactionDecision, BreakerEvent, COMPACTION_BREAKER_WARNING,
-    CompactionFailureBreaker, DEFAULT_COMPACTION_FAILURE_THRESHOLD, savings_ratio,
+    CompactionFailureBreaker, DEFAULT_COMPACTION_FAILURE_THRESHOLD, TRANSIENT_COOLDOWN_DURATION,
+    savings_ratio,
 };
 use nav_harness::sessions::{CompactionConfig, CompactionKind, ModelTurn, SessionStore};
 use nav_types::{RunId, SessionId};
@@ -132,7 +135,7 @@ fn manual_compaction_is_allowed_after_breaker_trips() {
     for _ in 0..3 {
         breaker.record_failure(&session_id);
     }
-    assert!(!breaker.auto_compaction_enabled(&session_id));
+    assert!(!breaker.auto_compaction_enabled(&session_id, Duration::ZERO));
 
     let request = store
         .compaction_summary_request(&session_id, CompactionConfig::default())
@@ -181,7 +184,7 @@ fn only_the_tripping_failure_surfaces_a_warning() {
 fn fresh_session_allows_auto_compaction() {
     let breaker = CompactionFailureBreaker::new();
 
-    assert!(breaker.auto_compaction_enabled(&session(1)));
+    assert!(breaker.auto_compaction_enabled(&session(1), Duration::ZERO));
     assert_eq!(breaker.consecutive_failures(&session(1)), 0);
 }
 
@@ -194,7 +197,7 @@ fn failures_below_threshold_keep_auto_compaction_enabled() {
 
     assert_eq!(first, BreakerEvent::Recorded { consecutive: 1 });
     assert_eq!(second, BreakerEvent::Recorded { consecutive: 2 });
-    assert!(breaker.auto_compaction_enabled(&session(1)));
+    assert!(breaker.auto_compaction_enabled(&session(1), Duration::ZERO));
     assert_eq!(breaker.consecutive_failures(&session(1)), 2);
 }
 
@@ -214,7 +217,7 @@ fn breaker_trips_after_threshold_consecutive_failures() {
             consecutive: DEFAULT_COMPACTION_FAILURE_THRESHOLD
         })
     );
-    assert!(!breaker.auto_compaction_enabled(&session));
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
 }
 
 #[test]
@@ -227,7 +230,7 @@ fn further_failures_after_trip_report_already_tripped() {
     let after = breaker.record_failure(&session);
 
     assert_eq!(after, BreakerEvent::AlreadyTripped { consecutive: 3 });
-    assert!(!breaker.auto_compaction_enabled(&session));
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
 }
 
 #[test]
@@ -237,11 +240,11 @@ fn success_resets_counter_and_reenables_auto_compaction() {
 
     breaker.record_failure(&session);
     breaker.record_failure(&session); // tripped
-    assert!(!breaker.auto_compaction_enabled(&session));
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
 
     breaker.record_success(&session);
 
-    assert!(breaker.auto_compaction_enabled(&session));
+    assert!(breaker.auto_compaction_enabled(&session, Duration::ZERO));
     assert_eq!(breaker.consecutive_failures(&session), 0);
 }
 
@@ -255,7 +258,7 @@ fn reset_clears_failures_for_manual_compaction_or_new_session() {
 
     breaker.reset(&session);
 
-    assert!(breaker.auto_compaction_enabled(&session));
+    assert!(breaker.auto_compaction_enabled(&session, Duration::ZERO));
     assert_eq!(breaker.consecutive_failures(&session), 0);
 }
 
@@ -266,8 +269,8 @@ fn failure_counts_are_isolated_per_session() {
     breaker.record_failure(&session(1));
     breaker.record_failure(&session(1)); // session 1 tripped
 
-    assert!(!breaker.auto_compaction_enabled(&session(1)));
-    assert!(breaker.auto_compaction_enabled(&session(2)));
+    assert!(!breaker.auto_compaction_enabled(&session(1), Duration::ZERO));
+    assert!(breaker.auto_compaction_enabled(&session(2), Duration::ZERO));
     assert_eq!(breaker.consecutive_failures(&session(2)), 0);
 }
 
@@ -276,15 +279,139 @@ fn zero_threshold_is_clamped_to_trip_on_the_first_failure() {
     let mut breaker = CompactionFailureBreaker::with_threshold(0);
     let session = session(99);
 
-    assert!(breaker.auto_compaction_enabled(&session));
+    assert!(breaker.auto_compaction_enabled(&session, Duration::ZERO));
     assert_eq!(
         breaker.record_failure(&session),
         BreakerEvent::Tripped { consecutive: 1 }
     );
-    assert!(!breaker.auto_compaction_enabled(&session));
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
     assert_eq!(breaker.consecutive_failures(&session), 1);
 }
 
 fn session(suffix: u64) -> SessionId {
     SessionId::try_new(format!("019f2f6f-f178-7a72-9f28-{suffix:012x}")).unwrap()
+}
+
+// ── Transient cooldown tests (CMP-15) ──────────────────────────────
+
+/// A transient (rate-limit / 5xx) failure starts a ~10 min cooldown that
+/// disables auto-compaction — even though the consecutive-failure counter
+/// has not reached the hard-disable threshold.
+#[test]
+fn transient_failure_trips_cooldown() {
+    let mut breaker = CompactionFailureBreaker::new();
+    let session = session(100);
+
+    let event = breaker.record_transient_failure(&session, Duration::ZERO);
+
+    assert_eq!(event, BreakerEvent::TransientCooldown { cooldown: TRANSIENT_COOLDOWN_DURATION });
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
+}
+
+/// Once the cooldown elapses, auto-compaction is allowed again.
+#[test]
+fn transient_cooldown_elapses_allows_retry() {
+    let mut breaker = CompactionFailureBreaker::new();
+    let session = session(100);
+
+    breaker.record_transient_failure(&session, Duration::ZERO);
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
+
+    // 10 minutes + 1 nanosecond later — cooldown expired.
+    let after = Duration::from_secs(600) + Duration::from_nanos(1);
+    assert!(breaker.auto_compaction_enabled(&session, after));
+}
+
+/// Transient failures must not count toward the consecutive-failure threshold.
+#[test]
+fn transient_failure_does_not_increment_consecutive_counter() {
+    let mut breaker = CompactionFailureBreaker::new();
+    let session = session(101);
+
+    breaker.record_transient_failure(&session, Duration::ZERO);
+    breaker.record_transient_failure(&session, Duration::ZERO);
+    breaker.record_transient_failure(&session, Duration::ZERO);
+
+    // 3 transient failures — but consecutive_failures stays at 0.
+    assert_eq!(breaker.consecutive_failures(&session), 0);
+}
+
+/// Cooldowns are per-session — one session's cooldown doesn't affect another.
+#[test]
+fn transient_cooldown_is_per_session() {
+    let mut breaker = CompactionFailureBreaker::new();
+    let session_a = session(200);
+    let session_b = session(201);
+
+    breaker.record_transient_failure(&session_a, Duration::ZERO);
+
+    assert!(!breaker.auto_compaction_enabled(&session_a, Duration::ZERO));
+    assert!(breaker.auto_compaction_enabled(&session_b, Duration::ZERO));
+}
+
+/// `reset` clears the transient cooldown.
+#[test]
+fn reset_clears_transient_cooldown() {
+    let mut breaker = CompactionFailureBreaker::new();
+    let session = session(202);
+
+    breaker.record_transient_failure(&session, Duration::ZERO);
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
+
+    breaker.reset(&session);
+    assert!(breaker.auto_compaction_enabled(&session, Duration::ZERO));
+}
+
+/// The transient-cooldown event carries a user-facing warning.
+#[test]
+fn transient_cooldown_surfaces_warning() {
+    let mut breaker = CompactionFailureBreaker::new();
+    let session = session(203);
+
+    let event = breaker.record_transient_failure(&session, Duration::ZERO);
+
+    let warning = event.warning().expect("transient cooldown should warn");
+    assert!(
+        warning.contains("rate-limit")
+            || warning.contains("rate limit")
+            || warning.contains("server error"),
+        "warning should mention the cause: {warning}"
+    );
+}
+
+/// `record_success` clears the transient cooldown (system recovered).
+#[test]
+fn success_clears_transient_cooldown() {
+    let mut breaker = CompactionFailureBreaker::new();
+    let session = session(204);
+
+    breaker.record_transient_failure(&session, Duration::ZERO);
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
+
+    breaker.record_success(&session);
+    assert!(breaker.auto_compaction_enabled(&session, Duration::ZERO));
+}
+
+/// Hard-disable overrides an active cooldown when both conditions exist.
+#[test]
+fn hard_disable_overrides_cooldown() {
+    let mut breaker = CompactionFailureBreaker::with_threshold(2);
+    let session = session(205);
+
+    // Set a cooldown.
+    breaker.record_transient_failure(&session, Duration::ZERO);
+    // Trip the hard-disable.
+    breaker.record_failure(&session);
+    breaker.record_failure(&session);
+
+    // Both active — auto-compaction should be disabled.
+    assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
+
+    // Cooldown elapses — still disabled because hard-disable remains.
+    let after_cooldown = Duration::from_secs(601);
+    assert!(!breaker.auto_compaction_enabled(&session, after_cooldown));
+
+    // Only after `record_success` clears both.
+    breaker.record_success(&session);
+    assert!(breaker.auto_compaction_enabled(&session, after_cooldown));
 }
