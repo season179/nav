@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const BACKEND_EVENT_TYPES: &[&str] = &[
     "session.created",
+    "session.totals_updated",
     "run.started",
     "model.text_delta",
     "model.reasoning_delta",
@@ -28,7 +29,7 @@ pub const BACKEND_EVENT_TYPES: &[&str] = &[
     "error",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub event_id: EventId,
     pub session_id: SessionId,
@@ -42,11 +43,20 @@ impl EventEnvelope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendEvent {
     #[serde(rename = "session.created")]
     SessionCreated,
+    #[serde(rename = "session.totals_updated")]
+    SessionTotalsUpdated {
+        cost: f64,
+        tokens_input: i64,
+        tokens_output: i64,
+        tokens_reasoning: i64,
+        tokens_cache_read: i64,
+        tokens_cache_write: i64,
+    },
     #[serde(rename = "run.started")]
     RunStarted { run_id: RunId },
     #[serde(rename = "model.text_delta")]
@@ -219,6 +229,7 @@ impl BackendEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::SessionCreated => "session.created",
+            Self::SessionTotalsUpdated { .. } => "session.totals_updated",
             Self::RunStarted { .. } => "run.started",
             Self::ModelTextDelta { .. } => "model.text_delta",
             Self::ModelReasoningDelta { .. } => "model.reasoning_delta",
@@ -286,6 +297,14 @@ mod tests {
     fn backend_event_samples() -> Vec<BackendEvent> {
         vec![
             BackendEvent::SessionCreated,
+            BackendEvent::SessionTotalsUpdated {
+                cost: 0.05,
+                tokens_input: 1000,
+                tokens_output: 500,
+                tokens_reasoning: 0,
+                tokens_cache_read: 0,
+                tokens_cache_write: 0,
+            },
             BackendEvent::RunStarted { run_id: run_id() },
             BackendEvent::ModelTextDelta {
                 run_id: run_id(),

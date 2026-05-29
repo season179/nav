@@ -1,5 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {Box, useApp, useInput} from 'ink';
+import {Box, Text, useApp, useInput} from 'ink';
 import {useTerminalSize} from './use-terminal-size.js';
 import {
 	COMPOSER_HEIGHT,
@@ -17,6 +17,7 @@ import {
 	type ApprovalResult,
 	type NavEvent,
 	type SessionInfo,
+	type SessionTotals,
 	type StreamMessageOptions,
 } from '../backend/client.js';
 import {parseSlashCommand} from '../commands/slash.js';
@@ -46,11 +47,24 @@ export type AppBackendClient = {
 	): AsyncGenerator<NavEvent, void, void>;
 	approveTool(approvalId: string): Promise<ApprovalResult>;
 	rejectTool(approvalId: string, reason?: string): Promise<ApprovalResult>;
+	sessionTotals(): Promise<SessionTotals>;
 	reconnect(): Promise<SessionInfo>;
 	close(): Promise<void>;
 };
 
 const IDLE_HINT = 'Enter send · /model · /exit · Esc clear · Ctrl+C quit';
+
+function formatCost(cost: number): string {
+	if (cost < 0.01) return `$${cost.toFixed(4)}`;
+	if (cost < 1) return `$${cost.toFixed(3)}`;
+	return `$${cost.toFixed(2)}`;
+}
+
+function formatTokens(count: number): string {
+	if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+	if (count >= 1_000) return `${(count / 1_000).toFixed(1)}K`;
+	return String(count);
+}
 
 export function App({backendPath = '', backendClient}: Props) {
 	const {exit} = useApp();
@@ -69,6 +83,7 @@ export function App({backendPath = '', backendClient}: Props) {
 		useState<ToolApprovalRequest | null>(null);
 	const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
 	const [currentModel, setCurrentModel] = useState<ModelRef | null>(null);
+	const [sessionTotals, setSessionTotals] = useState<SessionTotals | null>(null);
 
 	useEffect(() => {
 		void resolveCurrentModelRef().then(setCurrentModel);
@@ -94,7 +109,7 @@ export function App({backendPath = '', backendClient}: Props) {
 		},
 	);
 
-	const historyHeight = Math.max(1, rows - COMPOSER_HEIGHT);
+	const historyHeight = Math.max(1, rows - COMPOSER_HEIGHT - (sessionTotals ? 1 : 0));
 
 	return (
 		<Box flexDirection="column" width={columns} height={rows}>
@@ -106,6 +121,28 @@ export function App({backendPath = '', backendClient}: Props) {
 			>
 				{renderMainRegion()}
 			</Box>
+			{sessionTotals && (
+				<Box
+					width={columns}
+					height={1}
+					flexShrink={0}
+					borderStyle="single"
+					borderBottom={false}
+					borderLeft={false}
+					borderRight={false}
+					borderTop={true}
+					justifyContent="space-between"
+					paddingX={1}
+				>
+					<Box>
+						<Text color="yellow">Cost: {formatCost(sessionTotals.cost)}</Text>
+					</Box>
+					<Box gap={2}>
+						<Text color="cyan">In: {formatTokens(sessionTotals.tokensInput)}</Text>
+						<Text color="green">Out: {formatTokens(sessionTotals.tokensOutput)}</Text>
+					</Box>
+				</Box>
+			)}
 			<ComposerRegion
 				value={input}
 				busy={busy}
@@ -308,6 +345,15 @@ export function App({backendPath = '', backendClient}: Props) {
 		if (event.type === 'tool.approval_requested') {
 			setApprovalRequest(approvalRequestFromEvent(event));
 			setHint('Confirm tool request');
+		} else if (event.type === 'session.totals_updated') {
+			setSessionTotals({
+				cost: event.cost,
+				tokensInput: event.tokensInput,
+				tokensOutput: event.tokensOutput,
+				tokensReasoning: event.tokensReasoning,
+				tokensCacheRead: event.tokensCacheRead,
+				tokensCacheWrite: event.tokensCacheWrite,
+			});
 		} else if (isRunTerminalEvent(event)) {
 			setApprovalRequest(null);
 		}
@@ -325,6 +371,7 @@ export function applyEventToHistory(
 ): HistoryMessage[] {
 	switch (event.type) {
 		case 'session.created':
+		case 'session.totals_updated':
 		case 'run.started':
 		case 'message.completed':
 		case 'run.completed':

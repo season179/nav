@@ -6,6 +6,7 @@ pub mod methods {
     pub const INITIALIZE: &str = "initialize";
     pub const SESSION_CREATE: &str = "session.create";
     pub const SESSION_SEND_MESSAGE: &str = "session.sendMessage";
+    pub const SESSION_TOTALS: &str = "session.totals";
     pub const RUN_CANCEL: &str = "run.cancel";
     pub const TOOL_APPROVE: &str = "tool.approve";
     pub const TOOL_REJECT: &str = "tool.reject";
@@ -193,6 +194,22 @@ pub struct ToolConfirmationResult {
 pub enum ToolConfirmationOutcome {
     Approved,
     Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTotalsParams {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTotalsResult {
+    pub cost: f64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+    pub tokens_reasoning: i64,
+    pub tokens_cache_read: i64,
+    pub tokens_cache_write: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

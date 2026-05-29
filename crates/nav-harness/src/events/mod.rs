@@ -18,13 +18,13 @@ use crate::models::{
 #[derive(Debug, Default)]
 pub struct EventLog;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HarnessEventEnvelope {
     pub event_id: EventId,
     pub event: HarnessEvent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HarnessEvent {
     ModelTextDelta {
         run_id: RunId,
