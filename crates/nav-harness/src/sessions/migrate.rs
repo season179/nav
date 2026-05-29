@@ -6,9 +6,6 @@ use rusqlite::{Connection, params};
 
 pub const SCHEMA_VERSION: i64 = 1;
 
-// `provider_payload_id` stays plain TEXT in this core-table slice. Adding a
-// foreign key before `provider_payloads` exists makes `turn_parts` inserts fail
-// under `PRAGMA foreign_keys=ON`, even when the value is NULL.
 pub const CORE_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version     INTEGER PRIMARY KEY NOT NULL,
@@ -68,7 +65,7 @@ CREATE TABLE IF NOT EXISTS turn_parts (
     session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     type            TEXT NOT NULL,
     data_json       TEXT NOT NULL,
-    provider_payload_id TEXT,
+    provider_payload_id TEXT REFERENCES provider_payloads(id) ON DELETE SET NULL,
     provider_json_pointer TEXT,
     compacted_at    INTEGER,
     created_at      INTEGER NOT NULL
@@ -90,6 +87,29 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_sha256 ON artifacts(sha256);
+
+CREATE TABLE IF NOT EXISTS provider_payloads (
+    id                  TEXT PRIMARY KEY NOT NULL,
+    session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id              TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    direction           TEXT NOT NULL,
+    api_kind            TEXT NOT NULL,
+    provider_id         TEXT,
+    model_id            TEXT,
+    sequence            INTEGER NOT NULL,
+    provider_payload_id TEXT,
+    artifact_id         TEXT NOT NULL REFERENCES artifacts(id),
+    sha256              TEXT NOT NULL,
+    decoder_version     TEXT,
+    decode_status       TEXT NOT NULL DEFAULT 'pending',
+    error_json          TEXT,
+    created_at          INTEGER NOT NULL,
+    decoded_at          INTEGER,
+    UNIQUE (run_id, direction, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_provider_payloads_run_sequence ON provider_payloads(run_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_provider_payloads_session ON provider_payloads(session_id, created_at);
 "#;
 
 struct TableSchema {
@@ -396,7 +416,7 @@ const TABLES: &[TableSchema] = &[
             ),
             column(
                 "provider_payload_id",
-                "provider_payload_id TEXT",
+                "provider_payload_id TEXT REFERENCES provider_payloads(id) ON DELETE SET NULL",
                 "TEXT",
                 false,
                 None,
@@ -477,6 +497,118 @@ const TABLES: &[TableSchema] = &[
             ),
         ],
     },
+    TableSchema {
+        name: "provider_payloads",
+        columns: &[
+            column(
+                "id",
+                "id TEXT PRIMARY KEY NOT NULL",
+                "TEXT",
+                true,
+                None,
+                true,
+            ),
+            column(
+                "session_id",
+                "session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "run_id",
+                "run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "direction",
+                "direction TEXT NOT NULL",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "api_kind",
+                "api_kind TEXT NOT NULL",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "provider_id",
+                "provider_id TEXT",
+                "TEXT",
+                false,
+                None,
+                false,
+            ),
+            column("model_id", "model_id TEXT", "TEXT", false, None, false),
+            column(
+                "sequence",
+                "sequence INTEGER NOT NULL",
+                "INTEGER",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "provider_payload_id",
+                "provider_payload_id TEXT",
+                "TEXT",
+                false,
+                None,
+                false,
+            ),
+            column(
+                "artifact_id",
+                "artifact_id TEXT NOT NULL REFERENCES artifacts(id)",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column("sha256", "sha256 TEXT NOT NULL", "TEXT", true, None, false),
+            column(
+                "decoder_version",
+                "decoder_version TEXT",
+                "TEXT",
+                false,
+                None,
+                false,
+            ),
+            column(
+                "decode_status",
+                "decode_status TEXT NOT NULL DEFAULT 'pending'",
+                "TEXT",
+                true,
+                Some("'pending'"),
+                false,
+            ),
+            column("error_json", "error_json TEXT", "TEXT", false, None, false),
+            column(
+                "created_at",
+                "created_at INTEGER NOT NULL",
+                "INTEGER",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "decoded_at",
+                "decoded_at INTEGER",
+                "INTEGER",
+                false,
+                None,
+                false,
+            ),
+        ],
+    },
 ];
 
 const INDEXES: &[IndexSchema] = &[
@@ -504,6 +636,16 @@ const INDEXES: &[IndexSchema] = &[
         name: "idx_artifacts_sha256",
         table: "artifacts",
         sql: "CREATE UNIQUE INDEX idx_artifacts_sha256 ON artifacts(sha256)",
+    },
+    IndexSchema {
+        name: "idx_provider_payloads_run_sequence",
+        table: "provider_payloads",
+        sql: "CREATE INDEX idx_provider_payloads_run_sequence ON provider_payloads(run_id, sequence)",
+    },
+    IndexSchema {
+        name: "idx_provider_payloads_session",
+        table: "provider_payloads",
+        sql: "CREATE INDEX idx_provider_payloads_session ON provider_payloads(session_id, created_at)",
     },
 ];
 

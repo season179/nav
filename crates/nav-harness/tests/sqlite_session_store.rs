@@ -1,8 +1,10 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use nav_harness::sessions::{
-    CreateSession, Part, RunStatus, SessionSettings, SqliteSessionStore, SqliteStoreError,
-    StartRun, TokenDelta, Turn, TurnMeta, TurnRole,
+    CreateSession, DecodeStatus, NewProviderPayload, Part, ProviderPayloadDirection, RunStatus,
+    SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun, TokenDelta, Turn, TurnMeta,
+    TurnRole,
 };
 use nav_types::{MessageId, RunId, SessionId, ToolCallId};
 
@@ -35,6 +37,35 @@ impl Drop for TempDb {
             name.push(suffix);
             let _ = std::fs::remove_file(PathBuf::from(name));
         }
+    }
+}
+
+struct TempDataDir {
+    path: PathBuf,
+}
+
+impl TempDataDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "nav-sqlite-session-store-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir(&path).expect("temp data dir should be created");
+        Self { path }
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.path.join("nav.db")
+    }
+}
+
+impl Drop for TempDataDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -91,6 +122,12 @@ fn start_minimal_run(store: &SqliteSessionStore, session_id: SessionId, run_id: 
             started_at: 2_000,
         })
         .expect("run start should commit");
+}
+
+fn count_artifacts(store: &SqliteSessionStore) -> i64 {
+    store
+        .execute_write(|tx| tx.query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0)))
+        .expect("artifact count should be readable")
 }
 
 #[test]
@@ -463,9 +500,10 @@ fn update_part_delta_rejects_non_streaming_field_without_mutating_part() {
     let err = store
         .update_part_delta(&turn_id, &part_id, "type", "_corrupt")
         .expect_err("non-streaming deltas should be rejected");
-    assert!(err
-        .to_string()
-        .contains("cannot append delta to non-streaming JSON field"));
+    assert!(
+        err.to_string()
+            .contains("cannot append delta to non-streaming JSON field")
+    );
 
     let turns = store
         .list_turns_for_run(&run_id)
@@ -794,4 +832,194 @@ fn concurrent_cost_writers_preserve_every_delta() {
     assert_eq!(session.tokens_reasoning, total_writes * 3);
     assert_eq!(session.tokens_cache_read, total_writes * 4);
     assert_eq!(session.tokens_cache_write, total_writes * 5);
+}
+
+#[test]
+fn provider_payload_append_persists_pending_row_and_raw_bytes() {
+    let data_dir = TempDataDir::new("provider-payload-append");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000339");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000340");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    let raw_bytes = br#"{"id":"chatcmpl_1","choices":[]}"#.to_vec();
+    let payload_id = store
+        .append_provider_payload(NewProviderPayload {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_1".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: raw_bytes.clone(),
+            created_at: 3_000,
+        })
+        .expect("provider payload append should commit");
+
+    let row = store
+        .get_provider_payload(&payload_id)
+        .expect("provider payload row should be readable");
+    assert_eq!(row.id, payload_id);
+    assert_eq!(row.session_id, session_id);
+    assert_eq!(row.run_id, run_id);
+    assert_eq!(row.direction, "response");
+    assert_eq!(row.api_kind, "openai_chat_completions");
+    assert_eq!(row.provider_id.as_deref(), Some("openai"));
+    assert_eq!(row.model_id.as_deref(), Some("gpt-5.1"));
+    assert_eq!(row.sequence, 0);
+    assert_eq!(row.provider_payload_id.as_deref(), Some("chatcmpl_1"));
+    assert_eq!(row.decode_status, "pending");
+    assert_eq!(row.decoder_version, None);
+    assert_eq!(row.decoded_at, None);
+
+    let mut artifact = store
+        .get_artifact(&row.artifact_id)
+        .expect("raw provider envelope artifact should be readable");
+    let mut stored_bytes = Vec::new();
+    artifact
+        .reader
+        .read_to_end(&mut stored_bytes)
+        .expect("artifact reader should stream bytes");
+
+    assert_eq!(artifact.row.kind, "provider_envelope");
+    assert_eq!(artifact.row.mime, "application/json");
+    assert_eq!(artifact.row.sha256, row.sha256);
+    assert_eq!(stored_bytes, raw_bytes);
+}
+
+#[test]
+fn failed_provider_payload_append_does_not_commit_artifact_row() {
+    let data_dir = TempDataDir::new("provider-payload-append-rollback");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000345");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000346");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+
+    store
+        .append_provider_payload(NewProviderPayload {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_1".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: br#"{"id":"chatcmpl_1"}"#.to_vec(),
+            created_at: 3_000,
+        })
+        .expect("first provider payload append should commit");
+    let artifact_count = count_artifacts(&store);
+
+    let err = store
+        .append_provider_payload(NewProviderPayload {
+            session_id,
+            run_id,
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_duplicate".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: br#"{"id":"different-raw-envelope"}"#.to_vec(),
+            created_at: 3_001,
+        })
+        .expect_err("duplicate run/direction/sequence should reject the append");
+
+    assert!(
+        err.to_string().contains("UNIQUE constraint failed"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(count_artifacts(&store), artifact_count);
+}
+
+#[test]
+fn provider_payload_decode_status_can_be_marked_with_decoder_version() {
+    let data_dir = TempDataDir::new("provider-payload-decode-status");
+    let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000341");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000342");
+    start_minimal_run(&store, session_id.clone(), run_id.clone());
+    let payload_id = store
+        .append_provider_payload(NewProviderPayload {
+            session_id,
+            run_id,
+            direction: ProviderPayloadDirection::Response,
+            api_kind: "openai_chat_completions".to_string(),
+            provider_id: Some("openai".to_string()),
+            model_id: Some("gpt-5.1".to_string()),
+            sequence: 0,
+            provider_payload_id: Some("chatcmpl_1".to_string()),
+            mime: "application/json".to_string(),
+            raw_bytes: br#"{"choices":[{"message":{"content":"hello","extra":true}}]}"#.to_vec(),
+            created_at: 3_000,
+        })
+        .expect("provider payload append should commit");
+
+    store
+        .mark_provider_payload_decoded(
+            &payload_id,
+            "openai-chat-completions-decoder@2",
+            DecodeStatus::DecodedWithUnknowns,
+        )
+        .expect("decode status update should commit");
+
+    store
+        .mark_provider_payload_decoded(
+            &payload_id,
+            "openai-chat-completions-decoder@3",
+            DecodeStatus::Decoded,
+        )
+        .expect("re-decode status update should commit");
+
+    let row = store
+        .get_provider_payload(&payload_id)
+        .expect("provider payload row should be readable");
+    assert_eq!(row.decode_status, "decoded");
+    assert_eq!(
+        row.decoder_version.as_deref(),
+        Some("openai-chat-completions-decoder@3")
+    );
+    assert_eq!(row.error_json, None);
+    assert!(row.decoded_at.is_some());
+}
+
+#[test]
+fn pending_provider_payloads_survive_restart_before_decode() {
+    let data_dir = TempDataDir::new("provider-payload-crash-window");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000343");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000344");
+    let payload_id = {
+        let store = SqliteSessionStore::open(data_dir.db_path()).expect("open should succeed");
+        start_minimal_run(&store, session_id.clone(), run_id.clone());
+        store
+            .append_provider_payload(NewProviderPayload {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                direction: ProviderPayloadDirection::Response,
+                api_kind: "openai_chat_completions".to_string(),
+                provider_id: Some("openai".to_string()),
+                model_id: Some("gpt-5.1".to_string()),
+                sequence: 0,
+                provider_payload_id: Some("chatcmpl_1".to_string()),
+                mime: "application/json".to_string(),
+                raw_bytes: br#"{"choices":[{"message":{"content":"hello"}}]}"#.to_vec(),
+                created_at: 3_000,
+            })
+            .expect("provider payload append should commit")
+    };
+
+    let reopened = SqliteSessionStore::open(data_dir.db_path()).expect("reopen should succeed");
+    let pending = reopened
+        .list_pending_provider_payloads()
+        .expect("pending provider payloads should be readable after restart");
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, payload_id);
+    assert_eq!(pending[0].decode_status, "pending");
 }
