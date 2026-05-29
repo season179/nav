@@ -156,7 +156,7 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS trg_turn_parts_text_update
-AFTER UPDATE OF data_json ON turn_parts
+AFTER UPDATE ON turn_parts
 BEGIN
     DELETE FROM turn_parts_text WHERE part_id = NEW.id;
     INSERT OR REPLACE INTO turn_parts_text (part_id, turn_id, part_type, text)
