@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::compaction::{
     COMPACTION_REPLAY_TEXT, COMPACTION_SUMMARY_PLACEHOLDER,
+    overflow::OVERFLOW_CONTINUATION_TEXT,
     prune::tool_result_part_ids_to_prune,
     replay::{DEFAULT_TAIL_TURNS, project_for_replay},
     summary::CompactionSummaryRequest,
@@ -265,6 +266,41 @@ impl SessionStore {
             summary.into(),
             true,
         )
+    }
+
+    /// Append the synthetic continuation prompt replayed after an overflow
+    /// compaction.
+    ///
+    /// Exactly one continuation turn is added per recovery: if the most recent
+    /// turn is already the overflow continuation, the call is a no-op so the
+    /// prompt is never duplicated across repeated recovery attempts.
+    pub fn append_overflow_continuation(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+    ) -> Result<(), SqliteStoreError> {
+        let page = self.session_turns_chronological(session_id)?;
+        if page.last().is_some_and(is_overflow_continuation_turn) {
+            return Ok(());
+        }
+
+        let created_at = self.next_turn_created_at_for_run(run_id, unix_millis())?;
+        let turn = Turn {
+            id: new_message_id(),
+            run_id: run_id.clone(),
+            seq: 0,
+            role: TurnRole::User,
+            meta: TurnMeta::default(),
+            created_at,
+        };
+
+        self.sqlite.append_turns(&[(
+            turn,
+            vec![Part::Text {
+                text: OVERFLOW_CONTINUATION_TEXT.to_string(),
+                synthetic: Some(true),
+            }],
+        )])
     }
 
     fn write_compaction_summary(
@@ -1035,6 +1071,19 @@ fn is_verbatim_replay_turn(turns: &[StoredTurn], index: usize) -> bool {
     };
 
     !has_compaction_marker(parts) && !is_compaction_summary_turn(turns, index)
+}
+
+fn is_overflow_continuation_turn((turn, parts): &StoredTurn) -> bool {
+    turn.role == TurnRole::User
+        && parts.iter().any(|part| {
+            matches!(
+                &part.part,
+                Part::Text {
+                    text,
+                    synthetic: Some(true),
+                } if text == OVERFLOW_CONTINUATION_TEXT
+            )
+        })
 }
 
 fn has_compaction_marker(parts: &[StoredPart]) -> bool {
