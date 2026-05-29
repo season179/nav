@@ -15,13 +15,14 @@ pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, Thinking
 pub use config::{ModelRef, ModelSettings};
 pub use decode::{
     DecodeError, DecodedPart, DecodedProviderPayload, DecodedTurn, Decoder,
-    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
+    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput,
+    OpenAiResponsesDecoder,
 };
 pub use encode::{
     ChatGptSubscriptionContentPart, ChatGptSubscriptionEncoder, ChatGptSubscriptionItem,
     ChatGptSubscriptionMessageItem, ChatGptSubscriptionMessageRole, ChatGptSubscriptionMetadata,
     ChatGptSubscriptionRequest, ChatGptSubscriptionToolCallItem, ChatGptSubscriptionToolResultItem,
-    Encoder, OpenAiChatCompletionsEncoder,
+    Encoder, OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
 };
 pub use model::{ModelConfig, ModelInput};
 pub use openai_completions::{

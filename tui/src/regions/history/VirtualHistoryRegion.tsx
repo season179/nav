@@ -1,5 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {Box, Text} from 'ink';
+import {Box, Text, useInput} from 'ink';
 import {FileChangedCell} from './FileChangedCell.js';
 import {ToolCallCell} from './ToolCallCell.js';
 import {ToolResultCell} from './ToolResultCell.js';
@@ -10,6 +10,8 @@ import {ScrollViewport} from '../../ink-ext/ScrollViewport.js';
 import {useWheelScroll} from '../../ink-ext/use-wheel-scroll.js';
 
 const FOLLOW_TAIL_TOLERANCE = 1;
+const KEYBOARD_LINE_STEP = 1;
+const KEYBOARD_PAGE_STEP = 5;
 
 type Props = {
 	messages: HistoryMessage[];
@@ -32,7 +34,37 @@ export function VirtualHistoryRegion({
 		},
 	});
 	const previousScrollTopRef = useRef(scrollTop);
+	const keyboardScrollTopRef = useRef(scrollTop);
 	const atBottom = isAtBottom(scrollTop, knownMaxScrollTop);
+	keyboardScrollTopRef.current = scrollTop;
+
+	function scrollByRows(delta: number): void {
+		const currentScrollTop = keyboardScrollTopRef.current;
+		const nextScrollTop = clamp(
+			currentScrollTop + delta,
+			0,
+			knownMaxScrollTop,
+		);
+		if (nextScrollTop === currentScrollTop) {
+			return;
+		}
+
+		keyboardScrollTopRef.current = nextScrollTop;
+		setScrollTop(nextScrollTop);
+		setStickyBottom(isAtBottom(nextScrollTop, knownMaxScrollTop));
+	}
+
+	useInput((_input, key) => {
+		const scrollUp = key.pageUp || key.upArrow;
+		const scrollDown = key.pageDown || key.downArrow;
+		if (!scrollUp && !scrollDown) {
+			return;
+		}
+
+		const step =
+			key.pageUp || key.pageDown ? KEYBOARD_PAGE_STEP : KEYBOARD_LINE_STEP;
+		scrollByRows(scrollUp ? -step : step);
+	});
 
 	useEffect(() => {
 		const previousScrollTop = previousScrollTopRef.current;
@@ -62,10 +94,7 @@ export function VirtualHistoryRegion({
 			justifyContent="flex-end"
 		>
 			{messages.length === 0 ? (
-				<Box flexDirection="column" marginTop={1}>
-					<Text color={theme.accent} bold>
-						nav
-					</Text>
+				<Box marginTop={1}>
 					<Text color={theme.inactive}>
 						Ask a question, or type /model or /exit.
 					</Text>
@@ -93,7 +122,7 @@ export function VirtualHistoryRegion({
 					{indicatorVisible ? (
 						<Box justifyContent="center">
 							<Text color={theme.inactive}>
-								↓ {hiddenRows} hidden · scroll to reveal
+								↓ {hiddenRows} hidden · PgDn reveal · PgUp older
 							</Text>
 						</Box>
 					) : null}
@@ -105,6 +134,10 @@ export function VirtualHistoryRegion({
 
 function isAtBottom(scrollTop: number, maxScrollTop: number): boolean {
 	return scrollTop >= maxScrollTop - FOLLOW_TAIL_TOLERANCE;
+}
+
+function clamp(value: number, min: number, max: number): number {
+	return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
 const MessageRow = React.memo(function MessageRow({
