@@ -477,7 +477,12 @@ fn session_send_message_starts_run_and_streams_typed_sse_events() {
     let replayed_events = parse_sse(replay_response.body());
     assert_eq!(
         event_names(&replayed_events),
-        vec!["model.text_delta", "message.completed", "run.completed", "session.totals_updated"]
+        vec![
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+            "session.totals_updated"
+        ]
     );
     assert_protocol_event_ids(&replayed_events, session_id);
 }
@@ -1460,14 +1465,24 @@ fn session_send_message_streams_delayed_provider_chunks_live_and_replays_midstre
     let live_after_release = receive_live_events(&subscription, 4);
     assert_eq!(
         envelope_event_names(&live_after_release),
-        vec!["model.text_delta", "message.completed", "run.completed", "session.totals_updated"]
+        vec![
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+            "session.totals_updated"
+        ]
     );
     assert_model_text_delta(&live_after_release[0], "Season");
 
     let replay_after_release = receive_live_events(&replay_after_run_started, 4);
     assert_eq!(
         envelope_event_names(&replay_after_release),
-        vec!["model.text_delta", "message.completed", "run.completed", "session.totals_updated"]
+        vec![
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+            "session.totals_updated"
+        ]
     );
     assert_model_text_delta(&replay_after_release[0], "Season");
     wait_for_run_status(&server, &run_id, RunStatus::Completed);
@@ -1524,7 +1539,12 @@ fn streaming_delta_is_not_persisted_until_turn_boundary() {
     let live_after_release = receive_live_events(&subscription, 4);
     assert_eq!(
         envelope_event_names(&live_after_release),
-        vec!["model.text_delta", "message.completed", "run.completed", "session.totals_updated"]
+        vec![
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+            "session.totals_updated"
+        ]
     );
     assert_model_text_delta(&live_after_release[0], "Season");
     wait_for_run_status(&server, run_id.as_str(), RunStatus::Completed);
@@ -1703,7 +1723,12 @@ fn session_send_message_marks_transport_failure_as_run_failed() {
     );
     assert_eq!(
         event_names(&events),
-        vec!["session.created", "run.started", "run.failed", "session.totals_updated"]
+        vec![
+            "session.created",
+            "run.started",
+            "run.failed",
+            "session.totals_updated"
+        ]
     );
     let failed = &events[2].data;
     assert_eq!(failed["run_id"], run_id);
@@ -1762,7 +1787,12 @@ fn run_cancel_cancels_active_provider_stream_and_publishes_run_cancelled() {
     );
     assert_eq!(
         event_names(&events),
-        vec!["session.created", "run.started", "run.cancelled", "session.totals_updated"]
+        vec![
+            "session.created",
+            "run.started",
+            "run.cancelled",
+            "session.totals_updated"
+        ]
     );
     assert_eq!(events[2].data["run_id"], run_id);
 
@@ -1939,7 +1969,12 @@ fn session_send_message_streams_run_failed_when_default_model_cannot_resolve() {
     );
     assert_eq!(
         event_names(&events),
-        vec!["session.created", "run.started", "run.failed", "session.totals_updated"]
+        vec![
+            "session.created",
+            "run.started",
+            "run.failed",
+            "session.totals_updated"
+        ]
     );
 
     let failed = events

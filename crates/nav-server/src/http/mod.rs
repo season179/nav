@@ -19,10 +19,9 @@ use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     JsonRpcVersion, ProtocolCapabilities, RunCancelParams, RunCancelResult, SessionCreateParams,
-    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult,
-    SessionTotalsParams, SessionTotalsResult, SettingsReloadResult,
-    ToolApproveParams, ToolConfirmationOutcome, ToolConfirmationResult, ToolRejectParams,
-    ToolsPreset, methods,
+    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, SessionTotalsParams,
+    SessionTotalsResult, SettingsReloadResult, ToolApproveParams, ToolConfirmationOutcome,
+    ToolConfirmationResult, ToolRejectParams, ToolsPreset, methods,
 };
 use nav_protocol::{BACKEND_EVENT_TYPES, BackendEvent, EventEnvelope};
 use nav_types::{EventId, RunId, SessionId};
