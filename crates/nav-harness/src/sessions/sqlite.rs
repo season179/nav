@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
+use super::migrate;
+
 /// Maximum number of `BEGIN IMMEDIATE` retries before giving up on a busy DB.
 const MAX_WRITE_RETRIES: u32 = 15;
 /// Retry backoff is uniform jitter in `[JITTER_MIN_MS, JITTER_MAX_MS]`.
@@ -79,6 +81,8 @@ impl SqliteSessionStore {
             Connection::open(path).map_err(|err| SqliteStoreError::OpenFailed(err.to_string()))?;
         apply_base_pragmas(&conn)?;
         let journal_mode = establish_journal_mode(&conn, simulate_wal_failure)?;
+        migrate::migrate(&conn)
+            .map_err(|err| SqliteStoreError::MigrationFailed(err.to_string()))?;
         Ok(Self {
             conn: Mutex::new(conn),
             journal_mode,
@@ -307,6 +311,8 @@ pub enum SqliteStoreError {
     Locking(String),
     /// A write transaction failed or exhausted its retry budget.
     WriteFailed(String),
+    /// Schema migration or reconciliation failed.
+    MigrationFailed(String),
 }
 
 impl std::fmt::Display for SqliteStoreError {
@@ -316,6 +322,7 @@ impl std::fmt::Display for SqliteStoreError {
             Self::PragmaFailed(msg) => write!(f, "pragma failed: {msg}"),
             Self::Locking(msg) => write!(f, "locking protocol error: {msg}"),
             Self::WriteFailed(msg) => write!(f, "write failed: {msg}"),
+            Self::MigrationFailed(msg) => write!(f, "migration failed: {msg}"),
         }
     }
 }
@@ -506,5 +513,358 @@ mod tests {
         assert_eq!(store.pragma_i64("foreign_keys"), 1);
         assert_eq!(store.pragma_i64("busy_timeout"), 5000);
         assert_eq!(store.pragma_i64("cache_size"), -64000);
+    }
+
+    #[test]
+    fn open_creates_the_core_session_schema_and_is_idempotent() {
+        let db = TempDb::new("core-schema");
+
+        SqliteSessionStore::open(db.path()).expect("first open should migrate");
+        SqliteSessionStore::open(db.path()).expect("second open should be idempotent");
+
+        let conn = Connection::open(db.path()).expect("schema should be readable");
+        assert_table_exists(&conn, "schema_migrations");
+        assert_table_exists(&conn, "sessions");
+        assert_table_exists(&conn, "runs");
+        assert_table_exists(&conn, "turns");
+        assert_table_exists(&conn, "turn_parts");
+
+        assert_index_exists(&conn, "idx_runs_session_started");
+        assert_index_exists(&conn, "idx_turns_run_seq");
+        assert_index_exists(&conn, "idx_turn_parts_turn_id");
+        assert_index_exists(&conn, "idx_turn_parts_session_id");
+
+        let (version, applied_at): (i64, i64) = conn
+            .query_row(
+                "SELECT version, applied_at FROM schema_migrations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("schema_migrations should be queryable");
+        assert_eq!(version, migrate::SCHEMA_VERSION);
+        assert!(applied_at > 0);
+    }
+
+    #[test]
+    fn core_schema_accepts_rows_without_provider_payloads_table() {
+        let db = TempDb::new("core-schema-insert");
+
+        SqliteSessionStore::open(db.path()).expect("open should migrate");
+
+        let conn = Connection::open(db.path()).expect("schema should be readable");
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys should be enabled");
+        conn.execute(
+            "INSERT INTO sessions (id, version, created_at, updated_at) VALUES ('s1', 'test', 1, 1)",
+            [],
+        )
+        .expect("session insert");
+        conn.execute(
+            "INSERT INTO runs (id, session_id, status, started_at) VALUES ('r1', 's1', 'running', 1)",
+            [],
+        )
+        .expect("run insert");
+        conn.execute(
+            "INSERT INTO turns (id, run_id, seq, role, created_at) VALUES ('m1', 'r1', 0, 'user', 1)",
+            [],
+        )
+        .expect("turn insert");
+        conn.execute(
+            "INSERT INTO turn_parts (id, turn_id, session_id, type, data_json, created_at)
+             VALUES ('prt_1', 'm1', 's1', 'text', '{}', 1)",
+            [],
+        )
+        .expect("turn part insert");
+    }
+
+    #[test]
+    fn open_readds_missing_nullable_columns() {
+        let db = TempDb::new("schema-reconcile");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        create_sessions_table(&conn, None);
+        drop(conn);
+
+        SqliteSessionStore::open(db.path()).expect("open should reconcile missing nullable column");
+
+        let conn = Connection::open(db.path()).expect("schema should be readable");
+        assert_column_exists(&conn, "sessions", "slug");
+    }
+
+    #[test]
+    fn open_rejects_missing_required_columns() {
+        let db = TempDb::new("schema-missing-required");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        create_sessions_table_with_overrides(
+            &conn,
+            "id              TEXT PRIMARY KEY NOT NULL",
+            None,
+            Some("slug            TEXT"),
+        );
+        drop(conn);
+
+        let err = SqliteSessionStore::open(db.path())
+            .expect_err("open should reject incompatible schema");
+
+        assert!(
+            err.to_string()
+                .contains("missing required column sessions.source"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_incompatible_column_types() {
+        let db = TempDb::new("schema-incompatible");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        create_sessions_table(&conn, Some("slug            INTEGER"));
+        drop(conn);
+
+        let err = SqliteSessionStore::open(db.path())
+            .expect_err("open should reject incompatible schema");
+
+        assert!(
+            err.to_string()
+                .contains("incompatible column sessions.slug: expected TEXT, got INTEGER"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn failed_migration_does_not_partially_create_core_tables() {
+        let db = TempDb::new("schema-failed-atomic");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        create_sessions_table(&conn, Some("slug            INTEGER"));
+        drop(conn);
+
+        SqliteSessionStore::open(db.path()).expect_err("open should reject incompatible schema");
+
+        let conn = Connection::open(db.path()).expect("schema should be readable");
+        assert_table_exists(&conn, "sessions");
+        assert_table_missing(&conn, "schema_migrations");
+        assert_table_missing(&conn, "runs");
+        assert_table_missing(&conn, "turns");
+        assert_table_missing(&conn, "turn_parts");
+    }
+
+    #[test]
+    fn open_rejects_incompatible_primary_keys() {
+        let db = TempDb::new("schema-incompatible-primary-key");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        create_sessions_table_with_overrides(
+            &conn,
+            "id              TEXT NOT NULL",
+            Some("source          TEXT NOT NULL DEFAULT 'cli'"),
+            Some("slug            TEXT"),
+        );
+        drop(conn);
+
+        let err = SqliteSessionStore::open(db.path())
+            .expect_err("open should reject incompatible schema");
+
+        assert!(
+            err.to_string().contains(
+                "incompatible column sessions.id: expected PRIMARY KEY, got not primary key"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_incompatible_defaults() {
+        let db = TempDb::new("schema-incompatible-default");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        create_sessions_table_with_overrides(
+            &conn,
+            "id              TEXT PRIMARY KEY NOT NULL",
+            Some("source          TEXT NOT NULL DEFAULT 'api'"),
+            Some("slug            TEXT"),
+        );
+        drop(conn);
+
+        let err = SqliteSessionStore::open(db.path())
+            .expect_err("open should reject incompatible schema");
+
+        assert!(
+            err.to_string()
+                .contains("incompatible column sessions.source: expected 'cli', got 'api'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_case_changed_string_defaults() {
+        let db = TempDb::new("schema-incompatible-default-case");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        create_sessions_table_with_overrides(
+            &conn,
+            "id              TEXT PRIMARY KEY NOT NULL",
+            Some("source          TEXT NOT NULL DEFAULT 'CLI'"),
+            Some("slug            TEXT"),
+        );
+        drop(conn);
+
+        let err = SqliteSessionStore::open(db.path())
+            .expect_err("open should reject incompatible schema");
+
+        assert!(
+            err.to_string()
+                .contains("incompatible column sessions.source: expected 'cli', got 'CLI'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_incompatible_schema_migrations_table() {
+        let db = TempDb::new("schema-incompatible-migrations");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (
+                version     TEXT PRIMARY KEY NOT NULL,
+                applied_at  INTEGER NOT NULL
+            );
+            "#,
+        )
+        .expect("setup incompatible migrations table");
+        drop(conn);
+
+        let err = SqliteSessionStore::open(db.path())
+            .expect_err("open should reject incompatible schema");
+
+        assert!(
+            err.to_string().contains(
+                "incompatible column schema_migrations.version: expected INTEGER, got TEXT"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_incompatible_indexes() {
+        let db = TempDb::new("schema-incompatible-index");
+        let conn = Connection::open(db.path()).expect("setup should open");
+        create_sessions_table(&conn, Some("slug            TEXT"));
+        conn.execute_batch(
+            r#"
+            CREATE TABLE runs (
+                id              TEXT PRIMARY KEY NOT NULL,
+                session_id      TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                status          TEXT NOT NULL,
+                trigger         TEXT,
+                started_at      INTEGER NOT NULL,
+                finished_at     INTEGER,
+                error_json      TEXT
+            );
+
+            CREATE INDEX idx_runs_session_started ON runs(status);
+            "#,
+        )
+        .expect("setup incompatible index");
+        drop(conn);
+
+        let err = SqliteSessionStore::open(db.path())
+            .expect_err("open should reject incompatible schema");
+
+        assert!(
+            err.to_string()
+                .contains("incompatible index idx_runs_session_started"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fn create_sessions_table(conn: &Connection, slug_column: Option<&str>) {
+        create_sessions_table_with_overrides(
+            conn,
+            "id              TEXT PRIMARY KEY NOT NULL",
+            Some("source          TEXT NOT NULL DEFAULT 'cli'"),
+            slug_column,
+        );
+    }
+
+    fn create_sessions_table_with_overrides(
+        conn: &Connection,
+        id_column: &str,
+        source_column: Option<&str>,
+        slug_column: Option<&str>,
+    ) {
+        let source_column = source_column
+            .map(|column| format!("                {column},\n"))
+            .unwrap_or_default();
+        let slug_column = slug_column
+            .map(|column| format!("                {column},\n"))
+            .unwrap_or_default();
+        let sql = format!(
+            r#"
+            CREATE TABLE sessions (
+                {id_column},
+                title           TEXT,
+{source_column}                workspace_root  TEXT,
+                system_prompt   TEXT,
+                settings_json   TEXT NOT NULL DEFAULT '{{}}',
+                parent_id       TEXT REFERENCES sessions(id),
+                version         TEXT NOT NULL,
+{slug_column}                cost            REAL NOT NULL DEFAULT 0,
+                tokens_input    INTEGER NOT NULL DEFAULT 0,
+                tokens_output   INTEGER NOT NULL DEFAULT 0,
+                tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+                tokens_cache_read  INTEGER NOT NULL DEFAULT 0,
+                tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+                time_archived   INTEGER,
+                time_compacting INTEGER,
+                revert_json     TEXT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
+            "#
+        );
+        conn.execute_batch(&sql).expect("setup sessions table");
+    }
+
+    fn assert_table_exists(conn: &Connection, table: &str) {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("sqlite_master should be queryable");
+        assert_eq!(count, 1, "missing table {table}");
+    }
+
+    fn assert_table_missing(conn: &Connection, table: &str) {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .expect("sqlite_master should be queryable");
+        assert_eq!(count, 0, "unexpected table {table}");
+    }
+
+    fn assert_index_exists(conn: &Connection, index: &str) {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |row| row.get(0),
+            )
+            .expect("sqlite_master should be queryable");
+        assert_eq!(count, 1, "missing index {index}");
+    }
+
+    fn assert_column_exists(conn: &Connection, table: &str, column: &str) {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("table_info should prepare");
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("table_info should query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("table_info rows should decode");
+        assert!(
+            columns.iter().any(|name| name == column),
+            "missing column {table}.{column}"
+        );
     }
 }
