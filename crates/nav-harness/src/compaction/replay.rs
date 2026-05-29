@@ -1,16 +1,20 @@
 //! Projection from canonical storage rows into provider replay turns.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use nav_types::{MessageId, PartId};
+use nav_types::{MessageId, PartId, ToolCallId};
 use serde_json::Value;
 
-use crate::compaction::prune::OLD_TOOL_RESULT_CONTENT_CLEARED;
+use crate::compaction::prune::pruned_result_summary;
 use crate::sessions::{Part, StoredPart, StoredTurn, Turn, TurnRole};
 use crate::tools::truncation::TRUNCATED_MARKER;
 
 const DUPLICATE_TOOL_RESULT_CONTENT: &str = "[Duplicate — see more recent result]";
-const STRIPPED_IMAGE_CONTENT: &str = "[Attached image — stripped after compression]";
+const STRIPPED_IMAGE_CONTENT: &str = "[image elided]";
+
+/// Number of trailing image-bearing user turns whose images are kept verbatim.
+/// Older images are replaced with a text placeholder at replay time.
+pub const KEEP_MEDIA_TURNS: usize = 2;
 const MAX_ARGUMENT_STRING_CHARS: usize = 1024;
 
 /// Number of trailing turns whose `ToolCall.arguments` are left untouched
@@ -29,14 +33,15 @@ pub const DEFAULT_TAIL_TURNS: usize = 2;
 /// they apply to the entire turn history based on content, not position.
 pub fn project_for_replay(turns: &[StoredTurn], tail_turns: usize) -> Vec<(Turn, Vec<Part>)> {
     let duplicate_tool_results = duplicate_tool_result_part_ids(turns);
-    let latest_image_turn_index = latest_image_bearing_user_turn_index(turns);
+    let tool_names = stored_tool_names_by_call_id(turns);
+    let kept_image_turn_indices = kept_image_bearing_turn_indices(turns, KEEP_MEDIA_TURNS);
     let truncate_boundary = turns.len().saturating_sub(tail_turns);
 
     let projected = turns
         .iter()
         .enumerate()
         .map(|(index, (turn, parts))| {
-            let strip_images = latest_image_turn_index.is_some_and(|latest| index < latest);
+            let strip_images = !kept_image_turn_indices.contains(&index);
             let truncate_arguments = index < truncate_boundary;
             (
                 turn.clone(),
@@ -46,6 +51,7 @@ pub fn project_for_replay(turns: &[StoredTurn], tail_turns: usize) -> Vec<(Turn,
                         project_stored_part(
                             part,
                             &duplicate_tool_results,
+                            &tool_names,
                             strip_images,
                             truncate_arguments,
                         )
@@ -133,18 +139,39 @@ fn duplicate_tool_result_part_ids(turns: &[StoredTurn]) -> HashSet<PartId> {
     duplicate_part_ids
 }
 
-fn latest_image_bearing_user_turn_index(turns: &[StoredTurn]) -> Option<usize> {
-    turns.iter().rposition(|(turn, parts)| {
-        turn.role == TurnRole::User
-            && parts
-                .iter()
-                .any(|part| matches!(part.part, Part::Image { .. }))
-    })
+fn kept_image_bearing_turn_indices(turns: &[StoredTurn], keep_count: usize) -> HashSet<usize> {
+    let image_indices: Vec<usize> = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, (turn, parts))| {
+            turn.role == TurnRole::User
+                && parts
+                    .iter()
+                    .any(|part| matches!(part.part, Part::Image { .. }))
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    let skip = image_indices.len().saturating_sub(keep_count);
+    image_indices.into_iter().skip(skip).collect()
+}
+
+fn stored_tool_names_by_call_id(turns: &[StoredTurn]) -> HashMap<ToolCallId, String> {
+    let mut tool_names = HashMap::new();
+    for (_, parts) in turns {
+        for part in parts {
+            if let Part::ToolCall { id, name, .. } = &part.part {
+                tool_names.insert(id.clone(), name.clone());
+            }
+        }
+    }
+    tool_names
 }
 
 fn project_stored_part(
     part: &StoredPart,
     duplicate_tool_results: &HashSet<PartId>,
+    tool_names: &HashMap<ToolCallId, String>,
     strip_images: bool,
     truncate_arguments: bool,
 ) -> Part {
@@ -156,7 +183,7 @@ fn project_stored_part(
             is_error,
         } => Part::ToolResult {
             call_id: call_id.clone(),
-            content: tool_result_content_for_replay(part, content, duplicate_tool_results),
+            content: tool_result_content_for_replay(call_id, content, duplicate_tool_results, part, tool_names),
             raw_artifact_id: raw_artifact_id.clone(),
             is_error: *is_error,
         },
@@ -192,12 +219,15 @@ fn project_stored_part(
 }
 
 fn tool_result_content_for_replay(
-    part: &StoredPart,
+    call_id: &ToolCallId,
     content: &str,
     duplicate_tool_results: &HashSet<PartId>,
+    part: &StoredPart,
+    tool_names: &HashMap<ToolCallId, String>,
 ) -> String {
     if part.compacted_at.is_some() {
-        return OLD_TOOL_RESULT_CONTENT_CLEARED.to_string();
+        let tool_name = tool_names.get(call_id).map(String::as_str);
+        return pruned_result_summary(tool_name, content);
     }
 
     if duplicate_tool_results.contains(&part.id) {
