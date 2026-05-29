@@ -132,6 +132,66 @@ fn provider_error_before_output_emits_provider_error_event() {
 }
 
 #[test]
+fn context_limit_error_preserves_status_and_code_in_provider_error_event() {
+    let mut mapper = model_output_mapper();
+    let mut ids = TestIds::default();
+
+    let events = mapper.map_stream_result(
+        Err(OpenAiCompletionsResponseParser::parse_error_response(
+            400,
+            r#"{"error":{"message":"This model's maximum context length is 8192 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+            "sk-secret",
+        )),
+        &mut ids,
+    );
+
+    assert_eq!(event_types(&events), vec!["provider.error"]);
+
+    match &events[0].event {
+        HarnessEvent::ProviderError {
+            status,
+            code,
+            message,
+            ..
+        } => {
+            assert_eq!(*status, Some(400));
+            assert_eq!(code.as_deref(), Some("context_length_exceeded"));
+            assert_eq!(
+                message,
+                "This model's maximum context length is 8192 tokens."
+            );
+        }
+        event => panic!("expected provider error, got {event:?}"),
+    }
+}
+
+#[test]
+fn streamed_context_limit_error_frame_is_classified() {
+    let mut mapper = model_output_mapper();
+    let mut ids = TestIds::default();
+
+    // A gateway can deliver a context-overflow error inside a 200 SSE stream
+    // rather than as an initial HTTP 400; it must still classify as a limit.
+    let events = mapper.map_stream_result(
+        OpenAiCompletionsResponseParser::parse_stream_event(
+            r#"data: {"error":{"message":"This model's maximum context length is 8192 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
+            "sk-secret",
+        ),
+        &mut ids,
+    );
+
+    assert_eq!(event_types(&events), vec!["provider.error"]);
+
+    match &events[0].event {
+        HarnessEvent::ProviderError { status, code, .. } => {
+            assert_eq!(*status, Some(400));
+            assert_eq!(code.as_deref(), Some("context_length_exceeded"));
+        }
+        event => panic!("expected provider error, got {event:?}"),
+    }
+}
+
+#[test]
 fn provider_error_after_partial_output_preserves_stream_metadata() {
     let mut mapper = model_output_mapper();
     let mut ids = TestIds::default();
