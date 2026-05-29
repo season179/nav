@@ -69,6 +69,12 @@ fn session_create_stores_tools_preset_on_session_metadata() {
             "id": request_id(102),
             "method": "session.create",
             "params": {
+                "settingsJson": {
+                    "modelRef": {
+                        "provider": "compatible-gateway",
+                        "model": "vendor/model-large"
+                    }
+                },
                 "toolsPreset": "readonly"
             }
         })
@@ -88,6 +94,177 @@ fn session_create_stores_tools_preset_on_session_metadata() {
         .session_metadata(&session_id)
         .expect("session metadata should be retained");
     assert_eq!(metadata.tools_preset(), ToolsPreset::Readonly);
+}
+
+#[test]
+fn session_create_preserves_tools_preset_after_backend_restart() {
+    let db = TestSessionDb::new("restart-tools-preset");
+    let provider = successful_provider_with_text("readonly session survived restart");
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut first_server = HttpServer::with_model_settings(
+        config.clone(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+
+    let create_response = first_server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(105),
+            "method": "session.create",
+            "params": {
+                "settingsJson": {
+                    "modelRef": {
+                        "provider": "compatible-gateway",
+                        "model": "vendor/model-large"
+                    }
+                },
+                "toolsPreset": "readonly"
+            }
+        })
+        .to_string(),
+    ));
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = create_body["result"]["sessionId"]
+        .as_str()
+        .expect("session.create should return a session id")
+        .to_string();
+    drop(first_server);
+
+    let mut second_server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let run_id = send_message_text(&mut second_server, &session_id, "which tools can you use?");
+    wait_for_run_status(&second_server, &run_id, RunStatus::Completed);
+
+    let request = provider.request();
+    assert_eq!(tool_names_from_request(&request.body), vec!["read"]);
+    let session_id = SessionId::try_new(session_id).unwrap();
+    let metadata = second_server
+        .session_metadata(&session_id)
+        .expect("session metadata should reload from SQLite");
+    assert_eq!(metadata.tools_preset(), ToolsPreset::Readonly);
+    assert_eq!(
+        metadata.settings_json().unwrap()["modelRef"]["provider"],
+        "compatible-gateway"
+    );
+    assert!(
+        metadata
+            .settings_json()
+            .unwrap()
+            .get("__navToolsPreset")
+            .is_none()
+    );
+}
+
+#[test]
+fn session_create_ignores_reserved_tools_preset_inside_settings_json_after_backend_restart() {
+    let db = TestSessionDb::new("restart-settings-reserved-tools-preset");
+    let provider = successful_provider_with_text("settings cannot spoof tools");
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut first_server = HttpServer::with_model_settings(
+        config.clone(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+
+    let create_response = first_server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(106),
+            "method": "session.create",
+            "params": {
+                "settingsJson": {
+                    "__navToolsPreset": "readonly",
+                    "modelRef": {
+                        "provider": "compatible-gateway",
+                        "model": "vendor/model-large"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ));
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = create_body["result"]["sessionId"]
+        .as_str()
+        .expect("session.create should return a session id")
+        .to_string();
+    drop(first_server);
+
+    let mut second_server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let run_id = send_message_text(&mut second_server, &session_id, "which tools can you use?");
+    wait_for_run_status(&second_server, &run_id, RunStatus::Completed);
+
+    let request = provider.request();
+    assert_eq!(tool_names_from_request(&request.body), coding_tool_names());
+    let session_id = SessionId::try_new(session_id).unwrap();
+    let metadata = second_server
+        .session_metadata(&session_id)
+        .expect("session metadata should reload from SQLite");
+    assert_eq!(metadata.tools_preset(), ToolsPreset::Coding);
+    assert!(
+        metadata
+            .settings_json()
+            .unwrap()
+            .get("__navToolsPreset")
+            .is_none()
+    );
+}
+
+#[test]
+fn session_create_preserves_settings_json_object_with_settings_json_key_after_backend_restart() {
+    let db = TestSessionDb::new("restart-settings-json-key");
+    let provider = successful_provider_with_text("settings shape survived restart");
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut first_server = HttpServer::with_model_settings(
+        config.clone(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+
+    let create_response = first_server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(107),
+            "method": "session.create",
+            "params": {
+                "settingsJson": {
+                    "settingsJson": "user-visible"
+                }
+            }
+        })
+        .to_string(),
+    ));
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = create_body["result"]["sessionId"]
+        .as_str()
+        .expect("session.create should return a session id")
+        .to_string();
+    drop(first_server);
+
+    let mut second_server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let run_id = send_message_text(&mut second_server, &session_id, "which settings survived?");
+    wait_for_run_status(&second_server, &run_id, RunStatus::Completed);
+
+    let session_id = SessionId::try_new(session_id).unwrap();
+    let metadata = second_server
+        .session_metadata(&session_id)
+        .expect("session metadata should reload from SQLite");
+    assert_eq!(
+        metadata.settings_json().unwrap(),
+        &json!({ "settingsJson": "user-visible" })
+    );
 }
 
 #[test]
@@ -392,6 +569,44 @@ fn session_send_message_replays_previous_user_and_assistant_turns_to_provider() 
             { "role": "user", "content": "first user turn" },
             { "role": "assistant", "content": "assistant remembered one" },
             { "role": "user", "content": "second user turn" },
+        ])
+    );
+}
+
+#[test]
+fn session_history_survives_backend_restart_for_next_run() {
+    let db = TestSessionDb::new("restart-history");
+    let provider = SequencedProviderServer::start(vec![
+        successful_provider_chunks("assistant before restart"),
+        successful_provider_chunks("assistant after restart"),
+    ]);
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut first_server = HttpServer::with_model_settings(
+        config.clone(),
+        model_settings_with_base_url(provider.base_url()),
+    );
+    let session_id = create_session(&mut first_server);
+
+    let first_run_id = send_message_text(&mut first_server, &session_id, "first before restart");
+    wait_for_run_status(&first_server, &first_run_id, RunStatus::Completed);
+    drop(first_server);
+
+    let mut second_server =
+        HttpServer::with_model_settings(config, model_settings_with_base_url(provider.base_url()));
+    let second_run_id = send_message_text(&mut second_server, &session_id, "second after restart");
+    wait_for_run_status(&second_server, &second_run_id, RunStatus::Completed);
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"],
+        json!([
+            { "role": "user", "content": "first before restart" },
+            { "role": "assistant", "content": "assistant before restart" },
+            { "role": "user", "content": "second after restart" },
         ])
     );
 }
@@ -1521,6 +1736,10 @@ fn tool_names_from_request(body: &Value) -> Vec<&str> {
         .collect()
 }
 
+fn coding_tool_names() -> Vec<&'static str> {
+    vec!["bash", "edit", "read", "write"]
+}
+
 struct GuardedBashFixture {
     server: HttpServer,
     provider: SequencedProviderServer,
@@ -1772,6 +1991,35 @@ impl Drop for TestWorkspace {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+struct TestSessionDb {
+    path: PathBuf,
+}
+
+impl TestSessionDb {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("nav-server-{name}-{}.db", std::process::id()));
+        remove_sqlite_files(&path);
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestSessionDb {
+    fn drop(&mut self) {
+        remove_sqlite_files(&self.path);
+    }
+}
+
+fn remove_sqlite_files(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(path.with_extension("db-wal"));
+    let _ = fs::remove_file(path.with_extension("db-shm"));
 }
 
 #[derive(Debug)]

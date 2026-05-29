@@ -9,8 +9,9 @@ use std::thread;
 use nav_harness::guardrails::{GuardrailRunner, default_guardrails};
 use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
 use nav_harness::sessions::{
-    ConfirmationDecision, ModelTurn, PendingConfirmation, PendingConfirmationError,
-    PendingConfirmationReceiver, PendingConfirmationRegistry, SessionStore,
+    ConfirmationDecision, CreateSession, ModelTurn, PendingConfirmation, PendingConfirmationError,
+    PendingConfirmationReceiver, PendingConfirmationRegistry, RunStatus as StoredRunStatus,
+    SessionStore, SqliteStoreError,
 };
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, bash, edit, read, write};
 use nav_harness::workspace::path::WorkspacePathPolicy;
@@ -25,7 +26,7 @@ use nav_protocol::rpc::{
 use nav_protocol::{BACKEND_EVENT_TYPES, BackendEvent, EventEnvelope};
 use nav_types::{EventId, RunId, SessionId};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub mod auth;
 mod event_mapping;
@@ -42,11 +43,14 @@ use ids::ProtocolIdSource;
 use model_run::{ModelRunRequest, ModelRunService, ModelRunState};
 
 pub const PROTOCOL_VERSION: u32 = 1;
+const STORED_SETTINGS_JSON_KEY: &str = "__navSettingsJson";
+const STORED_TOOLS_PRESET_KEY: &str = "__navToolsPreset";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpServerConfig {
     pub bind_addr: String,
     pub settings_path: Option<PathBuf>,
+    pub session_db_path: Option<PathBuf>,
 }
 
 impl Default for HttpServerConfig {
@@ -54,6 +58,7 @@ impl Default for HttpServerConfig {
         Self {
             bind_addr: "127.0.0.1:0".to_string(),
             settings_path: None,
+            session_db_path: None,
         }
     }
 }
@@ -91,7 +96,7 @@ impl HttpServer {
             ids: Arc::new(Mutex::new(ProtocolIdSource::default())),
             sessions: HashMap::new(),
             runs: Arc::new(Mutex::new(HashMap::new())),
-            session_store: Arc::new(Mutex::new(SessionStore::default())),
+            session_store: Arc::new(Mutex::new(open_session_store(&config))),
             pending_confirmations: Arc::new(Mutex::new(PendingConfirmationRegistry::default())),
             event_store: Arc::new(Mutex::new(ProtocolEventStore::default())),
             model_run_service: ModelRunService::default(),
@@ -296,19 +301,20 @@ impl HttpServer {
             session_id: session_id.clone(),
             event: BackendEvent::SessionCreated,
         };
-        self.sessions.insert(
-            session_id.clone(),
-            SessionMetadata {
-                cwd: params.cwd,
-                source: params.source,
-                settings_json: params.settings_json,
-                tools_preset: params.tools_preset.unwrap_or_default(),
-            },
-        );
-        self.session_store
+        let metadata = SessionMetadata::from_create_params(&params);
+        if let Err(error) = self
+            .session_store
             .lock()
             .unwrap()
-            .create_session(session_id.clone());
+            .create_session_with_record(session_id.clone(), create_session_record(&params))
+        {
+            return rpc_error(
+                request.id,
+                -32603,
+                format!("failed to create session: {error}"),
+            );
+        }
+        self.sessions.insert(session_id.clone(), metadata);
         self.append_event(event);
 
         rpc_result(request.id, SessionCreateResult { session_id })
@@ -327,20 +333,48 @@ impl HttpServer {
             return rpc_error(request.id, -32602, "text is required");
         }
 
-        let Some(session_metadata) = self.sessions.get(&params.session_id).cloned() else {
-            return rpc_error(request.id, -32004, "session not found");
+        let session_metadata = match self.session_metadata_for_send(&params.session_id) {
+            Ok(metadata) => metadata,
+            Err(SessionLookupError::NotFound) => {
+                return rpc_error(request.id, -32004, "session not found");
+            }
+            Err(SessionLookupError::Store(error)) => {
+                return rpc_error(
+                    request.id,
+                    -32603,
+                    format!("failed to load session: {error}"),
+                );
+            }
         };
 
-        let turns = {
-            let mut session_store = self.session_store.lock().unwrap();
-            session_store.append_turn(
-                &params.session_id,
-                ModelTurn::user_text(params.text.clone()),
-            );
-            session_store.turns(&params.session_id)
-        };
         let run_id = self.next_run_id();
         let message_id = self.next_message_id();
+        let user_message_id = self.next_message_id();
+        let turns = {
+            let session_store = self.session_store.lock().unwrap();
+            if let Err(error) = session_store.start_run(&params.session_id, run_id.clone()) {
+                return rpc_error(request.id, -32603, format!("failed to start run: {error}"));
+            }
+            if let Err(error) = session_store.append_turn(
+                &run_id,
+                user_message_id,
+                ModelTurn::user_text(params.text.clone()),
+            ) {
+                fail_started_run(&session_store, &run_id);
+                return rpc_error(
+                    request.id,
+                    -32603,
+                    format!("failed to persist message: {error}"),
+                );
+            }
+            match session_store.try_turns(&params.session_id) {
+                Ok(turns) => turns,
+                Err(error) => {
+                    fail_started_run(&session_store, &run_id);
+                    return rpc_error(request.id, -32603, format!("failed to load turns: {error}"));
+                }
+            }
+        };
         let cancellation_token = OpenAiCompletionsCancellationToken::new();
         self.runs.lock().unwrap().insert(
             run_id.clone(),
@@ -414,6 +448,11 @@ impl HttpServer {
                 .clone()
                 .unwrap_or_else(OpenAiCompletionsCancellationToken::new)
         };
+        let _ = self
+            .session_store
+            .lock()
+            .unwrap()
+            .finish_run(&params.run_id, StoredRunStatus::Cancelled);
         cancellation_token.cancel();
 
         rpc_result(
@@ -521,7 +560,7 @@ impl HttpServer {
                     ids,
                     event_store,
                     Arc::clone(&runs),
-                    session_store,
+                    Arc::clone(&session_store),
                     pending_confirmations,
                 ),
                 cancellation_token,
@@ -543,6 +582,11 @@ impl HttpServer {
                 }
                 run.cancellation_token = None;
             }
+            let stored_status = stored_run_status(final_status);
+            let _ = session_store
+                .lock()
+                .unwrap()
+                .finish_run(&run_id, stored_status);
         });
     }
 
@@ -569,6 +613,40 @@ impl HttpServer {
     fn next_event_id(&self) -> EventId {
         self.ids.lock().unwrap().next_event_id()
     }
+
+    fn session_metadata_for_send(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<SessionMetadata, SessionLookupError> {
+        if let Some(metadata) = self.sessions.get(session_id) {
+            return Ok(metadata.clone());
+        }
+
+        let row = self
+            .session_store
+            .lock()
+            .unwrap()
+            .get_session(session_id)
+            .map_err(|error| match error {
+                SqliteStoreError::NotFound { .. } => SessionLookupError::NotFound,
+                other => SessionLookupError::Store(other),
+            })?;
+        let metadata = SessionMetadata::from_session_row(row);
+        self.sessions.insert(session_id.clone(), metadata.clone());
+        Ok(metadata)
+    }
+}
+
+fn open_session_store(config: &HttpServerConfig) -> SessionStore {
+    match config.session_db_path.as_deref() {
+        Some(path) => SessionStore::open(path),
+        None => Ok(SessionStore::default()),
+    }
+    .expect("session store should open")
+}
+
+fn fail_started_run(session_store: &SessionStore, run_id: &RunId) {
+    let _ = session_store.finish_run(run_id, StoredRunStatus::Failed);
 }
 
 fn tool_context_for_session(cwd: Option<&str>, guardrails: GuardrailRunner) -> ToolContext {
@@ -588,6 +666,131 @@ fn harness_tool_preset(preset: ToolsPreset) -> ToolPreset {
         ToolsPreset::Coding => ToolPreset::Coding,
         ToolsPreset::Readonly => ToolPreset::Readonly,
     }
+}
+
+fn create_session_record(params: &SessionCreateParams) -> CreateSession {
+    CreateSession {
+        title: None,
+        source: session_source_to_storage(params.source),
+        workspace_root: params.cwd.clone(),
+        system_prompt: None,
+        settings_json: session_settings_to_storage(
+            params.settings_json.as_ref(),
+            params.tools_preset,
+        ),
+        parent_id: None,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        slug: None,
+        created_at: unix_millis(),
+    }
+}
+
+fn session_source_to_storage(source: Option<SessionSource>) -> String {
+    match source.unwrap_or(SessionSource::Api) {
+        SessionSource::Cli => "cli",
+        SessionSource::Api => "api",
+        SessionSource::Tui => "tui",
+    }
+    .to_string()
+}
+
+fn session_source_from_storage(source: &str) -> Option<SessionSource> {
+    match source {
+        "cli" => Some(SessionSource::Cli),
+        "api" => Some(SessionSource::Api),
+        "tui" => Some(SessionSource::Tui),
+        _ => None,
+    }
+}
+
+fn session_settings_from_storage(settings_json: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(settings_json).ok()?;
+    match value {
+        Value::Object(mut object) => {
+            object.remove(STORED_TOOLS_PRESET_KEY);
+            if object.len() == 1
+                && let Some(settings_json) = object.remove(STORED_SETTINGS_JSON_KEY)
+            {
+                return Some(settings_json);
+            }
+            object.remove(STORED_SETTINGS_JSON_KEY);
+            if object.is_empty() {
+                None
+            } else {
+                Some(Value::Object(object))
+            }
+        }
+        other => Some(other),
+    }
+}
+
+fn session_settings_to_storage(
+    settings_json: Option<&Value>,
+    tools_preset: Option<ToolsPreset>,
+) -> String {
+    let tools_preset = tools_preset.unwrap_or_default();
+    let mut object = match settings_json {
+        Some(Value::Object(object)) => {
+            let mut object = object.clone();
+            object.remove(STORED_SETTINGS_JSON_KEY);
+            object.remove(STORED_TOOLS_PRESET_KEY);
+            object
+        }
+        Some(value) => Map::from_iter([(STORED_SETTINGS_JSON_KEY.to_string(), value.clone())]),
+        None => Map::new(),
+    };
+
+    if tools_preset != ToolsPreset::default() {
+        object.insert(
+            STORED_TOOLS_PRESET_KEY.to_string(),
+            Value::String(tools_preset_storage_name(tools_preset).to_string()),
+        );
+    }
+
+    Value::Object(object).to_string()
+}
+
+fn tools_preset_from_storage(settings_json: &str) -> ToolsPreset {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(settings_json) else {
+        return ToolsPreset::default();
+    };
+
+    object
+        .get(STORED_TOOLS_PRESET_KEY)
+        .and_then(Value::as_str)
+        .and_then(tools_preset_from_storage_name)
+        .unwrap_or_default()
+}
+
+fn tools_preset_storage_name(preset: ToolsPreset) -> &'static str {
+    match preset {
+        ToolsPreset::Coding => "coding",
+        ToolsPreset::Readonly => "readonly",
+    }
+}
+
+fn tools_preset_from_storage_name(name: &str) -> Option<ToolsPreset> {
+    match name {
+        "coding" => Some(ToolsPreset::Coding),
+        "readonly" => Some(ToolsPreset::Readonly),
+        _ => None,
+    }
+}
+
+fn stored_run_status(status: RunStatus) -> StoredRunStatus {
+    match status {
+        RunStatus::Running => StoredRunStatus::Running,
+        RunStatus::Completed => StoredRunStatus::Completed,
+        RunStatus::Failed => StoredRunStatus::Failed,
+        RunStatus::Cancelled => StoredRunStatus::Cancelled,
+    }
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone)]
@@ -673,6 +876,24 @@ pub struct SessionMetadata {
 }
 
 impl SessionMetadata {
+    fn from_create_params(params: &SessionCreateParams) -> Self {
+        Self {
+            cwd: params.cwd.clone(),
+            source: params.source,
+            settings_json: params.settings_json.clone(),
+            tools_preset: params.tools_preset.unwrap_or_default(),
+        }
+    }
+
+    fn from_session_row(row: nav_types::SessionRow) -> Self {
+        Self {
+            cwd: row.workspace_root,
+            source: session_source_from_storage(&row.source),
+            settings_json: session_settings_from_storage(&row.settings_json),
+            tools_preset: tools_preset_from_storage(&row.settings_json),
+        }
+    }
+
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
     }
@@ -688,6 +909,12 @@ impl SessionMetadata {
     pub fn tools_preset(&self) -> ToolsPreset {
         self.tools_preset
     }
+}
+
+#[derive(Debug)]
+enum SessionLookupError {
+    NotFound,
+    Store(SqliteStoreError),
 }
 
 #[derive(Debug, Clone)]
