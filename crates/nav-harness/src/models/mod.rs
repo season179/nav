@@ -19,7 +19,8 @@ pub use decode::{
     OpenAiResponsesDecoder,
 };
 pub use encode::{
-    Encoder, OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
+    AnthropicMessagesEncoder, AnthropicMessagesRequest, AnthropicToolDefinition, Encoder,
+    OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
 };
 pub use model::{ModelConfig, ModelInput};
 pub use openai_completions::{
