@@ -655,25 +655,35 @@ Because canonical storage is API-agnostic, switching is seamless:
 Context windows fill up. Compaction shrinks the turn history sent to the model
 while preserving the canonical ledger and artifact bytes intact.
 
-### Pruning (cheap, frequent)
+### Pruning (cheap, threshold-gated)
 
-Walk backward through tool-result parts. Keep a token budget of recent results
-(`PRUNE_PROTECT = 40K` tokens). For older results, set `compacted_at` on the
-part — the encoder replaces the content with `"[Old tool result content
-cleared]"`. No rows or artifacts are deleted. No summarization LLM call needed.
+Pruning runs only when estimated active tokens exceed **~60% of the context
+window** (estimated with a cheap char-count heuristic, so pruning does not block
+on the full token budgeter). Walk backward through tool-result parts, keeping a
+token budget of recent results (`PRUNE_PROTECT = 40K` tokens). For older results,
+set `compacted_at` on the part — on next read the encoder replaces the content
+with a one-line summary of what the call did, e.g.
+`[read_file] read src/main.rs: exit code 0, 1.2K chars.`, not a static
+placeholder. No rows or artifacts are deleted. No summarization LLM call needed.
 
 ```text
+if estimated_active_tokens <= 0.60 * context_window: skip pruning
 for each tool_result part, newest first:
     if tokens in budget: keep as-is
-    else: set compacted_at = now
+    else: set compacted_at = now   # encoder projects a one-line summary
 ```
 
-Protected tools (e.g. `skill`) are never pruned — their output may be needed
-for context even when old.
+Protected tools (e.g. `skill`, `todo`) are never pruned — their output may be
+needed for context even when old.
+
+**Output caps** (independent of pruning, applied at record time): each tool caps
+its *model-visible* `ToolResult` (`read` ≈ 4000 chars, `bash` ≈ 5000 chars). The
+full output bytes always go to the artifact store and stay reachable via
+`expand_artifact`.
 
 **Deduplication** (before pruning): hash tool-result content. If the same
 content appears multiple times (e.g. same file read 5×), replace older copies
-with `[Duplicate — see more recent result]` in the replay projection. Raw
+with `[Duplicate — see more recent tool result]` in the replay projection. Raw
 artifact bytes remain available through `expand_artifact`.
 
 **Tool call argument truncation:** assistant messages outside the protected
@@ -682,18 +692,19 @@ shrunk while preserving valid JSON structure. Prevents a single `write_file`
 with 50KB content from consuming the entire context budget. If the raw argument
 was spilled, `raw_arguments_artifact_id` points at the original JSON bytes.
 
-**Image stripping:** replace old `Image` parts (before the last image-bearing
-user turn) with `[Attached image — stripped after compression]`. Prevents
-multi-MB base64 blobs from surviving indefinitely in replay; the media artifact
-stays on disk until artifact retention deletes it.
+**Image stripping:** keep `Image` parts verbatim only for the last
+`keep_media_turns` (default 2) turns; replace older media with `[image elided]`.
+Prevents multi-MB base64 blobs from surviving indefinitely in replay; the media
+artifact stays on disk until artifact retention deletes it.
 
 ### Summarization (expensive, on overflow or manual)
 
 When the total turn history exceeds the usable context window:
 
 1. **Select** a "head" (turns to summarize) and "tail" (recent turns to keep
-   verbatim). Tail size is configurable (`tail_turns`, default 2). The tail
-   budget is a fraction of usable context.
+   verbatim). Tail size is configurable: keep the last `tail_turns` (default 2)
+   or `keep_recent_tokens` (default 20K) verbatim. The tail budget is a fraction
+   of usable context.
 2. **Generate summary** using a compaction agent over the head turns, building
    on any previous summary (incremental — not from scratch each time).
 3. **Write compaction turn**: a user turn with a `Compaction` part
@@ -731,10 +742,19 @@ The summarization prompt uses structured sections, not generic prose:
 
 ## Key Decisions
 [Important technical decisions and why]
+
+## Files
+### Read
+- path/to/file.rs
+### Modified
+- path/to/config.toml (added DB connection pool)
 ```
 
 This structure ensures the continuation model has a clear resumption point
-and doesn't repeat completed work.
+and doesn't repeat completed work. The `## Files` section is **cumulative across
+compactions**: the compaction prompt receives the previous summary's file lists
+and merges them with new file operations from the current range, so the model
+does not re-read files it already inspected after several compaction cycles.
 
 ```text
 Loaded for encoding:
@@ -751,10 +771,11 @@ Loaded for encoding:
 
 When a request exceeds the provider's size limit even after pruning:
 
-1. Auto-compact with `overflow: true`.
+1. Drop the failed assistant turn and auto-compact with `overflow: true`.
 2. Strip media attachments from the compacted context.
-3. Replay the triggering user message after compaction with a synthetic
-   continuation prompt.
+3. Re-issue the **original triggering user turn verbatim** against the compacted
+   context, so no user input is lost or paraphrased. A single-shot guard
+   prevents an overflow → compact → overflow loop.
 
 ### Anti-thrashing protection
 

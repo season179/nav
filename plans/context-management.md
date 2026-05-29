@@ -101,11 +101,13 @@ Message Volume Growth ───────────────────�
 *   **Artifact-Backed Fidelity:** "Lossless" means only the model-visible replay is shortened. The canonical row keeps the full tool arguments, raw output bytes, attachments, `content_hash`, byte count, MIME type, and producing `turn_part_id`, either inline when small or in the artifact store when large. `expand_artifact` must be able to reconstruct the original value before pruning/compaction.
 *   **Argument Projection:** Large tool inputs (e.g. writing a 100KB file) are executed and persisted in full, but their replay projection is truncated while preserving valid JSON syntax.
 *   **Output Caps:** Individual tool outputs are capped in the model-visible `ToolResult` (e.g. `read` is capped at 4000 characters, `bash` is capped at 5000 characters). Full outputs are written to the artifact store and can be accessed via `expand_artifact`.
-*   **Deduplication:** If the model runs the same read/grep command multiple times in a turn, older duplicate outputs are replaced at encode-time with `[Duplicate - see more recent tool result]`; the original part remains searchable and expandable.
+*   **Deduplication:** If the model runs the same read/grep command multiple times in a turn, older duplicate outputs are replaced at encode-time with `[Duplicate — see more recent tool result]`; the original part remains searchable and expandable.
 *   **Historical Media Eviction:** Image and other media blocks are kept verbatim only for the last `keep_media_turns` (default 2) turns; older media is replaced with an `[image elided]` text placeholder at read-time. Images are by far the densest cost in the window (see §5.1), and some providers reject requests whose media outlives the model's media support — so this is both a budget and a correctness measure (from `kimiflare` old-image stripping, with `codex`/`claudecode` stripping images for the compaction call specifically).
 
 ### Stage 2: Micro-Compaction & Pruning (Lossless)
-When active tokens exceed 60% of the context window, we run pruning.
+When active tokens exceed 60% of the context window, we run pruning. The 60%
+gate is computed with the cheap char-count heuristic (§6.1), so pruning does not
+block on the full token budgeter.
 *   We walk backward through history, keeping a tail budget of recent tool outputs intact (`PRUNE_PROTECT = 40K` tokens).
 *   For older tool results, we set the `compacted_at` timestamp in SQLite. On next read, the encoder replaces the tool result content with a one-line summary:
     `[read_file] read src/main.rs: exit code 0, 1.2K chars.`
@@ -120,14 +122,26 @@ Triggered when the total token count exceeds the `usable` threshold (context win
 *   **Split-Turn Handling:** If the cut point lands inside a tool-calling sequence, we split the turn. We run a separate summary of the in-progress turn's prefix and stitch it to the historical summary to avoid leaving orphan tool calls.
 *   **Structured Template:** The summary is generated using a dedicated "compaction agent" using the following markdown template:
     ```markdown
+    ## Active Task
+    [The user's most recent uncompleted request, verbatim]
+
     ## Goal
     [Overall user goal]
+
+    ## Constraints & Preferences
+    [User preferences, coding style, constraints]
 
     ## Completed Actions
     1. ACTION - outcome [tool: name]
 
     ## Active State
-    [Modified files, test status, running processes]
+    [Modified files, test status, working directory, running processes]
+
+    ## In Progress
+    [Work underway when compaction fired]
+
+    ## Blocked
+    [Unresolved errors, blockers]
 
     ## Key Decisions
     [Important choices made and why]
