@@ -9,15 +9,15 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nav_types::{
     ArtifactId, ArtifactRow, MessageId, PartId, ProviderPayloadId, ProviderPayloadRow, RunId,
     RunRow, SessionId, SessionRow, StorageCursor,
 };
-use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
+use rusqlite::{Connection, Row, Transaction, TransactionBehavior, params};
 
 use crate::models::{DecodedProviderPayload, DecodedTurn};
 
@@ -487,6 +487,48 @@ impl SqliteSessionStore {
             .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
         let rows = statement
             .query_map([], read_provider_payload_row)
+            .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
+
+        let mut payloads = Vec::new();
+        for row in rows {
+            payloads.push(row.map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?);
+        }
+        Ok(payloads)
+    }
+
+    pub fn list_provider_payloads_for_run(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<ProviderPayloadRow>, SqliteStoreError> {
+        let conn = self.conn.lock().expect("connection mutex poisoned");
+        let mut statement = conn
+            .prepare(
+                r#"
+                SELECT
+                    id,
+                    session_id,
+                    run_id,
+                    direction,
+                    api_kind,
+                    provider_id,
+                    model_id,
+                    sequence,
+                    provider_payload_id,
+                    artifact_id,
+                    sha256,
+                    decoder_version,
+                    decode_status,
+                    error_json,
+                    created_at,
+                    decoded_at
+                FROM provider_payloads
+                WHERE run_id = ?1
+                ORDER BY sequence ASC, created_at ASC, id ASC
+                "#,
+            )
+            .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
+        let rows = statement
+            .query_map([run_id.as_str()], read_provider_payload_row)
             .map_err(|err| SqliteStoreError::ReadFailed(err.to_string()))?;
 
         let mut payloads = Vec::new();
@@ -1149,6 +1191,33 @@ impl SqliteSessionStore {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(read_query_err)?;
         Ok(rows)
+    }
+
+    pub fn next_turn_created_at_for_run(
+        &self,
+        run_id: &RunId,
+        now: i64,
+    ) -> Result<i64, SqliteStoreError> {
+        let latest: Option<i64> = self
+            .conn
+            .lock()
+            .expect("connection mutex poisoned")
+            .query_row(
+                r#"
+                SELECT MAX(t.created_at)
+                FROM runs target
+                JOIN runs session_runs ON session_runs.session_id = target.session_id
+                LEFT JOIN turns t ON t.run_id = session_runs.id
+                WHERE target.id = ?1
+                "#,
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|err| read_err(err, "run", run_id.as_str()))?;
+        Ok(latest
+            .and_then(|created_at| created_at.checked_add(1))
+            .unwrap_or(now)
+            .max(now))
     }
 
     /// Run `op` inside a `BEGIN IMMEDIATE` transaction, committing on success.

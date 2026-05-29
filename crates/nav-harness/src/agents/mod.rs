@@ -4,7 +4,8 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nav_types::{MessageId, RunId};
+use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId};
+use serde_json::{Value, json};
 
 use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
@@ -12,12 +13,15 @@ use crate::events::{
 };
 use crate::guardrails::{GuardrailError, ToolCallContext, ToolCallContextParams};
 use crate::models::{
-    OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, OpenAiCompletionsError,
-    OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, ResolvedModelConfig,
+    Decoder, Encoder, OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
+    OpenAiChatCompletionsEncoder, OpenAiCompletionsCancellationToken, OpenAiCompletionsClient,
+    OpenAiCompletionsError, OpenAiCompletionsRequest, OpenAiCompletionsRequestContext,
+    ResolvedModelConfig,
 };
 use crate::sessions::{
-    ConfirmationDecision, ModelTurn, PendingConfirmation, PendingConfirmationReceiver,
-    PendingConfirmationRegistry, ToolCall,
+    ConfirmationDecision, ModelTurn, NewProviderPayload, OPENAI_CHAT_COMPLETIONS_DECODER_VERSION,
+    PendingConfirmation, PendingConfirmationReceiver, PendingConfirmationRegistry,
+    ProviderPayloadDirection, SessionStore, ToolCall,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
@@ -36,12 +40,14 @@ pub struct RunLoop {
 
 #[derive(Debug)]
 pub struct RunLoopRequest<'a> {
+    pub session_id: &'a SessionId,
     pub run_id: &'a RunId,
     pub message_id: &'a MessageId,
     pub turns: &'a [ModelTurn],
     pub tool_registry: &'a ToolRegistry,
     pub tool_preset: ToolPreset,
     pub tool_context: &'a ToolContext,
+    pub session_store: Option<&'a Arc<Mutex<SessionStore>>>,
     pub pending_confirmations: Option<&'a Arc<Mutex<PendingConfirmationRegistry>>>,
     pub cancellation_token: OpenAiCompletionsCancellationToken,
 }
@@ -89,13 +95,27 @@ impl RunLoop {
             .expect("model streaming runtime should build");
         let mut turns = request.turns.to_vec();
         let mut new_turns = Vec::new();
+        let journal = request.session_store.map(|store| ProviderJournal {
+            session_id: request.session_id,
+            store,
+        });
+        let mut payload_sequence = 0;
 
         loop {
-            let completion_request = OpenAiCompletionsRequest::from_turns_with_tools(
-                &turns,
-                request.tool_registry,
-                request.tool_preset,
-            );
+            let completion_request =
+                encode_completion_request(&turns, request.tool_registry, request.tool_preset);
+            if let Some(journal) = journal {
+                if let Err(error) = self.journal_request_payload(
+                    journal,
+                    model,
+                    &completion_request,
+                    request.run_id,
+                    payload_sequence,
+                ) {
+                    return RunLoopResult::Failed(error);
+                }
+                payload_sequence += 1;
+            }
             let model_turn = match self.stream_model_turn(StreamModelTurnRequest {
                 runtime: &runtime,
                 model,
@@ -107,13 +127,41 @@ impl RunLoop {
             }) {
                 Ok(model_turn) => model_turn,
                 Err(OpenAiCompletionsError::Cancelled) => return RunLoopResult::Cancelled,
-                Err(error) => return RunLoopResult::Failed(error),
+                Err(error) => {
+                    if let Some(journal) = journal
+                        && let Err(journal_error) = self.journal_error_payload(
+                            journal,
+                            model,
+                            &error,
+                            request.run_id,
+                            payload_sequence,
+                        )
+                    {
+                        return RunLoopResult::Failed(journal_error);
+                    }
+                    return RunLoopResult::Failed(error);
+                }
             };
+
+            if let Some(journal) = journal {
+                if let Err(error) = self.journal_response_payload(
+                    journal,
+                    model,
+                    &model_turn,
+                    request.run_id,
+                    payload_sequence,
+                ) {
+                    return RunLoopResult::Failed(error);
+                }
+                payload_sequence += 1;
+            }
 
             let tool_calls = model_turn.tool_calls;
             if let Some(turn) = model_turn.assistant_turn {
                 turns.push(turn.clone());
-                new_turns.push(turn);
+                if journal.is_none() {
+                    new_turns.push(turn);
+                }
             }
 
             if tool_calls.is_empty() {
@@ -151,11 +199,102 @@ impl RunLoop {
             }) {
                 ToolDispatchResult::Completed(tool_turns) => {
                     turns.extend(tool_turns.clone());
-                    new_turns.extend(tool_turns);
+                    if let Some(journal) = journal {
+                        if let Err(error) = append_tool_turns(journal, request.run_id, tool_turns) {
+                            return RunLoopResult::Failed(error);
+                        }
+                    } else {
+                        new_turns.extend(tool_turns);
+                    }
                 }
                 ToolDispatchResult::Cancelled => return RunLoopResult::Cancelled,
             }
         }
+    }
+
+    fn journal_request_payload(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        request: &OpenAiCompletionsRequest,
+        run_id: &RunId,
+        sequence: u32,
+    ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
+        let raw_bytes = streaming_request_body(&self.client, model, request)?;
+        append_provider_payload(
+            journal,
+            NewProviderPayload {
+                session_id: journal.session_id.clone(),
+                run_id: run_id.clone(),
+                direction: ProviderPayloadDirection::Request,
+                api_kind: api_kind_name(model).to_string(),
+                provider_id: Some(model.provider_id.clone()),
+                model_id: Some(model.model.id.clone()),
+                sequence,
+                provider_payload_id: None,
+                mime: "application/json".to_string(),
+                raw_bytes,
+                created_at: payload_created_at(sequence),
+            },
+        )
+    }
+
+    fn journal_response_payload(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        output: &ModelTurnOutput,
+        run_id: &RunId,
+        sequence: u32,
+    ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
+        let raw_bytes = serde_json::to_vec(&output.response_payload).map_err(json_error)?;
+        let created_at = next_turn_created_at(journal, run_id)?;
+        let payload_id = append_provider_payload(
+            journal,
+            NewProviderPayload {
+                session_id: journal.session_id.clone(),
+                run_id: run_id.clone(),
+                direction: ProviderPayloadDirection::Response,
+                api_kind: api_kind_name(model).to_string(),
+                provider_id: Some(model.provider_id.clone()),
+                model_id: Some(model.model.id.clone()),
+                sequence,
+                provider_payload_id: output.provider_response_id.clone(),
+                mime: "application/json".to_string(),
+                raw_bytes: raw_bytes.clone(),
+                created_at,
+            },
+        )?;
+        append_decoded_response(journal, &payload_id, raw_bytes)
+            .map(|()| payload_id)
+            .map_err(persistence_error)
+    }
+
+    fn journal_error_payload(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        error: &OpenAiCompletionsError,
+        run_id: &RunId,
+        sequence: u32,
+    ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
+        let raw_bytes = serde_json::to_vec(&error_payload_value(error)).map_err(json_error)?;
+        append_provider_payload(
+            journal,
+            NewProviderPayload {
+                session_id: journal.session_id.clone(),
+                run_id: run_id.clone(),
+                direction: ProviderPayloadDirection::Error,
+                api_kind: api_kind_name(model).to_string(),
+                provider_id: Some(model.provider_id.clone()),
+                model_id: Some(model.model.id.clone()),
+                sequence,
+                provider_payload_id: None,
+                mime: "application/json".to_string(),
+                raw_bytes,
+                created_at: payload_created_at(sequence),
+            },
+        )
     }
 
     fn stream_model_turn<Ids, Emit>(
@@ -195,11 +334,176 @@ impl RunLoop {
         ))?;
 
         let tool_calls = capture.tool_calls.clone();
+        let response_payload = capture.response_payload();
+        let provider_response_id = capture.provider_response_id();
         Ok(ModelTurnOutput {
-            assistant_turn: capture.into_turn(),
+            assistant_turn: capture.to_turn(),
             tool_calls,
             terminal_events,
+            response_payload,
+            provider_response_id,
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProviderJournal<'a> {
+    session_id: &'a SessionId,
+    store: &'a Arc<Mutex<SessionStore>>,
+}
+
+fn encode_completion_request(
+    turns: &[ModelTurn],
+    tool_registry: &ToolRegistry,
+    tool_preset: ToolPreset,
+) -> OpenAiCompletionsRequest {
+    let encoder =
+        OpenAiChatCompletionsEncoder::new().with_tool_registry(tool_registry, tool_preset);
+    Encoder::encode(&encoder, turns).unwrap_or_else(|never| match never {})
+}
+
+fn streaming_request_body(
+    client: &OpenAiCompletionsClient,
+    model: &ResolvedModelConfig,
+    request: &OpenAiCompletionsRequest,
+) -> Result<Vec<u8>, OpenAiCompletionsError> {
+    let mut streaming_request = request.clone();
+    streaming_request.stream = true;
+    let plan = client.build_request(model, &streaming_request)?;
+    serde_json::to_vec(&plan.body).map_err(json_error)
+}
+
+fn append_provider_payload(
+    journal: ProviderJournal<'_>,
+    payload: NewProviderPayload,
+) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .append_provider_payload(payload)
+        .map_err(persistence_error)
+}
+
+fn append_decoded_response(
+    journal: ProviderJournal<'_>,
+    payload_id: &ProviderPayloadId,
+    raw_bytes: Vec<u8>,
+) -> Result<(), String> {
+    let payload = journal
+        .store
+        .lock()
+        .unwrap()
+        .get_provider_payload(payload_id)
+        .map_err(|error| error.to_string())?;
+    let decoded = OpenAiChatCompletionsDecoder::new()
+        .decode(&OpenAiChatCompletionsDecodeInput {
+            provider_payload_id: payload.id.clone(),
+            raw_artifact_id: payload.artifact_id,
+            run_id: payload.run_id,
+            provider_id: payload.provider_id,
+            raw_json: raw_bytes,
+            created_at: payload.created_at,
+        })
+        .map_err(|error| error.to_string())?;
+
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .append_decoded_provider_payload(
+            payload_id,
+            OPENAI_CHAT_COMPLETIONS_DECODER_VERSION,
+            &decoded,
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn append_tool_turns(
+    journal: ProviderJournal<'_>,
+    run_id: &RunId,
+    turns: Vec<ModelTurn>,
+) -> Result<(), OpenAiCompletionsError> {
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .append_turns(run_id, turns)
+        .map_err(persistence_error)
+}
+
+fn next_turn_created_at(
+    journal: ProviderJournal<'_>,
+    run_id: &RunId,
+) -> Result<i64, OpenAiCompletionsError> {
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .next_turn_created_at_for_run(run_id, unix_millis())
+        .map_err(persistence_error)
+}
+
+fn api_kind_name(model: &ResolvedModelConfig) -> &'static str {
+    match model.api {
+        crate::models::ApiKind::OpenAiCompletions => "openai-completions",
+    }
+}
+
+fn provider_tool_call_value(tool_call: &ToolCall) -> Value {
+    json!({
+        "id": tool_call.id.clone(),
+        "type": "function",
+        "function": {
+            "name": tool_call.name.clone(),
+            "arguments": tool_call.arguments.clone(),
+        },
+    })
+}
+
+fn error_payload_value(error: &OpenAiCompletionsError) -> Value {
+    match error {
+        OpenAiCompletionsError::Provider(error) => json!({
+            "status": error.status,
+            "message": error.message,
+            "error_type": error.error_type,
+            "code": error.code,
+        }),
+        OpenAiCompletionsError::ProviderStream(error) => json!({
+            "message": error.message,
+            "error_type": error.error_type,
+            "code": error.code,
+        }),
+        OpenAiCompletionsError::Http { status, body } => json!({
+            "status": status,
+            "body": body,
+        }),
+        error => json!({
+            "message": error.to_string(),
+        }),
+    }
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn payload_created_at(sequence: u32) -> i64 {
+    unix_millis().saturating_add(i64::from(sequence))
+}
+
+fn json_error(error: serde_json::Error) -> OpenAiCompletionsError {
+    OpenAiCompletionsError::MalformedResponse {
+        message: format!("failed to serialize provider payload: {error}"),
+    }
+}
+
+fn persistence_error(error: impl ToString) -> OpenAiCompletionsError {
+    OpenAiCompletionsError::MalformedResponse {
+        message: format!("failed to persist provider payload: {}", error.to_string()),
     }
 }
 
@@ -222,19 +526,28 @@ struct ModelTurnOutput {
     assistant_turn: Option<ModelTurn>,
     tool_calls: Vec<ToolCall>,
     terminal_events: Vec<HarnessEventEnvelope>,
+    response_payload: Value,
+    provider_response_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
 struct AssistantTurnCapture {
     text: String,
     tool_calls: Vec<ToolCall>,
+    finish_reason: Option<String>,
+    metadata: Option<ProviderEventMetadata>,
 }
 
 impl AssistantTurnCapture {
     fn observe(&mut self, events: &[HarnessEventEnvelope]) {
         for event in events {
             match &event.event {
-                HarnessEvent::ModelTextDelta { delta, .. } => self.text.push_str(delta),
+                HarnessEvent::ModelTextDelta {
+                    delta, metadata, ..
+                } => {
+                    self.text.push_str(delta);
+                    self.metadata = Some(metadata.clone());
+                }
                 HarnessEvent::ToolCallStarted { .. } | HarnessEvent::ToolCallDelta { .. } => {}
                 HarnessEvent::ToolCallCompleted {
                     tool_call_id,
@@ -242,33 +555,100 @@ impl AssistantTurnCapture {
                     arguments,
                     metadata,
                     ..
-                } => self.tool_calls.push(ToolCall {
-                    id: metadata
-                        .provider_tool_call_id
-                        .clone()
-                        .unwrap_or_else(|| tool_call_id.to_string()),
-                    tool_call_id: Some(tool_call_id.clone()),
-                    name: name.clone().unwrap_or_default(),
-                    arguments: arguments.clone(),
-                }),
+                } => {
+                    self.metadata = Some(metadata.clone());
+                    self.tool_calls.push(ToolCall {
+                        id: metadata
+                            .provider_tool_call_id
+                            .clone()
+                            .unwrap_or_else(|| tool_call_id.to_string()),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        name: name.clone().unwrap_or_default(),
+                        arguments: arguments.clone(),
+                    });
+                }
+                HarnessEvent::MessageCompleted {
+                    finish_reason,
+                    metadata,
+                    ..
+                } => {
+                    self.finish_reason = finish_reason.clone();
+                    self.metadata = Some(metadata.clone());
+                }
                 _ => {}
             }
         }
     }
 
-    fn into_turn(self) -> Option<ModelTurn> {
+    fn to_turn(&self) -> Option<ModelTurn> {
         if self.tool_calls.is_empty() {
-            return (!self.text.is_empty()).then(|| ModelTurn::assistant_text(self.text));
+            return (!self.text.is_empty()).then(|| ModelTurn::assistant_text(self.text.clone()));
         }
 
         if self.text.is_empty() {
-            Some(ModelTurn::assistant_tool_calls(self.tool_calls))
+            Some(ModelTurn::assistant_tool_calls(self.tool_calls.clone()))
         } else {
             Some(ModelTurn::assistant_text_with_tool_calls(
-                self.text,
-                self.tool_calls,
+                self.text.clone(),
+                self.tool_calls.clone(),
             ))
         }
+    }
+
+    fn response_payload(&self) -> Value {
+        let mut message = json!({
+            "role": "assistant",
+            "content": if self.text.is_empty() {
+                Value::Null
+            } else {
+                json!(self.text.clone())
+            },
+        });
+
+        if !self.tool_calls.is_empty() {
+            message.as_object_mut().unwrap().insert(
+                "tool_calls".to_string(),
+                Value::Array(
+                    self.tool_calls
+                        .iter()
+                        .map(provider_tool_call_value)
+                        .collect(),
+                ),
+            );
+        }
+
+        let mut response = json!({
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": self.finish_reason.clone(),
+            }],
+        });
+
+        let response_map = response.as_object_mut().unwrap();
+        if let Some(id) = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.provider_response_id.clone())
+        {
+            response_map.insert("id".to_string(), json!(id));
+        }
+        if let Some(model) = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.provider_model.clone())
+        {
+            response_map.insert("model".to_string(), json!(model));
+        }
+
+        response
+    }
+
+    fn provider_response_id(&self) -> Option<String> {
+        self.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.provider_response_id.clone())
     }
 }
 
@@ -2230,7 +2610,8 @@ mod tests {
         ) -> ToolFuture<'a> {
             Box::pin(async move {
                 cancel.cancel();
-                Ok(ToolOutput::text("mutated").with_file_changed("notes.md", FileChangeKind::Modified))
+                Ok(ToolOutput::text("mutated")
+                    .with_file_changed("notes.md", FileChangeKind::Modified))
             })
         }
     }

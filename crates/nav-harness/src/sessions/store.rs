@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nav_types::{MessageId, ProviderPayloadId, ProviderPayloadRow, RunId, SessionId, ToolCallId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::models::{
     DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
@@ -18,11 +18,12 @@ use super::canonical::{
     ModelTurn, ModelTurnRole, Part, ToolCall, Turn, TurnMeta, TurnPart, TurnRole,
 };
 use super::sqlite::{
-    CreateSession, RunStatus, SqliteSessionStore, SqliteStoreError, StartRun, StoredPart,
-    StoredTurn,
+    CreateSession, NewProviderPayload, RunStatus, SqliteSessionStore, SqliteStoreError, StartRun,
+    StoredPart, StoredTurn,
 };
 
-const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str = "openai-chat-completions-decoder@1";
+pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
+    "openai-chat-completions-decoder@1";
 const UNKNOWN_DECODER_VERSION: &str = "unknown-decoder";
 
 const DEFAULT_PAYLOAD_DECODERS: &[PayloadDecoder] = &[PayloadDecoder {
@@ -166,6 +167,38 @@ impl SessionStore {
         self.provider_payload_recovery_report_with_decoders(DEFAULT_PAYLOAD_DECODERS)
     }
 
+    pub fn append_provider_payload(
+        &self,
+        payload: NewProviderPayload,
+    ) -> Result<ProviderPayloadId, SqliteStoreError> {
+        self.sqlite.append_provider_payload(payload)
+    }
+
+    pub fn get_provider_payload(
+        &self,
+        id: &ProviderPayloadId,
+    ) -> Result<ProviderPayloadRow, SqliteStoreError> {
+        self.sqlite.get_provider_payload(id)
+    }
+
+    pub fn append_decoded_provider_payload(
+        &self,
+        id: &ProviderPayloadId,
+        decoder_version: &str,
+        decoded: &DecodedProviderPayload,
+    ) -> Result<(), SqliteStoreError> {
+        self.sqlite
+            .append_decoded_provider_payload(id, decoder_version, decoded)
+    }
+
+    pub fn next_turn_created_at_for_run(
+        &self,
+        run_id: &RunId,
+        now: i64,
+    ) -> Result<i64, SqliteStoreError> {
+        self.sqlite.next_turn_created_at_for_run(run_id, now)
+    }
+
     fn append_turns_with_first_id(
         &self,
         run_id: &RunId,
@@ -174,6 +207,7 @@ impl SessionStore {
     ) -> Result<(), SqliteStoreError> {
         let mut tool_call_ids = HashMap::new();
         let mut first_message_id = first_message_id;
+        let mut created_at = self.next_turn_created_at_for_run(run_id, unix_millis())?;
         let mut stored_turns = Vec::new();
 
         for model_turn in turns {
@@ -181,7 +215,6 @@ impl SessionStore {
                 continue;
             };
             let message_id = first_message_id.take().unwrap_or_else(new_message_id);
-            let created_at = unix_millis();
             let parts = model_parts(&model_turn.parts, &mut tool_call_ids);
             stored_turns.push((
                 Turn {
@@ -194,6 +227,7 @@ impl SessionStore {
                 },
                 parts,
             ));
+            created_at = created_at.saturating_add(1);
         }
 
         self.sqlite.append_turns(&stored_turns)
