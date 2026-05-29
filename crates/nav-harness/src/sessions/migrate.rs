@@ -111,6 +111,12 @@ CREATE TABLE IF NOT EXISTS provider_payloads (
 CREATE INDEX IF NOT EXISTS idx_provider_payloads_run_sequence ON provider_payloads(run_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_provider_payloads_session ON provider_payloads(session_id, created_at);
 
+CREATE TABLE IF NOT EXISTS provider_state (
+    run_id          TEXT PRIMARY KEY NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    api_kind        TEXT NOT NULL,
+    state_json      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS turn_parts_text (
     part_id     TEXT PRIMARY KEY NOT NULL REFERENCES turn_parts(id) ON DELETE CASCADE,
     turn_id     TEXT NOT NULL,
@@ -682,6 +688,35 @@ const TABLES: &[TableSchema] = &[
         ],
     },
     TableSchema {
+        name: "provider_state",
+        columns: &[
+            column(
+                "run_id",
+                "run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(id) ON DELETE CASCADE",
+                "TEXT",
+                true,
+                None,
+                true,
+            ),
+            column(
+                "api_kind",
+                "api_kind TEXT NOT NULL",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+            column(
+                "state_json",
+                "state_json TEXT NOT NULL",
+                "TEXT",
+                true,
+                None,
+                false,
+            ),
+        ],
+    },
+    TableSchema {
         name: "turn_parts_text",
         columns: &[
             column(
@@ -708,14 +743,7 @@ const TABLES: &[TableSchema] = &[
                 None,
                 false,
             ),
-            column(
-                "text",
-                "text TEXT NOT NULL",
-                "TEXT",
-                true,
-                None,
-                false,
-            ),
+            column("text", "text TEXT NOT NULL", "TEXT", true, None, false),
         ],
     },
 ];
