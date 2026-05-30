@@ -2,6 +2,7 @@
 
 pub mod auto_title;
 
+use std::collections::HashMap;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,6 +10,9 @@ use std::time::Duration;
 use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId};
 use serde_json::{Value, json};
 
+use crate::compaction::breaker::{
+    AntiThrashingBreaker, AutoCompactionDecision, CompactionFailureBreaker, savings_ratio,
+};
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
 use crate::compaction::summary::CompactionSummaryAgent;
 use crate::context::ContextReminders;
@@ -19,14 +23,14 @@ use crate::events::{
 use crate::guardrails::{GuardrailError, ToolCallContext, ToolCallContextParams};
 use crate::models::{
     ApiKind, DialectHttpRequest, EncodedRequest, OpenAiCompletionsCancellationToken,
-    OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsRequest,
-    OpenAiCompletionsRequestContext, ResolvedModelConfig, anthropic_http_request, encode_request,
-    extract_turn, responses_http_request,
+    OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsProviderError,
+    OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, ResolvedModelConfig,
+    anthropic_http_request, encode_request, extract_turn, responses_http_request,
 };
 use crate::sessions::{
-    CompactionConfig, ConfirmationDecision, ModelTurn, NewProviderPayload, PendingConfirmation,
-    PendingConfirmationReceiver, PendingConfirmationRegistry, ProviderPayloadDirection,
-    SessionStore, ToolCall,
+    CompactionCommitError, CompactionConfig, CompactionKind, ConfirmationDecision, ModelTurn,
+    ModelTurnRole, NewProviderPayload, PendingConfirmation, PendingConfirmationReceiver,
+    PendingConfirmationRegistry, ProviderPayloadDirection, SessionStore, ToolCall, TurnPart,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
@@ -36,7 +40,7 @@ use crate::tools::{
 const TOOL_OUTPUT_BUFFER: usize = 64;
 
 /// How many times a single run may recover from a context-limit overflow by
-/// force-compacting and replaying the continuation prompt before giving up.
+/// force-compacting and replaying the triggering user turn before giving up.
 /// One attempt is enough to clear a window that pruning alone could not; a
 /// second consecutive overflow indicates compaction is not shrinking the
 /// request, so the run fails instead of looping.
@@ -124,9 +128,25 @@ impl SubagentRuntime {
 #[derive(Debug, Default)]
 pub struct AgentCatalog;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RunLoop {
     client: OpenAiCompletionsClient,
+    compaction_breakers: Arc<Mutex<RunLoopCompactionBreakers>>,
+}
+
+impl Default for RunLoop {
+    fn default() -> Self {
+        Self {
+            client: OpenAiCompletionsClient::new(),
+            compaction_breakers: Arc::new(Mutex::new(RunLoopCompactionBreakers::default())),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunLoopCompactionBreakers {
+    anti_thrashing: HashMap<SessionId, AntiThrashingBreaker>,
+    failures: CompactionFailureBreaker,
 }
 
 #[derive(Debug)]
@@ -162,7 +182,16 @@ impl RunLoop {
     }
 
     pub fn with_client(client: OpenAiCompletionsClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            compaction_breakers: Arc::new(Mutex::new(RunLoopCompactionBreakers::default())),
+        }
+    }
+
+    pub fn reset_compaction_breakers(&self, session_id: &SessionId) {
+        let mut breakers = self.compaction_breakers.lock().unwrap();
+        breakers.anti_thrashing.remove(session_id);
+        breakers.failures.reset(session_id);
     }
 
     pub fn run(
@@ -186,6 +215,7 @@ impl RunLoop {
             .expect("model streaming runtime should build");
         let mut turns = request.turns.to_vec();
         let mut new_turns = Vec::new();
+        let overflow_replay_text = latest_user_text(&turns);
         let journal = request.session_store.map(|store| ProviderJournal {
             session_id: request.session_id,
             store,
@@ -242,13 +272,44 @@ impl RunLoop {
                         && overflow_attempts < MAX_OVERFLOW_ATTEMPTS
                     {
                         overflow_attempts += 1;
-                        match self.recover_from_overflow(journal, model, request.run_id) {
+                        let tokens_before_compaction = estimate_model_turn_tokens(&turns);
+                        match self.recover_from_overflow(
+                            journal,
+                            model,
+                            request.run_id,
+                            overflow_replay_text.as_deref(),
+                            tokens_before_compaction,
+                        ) {
                             Ok(recovered_turns) => {
                                 turns = recovered_turns;
                                 continue;
                             }
                             Err(recovery_error) => return RunLoopResult::Failed(recovery_error),
                         }
+                    }
+                    if matches!(error, OpenAiCompletionsError::ContextLimit(_))
+                        && overflow_attempts >= MAX_OVERFLOW_ATTEMPTS
+                        && let Some(journal) = journal
+                    {
+                        if let Err(journal_error) = self.flush_stream_error(
+                            journal,
+                            model,
+                            partial_output,
+                            request.run_id,
+                            payload_sequence,
+                            &error,
+                        ) {
+                            return RunLoopResult::Failed(journal_error);
+                        }
+                        if let Err(drop_error) = journal
+                            .store
+                            .lock()
+                            .unwrap()
+                            .drop_latest_compaction_summary(journal.session_id)
+                        {
+                            return RunLoopResult::Failed(persistence_error(drop_error));
+                        }
+                        return RunLoopResult::Failed(context_overflow_error());
                     }
                     if let Some(journal) = journal
                         && let Err(journal_error) = self.flush_stream_error(
@@ -342,8 +403,8 @@ impl RunLoop {
     }
 
     /// Recover from a context-limit overflow: force-compact the session into a
-    /// summary, then replay a single synthetic continuation prompt so the next
-    /// attempt resumes from the summary instead of the oversized history.
+    /// summary, then replay a single synthetic user turn so the next attempt
+    /// resumes from the summary instead of the oversized history.
     ///
     /// Returns the recompacted replay turns to retry with. Media is dropped as
     /// a side effect of replay projection, so the retried request carries no
@@ -353,33 +414,126 @@ impl RunLoop {
         journal: ProviderJournal<'_>,
         model: &ResolvedModelConfig,
         run_id: &RunId,
+        replay_text: Option<&str>,
+        tokens_before_compaction: usize,
     ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
         let session_id = journal.session_id;
+        self.ensure_auto_compaction_enabled(session_id)?;
         let summary_request = journal
             .store
             .lock()
             .unwrap()
             .compaction_summary_request(session_id, CompactionConfig::default())
             .map_err(persistence_error)?;
-        let summary = CompactionSummaryAgent::with_client(self.client.clone())
-            .generate(model, &summary_request)?;
+        let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
+        let summary = match summary_agent.generate(model, &summary_request) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.record_compaction_error(session_id, &error);
+                return Err(error);
+            }
+        };
 
         {
             let store = journal.store.lock().unwrap();
+            if let Err(error) = store.compact_session_with_validated_summary(
+                session_id,
+                &summary_request,
+                summary,
+                CompactionKind::Auto,
+            ) {
+                self.record_compaction_commit_error(session_id, &error);
+                return Err(persistence_error(error));
+            }
             store
-                .compact_session_with_summary(session_id, &summary_request, summary)
-                .map_err(persistence_error)?;
-            store
-                .append_overflow_continuation(session_id, run_id)
+                .append_overflow_replay_turn(
+                    session_id,
+                    run_id,
+                    replay_text.unwrap_or(crate::compaction::overflow::OVERFLOW_CONTINUATION_TEXT),
+                )
                 .map_err(persistence_error)?;
         }
-
-        journal
+        let recovered_turns = journal
             .store
             .lock()
             .unwrap()
             .try_turns(session_id)
-            .map_err(persistence_error)
+            .map_err(persistence_error)?;
+        self.record_compaction_success(session_id);
+        self.record_compaction_savings(
+            session_id,
+            tokens_before_compaction,
+            estimate_model_turn_tokens(&recovered_turns),
+        );
+        Ok(recovered_turns)
+    }
+
+    fn ensure_auto_compaction_enabled(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), OpenAiCompletionsError> {
+        let now = unix_duration();
+        let breakers = self.compaction_breakers.lock().unwrap();
+        if let Some(warning) = breakers.failures.auto_compaction_warning(session_id, now) {
+            return Err(OpenAiCompletionsError::MalformedResponse {
+                message: warning.to_string(),
+            });
+        }
+        if let Some(AutoCompactionDecision::Skip { warning }) = breakers
+            .anti_thrashing
+            .get(session_id)
+            .map(AntiThrashingBreaker::decide_auto_compaction)
+        {
+            return Err(OpenAiCompletionsError::MalformedResponse { message: warning });
+        }
+        Ok(())
+    }
+
+    fn record_compaction_error(&self, session_id: &SessionId, error: &OpenAiCompletionsError) {
+        let now = unix_duration();
+        let mut breakers = self.compaction_breakers.lock().unwrap();
+        if is_transient_compaction_error(error) {
+            breakers.failures.record_transient_failure(session_id, now);
+        } else {
+            breakers.failures.record_failure(session_id);
+        }
+    }
+
+    fn record_compaction_commit_error(
+        &self,
+        session_id: &SessionId,
+        error: &CompactionCommitError,
+    ) {
+        if matches!(error, CompactionCommitError::InvalidSummary(_)) {
+            self.compaction_breakers
+                .lock()
+                .unwrap()
+                .failures
+                .record_failure(session_id);
+        }
+    }
+
+    fn record_compaction_success(&self, session_id: &SessionId) {
+        self.compaction_breakers
+            .lock()
+            .unwrap()
+            .failures
+            .record_success(session_id);
+    }
+
+    fn record_compaction_savings(
+        &self,
+        session_id: &SessionId,
+        tokens_before: usize,
+        tokens_after: usize,
+    ) {
+        self.compaction_breakers
+            .lock()
+            .unwrap()
+            .anti_thrashing
+            .entry(session_id.clone())
+            .or_default()
+            .record_auto_compaction(savings_ratio(tokens_before, tokens_after));
     }
 
     fn journal_request_payload(
@@ -768,6 +922,32 @@ fn streaming_request_body(
     serde_json::to_vec(&plan.body).map_err(json_error)
 }
 
+fn latest_user_text(turns: &[ModelTurn]) -> Option<String> {
+    turns
+        .iter()
+        .rev()
+        .find(|turn| turn.role == ModelTurnRole::User)
+        .map(ModelTurn::text_content)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn estimate_model_turn_tokens(turns: &[ModelTurn]) -> usize {
+    let char_count: usize = turns
+        .iter()
+        .flat_map(|turn| &turn.parts)
+        .map(|part| match part {
+            TurnPart::Text { text, .. } | TurnPart::ToolResult { content: text, .. } => text.len(),
+            TurnPart::ToolCall(tool_call) => tool_call.name.len() + tool_call.arguments.len(),
+        })
+        .sum();
+
+    if char_count == 0 {
+        0
+    } else {
+        char_count.div_ceil(4)
+    }
+}
+
 fn dialect_stream_error(error: OpenAiCompletionsError) -> Box<ModelTurnStreamError> {
     Box::new(ModelTurnStreamError {
         error,
@@ -1043,6 +1223,10 @@ fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
+fn unix_duration() -> Duration {
+    Duration::from_millis(u64::try_from(unix_millis()).unwrap_or(0))
+}
+
 fn payload_created_at(sequence: u32) -> i64 {
     unix_millis().saturating_add(i64::from(sequence))
 }
@@ -1056,6 +1240,22 @@ fn json_error(error: serde_json::Error) -> OpenAiCompletionsError {
 fn persistence_error(error: impl ToString) -> OpenAiCompletionsError {
     OpenAiCompletionsError::MalformedResponse {
         message: format!("failed to persist provider payload: {}", error.to_string()),
+    }
+}
+
+fn context_overflow_error() -> OpenAiCompletionsError {
+    OpenAiCompletionsError::ContextOverflow {
+        message: "compacted summary and retained tail still exceed the context window".to_string(),
+    }
+}
+
+fn is_transient_compaction_error(error: &OpenAiCompletionsError) -> bool {
+    match error {
+        OpenAiCompletionsError::Http { status, .. }
+        | OpenAiCompletionsError::Provider(OpenAiCompletionsProviderError { status, .. }) => {
+            *status == 429 || *status >= 500
+        }
+        _ => false,
     }
 }
 

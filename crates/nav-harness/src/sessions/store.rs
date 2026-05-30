@@ -374,8 +374,8 @@ impl SessionStore {
         )
     }
 
-    /// Append the synthetic continuation prompt replayed after an overflow
-    /// compaction.
+    /// Append the fallback synthetic continuation prompt replayed after an
+    /// overflow compaction.
     ///
     /// Exactly one continuation turn is added per recovery: if the most recent
     /// turn is already the overflow continuation, the call is a no-op so the
@@ -385,8 +385,26 @@ impl SessionStore {
         session_id: &SessionId,
         run_id: &RunId,
     ) -> Result<(), SqliteStoreError> {
+        self.append_overflow_replay_turn(session_id, run_id, OVERFLOW_CONTINUATION_TEXT)
+    }
+
+    /// Append the original user turn text replayed after an overflow
+    /// compaction.
+    ///
+    /// Exactly one synthetic replay turn is added per recovery: the original
+    /// persisted user turn may already be the latest real turn, so the guard
+    /// only suppresses a matching synthetic replay that was appended earlier.
+    pub fn append_overflow_replay_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        text: &str,
+    ) -> Result<(), SqliteStoreError> {
         let page = self.session_turns_chronological(session_id)?;
-        if page.last().is_some_and(is_overflow_continuation_turn) {
+        if page
+            .last()
+            .is_some_and(|turn| is_synthetic_user_text_turn(turn, text))
+        {
             return Ok(());
         }
 
@@ -403,7 +421,7 @@ impl SessionStore {
         self.sqlite.append_turns(&[(
             turn,
             vec![Part::Text {
-                text: OVERFLOW_CONTINUATION_TEXT.to_string(),
+                text: text.to_string(),
                 synthetic: Some(true),
             }],
         )])
@@ -430,6 +448,39 @@ impl SessionStore {
             false,
         )
         .map_err(CompactionCommitError::Store)
+    }
+
+    /// Drop the latest auto-compaction replay artifacts after Stage-5 terminal
+    /// overflow proves the summary did not shrink the request enough.
+    pub fn drop_latest_compaction_summary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SqliteStoreError> {
+        let page = self.session_turns_chronological(session_id)?;
+        let Some(marker_index) = latest_compaction_marker_index(&page) else {
+            return Ok(());
+        };
+        let summary_index = marker_index.saturating_add(1);
+
+        for index in [marker_index, summary_index] {
+            if let Some((turn, parts)) = page.get(index) {
+                for part in parts {
+                    self.sqlite.remove_part(&turn.id, &part.id)?;
+                }
+            }
+        }
+
+        let replay_index = summary_index.saturating_add(1);
+        if let Some(stored_turn) = page.get(replay_index)
+            && is_synthetic_user_text_replay_turn(stored_turn)
+        {
+            let (turn, parts) = stored_turn;
+            for part in parts {
+                self.sqlite.remove_part(&turn.id, &part.id)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn write_compaction_summary(
@@ -1375,7 +1426,7 @@ fn is_verbatim_replay_turn(turns: &[StoredTurn], index: usize) -> bool {
     !has_compaction_marker(parts) && !is_compaction_summary_turn(turns, index)
 }
 
-fn is_overflow_continuation_turn((turn, parts): &StoredTurn) -> bool {
+fn is_synthetic_user_text_turn((turn, parts): &StoredTurn, expected_text: &str) -> bool {
     turn.role == TurnRole::User
         && parts.iter().any(|part| {
             matches!(
@@ -1383,7 +1434,20 @@ fn is_overflow_continuation_turn((turn, parts): &StoredTurn) -> bool {
                 Part::Text {
                     text,
                     synthetic: Some(true),
-                } if text == OVERFLOW_CONTINUATION_TEXT
+                } if text == expected_text
+            )
+        })
+}
+
+fn is_synthetic_user_text_replay_turn((turn, parts): &StoredTurn) -> bool {
+    turn.role == TurnRole::User
+        && parts.iter().any(|part| {
+            matches!(
+                &part.part,
+                Part::Text {
+                    synthetic: Some(true),
+                    ..
+                }
             )
         })
 }
@@ -1392,6 +1456,12 @@ fn has_compaction_marker(parts: &[StoredPart]) -> bool {
     parts
         .iter()
         .any(|part| matches!(part.part, Part::Compaction { .. }))
+}
+
+fn latest_compaction_marker_index(turns: &[StoredTurn]) -> Option<usize> {
+    turns
+        .iter()
+        .rposition(|(_, parts)| has_compaction_marker(parts))
 }
 
 fn is_compaction_summary_turn(turns: &[StoredTurn], index: usize) -> bool {
