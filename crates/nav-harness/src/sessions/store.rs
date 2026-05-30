@@ -555,24 +555,21 @@ impl SessionStore {
         let Some(marker_index) = latest_compaction_marker_index(&page) else {
             return Ok(());
         };
-        let summary_index = marker_index.saturating_add(1);
         let mut parts_to_remove: Vec<(MessageId, PartId)> = Vec::new();
 
-        for index in [marker_index, summary_index] {
-            if let Some((turn, parts)) = page.get(index) {
-                for part in parts {
-                    parts_to_remove.push((turn.id.clone(), part.id.clone()));
-                }
-            }
-        }
+        collect_turn_part_ids(&page, marker_index, &mut parts_to_remove);
 
-        let replay_index = summary_index.saturating_add(1);
-        if let Some(stored_turn) = page.get(replay_index)
-            && is_synthetic_user_text_replay_turn(stored_turn)
-        {
-            let (turn, parts) = stored_turn;
-            for part in parts {
-                parts_to_remove.push((turn.id.clone(), part.id.clone()));
+        let summary_index = marker_index
+            .checked_add(1)
+            .filter(|index| is_compaction_summary_turn(&page, *index));
+        if let Some(summary_index) = summary_index {
+            collect_turn_part_ids(&page, summary_index, &mut parts_to_remove);
+
+            let replay_index = summary_index.saturating_add(1);
+            if let Some(stored_turn) = page.get(replay_index)
+                && is_synthetic_user_text_replay_turn(stored_turn)
+            {
+                collect_turn_part_ids(&page, replay_index, &mut parts_to_remove);
             }
         }
 
@@ -1613,6 +1610,12 @@ fn latest_compaction_marker_index(turns: &[StoredTurn]) -> Option<usize> {
         .rposition(|(_, parts)| has_compaction_marker(parts))
 }
 
+fn collect_turn_part_ids(turns: &[StoredTurn], index: usize, out: &mut Vec<(MessageId, PartId)>) {
+    if let Some((turn, parts)) = turns.get(index) {
+        out.extend(parts.iter().map(|part| (turn.id.clone(), part.id.clone())));
+    }
+}
+
 fn is_compaction_summary_turn(turns: &[StoredTurn], index: usize) -> bool {
     let Some((turn, parts)) = turns.get(index) else {
         return false;
@@ -2138,6 +2141,71 @@ mod tests {
             !after
                 .iter()
                 .any(|turn| turn.text_content() == COMPACTION_REPLAY_TEXT)
+        );
+    }
+
+    #[test]
+    fn drop_latest_compaction_summary_keeps_real_neighbor_when_summary_is_missing() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let marker_id = new_message_id();
+        let real_turn_id = new_message_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .sqlite
+            .append_turn(
+                Turn {
+                    id: marker_id,
+                    run_id: run_id.clone(),
+                    seq: 0,
+                    role: TurnRole::User,
+                    meta: TurnMeta::default(),
+                    created_at: 1_000,
+                },
+                vec![Part::Compaction {
+                    auto: true,
+                    tail_start_id: None,
+                }],
+            )
+            .unwrap();
+        store
+            .sqlite
+            .append_turn(
+                Turn {
+                    id: real_turn_id.clone(),
+                    run_id,
+                    seq: 1,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta::default(),
+                    created_at: 1_001,
+                },
+                vec![Part::Text {
+                    text: "real assistant turn".to_string(),
+                    synthetic: None,
+                }],
+            )
+            .unwrap();
+
+        store.drop_latest_compaction_summary(&session_id).unwrap();
+
+        let stored_turns = store
+            .sqlite
+            .list_turns_for_session(&session_id, None, usize::MAX)
+            .unwrap()
+            .items;
+        let real_turn = stored_turns
+            .into_iter()
+            .find(|(turn, _)| turn.id == real_turn_id)
+            .expect("real neighbor turn should still exist");
+        assert_eq!(
+            real_turn.1[0].part,
+            Part::Text {
+                text: "real assistant turn".to_string(),
+                synthetic: None,
+            }
         );
     }
 
