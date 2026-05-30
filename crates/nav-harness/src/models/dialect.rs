@@ -8,6 +8,7 @@
 use reqwest::Url;
 use serde_json::{Map, Value, json};
 
+use crate::context::reminders::ContextReminders;
 use crate::sessions::ModelTurn;
 use crate::tools::{ToolPreset, ToolRegistry};
 
@@ -37,11 +38,17 @@ pub enum EncodedRequest {
 }
 
 /// Encode canonical turns into the dialect selected by `api`.
+///
+/// `reminders` are injected as a `<system-reminder>` block in the last user
+/// message of the Anthropic dialect (plans/context-management.md §2.3); the
+/// OpenAI dialects do not carry the cache-stable system/message split this
+/// relies on, so they ignore it for now.
 pub fn encode_request(
     api: ApiKind,
     turns: &[ModelTurn],
     tool_registry: &ToolRegistry,
     tool_preset: ToolPreset,
+    reminders: &ContextReminders,
 ) -> EncodedRequest {
     match api {
         ApiKind::OpenAiResponses => {
@@ -49,8 +56,9 @@ pub fn encode_request(
             EncodedRequest::Responses(infallible(Encoder::encode(&encoder, turns)))
         }
         ApiKind::AnthropicMessages => {
-            let encoder =
-                AnthropicMessagesEncoder::new().with_tool_registry(tool_registry, tool_preset);
+            let encoder = AnthropicMessagesEncoder::new()
+                .with_tool_registry(tool_registry, tool_preset)
+                .with_reminders(reminders.clone());
             EncodedRequest::Anthropic(infallible(Encoder::encode(&encoder, turns)))
         }
         // Chat Completions and (for now) ChatGPT subscription both encode as
@@ -361,8 +369,32 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            &ContextReminders::new(),
         );
         assert!(matches!(encoded, EncodedRequest::Anthropic(_)));
+    }
+
+    #[test]
+    fn anthropic_request_injects_context_reminders() {
+        let turns = vec![ModelTurn::user_text("hello")];
+        let encoded = encode_request(
+            ApiKind::AnthropicMessages,
+            &turns,
+            &registry(),
+            ToolPreset::Coding,
+            &ContextReminders::new().plan_mode(true),
+        );
+        let EncodedRequest::Anthropic(request) = encoded else {
+            panic!("expected an Anthropic request");
+        };
+        let content = request.messages.last().unwrap()["content"]
+            .as_array()
+            .unwrap();
+        assert!(content.iter().any(|block| {
+            block["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("[Plan Mode: Active]"))
+        }));
     }
 
     #[test]
@@ -373,6 +405,7 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            &ContextReminders::new(),
         );
         assert!(matches!(encoded, EncodedRequest::Responses(_)));
     }
@@ -385,6 +418,7 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            &ContextReminders::new(),
         );
         assert!(matches!(encoded, EncodedRequest::Completions(_)));
     }
@@ -397,6 +431,7 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            &ContextReminders::new(),
         );
         assert!(matches!(encoded, EncodedRequest::Completions(_)));
     }
