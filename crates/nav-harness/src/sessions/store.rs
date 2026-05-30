@@ -34,7 +34,7 @@ use super::canonical::{
 };
 use super::sqlite::{
     Artifact, CreateSession, NewArtifact, NewProviderPayload, ProviderState, RevertInfo, RunStatus,
-    SqliteSessionStore, SqliteStoreError, StartRun, StoredPart, StoredTurn,
+    SqliteSessionStore, SqliteStoreError, StartRun, StoredPart, StoredTurn, TurnPartSearchHit,
 };
 
 pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
@@ -121,6 +121,36 @@ pub struct SessionTotals {
     pub tokens_reasoning: i64,
     pub tokens_cache_read: i64,
     pub tokens_cache_write: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionSearchIndex {
+    Unicode,
+    #[default]
+    Trigram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSearchOptions {
+    pub limit: usize,
+    pub surrounding_turns: usize,
+    pub index: SessionSearchIndex,
+}
+
+impl Default for SessionSearchOptions {
+    fn default() -> Self {
+        Self {
+            limit: 20,
+            surrounding_turns: 2,
+            index: SessionSearchIndex::Trigram,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnchoredSearchHit {
+    pub hit: TurnPartSearchHit,
+    pub anchored_turns: Vec<StoredTurn>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +255,51 @@ impl SessionStore {
             tokens_cache_read: row.tokens_cache_read,
             tokens_cache_write: row.tokens_cache_write,
         })
+    }
+
+    pub fn search_turn_parts(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TurnPartSearchHit>, SqliteStoreError> {
+        self.sqlite.search_turn_parts(query, limit)
+    }
+
+    pub fn search_turn_parts_trigram(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TurnPartSearchHit>, SqliteStoreError> {
+        self.sqlite.search_turn_parts_trigram(query, limit)
+    }
+
+    pub fn get_anchored_view(
+        &self,
+        hit: &TurnPartSearchHit,
+        surrounding_turns: usize,
+    ) -> Result<Vec<StoredTurn>, SqliteStoreError> {
+        self.sqlite.get_anchored_view(hit, surrounding_turns)
+    }
+
+    pub fn search_turn_parts_with_anchored_view(
+        &self,
+        query: &str,
+        options: SessionSearchOptions,
+    ) -> Result<Vec<AnchoredSearchHit>, SqliteStoreError> {
+        let hits = match options.index {
+            SessionSearchIndex::Unicode => self.search_turn_parts(query, options.limit)?,
+            SessionSearchIndex::Trigram => self.search_turn_parts_trigram(query, options.limit)?,
+        };
+
+        hits.into_iter()
+            .map(|hit| {
+                let anchored_turns = self.get_anchored_view(&hit, options.surrounding_turns)?;
+                Ok(AnchoredSearchHit {
+                    hit,
+                    anchored_turns,
+                })
+            })
+            .collect()
     }
 
     pub fn update_session_title(
