@@ -329,11 +329,16 @@ fn decode_anthropic_content_block(
                         "missing thinking text at /content/{index}/thinking"
                     ))
                 })?;
+            let signature = block
+                .get("signature")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             Ok(vec![anthropic_decoded_part(
                 input,
                 Part::Thinking {
                     text: text.to_string(),
                     provider_hint: Some("thinking".to_string()),
+                    signature,
                 },
                 format!("/content/{index}/thinking"),
             )])
@@ -349,6 +354,7 @@ fn decode_anthropic_content_block(
                 Part::Thinking {
                     text: text.to_string(),
                     provider_hint: Some("redacted_thinking".to_string()),
+                    signature: None,
                 },
                 format!("/content/{index}/data"),
             )])
@@ -795,6 +801,7 @@ fn responses_thinking_part(
         part: Part::Thinking {
             text: text.to_string(),
             provider_hint: Some(provider_hint.to_string()),
+            signature: None,
         },
         provider_payload_id: input.provider_payload_id.clone(),
         provider_json_pointer,
@@ -1219,6 +1226,7 @@ impl<'a> SubscriptionDecodeState<'a> {
             part: Part::Thinking {
                 text: text.to_string(),
                 provider_hint: Some("encrypted".to_string()),
+                signature: None,
             },
             provider_payload_id: self.input.provider_payload_id.clone(),
             provider_json_pointer: self.event_pointer(index, &format!("/item/{field}")),

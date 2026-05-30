@@ -412,6 +412,7 @@ fn update_part_replaces_stored_part_payload() {
             Part::Thinking {
                 text: "replaced".to_string(),
                 provider_hint: Some("reasoning".to_string()),
+                signature: None,
             },
         )
         .expect("part update should commit");
@@ -424,6 +425,7 @@ fn update_part_replaces_stored_part_payload() {
         Part::Thinking {
             text: "replaced".to_string(),
             provider_hint: Some("reasoning".to_string()),
+            signature: None,
         }
     );
 }
@@ -751,6 +753,7 @@ fn remove_part_deletes_only_the_target_part() {
                 Part::Thinking {
                     text: "remove".to_string(),
                     provider_hint: None,
+                    signature: None,
                 },
             ],
         )
@@ -1739,6 +1742,7 @@ fn thinking_part_populates_turn_parts_text_with_text_field() {
             vec![Part::Thinking {
                 text: "let me reason about this".to_string(),
                 provider_hint: Some("reasoning".to_string()),
+                signature: None,
             }],
         )
         .expect("turn append should commit");

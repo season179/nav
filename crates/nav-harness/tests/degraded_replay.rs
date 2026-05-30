@@ -59,6 +59,7 @@ fn non_thinking_dialect_drops_thinking_and_reports_it() {
                 Part::Thinking {
                     text: "SECRET_REASONING".to_string(),
                     provider_hint: None,
+                    signature: None,
                 },
                 text("The answer is 42."),
             ],
@@ -186,6 +187,7 @@ fn thinking_capable_dialect_keeps_thinking_without_events() {
             Part::Thinking {
                 text: "SECRET_REASONING".to_string(),
                 provider_hint: None,
+                signature: None,
             },
             text("The answer is 42."),
         ],
@@ -263,6 +265,7 @@ fn swap_to_non_thinking_provider_still_grounds_in_prior_conversation() {
                 Part::Thinking {
                     text: "SECRET_REASONING_TRACE".to_string(),
                     provider_hint: None,
+                    signature: None,
                 },
                 text("Got it, the passphrase is BLUE_OTTER."),
             ],
@@ -319,6 +322,7 @@ fn turn_emptied_by_thinking_drop_produces_no_dangling_message() {
             vec![Part::Thinking {
                 text: "only reasoning, no visible answer".to_string(),
                 provider_hint: None,
+                signature: None,
             }],
         ),
     ];

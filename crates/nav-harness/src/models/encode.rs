@@ -311,10 +311,18 @@ fn anthropic_assistant_content_block(part: &Part) -> Option<Value> {
             "name": name,
             "input": arguments,
         })),
-        Part::Thinking { text, .. } => Some(json!({
-            "type": "thinking",
-            "thinking": text,
-        })),
+        Part::Thinking {
+            text, signature, ..
+        } => {
+            let mut block = json!({
+                "type": "thinking",
+                "thinking": text,
+            });
+            if let Some(signature) = signature {
+                block["signature"] = json!(signature);
+            }
+            Some(block)
+        }
         _ => None,
     }
 }
@@ -928,6 +936,7 @@ fn responses_assistant_item(part: &Part) -> Option<Value> {
         Part::Thinking {
             text,
             provider_hint: Some(provider_hint),
+            ..
         } if provider_hint == "encrypted" => Some(responses_reasoning_item(text)),
         _ => None,
     }

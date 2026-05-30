@@ -68,6 +68,7 @@ fn thinking_text_estimated_at_chars_divided_by_3_point_8() {
     let part = Part::Thinking {
         text,
         provider_hint: None,
+        signature: None,
     };
     let tokens = estimate_tokens_for_parts(&[part]);
     assert_eq!(tokens, 100);

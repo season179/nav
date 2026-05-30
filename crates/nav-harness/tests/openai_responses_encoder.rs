@@ -280,6 +280,7 @@ fn encrypted_thinking_part_produces_reasoning_item() {
         vec![Part::Thinking {
             text: "gAAAAABm-encrypted-reasoning".to_string(),
             provider_hint: Some("encrypted".to_string()),
+            signature: None,
         }],
     )];
 
@@ -333,6 +334,7 @@ fn assistant_items_preserve_canonical_part_order() {
             Part::Thinking {
                 text: "encrypted-reasoning".to_string(),
                 provider_hint: Some("encrypted".to_string()),
+                signature: None,
             },
             Part::ToolCall {
                 id: call_id,
