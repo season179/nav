@@ -28,10 +28,23 @@ use super::{
 /// its work is stubbed.
 const SKELETON_SUMMARY: &str = "subagent skeleton: child session created (no work run yet)";
 
-/// What the child subagent was asked to do.
+/// Maximum subagent recursion depth across the whole delegation tree (root = 0).
+///
+/// Bounds how deep `task` delegation can nest, enforced *in addition* to each
+/// agent's [`IterationBudget`](crate::agents::IterationBudget): because every
+/// child gets its own independent budget, an unbounded tree could otherwise blow
+/// far past any single agent's round cap. A child spawned at `MAX_TASK_DEPTH` is
+/// denied the `task` tool, so it cannot delegate further. Default of 4 follows
+/// `flue`.
+pub const MAX_TASK_DEPTH: u32 = 4;
+
+/// What the child subagent was asked to do, plus the isolation it runs under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSpawnRequest {
     pub prompt: String,
+    /// Recursion depth of the child within the delegation tree (root agent = 0,
+    /// so the shallowest child is 1). Bounded by [`MAX_TASK_DEPTH`].
+    pub depth: u32,
 }
 
 /// Terminal state of a spawned subagent.
@@ -114,6 +127,10 @@ impl TaskSpawner for SessionStoreTaskSpawner {
                 TaskSpawnError::new(format!("failed to create child session: {error}"))
             })?;
 
+        // TASK-03 will build the child's isolation with
+        // `agents::SubagentRuntime::for_depth(_request.depth)` and drive the real
+        // agent loop under that budget and the depth-derived tool pool, replacing
+        // this placeholder summary.
         Ok(TaskSpawnOutcome {
             session_id: session_id.to_string(),
             status: TaskStatus::Completed,
@@ -178,15 +195,32 @@ fn execute_task(
     }
 
     let prompt = parse_prompt(&args)?;
+    let depth = child_depth(ctx.task_depth())?;
     let spawner = ctx
         .task_spawner()
         .ok_or_else(|| ToolError::new("task spawner is not configured"))?;
 
     let outcome = spawner
-        .spawn(TaskSpawnRequest { prompt })
+        .spawn(TaskSpawnRequest { prompt, depth })
         .map_err(|error| ToolError::new(format!("subagent failed: {error}")))?;
 
     Ok(ToolOutput::text(format_task_result(&outcome)))
+}
+
+/// Depth of the child an agent at `parent_depth` would spawn (one level below),
+/// or an error if delegating would breach [`MAX_TASK_DEPTH`].
+///
+/// A caller already at the cap is denied `task` entirely, so a deep delegation
+/// tree cannot keep nesting (each child would otherwise carry its own fresh
+/// [`IterationBudget`](crate::agents::IterationBudget)).
+fn child_depth(parent_depth: u32) -> Result<u32, ToolError> {
+    if parent_depth >= MAX_TASK_DEPTH {
+        return Err(ToolError::new(format!(
+            "task delegation depth limit reached (MAX_TASK_DEPTH = {MAX_TASK_DEPTH}): \
+             a subagent at maximum depth cannot spawn further subagents"
+        )));
+    }
+    Ok(parent_depth + 1)
 }
 
 fn parse_prompt(args: &Value) -> Result<String, ToolError> {
@@ -239,6 +273,77 @@ mod tests {
 
     fn context_with(outcome: TaskSpawnOutcome) -> ToolContext {
         ToolContext::default().with_task_spawner(Arc::new(FakeSpawner { outcome }))
+    }
+
+    /// Records the request it was handed so tests can assert the depth the tool
+    /// derived for the child.
+    #[derive(Debug)]
+    struct CapturingSpawner {
+        seen: Mutex<Option<TaskSpawnRequest>>,
+    }
+
+    impl CapturingSpawner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(None),
+            })
+        }
+
+        fn captured(&self) -> TaskSpawnRequest {
+            self.seen.lock().unwrap().clone().expect("a spawn request")
+        }
+    }
+
+    impl TaskSpawner for CapturingSpawner {
+        fn spawn(&self, request: TaskSpawnRequest) -> Result<TaskSpawnOutcome, TaskSpawnError> {
+            let outcome = TaskSpawnOutcome {
+                session_id: "child".to_string(),
+                status: TaskStatus::Completed,
+                summary: "done".to_string(),
+            };
+            *self.seen.lock().unwrap() = Some(request);
+            Ok(outcome)
+        }
+    }
+
+    #[tokio::test]
+    async fn spawns_child_one_level_below_the_caller() {
+        let spawner = CapturingSpawner::new();
+        let ctx = ToolContext::default()
+            .with_task_spawner(Arc::clone(&spawner) as Arc<dyn TaskSpawner>)
+            .with_task_depth(1);
+
+        TaskTool
+            .execute(
+                &ctx,
+                json!({ "prompt": "investigate" }),
+                ToolCancellationToken::new(),
+            )
+            .await
+            .expect("task should execute");
+
+        assert_eq!(spawner.captured().depth, 2);
+    }
+
+    #[tokio::test]
+    async fn denies_task_to_a_caller_at_max_depth() {
+        let spawner = CapturingSpawner::new();
+        let ctx = ToolContext::default()
+            .with_task_spawner(Arc::clone(&spawner) as Arc<dyn TaskSpawner>)
+            .with_task_depth(MAX_TASK_DEPTH);
+
+        let error = TaskTool
+            .execute(
+                &ctx,
+                json!({ "prompt": "delegate again" }),
+                ToolCancellationToken::new(),
+            )
+            .await
+            .expect_err("a subagent at max depth must not spawn further subagents");
+
+        assert!(error.message().contains("depth"));
+        // The depth gate must trip before the spawner is ever consulted.
+        assert!(spawner.seen.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -392,11 +497,13 @@ mod tests {
         let first = spawner
             .spawn(TaskSpawnRequest {
                 prompt: "investigate the logs".to_string(),
+                depth: 1,
             })
             .expect("first child should spawn");
         let second = spawner
             .spawn(TaskSpawnRequest {
                 prompt: "investigate the config".to_string(),
+                depth: 1,
             })
             .expect("second child should spawn");
 
