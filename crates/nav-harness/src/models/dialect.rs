@@ -222,7 +222,10 @@ fn extract_anthropic_turn(response: &Value) -> ExtractedTurn {
 
 fn anthropic_tool_use(block: &Value) -> Option<ExtractedToolCall> {
     let provider_id = block.get("id").and_then(Value::as_str)?;
-    let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let arguments = block
         .get("input")
         .map(stringify_arguments)
@@ -290,7 +293,10 @@ fn responses_function_call(item: &Value) -> Option<ExtractedToolCall> {
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(ToOwned::to_owned)
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn stringify_arguments(value: &Value) -> String {
@@ -366,24 +372,36 @@ mod tests {
     #[test]
     fn dispatches_anthropic_messages() {
         let turns = vec![ModelTurn::user_text("hello")];
-        let encoded =
-            encode_request(ApiKind::AnthropicMessages, &turns, &registry(), ToolPreset::Coding);
+        let encoded = encode_request(
+            ApiKind::AnthropicMessages,
+            &turns,
+            &registry(),
+            ToolPreset::Coding,
+        );
         assert!(matches!(encoded, EncodedRequest::Anthropic(_)));
     }
 
     #[test]
     fn dispatches_openai_responses() {
         let turns = vec![ModelTurn::user_text("hello")];
-        let encoded =
-            encode_request(ApiKind::OpenAiResponses, &turns, &registry(), ToolPreset::Coding);
+        let encoded = encode_request(
+            ApiKind::OpenAiResponses,
+            &turns,
+            &registry(),
+            ToolPreset::Coding,
+        );
         assert!(matches!(encoded, EncodedRequest::Responses(_)));
     }
 
     #[test]
     fn dispatches_chat_completions() {
         let turns = vec![ModelTurn::user_text("hello")];
-        let encoded =
-            encode_request(ApiKind::OpenAiCompletions, &turns, &registry(), ToolPreset::Coding);
+        let encoded = encode_request(
+            ApiKind::OpenAiCompletions,
+            &turns,
+            &registry(),
+            ToolPreset::Coding,
+        );
         assert!(matches!(encoded, EncodedRequest::Completions(_)));
     }
 

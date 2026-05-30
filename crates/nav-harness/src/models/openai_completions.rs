@@ -539,8 +539,13 @@ impl OpenAiCompletionsResponseParser {
         parse_stream_event(event, api_key)
     }
 
-    pub fn parse_error_response(status: u16, body: &str, api_key: &str) -> OpenAiCompletionsError {
-        parse_error_response(status, body, api_key)
+    pub fn parse_error_response(
+        api: ApiKind,
+        status: u16,
+        body: &str,
+        api_key: &str,
+    ) -> OpenAiCompletionsError {
+        parse_error_response(api, status, body, api_key)
     }
 }
 
@@ -696,23 +701,26 @@ impl OpenAiCompletionsClient {
         };
 
         let exchange = async {
-            let response = builder
-                .send()
-                .await
-                .map_err(|error| OpenAiCompletionsError::Transport {
-                    message: redact_secret(&error.to_string(), api_key),
-                })?;
+            let response =
+                builder
+                    .send()
+                    .await
+                    .map_err(|error| OpenAiCompletionsError::Transport {
+                        message: redact_secret(&error.to_string(), api_key),
+                    })?;
 
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .map_err(|error| OpenAiCompletionsError::Transport {
-                    message: redact_secret(&error.to_string(), api_key),
-                })?;
+            let body =
+                response
+                    .text()
+                    .await
+                    .map_err(|error| OpenAiCompletionsError::Transport {
+                        message: redact_secret(&error.to_string(), api_key),
+                    })?;
 
             if !status.is_success() {
                 return Err(OpenAiCompletionsResponseParser::parse_error_response(
+                    model.api,
                     status.as_u16(),
                     &body,
                     api_key,
@@ -764,6 +772,7 @@ impl OpenAiCompletionsClient {
 
         if !status.is_success() {
             return Err(OpenAiCompletionsResponseParser::parse_error_response(
+                model.api,
                 status.as_u16(),
                 &body,
                 api_key,
@@ -826,6 +835,7 @@ impl OpenAiCompletionsClient {
                         message: redact_secret(&error.to_string(), api_key),
                     })?;
             return Err(OpenAiCompletionsResponseParser::parse_error_response(
+                model.api,
                 status.as_u16(),
                 &body,
                 api_key,
@@ -1259,12 +1269,15 @@ fn routing_value(routing: &ProviderRoutingCompat) -> Option<Value> {
     (!value.is_empty()).then_some(Value::Object(value))
 }
 
-fn parse_error_response(status: u16, body: &str, api_key: &str) -> OpenAiCompletionsError {
+fn parse_error_response(
+    api: ApiKind,
+    status: u16,
+    body: &str,
+    api_key: &str,
+) -> OpenAiCompletionsError {
     let redacted_body = redact_secret(body, api_key);
 
-    if let Some(context_limit) =
-        classify_context_limit(ApiKind::OpenAiCompletions, status, &redacted_body)
-    {
+    if let Some(context_limit) = classify_context_limit(api, status, &redacted_body) {
         return OpenAiCompletionsError::ContextLimit(context_limit);
     }
 
@@ -1400,7 +1413,9 @@ fn redact_secret(value: &str, secret: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ApiKeyConfig, ModelConfig, ProviderCompat, ProviderConfig, resolver::ResolvedApiKey};
+    use crate::models::{
+        ApiKeyConfig, ModelConfig, ProviderCompat, ProviderConfig, resolver::ResolvedApiKey,
+    };
 
     fn resolved_model() -> ResolvedModelConfig {
         ResolvedModelConfig {

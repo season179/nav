@@ -16,7 +16,8 @@ use nav_harness::agents::{RunLoop, RunLoopRequest, RunLoopResult};
 use nav_harness::events::HarnessEventIdSource;
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelRef, ModelResolver, ModelSettings,
-    OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, ProviderConfig, ResolvedModelConfig,
+    OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, ProviderConfig,
+    ResolvedModelConfig,
 };
 use nav_harness::sessions::{ModelTurn, ModelTurnRole, SessionStore};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};

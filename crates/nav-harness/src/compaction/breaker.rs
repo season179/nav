@@ -98,8 +98,7 @@ pub const COMPACTION_BREAKER_WARNING: &str =
 pub const TRANSIENT_COOLDOWN_DURATION: Duration = Duration::from_secs(600);
 
 /// Warning surfaced when a transient cooldown is active.
-pub const TRANSIENT_COOLDOWN_WARNING: &str =
-    "Auto-compaction temporarily paused due to provider rate-limit or server error. \
+pub const TRANSIENT_COOLDOWN_WARNING: &str = "Auto-compaction temporarily paused due to provider rate-limit or server error. \
      Will retry shortly.";
 
 /// What recording a failure did to the breaker.

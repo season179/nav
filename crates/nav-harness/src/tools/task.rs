@@ -168,7 +168,11 @@ impl NavTool for TaskTool {
     }
 }
 
-fn execute_task(ctx: &ToolContext, args: Value, cancel: ToolCancellationToken) -> super::ToolResult {
+fn execute_task(
+    ctx: &ToolContext,
+    args: Value,
+    cancel: ToolCancellationToken,
+) -> super::ToolResult {
     if cancel.is_cancelled() {
         return Err(ToolError::new("tool call cancelled"));
     }
@@ -254,7 +258,11 @@ mod tests {
             .await
             .expect("task should execute");
 
-        assert!(output.content.contains("Found missing database url in config"));
+        assert!(
+            output
+                .content
+                .contains("Found missing database url in config")
+        );
         assert_eq!(output.content.matches("<task_result>").count(), 1);
         assert_eq!(output.content.matches("</task_result>").count(), 1);
     }

@@ -120,8 +120,12 @@ impl RunLoop {
                 }
                 project_model_turns_for_tool_result_pruning(&mut turns);
             }
-            let encoded =
-                encode_request(model.api, &turns, request.tool_registry, request.tool_preset);
+            let encoded = encode_request(
+                model.api,
+                &turns,
+                request.tool_registry,
+                request.tool_preset,
+            );
             if let Some(journal) = journal {
                 if let Err(error) = self.journal_request_payload(
                     journal,
@@ -481,8 +485,8 @@ impl RunLoop {
                     emit,
                 })
             }
-            EncodedRequest::Responses(_) | EncodedRequest::Anthropic(_) => self
-                .fetch_dialect_turn(FetchDialectTurnRequest {
+            EncodedRequest::Responses(_) | EncodedRequest::Anthropic(_) => {
+                self.fetch_dialect_turn(FetchDialectTurnRequest {
                     runtime,
                     model,
                     encoded,
@@ -490,7 +494,8 @@ impl RunLoop {
                     output_context,
                     ids,
                     emit,
-                }),
+                })
+            }
         }
     }
 

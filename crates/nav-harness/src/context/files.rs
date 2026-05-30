@@ -187,10 +187,7 @@ mod tests {
         let mut cache = ContextFileCache::with_reader(PathBuf::from("/proj"), reader);
         let content = cache.load();
 
-        assert_eq!(
-            content,
-            "Use conventional commits.\nNo force-push.\n"
-        );
+        assert_eq!(content, "Use conventional commits.\nNo force-push.\n");
     }
 
     #[test]
@@ -237,7 +234,10 @@ mod tests {
 
         let mut cache = ContextFileCache::with_reader(PathBuf::from("/proj"), reader);
         let content = cache.load();
-        assert!(content.ends_with('\n'), "must append trailing newline: {content:?}");
+        assert!(
+            content.ends_with('\n'),
+            "must append trailing newline: {content:?}"
+        );
     }
 
     #[test]

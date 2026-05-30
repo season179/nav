@@ -3633,7 +3633,8 @@ mod tests {
     fn append_turn_denormalizes_model_id_into_its_own_column() {
         let db = TempDb::new("turn-model-id");
         let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
-        let session_id = nav_types::SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000001");
+        let session_id =
+            nav_types::SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000001");
         let run_id = nav_types::RunId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000002");
         insert_test_session(&store, &session_id);
         store
