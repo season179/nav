@@ -16,7 +16,7 @@ use crate::compaction::breaker::{
     AntiThrashingBreaker, AutoCompactionDecision, CompactionFailureBreaker, savings_ratio,
 };
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
-use crate::compaction::summary::CompactionSummaryAgent;
+use crate::compaction::summary::{CompactionSummaryAgent, CompactionSummaryRequest};
 use crate::context::{
     ContextBudget, ContextReminders, DEFAULT_COMPLETION_BUFFER_TOKENS,
     estimate_tokens_for_model_turns, truncate_model_turns,
@@ -512,7 +512,12 @@ impl RunLoop {
             {
                 proactive_compaction_attempted = true;
                 let tokens_before_compaction = estimate_model_turn_tokens(&turns);
-                match self.compact_for_budget(journal, model, tokens_before_compaction) {
+                match self.compact_for_budget(
+                    journal,
+                    model,
+                    request.compaction_model_resolver,
+                    tokens_before_compaction,
+                ) {
                     Ok(compacted_turns) => {
                         turns = compacted_turns;
                         reload_store_turns = true;
@@ -550,7 +555,12 @@ impl RunLoop {
             {
                 proactive_compaction_attempted = true;
                 let tokens_before_compaction = estimate_model_turn_tokens(&turns);
-                match self.compact_for_budget(journal, model, tokens_before_compaction) {
+                match self.compact_for_budget(
+                    journal,
+                    model,
+                    request.compaction_model_resolver,
+                    tokens_before_compaction,
+                ) {
                     Ok(compacted_turns) => {
                         turns = compacted_turns;
                         reload_store_turns = true;
@@ -794,31 +804,12 @@ impl RunLoop {
             .unwrap()
             .compaction_summary_request(session_id, CompactionConfig::default())
             .map_err(persistence_error)?;
-        let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
-        let compaction_model_override = match compaction_model_resolver {
-            Some(resolver) => match resolver.resolve_compaction_model_override() {
-                Ok(model) => model,
-                Err(error) => {
-                    let error = OpenAiCompletionsError::from(error);
-                    self.record_compaction_error(session_id, &error);
-                    return Err(error);
-                }
-            },
-            None => None,
-        };
-        let summary_result = match compaction_model_override {
-            Some(ref summary_model) => {
-                summary_agent.generate_stripped(summary_model, &summary_request)
-            }
-            None => summary_agent.generate(model, &summary_request),
-        };
-        let summary = match summary_result {
-            Ok(summary) => summary,
-            Err(error) => {
-                self.record_compaction_error(session_id, &error);
-                return Err(error);
-            }
-        };
+        let summary = self.generate_compaction_summary(
+            session_id,
+            model,
+            compaction_model_resolver,
+            &summary_request,
+        )?;
 
         {
             let store = journal.store.lock().unwrap();
@@ -854,10 +845,46 @@ impl RunLoop {
         Ok(recovered_turns)
     }
 
+    fn generate_compaction_summary(
+        &self,
+        session_id: &SessionId,
+        model: &ResolvedModelConfig,
+        compaction_model_resolver: Option<&ModelResolver>,
+        summary_request: &CompactionSummaryRequest,
+    ) -> Result<String, OpenAiCompletionsError> {
+        let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
+        let compaction_model_override = match compaction_model_resolver {
+            Some(resolver) => match resolver.resolve_compaction_model_override() {
+                Ok(model) => model,
+                Err(error) => {
+                    let error = OpenAiCompletionsError::from(error);
+                    self.record_compaction_error(session_id, &error);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        let summary_result = match compaction_model_override {
+            Some(ref summary_model) => {
+                summary_agent.generate_stripped(summary_model, summary_request)
+            }
+            None => summary_agent.generate(model, summary_request),
+        };
+
+        match summary_result {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                self.record_compaction_error(session_id, &error);
+                Err(error)
+            }
+        }
+    }
+
     fn compact_for_budget(
         &self,
         journal: ProviderJournal<'_>,
         model: &ResolvedModelConfig,
+        compaction_model_resolver: Option<&ModelResolver>,
         tokens_before_compaction: usize,
     ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
         let session_id = journal.session_id;
@@ -868,14 +895,12 @@ impl RunLoop {
             .unwrap()
             .compaction_summary_request(session_id, CompactionConfig::default())
             .map_err(persistence_error)?;
-        let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
-        let summary = match summary_agent.generate(model, &summary_request) {
-            Ok(summary) => summary,
-            Err(error) => {
-                self.record_compaction_error(session_id, &error);
-                return Err(error);
-            }
-        };
+        let summary = self.generate_compaction_summary(
+            session_id,
+            model,
+            compaction_model_resolver,
+            &summary_request,
+        )?;
 
         {
             let store = journal.store.lock().unwrap();
