@@ -553,11 +553,12 @@ impl SessionStore {
             return Ok(());
         };
         let summary_index = marker_index.saturating_add(1);
+        let mut parts_to_remove: Vec<(MessageId, PartId)> = Vec::new();
 
         for index in [marker_index, summary_index] {
             if let Some((turn, parts)) = page.get(index) {
                 for part in parts {
-                    self.sqlite.remove_part(&turn.id, &part.id)?;
+                    parts_to_remove.push((turn.id.clone(), part.id.clone()));
                 }
             }
         }
@@ -568,9 +569,11 @@ impl SessionStore {
         {
             let (turn, parts) = stored_turn;
             for part in parts {
-                self.sqlite.remove_part(&turn.id, &part.id)?;
+                parts_to_remove.push((turn.id.clone(), part.id.clone()));
             }
         }
+
+        self.sqlite.remove_parts(&parts_to_remove)?;
 
         Ok(())
     }

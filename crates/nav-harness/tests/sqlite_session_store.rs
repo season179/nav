@@ -776,6 +776,60 @@ fn remove_part_deletes_only_the_target_part() {
 }
 
 #[test]
+fn remove_parts_does_not_partially_delete_when_any_target_is_missing() {
+    let db = TempDb::new("turn-parts-remove-atomic");
+    let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+    let session_id = session_id("019e7000-0000-7000-8000-000000000375");
+    let run_id = run_id("019e7000-0000-7000-8000-000000000376");
+    let turn_id = message_id("019e7000-0000-7000-8000-000000000377");
+    start_minimal_run(&store, session_id, run_id.clone());
+
+    store
+        .append_turn(
+            Turn {
+                id: turn_id.clone(),
+                run_id: run_id.clone(),
+                seq: 0,
+                role: TurnRole::Assistant,
+                meta: TurnMeta::default(),
+                created_at: 7_301,
+            },
+            vec![
+                text_part("keep because batch fails"),
+                text_part("also keep"),
+            ],
+        )
+        .expect("turn append should commit");
+    let parts = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable")[0]
+        .1
+        .clone();
+    let missing_part_id = PartId::new_unchecked("prt_0000018bcfe56800_000000000000beef");
+
+    let err = store
+        .remove_parts(&[
+            (turn_id.clone(), parts[0].id.clone()),
+            (turn_id.clone(), missing_part_id.clone()),
+        ])
+        .expect_err("missing part should fail the batch");
+
+    assert_eq!(
+        err,
+        SqliteStoreError::NotFound {
+            entity: "turn_part",
+            id: missing_part_id.to_string(),
+        }
+    );
+    let turns = store
+        .list_turns_for_run(&run_id)
+        .expect("turns should be readable after failed batch");
+    assert_eq!(turns[0].1.len(), 2);
+    assert_eq!(turns[0].1[0].part, text_part("keep because batch fails"));
+    assert_eq!(turns[0].1[1].part, text_part("also keep"));
+}
+
+#[test]
 fn sessions_can_be_created_read_and_settings_updated() {
     let db = TempDb::new("session-crud");
     let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
