@@ -3,14 +3,19 @@
 use std::collections::BTreeSet;
 
 use crate::models::{
-    ChatCompletionRequestMessage, OpenAiCompletionsClient, OpenAiCompletionsError,
-    OpenAiCompletionsRequest, ResolvedModelConfig,
+    ChatCompletionRequestMessage, ChatCompletionResponse, OpenAiCompletionsClient,
+    OpenAiCompletionsError, OpenAiCompletionsRequest, ResolvedModelConfig,
 };
 use crate::sessions::{ModelTurn, ModelTurnRole, TurnPart};
 use nav_types::MessageId;
 
 const SUMMARY_MAX_TOKENS: u32 = 1_200;
 const SUMMARY_TEMPERATURE: f64 = 0.2;
+
+/// Maximum number of drop-oldest retries after the compaction call itself
+/// overflows the provider's context window. Bounds the PTL (Prompt Too Long)
+/// retry loop so one oversized session can never spin forever.
+const MAX_PTL_RETRIES: usize = 3;
 
 const SYSTEM_PROMPT: &str = r#"You are nav's compaction agent.
 
@@ -76,30 +81,73 @@ impl CompactionSummaryAgent {
         model: &ResolvedModelConfig,
         request: &CompactionSummaryRequest,
     ) -> Result<String, OpenAiCompletionsError> {
-        let completion_request = build_compaction_summary_request(request);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| OpenAiCompletionsError::Transport {
                 message: format!("failed to build compaction runtime: {error}"),
             })?;
-        let response = runtime.block_on(self.client.complete(model, &completion_request))?;
-        let summary = response
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.clone())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
 
-        if summary.is_empty() {
-            return Err(OpenAiCompletionsError::MalformedResponse {
-                message: "summary response did not include assistant text".to_string(),
-            });
+        // PTL (Prompt Too Long) retry: if the compaction call itself overflows
+        // the context window, drop the oldest head turns and retry with a
+        // smaller prompt, up to MAX_PTL_RETRIES times.
+        let mut head_turns = request.head_turns.as_slice();
+        let mut retries_left = MAX_PTL_RETRIES;
+        loop {
+            let attempt = CompactionSummaryRequest {
+                previous_summary: request.previous_summary.clone(),
+                head_turns: head_turns.to_vec(),
+                tail_start_id: request.tail_start_id.clone(),
+            };
+            let completion_request = build_compaction_summary_request(&attempt);
+
+            match runtime.block_on(self.client.complete(model, &completion_request)) {
+                Ok(response) => return summary_from_response(response),
+                Err(OpenAiCompletionsError::ContextLimit(error)) => {
+                    let smaller = drop_oldest_head_turns(head_turns);
+                    if retries_left == 0 || smaller.len() == head_turns.len() {
+                        return Err(OpenAiCompletionsError::ContextLimit(error));
+                    }
+                    head_turns = smaller;
+                    retries_left -= 1;
+                }
+                Err(other) => return Err(other),
+            }
         }
-
-        Ok(summary)
     }
+}
+
+fn summary_from_response(
+    response: ChatCompletionResponse,
+) -> Result<String, OpenAiCompletionsError> {
+    let summary = response
+        .choices
+        .first()
+        .and_then(|choice| choice.message.content.clone())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if summary.is_empty() {
+        return Err(OpenAiCompletionsError::MalformedResponse {
+            message: "summary response did not include assistant text".to_string(),
+        });
+    }
+
+    Ok(summary)
+}
+
+/// Drop the oldest head turns ahead of a PTL retry, removing the front half so
+/// each retry meaningfully shrinks the prompt. Returns the slice unchanged once
+/// a single turn remains: dropping it would summarize no head content at all and
+/// silently lose the last unsummarized turn, so the caller surfaces
+/// `ContextLimit` instead and lets terminal fallback handle it.
+fn drop_oldest_head_turns(turns: &[ModelTurn]) -> &[ModelTurn] {
+    if turns.len() <= 1 {
+        return turns;
+    }
+    let drop = turns.len() / 2;
+    &turns[drop..]
 }
 
 pub fn build_compaction_summary_request(
