@@ -5,6 +5,7 @@ use serde_json::Value;
 pub mod methods {
     pub const INITIALIZE: &str = "initialize";
     pub const SESSION_CREATE: &str = "session.create";
+    pub const SESSION_UPDATE_SETTINGS: &str = "session.updateSettings";
     pub const SESSION_SEND_MESSAGE: &str = "session.sendMessage";
     pub const SESSION_SEARCH: &str = "session.search";
     pub const SESSION_TOTALS: &str = "session.totals";
@@ -142,6 +143,22 @@ pub enum SessionSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionCreateResult {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUpdateSettingsParams {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_json: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_preset: Option<ToolsPreset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUpdateSettingsResult {
     pub session_id: SessionId,
 }
 

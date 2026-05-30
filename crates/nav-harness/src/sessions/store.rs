@@ -34,7 +34,8 @@ use super::canonical::{
 };
 use super::sqlite::{
     Artifact, CreateSession, NewArtifact, NewProviderPayload, ProviderState, RevertInfo, RunStatus,
-    SqliteSessionStore, SqliteStoreError, StartRun, StoredPart, StoredTurn, TurnPartSearchHit,
+    SessionSettings, SqliteSessionStore, SqliteStoreError, StartRun, StoredPart, StoredTurn,
+    TurnPartSearchHit,
 };
 
 pub(crate) const OPENAI_CHAT_COMPLETIONS_DECODER_VERSION: &str =
@@ -316,6 +317,14 @@ impl SessionStore {
         title: &str,
     ) -> Result<(), SqliteStoreError> {
         self.sqlite.update_session_title(session_id, title)
+    }
+
+    pub fn update_session_settings(
+        &self,
+        session_id: &SessionId,
+        settings: SessionSettings,
+    ) -> Result<(), SqliteStoreError> {
+        self.sqlite.update_session_settings(session_id, settings)
     }
 
     pub fn update_session_revert(
@@ -727,13 +736,32 @@ impl SessionStore {
         &self,
         id: &ProviderPayloadId,
     ) -> Result<Option<MessageId>, SqliteStoreError> {
-        self.decode_and_append_provider_payload_with_decoders(id, DEFAULT_PAYLOAD_DECODERS)
+        self.decode_and_append_provider_payload_with_decoders(id, DEFAULT_PAYLOAD_DECODERS, None)
+    }
+
+    /// Decode a journaled provider payload and persist provider state with it.
+    ///
+    /// Prefer this variant when the caller has provider-specific state to save,
+    /// such as an OpenAI Responses `previous_response_id`. `id` selects the
+    /// payload to decode, and `provider_state` is written in the same append
+    /// path used by the default payload decoders.
+    pub fn decode_and_append_provider_payload_with_provider_state(
+        &self,
+        id: &ProviderPayloadId,
+        provider_state: Option<&ProviderState>,
+    ) -> Result<Option<MessageId>, SqliteStoreError> {
+        self.decode_and_append_provider_payload_with_decoders(
+            id,
+            DEFAULT_PAYLOAD_DECODERS,
+            provider_state,
+        )
     }
 
     fn decode_and_append_provider_payload_with_decoders(
         &self,
         id: &ProviderPayloadId,
         decoders: &[PayloadDecoder],
+        provider_state: Option<&ProviderState>,
     ) -> Result<Option<MessageId>, SqliteStoreError> {
         let payload = self.sqlite.get_provider_payload(id)?;
         let Some(decoder) = decoder_for_api_kind(decoders, payload.api_kind.as_str()) else {
@@ -758,7 +786,12 @@ impl SessionStore {
             .map(|turn| turn.turn.id.clone());
 
         self.sqlite
-            .append_decoded_provider_payload(id, decoder.version, &decoded)?;
+            .append_decoded_provider_payload_with_provider_state(
+                id,
+                decoder.version,
+                &decoded,
+                provider_state,
+            )?;
         Ok(assistant_message_id)
     }
 
@@ -2808,8 +2841,11 @@ mod tests {
 
         // The live run path must surface a decoder panic as an error rather than
         // unwinding the run loop.
-        let result =
-            store.decode_and_append_provider_payload_with_decoders(&payload_id, &[panic_decoder]);
+        let result = store.decode_and_append_provider_payload_with_decoders(
+            &payload_id,
+            &[panic_decoder],
+            None,
+        );
 
         let error = result.expect_err("a panicking decoder should produce an error, not unwind");
         assert!(

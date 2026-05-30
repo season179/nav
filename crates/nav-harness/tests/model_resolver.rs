@@ -128,6 +128,18 @@ fn reports_missing_api_key_for_explicit_env_var_config() {
 }
 
 #[test]
+fn resolves_api_kind_without_resolving_api_key() {
+    let env_var = "NAV_COMPATIBLE_API_KEY";
+    let api_kind = ModelResolver::new(compatible_settings(ApiKeyConfig::EnvVar {
+        env_var: env_var.to_string(),
+    }))
+    .resolve_api_kind("compatible-gateway", "vendor/model-large")
+    .expect("api kind lookup should not require credentials");
+
+    assert_eq!(api_kind, ApiKind::OpenAiCompletions);
+}
+
+#[test]
 fn resolves_explicit_inline_api_key() {
     let resolved = ModelResolver::new(compatible_settings(ApiKeyConfig::Inline {
         inline: "sk-inline".to_string(),

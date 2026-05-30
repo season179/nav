@@ -423,6 +423,39 @@ fn session_create_rejects_invalid_tools_preset() {
 }
 
 #[test]
+fn session_create_rejects_invalid_model_ref() {
+    let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
+
+    let create_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(106),
+            "method": "session.create",
+            "params": {
+                "settingsJson": {
+                    "modelRef": {
+                        "provider": "missing-provider",
+                        "model": "vendor/model-large"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ));
+
+    assert_eq!(create_response.status(), 200);
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    assert_eq!(create_body["error"]["code"], -32602);
+    assert!(
+        create_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid modelRef")
+    );
+}
+
+#[test]
 fn session_create_keeps_optional_session_metadata_outside_event_log() {
     let mut server = HttpServer::with_model_settings(HttpServerConfig::default(), model_settings());
 
@@ -580,6 +613,215 @@ fn session_send_message_starts_run_and_streams_typed_sse_events() {
         ]
     );
     assert_protocol_event_ids(&replayed_events, session_id);
+}
+
+#[test]
+fn session_send_message_uses_session_model_ref() {
+    let default_provider = successful_provider_with_text("default reply");
+    let selected_provider = successful_provider_with_text("selected reply");
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        two_provider_model_settings(default_provider.base_url(), selected_provider.base_url()),
+    );
+
+    let create_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(103),
+            "method": "session.create",
+            "params": {
+                "settingsJson": {
+                    "modelRef": {
+                        "provider": "selected-gateway",
+                        "model": "vendor/model-small"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ));
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = create_body["result"]["sessionId"]
+        .as_str()
+        .expect("session.create should return a session id")
+        .to_string();
+
+    let run_id = send_message_text(&mut server, &session_id, "use the session model");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+
+    let request = selected_provider.request();
+    assert_eq!(request.body["model"], "vendor/model-small");
+    drop(default_provider);
+}
+
+#[test]
+fn session_update_settings_switches_model_and_drops_provider_state() {
+    let db = TestSessionDb::new("switch-model-drops-provider-state");
+    let responses_provider = FakeProviderServer::start(
+        200,
+        "application/json",
+        vec![json!({
+            "id": "resp_before_switch",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "responses reply", "annotations": []}]
+            }]
+        })
+        .to_string()],
+    );
+    let anthropic_provider = FakeProviderServer::start(
+        200,
+        "application/json",
+        vec![
+            json!({
+                "id": "msg_after_switch",
+                "model": "claude-test",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "anthropic reply"}],
+                "stop_reason": "end_turn"
+            })
+            .to_string(),
+        ],
+    );
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server = HttpServer::with_model_settings(
+        config,
+        switch_model_settings(responses_provider.base_url(), anthropic_provider.base_url()),
+    );
+
+    let create_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(104),
+            "method": "session.create",
+            "params": {
+                "settingsJson": {
+                    "modelRef": {
+                        "provider": "responses-gateway",
+                        "model": "gpt-test"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ));
+    let create_body: Value = serde_json::from_str(create_response.body()).unwrap();
+    let session_id = create_body["result"]["sessionId"]
+        .as_str()
+        .expect("session.create should return a session id")
+        .to_string();
+
+    let first_run_id = send_message_text(&mut server, &session_id, "start on responses");
+    wait_for_run_status(&server, &first_run_id, RunStatus::Completed);
+    assert_eq!(responses_provider.request().path, "/v1/responses");
+
+    let first_store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    let first_state = first_store
+        .get_provider_state(&RunId::try_new(&first_run_id).unwrap())
+        .expect("provider state lookup should succeed")
+        .expect("first run should persist provider state before switching models");
+    assert_eq!(first_state.api_kind, "openai-responses");
+
+    let update_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(105),
+            "method": "session.updateSettings",
+            "params": {
+                "sessionId": session_id,
+                "settingsJson": {
+                    "modelRef": {
+                        "provider": "anthropic-gateway",
+                        "model": "claude-test"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ));
+    let update_body: Value = serde_json::from_str(update_response.body()).unwrap();
+    assert_eq!(update_body["result"]["sessionId"], session_id);
+
+    let second_run_id = send_message_text(&mut server, &session_id, "switch to anthropic");
+    wait_for_run_status(&server, &second_run_id, RunStatus::Completed);
+    let request = anthropic_provider.request();
+    assert_eq!(request.path, "/v1/messages");
+    assert!(request.body.get("previous_response_id").is_none());
+    drop(server);
+
+    let store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    assert!(
+        store
+            .get_provider_state(&RunId::try_new(&first_run_id).unwrap())
+            .expect("provider state lookup should succeed")
+            .is_none()
+    );
+}
+
+#[test]
+fn session_update_settings_rejects_running_session() {
+    let provider = HangingProviderServer::start();
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        two_provider_model_settings(provider.base_url(), unused_local_base_url()),
+    );
+    let session_id = create_session(&mut server);
+    let run_id = send_message_text(&mut server, &session_id, "keep running");
+    let request = provider.wait_for_request();
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        server.run_status(&RunId::try_new(&run_id).unwrap()),
+        Some(RunStatus::Running)
+    );
+
+    let update_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(106),
+            "method": "session.updateSettings",
+            "params": {
+                "sessionId": session_id,
+                "settingsJson": {
+                    "modelRef": {
+                        "provider": "selected-gateway",
+                        "model": "vendor/model-small"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    ));
+    let update_body: Value = serde_json::from_str(update_response.body()).unwrap();
+    assert_eq!(update_body["error"]["code"], -32005);
+    assert!(
+        update_body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("running run")
+    );
+
+    let _ = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(107),
+            "method": "run.cancel",
+            "params": { "runId": run_id }
+        })
+        .to_string(),
+    ));
+    provider.stop();
 }
 
 #[test]
@@ -2747,6 +2989,95 @@ fn model_settings_with_base_url(base_url: String) -> ModelSettings {
         },
     );
 
+    settings
+}
+
+fn two_provider_model_settings(
+    default_base_url: String,
+    selected_base_url: String,
+) -> ModelSettings {
+    let mut settings = model_settings_with_base_url(default_base_url);
+    settings.providers.insert(
+        "selected-gateway".to_string(),
+        ProviderConfig {
+            name: Some("Selected Gateway".to_string()),
+            api: ApiKind::OpenAiCompletions,
+            base_url: selected_base_url,
+            api_key: ApiKeyConfig::Inline {
+                inline: "sk-selected".to_string(),
+            },
+            models: vec![ModelConfig {
+                id: "vendor/model-small".to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: vec![ModelInput::Text],
+                context_window: None,
+                max_tokens: None,
+                compat: ProviderCompat::default(),
+            }],
+            compat: ProviderCompat::default(),
+        },
+    );
+    settings
+}
+
+fn switch_model_settings(responses_base_url: String, anthropic_base_url: String) -> ModelSettings {
+    let mut settings = ModelSettings {
+        default_model: Some(ModelRef {
+            provider: "responses-gateway".to_string(),
+            model: "gpt-test".to_string(),
+        }),
+        ..ModelSettings::default()
+    };
+
+    settings.providers.insert(
+        "responses-gateway".to_string(),
+        ProviderConfig {
+            name: Some("Responses Gateway".to_string()),
+            api: ApiKind::OpenAiResponses,
+            base_url: responses_base_url,
+            api_key: ApiKeyConfig::Inline {
+                inline: "sk-responses".to_string(),
+            },
+            models: vec![ModelConfig {
+                id: "gpt-test".to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: vec![ModelInput::Text],
+                context_window: None,
+                max_tokens: None,
+                compat: ProviderCompat::default(),
+            }],
+            compat: ProviderCompat::default(),
+        },
+    );
+    settings.providers.insert(
+        "anthropic-gateway".to_string(),
+        ProviderConfig {
+            name: Some("Anthropic Gateway".to_string()),
+            api: ApiKind::AnthropicMessages,
+            base_url: anthropic_base_url,
+            api_key: ApiKeyConfig::Inline {
+                inline: "sk-anthropic".to_string(),
+            },
+            models: vec![ModelConfig {
+                id: "claude-test".to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: vec![ModelInput::Text],
+                context_window: None,
+                max_tokens: Some(256),
+                compat: ProviderCompat::default(),
+            }],
+            compat: ProviderCompat::default(),
+        },
+    );
     settings
 }
 
