@@ -42,6 +42,85 @@ const TOOL_OUTPUT_BUFFER: usize = 64;
 /// request, so the run fails instead of looping.
 const MAX_OVERFLOW_ATTEMPTS: usize = 1;
 
+/// How many agent-loop rounds an agent may run before its loop must stop.
+///
+/// Each subagent gets its own budget ([`Default`] = 50 rounds) so a child's
+/// rounds are never drawn from its parent's remaining allowance — the isolation
+/// that makes [`crate::tools::task::MAX_TASK_DEPTH`] necessary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IterationBudget {
+    remaining: u32,
+}
+
+impl IterationBudget {
+    /// Default rounds granted to a freshly spawned subagent.
+    pub const SUBAGENT_DEFAULT: u32 = 50;
+
+    /// Create a budget with `rounds` remaining.
+    pub fn new(rounds: u32) -> Self {
+        Self { remaining: rounds }
+    }
+
+    /// Rounds still available to this agent.
+    pub fn remaining(self) -> u32 {
+        self.remaining
+    }
+
+    /// Whether the budget is spent and the loop must stop.
+    pub fn is_exhausted(self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Spend one round, returning `false` if the budget was already exhausted.
+    pub fn try_consume(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
+impl Default for IterationBudget {
+    fn default() -> Self {
+        Self::new(Self::SUBAGENT_DEFAULT)
+    }
+}
+
+/// The isolated runtime a freshly spawned subagent runs under: its position in
+/// the delegation tree and an independent [`IterationBudget`].
+///
+/// Each child is built with [`IterationBudget::default`] so its rounds are never
+/// drawn from its parent's remaining allowance. The child's tool pool is shaped
+/// by its [`depth`](Self::depth): the `task` tool is depth-gated, so a child at
+/// [`crate::tools::task::MAX_TASK_DEPTH`] cannot delegate further.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubagentRuntime {
+    depth: u32,
+    iteration_budget: IterationBudget,
+}
+
+impl SubagentRuntime {
+    /// Build the runtime for a child at `depth`, granting it a fresh default
+    /// iteration budget.
+    pub fn for_depth(depth: u32) -> Self {
+        Self {
+            depth,
+            iteration_budget: IterationBudget::default(),
+        }
+    }
+
+    /// This child's depth in the delegation tree (root agent = 0).
+    pub fn depth(self) -> u32 {
+        self.depth
+    }
+
+    /// The child's own iteration budget, independent of its parent's.
+    pub fn iteration_budget(self) -> IterationBudget {
+        self.iteration_budget
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AgentCatalog;
 
@@ -3408,5 +3487,50 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn iteration_budget_defaults_to_fifty_independent_rounds() {
+        let mut first = IterationBudget::default();
+        let second = IterationBudget::default();
+
+        assert_eq!(first.remaining(), 50);
+        assert_eq!(second.remaining(), 50);
+
+        // Consuming one budget must not touch another: each subagent's budget is
+        // its own.
+        assert!(first.try_consume());
+        assert_eq!(first.remaining(), 49);
+        assert_eq!(second.remaining(), 50);
+    }
+
+    #[test]
+    fn iteration_budget_refuses_to_consume_past_exhaustion() {
+        let mut budget = IterationBudget::new(2);
+
+        assert!(!budget.is_exhausted());
+        assert!(budget.try_consume());
+        assert!(budget.try_consume());
+
+        assert!(budget.is_exhausted());
+        assert!(!budget.try_consume());
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn each_child_runtime_gets_its_own_default_budget() {
+        let first = SubagentRuntime::for_depth(1);
+        let second = SubagentRuntime::for_depth(3);
+
+        assert_eq!(first.depth(), 1);
+        assert_eq!(second.depth(), 3);
+        assert_eq!(
+            first.iteration_budget().remaining(),
+            IterationBudget::SUBAGENT_DEFAULT
+        );
+        assert_eq!(
+            second.iteration_budget().remaining(),
+            IterationBudget::SUBAGENT_DEFAULT
+        );
     }
 }

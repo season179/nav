@@ -79,6 +79,9 @@ pub struct ToolContext {
     output_sink: Option<ToolOutputSink>,
     workspace_mutation_recorder: Option<WorkspaceMutationRecorder>,
     task_spawner: Option<Arc<dyn task::TaskSpawner>>,
+    /// Recursion depth of the agent running these tools (root agent = 0). The
+    /// `task` tool reads it to bound subagent delegation; see [`task`].
+    task_depth: u32,
 }
 
 impl ToolContext {
@@ -89,6 +92,7 @@ impl ToolContext {
             output_sink: None,
             workspace_mutation_recorder: None,
             task_spawner: None,
+            task_depth: 0,
         }
     }
 
@@ -112,6 +116,12 @@ impl ToolContext {
         self
     }
 
+    /// Set the recursion depth of the agent that will run these tools.
+    pub fn with_task_depth(mut self, task_depth: u32) -> Self {
+        self.task_depth = task_depth;
+        self
+    }
+
     pub fn path_policy(&self) -> Option<&WorkspacePathPolicy> {
         self.path_policy.as_ref()
     }
@@ -126,6 +136,11 @@ impl ToolContext {
 
     pub fn task_spawner(&self) -> Option<&dyn task::TaskSpawner> {
         self.task_spawner.as_deref()
+    }
+
+    /// Recursion depth of the agent running these tools (root agent = 0).
+    pub fn task_depth(&self) -> u32 {
+        self.task_depth
     }
 
     pub fn capture_pre_workspace_mutation(&self, path: &Path) -> Result<(), ToolError> {
