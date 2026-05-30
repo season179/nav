@@ -1173,6 +1173,7 @@ fn run_loop_once_collecting_events(
             tool_context: &context,
             session_store: Some(store),
             pending_confirmations: None,
+            compaction_model_resolver: None,
             cancellation_token: OpenAiCompletionsCancellationToken::new(),
         },
         &mut ids,
@@ -1227,6 +1228,7 @@ fn run_loop_with_token_and_registry(
             tool_context: &context,
             session_store: Some(store),
             pending_confirmations: None,
+            compaction_model_resolver: None,
             cancellation_token,
         },
         &mut ids,
@@ -1471,6 +1473,7 @@ fn resolved_model_with_window(
             model: model_id.to_string(),
         }),
         providers,
+        ..ModelSettings::default()
     })
     .resolve_default()
     .unwrap()

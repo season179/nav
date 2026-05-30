@@ -9,7 +9,15 @@ use super::ProviderConfig;
 pub struct ModelSettings {
     #[serde(rename = "defaultModel", alias = "default_model")]
     pub default_model: Option<ModelRef>,
+    pub compaction: CompactionSettings,
     pub providers: BTreeMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionSettings {
+    #[serde(rename = "model_override", alias = "modelOverride")]
+    pub model_override: Option<ModelRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -99,7 +99,6 @@ impl ModelRunService {
                 return RunStatus::Failed;
             }
         };
-
         let mut stream_ids = SharedProtocolIdSource {
             ids: Arc::clone(&state.ids),
         };
@@ -116,6 +115,7 @@ impl ModelRunService {
                 tool_context: request.tool_context,
                 session_store: Some(&state.session_store),
                 pending_confirmations: Some(&state.pending_confirmations),
+                compaction_model_resolver: Some(resolver),
                 cancellation_token,
             },
             &mut stream_ids,

@@ -15,7 +15,7 @@ use nav_harness::models::{
     OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, ProviderConfig,
     ResolvedModelConfig,
 };
-use nav_harness::sessions::{ModelTurn, ModelTurnRole, SessionStore};
+use nav_harness::sessions::{ModelTurn, ModelTurnRole, SessionStore, TurnPart};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};
 use nav_types::{ApprovalId, EventId, MessageId, RunId, SessionId, ToolCallId};
 
@@ -152,6 +152,161 @@ fn overflow_error_triggers_compaction_and_completes_on_retry() {
             .iter()
             .any(|turn| turn.text_content().contains("Finish the overflow handler")),
         "the compaction summary should remain in the replay window"
+    );
+
+    let request_bodies = server.requests();
+    assert_eq!(request_bodies.len(), 3);
+    assert!(
+        request_bodies[1].contains("\"model\":\"overflow-model\""),
+        "without an override, the summary request should use the session model:\n{}",
+        request_bodies[1]
+    );
+}
+
+#[test]
+fn overflow_compaction_uses_model_override_when_configured() {
+    let session_server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_stream_completion("Done."),
+    ]);
+    let summary_server =
+        FakeProviderServer::start(vec![canned_summary(&valid_summary("Use cheaper summary."))]);
+    let oversized_result = "x".repeat(6_000);
+    let store = oversize_session_with_strippable_summary_payload(&oversized_result);
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let trigger_id = message_id(99);
+
+    let session_model = resolved_model_with_id(session_server.base_url(), "session-model");
+    let summary_model_resolver =
+        compaction_override_resolver(summary_server.base_url(), "summary-model");
+    let store = Arc::new(Mutex::new(store));
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+
+    let result = run_overflow_loop_with_override(
+        &session_model,
+        Some(&summary_model_resolver),
+        &store,
+        &session_id,
+        &run_id,
+        &trigger_id,
+        &turns,
+    );
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "overflow recovery should complete with an override model, got {result:?}"
+    );
+    assert_eq!(
+        session_server.handled(),
+        2,
+        "session model should only receive the failed request and retry"
+    );
+    assert_eq!(
+        summary_server.handled(),
+        1,
+        "override model should receive the compaction summary request"
+    );
+
+    let summary_bodies = summary_server.requests();
+    assert_eq!(summary_bodies.len(), 1);
+    assert!(
+        summary_bodies[0].contains("\"model\":\"summary-model\""),
+        "summary request should target override model but was:\n{}",
+        summary_bodies[0]
+    );
+    assert!(
+        !summary_bodies[0].contains("[image elided]"),
+        "override summary request should strip image placeholders:\n{}",
+        summary_bodies[0]
+    );
+    assert!(
+        !summary_bodies[0].contains(&oversized_result),
+        "override summary request should truncate oversized tool results"
+    );
+}
+
+#[test]
+fn override_resolution_failures_trip_failure_breaker() {
+    let server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_context_limit(),
+        canned_context_limit(),
+        canned_context_limit(),
+    ]);
+    let store = Arc::new(Mutex::new(oversize_session()));
+    let session_id = session_id();
+    let model = resolved_model(server.base_url());
+    let summary_model_resolver = missing_key_compaction_override_resolver("summary-model");
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+
+    for attempt in 1..=3 {
+        let run_id = run_id(attempt + 1);
+        let trigger_id = message_id(180 + attempt);
+        append_user_turn_for_run(
+            &store,
+            &session_id,
+            &run_id,
+            trigger_id.clone(),
+            &format!("override resolver failure {attempt}"),
+        );
+        let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+        let result = run_overflow_loop_with_resolver(
+            &run_loop,
+            &model,
+            Some(&summary_model_resolver),
+            &store,
+            &session_id,
+            (&run_id, &trigger_id),
+            &turns,
+        );
+
+        assert!(
+            matches!(
+                result,
+                RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MissingApiKey {
+                    ref provider_id,
+                    ..
+                }) if provider_id == "summary-provider"
+            ),
+            "override resolver failure {attempt} should surface the missing key, got {result:?}"
+        );
+    }
+
+    let blocked_run_id = run_id(6);
+    let blocked_trigger_id = message_id(186);
+    append_user_turn_for_run(
+        &store,
+        &session_id,
+        &blocked_run_id,
+        blocked_trigger_id.clone(),
+        "blocked after repeated override resolver failures",
+    );
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let blocked = run_overflow_loop_with_resolver(
+        &run_loop,
+        &model,
+        Some(&summary_model_resolver),
+        &store,
+        &session_id,
+        (&blocked_run_id, &blocked_trigger_id),
+        &turns,
+    );
+
+    let RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MalformedResponse {
+        message,
+    }) = blocked
+    else {
+        panic!("breaker should block auto-compaction, got {blocked:?}");
+    };
+    assert!(
+        message.contains("Auto-compaction disabled"),
+        "breaker warning should be surfaced, got {message:?}"
+    );
+    assert_eq!(
+        server.handled(),
+        4,
+        "fourth overflow should stop after the provider context-limit response"
     );
 }
 
@@ -748,9 +903,27 @@ fn run_overflow_loop(
     message_id: &MessageId,
     turns: &[ModelTurn],
 ) -> RunLoopResult {
+    run_overflow_loop_with_override(model, None, store, session_id, run_id, message_id, turns)
+}
+
+fn run_overflow_loop_with_override(
+    model: &ResolvedModelConfig,
+    compaction_model_resolver: Option<&ModelResolver>,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    message_id: &MessageId,
+    turns: &[ModelTurn],
+) -> RunLoopResult {
     let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
-    run_overflow_loop_with(
-        &run_loop, model, store, session_id, run_id, message_id, turns,
+    run_overflow_loop_with_resolver(
+        &run_loop,
+        model,
+        compaction_model_resolver,
+        store,
+        session_id,
+        (run_id, message_id),
+        turns,
     )
 }
 
@@ -763,6 +936,26 @@ fn run_overflow_loop_with(
     message_id: &MessageId,
     turns: &[ModelTurn],
 ) -> RunLoopResult {
+    run_overflow_loop_with_resolver(
+        run_loop,
+        model,
+        None,
+        store,
+        session_id,
+        (run_id, message_id),
+        turns,
+    )
+}
+
+fn run_overflow_loop_with_resolver(
+    run_loop: &RunLoop,
+    model: &ResolvedModelConfig,
+    compaction_model_resolver: Option<&ModelResolver>,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run: (&RunId, &MessageId),
+    turns: &[ModelTurn],
+) -> RunLoopResult {
     let registry = ToolRegistry::default();
     let context = ToolContext::default();
     let mut ids = TestIds::default();
@@ -771,14 +964,15 @@ fn run_overflow_loop_with(
         model,
         RunLoopRequest {
             session_id,
-            run_id,
-            message_id,
+            run_id: run.0,
+            message_id: run.1,
             turns,
             tool_registry: &registry,
             tool_preset: ToolPreset::Coding,
             tool_context: &context,
             session_store: Some(store),
             pending_confirmations: None,
+            compaction_model_resolver,
             cancellation_token: OpenAiCompletionsCancellationToken::new(),
         },
         &mut ids,
@@ -827,6 +1021,65 @@ fn oversize_session() -> SessionStore {
         };
         store.append_turn(&run_id, message_id(index), turn).unwrap();
     }
+    store
+        .append_turn(
+            &run_id,
+            message_id(99),
+            ModelTurn::user_text("please finish the overflow handler"),
+        )
+        .unwrap();
+
+    store
+}
+
+fn oversize_session_with_strippable_summary_payload(oversized_result: &str) -> SessionStore {
+    let store = SessionStore::default();
+    let session_id = session_id();
+    let run_id = run_id(1);
+
+    store.create_session(session_id.clone()).unwrap();
+    store.start_run(&session_id, run_id.clone()).unwrap();
+    for index in 0..8 {
+        let turn = if index % 2 == 0 {
+            ModelTurn::user_text(format!("user turn {index} with a long oversize body"))
+        } else {
+            ModelTurn::assistant_text(format!("assistant turn {index} with a long oversize body"))
+        };
+        store.append_turn(&run_id, message_id(index), turn).unwrap();
+    }
+    store
+        .append_turn(
+            &run_id,
+            message_id(20),
+            ModelTurn {
+                role: ModelTurnRole::User,
+                parts: vec![
+                    TurnPart::Text {
+                        text: "[image elided]".to_string(),
+                        synthetic: Some(true),
+                    },
+                    TurnPart::Text {
+                        text: "Please continue from the screenshot.".to_string(),
+                        synthetic: None,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    store
+        .append_turn(
+            &run_id,
+            message_id(21),
+            ModelTurn::tool_result("tc1", oversized_result),
+        )
+        .unwrap();
+    store
+        .append_turn(
+            &run_id,
+            message_id(98),
+            ModelTurn::assistant_text("tail assistant turn"),
+        )
+        .unwrap();
     store
         .append_turn(
             &run_id,
@@ -969,11 +1222,24 @@ fn last_user_turn(turns: &[ModelTurn]) -> Option<&ModelTurn> {
 }
 
 fn resolved_model(base_url: &str) -> ResolvedModelConfig {
-    resolved_model_with_budget(base_url, None, None)
+    resolved_model_with_id(base_url, "overflow-model")
+}
+
+fn resolved_model_with_id(base_url: &str, model_id: &str) -> ResolvedModelConfig {
+    resolved_model_with_id_and_budget(base_url, model_id, None, None)
 }
 
 fn resolved_model_with_budget(
     base_url: &str,
+    context_window: Option<u32>,
+    max_tokens: Option<u32>,
+) -> ResolvedModelConfig {
+    resolved_model_with_id_and_budget(base_url, "overflow-model", context_window, max_tokens)
+}
+
+fn resolved_model_with_id_and_budget(
+    base_url: &str,
+    model_id: &str,
     context_window: Option<u32>,
     max_tokens: Option<u32>,
 ) -> ResolvedModelConfig {
@@ -988,7 +1254,7 @@ fn resolved_model_with_budget(
                 inline: "test-secret".to_string(),
             },
             models: vec![ModelConfig {
-                id: "overflow-model".to_string(),
+                id: model_id.to_string(),
                 name: None,
                 api: None,
                 base_url: None,
@@ -1005,12 +1271,100 @@ fn resolved_model_with_budget(
     ModelResolver::new(ModelSettings {
         default_model: Some(ModelRef {
             provider: "test-provider".to_string(),
-            model: "overflow-model".to_string(),
+            model: model_id.to_string(),
         }),
         providers,
+        ..ModelSettings::default()
     })
     .resolve_default()
     .unwrap()
+}
+
+fn compaction_override_resolver(base_url: &str, model_id: &str) -> ModelResolver {
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "summary-provider".to_string(),
+        ProviderConfig {
+            name: None,
+            api: ApiKind::OpenAiCompletions,
+            base_url: base_url.to_string(),
+            api_key: ApiKeyConfig::Inline {
+                inline: "test-secret".to_string(),
+            },
+            models: vec![ModelConfig {
+                id: model_id.to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: Vec::new(),
+                context_window: None,
+                max_tokens: None,
+                compat: Default::default(),
+            }],
+            compat: Default::default(),
+        },
+    );
+    let mut settings = ModelSettings {
+        providers,
+        ..ModelSettings::default()
+    };
+    settings.compaction.model_override = Some(ModelRef {
+        provider: "summary-provider".to_string(),
+        model: model_id.to_string(),
+    });
+
+    ModelResolver::new(settings)
+}
+
+fn missing_key_compaction_override_resolver(model_id: &str) -> ModelResolver {
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "summary-provider".to_string(),
+        ProviderConfig {
+            name: None,
+            api: ApiKind::OpenAiCompletions,
+            base_url: "https://summary.example.com/v1".to_string(),
+            api_key: ApiKeyConfig::EnvVar {
+                env_var: missing_api_key_env_var(),
+            },
+            models: vec![ModelConfig {
+                id: model_id.to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: Vec::new(),
+                context_window: None,
+                max_tokens: None,
+                compat: Default::default(),
+            }],
+            compat: Default::default(),
+        },
+    );
+    let mut settings = ModelSettings {
+        providers,
+        ..ModelSettings::default()
+    };
+    settings.compaction.model_override = Some(ModelRef {
+        provider: "summary-provider".to_string(),
+        model: model_id.to_string(),
+    });
+
+    ModelResolver::new(settings)
+}
+
+fn missing_api_key_env_var() -> String {
+    (0u32..)
+        .map(|index| {
+            format!(
+                "NAV_TEST_MISSING_COMPACTION_API_KEY_{}_{}",
+                std::process::id(),
+                index
+            )
+        })
+        .find(|name| std::env::var_os(name).is_none())
+        .expect("should find an unset env var name for test fixture")
 }
 
 #[derive(Clone)]

@@ -234,6 +234,7 @@ fn resolves_provider_and_model_pair_without_global_model_aliases() {
                 },
             ),
         ]),
+        ..ModelSettings::default()
     };
 
     let resolved = ModelResolver::new(settings)
@@ -269,6 +270,7 @@ fn resolves_model_level_api_and_base_url_overrides() {
                 compat: Default::default(),
             },
         )]),
+        ..ModelSettings::default()
     };
 
     let resolved = ModelResolver::new(settings)
@@ -321,6 +323,7 @@ fn merges_provider_compat_defaults_with_model_overrides() {
                 }],
             },
         )]),
+        ..ModelSettings::default()
     };
 
     let resolved = ModelResolver::new(settings)
@@ -408,6 +411,57 @@ fn deserializes_pi_like_model_settings_shape() {
     assert_eq!(model.input, vec![ModelInput::Text]);
 }
 
+#[test]
+fn resolves_compaction_model_override_from_settings() {
+    let settings: ModelSettings = serde_json::from_str(
+        r#"{
+            "defaultModel": {
+                "provider": "primary",
+                "model": "large"
+            },
+            "compaction": {
+                "model_override": {
+                    "provider": "summary",
+                    "model": "small"
+                }
+            },
+            "providers": {
+                "primary": {
+                    "api": "openai-completions",
+                    "baseUrl": "https://primary.example.com/v1",
+                    "apiKey": { "inline": "sk-primary" },
+                    "models": [{ "id": "large" }]
+                },
+                "summary": {
+                    "api": "openai-completions",
+                    "baseUrl": "https://summary.example.com/v1",
+                    "apiKey": { "inline": "sk-summary" },
+                    "models": [{ "id": "small" }]
+                }
+            }
+        }"#,
+    )
+    .expect("settings with compaction override should deserialize");
+
+    assert_eq!(
+        settings.compaction.model_override,
+        Some(ModelRef {
+            provider: "summary".to_string(),
+            model: "small".to_string(),
+        })
+    );
+
+    let resolved = ModelResolver::new(settings)
+        .resolve_compaction_model_override()
+        .expect("override should resolve")
+        .expect("override should be configured");
+
+    assert_eq!(resolved.provider_id, "summary");
+    assert_eq!(resolved.model.id, "small");
+    assert_eq!(resolved.base_url, "https://summary.example.com/v1");
+    assert_eq!(resolved.api_key.expose_secret(), "sk-summary");
+}
+
 fn compatible_settings(api_key: ApiKeyConfig) -> ModelSettings {
     ModelSettings {
         default_model: Some(ModelRef {
@@ -431,6 +485,7 @@ fn compatible_settings(api_key: ApiKeyConfig) -> ModelSettings {
                 compat: Default::default(),
             },
         )]),
+        ..ModelSettings::default()
     }
 }
 

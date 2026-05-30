@@ -1047,6 +1047,7 @@ fn settings_for(
                 compat,
             },
         )]),
+        ..ModelSettings::default()
     }
 }
 

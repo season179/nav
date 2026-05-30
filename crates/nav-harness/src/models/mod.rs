@@ -14,7 +14,7 @@ pub mod resolver;
 
 pub use api::ApiKind;
 pub use compat::{MaxTokensField, ProviderCompat, ProviderRoutingCompat, ThinkingFormat};
-pub use config::{ModelRef, ModelSettings};
+pub use config::{CompactionSettings, ModelRef, ModelSettings};
 pub use context_limit::{
     ContextLimitError, classify_context_limit, classify_streamed_context_limit,
 };
