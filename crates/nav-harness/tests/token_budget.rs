@@ -1,6 +1,7 @@
-//! Token budget estimator tests (issue #461, BUD-01).
+//! Token budget estimator tests (issue #461, BUD-01; issue #469, BUD-03).
 
-use nav_harness::context::budget::{estimate_tokens_for_parts, active_context_size};
+use nav_harness::context::budget::{ContextBudget, active_context_size, estimate_tokens_for_parts};
+use nav_harness::models::{DEFAULT_CONTEXT_WINDOW, ModelConfig};
 use nav_harness::sessions::{Part, TokenUsage};
 
 // ── Slice 1: text estimation uses chars/3.8 ──────────────────────────────
@@ -32,8 +33,8 @@ fn empty_text_estimated_at_zero_tokens() {
 #[test]
 fn tool_call_arguments_estimated_at_chars_divided_by_2() {
     // 200 chars of JSON arguments → 100 tokens at chars/2.0
-    let arguments = serde_json::from_str(&format!("{{\"key\":\"{}\"}}", "x".repeat(189)))
-        .expect("valid json");
+    let arguments =
+        serde_json::from_str(&format!("{{\"key\":\"{}\"}}", "x".repeat(189))).expect("valid json");
     let json_len = serde_json::to_string(&arguments).unwrap().chars().count();
     let expected = (json_len as f64 / 2.0).ceil() as u64;
     let part = Part::ToolCall {
@@ -184,4 +185,58 @@ fn estimate_within_15_percent_of_known_token_count() {
     let expected = (1000_f64 / 3.8).ceil() as u64 + (500_f64 / 2.0).ceil() as u64;
     assert_eq!(tokens, expected);
     assert_eq!(tokens, 514); // 264 + 250
+}
+
+// ── Slice 6: two-scope budgeting (issue #469, BUD-03) ────────────────────
+
+#[test]
+fn budget_tracks_total_context_and_prefix_separately() {
+    // Total window 200K, prefix (system prompt + static blocks) 30K.
+    let budget = ContextBudget::new(200_000, 30_000);
+    assert_eq!(budget.total_context(), 200_000);
+    assert_eq!(budget.prefix(), 30_000);
+}
+
+#[test]
+fn body_budget_is_total_window_minus_prefix() {
+    // A 30K static prefix leaves 170K of a 200K window for the conversation body.
+    let budget = ContextBudget::new(200_000, 30_000);
+    assert_eq!(budget.body_budget(), 170_000);
+}
+
+#[test]
+fn body_after_prefix_subtracts_prefix_from_active_size() {
+    // Active context of 50K with a 30K prefix means the body occupies 20K.
+    let budget = ContextBudget::new(200_000, 30_000);
+    assert_eq!(budget.body_after_prefix(50_000), 20_000);
+}
+
+#[test]
+fn from_model_reads_total_context_from_model_window() {
+    let model = ModelConfig {
+        context_window: Some(128_000),
+        ..ModelConfig::default()
+    };
+    let budget = ContextBudget::from_model(&model, 30_000);
+    assert_eq!(budget.total_context(), 128_000);
+    assert_eq!(budget.body_budget(), 98_000);
+}
+
+#[test]
+fn from_model_falls_back_to_default_window_when_unset() {
+    let budget = ContextBudget::from_model(&ModelConfig::default(), 0);
+    assert_eq!(budget.total_context(), DEFAULT_CONTEXT_WINDOW);
+}
+
+#[test]
+fn body_budget_saturates_at_zero_when_prefix_exceeds_window() {
+    // A prefix larger than the window leaves no room for the body, not a wrap.
+    let budget = ContextBudget::new(8_000, 10_000);
+    assert_eq!(budget.body_budget(), 0);
+}
+
+#[test]
+fn body_after_prefix_saturates_at_zero_when_active_below_prefix() {
+    let budget = ContextBudget::new(200_000, 30_000);
+    assert_eq!(budget.body_after_prefix(10_000), 0);
 }

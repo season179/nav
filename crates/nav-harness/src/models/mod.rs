@@ -30,7 +30,7 @@ pub use encode::{
     ChatGptSubscriptionRequest, ChatGptSubscriptionToolCallItem, ChatGptSubscriptionToolResultItem,
     Encoder, OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
 };
-pub use model::{ModelConfig, ModelInput};
+pub use model::{DEFAULT_CONTEXT_WINDOW, ModelConfig, ModelInput};
 pub use openai_completions::{
     ChatCompletionChoice, ChatCompletionDelta, ChatCompletionMessageRole,
     ChatCompletionRequestMessage, ChatCompletionRequestPlan, ChatCompletionResponse,
