@@ -137,9 +137,12 @@ impl SubagentRuntime {
     }
 }
 
+/// Registry placeholder for the agent roles supported by the harness.
 #[derive(Debug, Default)]
 pub struct AgentCatalog;
 
+/// Executes model turns, tool calls, compaction recovery, and speculative
+/// context prefetching for a single agent run.
 #[derive(Debug, Clone)]
 pub struct RunLoop {
     client: OpenAiCompletionsClient,
@@ -147,12 +150,14 @@ pub struct RunLoop {
     compaction_breakers: Arc<Mutex<RunLoopCompactionBreakers>>,
 }
 
+/// Transient context prepared for the next model request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrefetchedTurnContext {
     system_context: Option<String>,
 }
 
 impl PrefetchedTurnContext {
+    /// Build a prefetched context payload that will be injected as system text.
     pub fn from_system_context(system_context: impl Into<String>) -> Self {
         Self {
             system_context: Some(system_context.into()),
@@ -168,19 +173,27 @@ impl PrefetchedTurnContext {
     }
 }
 
+/// Inputs captured when starting speculative next-turn lookups.
 #[derive(Debug, Clone)]
 pub struct TurnLookupPrefetchRequest<'a> {
+    /// Session receiving the current run.
     pub session_id: &'a SessionId,
+    /// Run whose current model response is in flight.
     pub run_id: &'a RunId,
+    /// User message that triggered this run.
     pub message_id: &'a MessageId,
+    /// Model-visible turns available when prefetch starts.
     pub turns: &'a [ModelTurn],
+    /// Optional session store used for memory recall.
     pub session_store: Option<&'a Arc<Mutex<SessionStore>>>,
+    /// Optional workspace root used for local skill discovery.
     pub workspace_root: Option<PathBuf>,
 }
 
 /// A background lookup batch started during the current model response and
 /// resolved only if the loop needs a follow-up request after tool execution.
 pub trait PendingTurnLookupResults: std::fmt::Debug + Send {
+    /// Wait for the background work and return context for the next request.
     fn resolve(self: Box<Self>) -> PrefetchedTurnContext;
 }
 
@@ -190,19 +203,23 @@ pub trait PendingTurnLookupResults: std::fmt::Debug + Send {
 /// run loop overlaps the returned handle with provider streaming and tool
 /// execution, then resolves it just before building the next request.
 pub trait TurnLookupPrefetcher: std::fmt::Debug + Send + Sync {
+    /// Start speculative lookups and return a handle that resolves the result.
     fn start(&self, request: TurnLookupPrefetchRequest<'_>) -> Box<dyn PendingTurnLookupResults>;
 }
 
+/// Default prefetcher that recalls session memory and discovers local skills.
 #[derive(Debug, Clone)]
 pub struct TurnContextPrefetcher {
     skill_roots: Arc<Vec<PathBuf>>,
 }
 
 impl TurnContextPrefetcher {
+    /// Build a prefetcher using configured and workspace-local skill roots.
     pub fn new() -> Self {
         Self::with_skill_roots(default_skill_roots())
     }
 
+    /// Build a prefetcher with explicit skill roots for deterministic callers.
     pub fn with_skill_roots(skill_roots: Vec<PathBuf>) -> Self {
         Self {
             skill_roots: Arc::new(skill_roots),
