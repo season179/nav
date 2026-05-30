@@ -109,10 +109,12 @@ impl SubagentRuntime {
         }
     }
 
+    /// This child's depth in the delegation tree (root agent = 0).
     pub fn depth(self) -> u32 {
         self.depth
     }
 
+    /// The child's own iteration budget, independent of its parent's.
     pub fn iteration_budget(self) -> IterationBudget {
         self.iteration_budget
     }

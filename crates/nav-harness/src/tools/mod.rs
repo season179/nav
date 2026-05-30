@@ -116,6 +116,7 @@ impl ToolContext {
         self
     }
 
+    /// Set the recursion depth of the agent that will run these tools.
     pub fn with_task_depth(mut self, task_depth: u32) -> Self {
         self.task_depth = task_depth;
         self
@@ -137,6 +138,7 @@ impl ToolContext {
         self.task_spawner.as_deref()
     }
 
+    /// Recursion depth of the agent running these tools (root agent = 0).
     pub fn task_depth(&self) -> u32 {
         self.task_depth
     }
