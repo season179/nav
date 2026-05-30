@@ -146,6 +146,54 @@ describe('applyEventToHistory', () => {
 		expect(warn).not.toHaveBeenCalled();
 	});
 
+	test('floats the final answer below tool calls when an earlier turn already produced text', () => {
+		const warn = mock(() => {});
+		// Reproduces the live ordering bug: the backend emits each turn's text
+		// before that turn's tool calls, and every turn accumulates into one
+		// assistant cell. Turn 1's preamble must not anchor the cell above the
+		// tools so that turn 2's final answer ends up above them too.
+		let messages: HistoryMessage[] = [
+			{id: ASSISTANT_ID, role: 'assistant', text: ''},
+		];
+
+		// Turn 1: preamble text, then a tool call.
+		messages = applyEventToHistory(
+			messages,
+			event('model.text_delta', {delta: 'Let me check.'}),
+			ASSISTANT_ID,
+			warn,
+		);
+		messages = applyEventToHistory(
+			messages,
+			event('tool.call_completed', {
+				runId: 'run-1',
+				toolCallId: 'tool-1',
+				name: 'read',
+				arguments: '{}',
+			}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		// Turn 2: the final answer arrives after the tool resolves.
+		messages = applyEventToHistory(
+			messages,
+			event('model.text_delta', {delta: ' The answer is 42.'}),
+			ASSISTANT_ID,
+			warn,
+		);
+
+		expect(messages.map(message => message.role)).toEqual([
+			'tool_call',
+			'assistant',
+		]);
+		expect(messages.at(-1)).toMatchObject({
+			role: 'assistant',
+			text: 'Let me check. The answer is 42.',
+		});
+		expect(warn).not.toHaveBeenCalled();
+	});
+
 	test('replaces assistant text for error events', () => {
 		const warn = mock(() => {});
 

@@ -661,7 +661,13 @@ function updateAssistantText(
 		contentVersion: nextContentVersion(assistant),
 		text: updateText(assistant.text),
 	};
-	if (assistant.text === '' && index < messages.length - 1) {
+	// The live backend emits each turn's text before that turn's tool calls, and
+	// every turn of a run accumulates into this one cell. Whenever fresh text
+	// arrives while tool calls (or other cells) already sit after it, float the
+	// cell to the end so the latest assistant prose — including the final answer
+	// — renders chronologically below the tools it followed, rather than staying
+	// anchored above them. Text never touched again keeps its place.
+	if (index < messages.length - 1) {
 		return [
 			...messages.slice(0, index),
 			...messages.slice(index + 1),
