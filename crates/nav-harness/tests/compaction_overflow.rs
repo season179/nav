@@ -208,21 +208,10 @@ fn overflow_compaction_uses_model_override_when_configured() {
         "override model should receive the compaction summary request"
     );
 
-    let summary_bodies = summary_server.requests();
-    assert_eq!(summary_bodies.len(), 1);
-    assert!(
-        summary_bodies[0].contains("\"model\":\"summary-model\""),
-        "summary request should target override model but was:\n{}",
-        summary_bodies[0]
-    );
-    assert!(
-        !summary_bodies[0].contains("[image elided]"),
-        "override summary request should strip image placeholders:\n{}",
-        summary_bodies[0]
-    );
-    assert!(
-        !summary_bodies[0].contains(&oversized_result),
-        "override summary request should truncate oversized tool results"
+    assert_override_summary_request_strips_payload(
+        &summary_server,
+        "summary-model",
+        &oversized_result,
     );
 }
 
@@ -871,6 +860,139 @@ fn run_loop_compacts_before_streaming_at_usable_threshold() {
 }
 
 #[test]
+fn proactive_compaction_uses_model_override_when_configured() {
+    let session_server =
+        FakeProviderServer::start(vec![canned_stream_completion("Compacted proactively.")]);
+    let summary_server = FakeProviderServer::start(vec![canned_summary(&valid_summary(
+        "Use cheaper proactive summary.",
+    ))]);
+    let oversized_result = "x".repeat(10_000);
+    let store = oversize_session_with_strippable_summary_payload(&oversized_result);
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let trigger_id = message_id(99);
+
+    let session_model = proactive_override_session_model(session_server.base_url());
+    let summary_model_resolver =
+        compaction_override_resolver(summary_server.base_url(), "summary-model");
+    let store = Arc::new(Mutex::new(store));
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+
+    let result = run_overflow_loop_with_override(
+        &session_model,
+        Some(&summary_model_resolver),
+        &store,
+        &session_id,
+        &run_id,
+        &trigger_id,
+        &turns,
+    );
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "proactive compaction should complete with an override model, got {result:?}"
+    );
+    assert_eq!(
+        session_server.handled(),
+        1,
+        "session model should only receive the compacted streaming request"
+    );
+    assert_eq!(
+        summary_server.handled(),
+        1,
+        "override model should receive the proactive compaction summary request"
+    );
+
+    assert_override_summary_request_strips_payload(
+        &summary_server,
+        "summary-model",
+        &oversized_result,
+    );
+}
+
+#[test]
+fn proactive_override_resolution_failures_trip_failure_breaker() {
+    let server = FakeProviderServer::start(Vec::new());
+    let oversized_result = "x".repeat(10_000);
+    let store = Arc::new(Mutex::new(
+        oversize_session_with_strippable_summary_payload(&oversized_result),
+    ));
+    let session_id = session_id();
+    let model = proactive_override_session_model(server.base_url());
+    let summary_model_resolver = missing_key_compaction_override_resolver("summary-model");
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+
+    for attempt in 1..=3 {
+        let run_id = run_id(attempt + 1);
+        let trigger_id = message_id(200 + attempt);
+        append_user_turn_for_run(
+            &store,
+            &session_id,
+            &run_id,
+            trigger_id.clone(),
+            &format!("proactive override resolver failure {attempt}"),
+        );
+        let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+        let result = run_overflow_loop_with_resolver(
+            &run_loop,
+            &model,
+            Some(&summary_model_resolver),
+            &store,
+            &session_id,
+            (&run_id, &trigger_id),
+            &turns,
+        );
+
+        assert!(
+            matches!(
+                result,
+                RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MissingApiKey {
+                    ref provider_id,
+                    ..
+                }) if provider_id == "summary-provider"
+            ),
+            "proactive override resolver failure {attempt} should surface the missing key, got {result:?}"
+        );
+    }
+
+    let blocked_run_id = run_id(6);
+    let blocked_trigger_id = message_id(206);
+    append_user_turn_for_run(
+        &store,
+        &session_id,
+        &blocked_run_id,
+        blocked_trigger_id.clone(),
+        "blocked after repeated proactive override resolver failures",
+    );
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let blocked = run_overflow_loop_with_resolver(
+        &run_loop,
+        &model,
+        Some(&summary_model_resolver),
+        &store,
+        &session_id,
+        (&blocked_run_id, &blocked_trigger_id),
+        &turns,
+    );
+
+    let RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MalformedResponse {
+        message,
+    }) = blocked
+    else {
+        panic!("breaker should block proactive auto-compaction, got {blocked:?}");
+    };
+    assert!(
+        message.contains("Auto-compaction disabled"),
+        "breaker warning should be surfaced, got {message:?}"
+    );
+    assert_eq!(
+        server.handled(),
+        0,
+        "proactive resolver failures should stop before the session model request"
+    );
+}
+
+#[test]
 fn run_loop_does_not_compact_when_completion_buffer_exceeds_window() {
     let server = FakeProviderServer::start(vec![canned_stream_completion("No useful budget.")]);
     let store = small_session();
@@ -1003,6 +1125,37 @@ fn assert_malformed_failure(result: RunLoopResult, context: &str) {
             )
         ),
         "{context} should fail with a malformed-response error, got {result:?}"
+    );
+}
+
+fn assert_override_summary_request_strips_payload(
+    summary_server: &FakeProviderServer,
+    expected_model_id: &str,
+    oversized_result: &str,
+) {
+    let summary_bodies = summary_server.requests();
+    assert_eq!(summary_bodies.len(), 1);
+    let summary_body = &summary_bodies[0];
+    let summary_request: serde_json::Value =
+        serde_json::from_str(summary_body).expect("summary request should be JSON");
+    assert_eq!(
+        summary_request
+            .get("model")
+            .and_then(serde_json::Value::as_str),
+        Some(expected_model_id),
+        "summary request should target override model but was:\n{summary_body}"
+    );
+    assert!(
+        summary_request.get("tools").is_none(),
+        "override summary request should not include tool definitions:\n{summary_body}"
+    );
+    assert!(
+        !summary_body.contains("[image elided]"),
+        "override summary request should strip image placeholders:\n{summary_body}"
+    );
+    assert!(
+        !summary_body.contains(oversized_result),
+        "override summary request should truncate oversized tool results"
     );
 }
 
@@ -1235,6 +1388,10 @@ fn resolved_model_with_budget(
     max_tokens: Option<u32>,
 ) -> ResolvedModelConfig {
     resolved_model_with_id_and_budget(base_url, "overflow-model", context_window, max_tokens)
+}
+
+fn proactive_override_session_model(base_url: &str) -> ResolvedModelConfig {
+    resolved_model_with_id_and_budget(base_url, "session-model", Some(5_000), Some(500))
 }
 
 fn resolved_model_with_id_and_budget(
