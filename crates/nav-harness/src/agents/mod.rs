@@ -20,7 +20,7 @@ use crate::compaction::summary::{CompactionSummaryAgent, CompactionSummaryReques
 use crate::context::files::ContextFileCache;
 use crate::context::system_prompt::{SystemClock, SystemCwd, SystemPromptBuilder};
 use crate::context::{
-    ContextBudget, ContextReminders, DEFAULT_COMPLETION_BUFFER_TOKENS,
+    ContextBudget, ContextReminders, DEFAULT_COMPLETION_BUFFER_TOKENS, estimate_text_tokens,
     estimate_tokens_for_model_turns, truncate_model_turns,
 };
 use crate::events::{
@@ -541,10 +541,14 @@ impl RunLoop {
             .map(|policy| policy.workspace_root().to_path_buf());
         let system_prompt =
             assemble_system_prompt(request.tool_registry, workspace_root.as_deref());
+        // The assembled prompt is a cache-stable prefix that the budget checks
+        // must account for: skills + conventions can be large, so ignoring it
+        // would let an "in-budget" request overflow the provider window (#524).
+        let system_prompt_tokens = estimate_text_tokens(&system_prompt);
 
         loop {
             let mut should_project_pruned_tool_results =
-                journal.is_some() && should_prune_for_budget(model, &turns);
+                journal.is_some() && should_prune_for_budget(model, &turns, system_prompt_tokens);
             if let Some(journal) = journal
                 && should_project_pruned_tool_results
             {
@@ -555,7 +559,7 @@ impl RunLoop {
             }
             if let Some(journal) = journal
                 && !proactive_compaction_attempted
-                && should_compact_for_budget(model, &turns)
+                && should_compact_for_budget(model, &turns, system_prompt_tokens)
             {
                 proactive_compaction_attempted = true;
                 let tokens_before_compaction = estimate_model_turn_tokens(&turns);
@@ -598,7 +602,7 @@ impl RunLoop {
 
             if let Some(journal) = journal
                 && !proactive_compaction_attempted
-                && should_compact_for_budget(model, &turns)
+                && should_compact_for_budget(model, &turns, system_prompt_tokens)
             {
                 proactive_compaction_attempted = true;
                 let tokens_before_compaction = estimate_model_turn_tokens(&turns);
@@ -618,7 +622,8 @@ impl RunLoop {
             }
 
             should_project_pruned_tool_results = should_project_pruned_tool_results
-                || (journal.is_some() && should_prune_for_budget(model, &turns));
+                || (journal.is_some()
+                    && should_prune_for_budget(model, &turns, system_prompt_tokens));
             let mut turns_for_model =
                 project_turns_for_encoding(&turns, model, should_project_pruned_tool_results);
             apply_prefetched_turn_context(
@@ -1649,20 +1654,28 @@ fn prune_stored_tool_results_for_encoding(
         .map_err(persistence_error)
 }
 
-fn should_prune_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -> bool {
-    let budget = ContextBudget::from_model(&model.model, 0);
-    let active_tokens = estimate_tokens_for_model_turns(turns);
+fn should_prune_for_budget(
+    model: &ResolvedModelConfig,
+    turns: &[ModelTurn],
+    prefix_tokens: u64,
+) -> bool {
+    let budget = ContextBudget::from_model(&model.model, prefix_tokens);
+    let active_tokens = prefix_tokens + estimate_tokens_for_model_turns(turns);
     budget.body_after_prefix(active_tokens) > budget.prune_threshold()
 }
 
-fn should_compact_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -> bool {
-    let budget = ContextBudget::from_model(&model.model, 0);
+fn should_compact_for_budget(
+    model: &ResolvedModelConfig,
+    turns: &[ModelTurn],
+    prefix_tokens: u64,
+) -> bool {
+    let budget = ContextBudget::from_model(&model.model, prefix_tokens);
     let completion_buffer = model
         .model
         .max_tokens
         .map(u64::from)
         .unwrap_or(DEFAULT_COMPLETION_BUFFER_TOKENS);
-    let active_tokens = estimate_tokens_for_model_turns(turns);
+    let active_tokens = prefix_tokens + estimate_tokens_for_model_turns(turns);
     let threshold = budget.usable_threshold(completion_buffer);
     threshold > 0 && budget.body_after_prefix(active_tokens) >= threshold
 }
