@@ -35,13 +35,12 @@ static ANTHROPIC_TOOL_CACHE: LazyLock<RwLock<HashMap<ToolSchemaKey, AnthropicToo
 static OPENAI_TOOL_CACHE: LazyLock<RwLock<HashMap<ToolSchemaKey, ChatCompletionToolDefinition>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-/// Compute a stable cache key from a tool name, description, and schema: `name:hash(desc+sorted_schema)`.
-fn tool_cache_key(name: &str, description: &str, schema: &Value) -> String {
+/// Compute a stable cache key from a tool name, description, and pre-sorted schema.
+fn tool_cache_key(name: &str, description: &str, sorted_schema: &Value) -> String {
     use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
 
-    let sorted = sort_json_value(schema);
-    let canonical = serde_json::to_string(&sorted).unwrap_or_default();
+    let canonical = serde_json::to_string(sorted_schema).unwrap_or_default();
 
     let mut hasher = DefaultHasher::new();
     name.hash(&mut hasher);
@@ -79,7 +78,7 @@ pub(crate) fn anthropic_tools_from_registry(
         .map(|tool| {
             let name = tool.name().to_string();
             let description = tool.description().to_string();
-            let schema = tool.parameters();
+            let schema = sort_json_value(&tool.parameters());
             let key = tool_cache_key(&name, &description, &schema);
 
             {
@@ -117,7 +116,7 @@ pub(crate) fn openai_tools_from_registry(
         .map(|tool| {
             let name = tool.name().to_string();
             let description = tool.description().to_string();
-            let schema = tool.parameters();
+            let schema = sort_json_value(&tool.parameters());
             let key = tool_cache_key(&name, &description, &schema);
 
             {
