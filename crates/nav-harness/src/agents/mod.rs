@@ -520,7 +520,14 @@ impl RunLoop {
             .map_err(persistence_error)?;
         let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
         let compaction_model_override = match compaction_model_resolver {
-            Some(resolver) => resolver.resolve_compaction_model_override()?,
+            Some(resolver) => match resolver.resolve_compaction_model_override() {
+                Ok(model) => model,
+                Err(error) => {
+                    let error = OpenAiCompletionsError::from(error);
+                    self.record_compaction_error(session_id, &error);
+                    return Err(error);
+                }
+            },
             None => None,
         };
         let summary_result = match compaction_model_override {

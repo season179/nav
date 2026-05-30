@@ -232,6 +232,90 @@ fn overflow_compaction_uses_model_override_when_configured() {
 }
 
 #[test]
+fn override_resolution_failures_trip_failure_breaker() {
+    let server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_context_limit(),
+        canned_context_limit(),
+        canned_context_limit(),
+    ]);
+    let store = Arc::new(Mutex::new(oversize_session()));
+    let session_id = session_id();
+    let model = resolved_model(server.base_url());
+    let summary_model_resolver = missing_key_compaction_override_resolver("summary-model");
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+
+    for attempt in 1..=3 {
+        let run_id = run_id(attempt + 1);
+        let trigger_id = message_id(180 + attempt);
+        append_user_turn_for_run(
+            &store,
+            &session_id,
+            &run_id,
+            trigger_id.clone(),
+            &format!("override resolver failure {attempt}"),
+        );
+        let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+        let result = run_overflow_loop_with_resolver(
+            &run_loop,
+            &model,
+            Some(&summary_model_resolver),
+            &store,
+            &session_id,
+            (&run_id, &trigger_id),
+            &turns,
+        );
+
+        assert!(
+            matches!(
+                result,
+                RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MissingApiKey {
+                    ref provider_id,
+                    ..
+                }) if provider_id == "summary-provider"
+            ),
+            "override resolver failure {attempt} should surface the missing key, got {result:?}"
+        );
+    }
+
+    let blocked_run_id = run_id(6);
+    let blocked_trigger_id = message_id(186);
+    append_user_turn_for_run(
+        &store,
+        &session_id,
+        &blocked_run_id,
+        blocked_trigger_id.clone(),
+        "blocked after repeated override resolver failures",
+    );
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let blocked = run_overflow_loop_with_resolver(
+        &run_loop,
+        &model,
+        Some(&summary_model_resolver),
+        &store,
+        &session_id,
+        (&blocked_run_id, &blocked_trigger_id),
+        &turns,
+    );
+
+    let RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MalformedResponse {
+        message,
+    }) = blocked
+    else {
+        panic!("breaker should block auto-compaction, got {blocked:?}");
+    };
+    assert!(
+        message.contains("Auto-compaction disabled"),
+        "breaker warning should be surfaced, got {message:?}"
+    );
+    assert_eq!(
+        server.handled(),
+        4,
+        "fourth overflow should stop after the provider context-limit response"
+    );
+}
+
+#[test]
 fn overflow_recovery_is_bounded_and_fails_without_looping() {
     let server = FakeProviderServer::start(vec![
         canned_context_limit(),
@@ -1236,6 +1320,56 @@ fn compaction_override_resolver(base_url: &str, model_id: &str) -> ModelResolver
     });
 
     ModelResolver::new(settings)
+}
+
+fn missing_key_compaction_override_resolver(model_id: &str) -> ModelResolver {
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "summary-provider".to_string(),
+        ProviderConfig {
+            name: None,
+            api: ApiKind::OpenAiCompletions,
+            base_url: "https://summary.example.com/v1".to_string(),
+            api_key: ApiKeyConfig::EnvVar {
+                env_var: missing_api_key_env_var(),
+            },
+            models: vec![ModelConfig {
+                id: model_id.to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: Vec::new(),
+                context_window: None,
+                max_tokens: None,
+                compat: Default::default(),
+            }],
+            compat: Default::default(),
+        },
+    );
+    let mut settings = ModelSettings {
+        providers,
+        ..ModelSettings::default()
+    };
+    settings.compaction.model_override = Some(ModelRef {
+        provider: "summary-provider".to_string(),
+        model: model_id.to_string(),
+    });
+
+    ModelResolver::new(settings)
+}
+
+fn missing_api_key_env_var() -> String {
+    (0u32..)
+        .map(|index| {
+            format!(
+                "NAV_TEST_MISSING_COMPACTION_API_KEY_{}_{}",
+                std::process::id(),
+                index
+            )
+        })
+        .find(|name| std::env::var_os(name).is_none())
+        .expect("should find an unset env var name for test fixture")
 }
 
 #[derive(Clone)]
