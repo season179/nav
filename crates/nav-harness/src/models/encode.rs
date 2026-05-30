@@ -37,8 +37,8 @@ static OPENAI_TOOL_CACHE: LazyLock<RwLock<HashMap<ToolSchemaKey, ChatCompletionT
 
 /// Compute a stable cache key from a tool name, description, and pre-sorted schema.
 fn tool_cache_key(name: &str, description: &str, sorted_schema: &Value) -> String {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let canonical = serde_json::to_string(sorted_schema).unwrap_or_default();
 
@@ -131,10 +131,7 @@ pub(crate) fn openai_tools_from_registry(
                 description,
                 parameters: schema,
             };
-            OPENAI_TOOL_CACHE
-                .write()
-                .unwrap()
-                .insert(key, def.clone());
+            OPENAI_TOOL_CACHE.write().unwrap().insert(key, def.clone());
             def
         })
         .collect();
@@ -1493,8 +1490,7 @@ mod tests {
         );
 
         let (registry, preset) = build_registry(vec![tool_c, tool_a, tool_b]);
-        let encoder =
-            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let encoder = AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
         let request = encoder.encode(&[]).unwrap();
 
         let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
@@ -1520,8 +1516,7 @@ mod tests {
         );
 
         let (registry, preset) = build_registry(vec![tool_c, tool_a, tool_b]);
-        let encoder =
-            OpenAiChatCompletionsEncoder::new().with_tool_registry(&registry, preset);
+        let encoder = OpenAiChatCompletionsEncoder::new().with_tool_registry(&registry, preset);
         let request = encoder.encode(&[]).unwrap();
 
         let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
@@ -1543,13 +1538,11 @@ mod tests {
 
         let (registry, preset) = build_registry(vec![tool_a, tool_b]);
 
-        let enc1 =
-            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let enc1 = AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
         let req1 = enc1.encode(&[]).unwrap();
         let serialized1 = serde_json::to_string(&req1.serialized_tools()).unwrap();
 
-        let enc2 =
-            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let enc2 = AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
         let req2 = enc2.encode(&[]).unwrap();
         let serialized2 = serde_json::to_string(&req2.serialized_tools()).unwrap();
 
@@ -1568,10 +1561,8 @@ mod tests {
 
         let (registry, preset) = build_registry(vec![tool]);
 
-        let enc1 =
-            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
-        let enc2 =
-            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let enc1 = AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let enc2 = AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
 
         let req1 = enc1.encode(&[]).unwrap();
         let req2 = enc2.encode(&[]).unwrap();
@@ -1599,8 +1590,7 @@ mod tests {
         );
 
         let (registry, preset) = build_registry(vec![tool_a, tool_b]);
-        let encoder =
-            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let encoder = AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
 
         let req1 = encoder.encode(&[]).unwrap();
         let req2 = encoder.encode(&[]).unwrap();
