@@ -563,8 +563,7 @@ fn compaction_summary_agent_calls_model_and_returns_assistant_text() {
 #[test]
 fn compaction_call_overflow_drops_oldest_head_turns_and_retries() {
     let overflow_body = "{\"error\":{\"message\":\"This model's maximum context length is exceeded\",\"code\":\"context_length_exceeded\"}}";
-    let success_body =
-        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"## Active Task\\nRetried summary\"}}]}";
+    let success_body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"## Active Task\\nRetried summary\"}}]}";
     let server = SequencedResponseServer::new(vec![
         SequencedResponse::error(400, overflow_body),
         SequencedResponse::ok(success_body),
@@ -647,8 +646,7 @@ fn single_head_turn_overflow_surfaces_context_limit_without_dropping_it() {
     // A summary call that would succeed on an empty-head prompt must NOT be
     // reached: dropping the only head turn would silently lose it, so the agent
     // surfaces ContextLimit instead.
-    let success_body =
-        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"## Active Task\\nShould never be returned\"}}]}";
+    let success_body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"## Active Task\\nShould never be returned\"}}]}";
     let server = SequencedResponseServer::new(vec![
         SequencedResponse::error(400, overflow_body),
         SequencedResponse::ok(success_body),
@@ -816,7 +814,11 @@ impl SequencedResponseServer {
                 let body = read_http_request_body(&mut stream);
                 sender.send(body).unwrap();
 
-                let reason = if response.status == 200 { "OK" } else { "Bad Request" };
+                let reason = if response.status == 200 {
+                    "OK"
+                } else {
+                    "Bad Request"
+                };
                 let http = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     response.status,
