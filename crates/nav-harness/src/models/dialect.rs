@@ -12,8 +12,8 @@ use crate::sessions::ModelTurn;
 use crate::tools::{ToolPreset, ToolRegistry};
 
 use super::encode::{
-    AnthropicMessagesEncoder, AnthropicMessagesRequest, AnthropicToolDefinition, Encoder,
-    OpenAiChatCompletionsEncoder, OpenAiResponsesEncoder, OpenAiResponsesRequest,
+    AnthropicMessagesEncoder, AnthropicMessagesRequest, Encoder, OpenAiChatCompletionsEncoder,
+    OpenAiResponsesEncoder, OpenAiResponsesRequest,
 };
 use super::{ApiKind, OpenAiCompletionsError, OpenAiCompletionsRequest, ResolvedModelConfig};
 
@@ -119,42 +119,24 @@ pub fn anthropic_http_request(
     model: &ResolvedModelConfig,
     request: &AnthropicMessagesRequest,
 ) -> Result<DialectHttpRequest, OpenAiCompletionsError> {
-    let mut body = Map::new();
-    body.insert("model".to_string(), json!(model.model.id));
-    body.insert("messages".to_string(), json!(request.messages));
-    body.insert(
+    // `to_request_body` assembles system/messages/tools with the cache_control
+    // breakpoints (plans/context-management.md §2.4); layer the model and the
+    // Anthropic-required `max_tokens`/`stream` fields on top.
+    let mut body = request.to_request_body();
+    let map = body
+        .as_object_mut()
+        .expect("to_request_body returns a JSON object");
+    map.insert("model".to_string(), json!(model.model.id));
+    map.insert(
         "max_tokens".to_string(),
         json!(model.model.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
     );
-    body.insert("stream".to_string(), json!(false));
-    if let Some(system) = &request.system {
-        body.insert("system".to_string(), json!(system));
-    }
-    if !request.tools.is_empty() {
-        body.insert(
-            "tools".to_string(),
-            json!(
-                request
-                    .tools
-                    .iter()
-                    .map(anthropic_tool_value)
-                    .collect::<Vec<_>>()
-            ),
-        );
-    }
+    map.insert("stream".to_string(), json!(false));
 
     Ok(DialectHttpRequest {
         endpoint: join_endpoint(&model.base_url, "messages")?,
-        body: Value::Object(body),
+        body,
         auth: AuthStyle::AnthropicApiKey,
-    })
-}
-
-fn anthropic_tool_value(tool: &AnthropicToolDefinition) -> Value {
-    json!({
-        "name": tool.name,
-        "description": tool.description,
-        "input_schema": tool.input_schema,
     })
 }
 
@@ -330,7 +312,9 @@ fn join_endpoint(base_url: &str, path: &str) -> Result<String, OpenAiCompletions
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ApiKeyConfig, ModelConfig, ProviderConfig, ResolvedApiKey};
+    use crate::models::{
+        AnthropicToolDefinition, ApiKeyConfig, ModelConfig, ProviderConfig, ResolvedApiKey,
+    };
 
     fn registry() -> ToolRegistry {
         ToolRegistry::default()
@@ -424,6 +408,7 @@ mod tests {
             system: Some("be helpful".to_string()),
             messages: vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})],
             tools: Vec::new(),
+            subagent_fork: false,
         };
 
         let http = anthropic_http_request(&model, &request).unwrap();
@@ -431,10 +416,23 @@ mod tests {
         assert_eq!(http.endpoint, "https://api.test/v1/messages");
         assert_eq!(http.auth, AuthStyle::AnthropicApiKey);
         assert_eq!(http.body["model"], json!("model-id"));
-        assert_eq!(http.body["system"], json!("be helpful"));
+        // System is emitted as cache-annotated text blocks, not a bare string,
+        // so the static-system-end breakpoint can ride on Block 1.
+        assert_eq!(
+            http.body["system"],
+            json!([{
+                "type": "text",
+                "text": "be helpful",
+                "cache_control": {"type": "ephemeral"},
+            }])
+        );
         assert_eq!(http.body["max_tokens"], json!(1024));
         assert_eq!(http.body["stream"], json!(false));
-        assert_eq!(http.body["messages"], json!(request.messages));
+        // The sole message is the last one, so it carries the rolling breakpoint.
+        assert_eq!(
+            http.body["messages"][0]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
         assert!(http.body.get("tools").is_none());
     }
 
@@ -459,16 +457,19 @@ mod tests {
                 description: "read a file".to_string(),
                 input_schema: json!({"type": "object"}),
             }],
+            subagent_fork: false,
         };
 
         let http = anthropic_http_request(&model, &request).unwrap();
 
+        // The last (here, only) tool definition carries the tools-end breakpoint.
         assert_eq!(
             http.body["tools"],
             json!([{
                 "name": "read",
                 "description": "read a file",
                 "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"},
             }])
         );
     }

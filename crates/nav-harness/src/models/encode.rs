@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::compaction::COMPACTION_REPLAY_TEXT;
+use crate::context::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
 use crate::models::openai_completions::{
     ChatCompletionMessageRole, ChatCompletionRequestMessage, ChatCompletionToolCall,
     ChatCompletionToolCallFunction, ChatCompletionToolDefinition, OpenAiCompletionsRequest,
@@ -167,6 +168,10 @@ pub struct AnthropicMessagesRequest {
     pub system: Option<String>,
     pub messages: Vec<Value>,
     pub tools: Vec<AnthropicToolDefinition>,
+    /// When set, the rolling message-level cache breakpoint is shifted one
+    /// message earlier so a fire-and-forget subagent fork's throwaway tail is
+    /// never written to the shared cache (plans/context-management.md §2.4).
+    pub subagent_fork: bool,
 }
 
 impl AnthropicMessagesRequest {
@@ -175,7 +180,99 @@ impl AnthropicMessagesRequest {
             system: None,
             messages,
             tools: Vec::new(),
+            subagent_fork: false,
         }
+    }
+
+    /// Serialize to the Anthropic Messages wire body, placing up to four
+    /// `cache_control: {type: "ephemeral"}` breakpoints in the fixed
+    /// tools → system → messages hierarchy (plans/context-management.md §2.4):
+    ///
+    /// 1. end of the tool definitions (large and stable — the biggest win),
+    /// 2. end of the static system block (the Block 1/2 boundary),
+    /// 3. a rolling pair on the last and second-to-last messages, shifted one
+    ///    message earlier for fire-and-forget subagent forks so the throwaway
+    ///    execution tail is never written to the shared cache.
+    pub fn to_request_body(&self) -> Value {
+        let mut body = json!({ "messages": self.serialized_messages() });
+        if let Some(system) = self.serialized_system() {
+            body["system"] = json!(system);
+        }
+        if !self.tools.is_empty() {
+            body["tools"] = json!(self.serialized_tools());
+        }
+        body
+    }
+
+    /// Place the rolling pair of message-level breakpoints on the last and
+    /// second-to-last messages, shifted one earlier for subagent forks. Keeping
+    /// the prior breakpoint guarantees the cache read lands inside Anthropic's
+    /// ~20-block read-lookback window even when one turn appends many tool
+    /// results (plans/context-management.md §2.4).
+    fn serialized_messages(&self) -> Vec<Value> {
+        let len = self.messages.len();
+        let shift = usize::from(self.subagent_fork);
+        let mut messages = self.messages.clone();
+        for offset in [1 + shift, 2 + shift] {
+            if let Some(index) = len.checked_sub(offset) {
+                mark_last_content_block(&mut messages[index]);
+            }
+        }
+        messages
+    }
+
+    /// Split the rendered system prompt on [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`]
+    /// into text blocks (dropping the sentinel), placing the static-system-end
+    /// breakpoint on the first (Block 1) block.
+    fn serialized_system(&self) -> Option<Vec<Value>> {
+        let system = self.system.as_deref()?;
+        let blocks: Vec<Value> = system
+            .split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .enumerate()
+            .map(|(index, text)| {
+                let mut block = anthropic_text_block(text);
+                if index == 0 {
+                    block["cache_control"] = ephemeral_cache_control();
+                }
+                block
+            })
+            .collect();
+        Some(blocks)
+    }
+
+    fn serialized_tools(&self) -> Vec<Value> {
+        let last = self.tools.len().saturating_sub(1);
+        self.tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let mut value = json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                });
+                if index == last {
+                    value["cache_control"] = ephemeral_cache_control();
+                }
+                value
+            })
+            .collect()
+    }
+}
+
+fn ephemeral_cache_control() -> Value {
+    json!({ "type": "ephemeral" })
+}
+
+/// Attach an ephemeral `cache_control` marker to the last content block of a
+/// message. No-op if the message has no non-empty content array.
+fn mark_last_content_block(message: &mut Value) {
+    if let Some(block) = message
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|content| content.last_mut())
+    {
+        block["cache_control"] = ephemeral_cache_control();
     }
 }
 
@@ -200,6 +297,7 @@ impl AnthropicToolDefinition {
 pub struct AnthropicMessagesEncoder {
     system: Option<String>,
     tools: Vec<AnthropicToolDefinition>,
+    subagent_fork: bool,
 }
 
 impl AnthropicMessagesEncoder {
@@ -226,6 +324,14 @@ impl AnthropicMessagesEncoder {
         self
     }
 
+    /// Mark this request as a fire-and-forget subagent fork, shifting the
+    /// rolling message-level cache breakpoint one message earlier so the
+    /// fork's throwaway tail is never written to the shared cache.
+    pub fn subagent_fork(mut self, subagent_fork: bool) -> Self {
+        self.subagent_fork = subagent_fork;
+        self
+    }
+
     pub fn encode(
         &self,
         turns: &[(Turn, Vec<Part>)],
@@ -242,6 +348,7 @@ impl AnthropicMessagesEncoder {
             system: self.system.clone(),
             messages,
             tools: self.tools.clone(),
+            subagent_fork: self.subagent_fork,
         }
     }
 }
