@@ -53,6 +53,23 @@ fn encode(turns: &[(Turn, Vec<Part>)]) -> OpenAiResponsesRequest {
         .expect("encoding should succeed")
 }
 
+/// A turn tagged with the model that produced it, so encrypted reasoning can be
+/// exercised against an active-model match (issue #476).
+fn turn_for_model(role: TurnRole, seq: u32, model_id: &str, parts: Vec<Part>) -> (Turn, Vec<Part>) {
+    let (mut envelope, parts) = turn(role, seq, parts);
+    envelope.meta.model_id = Some(model_id.to_string());
+    (envelope, parts)
+}
+
+/// Encode against an active model that matches the producing model, so verbatim
+/// reasoning re-send is in effect.
+fn encode_for_model(model_id: &str, turns: &[(Turn, Vec<Part>)]) -> OpenAiResponsesRequest {
+    OpenAiResponsesEncoder::new()
+        .with_active_model(Some(model_id))
+        .encode(turns)
+        .expect("encoding should succeed")
+}
+
 #[test]
 fn user_text_part_produces_responses_input_message() {
     let turns = vec![turn(
@@ -274,9 +291,10 @@ fn provider_state_for_different_api_kind_drops_previous_response_id() {
 
 #[test]
 fn encrypted_thinking_part_produces_reasoning_item() {
-    let turns = vec![turn(
+    let turns = vec![turn_for_model(
         TurnRole::Assistant,
         1,
+        "gpt-5",
         vec![Part::Thinking {
             text: "gAAAAABm-encrypted-reasoning".to_string(),
             provider_hint: Some("encrypted".to_string()),
@@ -284,7 +302,7 @@ fn encrypted_thinking_part_produces_reasoning_item() {
         }],
     )];
 
-    let request = encode(&turns);
+    let request = encode_for_model("gpt-5", &turns);
 
     assert_eq!(request.input.len(), 1);
     assert_eq!(
@@ -327,9 +345,10 @@ fn provider_opaque_part_produces_synthetic_output_text_message() {
 #[test]
 fn assistant_items_preserve_canonical_part_order() {
     let call_id = ToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000050").unwrap();
-    let turns = vec![turn(
+    let turns = vec![turn_for_model(
         TurnRole::Assistant,
         1,
+        "gpt-5",
         vec![
             Part::Thinking {
                 text: "encrypted-reasoning".to_string(),
@@ -349,7 +368,7 @@ fn assistant_items_preserve_canonical_part_order() {
         ],
     )];
 
-    let request = encode(&turns);
+    let request = encode_for_model("gpt-5", &turns);
 
     assert_eq!(
         request

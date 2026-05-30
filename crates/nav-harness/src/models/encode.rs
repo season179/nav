@@ -227,6 +227,7 @@ impl OpenAiResponsesRequest {
 pub struct OpenAiResponsesEncoder {
     instructions: Option<String>,
     provider_state: Option<ProviderState>,
+    active_model: Option<String>,
 }
 
 impl OpenAiResponsesEncoder {
@@ -244,13 +245,27 @@ impl OpenAiResponsesEncoder {
         self
     }
 
+    /// Record the model this request will be sent to. Encrypted reasoning is
+    /// re-sent verbatim only when it matches the producing model; otherwise it
+    /// is downgraded to plain text (issue #476).
+    pub fn with_active_model(mut self, active_model: Option<&str>) -> Self {
+        self.active_model = active_model.map(str::to_string);
+        self
+    }
+
     pub fn encode(
         &self,
         turns: &[(Turn, Vec<Part>)],
     ) -> Result<OpenAiResponsesRequest, std::convert::Infallible> {
         let input = turns
             .iter()
-            .flat_map(|(turn, parts)| encode_responses_turn(turn.role, parts))
+            .flat_map(|(turn, parts)| {
+                let verbatim = resend_reasoning_verbatim(
+                    self.active_model.as_deref(),
+                    turn.meta.model_id.as_deref(),
+                );
+                encode_responses_turn(turn.role, parts, verbatim)
+            })
             .collect();
         Ok(self.request(input))
     }
@@ -404,6 +419,7 @@ pub struct AnthropicMessagesEncoder {
     system: Option<String>,
     tools: Vec<AnthropicToolDefinition>,
     subagent_fork: bool,
+    active_model: Option<String>,
 }
 
 impl AnthropicMessagesEncoder {
@@ -434,13 +450,27 @@ impl AnthropicMessagesEncoder {
         self
     }
 
+    /// Record the model this request will be sent to. Signed reasoning is
+    /// re-sent verbatim only when it matches the model that produced the turn;
+    /// see [`resend_reasoning_verbatim`].
+    pub fn with_active_model(mut self, active_model: Option<&str>) -> Self {
+        self.active_model = active_model.map(str::to_string);
+        self
+    }
+
     pub fn encode(
         &self,
         turns: &[(Turn, Vec<Part>)],
     ) -> Result<AnthropicMessagesRequest, std::convert::Infallible> {
         let messages = turns
             .iter()
-            .flat_map(|(turn, parts)| encode_anthropic_turn(turn.role, parts))
+            .flat_map(|(turn, parts)| {
+                let verbatim = resend_reasoning_verbatim(
+                    self.active_model.as_deref(),
+                    turn.meta.model_id.as_deref(),
+                );
+                encode_anthropic_turn(turn.role, parts, verbatim)
+            })
             .collect();
         Ok(self.request(messages))
     }
@@ -455,10 +485,18 @@ impl AnthropicMessagesEncoder {
     }
 }
 
-fn encode_anthropic_turn(role: TurnRole, parts: &[Part]) -> Vec<Value> {
+/// Whether signed/encrypted reasoning may be re-sent verbatim to the active
+/// model. True only when the producing model is known and matches the active
+/// model; an unknown producer or a model swap forces a plain-text downgrade so
+/// a foreign model never rejects another model's signature (issue #476).
+fn resend_reasoning_verbatim(active_model: Option<&str>, producing_model: Option<&str>) -> bool {
+    matches!((active_model, producing_model), (Some(active), Some(producing)) if active == producing)
+}
+
+fn encode_anthropic_turn(role: TurnRole, parts: &[Part], resend_reasoning: bool) -> Vec<Value> {
     match role {
         TurnRole::User => anthropic_user_messages(parts),
-        TurnRole::Assistant => anthropic_assistant_messages(parts),
+        TurnRole::Assistant => anthropic_assistant_messages(parts, resend_reasoning),
     }
 }
 
@@ -470,7 +508,7 @@ fn anthropic_user_messages(parts: &[Part]) -> Vec<Value> {
     anthropic_message("user", content)
 }
 
-fn anthropic_assistant_messages(parts: &[Part]) -> Vec<Value> {
+fn anthropic_assistant_messages(parts: &[Part], resend_reasoning: bool) -> Vec<Value> {
     let mut messages = Vec::new();
     let mut assistant_content = Vec::new();
     let mut tool_result_content = Vec::new();
@@ -483,7 +521,7 @@ fn anthropic_assistant_messages(parts: &[Part]) -> Vec<Value> {
             continue;
         }
 
-        if let Some(block) = anthropic_assistant_content_block(part) {
+        if let Some(block) = anthropic_assistant_content_block(part, resend_reasoning) {
             messages.extend(anthropic_message("user", tool_result_content));
             tool_result_content = Vec::new();
             assistant_content.push(block);
@@ -503,7 +541,7 @@ fn anthropic_user_content_block(part: &Part) -> Option<Value> {
     anthropic_text_content_block(part)
 }
 
-fn anthropic_assistant_content_block(part: &Part) -> Option<Value> {
+fn anthropic_assistant_content_block(part: &Part, resend_reasoning: bool) -> Option<Value> {
     if let Some(text) = anthropic_text_for_part(part) {
         return Some(anthropic_text_block(text));
     }
@@ -521,18 +559,38 @@ fn anthropic_assistant_content_block(part: &Part) -> Option<Value> {
             "input": arguments,
         })),
         Part::Thinking {
-            text, signature, ..
-        } => {
-            let mut block = json!({
-                "type": "thinking",
-                "thinking": text,
-            });
-            if let Some(signature) = signature {
-                block["signature"] = json!(signature);
-            }
-            Some(block)
-        }
+            text,
+            signature,
+            provider_hint,
+        } => anthropic_reasoning_block(
+            text,
+            signature.as_deref(),
+            provider_hint.as_deref(),
+            resend_reasoning,
+        ),
         _ => None,
+    }
+}
+
+/// Encode a reasoning part for an Anthropic request, honoring reasoning fidelity
+/// across model swaps (issue #476):
+/// - To its producing model, signed thinking is re-sent verbatim and redacted
+///   thinking round-trips as a `redacted_thinking` block.
+/// - To a foreign model, signed thinking is downgraded to a plain text block (no
+///   signature to reject), while redacted thinking is dropped entirely because
+///   its opaque data carries no human-readable reasoning.
+fn anthropic_reasoning_block(
+    text: &str,
+    signature: Option<&str>,
+    provider_hint: Option<&str>,
+    resend_reasoning: bool,
+) -> Option<Value> {
+    let is_redacted = provider_hint == Some("redacted_thinking");
+    match (is_redacted, resend_reasoning) {
+        (true, true) => Some(anthropic_redacted_thinking_block(text)),
+        (true, false) => None,
+        (false, true) => Some(anthropic_thinking_block(text, signature)),
+        (false, false) => Some(anthropic_text_block(text)),
     }
 }
 
@@ -575,6 +633,24 @@ fn anthropic_text_block(text: &str) -> Value {
     json!({
         "type": "text",
         "text": text,
+    })
+}
+
+fn anthropic_thinking_block(text: &str, signature: Option<&str>) -> Value {
+    let mut block = json!({
+        "type": "thinking",
+        "thinking": text,
+    });
+    if let Some(signature) = signature {
+        block["signature"] = json!(signature);
+    }
+    block
+}
+
+fn anthropic_redacted_thinking_block(data: &str) -> Value {
+    json!({
+        "type": "redacted_thinking",
+        "data": data,
     })
 }
 
@@ -1070,10 +1146,10 @@ fn encode_turn(turn: &Turn, parts: &[Part]) -> Vec<ChatCompletionRequestMessage>
     messages
 }
 
-fn encode_responses_turn(role: TurnRole, parts: &[Part]) -> Vec<Value> {
+fn encode_responses_turn(role: TurnRole, parts: &[Part], resend_reasoning: bool) -> Vec<Value> {
     match role {
         TurnRole::User => responses_user_items(parts),
-        TurnRole::Assistant => responses_assistant_items(parts),
+        TurnRole::Assistant => responses_assistant_items(parts, resend_reasoning),
     }
 }
 
@@ -1118,11 +1194,14 @@ fn responses_user_items(parts: &[Part]) -> Vec<Value> {
     })]
 }
 
-fn responses_assistant_items(parts: &[Part]) -> Vec<Value> {
-    parts.iter().filter_map(responses_assistant_item).collect()
+fn responses_assistant_items(parts: &[Part], resend_reasoning: bool) -> Vec<Value> {
+    parts
+        .iter()
+        .filter_map(|part| responses_assistant_item(part, resend_reasoning))
+        .collect()
 }
 
-fn responses_assistant_item(part: &Part) -> Option<Value> {
+fn responses_assistant_item(part: &Part, resend_reasoning: bool) -> Option<Value> {
     if let Some(text) = responses_text_for_part(part) {
         return Some(responses_output_text_message(text.to_string()));
     }
@@ -1144,11 +1223,17 @@ fn responses_assistant_item(part: &Part) -> Option<Value> {
             call_id.as_str(),
             content,
         )),
+        // The encrypted reasoning blob is opaque (no human-readable form), so it
+        // is re-sent verbatim only to its producing model and otherwise dropped:
+        // a foreign model is never handed another model's undecryptable content,
+        // and we avoid polluting its context with an opaque blob (issue #476).
         Part::Thinking {
             text,
             provider_hint: Some(provider_hint),
             ..
-        } if provider_hint == "encrypted" => Some(responses_reasoning_item(text)),
+        } if provider_hint == "encrypted" => {
+            resend_reasoning.then(|| responses_reasoning_item(text))
+        }
         _ => None,
     }
 }
@@ -1598,5 +1683,194 @@ mod tests {
         let tools1 = serde_json::to_string(&req1.serialized_tools()).unwrap();
         let tools2 = serde_json::to_string(&req2.serialized_tools()).unwrap();
         assert_eq!(tools1, tools2);
+    }
+
+    // --- Reasoning fidelity across model swaps (issue #476) ---
+
+    use crate::sessions::TurnMeta;
+    use nav_types::{MessageId, RunId};
+
+    fn assistant_turn(model_id: &str, parts: Vec<Part>) -> (Turn, Vec<Part>) {
+        let turn = Turn {
+            id: MessageId::new_unchecked("msg"),
+            run_id: RunId::new_unchecked("run"),
+            seq: 0,
+            role: TurnRole::Assistant,
+            meta: TurnMeta {
+                model_id: Some(model_id.to_string()),
+                ..TurnMeta::default()
+            },
+            created_at: 0,
+        };
+        (turn, parts)
+    }
+
+    fn signed_thinking(text: &str, signature: &str) -> Part {
+        Part::Thinking {
+            text: text.to_string(),
+            provider_hint: Some("thinking".to_string()),
+            signature: Some(signature.to_string()),
+        }
+    }
+
+    fn encrypted_reasoning(encrypted: &str) -> Part {
+        Part::Thinking {
+            text: encrypted.to_string(),
+            provider_hint: Some("encrypted".to_string()),
+            signature: None,
+        }
+    }
+
+    fn redacted_thinking(data: &str) -> Part {
+        Part::Thinking {
+            text: data.to_string(),
+            provider_hint: Some("redacted_thinking".to_string()),
+            signature: None,
+        }
+    }
+
+    fn anthropic_blocks(request: &AnthropicMessagesRequest) -> Vec<Value> {
+        request
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_array))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    fn block_of_type<'a>(blocks: &'a [Value], type_name: &str) -> Option<&'a Value> {
+        blocks
+            .iter()
+            .find(|block| block.get("type").and_then(Value::as_str) == Some(type_name))
+    }
+
+    #[test]
+    fn anthropic_resends_signed_reasoning_verbatim_when_model_matches() {
+        let turns = vec![assistant_turn(
+            "claude-opus",
+            vec![signed_thinking("deep thoughts", "sig-abc")],
+        )];
+        let encoder = AnthropicMessagesEncoder::new().with_active_model(Some("claude-opus"));
+
+        let request = encoder.encode(&turns).unwrap();
+
+        let blocks = anthropic_blocks(&request);
+        let thinking = block_of_type(&blocks, "thinking").expect("thinking block re-sent");
+        assert_eq!(thinking["thinking"], json!("deep thoughts"));
+        assert_eq!(thinking["signature"], json!("sig-abc"));
+    }
+
+    #[test]
+    fn anthropic_downgrades_reasoning_to_plain_text_for_foreign_model() {
+        let turns = vec![assistant_turn(
+            "claude-opus",
+            vec![signed_thinking("deep thoughts", "sig-abc")],
+        )];
+        let encoder = AnthropicMessagesEncoder::new().with_active_model(Some("gpt-5"));
+
+        let request = encoder.encode(&turns).unwrap();
+
+        let blocks = anthropic_blocks(&request);
+        // A foreign model never receives the signed thinking block...
+        assert!(block_of_type(&blocks, "thinking").is_none());
+        // ...the reasoning survives as a plain text block instead, with no
+        // signature for the foreign model to reject.
+        let text = block_of_type(&blocks, "text").expect("reasoning downgraded to text");
+        assert_eq!(text["text"], json!("deep thoughts"));
+        assert!(text.get("signature").is_none());
+    }
+
+    #[test]
+    fn anthropic_resends_redacted_reasoning_as_redacted_block_when_model_matches() {
+        let turns = vec![assistant_turn(
+            "claude-opus",
+            vec![redacted_thinking("ENC_DATA")],
+        )];
+        let encoder = AnthropicMessagesEncoder::new().with_active_model(Some("claude-opus"));
+
+        let request = encoder.encode(&turns).unwrap();
+
+        let blocks = anthropic_blocks(&request);
+        // Redacted thinking must round-trip as a redacted_thinking block; sent as
+        // a plain "thinking" block its opaque data would be rejected (a 400).
+        assert!(block_of_type(&blocks, "thinking").is_none());
+        let redacted = block_of_type(&blocks, "redacted_thinking").expect("redacted block re-sent");
+        assert_eq!(redacted["data"], json!("ENC_DATA"));
+    }
+
+    #[test]
+    fn anthropic_drops_redacted_reasoning_for_foreign_model() {
+        let turns = vec![assistant_turn(
+            "claude-opus",
+            vec![redacted_thinking("ENC_DATA")],
+        )];
+        let encoder = AnthropicMessagesEncoder::new().with_active_model(Some("gpt-5"));
+
+        let request = encoder.encode(&turns).unwrap();
+
+        // Redacted thinking carries no human-readable text, so a foreign model
+        // gets nothing rather than an opaque blob masquerading as assistant text.
+        assert!(request.messages.is_empty());
+    }
+
+    fn responses_item_of_type<'a>(
+        request: &'a OpenAiResponsesRequest,
+        ty: &str,
+    ) -> Option<&'a Value> {
+        request
+            .input
+            .iter()
+            .find(|item| item.get("type").and_then(Value::as_str) == Some(ty))
+    }
+
+    #[test]
+    fn responses_resends_encrypted_reasoning_verbatim_when_model_matches() {
+        let turns = vec![assistant_turn(
+            "gpt-5",
+            vec![encrypted_reasoning("enc-blob")],
+        )];
+        let encoder = OpenAiResponsesEncoder::new().with_active_model(Some("gpt-5"));
+
+        let request = encoder.encode(&turns).unwrap();
+
+        let reasoning = responses_item_of_type(&request, "reasoning").expect("reasoning re-sent");
+        assert_eq!(reasoning["encrypted_content"], json!("enc-blob"));
+    }
+
+    #[test]
+    fn responses_drops_encrypted_reasoning_for_foreign_model() {
+        let turns = vec![assistant_turn(
+            "gpt-5",
+            vec![encrypted_reasoning("enc-blob")],
+        )];
+        let encoder = OpenAiResponsesEncoder::new().with_active_model(Some("claude-opus"));
+
+        let request = encoder.encode(&turns).unwrap();
+
+        // The opaque encrypted blob is never replayed to a foreign model, and
+        // since it carries no readable text it is dropped rather than surfaced
+        // as gibberish output_text.
+        assert!(request.input.is_empty());
+    }
+
+    #[test]
+    fn reasoning_downgraded_when_active_model_is_unknown() {
+        let turns = vec![assistant_turn(
+            "claude-opus",
+            vec![signed_thinking("deep thoughts", "sig-abc")],
+        )];
+        // No active model recorded: we cannot prove a producer match, so the
+        // safe default is to downgrade rather than risk a signature rejection.
+        let encoder = AnthropicMessagesEncoder::new();
+
+        let request = encoder.encode(&turns).unwrap();
+
+        let blocks = anthropic_blocks(&request);
+        assert!(block_of_type(&blocks, "thinking").is_none());
+        assert_eq!(
+            block_of_type(&blocks, "text").expect("downgraded text")["text"],
+            json!("deep thoughts")
+        );
     }
 }
