@@ -33,6 +33,10 @@ impl NavTool for BashTool {
         "Run a shell command from the session cwd."
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Execute bash commands")
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

@@ -27,6 +27,14 @@ impl NavTool for ReadTool {
         "Read a UTF-8 text file from the workspace with line numbers."
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Read file contents")
+    }
+
+    fn prompt_guidelines(&self) -> &[&str] {
+        &["Use read to examine files instead of cat or sed."]
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

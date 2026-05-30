@@ -22,6 +22,25 @@ impl NavTool for EditTool {
         "Edit a UTF-8 text file by replacing exact old_text matches."
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some(
+            "Make precise file edits with exact text replacement, including multiple disjoint \
+             edits in one call",
+        )
+    }
+
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[
+            "Use edit for precise changes (old_text must match exactly)",
+            "When changing multiple separate locations in one file, use one edit call with \
+             multiple edits instead of multiple edit calls",
+            "Each old_text is matched against the original file, not after earlier edits are \
+             applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+            "Keep old_text as small as possible while still being unique in the file. Do not pad \
+             with large unchanged regions.",
+        ]
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

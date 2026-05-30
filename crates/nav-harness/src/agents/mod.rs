@@ -318,19 +318,19 @@ fn assemble_system_prompt(tool_registry: &ToolRegistry, workspace_root: Option<&
     );
     let skills = SkillRegistry::discover_all(&skill_roots);
 
-    let conventions = workspace_root
+    let context_files = workspace_root
         .map(|root| {
             let mut cache = ContextFileCache::new(root.to_path_buf());
-            cache.load().to_string()
+            cache.load_files().to_vec()
         })
         .unwrap_or_default();
 
-    // The builder omits empty skills/conventions sections itself, so pass them
+    // The builder omits empty skills/context sections itself, so pass them
     // unconditionally rather than re-guarding here.
     SystemPromptBuilder::new(&clock, &cwd)
         .tools(tool_registry)
         .skills(&skills)
-        .conventions(&conventions)
+        .context_files(&context_files)
         .render()
 }
 

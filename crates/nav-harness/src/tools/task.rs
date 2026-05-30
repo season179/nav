@@ -209,6 +209,10 @@ impl NavTool for TaskTool {
          reports back a single consolidated result."
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Delegate a sub-task to a child subagent")
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

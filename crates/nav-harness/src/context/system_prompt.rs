@@ -1,12 +1,15 @@
 //! Deterministic system-prompt builder.
 //!
-//! Renders OS, cwd, date, optional user conventions, and a tool list into a
-//! `ModelTurn::system_text(…)` ready to prepend to the model request. `Clock` and
-//! `Cwd` are injectable traits so tests are deterministic.
+//! Renders an identity preamble, an advertised tool list, guidelines, project
+//! context files, available skills, and a date/cwd footer into a
+//! `ModelTurn::system_text(…)` ready to prepend to the model request. The layout
+//! mirrors pi's `buildSystemPrompt`. `Clock` and `Cwd` are injectable traits so
+//! tests are deterministic.
 
 use std::fmt::Write;
 use std::time::SystemTime;
 
+use crate::context::files::ContextFile;
 use crate::sessions::ModelTurn;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
@@ -22,21 +25,17 @@ use crate::tools::ToolRegistry;
 /// the marker so it never reaches the model.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 
-/// Block 1: static agent identity, tone, and tool-usage rules. This text is
-/// byte-identical across model swaps and session state — it deliberately
-/// contains no model name, date, cwd, or other volatile data so the cached
-/// prefix never churns.
-const STATIC_IDENTITY: &str = "\
-You are nav, an interactive CLI agent for software-engineering tasks.
+/// Block 1: static agent identity. Byte-identical across model swaps and session
+/// state — it deliberately contains no model name, date, cwd, or other volatile
+/// data so the cached prefix never churns. The advertised tool list and
+/// guidelines follow it (also Block 1, stable for a session).
+const STATIC_IDENTITY: &str = "You are an expert coding assistant operating inside nav, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
 
-## Tone
-- Be concise, direct, and objective. Favor action over commentary.
-- Don't just agree; surface what is best for the project.
-
-## Tool usage
-- Prefer a dedicated tool over a shell command whenever one fits.
-- Read a file before editing it.
-- Never assume a library or framework is available; verify it is used in the project first.";
+/// Guidelines always appended last, in this order (mirrors pi).
+const ALWAYS_GUIDELINES: &[&str] = &[
+    "Be concise in your responses",
+    "Show file paths clearly when working with files",
+];
 
 // ---------------------------------------------------------------------------
 // Traits (injectable seams)
@@ -89,7 +88,7 @@ impl Cwd for SystemCwd {
 pub struct SystemPromptBuilder<'a> {
     clock: &'a dyn Clock,
     cwd: &'a dyn Cwd,
-    conventions: Option<&'a str>,
+    context_files: &'a [ContextFile],
     tools: Option<&'a ToolRegistry>,
     skills: Option<&'a SkillRegistry>,
     git_status: Option<&'a str>,
@@ -100,15 +99,17 @@ impl<'a> SystemPromptBuilder<'a> {
         Self {
             clock,
             cwd,
-            conventions: None,
+            context_files: &[],
             tools: None,
             skills: None,
             git_status: None,
         }
     }
 
-    pub fn conventions(mut self, conventions: &'a str) -> Self {
-        self.conventions = Some(conventions);
+    /// Set the discovered project context files (CLAUDE.md / AGENTS.md), each
+    /// wrapped in a `<project_instructions path="…">` block.
+    pub fn context_files(mut self, files: &'a [ContextFile]) -> Self {
+        self.context_files = files;
         self
     }
 
@@ -117,7 +118,7 @@ impl<'a> SystemPromptBuilder<'a> {
         self
     }
 
-    /// Set the discovered skills, disclosed as name + summary + path only.
+    /// Set the discovered skills, disclosed as name + description + location.
     pub fn skills(mut self, registry: &'a SkillRegistry) -> Self {
         self.skills = Some(registry);
         self
@@ -138,81 +139,166 @@ impl<'a> SystemPromptBuilder<'a> {
     ///
     /// The output is three cache-stable blocks joined by
     /// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`]:
-    /// 1. static identity/tone/tool-usage rules (byte-identical across models),
-    /// 2. semi-static context (OS, cwd, tool list),
-    /// 3. volatile context (date, git status, project conventions).
+    /// 1. identity, advertised tools, and guidelines (stable for a session),
+    /// 2. semi-static context (project context files, skills),
+    /// 3. volatile context (git status, date, cwd).
     pub(crate) fn render(&self) -> String {
-        let mut out = String::with_capacity(512);
+        let mut out = String::with_capacity(1024);
 
-        // Block 1 — static identity, tone, and tool-usage rules.
+        // Block 1 — identity, advertised tools, guidelines.
         out.push_str(STATIC_IDENTITY);
-        out.push('\n');
+        self.write_tools(&mut out);
+        self.write_guidelines(&mut out);
         out.push_str(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
-        self.write_semi_static(&mut out);
+
+        // Block 2 — semi-static context: project context files and skills.
+        self.write_project_context(&mut out);
+        self.write_skills(&mut out);
         out.push_str(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
-        self.write_volatile(&mut out);
+
+        // Block 3 — volatile context: git status and the date/cwd footer.
+        self.write_footer(&mut out);
 
         out
     }
 
-    /// Block 2 — semi-static context: OS, cwd, and the active tool list.
-    fn write_semi_static(&self, out: &mut String) {
-        writeln!(out, "## Environment").unwrap();
-        writeln!(out, "- OS: {}", os_name()).unwrap();
-        writeln!(out, "- cwd: {}", self.cwd.cwd()).unwrap();
-        out.push('\n');
-
-        writeln!(out, "## Tools").unwrap();
-        let tool_names = self.tools.map(|r| r.tool_names()).unwrap_or_default();
-        if tool_names.is_empty() {
-            out.push_str("(no tools available)\n");
-        } else {
-            for name in &tool_names {
-                writeln!(out, "- {name}").unwrap();
+    /// Block 1 — the advertised tool list. A tool appears only when it returns a
+    /// one-line `prompt_snippet`; otherwise the list reads `(none)`. Extension
+    /// tools without snippets are covered by the trailing sentence.
+    fn write_tools(&self, out: &mut String) {
+        out.push_str("\n\nAvailable tools:\n");
+        let mut any = false;
+        if let Some(registry) = self.tools {
+            for tool in registry.tools() {
+                if let Some(snippet) = tool.prompt_snippet() {
+                    writeln!(out, "- {}: {}", tool.name(), snippet).unwrap();
+                    any = true;
+                }
             }
         }
-
-        self.write_skills(out);
+        if !any {
+            out.push_str("(none)\n");
+        }
+        out.push_str(
+            "\nIn addition to the tools above, you may have access to other custom tools \
+             depending on the project.",
+        );
     }
 
-    /// Block 2 — available skills, disclosed progressively: only name, summary,
-    /// and path. The model reads each `SKILL.md` on demand. Omitted entirely
-    /// when no skills are present so the cached prefix never carries a stray
-    /// heading.
+    /// Block 1 — guidelines, deduplicated and ordered: an optional bash-only
+    /// file-ops hint, then each tool's contributed guidelines (sorted tool
+    /// order), then the always-on guidelines.
+    fn write_guidelines(&self, out: &mut String) {
+        out.push_str("\n\nGuidelines:");
+        for guideline in self.guidelines() {
+            write!(out, "\n- {guideline}").unwrap();
+        }
+    }
+
+    /// Collect the guideline bullets in order, trimming and deduplicating.
+    fn guidelines(&self) -> Vec<&'a str> {
+        let names = self.tools.map(ToolRegistry::tool_names).unwrap_or_default();
+        let has = |name: &str| names.contains(&name);
+
+        let mut candidates: Vec<&'a str> = Vec::new();
+        // File-exploration hint: only when bash is present without dedicated
+        // listing/search tools (mirrors pi).
+        if has("bash") && !has("grep") && !has("find") && !has("ls") {
+            candidates.push("Use bash for file operations like ls, rg, find");
+        }
+        if let Some(registry) = self.tools {
+            for tool in registry.tools() {
+                candidates.extend(tool.prompt_guidelines().iter().copied());
+            }
+        }
+        candidates.extend_from_slice(ALWAYS_GUIDELINES);
+
+        let mut seen = std::collections::HashSet::new();
+        candidates
+            .into_iter()
+            .map(str::trim)
+            .filter(|g| !g.is_empty() && seen.insert(*g))
+            .collect()
+    }
+
+    /// Block 2 — project context files, each wrapped in a
+    /// `<project_instructions path="…">` block. Omitted entirely when none were
+    /// discovered.
+    fn write_project_context(&self, out: &mut String) {
+        if self.context_files.is_empty() {
+            return;
+        }
+        out.push_str("\n\n<project_context>\n\nProject-specific instructions and guidelines:\n");
+        for file in self.context_files {
+            write!(
+                out,
+                "\n<project_instructions path=\"{}\">\n{}\n</project_instructions>\n",
+                file.path.display(),
+                file.content.trim_end()
+            )
+            .unwrap();
+        }
+        out.push_str("\n</project_context>");
+    }
+
+    /// Block 2 — available skills, disclosed progressively (name, description,
+    /// location only). Emitted only when the `read` tool is available — the
+    /// model loads each `SKILL.md` on demand — and omitted when no skills exist.
     fn write_skills(&self, out: &mut String) {
+        let read_available = self.tools.is_some_and(|r| r.tool_names().contains(&"read"));
+        if !read_available {
+            return;
+        }
         let Some(registry) = self.skills.filter(|r| !r.is_empty()) else {
             return;
         };
 
-        out.push('\n');
-        writeln!(out, "## Skills").unwrap();
         out.push_str(
-            "Each entry is name — summary (path). Read a skill's SKILL.md with the read tool \
-             only when you decide to use that skill.\n",
+            "\n\nThe following skills provide specialized instructions for specific tasks.\n",
         );
+        out.push_str(
+            "Use the read tool to load a skill's file when the task matches its description.\n",
+        );
+        out.push_str(
+            "When a skill file references a relative path, resolve it against the skill directory \
+             (parent of SKILL.md / dirname of the path) and use that absolute path in tool \
+             commands.\n\n",
+        );
+        out.push_str("<available_skills>\n");
         for skill in registry.skills() {
+            out.push_str("  <skill>\n");
+            writeln!(out, "    <name>{}</name>", escape_xml(&skill.name)).unwrap();
             writeln!(
                 out,
-                "- {} — {} ({})",
-                skill.name,
-                skill.summary,
-                skill.path.display()
+                "    <description>{}</description>",
+                escape_xml(&skill.summary)
             )
             .unwrap();
+            writeln!(
+                out,
+                "    <location>{}</location>",
+                escape_xml(&skill.path.display().to_string())
+            )
+            .unwrap();
+            out.push_str("  </skill>\n");
         }
+        out.push_str("</available_skills>");
     }
 
-    /// Block 3 — volatile context: date, git status, and project conventions.
-    fn write_volatile(&self, out: &mut String) {
-        writeln!(out, "## Session").unwrap();
-        writeln!(out, "- date: {}", self.clock.now_date()).unwrap();
-
-        if let Some(status) = self.git_status {
-            push_section(out, "Git status", status);
+    /// Block 3 — volatile footer: optional git status, then the current date and
+    /// working directory.
+    fn write_footer(&self, out: &mut String) {
+        if let Some(status) = self.git_status.filter(|s| !s.is_empty()) {
+            out.push_str("\n\nGit status:\n");
+            out.push_str(status.trim_end());
         }
-        if let Some(conv) = self.conventions {
-            push_section(out, "Project conventions", conv);
-        }
+        write!(
+            out,
+            "\n\nCurrent date: {}\nCurrent working directory: {}\n",
+            self.clock.now_date(),
+            self.cwd.cwd()
+        )
+        .unwrap();
     }
 }
 
@@ -220,31 +306,11 @@ impl<'a> SystemPromptBuilder<'a> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Append a blank line, a `## {header}` heading, and `body` to `out`,
-/// normalizing `body` to end with exactly one newline. An empty `body` is
-/// skipped entirely so the prompt never carries a dangling heading.
-fn push_section(out: &mut String, header: &str, body: &str) {
-    if body.is_empty() {
-        return;
-    }
-    out.push('\n');
-    writeln!(out, "## {header}").unwrap();
-    out.push_str(body);
-    if !body.ends_with('\n') {
-        out.push('\n');
-    }
-}
-
-fn os_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macOS"
-    } else if cfg!(target_os = "linux") {
-        "Linux"
-    } else if cfg!(target_os = "windows") {
-        "Windows"
-    } else {
-        "unknown"
-    }
+/// Minimal XML escaping for skill metadata rendered inside `<available_skills>`.
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Convert a day count since 1970-01-01 into a `YYYY-MM-DD` string using
@@ -306,18 +372,23 @@ mod tests {
         }
     }
 
+    fn clock() -> FakeClock {
+        FakeClock {
+            date: "2025-06-15".to_string(),
+        }
+    }
+
+    fn cwd() -> FakeCwd {
+        FakeCwd {
+            dir: "/home/user/project".to_string(),
+        }
+    }
+
     // -- Three-block structure tests -----------------------------------------
 
     #[test]
     fn render_emits_three_blocks_separated_by_boundary() {
-        let clock = FakeClock {
-            date: "2025-06-15".to_string(),
-        };
-        let cwd = FakeCwd {
-            dir: "/home/user/project".to_string(),
-        };
-
-        let rendered = SystemPromptBuilder::new(&clock, &cwd).render();
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd()).render();
         let blocks: Vec<&str> = rendered.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).collect();
 
         assert_eq!(
@@ -330,7 +401,12 @@ mod tests {
     #[test]
     fn block_one_is_byte_identical_across_session_state() {
         let mut registry = ToolRegistry::default();
-        registry.register(PromptTool("read")).unwrap();
+        registry.register(PromptTool::new("read")).unwrap();
+
+        let files = [ContextFile {
+            path: std::path::PathBuf::from("/proj/CLAUDE.md"),
+            content: "Use conventional commits.".to_string(),
+        }];
 
         let a = SystemPromptBuilder::new(
             &FakeClock {
@@ -342,7 +418,7 @@ mod tests {
         )
         .tools(&registry)
         .git_status(" M src/main.rs")
-        .conventions("Use conventional commits.")
+        .context_files(&files)
         .render();
 
         let b = SystemPromptBuilder::new(
@@ -353,6 +429,7 @@ mod tests {
                 dir: "/srv/bob".to_string(),
             },
         )
+        .tools(&registry)
         .render();
 
         let block_a = a.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).next().unwrap();
@@ -366,16 +443,9 @@ mod tests {
 
     #[test]
     fn volatile_data_confined_to_block_three() {
-        let rendered = SystemPromptBuilder::new(
-            &FakeClock {
-                date: "2025-06-15".to_string(),
-            },
-            &FakeCwd {
-                dir: "/home/user/project".to_string(),
-            },
-        )
-        .git_status(" M src/main.rs")
-        .render();
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .git_status(" M src/main.rs")
+            .render();
 
         let blocks: Vec<&str> = rendered.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).collect();
         assert_eq!(blocks.len(), 3);
@@ -394,7 +464,7 @@ mod tests {
         }
 
         assert!(
-            blocks[2].contains("2025-06-15"),
+            blocks[2].contains("Current date: 2025-06-15"),
             "date missing from Block 3"
         );
         assert!(
@@ -403,120 +473,191 @@ mod tests {
         );
     }
 
+    // -- Tool list -----------------------------------------------------------
+
     #[test]
-    fn empty_optional_sections_are_omitted() {
-        let rendered = SystemPromptBuilder::new(
-            &FakeClock {
-                date: "2025-06-15".to_string(),
-            },
-            &FakeCwd {
-                dir: "/home/user/project".to_string(),
-            },
-        )
-        // A clean working tree yields empty `git status --porcelain`.
-        .git_status("")
-        .conventions("")
-        .render();
+    fn advertises_only_tools_with_snippets() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PromptTool::with_snippet("read", "Read file contents"))
+            .unwrap();
+        registry
+            .register(PromptTool::new("nosnippet")) // no snippet → hidden
+            .unwrap();
+
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .tools(&registry)
+            .render();
 
         assert!(
-            !rendered.contains("## Git status"),
+            rendered.contains("Available tools:\n- read: Read file contents\n"),
+            "snippet-bearing tool should be listed: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("nosnippet"),
+            "snippet-less tool should be hidden: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(
+                "In addition to the tools above, you may have access to other custom tools"
+            ),
+            "missing custom-tools sentence: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn empty_tool_list_reads_none() {
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd()).render();
+        assert!(
+            rendered.contains("Available tools:\n(none)\n"),
+            "no tools should render `(none)`: {rendered:?}"
+        );
+    }
+
+    // -- Guidelines ----------------------------------------------------------
+
+    #[test]
+    fn guidelines_collect_tool_bullets_and_always_ons_deduped() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PromptTool::with_guidelines(
+                "edit",
+                &[
+                    "Use edit for precise changes",
+                    "Be concise in your responses",
+                ],
+            ))
+            .unwrap();
+
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .tools(&registry)
+            .render();
+
+        assert!(rendered.contains("- Use edit for precise changes"));
+        assert!(rendered.contains("- Be concise in your responses"));
+        assert!(rendered.contains("- Show file paths clearly when working with files"));
+        // "Be concise" appears once despite being contributed by both the tool
+        // and the always-on list.
+        assert_eq!(
+            rendered.matches("Be concise in your responses").count(),
+            1,
+            "guidelines must be deduplicated: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bash_file_ops_guideline_suppressed_when_ls_present() {
+        let mut registry = ToolRegistry::default();
+        registry.register(PromptTool::new("bash")).unwrap();
+        registry.register(PromptTool::new("ls")).unwrap();
+
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .tools(&registry)
+            .render();
+
+        assert!(
+            !rendered.contains("Use bash for file operations"),
+            "bash file-ops hint must be suppressed when ls is present: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn bash_file_ops_guideline_present_without_listing_tools() {
+        let mut registry = ToolRegistry::default();
+        registry.register(PromptTool::new("bash")).unwrap();
+
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .tools(&registry)
+            .render();
+
+        assert!(
+            rendered.contains("- Use bash for file operations like ls, rg, find"),
+            "bash file-ops hint expected when no listing tools: {rendered:?}"
+        );
+    }
+
+    // -- Project context -----------------------------------------------------
+
+    #[test]
+    fn project_context_wraps_each_file_with_path() {
+        let files = [
+            ContextFile {
+                path: std::path::PathBuf::from("/proj/CLAUDE.md"),
+                content: "Use conventional commits.\n".to_string(),
+            },
+            ContextFile {
+                path: std::path::PathBuf::from("/proj/AGENTS.md"),
+                content: "No force-push.".to_string(),
+            },
+        ];
+
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .context_files(&files)
+            .render();
+
+        assert!(rendered.contains("<project_context>"));
+        assert!(rendered.contains("Project-specific instructions and guidelines:"));
+        assert!(
+            rendered.contains(
+                "<project_instructions path=\"/proj/CLAUDE.md\">\nUse conventional commits.\n</project_instructions>"
+            ),
+            "first file not wrapped with path: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(
+                "<project_instructions path=\"/proj/AGENTS.md\">\nNo force-push.\n</project_instructions>"
+            ),
+            "second file not wrapped with path: {rendered:?}"
+        );
+        assert!(rendered.contains("</project_context>"));
+    }
+
+    #[test]
+    fn no_project_context_section_when_no_files() {
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd()).render();
+        assert!(
+            !rendered.contains("<project_context>"),
+            "no files should omit the project context block: {rendered:?}"
+        );
+    }
+
+    // -- Footer --------------------------------------------------------------
+
+    #[test]
+    fn footer_ends_with_date_and_cwd() {
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd()).render();
+        assert!(
+            rendered.ends_with(
+                "Current date: 2025-06-15\nCurrent working directory: /home/user/project\n"
+            ),
+            "footer must end with date and cwd: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn git_status_rendered_before_footer_when_present() {
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .git_status(" M src/main.rs")
+            .render();
+
+        let git_idx = rendered.find("Git status:").expect("git status present");
+        let date_idx = rendered.find("Current date:").expect("date present");
+        assert!(
+            git_idx < date_idx,
+            "git status must precede the date/cwd footer: {rendered:?}"
+        );
+        assert!(rendered.contains("Git status:\n M src/main.rs"));
+    }
+
+    #[test]
+    fn empty_git_status_omitted() {
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .git_status("")
+            .render();
+        assert!(
+            !rendered.contains("Git status:"),
             "empty git status should not emit a heading: {rendered:?}"
         );
-        assert!(
-            !rendered.contains("## Project conventions"),
-            "empty conventions should not emit a heading: {rendered:?}"
-        );
-    }
-
-    // -- Snapshot tests ------------------------------------------------------
-
-    #[test]
-    fn system_prompt_no_tools_no_conventions() {
-        let clock = FakeClock {
-            date: "2025-06-15".to_string(),
-        };
-        let cwd = FakeCwd {
-            dir: "/home/user/project".to_string(),
-        };
-
-        let prompt = SystemPromptBuilder::new(&clock, &cwd).build();
-
-        assert_eq!(prompt.role, crate::sessions::ModelTurnRole::System);
-
-        let os = if cfg!(target_os = "macos") {
-            "macOS"
-        } else if cfg!(target_os = "linux") {
-            "Linux"
-        } else if cfg!(target_os = "windows") {
-            "Windows"
-        } else {
-            "unknown"
-        };
-
-        let expected = format!(
-            "\
-{STATIC_IDENTITY}
-{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}## Environment
-- OS: {os}
-- cwd: /home/user/project
-
-\
-## Tools
-(no tools available)
-{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}## Session
-- date: 2025-06-15
-"
-        );
-
-        assert_eq!(prompt.text_content(), expected);
-    }
-
-    #[test]
-    fn system_prompt_with_conventions() {
-        let clock = FakeClock {
-            date: "2025-01-01".to_string(),
-        };
-        let cwd = FakeCwd {
-            dir: "/app".to_string(),
-        };
-
-        let prompt = SystemPromptBuilder::new(&clock, &cwd)
-            .conventions("Use conventional commits.\nNo force-push.\n")
-            .build();
-
-        assert_eq!(prompt.role, crate::sessions::ModelTurnRole::System);
-
-        let os = if cfg!(target_os = "macos") {
-            "macOS"
-        } else if cfg!(target_os = "linux") {
-            "Linux"
-        } else if cfg!(target_os = "windows") {
-            "Windows"
-        } else {
-            "unknown"
-        };
-
-        let expected = format!(
-            "\
-{STATIC_IDENTITY}
-{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}## Environment
-- OS: {os}
-- cwd: /app
-
-\
-## Tools
-(no tools available)
-{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}## Session
-- date: 2025-01-01
-
-\
-## Project conventions
-Use conventional commits.
-No force-push.
-"
-        );
-
-        assert_eq!(prompt.text_content(), expected);
     }
 
     // -- Skills (progressive disclosure) -------------------------------------
@@ -543,9 +684,17 @@ No force-push.
         crate::skills::SkillRegistry::with_scanner(FakeScanner(files))
     }
 
+    fn registry_with_read() -> ToolRegistry {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PromptTool::with_snippet("read", "Read file contents"))
+            .unwrap();
+        registry
+    }
+
     #[test]
-    fn skills_rendered_as_name_summary_path_with_read_instruction() {
-        let registry = skill_registry(&[
+    fn skills_rendered_as_xml_with_location() {
+        let skills = skill_registry(&[
             ("commit", "Create a git commit.", "/skills/commit/SKILL.md"),
             (
                 "review",
@@ -553,126 +702,144 @@ No force-push.
                 "/skills/review/SKILL.md",
             ),
         ]);
+        let tools = registry_with_read();
 
-        let rendered = SystemPromptBuilder::new(
-            &FakeClock {
-                date: "2025-06-15".to_string(),
-            },
-            &FakeCwd {
-                dir: "/app".to_string(),
-            },
-        )
-        .skills(&registry)
-        .render();
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .tools(&tools)
+            .skills(&skills)
+            .render();
 
-        // Name + summary + path, no inlined script body.
-        assert!(
-            rendered.contains("- commit — Create a git commit. (/skills/commit/SKILL.md)"),
-            "missing skill line: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("- review — Review a pull request. (/skills/review/SKILL.md)"),
-            "missing skill line: {rendered:?}"
-        );
+        assert!(rendered.contains("<available_skills>"));
+        assert!(rendered.contains("    <name>commit</name>"));
+        assert!(rendered.contains("    <description>Create a git commit.</description>"));
+        assert!(rendered.contains("    <location>/skills/commit/SKILL.md</location>"));
+        assert!(rendered.contains("    <name>review</name>"));
+        assert!(rendered.contains("</available_skills>"));
         assert!(
             !rendered.contains("body"),
-            "script body leaked: {rendered:?}"
+            "skill body must not leak: {rendered:?}"
         );
-        // On-demand read instruction.
+    }
+
+    #[test]
+    fn no_skills_section_when_read_tool_absent() {
+        let skills =
+            skill_registry(&[("commit", "Create a git commit.", "/skills/commit/SKILL.md")]);
+        // Registry without `read`.
+        let mut tools = ToolRegistry::default();
+        tools.register(PromptTool::new("bash")).unwrap();
+
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .tools(&tools)
+            .skills(&skills)
+            .render();
+
         assert!(
-            rendered.contains("SKILL.md") && rendered.contains("read"),
-            "missing on-demand read instruction: {rendered:?}"
+            !rendered.contains("<available_skills>"),
+            "skills require the read tool: {rendered:?}"
         );
     }
 
     #[test]
     fn no_skills_section_when_registry_empty() {
-        let registry = skill_registry(&[]);
+        let skills = skill_registry(&[]);
+        let tools = registry_with_read();
 
-        let rendered = SystemPromptBuilder::new(
-            &FakeClock {
-                date: "2025-06-15".to_string(),
-            },
-            &FakeCwd {
-                dir: "/app".to_string(),
-            },
-        )
-        .skills(&registry)
-        .render();
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .tools(&tools)
+            .skills(&skills)
+            .render();
 
         assert!(
-            !rendered.contains("## Skills"),
-            "empty registry should not emit a Skills section: {rendered:?}"
+            !rendered.contains("<available_skills>"),
+            "empty registry should not emit a skills section: {rendered:?}"
         );
     }
 
     #[test]
     fn skills_confined_to_semi_static_block_two() {
-        let registry =
+        let skills =
             skill_registry(&[("commit", "Create a git commit.", "/skills/commit/SKILL.md")]);
+        let tools = registry_with_read();
 
-        let rendered = SystemPromptBuilder::new(
+        let rendered = SystemPromptBuilder::new(&clock(), &cwd())
+            .tools(&tools)
+            .skills(&skills)
+            .render();
+
+        let blocks: Vec<&str> = rendered.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).collect();
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            blocks[1].contains("<available_skills>"),
+            "skills must live in the semi-static Block 2: {rendered:?}"
+        );
+    }
+
+    // -- Snapshot ------------------------------------------------------------
+
+    #[test]
+    fn full_snapshot_with_tools_context_and_footer() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(PromptTool::with_snippet("read", "Read file contents"))
+            .unwrap();
+        registry
+            .register(PromptTool::with_both(
+                "write",
+                "Create or overwrite files",
+                &["Use write only for new files or complete rewrites."],
+            ))
+            .unwrap();
+
+        let files = [ContextFile {
+            path: std::path::PathBuf::from("/app/AGENTS.md"),
+            content: "No force-push.".to_string(),
+        }];
+
+        let prompt = SystemPromptBuilder::new(
             &FakeClock {
-                date: "2025-06-15".to_string(),
+                date: "2025-01-01".to_string(),
             },
             &FakeCwd {
                 dir: "/app".to_string(),
             },
         )
-        .skills(&registry)
-        .render();
+        .tools(&registry)
+        .context_files(&files)
+        .build();
 
-        let blocks: Vec<&str> = rendered.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).collect();
-        assert_eq!(blocks.len(), 3);
-        assert!(
-            blocks[1].contains("## Skills"),
-            "Skills must live in the semi-static Block 2: {rendered:?}"
+        assert_eq!(prompt.role, crate::sessions::ModelTurnRole::System);
+
+        let expected = format!(
+            "{STATIC_IDENTITY}\n\n\
+Available tools:\n\
+- read: Read file contents\n\
+- write: Create or overwrite files\n\
+\n\
+In addition to the tools above, you may have access to other custom tools depending on the project.\n\
+\n\
+Guidelines:\n\
+- Use write only for new files or complete rewrites.\n\
+- Be concise in your responses\n\
+- Show file paths clearly when working with files\
+{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}\n\
+\n\
+<project_context>\n\
+\n\
+Project-specific instructions and guidelines:\n\
+\n\
+<project_instructions path=\"/app/AGENTS.md\">\n\
+No force-push.\n\
+</project_instructions>\n\
+\n\
+</project_context>\
+{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}\n\
+\n\
+Current date: 2025-01-01\n\
+Current working directory: /app\n"
         );
-    }
 
-    #[test]
-    fn system_prompt_lists_registered_tools() {
-        let clock = FakeClock {
-            date: "2025-01-01".to_string(),
-        };
-        let cwd = FakeCwd {
-            dir: "/app".to_string(),
-        };
-        let mut registry = ToolRegistry::default();
-        registry
-            .register(PromptTool("read"))
-            .expect("read should register");
-        registry
-            .register(PromptTool("bash"))
-            .expect("bash should register");
-
-        let prompt = SystemPromptBuilder::new(&clock, &cwd)
-            .tools(&registry)
-            .build();
-
-        assert!(prompt.text_content().contains("## Tools\n- bash\n- read\n"));
-    }
-
-    #[test]
-    fn conventions_without_trailing_newline() {
-        let clock = FakeClock {
-            date: "2025-03-10".to_string(),
-        };
-        let cwd = FakeCwd {
-            dir: "/proj".to_string(),
-        };
-
-        let prompt = SystemPromptBuilder::new(&clock, &cwd)
-            .conventions("No force-push.")
-            .build();
-
-        let text = prompt.text_content();
-        // Conventions live in the volatile block; a missing trailing newline is
-        // normalized so the rendered prompt always ends with exactly one.
-        assert!(
-            text.ends_with("## Project conventions\nNo force-push.\n"),
-            "conventions without trailing newline should be normalized: {text:?}"
-        );
+        assert_eq!(prompt.text_content(), expected);
     }
 
     // -- Unit tests for helpers ----------------------------------------------
@@ -694,11 +861,60 @@ No force-push.
         assert_eq!(gregorian_date(19_782), "2024-02-29");
     }
 
-    struct PromptTool(&'static str);
+    #[test]
+    fn escape_xml_escapes_markup() {
+        assert_eq!(escape_xml("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+    }
+
+    // -- Test tool -----------------------------------------------------------
+
+    struct PromptTool {
+        name: &'static str,
+        snippet: Option<&'static str>,
+        guidelines: &'static [&'static str],
+    }
+
+    impl PromptTool {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                snippet: None,
+                guidelines: &[],
+            }
+        }
+
+        fn with_snippet(name: &'static str, snippet: &'static str) -> Self {
+            Self {
+                name,
+                snippet: Some(snippet),
+                guidelines: &[],
+            }
+        }
+
+        fn with_guidelines(name: &'static str, guidelines: &'static [&'static str]) -> Self {
+            Self {
+                name,
+                snippet: None,
+                guidelines,
+            }
+        }
+
+        fn with_both(
+            name: &'static str,
+            snippet: &'static str,
+            guidelines: &'static [&'static str],
+        ) -> Self {
+            Self {
+                name,
+                snippet: Some(snippet),
+                guidelines,
+            }
+        }
+    }
 
     impl NavTool for PromptTool {
         fn name(&self) -> &str {
-            self.0
+            self.name
         }
 
         fn description(&self) -> &str {
@@ -715,6 +931,14 @@ No force-push.
 
         fn risk_class(&self) -> RiskClass {
             RiskClass::Read
+        }
+
+        fn prompt_snippet(&self) -> Option<&str> {
+            self.snippet
+        }
+
+        fn prompt_guidelines(&self) -> &[&str] {
+            self.guidelines
         }
 
         fn execute<'a>(

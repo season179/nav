@@ -45,6 +45,21 @@ pub trait NavTool: Send + Sync {
         false
     }
 
+    /// One-line snippet shown next to the tool's name in the system prompt's
+    /// "Available tools" list. A tool is listed only when it returns `Some`;
+    /// the default `None` keeps a tool out of the list (mirrors pi, where only
+    /// snippet-bearing tools are advertised).
+    fn prompt_snippet(&self) -> Option<&str> {
+        None
+    }
+
+    /// Guideline bullets this tool contributes to the system prompt's
+    /// "Guidelines" section. Deduplicated across tools by the builder. Defaults
+    /// to none.
+    fn prompt_guidelines(&self) -> &[&str] {
+        &[]
+    }
+
     fn execute<'a>(
         &'a self,
         ctx: &'a ToolContext,
@@ -489,6 +504,12 @@ impl ToolRegistry {
 
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools_by_name.keys().map(String::as_str).collect()
+    }
+
+    /// Iterate registered tools in sorted (name) order. Used by the system
+    /// prompt builder to read each tool's `prompt_snippet`/`prompt_guidelines`.
+    pub fn tools(&self) -> impl Iterator<Item = &Arc<dyn NavTool>> {
+        self.tools_by_name.values()
     }
 
     pub fn add_to_preset(

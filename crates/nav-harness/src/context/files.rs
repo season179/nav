@@ -11,6 +11,13 @@ use std::sync::Arc;
 /// File names to discover and concatenate, in order.
 const CONTEXT_FILE_NAMES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
 
+/// A single discovered project context file: its path and full contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFile {
+    pub path: PathBuf,
+    pub content: String,
+}
+
 // ---------------------------------------------------------------------------
 // Injectable seam
 // ---------------------------------------------------------------------------
@@ -48,6 +55,7 @@ pub struct ContextFileCache {
     reader: Box<dyn FileReader>,
     root: PathBuf,
     cached: Option<String>,
+    cached_files: Option<Vec<ContextFile>>,
 }
 
 impl ContextFileCache {
@@ -62,6 +70,7 @@ impl ContextFileCache {
             reader: Box::new(reader),
             root,
             cached: None,
+            cached_files: None,
         }
     }
 
@@ -73,6 +82,7 @@ impl ContextFileCache {
             reader: Box::new(ArcFileReader(reader)),
             root,
             cached: None,
+            cached_files: None,
         }
     }
 
@@ -80,37 +90,57 @@ impl ContextFileCache {
     /// first call and returning the cached value thereafter.
     pub fn load(&mut self) -> &str {
         if self.cached.is_none() {
-            self.cached = Some(self.read_all_files());
+            self.cached = Some(concatenate(self.load_files()));
         }
         // SAFETY: `is_none` branch guarantees `Some` when we reach here.
         self.cached.as_deref().unwrap()
     }
 
-    /// Discard the cached content and reload from disk on the next [`Self::load`].
+    /// Return the discovered context files (path + contents) in order, loading
+    /// from disk on the first call and returning the cached value thereafter.
+    pub fn load_files(&mut self) -> &[ContextFile] {
+        if self.cached_files.is_none() {
+            self.cached_files = Some(self.read_all_files());
+        }
+        // SAFETY: `is_none` branch guarantees `Some` when we reach here.
+        self.cached_files.as_deref().unwrap()
+    }
+
+    /// Discard the cached content and reload from disk on the next
+    /// [`Self::load`] or [`Self::load_files`].
     pub fn refresh(&mut self) {
         self.cached = None;
+        self.cached_files = None;
     }
 
     // -- Private helpers ----------------------------------------------------
 
-    fn read_all_files(&self) -> String {
-        let mut out = String::new();
+    fn read_all_files(&self) -> Vec<ContextFile> {
+        let mut files = Vec::new();
         for name in CONTEXT_FILE_NAMES {
             let path = self.root.join(name);
-            match self.reader.read_to_string(&path) {
-                Ok(content) => {
-                    if !content.is_empty() {
-                        out.push_str(&content);
-                        if !content.ends_with('\n') {
-                            out.push('\n');
-                        }
-                    }
-                }
-                Err(_) => continue,
+            if let Ok(content) = self.reader.read_to_string(&path)
+                && !content.is_empty()
+            {
+                files.push(ContextFile { path, content });
             }
         }
-        out
+        files
     }
+}
+
+/// Concatenate context file contents in order, normalizing each to end with
+/// exactly one newline. Preserves the byte output [`ContextFileCache::load`]
+/// produced before per-file paths were tracked.
+fn concatenate(files: &[ContextFile]) -> String {
+    let mut out = String::new();
+    for file in files {
+        out.push_str(&file.content);
+        if !file.content.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Wrapper so an `Arc<dyn FileReader>` can be used where `Box<dyn FileReader>`

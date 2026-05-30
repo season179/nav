@@ -1145,7 +1145,7 @@ fn live_anthropic_request_carries_the_static_system_prompt() {
         serde_json::from_str(&requests[0]).expect("request body should be JSON");
     let system = request["system"].to_string();
     assert!(
-        system.contains("You are nav, an interactive CLI agent"),
+        system.contains("You are an expert coding assistant operating inside nav"),
         "the live loop must send the static system identity block: {system}"
     );
 }
@@ -1179,7 +1179,8 @@ fn live_request_carries_project_conventions_from_workspace_root() {
     let system =
         serde_json::from_str::<serde_json::Value>(&requests[0]).unwrap()["system"].to_string();
     assert!(
-        system.contains("## Project conventions")
+        system.contains("<project_context>")
+            && system.contains("project_instructions path=")
             && system.contains("Always run the formatter before finishing.")
             && system.contains("Prefer small, focused commits."),
         "CLAUDE.md/AGENTS.md content must appear in the live request system prompt: {system}"
@@ -1217,8 +1218,8 @@ fn live_request_lists_workspace_skills_in_the_system_prompt() {
     let system =
         serde_json::from_str::<serde_json::Value>(&requests[0]).unwrap()["system"].to_string();
     assert!(
-        system.contains("## Skills")
-            && system.contains("deploy")
+        system.contains("<available_skills>")
+            && system.contains("<name>deploy</name>")
             && system.contains("Ship the service to production."),
         "the system prompt must list discovered workspace skills: {system}"
     );
@@ -1300,7 +1301,7 @@ fn live_openai_responses_request_carries_system_prompt_without_the_boundary_mark
         .as_str()
         .expect("responses request should carry the system prompt as instructions");
     assert!(
-        instructions.contains("You are nav, an interactive CLI agent"),
+        instructions.contains("You are an expert coding assistant operating inside nav"),
         "the system prompt must reach the OpenAI Responses dialect: {instructions}"
     );
     assert!(
@@ -1435,7 +1436,9 @@ fn run_loop_once_with_context(
     context: &ToolContext,
 ) -> RunLoopResult {
     let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
-    let registry = ToolRegistry::default();
+    // Register the read tool so the assembled prompt advertises skills (which
+    // are loaded via read); mirrors the production server's registry.
+    let registry = registry_with_read_tool();
     let mut ids = TestIds::default();
 
     run_loop.run(

@@ -70,6 +70,10 @@ impl NavTool for RipgrepTool {
         "Search the codebase with ripgrep. Returns matching lines with file paths and line numbers."
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("Search file contents with ripgrep")
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

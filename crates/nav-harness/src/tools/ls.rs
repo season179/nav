@@ -29,6 +29,10 @@ impl NavTool for LsTool {
         "List directory contents with name, type (file/dir/symlink/other), size, and modification time."
     }
 
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some("List directory contents")
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
