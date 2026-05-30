@@ -3,8 +3,10 @@
 pub mod auto_title;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId};
@@ -37,12 +39,17 @@ use crate::sessions::{
     PendingConfirmationRegistry, ProviderPayloadDirection, ProviderState, SessionStore, ToolCall,
     TurnPart,
 };
+use crate::skills::{Skill, SkillRegistry};
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
     ToolOutputSink, ToolPreset, ToolRegistry, ToolResult, WorkspaceMutationRecorder,
 };
 
 const TOOL_OUTPUT_BUFFER: usize = 64;
+const PREFETCH_MEMORY_HITS: usize = 3;
+const PREFETCH_MEMORY_SEARCH_LIMIT: usize = 8;
+const PREFETCH_SKILL_LIMIT: usize = 20;
+const PREFETCH_SNIPPET_CHARS: usize = 240;
 
 /// How many times a single run may recover from a context-limit overflow by
 /// force-compacting and replaying the triggering user turn before giving up.
@@ -130,22 +137,263 @@ impl SubagentRuntime {
     }
 }
 
+/// Registry placeholder for the agent roles supported by the harness.
 #[derive(Debug, Default)]
 pub struct AgentCatalog;
 
+/// Executes model turns, tool calls, compaction recovery, and speculative
+/// context prefetching for a single agent run.
 #[derive(Debug, Clone)]
 pub struct RunLoop {
     client: OpenAiCompletionsClient,
+    lookup_prefetcher: Arc<dyn TurnLookupPrefetcher>,
     compaction_breakers: Arc<Mutex<RunLoopCompactionBreakers>>,
+}
+
+/// Transient context prepared for the next model request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrefetchedTurnContext {
+    system_context: Option<String>,
+}
+
+impl PrefetchedTurnContext {
+    /// Build a prefetched context payload that will be injected as system text.
+    pub fn from_system_context(system_context: impl Into<String>) -> Self {
+        Self {
+            system_context: Some(system_context.into()),
+        }
+    }
+
+    fn into_model_turns(self) -> Vec<ModelTurn> {
+        self.system_context
+            .filter(|context| !context.trim().is_empty())
+            .map(ModelTurn::system_text)
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Inputs captured when starting speculative next-turn lookups.
+#[derive(Debug, Clone)]
+pub struct TurnLookupPrefetchRequest<'a> {
+    /// Session receiving the current run.
+    pub session_id: &'a SessionId,
+    /// Run whose current model response is in flight.
+    pub run_id: &'a RunId,
+    /// User message that triggered this run.
+    pub message_id: &'a MessageId,
+    /// Model-visible turns available when prefetch starts.
+    pub turns: &'a [ModelTurn],
+    /// Optional session store used for memory recall.
+    pub session_store: Option<&'a Arc<Mutex<SessionStore>>>,
+    /// Optional workspace root used for local skill discovery.
+    pub workspace_root: Option<PathBuf>,
+}
+
+/// A background lookup batch started during the current model response and
+/// resolved only if the loop needs a follow-up request after tool execution.
+pub trait PendingTurnLookupResults: std::fmt::Debug + Send {
+    /// Wait for the background work and return context for the next request.
+    fn resolve(self: Box<Self>) -> PrefetchedTurnContext;
+}
+
+/// Starts speculative memory/skill lookups for the next model request.
+///
+/// Implementations should kick off the expensive work and return quickly; the
+/// run loop overlaps the returned handle with provider streaming and tool
+/// execution, then resolves it just before building the next request.
+pub trait TurnLookupPrefetcher: std::fmt::Debug + Send + Sync {
+    /// Start speculative lookups and return a handle that resolves the result.
+    fn start(&self, request: TurnLookupPrefetchRequest<'_>) -> Box<dyn PendingTurnLookupResults>;
+}
+
+/// Default prefetcher that recalls session memory and discovers local skills.
+#[derive(Debug, Clone)]
+pub struct TurnContextPrefetcher {
+    skill_roots: Arc<Vec<PathBuf>>,
+}
+
+impl TurnContextPrefetcher {
+    /// Build a prefetcher using configured and workspace-local skill roots.
+    pub fn new() -> Self {
+        Self::with_skill_roots(default_skill_roots())
+    }
+
+    /// Build a prefetcher with explicit skill roots for deterministic callers.
+    pub fn with_skill_roots(skill_roots: Vec<PathBuf>) -> Self {
+        Self {
+            skill_roots: Arc::new(skill_roots),
+        }
+    }
+}
+
+impl Default for TurnContextPrefetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TurnLookupPrefetcher for TurnContextPrefetcher {
+    fn start(&self, request: TurnLookupPrefetchRequest<'_>) -> Box<dyn PendingTurnLookupResults> {
+        let query = latest_user_query(request.turns);
+        let session_store = request.session_store.cloned();
+        let current_message_id = request.message_id.clone();
+        let skill_roots =
+            skill_roots_for_request(&self.skill_roots, request.workspace_root.as_ref());
+
+        Box::new(BackgroundTurnLookupResults {
+            handle: thread::spawn(move || {
+                let memory_hits =
+                    recall_memory_hits(session_store, query.as_deref(), &current_message_id);
+                let skills = discover_prefetched_skills(&skill_roots);
+                prefetched_context(memory_hits, skills)
+            }),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BackgroundTurnLookupResults {
+    handle: JoinHandle<PrefetchedTurnContext>,
+}
+
+impl PendingTurnLookupResults for BackgroundTurnLookupResults {
+    fn resolve(self: Box<Self>) -> PrefetchedTurnContext {
+        self.handle.join().unwrap_or_default()
+    }
 }
 
 impl Default for RunLoop {
     fn default() -> Self {
         Self {
             client: OpenAiCompletionsClient::new(),
+            lookup_prefetcher: Arc::new(TurnContextPrefetcher::default()),
             compaction_breakers: Arc::new(Mutex::new(RunLoopCompactionBreakers::default())),
         }
     }
+}
+
+fn default_skill_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(paths) = std::env::var_os("NAV_SKILL_ROOTS") {
+        roots.extend(std::env::split_paths(&paths));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd.join("skills"));
+        roots.push(cwd.join(".nav").join("skills"));
+    }
+    roots
+}
+
+fn skill_roots_for_request(
+    configured_roots: &[PathBuf],
+    workspace_root: Option<&PathBuf>,
+) -> Vec<PathBuf> {
+    let mut roots = configured_roots.to_vec();
+    if let Some(workspace_root) = workspace_root {
+        roots.push(workspace_root.join("skills"));
+        roots.push(workspace_root.join(".nav").join("skills"));
+    }
+    roots
+}
+
+fn latest_user_query(turns: &[ModelTurn]) -> Option<String> {
+    turns
+        .iter()
+        .rev()
+        .find(|turn| turn.role == ModelTurnRole::User)
+        .map(ModelTurn::text_content)
+        .map(|text| compact_snippet(&text, PREFETCH_SNIPPET_CHARS))
+        .filter(|text| !text.is_empty())
+}
+
+fn recall_memory_hits(
+    session_store: Option<Arc<Mutex<SessionStore>>>,
+    query: Option<&str>,
+    current_message_id: &MessageId,
+) -> Vec<String> {
+    let (Some(session_store), Some(query)) = (session_store, query) else {
+        return Vec::new();
+    };
+
+    let hits = session_store
+        .lock()
+        .unwrap()
+        .search_turn_parts_trigram(query, PREFETCH_MEMORY_SEARCH_LIMIT)
+        .unwrap_or_default();
+
+    hits.into_iter()
+        .filter(|hit| hit.turn_id != *current_message_id)
+        .map(|hit| compact_snippet(&hit.text, PREFETCH_SNIPPET_CHARS))
+        .filter(|text| text != query)
+        .filter(|text| !text.is_empty())
+        .take(PREFETCH_MEMORY_HITS)
+        .collect()
+}
+
+fn discover_prefetched_skills(skill_roots: &[PathBuf]) -> Vec<Skill> {
+    let mut skills = skill_roots
+        .iter()
+        .flat_map(|root| SkillRegistry::discover(root).skills().to_vec())
+        .collect::<Vec<_>>();
+    skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    skills.dedup_by(|a, b| a.name == b.name && a.path == b.path);
+    skills.truncate(PREFETCH_SKILL_LIMIT);
+    skills
+}
+
+fn prefetched_context(memory_hits: Vec<String>, skills: Vec<Skill>) -> PrefetchedTurnContext {
+    let Some(context) = render_prefetched_context(&memory_hits, &skills) else {
+        return PrefetchedTurnContext::default();
+    };
+    PrefetchedTurnContext::from_system_context(context)
+}
+
+fn render_prefetched_context(memory_hits: &[String], skills: &[Skill]) -> Option<String> {
+    if memory_hits.is_empty() && skills.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("<turn-context-prefetch>\n");
+    if !memory_hits.is_empty() {
+        out.push_str("## Memory Recall\n");
+        for hit in memory_hits {
+            out.push_str("- ");
+            out.push_str(hit);
+            out.push('\n');
+        }
+    }
+    if !skills.is_empty() {
+        if !memory_hits.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("## Skill Discovery\n");
+        out.push_str("Each entry is name - summary (path). Read SKILL.md only when needed.\n");
+        for skill in skills {
+            out.push_str("- ");
+            out.push_str(&skill.name);
+            if !skill.summary.is_empty() {
+                out.push_str(" - ");
+                out.push_str(&compact_snippet(&skill.summary, PREFETCH_SNIPPET_CHARS));
+            }
+            out.push_str(" (");
+            out.push_str(&skill.path.display().to_string());
+            out.push_str(")\n");
+        }
+    }
+    out.push_str("</turn-context-prefetch>");
+    Some(out)
+}
+
+fn compact_snippet(text: &str, max_chars: usize) -> String {
+    let compacted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compacted.chars().count() <= max_chars {
+        return compacted;
+    }
+
+    let mut truncated = compacted.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 #[derive(Debug, Default)]
@@ -189,6 +437,18 @@ impl RunLoop {
     pub fn with_client(client: OpenAiCompletionsClient) -> Self {
         Self {
             client,
+            lookup_prefetcher: Arc::new(TurnContextPrefetcher::default()),
+            compaction_breakers: Arc::new(Mutex::new(RunLoopCompactionBreakers::default())),
+        }
+    }
+
+    pub fn with_client_and_prefetcher(
+        client: OpenAiCompletionsClient,
+        lookup_prefetcher: Arc<dyn TurnLookupPrefetcher>,
+    ) -> Self {
+        Self {
+            client,
+            lookup_prefetcher,
             compaction_breakers: Arc::new(Mutex::new(RunLoopCompactionBreakers::default())),
         }
     }
@@ -225,6 +485,7 @@ impl RunLoop {
             session_id: request.session_id,
             store,
         });
+        let mut next_turn_context = PrefetchedTurnContext::default();
         let mut payload_sequence = 0;
         let mut overflow_attempts = 0;
         let mut proactive_compaction_attempted = false;
@@ -266,7 +527,6 @@ impl RunLoop {
                 };
                 reload_store_turns = false;
             }
-
             let step_decision = match step_budget.next_step() {
                 Ok(decision) => decision,
                 Err(error) => return RunLoopResult::Failed(step_budget_error(error)),
@@ -301,8 +561,12 @@ impl RunLoop {
 
             should_project_pruned_tool_results = should_project_pruned_tool_results
                 || (journal.is_some() && should_prune_for_budget(model, &turns));
-            let turns_for_model =
+            let mut turns_for_model =
                 project_turns_for_encoding(&turns, model, should_project_pruned_tool_results);
+            apply_prefetched_turn_context(
+                &mut turns_for_model,
+                std::mem::take(&mut next_turn_context),
+            );
             let provider_state = match load_provider_state(journal, request.run_id) {
                 Ok(provider_state) => provider_state,
                 Err(error) => return RunLoopResult::Failed(error),
@@ -332,6 +596,17 @@ impl RunLoop {
                 }
                 payload_sequence += 1;
             }
+            let pending_turn_lookups = self.lookup_prefetcher.start(TurnLookupPrefetchRequest {
+                session_id: request.session_id,
+                run_id: request.run_id,
+                message_id: request.message_id,
+                turns: &turns,
+                session_store: request.session_store,
+                workspace_root: request
+                    .tool_context
+                    .path_policy()
+                    .map(|policy| policy.workspace_root().to_path_buf()),
+            });
             let mut model_turn = match self.stream_turn(StreamTurnRequest {
                 runtime: &runtime,
                 model,
@@ -486,6 +761,7 @@ impl RunLoop {
                     } else {
                         new_turns.extend(tool_turns);
                     }
+                    next_turn_context = pending_turn_lookups.resolve();
                 }
                 ToolDispatchResult::Cancelled => return RunLoopResult::Cancelled,
             }
@@ -1341,6 +1617,22 @@ fn project_turns_for_encoding(
     }
     let truncated = truncate_model_turns(projected, ContextBudget::from_model(&model.model, 0));
     degrade_unpaired_model_tool_activity(truncated)
+}
+
+fn apply_prefetched_turn_context(
+    turns_for_model: &mut Vec<ModelTurn>,
+    context: PrefetchedTurnContext,
+) {
+    let context_turns = context.into_model_turns();
+    if context_turns.is_empty() {
+        return;
+    }
+
+    let insert_at = turns_for_model
+        .iter()
+        .rposition(|turn| turn.role == ModelTurnRole::System)
+        .map_or(0, |index| index + 1);
+    turns_for_model.splice(insert_at..insert_at, context_turns);
 }
 
 fn degrade_unpaired_model_tool_activity(turns: Vec<ModelTurn>) -> Vec<ModelTurn> {
@@ -2822,6 +3114,39 @@ mod tests {
             persisted_api_kind_name(crate::models::ApiKind::OpenAiResponses),
             "openai-responses"
         );
+    }
+
+    #[test]
+    fn prefetched_turn_context_is_inserted_with_system_turns() {
+        let mut turns = vec![
+            ModelTurn::system_text("base system"),
+            ModelTurn::user_text("use a tool"),
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "call_1".to_string(),
+                tool_call_id: None,
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ModelTurn::tool_result("call_1", "tool output"),
+        ];
+
+        apply_prefetched_turn_context(
+            &mut turns,
+            PrefetchedTurnContext::from_system_context("prefetched context"),
+        );
+
+        let roles: Vec<ModelTurnRole> = turns.iter().map(|turn| turn.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                ModelTurnRole::System,
+                ModelTurnRole::System,
+                ModelTurnRole::User,
+                ModelTurnRole::Assistant,
+                ModelTurnRole::Tool,
+            ]
+        );
+        assert_eq!(turns[1].text_content(), "prefetched context");
     }
 
     #[test]

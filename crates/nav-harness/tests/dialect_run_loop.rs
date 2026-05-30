@@ -5,14 +5,19 @@
 //! encoder/transport/decoder from the resolved `ApiKind`.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use nav_harness::agents::{RunLoop, RunLoopRequest, RunLoopResult};
+use nav_harness::agents::{
+    PendingTurnLookupResults, PrefetchedTurnContext, RunLoop, RunLoopRequest, RunLoopResult,
+    TurnContextPrefetcher, TurnLookupPrefetchRequest, TurnLookupPrefetcher,
+};
 use nav_harness::events::{HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource};
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelRef, ModelResolver, ModelSettings,
@@ -21,6 +26,7 @@ use nav_harness::models::{
 };
 use nav_harness::sessions::{ModelTurn, ModelTurnRole, ProviderState, SessionStore, TurnPart};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, read};
+use nav_harness::workspace::path::WorkspacePathPolicy;
 use nav_types::{ApprovalId, EventId, MessageId, RunId, SessionId, ToolCallId};
 
 const DOOM_LOOP_READ_MESSAGE: &str = "[doom_loop detected: tool read with identical arguments called 3 times. Try a different approach.]";
@@ -260,6 +266,231 @@ fn anthropic_tool_call_round_trips_to_a_second_request() {
     assert_eq!(
         tool_use_id, tool_result_id,
         "tool_use.id must match tool_result.tool_use_id on re-encode"
+    );
+}
+
+#[test]
+fn prefetched_turn_context_is_consumed_by_the_next_request_after_tools() {
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json(anthropic_missing_tool_response()),
+        CannedResponse::json(anthropic_final_answer_response()),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "use a tool");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once_with_prefetcher(
+        &model,
+        &store,
+        &session_id,
+        &run_id,
+        &turns,
+        Arc::new(StaticPrefetcher {
+            reminder: "memory recall ready\nskill discovery ready".to_string(),
+        }),
+    );
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "prefetch round trip should complete, got {result:?}"
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool use should produce a follow-up request"
+    );
+    assert!(
+        !requests[0].contains("memory recall ready"),
+        "prefetch result must not affect the already-encoded request"
+    );
+    assert!(
+        requests[1].contains("memory recall ready")
+            && requests[1].contains("skill discovery ready"),
+        "prefetch result should be consumed by the next request: {}",
+        requests[1]
+    );
+}
+
+#[test]
+fn turn_context_prefetch_overlaps_provider_response_latency() {
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json_delayed(
+            anthropic_missing_tool_response(),
+            Duration::from_millis(400),
+        ),
+        CannedResponse::json(anthropic_final_answer_response()),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "use a tool");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let started = Instant::now();
+    let result = run_loop_once_with_prefetcher(
+        &model,
+        &store,
+        &session_id,
+        &run_id,
+        &turns,
+        Arc::new(DelayedPrefetcher {
+            delay: Duration::from_millis(300),
+        }),
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "prefetch timing run should complete, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "lookup should overlap provider latency; elapsed {elapsed:?} would be close to sequential"
+    );
+}
+
+#[test]
+fn default_turn_context_prefetcher_recalls_relevant_session_memory() {
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json(anthropic_missing_tool_response()),
+        CannedResponse::json(anthropic_final_answer_response()),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    {
+        let store = store.lock().unwrap();
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turn(
+                &run_id,
+                message_id(1),
+                ModelTurn::user_text("dragonfruit release checklist"),
+            )
+            .unwrap();
+        store
+            .append_turn(&run_id, message_id(2), ModelTurn::user_text("dragonfruit"))
+            .unwrap();
+    }
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "default prefetch run should complete, got {result:?}"
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool use should produce a follow-up request"
+    );
+    assert!(
+        requests[1].contains("## Memory Recall")
+            && requests[1].contains("dragonfruit release checklist"),
+        "default prefetcher should recall relevant stored memory: {}",
+        requests[1]
+    );
+}
+
+#[test]
+fn turn_context_prefetcher_discovers_skills_for_the_follow_up_request() {
+    let skills = TestSkillRoot::new("run-loop-prefetch-skills");
+    skills.write_skill(
+        "ship",
+        "---\nname: ship\ndescription: Ship changes safely.\n---\nbody\n",
+    );
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json(anthropic_missing_tool_response()),
+        CannedResponse::json(anthropic_final_answer_response()),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "use a tool");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once_with_prefetcher(
+        &model,
+        &store,
+        &session_id,
+        &run_id,
+        &turns,
+        Arc::new(TurnContextPrefetcher::with_skill_roots(vec![
+            skills.root.clone(),
+        ])),
+    );
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "skill prefetch run should complete, got {result:?}"
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool use should produce a follow-up request"
+    );
+    assert!(
+        requests[1].contains("## Skill Discovery")
+            && requests[1].contains("ship")
+            && requests[1].contains("Ship changes safely."),
+        "prefetcher should disclose discovered skills in the follow-up request: {}",
+        requests[1]
+    );
+}
+
+#[test]
+fn default_prefetcher_discovers_workspace_skills_for_the_follow_up_request() {
+    let workspace = TestSkillRoot::new("run-loop-workspace-skills");
+    workspace.write_workspace_skill(
+        "review",
+        "---\nname: review\ndescription: Review local changes.\n---\nbody\n",
+    );
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json(anthropic_missing_tool_response()),
+        CannedResponse::json(anthropic_final_answer_response()),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "use a tool");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let context = ToolContext::with_path_policy(workspace.policy());
+    let result = run_loop_once_with_context(&model, &store, &session_id, &run_id, &turns, &context);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "workspace skill prefetch run should complete, got {result:?}"
+    );
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "tool use should produce a follow-up request"
+    );
+    assert!(
+        requests[1].contains("## Skill Discovery")
+            && requests[1].contains("review")
+            && requests[1].contains("Review local changes."),
+        "default prefetcher should discover workspace skills in the follow-up request: {}",
+        requests[1]
     );
 }
 
@@ -1003,6 +1234,70 @@ fn run_loop_with_token_and_registry(
     )
 }
 
+fn run_loop_once_with_context(
+    model: &ResolvedModelConfig,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turns: &[ModelTurn],
+    context: &ToolContext,
+) -> RunLoopResult {
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+    let registry = ToolRegistry::default();
+    let mut ids = TestIds::default();
+
+    run_loop.run(
+        model,
+        RunLoopRequest {
+            session_id,
+            run_id,
+            message_id: &message_id(0),
+            turns,
+            tool_registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            tool_context: context,
+            session_store: Some(store),
+            pending_confirmations: None,
+            cancellation_token: OpenAiCompletionsCancellationToken::new(),
+        },
+        &mut ids,
+        |_events| {},
+    )
+}
+
+fn run_loop_once_with_prefetcher(
+    model: &ResolvedModelConfig,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turns: &[ModelTurn],
+    lookup_prefetcher: Arc<dyn TurnLookupPrefetcher>,
+) -> RunLoopResult {
+    let run_loop =
+        RunLoop::with_client_and_prefetcher(OpenAiCompletionsClient::new(), lookup_prefetcher);
+    let registry = ToolRegistry::default();
+    let context = ToolContext::default();
+    let mut ids = TestIds::default();
+
+    run_loop.run(
+        model,
+        RunLoopRequest {
+            session_id,
+            run_id,
+            message_id: &message_id(0),
+            turns,
+            tool_registry: &registry,
+            tool_preset: ToolPreset::Coding,
+            tool_context: &context,
+            session_store: Some(store),
+            pending_confirmations: None,
+            cancellation_token: OpenAiCompletionsCancellationToken::new(),
+        },
+        &mut ids,
+        |_events| {},
+    )
+}
+
 fn registry_with_read_tool() -> ToolRegistry {
     let mut registry = ToolRegistry::default();
     read::register(&mut registry).unwrap();
@@ -1106,6 +1401,26 @@ fn responses_model(base_url: &str) -> ResolvedModelConfig {
     resolved_model(base_url, ApiKind::OpenAiResponses, "gpt-test")
 }
 
+fn anthropic_missing_tool_response() -> &'static str {
+    r#"{
+        "id": "msg_tool",
+        "model": "claude-test",
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "toolu_1", "name": "missing_tool", "input": {"q": 1}}],
+        "stop_reason": "tool_use"
+    }"#
+}
+
+fn anthropic_final_answer_response() -> &'static str {
+    r#"{
+        "id": "msg_final",
+        "model": "claude-test",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "All done"}],
+        "stop_reason": "end_turn"
+    }"#
+}
+
 fn chat_model(base_url: &str, context_window: Option<u32>) -> ResolvedModelConfig {
     resolved_model_with_window(
         base_url,
@@ -1161,11 +1476,97 @@ fn resolved_model_with_window(
     .unwrap()
 }
 
+#[derive(Debug)]
+struct StaticPrefetcher {
+    reminder: String,
+}
+
+impl TurnLookupPrefetcher for StaticPrefetcher {
+    fn start(&self, _request: TurnLookupPrefetchRequest<'_>) -> Box<dyn PendingTurnLookupResults> {
+        Box::new(StaticPrefetch {
+            reminder: self.reminder.clone(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct StaticPrefetch {
+    reminder: String,
+}
+
+impl PendingTurnLookupResults for StaticPrefetch {
+    fn resolve(self: Box<Self>) -> PrefetchedTurnContext {
+        PrefetchedTurnContext::from_system_context(self.reminder)
+    }
+}
+
+#[derive(Debug)]
+struct DelayedPrefetcher {
+    delay: Duration,
+}
+
+impl TurnLookupPrefetcher for DelayedPrefetcher {
+    fn start(&self, _request: TurnLookupPrefetchRequest<'_>) -> Box<dyn PendingTurnLookupResults> {
+        let delay = self.delay;
+        Box::new(DelayedPrefetch {
+            handle: thread::spawn(move || thread::sleep(delay)),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct DelayedPrefetch {
+    handle: JoinHandle<()>,
+}
+
+impl PendingTurnLookupResults for DelayedPrefetch {
+    fn resolve(self: Box<Self>) -> PrefetchedTurnContext {
+        self.handle.join().expect("prefetch thread should finish");
+        PrefetchedTurnContext::default()
+    }
+}
+
+struct TestSkillRoot {
+    root: PathBuf,
+}
+
+impl TestSkillRoot {
+    fn new(name: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("nav-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("skill root should be created");
+        Self { root }
+    }
+
+    fn write_skill(&self, name: &str, contents: &str) {
+        let dir = self.root.join(name);
+        fs::create_dir_all(&dir).expect("skill directory should be created");
+        fs::write(dir.join("SKILL.md"), contents).expect("skill file should be written");
+    }
+
+    fn write_workspace_skill(&self, name: &str, contents: &str) {
+        let dir = self.root.join(".nav").join("skills").join(name);
+        fs::create_dir_all(&dir).expect("workspace skill directory should be created");
+        fs::write(dir.join("SKILL.md"), contents).expect("workspace skill file should be written");
+    }
+
+    fn policy(&self) -> WorkspacePathPolicy {
+        WorkspacePathPolicy::new(&self.root, &self.root).expect("workspace policy should build")
+    }
+}
+
+impl Drop for TestSkillRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
 #[derive(Clone)]
 struct CannedResponse {
     status: u16,
     content_type: &'static str,
     body: String,
+    delay: Duration,
 }
 
 impl CannedResponse {
@@ -1174,6 +1575,16 @@ impl CannedResponse {
             status: 200,
             content_type: "application/json",
             body: body.to_string(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    fn json_delayed(body: &str, delay: Duration) -> Self {
+        Self {
+            status: 200,
+            content_type: "application/json",
+            body: body.to_string(),
+            delay,
         }
     }
 
@@ -1184,6 +1595,7 @@ impl CannedResponse {
             body: format!(
                 "data: {{\"id\":\"chatcmpl_test\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"id\":\"chatcmpl_test\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
             ),
+            delay: Duration::ZERO,
         }
     }
 }
@@ -1216,6 +1628,9 @@ impl FakeProviderServer {
                 };
                 let body = drain_http_request(&mut stream);
                 requests_in_thread.lock().unwrap().push(body);
+                if response.delay > Duration::ZERO {
+                    thread::sleep(response.delay);
+                }
 
                 let header = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
