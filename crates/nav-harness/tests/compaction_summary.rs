@@ -553,7 +553,10 @@ fn compaction_summary_agent_calls_model_and_returns_assistant_text() {
     let request_bodies = server.request_bodies();
     assert_eq!(summary, "## Active Task\nGenerated summary");
     assert_eq!(request_bodies.len(), 1);
-    assert!(request_bodies[0].contains("Previous summary"));
+    assert!(
+        request_bodies[0].contains("Implement CMP-05b summarization."),
+        "request should carry the previous summary's content forward"
+    );
     assert!(request_bodies[0].contains("continue with the next slice"));
 }
 
@@ -635,6 +638,39 @@ fn persistent_compaction_overflow_gives_up_after_bounded_retries() {
     assert!(
         (2..=5).contains(&attempts),
         "agent should retry a bounded handful of times, made {attempts} attempts"
+    );
+}
+
+#[test]
+fn single_head_turn_overflow_surfaces_context_limit_without_dropping_it() {
+    let overflow_body = "{\"error\":{\"message\":\"This model's maximum context length is exceeded\",\"code\":\"context_length_exceeded\"}}";
+    // A summary call that would succeed on an empty-head prompt must NOT be
+    // reached: dropping the only head turn would silently lose it, so the agent
+    // surfaces ContextLimit instead.
+    let success_body =
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"## Active Task\\nShould never be returned\"}}]}";
+    let server = SequencedResponseServer::new(vec![
+        SequencedResponse::error(400, overflow_body),
+        SequencedResponse::ok(success_body),
+    ]);
+    let model = resolved_model(server.base_url());
+    let agent = CompactionSummaryAgent::new();
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: None,
+        head_turns: vec![ModelTurn::user_text("the only head turn")],
+        tail_start_id: None,
+    };
+
+    let error = agent.generate(&model, &summary_request).unwrap_err();
+
+    assert!(
+        matches!(error, OpenAiCompletionsError::ContextLimit(_)),
+        "a single overflowing head turn should surface ContextLimit, got: {error:?}"
+    );
+    assert_eq!(
+        server.request_bodies().len(),
+        1,
+        "agent must not retry with an empty-head prompt once one turn remains"
     );
 }
 

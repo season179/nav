@@ -137,14 +137,16 @@ fn summary_from_response(
     Ok(summary)
 }
 
-/// Drop the oldest head turns ahead of a PTL retry, removing the front half
-/// (at least one turn) so each retry meaningfully shrinks the prompt. Returns
-/// the slice unchanged when there is nothing left to drop.
+/// Drop the oldest head turns ahead of a PTL retry, removing the front half so
+/// each retry meaningfully shrinks the prompt. Returns the slice unchanged once
+/// a single turn remains: dropping it would summarize no head content at all and
+/// silently lose the last unsummarized turn, so the caller surfaces
+/// `ContextLimit` instead and lets terminal fallback handle it.
 fn drop_oldest_head_turns(turns: &[ModelTurn]) -> &[ModelTurn] {
-    if turns.is_empty() {
+    if turns.len() <= 1 {
         return turns;
     }
-    let drop = (turns.len() / 2).max(1);
+    let drop = turns.len() / 2;
     &turns[drop..]
 }
 
