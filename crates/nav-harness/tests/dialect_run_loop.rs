@@ -13,15 +13,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nav_harness::agents::{RunLoop, RunLoopRequest, RunLoopResult};
-use nav_harness::events::HarnessEventIdSource;
+use nav_harness::events::{HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource};
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelRef, ModelResolver, ModelSettings,
     OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, ProviderConfig,
     ResolvedModelConfig,
 };
-use nav_harness::sessions::{ModelTurn, ModelTurnRole, ProviderState, SessionStore};
-use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};
+use nav_harness::sessions::{ModelTurn, ModelTurnRole, ProviderState, SessionStore, TurnPart};
+use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, read};
 use nav_types::{ApprovalId, EventId, MessageId, RunId, SessionId, ToolCallId};
+
+const DOOM_LOOP_READ_MESSAGE: &str = "[doom_loop detected: tool read with identical arguments called 3 times. Try a different approach.]";
+const DOOM_LOOP_REPEAT_TOOL_MESSAGE: &str = "[doom_loop detected: tool repeat_tool with identical arguments called 3 times. Try a different approach.]";
 
 #[test]
 fn anthropic_messages_run_completes_end_to_end() {
@@ -478,6 +481,268 @@ fn openai_responses_tool_call_round_trips_to_a_second_request() {
 }
 
 #[test]
+fn default_step_budget_finishes_with_tools_disabled_summary_turn() {
+    let mut responses: Vec<CannedResponse> = (1..80)
+        .map(|step| CannedResponse::json(&anthropic_tool_use_response(step)))
+        .collect();
+    responses.push(CannedResponse::json(
+        r#"{
+            "id": "msg_final",
+            "model": "claude-test",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Budget summary"}],
+            "stop_reason": "end_turn"
+        }"#,
+    ));
+    let server = FakeProviderServer::start(responses);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "keep using tools");
+
+    let registry = registry_with_read_tool();
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result =
+        run_loop_once_with_registry(&model, &store, &session_id, &run_id, &turns, &registry);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "budgeted run should complete with a final text turn, got {result:?}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 80, "default budget should stop at step 80");
+    let first_request: serde_json::Value =
+        serde_json::from_str(&requests[0]).expect("first request body should be JSON");
+    assert!(
+        first_request.get("tools").is_some(),
+        "tool definitions should be available before the final step"
+    );
+    let final_request: serde_json::Value =
+        serde_json::from_str(&requests[79]).expect("final request body should be JSON");
+    assert!(
+        final_request.get("tools").is_none(),
+        "final-step request should disable tools"
+    );
+    let final_messages = final_request["messages"]
+        .as_array()
+        .expect("final request should carry messages");
+    assert!(
+        final_messages.iter().any(|message| {
+            message["role"] == "assistant"
+                && message["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|block| {
+                        block["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("Tools are now disabled"))
+                    })
+        }),
+        "final request should include the synthetic text-only summary instruction"
+    );
+
+    let final_turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    assert!(
+        final_turns.iter().any(|turn| {
+            turn.role == ModelTurnRole::Assistant
+                && matches!(
+                    turn.parts.as_slice(),
+                    [TurnPart::Text {
+                        synthetic: Some(true),
+                        ..
+                    }]
+                )
+                && turn.text_content().contains("Tools are now disabled")
+        }),
+        "synthetic final-step instruction should be persisted for replay"
+    );
+    assert!(
+        final_turns
+            .iter()
+            .filter(|turn| turn.role == ModelTurnRole::Assistant)
+            .any(|turn| turn.text_content() == "Budget summary"),
+        "provider's final text-only summary should be persisted"
+    );
+}
+
+#[test]
+fn final_step_does_not_dispatch_provider_tool_calls() {
+    let mut responses: Vec<CannedResponse> = (1..80)
+        .map(|step| CannedResponse::json(&anthropic_tool_use_response(step)))
+        .collect();
+    responses.push(CannedResponse::json(&anthropic_text_and_tool_use_response(
+        "Budget summary",
+        80,
+        "after-budget.txt",
+    )));
+    let server = FakeProviderServer::start(responses);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "keep using tools");
+
+    let registry = registry_with_read_tool();
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result =
+        run_loop_once_with_registry(&model, &store, &session_id, &run_id, &turns, &registry);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "final-step tool calls should not push the loop past the step budget, got {result:?}"
+    );
+    assert_eq!(
+        server.requests().len(),
+        80,
+        "run should stop at the final step"
+    );
+
+    let final_turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let final_assistant = final_turns
+        .iter()
+        .rev()
+        .find(|turn| turn.role == ModelTurnRole::Assistant)
+        .expect("final assistant turn should be persisted");
+    assert_eq!(final_assistant.text_content(), "Budget summary");
+    assert!(
+        final_assistant.tool_calls().is_empty(),
+        "final assistant turn should stay text-only even if the provider returned a tool call"
+    );
+    assert!(
+        final_turns.iter().all(|turn| {
+            !matches!(
+                turn.parts.as_slice(),
+                [TurnPart::ToolResult { tool_call_id, .. }] if tool_call_id == "toolu_80"
+            )
+        }),
+        "final-step tool call should not execute or persist a tool result"
+    );
+}
+
+#[test]
+fn third_consecutive_identical_tool_call_returns_doom_loop_tool_result() {
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json(&anthropic_tool_use_response_with_path(1, "repeat.txt")),
+        CannedResponse::json(&anthropic_tool_use_response_with_path(2, "repeat.txt")),
+        CannedResponse::json(&anthropic_tool_use_response_with_path(3, "repeat.txt")),
+        CannedResponse::json(
+            r#"{
+                "id": "msg_final",
+                "model": "claude-test",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Changed approach"}],
+                "stop_reason": "end_turn"
+            }"#,
+        ),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(
+        &store,
+        &session_id,
+        &run_id,
+        "read the same file repeatedly",
+    );
+
+    let registry = registry_with_read_tool();
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result =
+        run_loop_once_with_registry(&model, &store, &session_id, &run_id, &turns, &registry);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "doom-loop guarded run should complete, got {result:?}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "the synthetic doom-loop result should be sent to the next model turn"
+    );
+    assert!(
+        requests[3].contains(DOOM_LOOP_READ_MESSAGE),
+        "next provider request should include the synthetic doom-loop tool result"
+    );
+
+    let final_turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    assert!(
+        final_turns.iter().any(|turn| {
+            turn.role == ModelTurnRole::Tool
+                && matches!(
+                    turn.parts.as_slice(),
+                    [TurnPart::ToolResult { content, .. }]
+                        if content == DOOM_LOOP_READ_MESSAGE
+                )
+        }),
+        "third identical call should persist the synthetic doom-loop tool result"
+    );
+}
+
+#[test]
+fn batched_doom_loop_result_keeps_original_tool_result_order() {
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json(&anthropic_three_identical_tool_uses_response()),
+        CannedResponse::json(
+            r#"{
+                "id": "msg_final",
+                "model": "claude-test",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Changed approach"}],
+                "stop_reason": "end_turn"
+            }"#,
+        ),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "try repeated tool calls");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let (result, events) =
+        run_loop_once_collecting_events(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "doom-loop guarded batch should complete, got {result:?}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "tool batch should be returned once");
+    let first_error_index = requests[1]
+        .find("unknown tool `repeat_tool`")
+        .expect("first executable tool result should be replayed");
+    let doom_loop_index = requests[1]
+        .find(DOOM_LOOP_REPEAT_TOOL_MESSAGE)
+        .expect("synthetic doom-loop result should be replayed");
+    assert!(
+        first_error_index < doom_loop_index,
+        "synthetic doom-loop result should keep the original third-call position"
+    );
+
+    let failed_messages = tool_call_failed_messages(&events);
+    assert_eq!(
+        failed_messages,
+        vec![
+            "unknown tool `repeat_tool`".to_string(),
+            "unknown tool `repeat_tool`".to_string(),
+            DOOM_LOOP_REPEAT_TOOL_MESSAGE.to_string(),
+        ],
+        "streamed failure events should follow the original tool-call order"
+    );
+}
+
+#[test]
 fn cancelling_a_run_aborts_the_in_flight_dialect_request() {
     // A server that accepts the connection but never answers: without
     // cancellation propagation the run would block until the request timeout.
@@ -630,30 +895,42 @@ fn run_loop_once(
     run_id: &RunId,
     turns: &[ModelTurn],
 ) -> RunLoopResult {
-    run_loop_with_token(
-        model,
-        store,
-        session_id,
-        run_id,
-        turns,
-        OpenAiCompletionsCancellationToken::new(),
-    )
+    let registry = ToolRegistry::default();
+    run_loop_once_with_registry(model, store, session_id, run_id, turns, &registry)
 }
 
-fn run_loop_with_token(
+fn run_loop_once_with_registry(
     model: &ResolvedModelConfig,
     store: &Arc<Mutex<SessionStore>>,
     session_id: &SessionId,
     run_id: &RunId,
     turns: &[ModelTurn],
-    cancellation_token: OpenAiCompletionsCancellationToken,
+    registry: &ToolRegistry,
 ) -> RunLoopResult {
-    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+    run_loop_with_token_and_registry(
+        model,
+        store,
+        session_id,
+        run_id,
+        turns,
+        registry,
+        OpenAiCompletionsCancellationToken::new(),
+    )
+}
+
+fn run_loop_once_collecting_events(
+    model: &ResolvedModelConfig,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turns: &[ModelTurn],
+) -> (RunLoopResult, Vec<HarnessEventEnvelope>) {
     let registry = ToolRegistry::default();
     let context = ToolContext::default();
     let mut ids = TestIds::default();
-
-    run_loop.run(
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+    let mut events = Vec::new();
+    let result = run_loop.run(
         model,
         RunLoopRequest {
             session_id,
@@ -666,11 +943,138 @@ fn run_loop_with_token(
             session_store: Some(store),
             pending_confirmations: None,
             compaction_model_resolver: None,
+            cancellation_token: OpenAiCompletionsCancellationToken::new(),
+        },
+        &mut ids,
+        |envelopes| events.extend(envelopes),
+    );
+
+    (result, events)
+}
+
+fn run_loop_with_token(
+    model: &ResolvedModelConfig,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turns: &[ModelTurn],
+    cancellation_token: OpenAiCompletionsCancellationToken,
+) -> RunLoopResult {
+    let registry = ToolRegistry::default();
+    run_loop_with_token_and_registry(
+        model,
+        store,
+        session_id,
+        run_id,
+        turns,
+        &registry,
+        cancellation_token,
+    )
+}
+
+fn run_loop_with_token_and_registry(
+    model: &ResolvedModelConfig,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turns: &[ModelTurn],
+    registry: &ToolRegistry,
+    cancellation_token: OpenAiCompletionsCancellationToken,
+) -> RunLoopResult {
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+    let context = ToolContext::default();
+    let mut ids = TestIds::default();
+
+    run_loop.run(
+        model,
+        RunLoopRequest {
+            session_id,
+            run_id,
+            message_id: &message_id(0),
+            turns,
+            tool_registry: registry,
+            tool_preset: ToolPreset::Coding,
+            tool_context: &context,
+            session_store: Some(store),
+            pending_confirmations: None,
+            compaction_model_resolver: None,
             cancellation_token,
         },
         &mut ids,
         |_events| {},
     )
+}
+
+fn registry_with_read_tool() -> ToolRegistry {
+    let mut registry = ToolRegistry::default();
+    read::register(&mut registry).unwrap();
+    registry
+}
+
+fn tool_call_failed_messages(events: &[HarnessEventEnvelope]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            HarnessEvent::ToolCallFailed { error_message, .. } => Some(error_message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn anthropic_tool_use_response(step: usize) -> String {
+    anthropic_tool_use_response_with_path(step, &format!("file-{step}.txt"))
+}
+
+fn anthropic_tool_use_response_with_path(step: usize, path: &str) -> String {
+    format!(
+        r#"{{
+            "id": "msg_tool_{step}",
+            "model": "claude-test",
+            "role": "assistant",
+            "content": [{{
+                "type": "tool_use",
+                "id": "toolu_{step}",
+                "name": "read",
+                "input": {{"path": "{path}"}}
+            }}],
+            "stop_reason": "tool_use"
+        }}"#
+    )
+}
+
+fn anthropic_text_and_tool_use_response(text: &str, step: usize, path: &str) -> String {
+    format!(
+        r#"{{
+            "id": "msg_tool_{step}",
+            "model": "claude-test",
+            "role": "assistant",
+            "content": [
+                {{"type": "text", "text": "{text}"}},
+                {{
+                    "type": "tool_use",
+                    "id": "toolu_{step}",
+                    "name": "read",
+                    "input": {{"path": "{path}"}}
+                }}
+            ],
+            "stop_reason": "tool_use"
+        }}"#
+    )
+}
+
+fn anthropic_three_identical_tool_uses_response() -> String {
+    r#"{
+        "id": "msg_repeat_batch",
+        "model": "claude-test",
+        "role": "assistant",
+        "content": [
+            {"type": "tool_use", "id": "toolu_repeat_1", "name": "repeat_tool", "input": {"path": "repeat.txt"}},
+            {"type": "tool_use", "id": "toolu_repeat_2", "name": "repeat_tool", "input": {"path": "repeat.txt"}},
+            {"type": "tool_use", "id": "toolu_repeat_3", "name": "repeat_tool", "input": {"path": "repeat.txt"}}
+        ],
+        "stop_reason": "tool_use"
+    }"#
+    .to_string()
 }
 
 fn seed_user_turn(
