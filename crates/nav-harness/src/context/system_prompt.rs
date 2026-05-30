@@ -8,6 +8,7 @@ use std::fmt::Write;
 use std::time::SystemTime;
 
 use crate::sessions::ModelTurn;
+use crate::skills::SkillRegistry;
 use crate::tools::ToolRegistry;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,7 @@ pub struct SystemPromptBuilder<'a> {
     cwd: &'a dyn Cwd,
     conventions: Option<&'a str>,
     tools: Option<&'a ToolRegistry>,
+    skills: Option<&'a SkillRegistry>,
     git_status: Option<&'a str>,
 }
 
@@ -100,6 +102,7 @@ impl<'a> SystemPromptBuilder<'a> {
             cwd,
             conventions: None,
             tools: None,
+            skills: None,
             git_status: None,
         }
     }
@@ -111,6 +114,12 @@ impl<'a> SystemPromptBuilder<'a> {
 
     pub fn tools(mut self, registry: &'a ToolRegistry) -> Self {
         self.tools = Some(registry);
+        self
+    }
+
+    /// Set the discovered skills, disclosed as name + summary + path only.
+    pub fn skills(mut self, registry: &'a SkillRegistry) -> Self {
+        self.skills = Some(registry);
         self
     }
 
@@ -161,6 +170,35 @@ impl<'a> SystemPromptBuilder<'a> {
             for name in &tool_names {
                 writeln!(out, "- {name}").unwrap();
             }
+        }
+
+        self.write_skills(out);
+    }
+
+    /// Block 2 — available skills, disclosed progressively: only name, summary,
+    /// and path. The model reads each `SKILL.md` on demand. Omitted entirely
+    /// when no skills are present so the cached prefix never carries a stray
+    /// heading.
+    fn write_skills(&self, out: &mut String) {
+        let Some(registry) = self.skills.filter(|r| !r.is_empty()) else {
+            return;
+        };
+
+        out.push('\n');
+        writeln!(out, "## Skills").unwrap();
+        out.push_str(
+            "Each entry is name — summary (path). Read a skill's SKILL.md with the read tool \
+             only when you decide to use that skill.\n",
+        );
+        for skill in registry.skills() {
+            writeln!(
+                out,
+                "- {} — {} ({})",
+                skill.name,
+                skill.summary,
+                skill.path.display()
+            )
+            .unwrap();
         }
     }
 
@@ -479,6 +517,117 @@ No force-push.
         );
 
         assert_eq!(prompt.text_content(), expected);
+    }
+
+    // -- Skills (progressive disclosure) -------------------------------------
+
+    #[derive(Debug)]
+    struct FakeScanner(Vec<(std::path::PathBuf, String)>);
+
+    impl crate::skills::SkillScanner for FakeScanner {
+        fn scan(&self) -> Vec<(std::path::PathBuf, String)> {
+            self.0.clone()
+        }
+    }
+
+    fn skill_registry(skills: &[(&str, &str, &str)]) -> crate::skills::SkillRegistry {
+        let files = skills
+            .iter()
+            .map(|(name, desc, path)| {
+                (
+                    std::path::PathBuf::from(*path),
+                    format!("---\nname: {name}\ndescription: {desc}\n---\nbody"),
+                )
+            })
+            .collect();
+        crate::skills::SkillRegistry::with_scanner(FakeScanner(files))
+    }
+
+    #[test]
+    fn skills_rendered_as_name_summary_path_with_read_instruction() {
+        let registry = skill_registry(&[
+            ("commit", "Create a git commit.", "/skills/commit/SKILL.md"),
+            (
+                "review",
+                "Review a pull request.",
+                "/skills/review/SKILL.md",
+            ),
+        ]);
+
+        let rendered = SystemPromptBuilder::new(
+            &FakeClock {
+                date: "2025-06-15".to_string(),
+            },
+            &FakeCwd {
+                dir: "/app".to_string(),
+            },
+        )
+        .skills(&registry)
+        .render();
+
+        // Name + summary + path, no inlined script body.
+        assert!(
+            rendered.contains("- commit — Create a git commit. (/skills/commit/SKILL.md)"),
+            "missing skill line: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("- review — Review a pull request. (/skills/review/SKILL.md)"),
+            "missing skill line: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("body"),
+            "script body leaked: {rendered:?}"
+        );
+        // On-demand read instruction.
+        assert!(
+            rendered.contains("SKILL.md") && rendered.contains("read"),
+            "missing on-demand read instruction: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn no_skills_section_when_registry_empty() {
+        let registry = skill_registry(&[]);
+
+        let rendered = SystemPromptBuilder::new(
+            &FakeClock {
+                date: "2025-06-15".to_string(),
+            },
+            &FakeCwd {
+                dir: "/app".to_string(),
+            },
+        )
+        .skills(&registry)
+        .render();
+
+        assert!(
+            !rendered.contains("## Skills"),
+            "empty registry should not emit a Skills section: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn skills_confined_to_semi_static_block_two() {
+        let registry =
+            skill_registry(&[("commit", "Create a git commit.", "/skills/commit/SKILL.md")]);
+
+        let rendered = SystemPromptBuilder::new(
+            &FakeClock {
+                date: "2025-06-15".to_string(),
+            },
+            &FakeCwd {
+                dir: "/app".to_string(),
+            },
+        )
+        .skills(&registry)
+        .render();
+
+        let blocks: Vec<&str> = rendered.split(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).collect();
+        assert_eq!(blocks.len(), 3);
+        assert!(
+            blocks[1].contains("## Skills"),
+            "Skills must live in the semi-static Block 2: {rendered:?}"
+        );
     }
 
     #[test]
