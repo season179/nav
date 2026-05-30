@@ -70,6 +70,7 @@ fn multi_event_stream_decodes_to_canonical_parts_in_event_order() {
         Part::Thinking {
             text: "enc_reasoning_1".to_string(),
             provider_hint: Some("encrypted".to_string()),
+            signature: None,
         }
     );
 

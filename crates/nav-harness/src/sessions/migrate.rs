@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS turns (
     run_id          TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     seq             INTEGER NOT NULL,
     role            TEXT NOT NULL,
+    model_id        TEXT,
     meta_json       TEXT NOT NULL DEFAULT '{}',
     created_at      INTEGER NOT NULL,
     UNIQUE (run_id, seq)
@@ -503,6 +504,7 @@ const TABLES: &[TableSchema] = &[
             ),
             column("seq", "seq INTEGER NOT NULL", "INTEGER", true, None, false),
             column("role", "role TEXT NOT NULL", "TEXT", true, None, false),
+            column("model_id", "model_id TEXT", "TEXT", false, None, false),
             column(
                 "meta_json",
                 "meta_json TEXT NOT NULL DEFAULT '{}'",
@@ -1207,5 +1209,33 @@ mod tests {
             .expect("fallback FTS table should be searchable");
 
         assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn migrate_adds_turns_model_id_to_legacy_schema() {
+        let conn = Connection::open_in_memory().expect("in-memory connection should open");
+        // A pre-#466 `turns` table that predates the model_id column.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE turns (
+                id              TEXT PRIMARY KEY NOT NULL,
+                run_id          TEXT NOT NULL,
+                seq             INTEGER NOT NULL,
+                role            TEXT NOT NULL,
+                meta_json       TEXT NOT NULL DEFAULT '{}',
+                created_at      INTEGER NOT NULL,
+                UNIQUE (run_id, seq)
+            );
+            "#,
+        )
+        .expect("legacy turns table should be created");
+
+        migrate(&conn).expect("migration should reconcile the legacy schema");
+
+        let columns = read_table_columns(&conn, "turns").expect("turns columns should be readable");
+        assert!(
+            columns.contains_key("model_id"),
+            "reconciliation should add the turns.model_id column without a manual migration"
+        );
     }
 }

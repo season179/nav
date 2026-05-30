@@ -185,6 +185,7 @@ fn sample_parts() -> Vec<Part> {
         Part::Thinking {
             text: "considering".to_string(),
             provider_hint: Some("encrypted".to_string()),
+            signature: Some("sig_round_trip".to_string()),
         },
         Part::StepStart {
             snapshot: Some("before".to_string()),

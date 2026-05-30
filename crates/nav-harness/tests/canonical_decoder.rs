@@ -251,6 +251,7 @@ fn anthropic_thinking_decodes_to_canonical_thinking_part() {
         Part::Thinking {
             text: "I should inspect the requested file first.".to_string(),
             provider_hint: Some("thinking".to_string()),
+            signature: Some("sig_01thinking".to_string()),
         }
     );
     assert_eq!(parts[1].provider_json_pointer, "/content/0/thinking");
@@ -270,6 +271,7 @@ fn anthropic_redacted_thinking_decodes_to_canonical_thinking_part() {
         Part::Thinking {
             text: "encrypted-redacted-thinking".to_string(),
             provider_hint: Some("redacted_thinking".to_string()),
+            signature: None,
         }
     );
     assert_eq!(parts[1].provider_json_pointer, "/content/0/data");
@@ -311,6 +313,7 @@ fn anthropic_multi_step_response_matches_snapshot() {
   {
     "part": {
       "provider_hint": "thinking",
+      "signature": "sig_01multi",
       "text": "I need to read the manifest first.",
       "type": "thinking"
     },
@@ -762,6 +765,7 @@ fn responses_encrypted_reasoning_decodes_to_thinking_part() {
         Part::Thinking {
             text: "enc_reasoning_payload".to_string(),
             provider_hint: Some("encrypted".to_string()),
+            signature: None,
         }
     );
     assert_eq!(
@@ -793,6 +797,7 @@ fn responses_reasoning_text_decodes_to_thinking_part() {
         Part::Thinking {
             text: "Detailed reasoning.".to_string(),
             provider_hint: Some("reasoning_text".to_string()),
+            signature: None,
         }
     );
     assert_eq!(parts[1].provider_json_pointer, "/output/0/content/0/text");
@@ -801,6 +806,7 @@ fn responses_reasoning_text_decodes_to_thinking_part() {
         Part::Thinking {
             text: "Checked the inputs.".to_string(),
             provider_hint: Some("summary_text".to_string()),
+            signature: None,
         }
     );
     assert_eq!(parts[2].provider_json_pointer, "/output/0/summary/0/text");

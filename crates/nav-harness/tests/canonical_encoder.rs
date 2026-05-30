@@ -204,6 +204,7 @@ fn thinking_step_retry_snapshot_parts_produce_no_messages() {
         Part::Thinking {
             text: "reasoning...".to_string(),
             provider_hint: None,
+            signature: None,
         },
         Part::StepStart {
             snapshot: Some("before".to_string()),
@@ -547,6 +548,7 @@ fn full_request_body_matches_known_good_fixture() {
                 Part::Thinking {
                     text: "considering options".to_string(),
                     provider_hint: None,
+                    signature: None,
                 },
             ],
         ),

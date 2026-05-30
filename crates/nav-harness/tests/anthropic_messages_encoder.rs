@@ -1,8 +1,11 @@
 //! Fixture-driven tests for the Anthropic Messages canonical encoder.
 
-use nav_harness::models::{AnthropicMessagesEncoder, AnthropicToolDefinition, ApiKind, Encoder};
+use nav_harness::models::{
+    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, AnthropicMessagesEncoder,
+    AnthropicToolDefinition, ApiKind, Decoder, Encoder,
+};
 use nav_harness::sessions::{ImageSource, ModelTurn, Part, ToolCall, Turn, TurnMeta, TurnRole};
-use nav_types::{ArtifactId, MessageId, RunId, ToolCallId};
+use nav_types::{ArtifactId, MessageId, ProviderPayloadId, RunId, ToolCallId};
 
 fn message_id(suffix: u64) -> MessageId {
     MessageId::try_new(format!("019f2f6f-f178-7a72-9f28-{suffix:012x}"))
@@ -322,6 +325,7 @@ fn canonical_thinking_part_produces_thinking_content_block() {
         vec![Part::Thinking {
             text: "I should inspect the manifest first.".to_string(),
             provider_hint: Some("anthropic".to_string()),
+            signature: None,
         }],
     )];
 
@@ -339,4 +343,57 @@ fn canonical_thinking_part_produces_thinking_content_block() {
             }]
         })]
     );
+}
+
+#[test]
+fn anthropic_thinking_signature_round_trips() {
+    // Decode an Anthropic response whose thinking block carries a signature, then
+    // re-encode the canonical parts and assert the signature survives verbatim.
+    let decoded = AnthropicMessagesDecoder::new()
+        .decode(&AnthropicMessagesDecodeInput {
+            provider_payload_id: ProviderPayloadId::try_new(
+                "pay_0000018bcfe56800_0000000000000001",
+            )
+            .expect("test provider payload id"),
+            raw_artifact_id: ArtifactId::try_new("art_0000018bcfe56800_0000000000000001")
+                .expect("test artifact id"),
+            run_id: run_id(1),
+            provider_id: Some("anthropic".to_string()),
+            raw_json: include_bytes!("fixtures/anthropic-messages/thinking.json").to_vec(),
+            created_at: 1_700_000_000_000,
+        })
+        .expect("fixture should decode");
+
+    let signature = decoded.turns[0]
+        .parts
+        .iter()
+        .find_map(|part| match &part.part {
+            Part::Thinking { signature, .. } => Some(signature.clone()),
+            _ => None,
+        })
+        .expect("a thinking part should be decoded");
+    assert_eq!(signature.as_deref(), Some("sig_01thinking"));
+
+    let parts: Vec<Part> = decoded.turns[0]
+        .parts
+        .iter()
+        .map(|part| part.part.clone())
+        .collect();
+    let turns = vec![turn(TurnRole::Assistant, 1, parts)];
+
+    let request = AnthropicMessagesEncoder::new()
+        .encode(&turns)
+        .expect("encoding should succeed");
+
+    let thinking_block = request.messages[0]["content"]
+        .as_array()
+        .expect("assistant content array")
+        .iter()
+        .find(|block| block["type"] == "thinking")
+        .expect("a re-emitted thinking block");
+    assert_eq!(
+        thinking_block["thinking"],
+        "I should inspect the requested file first."
+    );
+    assert_eq!(thinking_block["signature"], "sig_01thinking");
 }

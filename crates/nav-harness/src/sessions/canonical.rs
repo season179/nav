@@ -223,6 +223,10 @@ pub enum Part {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_hint: Option<String>,
+        /// Opaque provider signature (e.g. Anthropic signed thinking) re-sent
+        /// verbatim at encode so the producer can verify the reasoning block.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     StepStart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -302,6 +306,7 @@ impl<'de> Deserialize<'de> for Part {
                 Ok(Self::Thinking {
                     text: payload.text,
                     provider_hint: payload.provider_hint,
+                    signature: payload.signature,
                 })
             }
             "step_start" => {
@@ -427,6 +432,8 @@ struct ThinkingPartPayload {
     text: String,
     #[serde(default)]
     provider_hint: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Deserialize)]

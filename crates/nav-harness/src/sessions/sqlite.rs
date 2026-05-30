@@ -2235,16 +2235,18 @@ fn insert_turn(tx: &Transaction, prepared: &PreparedTurn) -> rusqlite::Result<()
             run_id,
             seq,
             role,
+            model_id,
             meta_json,
             created_at
         )
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         "#,
         params![
             turn.id.as_str(),
             turn.run_id.as_str(),
             seq,
             turn_role_name(turn.role),
+            turn.meta.model_id.as_deref(),
             prepared.meta_json.as_str(),
             turn.created_at,
         ],
@@ -3614,6 +3616,8 @@ mod tests {
         assert_index_exists(&conn, "idx_provider_payloads_run_sequence");
         assert_index_exists(&conn, "idx_provider_payloads_session");
 
+        assert_column_exists(&conn, "turns", "model_id");
+
         let (version, applied_at): (i64, i64) = conn
             .query_row(
                 "SELECT version, applied_at FROM schema_migrations",
@@ -3623,6 +3627,55 @@ mod tests {
             .expect("schema_migrations should be queryable");
         assert_eq!(version, migrate::SCHEMA_VERSION);
         assert!(applied_at > 0);
+    }
+
+    #[test]
+    fn append_turn_denormalizes_model_id_into_its_own_column() {
+        let db = TempDb::new("turn-model-id");
+        let store = SqliteSessionStore::open(db.path()).expect("open should succeed");
+        let session_id = nav_types::SessionId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000001");
+        let run_id = nav_types::RunId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000002");
+        insert_test_session(&store, &session_id);
+        store
+            .start_run(StartRun {
+                id: run_id.clone(),
+                session_id,
+                status: RunStatus::Running,
+                trigger: Some("user".to_string()),
+                started_at: 2_000,
+            })
+            .expect("run start should commit");
+
+        let turn = Turn {
+            id: nav_types::MessageId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000003"),
+            run_id: run_id.clone(),
+            seq: 0,
+            role: TurnRole::Assistant,
+            meta: crate::sessions::TurnMeta {
+                model_id: Some("claude-opus-4-8".to_string()),
+                ..crate::sessions::TurnMeta::default()
+            },
+            created_at: 3_000,
+        };
+        store
+            .append_turn(
+                turn,
+                vec![Part::Text {
+                    text: "hi".to_string(),
+                    synthetic: None,
+                }],
+            )
+            .expect("append should commit");
+
+        let conn = Connection::open(db.path()).expect("schema should be readable");
+        let model_id: Option<String> = conn
+            .query_row(
+                "SELECT model_id FROM turns WHERE run_id = ?1",
+                [run_id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("turns.model_id should be queryable");
+        assert_eq!(model_id.as_deref(), Some("claude-opus-4-8"));
     }
 
     #[test]
