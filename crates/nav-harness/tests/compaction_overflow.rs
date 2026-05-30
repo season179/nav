@@ -609,6 +609,137 @@ fn transient_summary_failure_cooldown_gates_next_auto_compaction() {
     );
 }
 
+#[test]
+fn run_loop_keeps_tool_results_verbatim_below_prune_threshold() {
+    let server = FakeProviderServer::start(vec![canned_stream_completion("Below threshold.")]);
+    let (store, turns) =
+        tool_result_session_with_tool_output("verbatim-below-threshold-output", 10_000);
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let trigger_id = message_id(99);
+
+    let model = resolved_model(server.base_url());
+    let store = Arc::new(Mutex::new(store));
+
+    let result = run_overflow_loop(&model, &store, &session_id, &run_id, &trigger_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "below-threshold request should complete normally, got {result:?}"
+    );
+
+    let requests = server.requests();
+    let request_body = requests.first().expect("provider should receive a request");
+    assert!(
+        request_body.contains("verbatim-below-threshold-output"),
+        "the model request should keep old tool output visible below the prune threshold"
+    );
+    assert!(
+        !request_body.contains("[read]:"),
+        "below the 60% threshold, cheap pruning summaries should not be projected"
+    );
+}
+
+#[test]
+fn run_loop_projects_tool_result_summaries_above_prune_threshold() {
+    let server = FakeProviderServer::start(vec![canned_stream_completion("Above threshold.")]);
+    let (store, turns) =
+        tool_result_session_with_tool_output("verbatim-above-threshold-output", 18_000);
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let trigger_id = message_id(99);
+
+    let model = resolved_model(server.base_url());
+    let store = Arc::new(Mutex::new(store));
+
+    let result = run_overflow_loop(&model, &store, &session_id, &run_id, &trigger_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "above-threshold request should complete normally, got {result:?}"
+    );
+
+    let requests = server.requests();
+    let request_body = requests.first().expect("provider should receive a request");
+    assert!(
+        request_body.contains("[read]:"),
+        "over the 60% threshold, old tool outputs should be projected into summaries"
+    );
+}
+
+#[test]
+fn run_loop_compacts_before_streaming_at_usable_threshold() {
+    let server = FakeProviderServer::start(vec![
+        canned_summary(&valid_summary("Finish proactive compaction.")),
+        canned_stream_completion("Compacted proactively."),
+    ]);
+    let (store, turns) = proactive_compaction_session();
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let trigger_id = message_id(99);
+
+    let model = resolved_model_with_budget(server.base_url(), Some(16_000), Some(2_000));
+    let store = Arc::new(Mutex::new(store));
+
+    let result = run_overflow_loop(&model, &store, &session_id, &run_id, &trigger_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "proactive compaction should complete without provider overflow, got {result:?}"
+    );
+    assert_eq!(
+        server.handled(),
+        2,
+        "run loop should call the summary agent, then stream the compacted request"
+    );
+
+    let requests = server.requests();
+    assert!(
+        requests[0].contains("Build the next compaction summary"),
+        "first provider call should ask for a compaction summary"
+    );
+    assert!(
+        requests[1].contains("Finish proactive compaction"),
+        "second provider call should include the generated summary"
+    );
+    assert!(
+        !requests[1].contains("proactive-oversize-head user 0"),
+        "the streamed request should not carry the oversized head after compaction"
+    );
+
+    let final_turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    assert_eq!(
+        continuation_count(&final_turns),
+        0,
+        "proactive compaction should not append an overflow continuation"
+    );
+}
+
+#[test]
+fn run_loop_does_not_compact_when_completion_buffer_exceeds_window() {
+    let server = FakeProviderServer::start(vec![canned_stream_completion("No useful budget.")]);
+    let store = small_session();
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let trigger_id = message_id(99);
+
+    let model = resolved_model_with_budget(server.base_url(), Some(1_000), Some(2_000));
+    let store = Arc::new(Mutex::new(store));
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+
+    let result = run_overflow_loop(&model, &store, &session_id, &run_id, &trigger_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "zero usable budget should not force a no-op compaction, got {result:?}"
+    );
+    assert_eq!(
+        server.handled(),
+        1,
+        "the run loop should stream the original request without a summary call"
+    );
+}
+
 fn run_overflow_loop(
     model: &ResolvedModelConfig,
     store: &Arc<Mutex<SessionStore>>,
@@ -707,6 +838,103 @@ fn oversize_session() -> SessionStore {
     store
 }
 
+fn tool_result_session_with_tool_output(
+    marker: &str,
+    repeated_chars: usize,
+) -> (SessionStore, Vec<ModelTurn>) {
+    let store = SessionStore::default();
+    let session_id = session_id();
+    let run_id = run_id(1);
+
+    store.create_session(session_id.clone()).unwrap();
+    store.start_run(&session_id, run_id.clone()).unwrap();
+    for index in 0..20 {
+        let call_id = format!("call_read_{index}");
+        let output = format!("{marker}-{index} {}", "x".repeat(repeated_chars));
+        store
+            .append_turn(
+                &run_id,
+                message_id(index * 2),
+                ModelTurn::assistant_tool_calls(vec![tool_call(&call_id, "read")]),
+            )
+            .unwrap();
+        store
+            .append_turn(
+                &run_id,
+                message_id(index * 2 + 1),
+                ModelTurn::tool_result(call_id, output),
+            )
+            .unwrap();
+    }
+    store
+        .append_turn(
+            &run_id,
+            message_id(99),
+            ModelTurn::user_text("summarize the tool outputs"),
+        )
+        .unwrap();
+    let turns = store.try_turns(&session_id).unwrap();
+
+    (store, turns)
+}
+
+fn proactive_compaction_session() -> (SessionStore, Vec<ModelTurn>) {
+    let store = SessionStore::default();
+    let session_id = session_id();
+    let run_id = run_id(1);
+
+    store.create_session(session_id.clone()).unwrap();
+    store.start_run(&session_id, run_id.clone()).unwrap();
+    for index in 0..16 {
+        let turn = if index % 2 == 0 {
+            ModelTurn::user_text(format!(
+                "proactive-oversize-head user {index} {}",
+                "u".repeat(4_000)
+            ))
+        } else {
+            ModelTurn::assistant_text(format!(
+                "proactive-oversize-head assistant {index} {}",
+                "a".repeat(4_000)
+            ))
+        };
+        store.append_turn(&run_id, message_id(index), turn).unwrap();
+    }
+
+    store
+        .append_turn(
+            &run_id,
+            message_id(99),
+            ModelTurn::user_text("please finish after proactive compaction"),
+        )
+        .unwrap();
+    let turns = store.try_turns(&session_id).unwrap();
+
+    (store, turns)
+}
+
+fn small_session() -> SessionStore {
+    let store = SessionStore::default();
+    let session_id = session_id();
+    let run_id = run_id(1);
+
+    store.create_session(session_id.clone()).unwrap();
+    store.start_run(&session_id, run_id.clone()).unwrap();
+    store
+        .append_turn(&run_id, message_id(99), ModelTurn::user_text("tiny prompt"))
+        .unwrap();
+
+    store
+}
+
+fn tool_call(id: &str, name: &str) -> nav_harness::sessions::ToolCall {
+    nav_harness::sessions::ToolCall {
+        id: id.to_string(),
+        tool_call_id: None,
+        name: name.to_string(),
+        arguments: "{}".to_string(),
+    }
+}
+
 fn continuation_count(turns: &[ModelTurn]) -> usize {
     turns
         .iter()
@@ -741,6 +969,14 @@ fn last_user_turn(turns: &[ModelTurn]) -> Option<&ModelTurn> {
 }
 
 fn resolved_model(base_url: &str) -> ResolvedModelConfig {
+    resolved_model_with_budget(base_url, None, None)
+}
+
+fn resolved_model_with_budget(
+    base_url: &str,
+    context_window: Option<u32>,
+    max_tokens: Option<u32>,
+) -> ResolvedModelConfig {
     let mut providers = BTreeMap::new();
     providers.insert(
         "test-provider".to_string(),
@@ -758,8 +994,8 @@ fn resolved_model(base_url: &str) -> ResolvedModelConfig {
                 base_url: None,
                 reasoning: false,
                 input: Vec::new(),
-                context_window: None,
-                max_tokens: None,
+                context_window,
+                max_tokens,
                 compat: Default::default(),
             }],
             compat: Default::default(),
@@ -867,6 +1103,7 @@ fn canned_stream_completion(text: &str) -> CannedResponse {
 struct FakeProviderServer {
     base_url: String,
     handled: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -878,7 +1115,9 @@ impl FakeProviderServer {
             .expect("fake server should set non-blocking");
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         let handled = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let handled_in_thread = Arc::clone(&handled);
+        let requests_in_thread = Arc::clone(&requests);
 
         let handle = thread::spawn(move || {
             for response in responses {
@@ -888,7 +1127,8 @@ impl FakeProviderServer {
                 let Some(mut stream) = accept_before(&listener, Duration::from_secs(10)) else {
                     return;
                 };
-                drain_http_request(&mut stream);
+                let request_body = drain_http_request(&mut stream);
+                requests_in_thread.lock().unwrap().push(request_body);
 
                 let header = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -911,6 +1151,7 @@ impl FakeProviderServer {
         Self {
             base_url,
             handled,
+            requests,
             handle: Some(handle),
         }
     }
@@ -921,6 +1162,10 @@ impl FakeProviderServer {
 
     fn handled(&self) -> usize {
         self.handled.load(Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -953,13 +1198,13 @@ fn accept_before(listener: &TcpListener, timeout: Duration) -> Option<TcpStream>
     }
 }
 
-fn drain_http_request(stream: &mut TcpStream) {
+fn drain_http_request(stream: &mut TcpStream) -> String {
     let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).expect("header should read") == 0 {
-            return;
+            return String::new();
         }
         if line == "\r\n" || line == "\n" {
             break;
@@ -972,6 +1217,7 @@ fn drain_http_request(stream: &mut TcpStream) {
     }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body).expect("body should read");
+    String::from_utf8(body).expect("request body should be UTF-8")
 }
 
 fn reason_phrase(status: u16) -> &'static str {
