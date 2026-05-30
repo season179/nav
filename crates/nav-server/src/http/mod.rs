@@ -9,9 +9,11 @@ use std::thread;
 use nav_harness::guardrails::{GuardrailRunner, default_guardrails};
 use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
 use nav_harness::sessions::{
-    ConfirmationDecision, CreateSession, ModelTurn, PendingConfirmation, PendingConfirmationError,
-    PendingConfirmationReceiver, PendingConfirmationRegistry, RunStatus as StoredRunStatus,
-    SessionStore, SessionTotals, SqliteStoreError,
+    AnchoredSearchHit, ConfirmationDecision, CreateSession, ModelTurn, Part, PendingConfirmation,
+    PendingConfirmationError, PendingConfirmationReceiver, PendingConfirmationRegistry,
+    RunStatus as StoredRunStatus, SessionSearchIndex as StoreSessionSearchIndex,
+    SessionSearchOptions, SessionStore, SessionTotals, SqliteStoreError, StoredPart, StoredTurn,
+    TurnRole,
 };
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, bash, edit, read, write};
 use nav_harness::workspace::path::WorkspacePathPolicy;
@@ -19,9 +21,11 @@ use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     JsonRpcVersion, ProtocolCapabilities, RunCancelParams, RunCancelResult, SessionCreateParams,
-    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, SessionTotalsParams,
-    SessionTotalsResult, SettingsReloadResult, ToolApproveParams, ToolConfirmationOutcome,
-    ToolConfirmationResult, ToolRejectParams, ToolsPreset, methods,
+    SessionCreateResult, SessionSearchHit, SessionSearchIndex, SessionSearchParams,
+    SessionSearchResult, SessionSearchTurn, SessionSearchTurnPart, SessionSendMessageParams,
+    SessionSendMessageResult, SessionTotalsParams, SessionTotalsResult, SettingsReloadResult,
+    ToolApproveParams, ToolConfirmationOutcome, ToolConfirmationResult, ToolRejectParams,
+    ToolsPreset, methods,
 };
 use nav_protocol::{BACKEND_EVENT_TYPES, BackendEvent, EventEnvelope};
 use nav_types::{EventId, RunId, SessionId};
@@ -238,6 +242,7 @@ impl HttpServer {
             methods::INITIALIZE => self.handle_initialize(request),
             methods::SESSION_CREATE => self.handle_session_create(request),
             methods::SESSION_SEND_MESSAGE => self.handle_session_send_message(request),
+            methods::SESSION_SEARCH => self.handle_session_search(request),
             methods::SESSION_TOTALS => self.handle_session_totals(request),
             methods::RUN_CANCEL => self.handle_run_cancel(request),
             methods::TOOL_APPROVE => self.handle_tool_approve(request),
@@ -338,6 +343,32 @@ impl HttpServer {
                 request.id,
                 -32603,
                 format!("failed to get session totals: {error}"),
+            ),
+        }
+    }
+
+    fn handle_session_search(&self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
+        let params = match parse_params::<SessionSearchParams>(request.params) {
+            Ok(params) => params,
+            Err(error) => return rpc_error(request.id, -32602, error),
+        };
+        let options = SessionSearchOptions {
+            limit: params.limit,
+            surrounding_turns: params.surrounding_turns,
+            index: store_session_search_index(params.index),
+        };
+
+        match self
+            .session_store
+            .lock()
+            .unwrap()
+            .search_turn_parts_with_anchored_view(&params.query, options)
+        {
+            Ok(hits) => rpc_result(request.id, session_search_result(hits)),
+            Err(error) => rpc_error(
+                request.id,
+                -32603,
+                format!("failed to search sessions: {error}"),
             ),
         }
     }
@@ -861,6 +892,70 @@ fn totals_updated_event(totals: SessionTotals) -> BackendEvent {
         tokens_reasoning: totals.tokens_reasoning,
         tokens_cache_read: totals.tokens_cache_read,
         tokens_cache_write: totals.tokens_cache_write,
+    }
+}
+
+fn store_session_search_index(index: SessionSearchIndex) -> StoreSessionSearchIndex {
+    match index {
+        SessionSearchIndex::Unicode => StoreSessionSearchIndex::Unicode,
+        SessionSearchIndex::Trigram => StoreSessionSearchIndex::Trigram,
+    }
+}
+
+fn session_search_result(hits: Vec<AnchoredSearchHit>) -> SessionSearchResult {
+    SessionSearchResult {
+        hits: hits.into_iter().map(session_search_hit).collect(),
+    }
+}
+
+fn session_search_hit(hit: AnchoredSearchHit) -> SessionSearchHit {
+    SessionSearchHit {
+        session_id: hit.hit.session_id,
+        turn_id: hit.hit.turn_id,
+        part_id: hit.hit.part_id,
+        rank: hit.hit.rank,
+        text: hit.hit.text,
+        anchored_turns: hit
+            .anchored_turns
+            .into_iter()
+            .map(session_search_turn)
+            .collect(),
+    }
+}
+
+fn session_search_turn(turn: StoredTurn) -> SessionSearchTurn {
+    let (turn, parts) = turn;
+    SessionSearchTurn {
+        turn_id: turn.id,
+        run_id: turn.run_id,
+        role: turn_role_name(turn.role).to_string(),
+        created_at: turn.created_at,
+        parts: parts.into_iter().map(session_search_turn_part).collect(),
+    }
+}
+
+fn session_search_turn_part(part: StoredPart) -> SessionSearchTurnPart {
+    SessionSearchTurnPart {
+        part_id: part.id,
+        part_type: part.part.type_name().to_string(),
+        text: session_search_part_text(&part.part),
+        created_at: part.created_at,
+    }
+}
+
+fn session_search_part_text(part: &Part) -> Option<String> {
+    match part {
+        Part::Text { text, .. } => Some(text.clone()),
+        Part::ToolResult { content, .. } => Some(content.clone()),
+        Part::Thinking { text, .. } => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn turn_role_name(role: TurnRole) -> &'static str {
+    match role {
+        TurnRole::User => "user",
+        TurnRole::Assistant => "assistant",
     }
 }
 
