@@ -2,3 +2,5 @@
 /.cache
 /tui/node_modules
 /tui/scratch
+
+.claude/worktrees/*
