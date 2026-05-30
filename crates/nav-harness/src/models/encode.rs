@@ -2,6 +2,8 @@
 
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
 
 use crate::compaction::COMPACTION_REPLAY_TEXT;
 use crate::context::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
@@ -13,12 +15,134 @@ use crate::sessions::canonical::{ImageSource, Part, Turn, TurnRole};
 use crate::sessions::{
     ModelTurn, ModelTurnRole, ProviderState, ToolCall as ModelToolCall, TurnPart,
 };
-use crate::tools::{NavTool, ToolPreset, ToolRegistry};
+use crate::tools::{ToolPreset, ToolRegistry};
 
 const CHATGPT_SUBSCRIPTION_API_KIND: &str = "chatgpt_subscription";
 const CHATGPT_SUBSCRIPTION_API_KIND_DASHED: &str = "chatgpt-subscription";
 const COMPACTION_TEXT: &str = COMPACTION_REPLAY_TEXT;
 const PROVIDER_OPAQUE_TEXT: &str = "[Provider-specific content: opaque]";
+
+/// In-memory cache for tool schema definitions, keyed by `name:hash(desc+sorted_schema)`.
+///
+/// Ensures that identical tool sets produce byte-identical serialized definitions
+/// across turns, preventing prompt-cache churn from minor serialization variations.
+/// Tools are sorted alphabetically before formatting for byte-stable output.
+type ToolSchemaKey = String;
+
+static ANTHROPIC_TOOL_CACHE: LazyLock<RwLock<HashMap<ToolSchemaKey, AnthropicToolDefinition>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static OPENAI_TOOL_CACHE: LazyLock<RwLock<HashMap<ToolSchemaKey, ChatCompletionToolDefinition>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Compute a stable cache key from a tool name, description, and schema: `name:hash(desc+sorted_schema)`.
+fn tool_cache_key(name: &str, description: &str, schema: &Value) -> String {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+
+    let sorted = sort_json_value(schema);
+    let canonical = serde_json::to_string(&sorted).unwrap_or_default();
+
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    description.hash(&mut hasher);
+    canonical.hash(&mut hasher);
+    format!("{name}:{:016x}", hasher.finish())
+}
+
+/// Recursively sort a JSON value so that all object keys are in alphabetical order,
+/// producing a canonical representation for hashing.
+fn sort_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted = serde_json::Map::with_capacity(map.len());
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), sort_json_value(&map[key]));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sort_json_value).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Build a sorted, deduplicated list of Anthropic tool definitions from a tool registry.
+pub(crate) fn anthropic_tools_from_registry(
+    registry: &ToolRegistry,
+    preset: ToolPreset,
+) -> Vec<AnthropicToolDefinition> {
+    let mut tools: Vec<_> = registry
+        .preset_tools(preset)
+        .into_iter()
+        .map(|tool| {
+            let name = tool.name().to_string();
+            let description = tool.description().to_string();
+            let schema = tool.parameters();
+            let key = tool_cache_key(&name, &description, &schema);
+
+            {
+                let cache = ANTHROPIC_TOOL_CACHE.read().unwrap();
+                if let Some(def) = cache.get(&key) {
+                    return def.clone();
+                }
+            }
+
+            let def = AnthropicToolDefinition {
+                name,
+                description,
+                input_schema: schema,
+            };
+            ANTHROPIC_TOOL_CACHE
+                .write()
+                .unwrap()
+                .insert(key, def.clone());
+            def
+        })
+        .collect();
+
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools
+}
+
+/// Build a sorted, deduplicated list of OpenAI tool definitions from a tool registry.
+pub(crate) fn openai_tools_from_registry(
+    registry: &ToolRegistry,
+    preset: ToolPreset,
+) -> Vec<ChatCompletionToolDefinition> {
+    let mut tools: Vec<_> = registry
+        .preset_tools(preset)
+        .into_iter()
+        .map(|tool| {
+            let name = tool.name().to_string();
+            let description = tool.description().to_string();
+            let schema = tool.parameters();
+            let key = tool_cache_key(&name, &description, &schema);
+
+            {
+                let cache = OPENAI_TOOL_CACHE.read().unwrap();
+                if let Some(def) = cache.get(&key) {
+                    return def.clone();
+                }
+            }
+
+            let def = ChatCompletionToolDefinition {
+                name,
+                description,
+                parameters: schema,
+            };
+            OPENAI_TOOL_CACHE
+                .write()
+                .unwrap()
+                .insert(key, def.clone());
+            def
+        })
+        .collect();
+
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools
+}
 
 /// Converts model request turns into a provider-specific request.
 ///
@@ -50,11 +174,7 @@ impl OpenAiChatCompletionsEncoder {
     }
 
     pub fn with_tool_registry(mut self, registry: &ToolRegistry, preset: ToolPreset) -> Self {
-        self.tools = registry
-            .preset_tools(preset)
-            .into_iter()
-            .map(|tool| ChatCompletionToolDefinition::from_tool(tool.as_ref()))
-            .collect();
+        self.tools = openai_tools_from_registry(registry, preset);
         self
     }
 
@@ -283,16 +403,6 @@ pub struct AnthropicToolDefinition {
     pub input_schema: Value,
 }
 
-impl AnthropicToolDefinition {
-    pub(crate) fn from_tool(tool: &dyn NavTool) -> Self {
-        Self {
-            name: tool.name().to_string(),
-            description: tool.description().to_string(),
-            input_schema: tool.parameters(),
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct AnthropicMessagesEncoder {
     system: Option<String>,
@@ -316,11 +426,7 @@ impl AnthropicMessagesEncoder {
     }
 
     pub fn with_tool_registry(mut self, registry: &ToolRegistry, preset: ToolPreset) -> Self {
-        self.tools = registry
-            .preset_tools(preset)
-            .into_iter()
-            .map(|tool| AnthropicToolDefinition::from_tool(tool.as_ref()))
-            .collect();
+        self.tools = anthropic_tools_from_registry(registry, preset);
         self
     }
 
@@ -1273,6 +1379,7 @@ fn provider_state_is_openai_responses(api_kind: &str) -> bool {
 mod tests {
     use super::*;
     use crate::models::openai_completions::OpenAiCompletionsRequest;
+    use crate::tools::NavTool;
 
     struct OpenAiEncoder;
 
@@ -1308,5 +1415,199 @@ mod tests {
         let request = encoder.encode(&turns).unwrap();
 
         assert_eq!(request.messages.len(), 4);
+    }
+
+    // --- Tool-schema cache tests (issue #473) ---
+
+    /// Mock tool for testing tool schema caching and sorting.
+    #[derive(Debug, Clone)]
+    struct MockTool {
+        name: &'static str,
+        description: &'static str,
+        parameters: serde_json::Value,
+    }
+
+    impl MockTool {
+        fn new(name: &'static str, description: &'static str, parameters: Value) -> Self {
+            Self {
+                name,
+                description,
+                parameters,
+            }
+        }
+    }
+
+    impl NavTool for MockTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            self.description
+        }
+
+        fn parameters(&self) -> Value {
+            self.parameters.clone()
+        }
+
+        fn risk_class(&self) -> crate::tools::RiskClass {
+            crate::tools::RiskClass::Read
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a crate::tools::ToolContext,
+            _args: Value,
+            _cancel: crate::tools::ToolCancellationToken,
+        ) -> crate::tools::ToolFuture<'a> {
+            Box::pin(async { Ok(crate::tools::ToolOutput::text("ok")) })
+        }
+    }
+
+    fn build_registry(tools: Vec<MockTool>) -> (ToolRegistry, ToolPreset) {
+        let mut registry = ToolRegistry::new();
+        let preset = ToolPreset::Coding;
+        for tool in tools {
+            let name = tool.name.to_string();
+            registry.register(tool).unwrap();
+            registry.add_to_preset(preset, &name).unwrap();
+        }
+        (registry, preset)
+    }
+
+    #[test]
+    fn anthropic_tools_are_sorted_alphabetically() {
+        let tool_c = MockTool::new(
+            "charlie",
+            "third",
+            json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+        );
+        let tool_a = MockTool::new(
+            "alpha",
+            "first",
+            json!({"type": "object", "properties": {"b": {"type": "string"}}}),
+        );
+        let tool_b = MockTool::new(
+            "bravo",
+            "second",
+            json!({"type": "object", "properties": {"c": {"type": "string"}}}),
+        );
+
+        let (registry, preset) = build_registry(vec![tool_c, tool_a, tool_b]);
+        let encoder =
+            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let request = encoder.encode(&[]).unwrap();
+
+        let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn openai_tools_are_sorted_alphabetically() {
+        let tool_c = MockTool::new(
+            "charlie",
+            "third",
+            json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+        );
+        let tool_a = MockTool::new(
+            "alpha",
+            "first",
+            json!({"type": "object", "properties": {"b": {"type": "string"}}}),
+        );
+        let tool_b = MockTool::new(
+            "bravo",
+            "second",
+            json!({"type": "object", "properties": {"c": {"type": "string"}}}),
+        );
+
+        let (registry, preset) = build_registry(vec![tool_c, tool_a, tool_b]);
+        let encoder =
+            OpenAiChatCompletionsEncoder::new().with_tool_registry(&registry, preset);
+        let request = encoder.encode(&[]).unwrap();
+
+        let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn anthropic_identical_tool_set_produces_byte_identical_serialization() {
+        let tool_a = MockTool::new(
+            "idem_alpha",
+            "desc a",
+            json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+        );
+        let tool_b = MockTool::new(
+            "idem_bravo",
+            "desc b",
+            json!({"type": "object", "properties": {"y": {"type": "string"}}}),
+        );
+
+        let (registry, preset) = build_registry(vec![tool_a, tool_b]);
+
+        let enc1 =
+            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let req1 = enc1.encode(&[]).unwrap();
+        let serialized1 = serde_json::to_string(&req1.serialized_tools()).unwrap();
+
+        let enc2 =
+            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let req2 = enc2.encode(&[]).unwrap();
+        let serialized2 = serde_json::to_string(&req2.serialized_tools()).unwrap();
+
+        assert_eq!(serialized1, serialized2);
+    }
+
+    #[test]
+    fn anthropic_schema_cache_returns_stable_definitions_for_same_hash() {
+        // Verify that building tools twice from the same registry yields
+        // exactly the same definition structs (pointer equality via content).
+        let tool = MockTool::new(
+            "cache_test_alpha",
+            "desc",
+            json!({"type": "object", "properties": {"x": {"type": "number"}}}),
+        );
+
+        let (registry, preset) = build_registry(vec![tool]);
+
+        let enc1 =
+            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+        let enc2 =
+            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+
+        let req1 = enc1.encode(&[]).unwrap();
+        let req2 = enc2.encode(&[]).unwrap();
+
+        // Same tools produced both times.
+        assert_eq!(req1.tools, req2.tools);
+
+        // Byte-identical serialization.
+        let s1 = serde_json::to_string(&req1.serialized_tools()).unwrap();
+        let s2 = serde_json::to_string(&req2.serialized_tools()).unwrap();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn anthropic_serialized_tools_byte_identical_across_turns() {
+        let tool_a = MockTool::new(
+            "read",
+            "read a file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        );
+        let tool_b = MockTool::new(
+            "write",
+            "write a file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}),
+        );
+
+        let (registry, preset) = build_registry(vec![tool_a, tool_b]);
+        let encoder =
+            AnthropicMessagesEncoder::new().with_tool_registry(&registry, preset);
+
+        let req1 = encoder.encode(&[]).unwrap();
+        let req2 = encoder.encode(&[]).unwrap();
+
+        let tools1 = serde_json::to_string(&req1.serialized_tools()).unwrap();
+        let tools2 = serde_json::to_string(&req2.serialized_tools()).unwrap();
+        assert_eq!(tools1, tools2);
     }
 }
