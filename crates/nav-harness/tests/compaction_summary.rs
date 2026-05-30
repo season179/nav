@@ -10,7 +10,8 @@ use nav_harness::compaction::summary::{
     CompactionSummaryAgent, CompactionSummaryRequest, build_compaction_summary_request,
 };
 use nav_harness::models::{
-    ApiKeyConfig, ApiKind, ModelConfig, ModelRef, ModelResolver, ModelSettings, ProviderConfig,
+    ApiKeyConfig, ApiKind, ModelConfig, ModelRef, ModelResolver, ModelSettings,
+    OpenAiCompletionsError, ProviderConfig,
 };
 use nav_harness::sessions::{CompactionConfig, ModelTurn, SessionStore, ToolCall};
 use nav_types::{MessageId, RunId, SessionId};
@@ -536,9 +537,9 @@ fn placeholder_summary_does_not_hide_older_real_summary() {
 
 #[test]
 fn compaction_summary_agent_calls_model_and_returns_assistant_text() {
-    let server = SingleResponseServer::json_response(
+    let server = SequencedResponseServer::new(vec![SequencedResponse::ok(
         "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"## Active Task\\nGenerated summary\"}}]}",
-    );
+    )]);
     let model = resolved_model(server.base_url());
     let agent = CompactionSummaryAgent::new();
     let summary_request = CompactionSummaryRequest {
@@ -549,10 +550,92 @@ fn compaction_summary_agent_calls_model_and_returns_assistant_text() {
 
     let summary = agent.generate(&model, &summary_request).unwrap();
 
-    let request_body = server.request_body();
+    let request_bodies = server.request_bodies();
     assert_eq!(summary, "## Active Task\nGenerated summary");
-    assert!(request_body.contains("Previous summary"));
-    assert!(request_body.contains("continue with the next slice"));
+    assert_eq!(request_bodies.len(), 1);
+    assert!(request_bodies[0].contains("Previous summary"));
+    assert!(request_bodies[0].contains("continue with the next slice"));
+}
+
+#[test]
+fn compaction_call_overflow_drops_oldest_head_turns_and_retries() {
+    let overflow_body = "{\"error\":{\"message\":\"This model's maximum context length is exceeded\",\"code\":\"context_length_exceeded\"}}";
+    let success_body =
+        "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"## Active Task\\nRetried summary\"}}]}";
+    let server = SequencedResponseServer::new(vec![
+        SequencedResponse::error(400, overflow_body),
+        SequencedResponse::ok(success_body),
+    ]);
+    let model = resolved_model(server.base_url());
+    let agent = CompactionSummaryAgent::new();
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: None,
+        head_turns: vec![
+            ModelTurn::user_text("OLDEST_HEAD_TURN keep dropping me"),
+            ModelTurn::assistant_text("middle head turn"),
+            ModelTurn::user_text("NEWEST_HEAD_TURN must survive"),
+        ],
+        tail_start_id: None,
+    };
+
+    let summary = agent.generate(&model, &summary_request).unwrap();
+
+    assert_eq!(summary, "## Active Task\nRetried summary");
+
+    let request_bodies = server.request_bodies();
+    assert_eq!(
+        request_bodies.len(),
+        2,
+        "agent should retry exactly once after a single overflow"
+    );
+    assert!(
+        request_bodies[0].contains("OLDEST_HEAD_TURN"),
+        "first attempt should include the oldest head turn"
+    );
+    assert!(
+        !request_bodies[1].contains("OLDEST_HEAD_TURN"),
+        "retry should drop the oldest head turn but body was:\n{}",
+        request_bodies[1]
+    );
+    assert!(
+        request_bodies[1].contains("NEWEST_HEAD_TURN"),
+        "retry should keep the newest head turn but body was:\n{}",
+        request_bodies[1]
+    );
+}
+
+#[test]
+fn persistent_compaction_overflow_gives_up_after_bounded_retries() {
+    let overflow_body = "{\"error\":{\"message\":\"This model's maximum context length is exceeded\",\"code\":\"context_length_exceeded\"}}";
+    // More overflow responses than any reasonable bound; the agent must stop
+    // well before exhausting them rather than looping forever.
+    let server = SequencedResponseServer::new(
+        (0..16)
+            .map(|_| SequencedResponse::error(400, overflow_body))
+            .collect(),
+    );
+    let model = resolved_model(server.base_url());
+    let agent = CompactionSummaryAgent::new();
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: None,
+        head_turns: (0..8)
+            .map(|index| ModelTurn::user_text(format!("head turn {index}")))
+            .collect(),
+        tail_start_id: None,
+    };
+
+    let error = agent.generate(&model, &summary_request).unwrap_err();
+
+    assert!(
+        matches!(error, OpenAiCompletionsError::ContextLimit(_)),
+        "persistent overflow should surface ContextLimit, got: {error:?}"
+    );
+
+    let attempts = server.request_bodies().len();
+    assert!(
+        (2..=5).contains(&attempts),
+        "agent should retry a bounded handful of times, made {attempts} attempts"
+    );
 }
 
 fn session_id() -> SessionId {
@@ -663,33 +746,55 @@ fn resolved_model(base_url: &str) -> nav_harness::models::ResolvedModelConfig {
     .unwrap()
 }
 
-struct SingleResponseServer {
-    base_url: String,
-    request_body: Receiver<String>,
+struct SequencedResponse {
+    status: u16,
+    body: &'static str,
 }
 
-impl SingleResponseServer {
-    fn json_response(response_body: &'static str) -> Self {
+impl SequencedResponse {
+    fn ok(body: &'static str) -> Self {
+        Self { status: 200, body }
+    }
+
+    fn error(status: u16, body: &'static str) -> Self {
+        Self { status, body }
+    }
+}
+
+/// Mock server that replies with a queued sequence of responses, one per
+/// incoming request, capturing every request body for later assertions.
+struct SequencedResponseServer {
+    base_url: String,
+    request_bodies: Receiver<String>,
+}
+
+impl SequencedResponseServer {
+    fn new(responses: Vec<SequencedResponse>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let (sender, request_body) = channel();
+        let (sender, request_bodies) = channel();
 
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let body = read_http_request_body(&mut stream);
-            sender.send(body).unwrap();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let body = read_http_request_body(&mut stream);
+                sender.send(body).unwrap();
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+                let reason = if response.status == 200 { "OK" } else { "Bad Request" };
+                let http = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.status,
+                    reason,
+                    response.body.len(),
+                    response.body
+                );
+                stream.write_all(http.as_bytes()).unwrap();
+            }
         });
 
         Self {
             base_url: format!("http://{address}"),
-            request_body,
+            request_bodies,
         }
     }
 
@@ -697,10 +802,12 @@ impl SingleResponseServer {
         &self.base_url
     }
 
-    fn request_body(self) -> String {
-        self.request_body
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
+    fn request_bodies(self) -> Vec<String> {
+        let mut bodies = Vec::new();
+        while let Ok(body) = self.request_bodies.recv_timeout(Duration::from_secs(2)) {
+            bodies.push(body);
+        }
+        bodies
     }
 }
 
