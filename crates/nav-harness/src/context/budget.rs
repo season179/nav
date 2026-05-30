@@ -7,7 +7,7 @@
 //! estimate for messages appended after it.
 
 use crate::models::ModelConfig;
-use crate::sessions::{Part, TokenUsage};
+use crate::sessions::{ModelTurn, Part, TokenUsage, TurnPart};
 
 /// Characters per token for natural-language text (prose, thinking, etc.).
 const TEXT_CHARS_PER_TOKEN: f64 = 3.8;
@@ -25,6 +25,9 @@ const IMAGE_PIXELS_PER_TOKEN: u64 = 750;
 /// still hitting a hard `prompt_too_long`.
 const IMAGE_FLAT_FALLBACK_TOKENS: u64 = 1600;
 
+/// Completion buffer used when a model config does not pin `maxTokens`.
+pub const DEFAULT_COMPLETION_BUFFER_TOKENS: u64 = 4_096;
+
 /// Estimate the total token count for a slice of [`Part`]s.
 ///
 /// Text and thinking parts use the natural-language ratio (chars/3.8).
@@ -33,6 +36,15 @@ const IMAGE_FLAT_FALLBACK_TOKENS: u64 = 1600;
 /// (step start/finish, etc.) contribute zero tokens at this estimation level.
 pub fn estimate_tokens_for_parts(parts: &[Part]) -> u64 {
     parts.iter().map(estimate_tokens_for_part).sum()
+}
+
+/// Estimate the total token count for model-visible turns.
+pub fn estimate_tokens_for_model_turns(turns: &[ModelTurn]) -> u64 {
+    turns
+        .iter()
+        .flat_map(|turn| &turn.parts)
+        .map(estimate_tokens_for_turn_part)
+        .sum()
 }
 
 /// Compute the active context size using the hybrid formula:
@@ -97,6 +109,18 @@ impl ContextBudget {
     pub fn body_after_prefix(&self, active_context_size: u64) -> u64 {
         active_context_size.saturating_sub(self.prefix)
     }
+
+    /// Cheap pruning should begin once the conversation body exceeds roughly
+    /// 60% of the body-after-prefix budget.
+    pub fn prune_threshold(&self) -> u64 {
+        self.body_budget().saturating_mul(60) / 100
+    }
+
+    /// Usable body threshold: the body budget with room reserved for the model
+    /// completion.
+    pub fn usable_threshold(&self, completion_buffer: u64) -> u64 {
+        self.body_budget().saturating_sub(completion_buffer)
+    }
 }
 
 fn estimate_tokens_for_part(part: &Part) -> u64 {
@@ -106,6 +130,14 @@ fn estimate_tokens_for_part(part: &Part) -> u64 {
         Part::ToolResult { content, .. } => estimate_dense_tokens(content),
         Part::Image { .. } => estimate_image_tokens(None),
         _ => 0,
+    }
+}
+
+fn estimate_tokens_for_turn_part(part: &TurnPart) -> u64 {
+    match part {
+        TurnPart::Text { text, .. } => estimate_text_tokens(text),
+        TurnPart::ToolCall(tool_call) => estimate_dense_tokens(&tool_call.arguments),
+        TurnPart::ToolResult { content, .. } => estimate_dense_tokens(content),
     }
 }
 
