@@ -2,7 +2,7 @@ use nav_harness::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     OpenAiStreamEventMapper,
 };
-use nav_harness::models::OpenAiCompletionsResponseParser;
+use nav_harness::models::{ApiKind, OpenAiCompletionsResponseParser};
 use nav_types::{ApprovalId, EventId, MessageId, RunId, ToolCallId};
 
 #[test]
@@ -93,6 +93,7 @@ fn provider_error_before_output_emits_provider_error_event() {
 
     let events = mapper.map_stream_result(
         Err(OpenAiCompletionsResponseParser::parse_error_response(
+            ApiKind::OpenAiCompletions,
             429,
             r#"{"error":{"message":"rate limited sk-secret","type":"rate_limit_error","code":"too_many_requests"}}"#,
             "sk-secret",
@@ -138,6 +139,7 @@ fn context_limit_error_preserves_status_and_code_in_provider_error_event() {
 
     let events = mapper.map_stream_result(
         Err(OpenAiCompletionsResponseParser::parse_error_response(
+            ApiKind::OpenAiCompletions,
             400,
             r#"{"error":{"message":"This model's maximum context length is 8192 tokens.","type":"invalid_request_error","code":"context_length_exceeded"}}"#,
             "sk-secret",

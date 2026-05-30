@@ -129,7 +129,12 @@ fn classifies_anthropic_prompt_too_long_error() {
 fn completions_provider_layer_surfaces_typed_context_limit_variant() {
     let body = fixture("openai-completions.json");
 
-    let error = OpenAiCompletionsResponseParser::parse_error_response(400, &body, "sk-secret");
+    let error = OpenAiCompletionsResponseParser::parse_error_response(
+        ApiKind::OpenAiCompletions,
+        400,
+        &body,
+        "sk-secret",
+    );
 
     match error {
         OpenAiCompletionsError::ContextLimit(context_limit) => {
@@ -145,10 +150,57 @@ fn completions_provider_layer_surfaces_typed_context_limit_variant() {
 }
 
 #[test]
+fn anthropic_provider_layer_surfaces_typed_context_limit_variant() {
+    let body = fixture("anthropic-messages.json");
+
+    // Passing the dialect through `parse_error_response` lets the Anthropic
+    // "prompt is too long" error classify as a context limit; with the prior
+    // hardcoded OpenAI classification it would fall through to a provider error.
+    let error = OpenAiCompletionsResponseParser::parse_error_response(
+        ApiKind::AnthropicMessages,
+        400,
+        &body,
+        "sk-secret",
+    );
+
+    match error {
+        OpenAiCompletionsError::ContextLimit(context_limit) => {
+            assert_eq!(context_limit.api, ApiKind::AnthropicMessages);
+            assert_eq!(context_limit.status, 400);
+        }
+        other => panic!("expected ContextLimit variant, got {other:?}"),
+    }
+}
+
+#[test]
+fn completions_dialect_does_not_classify_anthropic_context_limit() {
+    let body = fixture("anthropic-messages.json");
+
+    // The dialect must match: an Anthropic body classified as OpenAI does not
+    // trip the context-limit heuristic, confirming classification is dialect-keyed.
+    let error = OpenAiCompletionsResponseParser::parse_error_response(
+        ApiKind::OpenAiCompletions,
+        400,
+        &body,
+        "sk-secret",
+    );
+
+    assert!(
+        !matches!(error, OpenAiCompletionsError::ContextLimit(_)),
+        "anthropic body should not classify as a context limit under the OpenAI dialect"
+    );
+}
+
+#[test]
 fn completions_provider_layer_keeps_unrelated_400_as_provider_error() {
     let body = fixture("unrelated-openai-400.json");
 
-    let error = OpenAiCompletionsResponseParser::parse_error_response(400, &body, "sk-secret");
+    let error = OpenAiCompletionsResponseParser::parse_error_response(
+        ApiKind::OpenAiCompletions,
+        400,
+        &body,
+        "sk-secret",
+    );
 
     assert!(matches!(error, OpenAiCompletionsError::Provider(_)));
 }

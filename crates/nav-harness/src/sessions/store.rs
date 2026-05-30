@@ -633,6 +633,52 @@ impl SessionStore {
             )
     }
 
+    /// Decode a journaled response payload with the decoder registered for its
+    /// stored `api_kind`, persist the decoded turns, and return the assistant
+    /// turn's message id (if any).
+    ///
+    /// This is the live-loop counterpart to the pending-payload recovery path:
+    /// it dispatches the decoder by dialect rather than assuming Chat
+    /// Completions.
+    pub fn decode_and_append_provider_payload(
+        &self,
+        id: &ProviderPayloadId,
+    ) -> Result<Option<MessageId>, SqliteStoreError> {
+        self.decode_and_append_provider_payload_with_decoders(id, DEFAULT_PAYLOAD_DECODERS)
+    }
+
+    fn decode_and_append_provider_payload_with_decoders(
+        &self,
+        id: &ProviderPayloadId,
+        decoders: &[PayloadDecoder],
+    ) -> Result<Option<MessageId>, SqliteStoreError> {
+        let payload = self.sqlite.get_provider_payload(id)?;
+        let Some(decoder) = decoder_for_api_kind(decoders, payload.api_kind.as_str()) else {
+            return Err(SqliteStoreError::ReadFailed(format!(
+                "no decoder registered for api_kind `{}`",
+                payload.api_kind
+            )));
+        };
+
+        let raw_bytes = self
+            .read_provider_payload_bytes(&payload)
+            .map_err(SqliteStoreError::ReadFailed)?;
+        // Guard the live run path against a decoder panic, mirroring the
+        // recovery path: a panic here would otherwise unwind the run loop.
+        let decoded = decode_payload_catching_panics(decoder, &payload, raw_bytes)
+            .map_err(SqliteStoreError::ReadFailed)?;
+        let assistant_message_id = decoded
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| turn.turn.role == TurnRole::Assistant)
+            .map(|turn| turn.turn.id.clone());
+
+        self.sqlite
+            .append_decoded_provider_payload(id, decoder.version, &decoded)?;
+        Ok(assistant_message_id)
+    }
+
     pub fn get_provider_state(
         &self,
         run_id: &RunId,
@@ -814,7 +860,7 @@ impl SessionStore {
                 .read_provider_payload_bytes(&payload)
                 .map_err(SqliteStoreError::ReadFailed)?;
             let decoded =
-                decode_payload_for_report(decoder, &payload, raw_bytes).map_err(|error| {
+                decode_payload_catching_panics(decoder, &payload, raw_bytes).map_err(|error| {
                     SqliteStoreError::ReadFailed(format!(
                         "failed to re-decode provider payload {}: {error}",
                         payload.id
@@ -967,7 +1013,7 @@ fn decode_anthropic_messages_payload(
         .map_err(|error| error.to_string())
 }
 
-fn decode_payload_for_report(
+fn decode_payload_catching_panics(
     decoder: &PayloadDecoder,
     payload: &ProviderPayloadRow,
     raw_bytes: Vec<u8>,
@@ -2618,6 +2664,35 @@ mod tests {
             .recover_pending_provider_payloads_with_decoders(&[panic_decoder])
             .expect("failed payload should not be pending");
         assert_eq!(retried, 0);
+    }
+
+    #[test]
+    fn live_decode_converts_decoder_panic_into_read_failure() {
+        let (_data_dir, path, payload_id, _run_id) = seed_provider_payload(
+            "panic-decode-live",
+            "panic_api",
+            ProviderPayloadDirection::Response,
+            br#"{"ok":true}"#.to_vec(),
+        );
+        let store = SessionStore {
+            sqlite: SqliteSessionStore::open(&path).expect("live open should succeed"),
+        };
+        let panic_decoder = PayloadDecoder {
+            api_kinds: &["panic_api"],
+            version: "panic-decoder@1",
+            decode: decode_with_panic,
+        };
+
+        // The live run path must surface a decoder panic as an error rather than
+        // unwinding the run loop.
+        let result =
+            store.decode_and_append_provider_payload_with_decoders(&payload_id, &[panic_decoder]);
+
+        let error = result.expect_err("a panicking decoder should produce an error, not unwind");
+        assert!(
+            matches!(&error, SqliteStoreError::ReadFailed(message) if message.contains("decoder panicked")),
+            "expected a ReadFailed carrying the panic message, got {error:?}"
+        );
     }
 
     #[test]

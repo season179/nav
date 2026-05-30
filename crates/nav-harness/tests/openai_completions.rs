@@ -664,6 +664,7 @@ fn preserves_non_key_resolver_errors_as_model_resolution_errors() {
 #[test]
 fn parses_provider_error_and_redacts_api_key() {
     let error = OpenAiCompletionsResponseParser::parse_error_response(
+        ApiKind::OpenAiCompletions,
         401,
         r#"{"error":{"message":"bad key sk-secret","type":"authentication_error","code":"invalid_api_key"}}"#,
         "sk-secret",
@@ -685,6 +686,7 @@ fn parses_provider_error_and_redacts_api_key() {
 #[test]
 fn preserves_plain_http_error_without_leaking_key() {
     let error = OpenAiCompletionsResponseParser::parse_error_response(
+        ApiKind::OpenAiCompletions,
         502,
         "upstream included sk-secret in diagnostics",
         "sk-secret",

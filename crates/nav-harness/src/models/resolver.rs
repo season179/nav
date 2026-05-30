@@ -114,7 +114,9 @@ impl ResolvedApiKey {
 
     #[cfg(test)]
     pub(crate) fn new(secret: impl Into<String>) -> Self {
-        Self { secret: secret.into() }
+        Self {
+            secret: secret.into(),
+        }
     }
 }
 

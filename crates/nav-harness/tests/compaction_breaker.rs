@@ -304,7 +304,12 @@ fn transient_failure_trips_cooldown() {
 
     let event = breaker.record_transient_failure(&session, Duration::ZERO);
 
-    assert_eq!(event, BreakerEvent::TransientCooldown { cooldown: TRANSIENT_COOLDOWN_DURATION });
+    assert_eq!(
+        event,
+        BreakerEvent::TransientCooldown {
+            cooldown: TRANSIENT_COOLDOWN_DURATION
+        }
+    );
     assert!(!breaker.auto_compaction_enabled(&session, Duration::ZERO));
 }
 
