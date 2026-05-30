@@ -2,10 +2,11 @@
 //! issue #469, BUD-03).
 
 use nav_harness::context::budget::{
-    ContextBudget, active_context_size, estimate_image_tokens, estimate_tokens_for_parts,
+    ContextBudget, active_context_size, estimate_image_tokens, estimate_tokens_for_model_turns,
+    estimate_tokens_for_parts,
 };
 use nav_harness::models::{DEFAULT_CONTEXT_WINDOW, ModelConfig};
-use nav_harness::sessions::{ImageSource, Part, TokenUsage};
+use nav_harness::sessions::{ImageSource, ModelTurn, Part, TokenUsage, ToolCall};
 
 // ── Slice 1: text estimation uses chars/3.8 ──────────────────────────────
 
@@ -93,6 +94,22 @@ fn mixed_parts_use_correct_ratio_per_kind() {
     };
     let tokens = estimate_tokens_for_parts(&[text, tool_result]);
     assert_eq!(tokens, 100 + 100);
+}
+
+#[test]
+fn model_turn_estimate_uses_model_visible_parts() {
+    let turns = vec![
+        ModelTurn::user_text("a".repeat(380)),
+        ModelTurn::assistant_tool_calls(vec![ToolCall {
+            id: "call_1".to_string(),
+            tool_call_id: None,
+            name: "read".to_string(),
+            arguments: "x".repeat(200),
+        }]),
+        ModelTurn::tool_result("call_1", "y".repeat(200)),
+    ];
+
+    assert_eq!(estimate_tokens_for_model_turns(&turns), 100 + 100 + 100);
 }
 
 #[test]
@@ -243,6 +260,18 @@ fn body_budget_saturates_at_zero_when_prefix_exceeds_window() {
 fn body_after_prefix_saturates_at_zero_when_active_below_prefix() {
     let budget = ContextBudget::new(200_000, 30_000);
     assert_eq!(budget.body_after_prefix(10_000), 0);
+}
+
+#[test]
+fn prune_threshold_is_sixty_percent_of_body_budget() {
+    let budget = ContextBudget::new(200_000, 30_000);
+    assert_eq!(budget.prune_threshold(), 102_000);
+}
+
+#[test]
+fn usable_threshold_reserves_completion_buffer() {
+    let budget = ContextBudget::new(200_000, 30_000);
+    assert_eq!(budget.usable_threshold(4_096), 165_904);
 }
 
 // ── Slice 7: image estimation (issue #468, BUD-02) ───────────────────────

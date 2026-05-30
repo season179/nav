@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
 use crate::compaction::summary::CompactionSummaryAgent;
-use crate::context::ContextReminders;
+use crate::context::{
+    ContextBudget, ContextReminders, DEFAULT_COMPLETION_BUFFER_TOKENS,
+    estimate_tokens_for_model_turns,
+};
 use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
@@ -192,13 +195,29 @@ impl RunLoop {
         });
         let mut payload_sequence = 0;
         let mut overflow_attempts = 0;
+        let mut proactive_compaction_attempted = false;
 
         loop {
-            if let Some(journal) = journal {
+            if let Some(journal) = journal
+                && should_prune_for_budget(model, &turns)
+            {
                 if let Err(error) = prune_stored_tool_results_for_encoding(journal) {
                     return RunLoopResult::Failed(error);
                 }
                 project_model_turns_for_tool_result_pruning(&mut turns);
+            }
+            if let Some(journal) = journal
+                && !proactive_compaction_attempted
+                && should_compact_for_budget(model, &turns)
+            {
+                proactive_compaction_attempted = true;
+                match self.compact_for_budget(journal, model) {
+                    Ok(compacted_turns) => {
+                        turns = compacted_turns;
+                        continue;
+                    }
+                    Err(error) => return RunLoopResult::Failed(error),
+                }
             }
             let provider_state = match load_provider_state(journal, request.run_id) {
                 Ok(provider_state) => provider_state,
@@ -360,6 +379,42 @@ impl RunLoop {
         run_id: &RunId,
     ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
         let session_id = journal.session_id;
+        self.write_compaction_summary(journal, model)?;
+        journal
+            .store
+            .lock()
+            .unwrap()
+            .append_overflow_continuation(session_id, run_id)
+            .map_err(persistence_error)?;
+
+        journal
+            .store
+            .lock()
+            .unwrap()
+            .try_turns(session_id)
+            .map_err(persistence_error)
+    }
+
+    fn compact_for_budget(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+    ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
+        self.write_compaction_summary(journal, model)?;
+        journal
+            .store
+            .lock()
+            .unwrap()
+            .try_turns(journal.session_id)
+            .map_err(persistence_error)
+    }
+
+    fn write_compaction_summary(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+    ) -> Result<(), OpenAiCompletionsError> {
+        let session_id = journal.session_id;
         let summary_request = journal
             .store
             .lock()
@@ -369,22 +424,13 @@ impl RunLoop {
         let summary = CompactionSummaryAgent::with_client(self.client.clone())
             .generate(model, &summary_request)?;
 
-        {
-            let store = journal.store.lock().unwrap();
-            store
-                .compact_session_with_summary(session_id, &summary_request, summary)
-                .map_err(persistence_error)?;
-            store
-                .append_overflow_continuation(session_id, run_id)
-                .map_err(persistence_error)?;
-        }
-
         journal
             .store
             .lock()
             .unwrap()
-            .try_turns(session_id)
-            .map_err(persistence_error)
+            .compact_session_with_summary(session_id, &summary_request, summary)
+            .map_err(persistence_error)?;
+        Ok(())
     }
 
     fn journal_request_payload(
@@ -963,6 +1009,24 @@ fn prune_stored_tool_results_for_encoding(
         .unwrap()
         .prune_tool_results_for_session(journal.session_id)
         .map_err(persistence_error)
+}
+
+fn should_prune_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -> bool {
+    let budget = ContextBudget::from_model(&model.model, 0);
+    let active_tokens = estimate_tokens_for_model_turns(turns);
+    budget.body_after_prefix(active_tokens) > budget.prune_threshold()
+}
+
+fn should_compact_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -> bool {
+    let budget = ContextBudget::from_model(&model.model, 0);
+    let completion_buffer = model
+        .model
+        .max_tokens
+        .map(u64::from)
+        .unwrap_or(DEFAULT_COMPLETION_BUFFER_TOKENS);
+    let active_tokens = estimate_tokens_for_model_turns(turns);
+    let threshold = budget.usable_threshold(completion_buffer);
+    threshold > 0 && budget.body_after_prefix(active_tokens) >= threshold
 }
 
 fn load_provider_state(
