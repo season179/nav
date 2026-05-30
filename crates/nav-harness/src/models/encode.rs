@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
 use crate::compaction::COMPACTION_REPLAY_TEXT;
+use crate::context::reminders::ContextReminders;
 use crate::context::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
 use crate::models::openai_completions::{
     ChatCompletionMessageRole, ChatCompletionRequestMessage, ChatCompletionToolCall,
@@ -404,6 +405,7 @@ pub struct AnthropicMessagesEncoder {
     system: Option<String>,
     tools: Vec<AnthropicToolDefinition>,
     subagent_fork: bool,
+    reminders: ContextReminders,
 }
 
 impl AnthropicMessagesEncoder {
@@ -434,6 +436,13 @@ impl AnthropicMessagesEncoder {
         self
     }
 
+    /// Attach per-request context reminders, injected as a `<system-reminder>`
+    /// block inside the last user message (plans/context-management.md §2.3).
+    pub fn with_reminders(mut self, reminders: ContextReminders) -> Self {
+        self.reminders = reminders;
+        self
+    }
+
     pub fn encode(
         &self,
         turns: &[(Turn, Vec<Part>)],
@@ -445,13 +454,32 @@ impl AnthropicMessagesEncoder {
         Ok(self.request(messages))
     }
 
-    fn request(&self, messages: Vec<Value>) -> AnthropicMessagesRequest {
+    fn request(&self, mut messages: Vec<Value>) -> AnthropicMessagesRequest {
+        inject_reminders(&mut messages, &self.reminders);
         AnthropicMessagesRequest {
             system: self.system.clone(),
             messages,
             tools: self.tools.clone(),
             subagent_fork: self.subagent_fork,
         }
+    }
+}
+
+/// Append the rendered reminders as the final text block of the last user-role
+/// message. No-op when there are no reminders or no user message, leaving the
+/// request byte-identical (plans/context-management.md §2.3).
+fn inject_reminders(messages: &mut [Value], reminders: &ContextReminders) {
+    let Some(block) = reminders.render() else {
+        return;
+    };
+    if let Some(content) = messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    {
+        content.push(anthropic_text_block(&block));
     }
 }
 
@@ -1386,6 +1414,84 @@ mod tests {
         fn encode(&self, turns: &[ModelTurn]) -> Result<Self::Request, Self::Error> {
             Ok(OpenAiCompletionsRequest::from_turns(turns))
         }
+    }
+
+    #[test]
+    fn anthropic_encoder_injects_reminders_into_last_user_message() {
+        let encoder =
+            AnthropicMessagesEncoder::new().with_reminders(ContextReminders::new().plan_mode(true));
+        let turns = vec![ModelTurn::user_text("hello")];
+
+        let request = Encoder::encode(&encoder, &turns).unwrap();
+
+        let content = request.messages.last().unwrap()["content"]
+            .as_array()
+            .unwrap();
+        // Original user text is preserved as the first block.
+        assert_eq!(content[0]["text"], json!("hello"));
+        // The reminder rides as the final text block of the last user message.
+        let reminder = content.last().unwrap();
+        assert_eq!(reminder["type"], json!("text"));
+        assert_eq!(
+            reminder["text"],
+            json!("<system-reminder>\n[Plan Mode: Active]\n</system-reminder>")
+        );
+    }
+
+    #[test]
+    fn reminders_target_the_last_user_message_across_turns() {
+        let encoder =
+            AnthropicMessagesEncoder::new().with_reminders(ContextReminders::new().plan_mode(true));
+        let turns = vec![
+            ModelTurn::user_text("first"),
+            ModelTurn::assistant_text("reply"),
+            ModelTurn::user_text("second"),
+        ];
+
+        let request = Encoder::encode(&encoder, &turns).unwrap();
+
+        // The earlier user message is left untouched ...
+        let first = request.messages[0]["content"].as_array().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["text"], json!("first"));
+        // ... while the reminder lands only on the last user message.
+        let last = request.messages.last().unwrap()["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(last[0]["text"], json!("second"));
+        assert_eq!(
+            last.last().unwrap()["text"],
+            json!("<system-reminder>\n[Plan Mode: Active]\n</system-reminder>")
+        );
+    }
+
+    #[test]
+    fn empty_reminders_leave_messages_byte_identical() {
+        let turns = vec![ModelTurn::user_text("hello")];
+        let plain = AnthropicMessagesEncoder::new();
+        let empty = AnthropicMessagesEncoder::new().with_reminders(ContextReminders::new());
+
+        let plain_body = Encoder::encode(&plain, &turns).unwrap().to_request_body();
+        let empty_body = Encoder::encode(&empty, &turns).unwrap().to_request_body();
+
+        assert_eq!(plain_body["messages"], empty_body["messages"]);
+    }
+
+    #[test]
+    fn reminders_leave_system_prompt_bytes_unchanged() {
+        let turns = vec![ModelTurn::user_text("hello")];
+        let with = AnthropicMessagesEncoder::new()
+            .with_system("be helpful")
+            .with_reminders(ContextReminders::new().plan_mode(true));
+        let without = AnthropicMessagesEncoder::new().with_system("be helpful");
+
+        let body_with = Encoder::encode(&with, &turns).unwrap().to_request_body();
+        let body_without = Encoder::encode(&without, &turns).unwrap().to_request_body();
+
+        // The reminder rides in the messages, so the cached system block is
+        // byte-identical whether or not reminders are present.
+        assert_eq!(body_with["system"], body_without["system"]);
+        assert_ne!(body_with["messages"], body_without["messages"]);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
 use crate::compaction::summary::CompactionSummaryAgent;
+use crate::context::ContextReminders;
 use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
@@ -204,6 +205,7 @@ impl RunLoop {
                 &turns,
                 request.tool_registry,
                 request.tool_preset,
+                &ContextReminders::new(),
             );
             if let Some(journal) = journal {
                 if let Err(error) = self.journal_request_payload(
