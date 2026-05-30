@@ -130,6 +130,9 @@ pub enum SessionSearchIndex {
     Trigram,
 }
 
+const MAX_SESSION_SEARCH_LIMIT: usize = 100;
+const MAX_SESSION_SEARCH_SURROUNDING_TURNS: usize = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionSearchOptions {
     pub limit: usize,
@@ -286,14 +289,19 @@ impl SessionStore {
         query: &str,
         options: SessionSearchOptions,
     ) -> Result<Vec<AnchoredSearchHit>, SqliteStoreError> {
+        let bounded_limit = options.limit.min(MAX_SESSION_SEARCH_LIMIT);
+        let bounded_surrounding_turns = options
+            .surrounding_turns
+            .min(MAX_SESSION_SEARCH_SURROUNDING_TURNS);
+
         let hits = match options.index {
-            SessionSearchIndex::Unicode => self.search_turn_parts(query, options.limit)?,
-            SessionSearchIndex::Trigram => self.search_turn_parts_trigram(query, options.limit)?,
+            SessionSearchIndex::Unicode => self.search_turn_parts(query, bounded_limit)?,
+            SessionSearchIndex::Trigram => self.search_turn_parts_trigram(query, bounded_limit)?,
         };
 
         hits.into_iter()
             .map(|hit| {
-                let anchored_turns = self.get_anchored_view(&hit, options.surrounding_turns)?;
+                let anchored_turns = self.get_anchored_view(&hit, bounded_surrounding_turns)?;
                 Ok(AnchoredSearchHit {
                     hit,
                     anchored_turns,
@@ -2874,6 +2882,96 @@ mod tests {
             .expect("payload should be readable after recovery");
         assert_eq!(payload.decode_status, "ignored");
         assert!(payload.error_json.unwrap().contains("request_payload"));
+    }
+
+    #[test]
+    fn search_turn_parts_with_anchored_view_clamps_limit() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        for index in 0..(MAX_SESSION_SEARCH_LIMIT + 5) {
+            store
+                .append_turn(
+                    &run_id,
+                    new_message_id(),
+                    ModelTurn::user_text(format!("needle {index}")),
+                )
+                .unwrap();
+        }
+
+        let hits = store
+            .search_turn_parts_with_anchored_view(
+                "needle",
+                SessionSearchOptions {
+                    limit: usize::MAX,
+                    surrounding_turns: 0,
+                    index: SessionSearchIndex::Unicode,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), MAX_SESSION_SEARCH_LIMIT);
+    }
+
+    #[test]
+    fn search_turn_parts_with_anchored_view_clamps_surrounding_turns() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let total_turns = 50;
+        let anchor_index = 25;
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        let mut message_ids = Vec::new();
+        for index in 0..total_turns {
+            let message_id = new_message_id();
+            let text = if index == anchor_index {
+                "rareword anchor".to_string()
+            } else {
+                format!("context {index}")
+            };
+            store
+                .append_turn(&run_id, message_id.clone(), ModelTurn::user_text(text))
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let hits = store
+            .search_turn_parts_with_anchored_view(
+                "rareword",
+                SessionSearchOptions {
+                    limit: 10,
+                    surrounding_turns: usize::MAX,
+                    index: SessionSearchIndex::Unicode,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        let anchored_ids = hits[0]
+            .anchored_turns
+            .iter()
+            .map(|(turn, _)| turn.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            anchored_ids.len(),
+            MAX_SESSION_SEARCH_SURROUNDING_TURNS * 2 + 3
+        );
+        assert_eq!(anchored_ids.first(), Some(&message_ids[0]));
+        assert_eq!(anchored_ids.last(), Some(&message_ids[total_turns - 1]));
+        assert!(anchored_ids.contains(&message_ids[anchor_index]));
+        assert!(
+            !anchored_ids
+                .contains(&message_ids[anchor_index - MAX_SESSION_SEARCH_SURROUNDING_TURNS - 1])
+        );
+        assert!(
+            !anchored_ids
+                .contains(&message_ids[anchor_index + MAX_SESSION_SEARCH_SURROUNDING_TURNS + 1])
+        );
     }
 
     fn session_id() -> SessionId {
