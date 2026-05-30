@@ -2,6 +2,7 @@
 
 pub mod auto_title;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,27 +10,32 @@ use std::time::Duration;
 use nav_types::{MessageId, ProviderPayloadId, RunId, SessionId};
 use serde_json::{Value, json};
 
+use crate::compaction::breaker::{
+    AntiThrashingBreaker, AutoCompactionDecision, CompactionFailureBreaker, savings_ratio,
+};
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
 use crate::compaction::summary::CompactionSummaryAgent;
 use crate::context::{
     ContextBudget, ContextReminders, DEFAULT_COMPLETION_BUFFER_TOKENS,
-    estimate_tokens_for_model_turns,
+    estimate_tokens_for_model_turns, truncate_model_turns,
 };
 use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
 };
-use crate::guardrails::{GuardrailError, ToolCallContext, ToolCallContextParams};
+use crate::guardrails::step_budget::{StepBudget, StepBudgetError};
+use crate::guardrails::{DoomLoopGuard, GuardrailError, ToolCallContext, ToolCallContextParams};
 use crate::models::{
     ApiKind, DialectHttpRequest, EncodedRequest, OpenAiCompletionsCancellationToken,
-    OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsRequest,
-    OpenAiCompletionsRequestContext, ResolvedModelConfig, anthropic_http_request, encode_request,
-    extract_turn, responses_http_request,
+    OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsProviderError,
+    OpenAiCompletionsRequest, OpenAiCompletionsRequestContext, ResolvedModelConfig,
+    anthropic_http_request, encode_request, extract_turn, responses_http_request,
 };
 use crate::sessions::{
-    CompactionConfig, ConfirmationDecision, ModelTurn, NewProviderPayload, PendingConfirmation,
-    PendingConfirmationReceiver, PendingConfirmationRegistry, ProviderPayloadDirection,
-    ProviderState, SessionStore, ToolCall,
+    CompactionCommitError, CompactionConfig, CompactionKind, ConfirmationDecision, ModelTurn,
+    ModelTurnRole, NewProviderPayload, PendingConfirmation, PendingConfirmationReceiver,
+    PendingConfirmationRegistry, ProviderPayloadDirection, ProviderState, SessionStore, ToolCall,
+    TurnPart,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
@@ -39,7 +45,7 @@ use crate::tools::{
 const TOOL_OUTPUT_BUFFER: usize = 64;
 
 /// How many times a single run may recover from a context-limit overflow by
-/// force-compacting and replaying the continuation prompt before giving up.
+/// force-compacting and replaying the triggering user turn before giving up.
 /// One attempt is enough to clear a window that pruning alone could not; a
 /// second consecutive overflow indicates compaction is not shrinking the
 /// request, so the run fails instead of looping.
@@ -127,9 +133,25 @@ impl SubagentRuntime {
 #[derive(Debug, Default)]
 pub struct AgentCatalog;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RunLoop {
     client: OpenAiCompletionsClient,
+    compaction_breakers: Arc<Mutex<RunLoopCompactionBreakers>>,
+}
+
+impl Default for RunLoop {
+    fn default() -> Self {
+        Self {
+            client: OpenAiCompletionsClient::new(),
+            compaction_breakers: Arc::new(Mutex::new(RunLoopCompactionBreakers::default())),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunLoopCompactionBreakers {
+    anti_thrashing: HashMap<SessionId, AntiThrashingBreaker>,
+    failures: CompactionFailureBreaker,
 }
 
 #[derive(Debug)]
@@ -165,7 +187,16 @@ impl RunLoop {
     }
 
     pub fn with_client(client: OpenAiCompletionsClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            compaction_breakers: Arc::new(Mutex::new(RunLoopCompactionBreakers::default())),
+        }
+    }
+
+    pub fn reset_compaction_breakers(&self, session_id: &SessionId) {
+        let mut breakers = self.compaction_breakers.lock().unwrap();
+        breakers.anti_thrashing.remove(session_id);
+        breakers.failures.reset(session_id);
     }
 
     pub fn run(
@@ -189,6 +220,7 @@ impl RunLoop {
             .expect("model streaming runtime should build");
         let mut turns = request.turns.to_vec();
         let mut new_turns = Vec::new();
+        let overflow_replay_text = latest_user_text(&turns);
         let journal = request.session_store.map(|store| ProviderJournal {
             session_id: request.session_id,
             store,
@@ -196,10 +228,16 @@ impl RunLoop {
         let mut payload_sequence = 0;
         let mut overflow_attempts = 0;
         let mut proactive_compaction_attempted = false;
+        let mut reload_store_turns = journal.is_some();
+        let mut step_budget = StepBudget::default();
+        let disabled_tool_registry = ToolRegistry::new();
+        let mut doom_loop_guard = DoomLoopGuard::default();
 
         loop {
+            let mut should_project_pruned_tool_results =
+                journal.is_some() && should_prune_for_budget(model, &turns);
             if let Some(journal) = journal
-                && should_prune_for_budget(model, &turns)
+                && should_project_pruned_tool_results
             {
                 if let Err(error) = prune_stored_tool_results_for_encoding(journal) {
                     return RunLoopResult::Failed(error);
@@ -211,22 +249,73 @@ impl RunLoop {
                 && should_compact_for_budget(model, &turns)
             {
                 proactive_compaction_attempted = true;
-                match self.compact_for_budget(journal, model) {
+                let tokens_before_compaction = estimate_model_turn_tokens(&turns);
+                match self.compact_for_budget(journal, model, tokens_before_compaction) {
                     Ok(compacted_turns) => {
                         turns = compacted_turns;
+                        reload_store_turns = true;
                         continue;
                     }
                     Err(error) => return RunLoopResult::Failed(error),
                 }
             }
+            if reload_store_turns && let Some(journal) = journal {
+                turns = match turns_for_encoding(journal, model) {
+                    Ok(turns) => turns,
+                    Err(error) => return RunLoopResult::Failed(error),
+                };
+                reload_store_turns = false;
+            }
+
+            let step_decision = match step_budget.next_step() {
+                Ok(decision) => decision,
+                Err(error) => return RunLoopResult::Failed(step_budget_error(error)),
+            };
+            if let Some(message) = step_decision.synthetic_message() {
+                let message = message.clone();
+                turns.push(message.clone());
+                if let Some(journal) = journal {
+                    if let Err(error) = append_run_turns(journal, request.run_id, vec![message]) {
+                        return RunLoopResult::Failed(error);
+                    }
+                } else {
+                    new_turns.push(message);
+                }
+            }
+
+            if let Some(journal) = journal
+                && !proactive_compaction_attempted
+                && should_compact_for_budget(model, &turns)
+            {
+                proactive_compaction_attempted = true;
+                let tokens_before_compaction = estimate_model_turn_tokens(&turns);
+                match self.compact_for_budget(journal, model, tokens_before_compaction) {
+                    Ok(compacted_turns) => {
+                        turns = compacted_turns;
+                        reload_store_turns = true;
+                        continue;
+                    }
+                    Err(error) => return RunLoopResult::Failed(error),
+                }
+            }
+
+            should_project_pruned_tool_results = should_project_pruned_tool_results
+                || (journal.is_some() && should_prune_for_budget(model, &turns));
+            let turns_for_model =
+                project_turns_for_encoding(&turns, model, should_project_pruned_tool_results);
             let provider_state = match load_provider_state(journal, request.run_id) {
                 Ok(provider_state) => provider_state,
                 Err(error) => return RunLoopResult::Failed(error),
             };
+            let step_tool_registry = if step_decision.tools_enabled() {
+                request.tool_registry
+            } else {
+                &disabled_tool_registry
+            };
             let encoded = encode_request(
                 model.api,
-                &turns,
-                request.tool_registry,
+                &turns_for_model,
+                step_tool_registry,
                 request.tool_preset,
                 provider_state.as_ref(),
                 &ContextReminders::new(),
@@ -243,7 +332,7 @@ impl RunLoop {
                 }
                 payload_sequence += 1;
             }
-            let model_turn = match self.stream_turn(StreamTurnRequest {
+            let mut model_turn = match self.stream_turn(StreamTurnRequest {
                 runtime: &runtime,
                 model,
                 encoded: &encoded,
@@ -266,13 +355,45 @@ impl RunLoop {
                         && overflow_attempts < MAX_OVERFLOW_ATTEMPTS
                     {
                         overflow_attempts += 1;
-                        match self.recover_from_overflow(journal, model, request.run_id) {
+                        let tokens_before_compaction = estimate_model_turn_tokens(&turns);
+                        match self.recover_from_overflow(
+                            journal,
+                            model,
+                            request.run_id,
+                            overflow_replay_text.as_deref(),
+                            tokens_before_compaction,
+                        ) {
                             Ok(recovered_turns) => {
                                 turns = recovered_turns;
+                                reload_store_turns = true;
                                 continue;
                             }
                             Err(recovery_error) => return RunLoopResult::Failed(recovery_error),
                         }
+                    }
+                    if matches!(error, OpenAiCompletionsError::ContextLimit(_))
+                        && overflow_attempts >= MAX_OVERFLOW_ATTEMPTS
+                        && let Some(journal) = journal
+                    {
+                        if let Err(journal_error) = self.flush_stream_error(
+                            journal,
+                            model,
+                            partial_output,
+                            request.run_id,
+                            payload_sequence,
+                            &error,
+                        ) {
+                            return RunLoopResult::Failed(journal_error);
+                        }
+                        if let Err(drop_error) = journal
+                            .store
+                            .lock()
+                            .unwrap()
+                            .drop_latest_compaction_summary(journal.session_id)
+                        {
+                            return RunLoopResult::Failed(persistence_error(drop_error));
+                        }
+                        return RunLoopResult::Failed(context_overflow_error());
                     }
                     if let Some(journal) = journal
                         && let Err(journal_error) = self.flush_stream_error(
@@ -289,6 +410,9 @@ impl RunLoop {
                     return RunLoopResult::Failed(error);
                 }
             };
+            if !step_decision.tools_enabled() {
+                model_turn = text_only_final_step(model.api, model_turn);
+            }
 
             let revert_message_id = if let Some(journal) = journal {
                 let message_id = match self.journal_response_payload(
@@ -337,23 +461,26 @@ impl RunLoop {
             };
             let dispatch_context =
                 tool_context_with_revert_recorder(request.tool_context, journal, revert_message_id);
-            match dispatch_tool_calls(ToolDispatchRequest {
-                tool_calls: &tool_calls,
-                registry: request.tool_registry,
-                tool_preset: request.tool_preset,
-                context: &dispatch_context,
-                cancel: tool_cancel,
-                run_cancel: Some(request.cancellation_token.clone()),
-                pending_confirmations: request.pending_confirmations,
-                run_id: request.run_id,
-                ids,
-                emit: &mut emit,
-                base_metadata: &tool_dispatch_metadata,
-            }) {
+            match dispatch_guarded_tool_calls(
+                ToolDispatchRequest {
+                    tool_calls: &tool_calls,
+                    registry: request.tool_registry,
+                    tool_preset: request.tool_preset,
+                    context: &dispatch_context,
+                    cancel: tool_cancel,
+                    run_cancel: Some(request.cancellation_token.clone()),
+                    pending_confirmations: request.pending_confirmations,
+                    run_id: request.run_id,
+                    ids,
+                    emit: &mut emit,
+                    base_metadata: &tool_dispatch_metadata,
+                },
+                &mut doom_loop_guard,
+            ) {
                 ToolDispatchResult::Completed(tool_turns) => {
                     turns.extend(tool_turns.clone());
                     if let Some(journal) = journal {
-                        if let Err(error) = append_tool_turns(journal, request.run_id, tool_turns) {
+                        if let Err(error) = append_run_turns(journal, request.run_id, tool_turns) {
                             return RunLoopResult::Failed(error);
                         }
                     } else {
@@ -366,8 +493,8 @@ impl RunLoop {
     }
 
     /// Recover from a context-limit overflow: force-compact the session into a
-    /// summary, then replay a single synthetic continuation prompt so the next
-    /// attempt resumes from the summary instead of the oversized history.
+    /// summary, then replay a single synthetic user turn so the next attempt
+    /// resumes from the summary instead of the oversized history.
     ///
     /// Returns the recompacted replay turns to retry with. Media is dropped as
     /// a side effect of replay projection, so the retried request carries no
@@ -377,60 +504,176 @@ impl RunLoop {
         journal: ProviderJournal<'_>,
         model: &ResolvedModelConfig,
         run_id: &RunId,
+        replay_text: Option<&str>,
+        tokens_before_compaction: usize,
     ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
         let session_id = journal.session_id;
-        self.write_compaction_summary(journal, model)?;
-        journal
-            .store
-            .lock()
-            .unwrap()
-            .append_overflow_continuation(session_id, run_id)
-            .map_err(persistence_error)?;
-
-        journal
-            .store
-            .lock()
-            .unwrap()
-            .try_turns(session_id)
-            .map_err(persistence_error)
-    }
-
-    fn compact_for_budget(
-        &self,
-        journal: ProviderJournal<'_>,
-        model: &ResolvedModelConfig,
-    ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
-        self.write_compaction_summary(journal, model)?;
-        journal
-            .store
-            .lock()
-            .unwrap()
-            .try_turns(journal.session_id)
-            .map_err(persistence_error)
-    }
-
-    fn write_compaction_summary(
-        &self,
-        journal: ProviderJournal<'_>,
-        model: &ResolvedModelConfig,
-    ) -> Result<(), OpenAiCompletionsError> {
-        let session_id = journal.session_id;
+        self.ensure_auto_compaction_enabled(session_id)?;
         let summary_request = journal
             .store
             .lock()
             .unwrap()
             .compaction_summary_request(session_id, CompactionConfig::default())
             .map_err(persistence_error)?;
-        let summary = CompactionSummaryAgent::with_client(self.client.clone())
-            .generate(model, &summary_request)?;
+        let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
+        let summary = match summary_agent.generate(model, &summary_request) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.record_compaction_error(session_id, &error);
+                return Err(error);
+            }
+        };
 
-        journal
+        {
+            let store = journal.store.lock().unwrap();
+            if let Err(error) = store.compact_session_with_validated_summary(
+                session_id,
+                &summary_request,
+                summary,
+                CompactionKind::Auto,
+            ) {
+                self.record_compaction_commit_error(session_id, &error);
+                return Err(persistence_error(error));
+            }
+            store
+                .append_overflow_replay_turn(
+                    session_id,
+                    run_id,
+                    replay_text.unwrap_or(crate::compaction::overflow::OVERFLOW_CONTINUATION_TEXT),
+                )
+                .map_err(persistence_error)?;
+        }
+        let recovered_turns = journal
             .store
             .lock()
             .unwrap()
-            .compact_session_with_summary(session_id, &summary_request, summary)
+            .try_turns(session_id)
             .map_err(persistence_error)?;
+        self.record_compaction_success(session_id);
+        self.record_compaction_savings(
+            session_id,
+            tokens_before_compaction,
+            estimate_model_turn_tokens(&recovered_turns),
+        );
+        Ok(recovered_turns)
+    }
+
+    fn compact_for_budget(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        tokens_before_compaction: usize,
+    ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
+        let session_id = journal.session_id;
+        self.ensure_auto_compaction_enabled(session_id)?;
+        let summary_request = journal
+            .store
+            .lock()
+            .unwrap()
+            .compaction_summary_request(session_id, CompactionConfig::default())
+            .map_err(persistence_error)?;
+        let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
+        let summary = match summary_agent.generate(model, &summary_request) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.record_compaction_error(session_id, &error);
+                return Err(error);
+            }
+        };
+
+        {
+            let store = journal.store.lock().unwrap();
+            if let Err(error) = store.compact_session_with_validated_summary(
+                session_id,
+                &summary_request,
+                summary,
+                CompactionKind::Auto,
+            ) {
+                self.record_compaction_commit_error(session_id, &error);
+                return Err(persistence_error(error));
+            }
+        }
+        let compacted_turns = journal
+            .store
+            .lock()
+            .unwrap()
+            .try_turns(session_id)
+            .map_err(persistence_error)?;
+        self.record_compaction_success(session_id);
+        self.record_compaction_savings(
+            session_id,
+            tokens_before_compaction,
+            estimate_model_turn_tokens(&compacted_turns),
+        );
+        Ok(compacted_turns)
+    }
+
+    fn ensure_auto_compaction_enabled(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), OpenAiCompletionsError> {
+        let now = unix_duration();
+        let breakers = self.compaction_breakers.lock().unwrap();
+        if let Some(warning) = breakers.failures.auto_compaction_warning(session_id, now) {
+            return Err(OpenAiCompletionsError::MalformedResponse {
+                message: warning.to_string(),
+            });
+        }
+        if let Some(AutoCompactionDecision::Skip { warning }) = breakers
+            .anti_thrashing
+            .get(session_id)
+            .map(AntiThrashingBreaker::decide_auto_compaction)
+        {
+            return Err(OpenAiCompletionsError::MalformedResponse { message: warning });
+        }
         Ok(())
+    }
+
+    fn record_compaction_error(&self, session_id: &SessionId, error: &OpenAiCompletionsError) {
+        let now = unix_duration();
+        let mut breakers = self.compaction_breakers.lock().unwrap();
+        if is_transient_compaction_error(error) {
+            breakers.failures.record_transient_failure(session_id, now);
+        } else {
+            breakers.failures.record_failure(session_id);
+        }
+    }
+
+    fn record_compaction_commit_error(
+        &self,
+        session_id: &SessionId,
+        error: &CompactionCommitError,
+    ) {
+        if matches!(error, CompactionCommitError::InvalidSummary(_)) {
+            self.compaction_breakers
+                .lock()
+                .unwrap()
+                .failures
+                .record_failure(session_id);
+        }
+    }
+
+    fn record_compaction_success(&self, session_id: &SessionId) {
+        self.compaction_breakers
+            .lock()
+            .unwrap()
+            .failures
+            .record_success(session_id);
+    }
+
+    fn record_compaction_savings(
+        &self,
+        session_id: &SessionId,
+        tokens_before: usize,
+        tokens_after: usize,
+    ) {
+        self.compaction_breakers
+            .lock()
+            .unwrap()
+            .anti_thrashing
+            .entry(session_id.clone())
+            .or_default()
+            .record_auto_compaction(savings_ratio(tokens_before, tokens_after));
     }
 
     fn journal_request_payload(
@@ -823,6 +1066,32 @@ fn streaming_request_body(
     serde_json::to_vec(&plan.body).map_err(json_error)
 }
 
+fn latest_user_text(turns: &[ModelTurn]) -> Option<String> {
+    turns
+        .iter()
+        .rev()
+        .find(|turn| turn.role == ModelTurnRole::User)
+        .map(ModelTurn::text_content)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn estimate_model_turn_tokens(turns: &[ModelTurn]) -> usize {
+    let char_count: usize = turns
+        .iter()
+        .flat_map(|turn| &turn.parts)
+        .map(|part| match part {
+            TurnPart::Text { text, .. } | TurnPart::ToolResult { content: text, .. } => text.len(),
+            TurnPart::ToolCall(tool_call) => tool_call.name.len() + tool_call.arguments.len(),
+        })
+        .sum();
+
+    if char_count == 0 {
+        0
+    } else {
+        char_count.div_ceil(4)
+    }
+}
+
 fn dialect_stream_error(error: OpenAiCompletionsError) -> Box<ModelTurnStreamError> {
     Box::new(ModelTurnStreamError {
         error,
@@ -1029,6 +1298,22 @@ fn should_compact_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -
     threshold > 0 && budget.body_after_prefix(active_tokens) >= threshold
 }
 
+fn turns_for_encoding(
+    journal: ProviderJournal<'_>,
+    model: &ResolvedModelConfig,
+) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .try_turns_for_encoding(
+            journal.session_id,
+            model.api,
+            ContextBudget::from_model(&model.model, 0),
+        )
+        .map_err(persistence_error)
+}
+
 fn load_provider_state(
     journal: Option<ProviderJournal<'_>>,
     run_id: &RunId,
@@ -1045,7 +1330,159 @@ fn load_provider_state(
         .map_err(persistence_error)
 }
 
-fn append_tool_turns(
+fn project_turns_for_encoding(
+    turns: &[ModelTurn],
+    model: &ResolvedModelConfig,
+    project_pruned_tool_results: bool,
+) -> Vec<ModelTurn> {
+    let mut projected = turns.to_vec();
+    if project_pruned_tool_results {
+        project_model_turns_for_tool_result_pruning(&mut projected);
+    }
+    let truncated = truncate_model_turns(projected, ContextBudget::from_model(&model.model, 0));
+    degrade_unpaired_model_tool_activity(truncated)
+}
+
+fn degrade_unpaired_model_tool_activity(turns: Vec<ModelTurn>) -> Vec<ModelTurn> {
+    let paired_call_ids = paired_model_tool_call_ids(&turns);
+    let mut projected_turns = Vec::new();
+
+    for turn in turns {
+        let mut current_role = None;
+        let mut current_parts = Vec::with_capacity(turn.parts.len());
+        for part in turn.parts {
+            let (role, part) = project_model_tool_part(turn.role, part, &paired_call_ids);
+            push_projected_model_part(
+                &mut projected_turns,
+                &mut current_role,
+                &mut current_parts,
+                role,
+                part,
+            );
+        }
+        flush_projected_model_turn(&mut projected_turns, &mut current_role, &mut current_parts);
+    }
+
+    projected_turns
+}
+
+fn project_model_tool_part(
+    original_role: ModelTurnRole,
+    part: TurnPart,
+    paired_call_ids: &HashSet<String>,
+) -> (ModelTurnRole, TurnPart) {
+    match part {
+        TurnPart::Text { .. } => (text_projection_role(original_role), part),
+        TurnPart::ToolCall(tool_call) => {
+            if model_tool_call_ids(&tool_call)
+                .iter()
+                .any(|id| paired_call_ids.contains(id.as_str()))
+            {
+                (ModelTurnRole::Assistant, TurnPart::ToolCall(tool_call))
+            } else {
+                (
+                    ModelTurnRole::Assistant,
+                    TurnPart::Text {
+                        text: format!("[Tool call: {}({})]", tool_call.name, tool_call.arguments),
+                        synthetic: Some(true),
+                    },
+                )
+            }
+        }
+        TurnPart::ToolResult {
+            tool_call_id,
+            content,
+        } => {
+            if paired_call_ids.contains(tool_call_id.as_str()) {
+                (
+                    ModelTurnRole::Tool,
+                    TurnPart::ToolResult {
+                        tool_call_id,
+                        content,
+                    },
+                )
+            } else {
+                (
+                    ModelTurnRole::Assistant,
+                    TurnPart::Text {
+                        text: format!("[Tool result: {content}]"),
+                        synthetic: Some(true),
+                    },
+                )
+            }
+        }
+    }
+}
+
+fn text_projection_role(role: ModelTurnRole) -> ModelTurnRole {
+    if role == ModelTurnRole::Tool {
+        ModelTurnRole::Assistant
+    } else {
+        role
+    }
+}
+
+fn push_projected_model_part(
+    projected_turns: &mut Vec<ModelTurn>,
+    current_role: &mut Option<ModelTurnRole>,
+    current_parts: &mut Vec<TurnPart>,
+    role: ModelTurnRole,
+    part: TurnPart,
+) {
+    if current_role.is_some_and(|current| current != role) {
+        flush_projected_model_turn(projected_turns, current_role, current_parts);
+    }
+
+    *current_role = Some(role);
+    current_parts.push(part);
+}
+
+fn flush_projected_model_turn(
+    projected_turns: &mut Vec<ModelTurn>,
+    current_role: &mut Option<ModelTurnRole>,
+    current_parts: &mut Vec<TurnPart>,
+) {
+    let Some(role) = current_role.take() else {
+        return;
+    };
+    if current_parts.is_empty() {
+        return;
+    }
+
+    projected_turns.push(ModelTurn {
+        role,
+        parts: std::mem::take(current_parts),
+    });
+}
+
+fn paired_model_tool_call_ids(turns: &[ModelTurn]) -> HashSet<String> {
+    let mut call_ids = HashSet::new();
+    let mut result_ids = HashSet::new();
+
+    for part in turns.iter().flat_map(|turn| &turn.parts) {
+        match part {
+            TurnPart::ToolCall(tool_call) => {
+                call_ids.extend(model_tool_call_ids(tool_call));
+            }
+            TurnPart::ToolResult { tool_call_id, .. } => {
+                result_ids.insert(tool_call_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    call_ids.intersection(&result_ids).cloned().collect()
+}
+
+fn model_tool_call_ids(tool_call: &ToolCall) -> Vec<String> {
+    let mut ids = vec![tool_call.id.clone()];
+    if let Some(tool_call_id) = &tool_call.tool_call_id {
+        ids.push(tool_call_id.to_string());
+    }
+    ids
+}
+
+fn append_run_turns(
     journal: ProviderJournal<'_>,
     run_id: &RunId,
     turns: Vec<ModelTurn>,
@@ -1158,8 +1595,20 @@ fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
+fn unix_duration() -> Duration {
+    Duration::from_millis(u64::try_from(unix_millis()).unwrap_or(0))
+}
+
 fn payload_created_at(sequence: u32) -> i64 {
     unix_millis().saturating_add(i64::from(sequence))
+}
+
+fn step_budget_error(error: StepBudgetError) -> OpenAiCompletionsError {
+    match error {
+        StepBudgetError::Exhausted { max_steps } => OpenAiCompletionsError::MalformedResponse {
+            message: format!("step budget exhausted after {max_steps} steps"),
+        },
+    }
 }
 
 fn json_error(error: serde_json::Error) -> OpenAiCompletionsError {
@@ -1171,6 +1620,22 @@ fn json_error(error: serde_json::Error) -> OpenAiCompletionsError {
 fn persistence_error(error: impl ToString) -> OpenAiCompletionsError {
     OpenAiCompletionsError::MalformedResponse {
         message: format!("failed to persist provider payload: {}", error.to_string()),
+    }
+}
+
+fn context_overflow_error() -> OpenAiCompletionsError {
+    OpenAiCompletionsError::ContextOverflow {
+        message: "compacted summary and retained tail still exceed the context window".to_string(),
+    }
+}
+
+fn is_transient_compaction_error(error: &OpenAiCompletionsError) -> bool {
+    match error {
+        OpenAiCompletionsError::Http { status, .. }
+        | OpenAiCompletionsError::Provider(OpenAiCompletionsProviderError { status, .. }) => {
+            *status == 429 || *status >= 500
+        }
+        _ => false,
     }
 }
 
@@ -1223,6 +1688,75 @@ struct ModelTurnOutput {
     terminal_events: Vec<HarnessEventEnvelope>,
     response_payload: Value,
     provider_response_id: Option<String>,
+}
+
+fn text_only_final_step(api: ApiKind, mut output: ModelTurnOutput) -> ModelTurnOutput {
+    if output.tool_calls.is_empty() {
+        return output;
+    }
+
+    let text = output
+        .assistant_turn
+        .as_ref()
+        .map(ModelTurn::text_content)
+        .unwrap_or_default();
+    output.assistant_turn = (!text.is_empty()).then(|| ModelTurn::assistant_text(text.clone()));
+    output.tool_calls.clear();
+    output.response_payload = text_only_response_payload(api, output.response_payload, &text);
+    output
+}
+
+fn text_only_response_payload(api: ApiKind, mut payload: Value, text: &str) -> Value {
+    match api {
+        ApiKind::AnthropicMessages => remove_anthropic_tool_uses(&mut payload, text),
+        ApiKind::OpenAiResponses => remove_responses_function_calls(&mut payload),
+        ApiKind::OpenAiCompletions | ApiKind::ChatGptSubscription => {
+            remove_chat_completion_tool_calls(&mut payload, text)
+        }
+    }
+    payload
+}
+
+fn remove_anthropic_tool_uses(payload: &mut Value, text: &str) {
+    let Some(content) = payload.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    content.retain(|block| block.get("type").and_then(Value::as_str) != Some("tool_use"));
+    if content.is_empty() && !text.is_empty() {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("stop_reason".to_string(), json!("end_turn"));
+    }
+}
+
+fn remove_responses_function_calls(payload: &mut Value) {
+    let Some(output) = payload.get_mut("output").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    output.retain(|item| item.get("type").and_then(Value::as_str) != Some("function_call"));
+}
+
+fn remove_chat_completion_tool_calls(payload: &mut Value, text: &str) {
+    let Some(choices) = payload.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for choice in choices {
+        if choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls")
+            && let Some(object) = choice.as_object_mut()
+        {
+            object.insert("finish_reason".to_string(), json!("stop"));
+        }
+        let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        message.remove("tool_calls");
+        message.remove("function_call");
+        message.insert("content".to_string(), json!(text));
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1396,6 +1930,62 @@ fn split_run_completion_events(
 enum ToolDispatchResult {
     Completed(Vec<ModelTurn>),
     Cancelled,
+}
+
+fn dispatch_guarded_tool_calls<Ids, Emit>(
+    request: ToolDispatchRequest<'_, Ids, Emit>,
+    doom_loop_guard: &mut DoomLoopGuard,
+) -> ToolDispatchResult
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let ToolDispatchRequest {
+        tool_calls,
+        registry,
+        tool_preset,
+        context,
+        cancel,
+        run_cancel,
+        pending_confirmations,
+        run_id,
+        ids,
+        emit,
+        base_metadata,
+    } = request;
+    let mut turns = Vec::new();
+
+    for tool_call in tool_calls {
+        if let Ok(arguments) = serde_json::from_str::<Value>(&tool_call.arguments)
+            && let Err(error) = doom_loop_guard.observe_tool_call(&tool_call.name, &arguments)
+        {
+            let message = error.synthetic_message();
+            emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+            turns.push(ModelTurn::tool_result(&tool_call.id, message));
+            continue;
+        }
+
+        match dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: std::slice::from_ref(tool_call),
+            registry,
+            tool_preset,
+            context,
+            cancel: cancel.clone(),
+            run_cancel: run_cancel.clone(),
+            pending_confirmations,
+            run_id,
+            ids,
+            emit,
+            base_metadata,
+        }) {
+            ToolDispatchResult::Completed(mut tool_turns) => turns.append(&mut tool_turns),
+            ToolDispatchResult::Cancelled => {
+                return ToolDispatchResult::Cancelled;
+            }
+        }
+    }
+
+    ToolDispatchResult::Completed(turns)
 }
 
 struct ToolDispatchRequest<'a, Ids, Emit>
@@ -2232,6 +2822,50 @@ mod tests {
             persisted_api_kind_name(crate::models::ApiKind::OpenAiResponses),
             "openai-responses"
         );
+    }
+
+    #[test]
+    fn model_tool_degrade_splits_mixed_tool_result_turns_by_role() {
+        let paired_id = NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000051").unwrap();
+        let orphan_id = NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000052").unwrap();
+        let turns = vec![
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "provider-call".to_string(),
+                tool_call_id: Some(paired_id.clone()),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ModelTurn {
+                role: ModelTurnRole::Tool,
+                parts: vec![
+                    TurnPart::ToolResult {
+                        tool_call_id: paired_id.to_string(),
+                        content: "paired output".to_string(),
+                    },
+                    TurnPart::ToolResult {
+                        tool_call_id: orphan_id.to_string(),
+                        content: "orphan output".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        let projected = degrade_unpaired_model_tool_activity(turns);
+
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[0].role, ModelTurnRole::Assistant);
+        assert_eq!(projected[1].role, ModelTurnRole::Tool);
+        assert!(matches!(
+            projected[1].parts.as_slice(),
+            [TurnPart::ToolResult { tool_call_id, content }]
+                if tool_call_id == paired_id.as_str() && content == "paired output"
+        ));
+        assert_eq!(projected[2].role, ModelTurnRole::Assistant);
+        assert!(matches!(
+            projected[2].parts.as_slice(),
+            [TurnPart::Text { text, synthetic: Some(true) }]
+                if text.contains("orphan output")
+        ));
     }
 
     #[test]

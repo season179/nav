@@ -388,6 +388,9 @@ pub enum OpenAiCompletionsError {
     },
     Cancelled,
     ContextLimit(ContextLimitError),
+    ContextOverflow {
+        message: String,
+    },
     Provider(OpenAiCompletionsProviderError),
     ProviderStream(OpenAiCompletionsStreamProviderError),
     ModelResolution {
@@ -437,6 +440,9 @@ impl fmt::Display for OpenAiCompletionsError {
                 "provider returned HTTP {} (context limit exceeded): {}",
                 error.status, error.message
             ),
+            Self::ContextOverflow { message } => {
+                write!(formatter, "ContextOverflowError: {message}")
+            }
             Self::Provider(error) => write!(
                 formatter,
                 "provider returned HTTP {}: {}",

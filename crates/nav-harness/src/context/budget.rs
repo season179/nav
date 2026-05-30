@@ -125,13 +125,9 @@ impl ContextBudget {
 
 fn estimate_tokens_for_part(part: &Part) -> u64 {
     match part {
-        Part::Text { text, .. } | Part::Thinking { text, .. } => {
-            estimate_chars(text, TEXT_CHARS_PER_TOKEN)
-        }
-        Part::ToolCall { arguments, .. } => {
-            estimate_chars(&arguments.to_string(), DENSE_CHARS_PER_TOKEN)
-        }
-        Part::ToolResult { content, .. } => estimate_chars(content, DENSE_CHARS_PER_TOKEN),
+        Part::Text { text, .. } | Part::Thinking { text, .. } => estimate_text_tokens(text),
+        Part::ToolCall { arguments, .. } => estimate_dense_tokens(&arguments.to_string()),
+        Part::ToolResult { content, .. } => estimate_dense_tokens(content),
         Part::Image { .. } => estimate_image_tokens(None),
         _ => 0,
     }
@@ -139,12 +135,20 @@ fn estimate_tokens_for_part(part: &Part) -> u64 {
 
 fn estimate_tokens_for_turn_part(part: &TurnPart) -> u64 {
     match part {
-        TurnPart::Text { text, .. } => estimate_chars(text, TEXT_CHARS_PER_TOKEN),
-        TurnPart::ToolCall(tool_call) => {
-            estimate_chars(&tool_call.arguments, DENSE_CHARS_PER_TOKEN)
-        }
-        TurnPart::ToolResult { content, .. } => estimate_chars(content, DENSE_CHARS_PER_TOKEN),
+        TurnPart::Text { text, .. } => estimate_text_tokens(text),
+        TurnPart::ToolCall(tool_call) => estimate_dense_tokens(&tool_call.arguments),
+        TurnPart::ToolResult { content, .. } => estimate_dense_tokens(content),
     }
+}
+
+/// Estimate natural-language text tokens using the hybrid text ratio.
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    estimate_chars(text, TEXT_CHARS_PER_TOKEN)
+}
+
+/// Estimate dense JSON/tool text tokens using the hybrid dense ratio.
+pub fn estimate_dense_tokens(text: &str) -> u64 {
+    estimate_chars(text, DENSE_CHARS_PER_TOKEN)
 }
 
 /// Estimate the token cost of an image, rounding up.

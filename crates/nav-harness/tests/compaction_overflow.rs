@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nav_harness::agents::{RunLoop, RunLoopRequest, RunLoopResult};
+use nav_harness::compaction::breaker::TRANSIENT_COOLDOWN_WARNING;
 use nav_harness::compaction::overflow::OVERFLOW_CONTINUATION_TEXT;
 use nav_harness::events::HarnessEventIdSource;
 use nav_harness::models::{
@@ -78,10 +79,44 @@ fn overflow_continuation_is_not_duplicated_on_repeated_recovery() {
 }
 
 #[test]
+fn overflow_replay_turn_reissues_original_text_once() {
+    let store = SessionStore::default();
+    let session_id = session_id();
+    let run_id = run_id(1);
+
+    store.create_session(session_id.clone()).unwrap();
+    store.start_run(&session_id, run_id.clone()).unwrap();
+    store
+        .append_turn(
+            &run_id,
+            message_id(0),
+            ModelTurn::user_text("finish the exact task"),
+        )
+        .unwrap();
+
+    store
+        .append_overflow_replay_turn(&session_id, &run_id, "finish the exact task")
+        .unwrap();
+    store
+        .append_overflow_replay_turn(&session_id, &run_id, "finish the exact task")
+        .unwrap();
+
+    let turns = store.try_turns(&session_id).unwrap();
+    assert_eq!(
+        synthetic_user_text_count(&turns, "finish the exact task"),
+        1
+    );
+    assert_eq!(
+        turns.last().map(ModelTurn::text_content),
+        Some("finish the exact task".to_string())
+    );
+}
+
+#[test]
 fn overflow_error_triggers_compaction_and_completes_on_retry() {
     let server = FakeProviderServer::start(vec![
         canned_context_limit(),
-        canned_summary("## Active Task\nFinish the overflow handler."),
+        canned_summary(&valid_summary("Finish the overflow handler.")),
         canned_stream_completion("Resuming after compaction."),
     ]);
     let store = oversize_session();
@@ -102,11 +137,15 @@ fn overflow_error_triggers_compaction_and_completes_on_retry() {
     assert_eq!(server.handled(), 3);
 
     let final_turns = store.lock().unwrap().try_turns(&session_id).unwrap();
-    assert_eq!(continuation_count(&final_turns), 1);
+    assert_eq!(
+        synthetic_user_text_count(&final_turns, "please finish the overflow handler"),
+        1,
+        "the original user turn should be re-issued once"
+    );
     assert_eq!(
         last_user_turn(&final_turns).map(ModelTurn::text_content),
-        Some(OVERFLOW_CONTINUATION_TEXT.to_string()),
-        "the continuation prompt should be the final replayed user message"
+        Some("please finish the overflow handler".to_string()),
+        "overflow recovery should replay the original triggering user turn verbatim"
     );
     assert!(
         final_turns
@@ -120,7 +159,7 @@ fn overflow_error_triggers_compaction_and_completes_on_retry() {
 fn overflow_recovery_is_bounded_and_fails_without_looping() {
     let server = FakeProviderServer::start(vec![
         canned_context_limit(),
-        canned_summary("## Active Task\nStill too large."),
+        canned_summary(&valid_summary("Still too large.")),
         canned_context_limit(),
     ]);
     let store = oversize_session();
@@ -134,12 +173,15 @@ fn overflow_recovery_is_bounded_and_fails_without_looping() {
 
     let result = run_overflow_loop(&model, &store, &session_id, &run_id, &trigger_id, &turns);
 
+    let RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::ContextOverflow {
+        message,
+    }) = result
+    else {
+        panic!("a second consecutive overflow should surface ContextOverflowError, got {result:?}");
+    };
     assert!(
-        matches!(
-            result,
-            RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::ContextLimit(_))
-        ),
-        "a second consecutive overflow should fail the run, got {result:?}"
+        message.contains("compacted summary and retained tail still exceed the context window"),
+        "terminal overflow should explain Stage-5 fallback, got {message:?}"
     );
     assert_eq!(
         server.handled(),
@@ -148,7 +190,423 @@ fn overflow_recovery_is_bounded_and_fails_without_looping() {
     );
 
     let final_turns = store.lock().unwrap().try_turns(&session_id).unwrap();
-    assert_eq!(continuation_count(&final_turns), 1);
+    assert!(
+        !final_turns
+            .iter()
+            .any(|turn| turn.text_content().contains("Still too large.")),
+        "Stage-5 fallback should drop the unhelpful summary"
+    );
+    assert_eq!(
+        synthetic_user_text_count(&final_turns, "please finish the overflow handler"),
+        0,
+        "Stage-5 fallback should drop the synthetic replay turn"
+    );
+}
+
+#[test]
+fn malformed_overflow_summary_is_rejected_without_committing() {
+    let server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_summary("not a real summary"),
+    ]);
+    let store = oversize_session();
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let trigger_id = message_id(99);
+
+    let model = resolved_model(server.base_url());
+    let store = Arc::new(Mutex::new(store));
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+
+    let result = run_overflow_loop(&model, &store, &session_id, &run_id, &trigger_id, &turns);
+
+    assert_malformed_failure(result, "malformed summary recovery");
+    assert_eq!(server.handled(), 2);
+
+    let final_turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    assert!(
+        !final_turns
+            .iter()
+            .any(|turn| turn.text_content().contains("not a real summary")),
+        "invalid summary must not be inserted into replay"
+    );
+    assert_eq!(
+        synthetic_user_text_count(&final_turns, "please finish the overflow handler"),
+        0,
+        "replay turn should not be appended when summary validation fails"
+    );
+}
+
+#[test]
+fn repeated_malformed_summaries_trip_failure_breaker() {
+    let server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_summary("not a real summary 1"),
+        canned_context_limit(),
+        canned_summary("not a real summary 2"),
+        canned_context_limit(),
+        canned_summary("not a real summary 3"),
+        canned_context_limit(),
+    ]);
+    let store = Arc::new(Mutex::new(oversize_session()));
+    let session_id = session_id();
+    let model = resolved_model(server.base_url());
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+
+    for attempt in 1..=3 {
+        let run_id = run_id(attempt + 1);
+        let trigger_id = message_id(100 + attempt);
+        append_user_turn_for_run(
+            &store,
+            &session_id,
+            &run_id,
+            trigger_id.clone(),
+            &format!("overflow request {attempt}"),
+        );
+        let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+        let result = run_overflow_loop_with(
+            &run_loop,
+            &model,
+            &store,
+            &session_id,
+            &run_id,
+            &trigger_id,
+            &turns,
+        );
+
+        assert_malformed_failure(result, &format!("malformed summary attempt {attempt}"));
+    }
+
+    let blocked_run_id = run_id(5);
+    let blocked_trigger_id = message_id(104);
+    append_user_turn_for_run(
+        &store,
+        &session_id,
+        &blocked_run_id,
+        blocked_trigger_id.clone(),
+        "blocked overflow request",
+    );
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_overflow_loop_with(
+        &run_loop,
+        &model,
+        &store,
+        &session_id,
+        &blocked_run_id,
+        &blocked_trigger_id,
+        &turns,
+    );
+
+    let RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MalformedResponse {
+        message,
+    }) = result
+    else {
+        panic!("breaker should fail without attempting another summary, got {result:?}");
+    };
+    assert!(
+        message.contains("Auto-compaction disabled"),
+        "breaker warning should be surfaced, got {message:?}"
+    );
+    assert_eq!(
+        server.handled(),
+        7,
+        "fourth overflow should stop after the provider context-limit response"
+    );
+}
+
+#[test]
+fn repeated_low_savings_compactions_trip_anti_thrashing_guard() {
+    let low_savings_summary = long_valid_summary();
+    let server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_summary(&low_savings_summary),
+        canned_stream_completion("first retry completed"),
+        canned_context_limit(),
+        canned_summary(&low_savings_summary),
+        canned_stream_completion("second retry completed"),
+        canned_context_limit(),
+    ]);
+    let store = Arc::new(Mutex::new(oversize_session()));
+    let session_id = session_id();
+    let model = resolved_model(server.base_url());
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+
+    for attempt in 1..=2 {
+        let run_id = run_id(attempt + 1);
+        let trigger_id = message_id(120 + attempt);
+        append_user_turn_for_run(
+            &store,
+            &session_id,
+            &run_id,
+            trigger_id.clone(),
+            &format!("low savings request {attempt}"),
+        );
+        let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+        let result = run_overflow_loop_with(
+            &run_loop,
+            &model,
+            &store,
+            &session_id,
+            &run_id,
+            &trigger_id,
+            &turns,
+        );
+
+        assert!(
+            matches!(result, RunLoopResult::Completed(_)),
+            "low-savings recovery {attempt} should complete, got {result:?}"
+        );
+    }
+
+    let blocked_run_id = run_id(7);
+    let blocked_trigger_id = message_id(127);
+    append_user_turn_for_run(
+        &store,
+        &session_id,
+        &blocked_run_id,
+        blocked_trigger_id.clone(),
+        "blocked by anti-thrashing",
+    );
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_overflow_loop_with(
+        &run_loop,
+        &model,
+        &store,
+        &session_id,
+        &blocked_run_id,
+        &blocked_trigger_id,
+        &turns,
+    );
+
+    let RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MalformedResponse {
+        message,
+    }) = result
+    else {
+        panic!("anti-thrashing guard should fail before another summary, got {result:?}");
+    };
+    assert!(
+        message.contains("Automatic compaction paused"),
+        "anti-thrashing warning should be surfaced, got {message:?}"
+    );
+    assert_eq!(
+        server.handled(),
+        7,
+        "third overflow should stop after the provider context-limit response"
+    );
+}
+
+#[test]
+fn reset_compaction_breakers_clears_anti_thrashing_guard() {
+    let low_savings_summary = long_valid_summary();
+    let server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_summary(&low_savings_summary),
+        canned_stream_completion("first retry completed"),
+        canned_context_limit(),
+        canned_summary(&low_savings_summary),
+        canned_stream_completion("second retry completed"),
+        canned_context_limit(),
+        canned_summary(&valid_summary("Recovered after anti-thrashing reset.")),
+        canned_stream_completion("reset recovery completed"),
+    ]);
+    let store = Arc::new(Mutex::new(oversize_session()));
+    let session_id = session_id();
+    let model = resolved_model(server.base_url());
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+
+    for attempt in 1..=2 {
+        let run_id = run_id(attempt + 1);
+        let trigger_id = message_id(160 + attempt);
+        append_user_turn_for_run(
+            &store,
+            &session_id,
+            &run_id,
+            trigger_id.clone(),
+            &format!("low savings before reset {attempt}"),
+        );
+        let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+        let result = run_overflow_loop_with(
+            &run_loop,
+            &model,
+            &store,
+            &session_id,
+            &run_id,
+            &trigger_id,
+            &turns,
+        );
+
+        assert!(
+            matches!(result, RunLoopResult::Completed(_)),
+            "low-savings recovery {attempt} should complete, got {result:?}"
+        );
+    }
+
+    run_loop.reset_compaction_breakers(&session_id);
+
+    let recovered_run_id = run_id(10);
+    let recovered_trigger_id = message_id(170);
+    append_user_turn_for_run(
+        &store,
+        &session_id,
+        &recovered_run_id,
+        recovered_trigger_id.clone(),
+        "recover after anti-thrashing reset",
+    );
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_overflow_loop_with(
+        &run_loop,
+        &model,
+        &store,
+        &session_id,
+        &recovered_run_id,
+        &recovered_trigger_id,
+        &turns,
+    );
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "reset should clear the anti-thrashing guard, got {result:?}"
+    );
+    assert_eq!(server.handled(), 9);
+}
+
+#[test]
+fn reset_compaction_breakers_allows_auto_compaction_again() {
+    let server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_summary("not a real summary 1"),
+        canned_context_limit(),
+        canned_summary("not a real summary 2"),
+        canned_context_limit(),
+        canned_summary("not a real summary 3"),
+        canned_context_limit(),
+        canned_summary(&valid_summary("Recovered after reset.")),
+        canned_stream_completion("reset recovery completed"),
+    ]);
+    let store = Arc::new(Mutex::new(oversize_session()));
+    let session_id = session_id();
+    let model = resolved_model(server.base_url());
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+
+    for attempt in 1..=3 {
+        let run_id = run_id(attempt + 1);
+        let trigger_id = message_id(140 + attempt);
+        append_user_turn_for_run(
+            &store,
+            &session_id,
+            &run_id,
+            trigger_id.clone(),
+            &format!("malformed before reset {attempt}"),
+        );
+        let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+        let result = run_overflow_loop_with(
+            &run_loop,
+            &model,
+            &store,
+            &session_id,
+            &run_id,
+            &trigger_id,
+            &turns,
+        );
+
+        assert_malformed_failure(result, &format!("malformed summary attempt {attempt}"));
+    }
+
+    run_loop.reset_compaction_breakers(&session_id);
+
+    let recovered_run_id = run_id(9);
+    let recovered_trigger_id = message_id(149);
+    append_user_turn_for_run(
+        &store,
+        &session_id,
+        &recovered_run_id,
+        recovered_trigger_id.clone(),
+        "recover after breaker reset",
+    );
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_overflow_loop_with(
+        &run_loop,
+        &model,
+        &store,
+        &session_id,
+        &recovered_run_id,
+        &recovered_trigger_id,
+        &turns,
+    );
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "reset should allow auto-compaction to run again, got {result:?}"
+    );
+    assert_eq!(server.handled(), 9);
+}
+
+#[test]
+fn transient_summary_failure_cooldown_gates_next_auto_compaction() {
+    let server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_provider_error(500, "summary model unavailable"),
+        canned_context_limit(),
+    ]);
+    let store = Arc::new(Mutex::new(oversize_session()));
+    let session_id = session_id();
+    let model = resolved_model(server.base_url());
+    let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+
+    let first_run_id = run_id(1);
+    let first_trigger_id = message_id(99);
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let first = run_overflow_loop_with(
+        &run_loop,
+        &model,
+        &store,
+        &session_id,
+        &first_run_id,
+        &first_trigger_id,
+        &turns,
+    );
+
+    assert!(
+        matches!(
+            first,
+            RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::Provider(ref error))
+            if error.status == 500
+        ),
+        "transient summary failure should surface the provider error, got {first:?}"
+    );
+
+    let blocked_run_id = run_id(11);
+    let blocked_trigger_id = message_id(171);
+    append_user_turn_for_run(
+        &store,
+        &session_id,
+        &blocked_run_id,
+        blocked_trigger_id.clone(),
+        "blocked during transient cooldown",
+    );
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let blocked = run_overflow_loop_with(
+        &run_loop,
+        &model,
+        &store,
+        &session_id,
+        &blocked_run_id,
+        &blocked_trigger_id,
+        &turns,
+    );
+
+    let RunLoopResult::Failed(nav_harness::models::OpenAiCompletionsError::MalformedResponse {
+        message,
+    }) = blocked
+    else {
+        panic!("cooldown should block auto-compaction, got {blocked:?}");
+    };
+    assert_eq!(message, TRANSIENT_COOLDOWN_WARNING);
+    assert_eq!(
+        server.handled(),
+        3,
+        "cooldown should stop before a second summary request"
+    );
 }
 
 #[test]
@@ -212,7 +670,7 @@ fn run_loop_projects_tool_result_summaries_above_prune_threshold() {
 #[test]
 fn run_loop_compacts_before_streaming_at_usable_threshold() {
     let server = FakeProviderServer::start(vec![
-        canned_summary("## Active Task\nFinish proactive compaction."),
+        canned_summary(&valid_summary("Finish proactive compaction.")),
         canned_stream_completion("Compacted proactively."),
     ]);
     let (store, turns) = proactive_compaction_session();
@@ -291,6 +749,20 @@ fn run_overflow_loop(
     turns: &[ModelTurn],
 ) -> RunLoopResult {
     let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
+    run_overflow_loop_with(
+        &run_loop, model, store, session_id, run_id, message_id, turns,
+    )
+}
+
+fn run_overflow_loop_with(
+    run_loop: &RunLoop,
+    model: &ResolvedModelConfig,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    message_id: &MessageId,
+    turns: &[ModelTurn],
+) -> RunLoopResult {
     let registry = ToolRegistry::default();
     let context = ToolContext::default();
     let mut ids = TestIds::default();
@@ -312,6 +784,32 @@ fn run_overflow_loop(
         &mut ids,
         |_events| {},
     )
+}
+
+fn append_user_turn_for_run(
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    message_id: MessageId,
+    text: &str,
+) {
+    let store = store.lock().unwrap();
+    store.start_run(session_id, run_id.clone()).unwrap();
+    store
+        .append_turn(run_id, message_id, ModelTurn::user_text(text))
+        .unwrap();
+}
+
+fn assert_malformed_failure(result: RunLoopResult, context: &str) {
+    assert!(
+        matches!(
+            result,
+            RunLoopResult::Failed(
+                nav_harness::models::OpenAiCompletionsError::MalformedResponse { .. }
+            )
+        ),
+        "{context} should fail with a malformed-response error, got {result:?}"
+    );
 }
 
 fn oversize_session() -> SessionStore {
@@ -444,6 +942,25 @@ fn continuation_count(turns: &[ModelTurn]) -> usize {
         .count()
 }
 
+fn synthetic_user_text_count(turns: &[ModelTurn], text: &str) -> usize {
+    turns
+        .iter()
+        .filter(|turn| {
+            turn.role == ModelTurnRole::User
+                && turn.text_content() == text
+                && turn.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        nav_harness::sessions::TurnPart::Text {
+                            synthetic: Some(true),
+                            ..
+                        }
+                    )
+                })
+        })
+        .count()
+}
+
 fn last_user_turn(turns: &[ModelTurn]) -> Option<&ModelTurn> {
     turns
         .iter()
@@ -521,6 +1038,52 @@ fn canned_summary(summary: &str) -> CannedResponse {
             "{{\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"{escaped}\"}}}}]}}"
         ),
     }
+}
+
+fn canned_provider_error(status: u16, message: &str) -> CannedResponse {
+    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
+    CannedResponse {
+        status,
+        content_type: "application/json",
+        body: format!(
+            r#"{{"error":{{"message":"{escaped}","type":"server_error","code":"server_error"}}}}"#
+        ),
+    }
+}
+
+fn valid_summary(active_task: &str) -> String {
+    format!(
+        r#"## Active Task
+{active_task}
+
+## Goal
+Finish the overflow recovery behavior.
+
+## Constraints & Preferences
+Use TDD and keep the run-loop behavior observable.
+
+## Completed Actions
+1. Triggered overflow recovery - summary generated [tool: model]
+
+## Active State
+The test session is retrying after compaction.
+
+## In Progress
+Retry the original user request after compaction.
+
+## Blocked
+None.
+
+## Key Decisions
+Reject malformed summaries before they enter replay."#
+    )
+}
+
+fn long_valid_summary() -> String {
+    let padding = "x".repeat(900);
+    valid_summary(&format!(
+        "Continue after a deliberately low-savings compaction. {padding}"
+    ))
 }
 
 fn canned_stream_completion(text: &str) -> CannedResponse {

@@ -15,16 +15,19 @@ use serde_json::{Value, json};
 
 use crate::compaction::{
     COMPACTION_REPLAY_TEXT, COMPACTION_SUMMARY_PLACEHOLDER,
+    degrade::{DialectCaps, degrade_for_dialect},
     overflow::OVERFLOW_CONTINUATION_TEXT,
     prune::tool_result_part_ids_to_prune,
     replay::{DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_TAIL_TURNS, project_for_replay},
     summary::CompactionSummaryRequest,
     validate::{SummaryValidationError, validate_compaction_summary},
 };
+use crate::context::{ContextBudget, truncate};
 use crate::models::{
-    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
-    ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
-    OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
+    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ApiKind,
+    ChatGptSubscriptionDecodeInput, ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder,
+    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput,
+    OpenAiResponsesDecoder,
 };
 use crate::workspace::snapshot::{WORKSPACE_SNAPSHOT_MIME, WorkspaceSnapshot};
 
@@ -466,8 +469,8 @@ impl SessionStore {
         )
     }
 
-    /// Append the synthetic continuation prompt replayed after an overflow
-    /// compaction.
+    /// Append the fallback synthetic continuation prompt replayed after an
+    /// overflow compaction.
     ///
     /// Exactly one continuation turn is added per recovery: if the most recent
     /// turn is already the overflow continuation, the call is a no-op so the
@@ -477,8 +480,26 @@ impl SessionStore {
         session_id: &SessionId,
         run_id: &RunId,
     ) -> Result<(), SqliteStoreError> {
+        self.append_overflow_replay_turn(session_id, run_id, OVERFLOW_CONTINUATION_TEXT)
+    }
+
+    /// Append the original user turn text replayed after an overflow
+    /// compaction.
+    ///
+    /// Exactly one synthetic replay turn is added per recovery: the original
+    /// persisted user turn may already be the latest real turn, so the guard
+    /// only suppresses a matching synthetic replay that was appended earlier.
+    pub fn append_overflow_replay_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: &RunId,
+        text: &str,
+    ) -> Result<(), SqliteStoreError> {
         let page = self.session_turns_chronological(session_id)?;
-        if page.last().is_some_and(is_overflow_continuation_turn) {
+        if page
+            .last()
+            .is_some_and(|turn| is_synthetic_user_text_turn(turn, text))
+        {
             return Ok(());
         }
 
@@ -495,7 +516,7 @@ impl SessionStore {
         self.sqlite.append_turns(&[(
             turn,
             vec![Part::Text {
-                text: OVERFLOW_CONTINUATION_TEXT.to_string(),
+                text: text.to_string(),
                 synthetic: Some(true),
             }],
         )])
@@ -522,6 +543,39 @@ impl SessionStore {
             false,
         )
         .map_err(CompactionCommitError::Store)
+    }
+
+    /// Drop the latest auto-compaction replay artifacts after Stage-5 terminal
+    /// overflow proves the summary did not shrink the request enough.
+    pub fn drop_latest_compaction_summary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SqliteStoreError> {
+        let page = self.session_turns_chronological(session_id)?;
+        let Some(marker_index) = latest_compaction_marker_index(&page) else {
+            return Ok(());
+        };
+        let mut parts_to_remove: Vec<(MessageId, PartId)> = Vec::new();
+
+        collect_turn_part_ids(&page, marker_index, &mut parts_to_remove);
+
+        let summary_index = marker_index
+            .checked_add(1)
+            .filter(|index| is_compaction_summary_turn(&page, *index));
+        if let Some(summary_index) = summary_index {
+            collect_turn_part_ids(&page, summary_index, &mut parts_to_remove);
+
+            let replay_index = summary_index.saturating_add(1);
+            if let Some(stored_turn) = page.get(replay_index)
+                && is_synthetic_user_text_replay_turn(stored_turn)
+            {
+                collect_turn_part_ids(&page, replay_index, &mut parts_to_remove);
+            }
+        }
+
+        self.sqlite.remove_parts(&parts_to_remove)?;
+
+        Ok(())
     }
 
     fn write_compaction_summary(
@@ -675,6 +729,16 @@ impl SessionStore {
     pub fn try_turns_for_run(&self, run_id: &RunId) -> Result<Vec<ModelTurn>, SqliteStoreError> {
         let turns = self.sqlite.list_turns_for_run(run_id)?;
         Ok(model_turns_for_replay(&turns))
+    }
+
+    pub fn try_turns_for_encoding(
+        &self,
+        session_id: &SessionId,
+        api_kind: ApiKind,
+        budget: ContextBudget,
+    ) -> Result<Vec<ModelTurn>, SqliteStoreError> {
+        let page = self.session_turns_chronological(session_id)?;
+        Ok(model_turns_for_encoding(&page, api_kind, budget))
     }
 
     pub fn provider_payload_recovery_report(
@@ -1270,6 +1334,22 @@ fn model_turns_for_replay(turns: &[StoredTurn]) -> Vec<ModelTurn> {
         .collect()
 }
 
+fn model_turns_for_encoding(
+    turns: &[StoredTurn],
+    api_kind: ApiKind,
+    budget: ContextBudget,
+) -> Vec<ModelTurn> {
+    let projected = project_for_replay(turns, DEFAULT_TAIL_TURNS);
+    let truncated = truncate(projected, budget);
+    let degraded = degrade_for_dialect(truncated, DialectCaps::for_api_kind(api_kind));
+
+    degraded
+        .turns
+        .into_iter()
+        .filter_map(model_turn_from_projected_turn)
+        .collect()
+}
+
 fn compaction_head_turns(
     turns: &[StoredTurn],
     tail_start_id: Option<&MessageId>,
@@ -1484,7 +1564,7 @@ fn is_verbatim_replay_turn(turns: &[StoredTurn], index: usize) -> bool {
     !has_compaction_marker(parts) && !is_compaction_summary_turn(turns, index)
 }
 
-fn is_overflow_continuation_turn((turn, parts): &StoredTurn) -> bool {
+fn is_synthetic_user_text_turn((turn, parts): &StoredTurn, expected_text: &str) -> bool {
     turn.role == TurnRole::User
         && parts.iter().any(|part| {
             matches!(
@@ -1492,7 +1572,20 @@ fn is_overflow_continuation_turn((turn, parts): &StoredTurn) -> bool {
                 Part::Text {
                     text,
                     synthetic: Some(true),
-                } if text == OVERFLOW_CONTINUATION_TEXT
+                } if text == expected_text
+            )
+        })
+}
+
+fn is_synthetic_user_text_replay_turn((turn, parts): &StoredTurn) -> bool {
+    turn.role == TurnRole::User
+        && parts.iter().any(|part| {
+            matches!(
+                &part.part,
+                Part::Text {
+                    synthetic: Some(true),
+                    ..
+                }
             )
         })
 }
@@ -1501,6 +1594,18 @@ fn has_compaction_marker(parts: &[StoredPart]) -> bool {
     parts
         .iter()
         .any(|part| matches!(part.part, Part::Compaction { .. }))
+}
+
+fn latest_compaction_marker_index(turns: &[StoredTurn]) -> Option<usize> {
+    turns
+        .iter()
+        .rposition(|(_, parts)| has_compaction_marker(parts))
+}
+
+fn collect_turn_part_ids(turns: &[StoredTurn], index: usize, out: &mut Vec<(MessageId, PartId)>) {
+    if let Some((turn, parts)) = turns.get(index) {
+        out.extend(parts.iter().map(|part| (turn.id.clone(), part.id.clone())));
+    }
 }
 
 fn is_compaction_summary_turn(turns: &[StoredTurn], index: usize) -> bool {
@@ -2028,6 +2133,71 @@ mod tests {
             !after
                 .iter()
                 .any(|turn| turn.text_content() == COMPACTION_REPLAY_TEXT)
+        );
+    }
+
+    #[test]
+    fn drop_latest_compaction_summary_keeps_real_neighbor_when_summary_is_missing() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+        let marker_id = new_message_id();
+        let real_turn_id = new_message_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .sqlite
+            .append_turn(
+                Turn {
+                    id: marker_id,
+                    run_id: run_id.clone(),
+                    seq: 0,
+                    role: TurnRole::User,
+                    meta: TurnMeta::default(),
+                    created_at: 1_000,
+                },
+                vec![Part::Compaction {
+                    auto: true,
+                    tail_start_id: None,
+                }],
+            )
+            .unwrap();
+        store
+            .sqlite
+            .append_turn(
+                Turn {
+                    id: real_turn_id.clone(),
+                    run_id,
+                    seq: 1,
+                    role: TurnRole::Assistant,
+                    meta: TurnMeta::default(),
+                    created_at: 1_001,
+                },
+                vec![Part::Text {
+                    text: "real assistant turn".to_string(),
+                    synthetic: None,
+                }],
+            )
+            .unwrap();
+
+        store.drop_latest_compaction_summary(&session_id).unwrap();
+
+        let stored_turns = store
+            .sqlite
+            .list_turns_for_session(&session_id, None, usize::MAX)
+            .unwrap()
+            .items;
+        let real_turn = stored_turns
+            .into_iter()
+            .find(|(turn, _)| turn.id == real_turn_id)
+            .expect("real neighbor turn should still exist");
+        assert_eq!(
+            real_turn.1[0].part,
+            Part::Text {
+                text: "real assistant turn".to_string(),
+                synthetic: None,
+            }
         );
     }
 
