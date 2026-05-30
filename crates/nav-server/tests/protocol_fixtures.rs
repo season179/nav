@@ -228,16 +228,19 @@ fn session_send_message_fixture_matches_server_contract_and_replay() {
     assert_uuid_v7(message_id);
     let provider_request = provider.request();
     assert_eq!(provider_request.path, "/v1/chat/completions");
+    // messages[0] is the assembled system prompt (issue #524); the user turn
+    // follows it.
+    assert_eq!(provider_request.body["messages"][0]["role"], "system");
     assert_eq!(
-        provider_request.body["messages"][0]["content"],
+        provider_request.body["messages"][1]["content"],
         request_text
     );
     wait_for_run_status(&server, run_id, RunStatus::Completed);
 
-    let events = session_events(&mut server, &session_id);
-    assert_eq!(
-        event_names(&events),
-        fixture_event_names("event-streams/message-send-completed.sse")
+    let events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &fixture_event_names("event-streams/message-send-completed.sse"),
     );
     assert_protocol_event_ids(&events, &session_id);
     assert_eq!(events[1].data["run_id"].as_str(), Some(run_id));
@@ -336,10 +339,10 @@ fn run_failed_fixture_matches_server_contract() {
     assert_uuid_v7(run_id);
     wait_for_run_status(&server, run_id, RunStatus::Failed);
 
-    let events = session_events(&mut server, &session_id);
-    assert_eq!(
-        event_names(&events),
-        fixture_event_names("event-streams/run-failed.sse")
+    let events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &fixture_event_names("event-streams/run-failed.sse"),
     );
     assert_protocol_event_ids(&events, &session_id);
     assert_eq!(events[1].data["run_id"].as_str(), Some(run_id));
@@ -427,6 +430,30 @@ fn session_events(server: &mut HttpServer, session_id: &str) -> Vec<SseEvent> {
             .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
             .body(),
     )
+}
+
+/// Fetches the session event stream, polling until the event names match
+/// `expected` (or a short deadline elapses) before returning the parsed events.
+///
+/// The run status (observed by `wait_for_run_status`) flips to its terminal
+/// value before the trailing `session.totals_updated` event is appended by the
+/// run thread, so under heavy parallel load a reader can snapshot the stream in
+/// the window before that event lands. Polling closes that race; if the events
+/// never settle we still assert against the last snapshot for a useful diff.
+fn wait_for_session_events(
+    server: &mut HttpServer,
+    session_id: &str,
+    expected: &[String],
+) -> Vec<SseEvent> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let events = session_events(server, session_id);
+        if event_names(&events) == expected || std::time::Instant::now() >= deadline {
+            assert_eq!(event_names(&events), expected);
+            return events;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn fixture_json_response(relative_path: &str) -> JsonRpcResponse<Value> {

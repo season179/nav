@@ -1119,6 +1119,196 @@ fn chat_completions_truncates_history_to_model_context_budget_before_encode() {
     );
 }
 
+#[test]
+fn live_anthropic_request_carries_the_static_system_prompt() {
+    let server =
+        FakeProviderServer::start(vec![
+            CannedResponse::json(anthropic_final_answer_response()),
+        ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "say hello");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "anthropic run should complete, got {result:?}"
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected one provider request");
+    let request: serde_json::Value =
+        serde_json::from_str(&requests[0]).expect("request body should be JSON");
+    let system = request["system"].to_string();
+    assert!(
+        system.contains("You are nav, an interactive CLI agent"),
+        "the live loop must send the static system identity block: {system}"
+    );
+}
+
+#[test]
+fn live_request_carries_project_conventions_from_workspace_root() {
+    let workspace = TestSkillRoot::new("run-loop-conventions");
+    workspace.write_context_file("CLAUDE.md", "Always run the formatter before finishing.\n");
+    workspace.write_context_file("AGENTS.md", "Prefer small, focused commits.\n");
+
+    let server =
+        FakeProviderServer::start(vec![
+            CannedResponse::json(anthropic_final_answer_response()),
+        ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "say hello");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let context = ToolContext::with_path_policy(workspace.policy());
+    let result = run_loop_once_with_context(&model, &store, &session_id, &run_id, &turns, &context);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "run with project conventions should complete, got {result:?}"
+    );
+    let requests = server.requests();
+    let system =
+        serde_json::from_str::<serde_json::Value>(&requests[0]).unwrap()["system"].to_string();
+    assert!(
+        system.contains("## Project conventions")
+            && system.contains("Always run the formatter before finishing.")
+            && system.contains("Prefer small, focused commits."),
+        "CLAUDE.md/AGENTS.md content must appear in the live request system prompt: {system}"
+    );
+}
+
+#[test]
+fn live_request_lists_workspace_skills_in_the_system_prompt() {
+    let workspace = TestSkillRoot::new("run-loop-system-skills");
+    workspace.write_workspace_skill(
+        "deploy",
+        "---\nname: deploy\ndescription: Ship the service to production.\n---\nbody\n",
+    );
+
+    let server =
+        FakeProviderServer::start(vec![
+            CannedResponse::json(anthropic_final_answer_response()),
+        ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "say hello");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let context = ToolContext::with_path_policy(workspace.policy());
+    let result = run_loop_once_with_context(&model, &store, &session_id, &run_id, &turns, &context);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "run with workspace skills should complete, got {result:?}"
+    );
+    let requests = server.requests();
+    let system =
+        serde_json::from_str::<serde_json::Value>(&requests[0]).unwrap()["system"].to_string();
+    assert!(
+        system.contains("## Skills")
+            && system.contains("deploy")
+            && system.contains("Ship the service to production."),
+        "the system prompt must list discovered workspace skills: {system}"
+    );
+}
+
+#[test]
+fn live_anthropic_system_prompt_splits_into_cache_blocks_without_leaking_the_boundary() {
+    let server =
+        FakeProviderServer::start(vec![
+            CannedResponse::json(anthropic_final_answer_response()),
+        ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "say hello");
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "run should complete, got {result:?}"
+    );
+
+    let requests = server.requests();
+    let request: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+    let blocks = request["system"]
+        .as_array()
+        .expect("anthropic system should serialize as an array of text blocks");
+    assert!(
+        blocks.len() >= 2,
+        "the three-block prompt should split into multiple cache blocks: {:?}",
+        request["system"]
+    );
+    assert_eq!(
+        blocks[0]["cache_control"]["type"], "ephemeral",
+        "the static block must carry the cache breakpoint: {:?}",
+        request["system"]
+    );
+    assert!(
+        !requests[0].contains("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"),
+        "the boundary marker must never reach the wire: {}",
+        requests[0]
+    );
+}
+
+#[test]
+fn live_openai_responses_request_carries_system_prompt_without_the_boundary_marker() {
+    let body = r#"{
+        "id": "resp_final",
+        "model": "gpt-test",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "All done", "annotations": []}]
+        }]
+    }"#;
+    let server = FakeProviderServer::start(vec![CannedResponse::json(body)]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "say hello");
+
+    let model = responses_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "run should complete, got {result:?}"
+    );
+
+    let requests = server.requests();
+    let request: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+    let instructions = request["instructions"]
+        .as_str()
+        .expect("responses request should carry the system prompt as instructions");
+    assert!(
+        instructions.contains("You are nav, an interactive CLI agent"),
+        "the system prompt must reach the OpenAI Responses dialect: {instructions}"
+    );
+    assert!(
+        !instructions.contains("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"),
+        "the boundary marker must be stripped for the OpenAI dialects: {instructions}"
+    );
+}
+
 fn run_loop_once(
     model: &ResolvedModelConfig,
     store: &Arc<Mutex<SessionStore>>,
@@ -1553,6 +1743,10 @@ impl TestSkillRoot {
         let dir = self.root.join(".nav").join("skills").join(name);
         fs::create_dir_all(&dir).expect("workspace skill directory should be created");
         fs::write(dir.join("SKILL.md"), contents).expect("workspace skill file should be written");
+    }
+
+    fn write_context_file(&self, name: &str, contents: &str) {
+        fs::write(self.root.join(name), contents).expect("context file should be written");
     }
 
     fn policy(&self) -> WorkspacePathPolicy {

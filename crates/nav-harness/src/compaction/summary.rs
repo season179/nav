@@ -164,6 +164,9 @@ impl CompactionSummaryAgent {
                     ToolPreset::Coding,
                     None,
                     &ContextReminders::new(),
+                    // The summarizer carries its own instructions in `turns`; it
+                    // never receives the session system prompt.
+                    None,
                 );
                 let http_request = dialect_http_request(model, &encoded)?;
                 let request_context = OpenAiCompletionsRequestContext::new();

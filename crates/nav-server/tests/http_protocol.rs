@@ -566,17 +566,17 @@ fn session_send_message_starts_run_and_streams_typed_sse_events() {
     assert_eq!(event_response.status(), 200);
     assert_eq!(event_response.content_type(), "text/event-stream");
 
-    let events = parse_sse(event_response.body());
-    assert_eq!(
-        event_names(&events),
-        vec![
+    let events = wait_for_session_events(
+        &mut server,
+        session_id,
+        &[
             "session.created",
             "run.started",
             "model.text_delta",
             "message.completed",
             "run.completed",
             "session.totals_updated",
-        ]
+        ],
     );
     assert_protocol_event_ids(&events, session_id);
 
@@ -1055,17 +1055,14 @@ fn session_send_message_posts_provider_stream_and_publishes_provider_events() {
     assert_eq!(request.path, "/v1/chat/completions");
     assert_eq!(request.header("authorization"), Some("Bearer sk-test"));
     assert_eq!(request.body["stream"], true);
-    assert_eq!(request.body["messages"][0]["role"], "user");
-    assert_eq!(request.body["messages"][0]["content"], "hello");
+    let messages = conversation_messages(&request.body);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "hello");
 
-    let events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
-    );
-    assert_eq!(
-        event_names(&events),
-        vec![
+    let events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
             "session.created",
             "run.started",
             "model.text_delta",
@@ -1073,7 +1070,7 @@ fn session_send_message_posts_provider_stream_and_publishes_provider_events() {
             "message.completed",
             "run.completed",
             "session.totals_updated",
-        ]
+        ],
     );
     assert_eq!(events[2].data["delta"], "hello ");
     assert_eq!(events[3].data["delta"], "Season");
@@ -1111,7 +1108,7 @@ fn session_send_message_replays_previous_user_and_assistant_turns_to_provider() 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests[1].body["messages"],
+        conversation_messages(&requests[1].body),
         json!([
             { "role": "user", "content": "first user turn" },
             { "role": "assistant", "content": "assistant remembered one" },
@@ -1149,7 +1146,7 @@ fn session_history_survives_backend_restart_for_next_run() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests[1].body["messages"],
+        conversation_messages(&requests[1].body),
         json!([
             { "role": "user", "content": "first before restart" },
             { "role": "assistant", "content": "assistant before restart" },
@@ -1195,7 +1192,8 @@ fn session_send_message_returns_structured_tool_error_for_unknown_tool() {
     wait_for_run_status(&server, &run_id, RunStatus::Completed);
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    let tool_result = &requests[1].body["messages"][2];
+    let messages = conversation_messages(&requests[1].body);
+    let tool_result = &messages[2];
     assert_eq!(tool_result["role"], "tool");
     assert_eq!(tool_result["tool_call_id"], "call_missing_1");
     let tool_error: Value = serde_json::from_str(tool_result["content"].as_str().unwrap())
@@ -1203,14 +1201,10 @@ fn session_send_message_returns_structured_tool_error_for_unknown_tool() {
     assert_eq!(tool_error["ok"], false);
     assert_eq!(tool_error["error"]["message"], "unknown tool `missing`");
 
-    let events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
-    );
-    assert_eq!(
-        event_names(&events),
-        vec![
+    let events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
             "session.created",
             "run.started",
             "tool.call_started",
@@ -1222,7 +1216,7 @@ fn session_send_message_returns_structured_tool_error_for_unknown_tool() {
             "message.completed",
             "run.completed",
             "session.totals_updated",
-        ]
+        ],
     );
 
     let tool_call = events
@@ -1265,7 +1259,7 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
         vec!["bash", "edit", "read", "write"]
     );
     assert_eq!(
-        requests[1].body["messages"],
+        conversation_messages(&requests[1].body),
         json!([
             { "role": "user", "content": "read the fixture" },
             {
@@ -1288,14 +1282,10 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
         ])
     );
 
-    let events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
-    );
-    assert_eq!(
-        event_names(&events),
-        vec![
+    wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
             "session.created",
             "run.started",
             "tool.call_started",
@@ -1306,7 +1296,7 @@ fn session_send_message_executes_read_tool_and_reenters_model_loop() {
             "message.completed",
             "run.completed",
             "session.totals_updated",
-        ]
+        ],
     );
 }
 
@@ -1339,7 +1329,7 @@ fn session_send_message_executes_write_tool_and_publishes_file_changed() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests[1].body["messages"],
+        conversation_messages(&requests[1].body),
         json!([
             { "role": "user", "content": "write the note" },
             {
@@ -1362,14 +1352,10 @@ fn session_send_message_executes_write_tool_and_publishes_file_changed() {
         ])
     );
 
-    let events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
-    );
-    assert_eq!(
-        event_names(&events),
-        vec![
+    let events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
             "session.created",
             "run.started",
             "tool.call_started",
@@ -1381,7 +1367,7 @@ fn session_send_message_executes_write_tool_and_publishes_file_changed() {
             "message.completed",
             "run.completed",
             "session.totals_updated",
-        ]
+        ],
     );
     let file_changed = events
         .iter()
@@ -1426,7 +1412,7 @@ fn session_send_message_executes_edit_tool_and_publishes_file_changed() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(
-        requests[1].body["messages"],
+        conversation_messages(&requests[1].body),
         json!([
             { "role": "user", "content": "edit the note" },
             {
@@ -1584,12 +1570,10 @@ fn session_send_message_approves_guarded_bash_tool_and_resumes_run() {
     assert_eq!(fixture.execution_count(), 1);
     let requests = fixture.provider.requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[1].body["messages"][2]["role"], "tool");
-    assert_eq!(
-        requests[1].body["messages"][2]["tool_call_id"],
-        "call_bash_approve"
-    );
-    assert_eq!(requests[1].body["messages"][2]["content"], "bash output");
+    let messages = conversation_messages(&requests[1].body);
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_bash_approve");
+    assert_eq!(messages[2]["content"], "bash output");
 }
 
 #[test]
@@ -1660,10 +1644,8 @@ fn default_bash_tool_streams_output_deltas_without_confirmation() {
     wait_for_run_status(&server, &run_id, RunStatus::Completed);
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(
-        requests[1].body["messages"][2]["content"],
-        "first\nsecond\n"
-    );
+    let messages = conversation_messages(&requests[1].body);
+    assert_eq!(messages[2]["content"], "first\nsecond\n");
 }
 
 #[test]
@@ -1677,7 +1659,8 @@ fn session_send_message_rejects_guarded_bash_tool_without_execution() {
     assert_eq!(fixture.execution_count(), 0);
     let requests = fixture.provider.requests();
     assert_eq!(requests.len(), 2);
-    let tool_result = &requests[1].body["messages"][2];
+    let messages = conversation_messages(&requests[1].body);
+    let tool_result = &messages[2];
     assert_eq!(tool_result["role"], "tool");
     assert_eq!(tool_result["tool_call_id"], "call_bash_reject");
     let rejection: Value = serde_json::from_str(tool_result["content"].as_str().unwrap())
@@ -1727,7 +1710,8 @@ fn session_send_message_returns_structured_read_error_for_path_escape() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
-    let tool_result = &requests[1].body["messages"][2];
+    let messages = conversation_messages(&requests[1].body);
+    let tool_result = &messages[2];
     assert_eq!(tool_result["role"], "tool");
     assert_eq!(tool_result["tool_call_id"], "call_read_escape");
     let tool_error: Value = serde_json::from_str(tool_result["content"].as_str().unwrap())
@@ -1765,7 +1749,7 @@ fn session_send_message_keeps_interleaved_session_turns_isolated() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
     assert_eq!(
-        requests[2].body["messages"],
+        conversation_messages(&requests[2].body),
         json!([
             { "role": "user", "content": "session one first user turn" },
             { "role": "assistant", "content": "assistant reply for session one" },
@@ -2026,20 +2010,16 @@ fn session_send_message_publishes_provider_error_before_run_failed() {
 
     assert_eq!(provider.request().path, "/v1/chat/completions");
     wait_for_run_status(&server, &run_id, RunStatus::Failed);
-    let events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
-    );
-    assert_eq!(
-        event_names(&events),
-        vec![
+    let events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
             "session.created",
             "run.started",
             "provider.error",
             "run.failed",
             "session.totals_updated",
-        ]
+        ],
     );
     let provider_error = &events[2].data;
     assert_eq!(provider_error["run_id"], run_id);
@@ -2104,21 +2084,17 @@ fn stream_error_flushes_buffered_deltas_before_error_payload() {
 
     assert_eq!(provider.request().path, "/v1/chat/completions");
     wait_for_run_status(&server, &run_id, RunStatus::Failed);
-    let events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
-    );
-    assert_eq!(
-        event_names(&events),
-        vec![
+    wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
             "session.created",
             "run.started",
             "model.text_delta",
             "provider.error",
             "run.failed",
             "session.totals_updated",
-        ]
+        ],
     );
     drop(server);
 
@@ -2161,19 +2137,15 @@ fn session_send_message_marks_transport_failure_as_run_failed() {
     let run_id = send_message(&mut server, &session_id);
     wait_for_run_status(&server, &run_id, RunStatus::Failed);
 
-    let events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
-    );
-    assert_eq!(
-        event_names(&events),
-        vec![
+    let events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
             "session.created",
             "run.started",
             "run.failed",
-            "session.totals_updated"
-        ]
+            "session.totals_updated",
+        ],
     );
     let failed = &events[2].data;
     assert_eq!(failed["run_id"], run_id);
@@ -2410,19 +2382,15 @@ fn session_send_message_streams_run_failed_when_default_model_cannot_resolve() {
     assert_uuid_v7(run_id);
     wait_for_run_status(&server, run_id, RunStatus::Failed);
 
-    let events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
-    );
-    assert_eq!(
-        event_names(&events),
-        vec![
+    let events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
             "session.created",
             "run.started",
             "run.failed",
-            "session.totals_updated"
-        ]
+            "session.totals_updated",
+        ],
     );
 
     let failed = events
@@ -2483,10 +2451,20 @@ fn run_cancel_rejects_completed_runs_without_adding_events() {
     let run_id = send_message(&mut server, &session_id);
     assert_eq!(provider.request().path, "/v1/chat/completions");
     wait_for_run_status(&server, &run_id, RunStatus::Completed);
-    let initial_events = parse_sse(
-        server
-            .handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")))
-            .body(),
+    // Wait for the full terminal event set (including the trailing
+    // `session.totals_updated`, which is appended just after the run status
+    // flips) so the before/after comparison below is not racy.
+    let initial_events = wait_for_session_events(
+        &mut server,
+        &session_id,
+        &[
+            "session.created",
+            "run.started",
+            "model.text_delta",
+            "message.completed",
+            "run.completed",
+            "session.totals_updated",
+        ],
     );
 
     let cancel_response = server.handle_request(HttpRequest::post(
@@ -2556,6 +2534,35 @@ fn event_names(events: &[SseEvent]) -> Vec<&str> {
     events.iter().map(|event| event.name.as_str()).collect()
 }
 
+/// Fetches the session event stream, polling until the event names match
+/// `expected` (or a short deadline elapses) before returning the parsed events.
+///
+/// The run status (observed by `wait_for_run_status`) flips to its terminal
+/// value inside `publish_terminal_events`, but the trailing
+/// `session.totals_updated` event is appended afterwards by the run thread.
+/// Under heavy parallel load (e.g. `cargo test --workspace`) a reader can
+/// observe the terminal status and snapshot the stream in the window before
+/// that trailing event lands. Polling here closes that race without weakening
+/// the assertion: if the events never settle, we still assert against the last
+/// snapshot so the failure shows a useful diff.
+fn wait_for_session_events(
+    server: &mut HttpServer,
+    session_id: &str,
+    expected: &[&str],
+) -> Vec<SseEvent> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response =
+            server.handle_request(HttpRequest::get(format!("/sessions/{session_id}/events")));
+        let events = parse_sse(response.body());
+        if event_names(&events) == expected || Instant::now() >= deadline {
+            assert_eq!(event_names(&events), expected);
+            return events;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn assert_protocol_event_ids(events: &[SseEvent], session_id: &str) {
     for event in events {
         assert_uuid_v7(&event.id);
@@ -2599,6 +2606,26 @@ fn approval_id_from_event(event: &EventEnvelope) -> String {
         BackendEvent::ToolApprovalRequested { approval_id, .. } => approval_id.to_string(),
         event => panic!("event = {event:?}, want tool.approval_requested"),
     }
+}
+
+/// The provider request messages with the leading system prompt dropped.
+///
+/// The live loop now prepends the assembled system prompt as a `system`-role
+/// message (issue #524); its content is environment-dependent (cwd, date) and
+/// is asserted directly in the nav-harness dialect tests. These protocol tests
+/// verify the conversation and tool-call flow, so they compare against the
+/// messages with the system entry removed — which restores the exact indices
+/// the conversation occupied before the system prompt was wired in.
+fn conversation_messages(body: &Value) -> Value {
+    Value::Array(
+        body["messages"]
+            .as_array()
+            .expect("request body should carry a messages array")
+            .iter()
+            .filter(|message| message["role"] != "system")
+            .cloned()
+            .collect(),
+    )
 }
 
 fn tool_names_from_request(body: &Value) -> Vec<&str> {
