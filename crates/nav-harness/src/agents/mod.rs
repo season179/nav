@@ -520,7 +520,10 @@ impl RunLoop {
 
         let http_request = dialect_http_request(model, encoded).map_err(dialect_stream_error)?;
         let raw_bytes = runtime
-            .block_on(self.client.send_non_streaming(model, &http_request))
+            .block_on(
+                self.client
+                    .send_non_streaming(model, &http_request, request_context),
+            )
             .map_err(dialect_stream_error)?;
         let response: Value = serde_json::from_slice(&raw_bytes).map_err(|error| {
             dialect_stream_error(OpenAiCompletionsError::MalformedResponse {

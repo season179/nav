@@ -673,6 +673,7 @@ impl OpenAiCompletionsClient {
         &self,
         model: &ResolvedModelConfig,
         request: &DialectHttpRequest,
+        request_context: &OpenAiCompletionsRequestContext,
     ) -> Result<Vec<u8>, OpenAiCompletionsError> {
         let api_key = model.api_key.expose_secret();
         if api_key.trim().is_empty() {
@@ -694,30 +695,40 @@ impl OpenAiCompletionsClient {
                 .header("anthropic-version", ANTHROPIC_VERSION),
         };
 
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| OpenAiCompletionsError::Transport {
-                message: redact_secret(&error.to_string(), api_key),
-            })?;
+        let exchange = async {
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| OpenAiCompletionsError::Transport {
+                    message: redact_secret(&error.to_string(), api_key),
+                })?;
 
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| OpenAiCompletionsError::Transport {
-                message: redact_secret(&error.to_string(), api_key),
-            })?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|error| OpenAiCompletionsError::Transport {
+                    message: redact_secret(&error.to_string(), api_key),
+                })?;
 
-        if !status.is_success() {
-            return Err(OpenAiCompletionsResponseParser::parse_error_response(
-                status.as_u16(),
-                &body,
-                api_key,
-            ));
+            if !status.is_success() {
+                return Err(OpenAiCompletionsResponseParser::parse_error_response(
+                    status.as_u16(),
+                    &body,
+                    api_key,
+                ));
+            }
+
+            Ok(body.into_bytes())
+        };
+
+        // Race the request against cancellation so a cancelled run aborts the
+        // in-flight wait instead of blocking until the response or timeout.
+        tokio::select! {
+            biased;
+            () = request_context.cancelled() => Err(OpenAiCompletionsError::Cancelled),
+            result = exchange => result,
         }
-
-        Ok(body.into_bytes())
     }
 
     pub async fn complete(

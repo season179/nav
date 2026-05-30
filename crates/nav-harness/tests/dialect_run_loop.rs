@@ -260,12 +260,67 @@ fn openai_responses_tool_call_round_trips_to_a_second_request() {
     );
 }
 
+#[test]
+fn cancelling_a_run_aborts_the_in_flight_dialect_request() {
+    // A server that accepts the connection but never answers: without
+    // cancellation propagation the run would block until the request timeout.
+    let server = HangingProviderServer::start();
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "say hello");
+
+    let token = OpenAiCompletionsCancellationToken::new();
+    let token_for_canceller = token.clone();
+    // Cancel shortly after the request is in flight (well under the 30s client
+    // request timeout, so reaching the timeout would indicate a regression).
+    let canceller = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        token_for_canceller.cancel();
+    });
+
+    let model = anthropic_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let started = Instant::now();
+    let result = run_loop_with_token(&model, &store, &session_id, &run_id, &turns, token);
+    let elapsed = started.elapsed();
+    canceller.join().unwrap();
+
+    assert!(
+        matches!(result, RunLoopResult::Cancelled),
+        "cancelling mid-request should yield Cancelled, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "cancellation should abort promptly, took {elapsed:?}"
+    );
+}
+
 fn run_loop_once(
     model: &ResolvedModelConfig,
     store: &Arc<Mutex<SessionStore>>,
     session_id: &SessionId,
     run_id: &RunId,
     turns: &[ModelTurn],
+) -> RunLoopResult {
+    run_loop_with_token(
+        model,
+        store,
+        session_id,
+        run_id,
+        turns,
+        OpenAiCompletionsCancellationToken::new(),
+    )
+}
+
+fn run_loop_with_token(
+    model: &ResolvedModelConfig,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    turns: &[ModelTurn],
+    cancellation_token: OpenAiCompletionsCancellationToken,
 ) -> RunLoopResult {
     let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
     let registry = ToolRegistry::default();
@@ -284,7 +339,7 @@ fn run_loop_once(
             tool_context: &context,
             session_store: Some(store),
             pending_confirmations: None,
-            cancellation_token: OpenAiCompletionsCancellationToken::new(),
+            cancellation_token,
         },
         &mut ids,
         |_events| {},
@@ -433,6 +488,50 @@ impl FakeProviderServer {
 impl Drop for FakeProviderServer {
     fn drop(&mut self) {
         let _ = self.handled.load(Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// A fake provider that accepts one connection and then holds it open without
+/// ever sending a response, so a request only ends via cancellation or timeout.
+struct HangingProviderServer {
+    base_url: String,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl HangingProviderServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("hanging server should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("hanging server should set non-blocking");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+
+        let handle = thread::spawn(move || {
+            if let Some(mut stream) = accept_before(&listener, Duration::from_secs(10)) {
+                drain_http_request(&mut stream);
+                // Hold the connection without responding, long enough to outlast
+                // the ~200ms cancellation but bounded so a regression (waiting on
+                // the response) fails fast instead of hanging the test.
+                thread::sleep(Duration::from_millis(1500));
+            }
+        });
+
+        Self {
+            base_url,
+            handle: Some(handle),
+        }
+    }
+
+    fn base_url(&self) -> &str {
+        &self.base_url
+    }
+}
+
+impl Drop for HangingProviderServer {
+    fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
