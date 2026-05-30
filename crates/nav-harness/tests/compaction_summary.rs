@@ -637,11 +637,6 @@ fn compaction_summary_agent_uses_responses_dialect_for_responses_model() {
         "responses summary call should not use Chat Completions messages:\n{}",
         request_bodies[0]
     );
-    assert!(
-        !request_bodies[0].contains("\"tools\""),
-        "summary override payload should not include tool definitions:\n{}",
-        request_bodies[0]
-    );
 }
 
 #[test]

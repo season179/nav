@@ -154,6 +154,8 @@ impl CompactionSummaryAgent {
             }
             ApiKind::OpenAiResponses | ApiKind::AnthropicMessages => {
                 let turns = compaction_prompt_turns(request, payload);
+                // Compaction summaries are text-only requests; never expose
+                // session tools to the summarizer, regardless of payload mode.
                 let registry = ToolRegistry::default();
                 let encoded = encode_request(
                     model.api,

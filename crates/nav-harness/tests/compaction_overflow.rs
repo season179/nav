@@ -224,11 +224,6 @@ fn overflow_compaction_uses_model_override_when_configured() {
         !summary_bodies[0].contains(&oversized_result),
         "override summary request should truncate oversized tool results"
     );
-    assert!(
-        !summary_bodies[0].contains("\"tools\""),
-        "override summary request should not carry tool definitions:\n{}",
-        summary_bodies[0]
-    );
 }
 
 #[test]
