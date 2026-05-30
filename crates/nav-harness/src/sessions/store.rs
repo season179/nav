@@ -1,6 +1,6 @@
 //! SQLite-backed session store facade used by the server and tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -1196,10 +1196,50 @@ fn select_tail_start_id(turns: &[StoredTurn], config: CompactionConfig) -> Optio
         (Some(a), None) | (None, Some(a)) => a,
         (None, None) => return None,
     };
+    let tail_start_index = advance_past_split_tool_sequence(&verbatim_turns, tail_start_index);
 
     verbatim_turns
         .get(tail_start_index)
         .map(|(turn, _)| turn.id.clone())
+}
+
+/// CMP-16 split-turn handling: the verbatim tail must never begin with a tool
+/// result whose originating tool call sits in the summarized head — strict
+/// dialects reject a replay that opens with an orphaned tool result. Advance
+/// the cut forward over any such leading turns so the in-progress tool
+/// call+result fold into the head summary instead of dangling in the tail.
+fn advance_past_split_tool_sequence(
+    verbatim_turns: &[&StoredTurn],
+    tail_start_index: usize,
+) -> usize {
+    let mut index = tail_start_index;
+    while index < verbatim_turns.len()
+        && tail_opens_with_orphan_tool_result(&verbatim_turns[index..])
+    {
+        index += 1;
+    }
+    index
+}
+
+/// Whether the first turn of `tail` carries a tool result whose matching tool
+/// call is absent from the retained tail (i.e. it lives in the head).
+fn tail_opens_with_orphan_tool_result(tail: &[&StoredTurn]) -> bool {
+    let Some((_, first_parts)) = tail.first() else {
+        return false;
+    };
+
+    let tail_call_ids: HashSet<&ToolCallId> = tail
+        .iter()
+        .flat_map(|(_, parts)| parts.iter())
+        .filter_map(|part| match &part.part {
+            Part::ToolCall { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+
+    first_parts.iter().any(|part| {
+        matches!(&part.part, Part::ToolResult { call_id, .. } if !tail_call_ids.contains(call_id))
+    })
 }
 
 /// Walk backwards from the most recent turn, accumulating an approximate
@@ -3057,6 +3097,239 @@ mod tests {
             boundary.tail_start_id,
             Some(message_ids[6].clone()),
             "compact_session should respect token-based tail expansion"
+        );
+    }
+
+    // --- CMP-16: split-turn handling at the compaction cut point ---
+
+    #[test]
+    fn select_tail_start_id_advances_past_orphaned_tool_result() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        // 0: user request
+        // 1: assistant issues a tool call
+        // 2: tool result for that call
+        // 3: assistant final text
+        let turns = vec![
+            ModelTurn::user_text("do the thing"),
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "provider-call-a".to_string(),
+                tool_call_id: Some(
+                    ToolCallId::try_new("019f2f6f-f178-7a72-9f28-0000000000a1").unwrap(),
+                ),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ModelTurn::tool_result("019f2f6f-f178-7a72-9f28-0000000000a1", "file contents"),
+            ModelTurn::assistant_text("all done"),
+        ];
+        let mut message_ids = Vec::new();
+        for turn in turns {
+            let message_id = new_message_id();
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let page = store.session_turns_chronological(&session_id).unwrap();
+
+        // tail_turns=2 naively lands the cut on turn 2 (the tool result), which
+        // would orphan the tool call in the summarized head. Split-turn handling
+        // must advance the cut to the next clean boundary (turn 3) so the
+        // in-progress call+result are folded into the head.
+        let config = CompactionConfig {
+            tail_turns: 2,
+            keep_recent_tokens: 0,
+        };
+        let tail_start = select_tail_start_id(&page, config);
+
+        assert_eq!(
+            tail_start,
+            Some(message_ids[3].clone()),
+            "cut must not leave an orphaned tool result at the head of the tail"
+        );
+    }
+
+    #[test]
+    fn replay_after_mid_sequence_cut_has_no_orphan_tool_result() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let call_id = "019f2f6f-f178-7a72-9f28-0000000000b2";
+        let turns = vec![
+            ModelTurn::user_text("kick off a long task"),
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "provider-call-b".to_string(),
+                tool_call_id: Some(ToolCallId::try_new(call_id).unwrap()),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ModelTurn::tool_result(call_id, "file contents"),
+            ModelTurn::assistant_text("done"),
+        ];
+        for turn in turns {
+            store.append_turn(&run_id, new_message_id(), turn).unwrap();
+        }
+
+        // tail_turns=2 alone would cut at the tool-result turn, orphaning the
+        // call. After compaction the projected replay window must stay valid.
+        let config = CompactionConfig {
+            tail_turns: 2,
+            keep_recent_tokens: 0,
+        };
+        store.compact_session(&session_id, config).unwrap();
+
+        let page = store.session_turns_chronological(&session_id).unwrap();
+        let replay = project_for_replay(&page, DEFAULT_TAIL_TURNS);
+
+        // Every tool result surviving into the replay window must have its
+        // originating tool call in the same window — required by strict
+        // dialects (e.g. Anthropic Messages).
+        let call_ids: HashSet<&ToolCallId> = replay
+            .iter()
+            .flat_map(|(_, parts)| parts)
+            .filter_map(|part| match part {
+                Part::ToolCall { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        let orphan = replay.iter().flat_map(|(_, parts)| parts).any(
+            |part| matches!(part, Part::ToolResult { call_id, .. } if !call_ids.contains(call_id)),
+        );
+
+        assert!(
+            !orphan,
+            "replay tail must not contain an orphaned tool result after a mid-sequence cut"
+        );
+    }
+
+    #[test]
+    fn select_tail_start_id_keeps_cut_at_tool_call_turn() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let call_id = "019f2f6f-f178-7a72-9f28-0000000000c3";
+        // 0: user, 1: assistant call, 2: result, 3: assistant call, 4: result.
+        let turns = vec![
+            ModelTurn::user_text("start"),
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "call-first".to_string(),
+                tool_call_id: Some(
+                    ToolCallId::try_new("019f2f6f-f178-7a72-9f28-0000000000c2").unwrap(),
+                ),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ModelTurn::tool_result("019f2f6f-f178-7a72-9f28-0000000000c2", "first"),
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "call-second".to_string(),
+                tool_call_id: Some(ToolCallId::try_new(call_id).unwrap()),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ModelTurn::tool_result(call_id, "second"),
+        ];
+        let mut message_ids = Vec::new();
+        for turn in turns {
+            let message_id = new_message_id();
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let page = store.session_turns_chronological(&session_id).unwrap();
+
+        // tail_turns=2 cuts at turn 3 (the tool *call*), whose result is the
+        // next tail turn. That is a clean boundary — the cut must stay put and
+        // not over-advance into the paired result.
+        let config = CompactionConfig {
+            tail_turns: 2,
+            keep_recent_tokens: 0,
+        };
+        let tail_start = select_tail_start_id(&page, config);
+
+        assert_eq!(
+            tail_start,
+            Some(message_ids[3].clone()),
+            "a cut landing on a tool-call turn is already a clean boundary"
+        );
+    }
+
+    #[test]
+    fn select_tail_start_id_advances_past_batched_tool_results() {
+        let store = SessionStore::default();
+        let session_id = session_id();
+        let run_id = run_id();
+
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+
+        let call_a = "019f2f6f-f178-7a72-9f28-0000000000d1";
+        let call_b = "019f2f6f-f178-7a72-9f28-0000000000d2";
+        // 0: user
+        // 1: assistant issues two parallel tool calls
+        // 2: result for call A
+        // 3: result for call B
+        // 4: assistant final text
+        let turns = vec![
+            ModelTurn::user_text("run two tools"),
+            ModelTurn::assistant_tool_calls(vec![
+                ToolCall {
+                    id: "provider-call-a".to_string(),
+                    tool_call_id: Some(ToolCallId::try_new(call_a).unwrap()),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+                ToolCall {
+                    id: "provider-call-b".to_string(),
+                    tool_call_id: Some(ToolCallId::try_new(call_b).unwrap()),
+                    name: "read".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            ]),
+            ModelTurn::tool_result(call_a, "a"),
+            ModelTurn::tool_result(call_b, "b"),
+            ModelTurn::assistant_text("both done"),
+        ];
+        let mut message_ids = Vec::new();
+        for turn in turns {
+            let message_id = new_message_id();
+            store
+                .append_turn(&run_id, message_id.clone(), turn)
+                .unwrap();
+            message_ids.push(message_id);
+        }
+
+        let page = store.session_turns_chronological(&session_id).unwrap();
+
+        // tail_turns=3 lands the cut on turn 2 (result A). Both result turns
+        // orphan calls in the head, so the cut must advance over *both* (the
+        // loop iterates more than once) to the clean boundary at turn 4.
+        let config = CompactionConfig {
+            tail_turns: 3,
+            keep_recent_tokens: 0,
+        };
+        let tail_start = select_tail_start_id(&page, config);
+
+        assert_eq!(
+            tail_start,
+            Some(message_ids[4].clone()),
+            "cut must advance past every leading orphaned tool-result turn"
         );
     }
 }
