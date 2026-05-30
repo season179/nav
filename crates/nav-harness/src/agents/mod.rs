@@ -25,7 +25,7 @@ use crate::models::{
 use crate::sessions::{
     CompactionConfig, ConfirmationDecision, ModelTurn, NewProviderPayload, PendingConfirmation,
     PendingConfirmationReceiver, PendingConfirmationRegistry, ProviderPayloadDirection,
-    SessionStore, ToolCall,
+    ProviderState, SessionStore, ToolCall,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
@@ -120,11 +120,16 @@ impl RunLoop {
                 }
                 project_model_turns_for_tool_result_pruning(&mut turns);
             }
+            let provider_state = match load_provider_state(journal, request.run_id) {
+                Ok(provider_state) => provider_state,
+                Err(error) => return RunLoopResult::Failed(error),
+            };
             let encoded = encode_request(
                 model.api,
                 &turns,
                 request.tool_registry,
                 request.tool_preset,
+                provider_state.as_ref(),
             );
             if let Some(journal) = journal {
                 if let Err(error) = self.journal_request_payload(
@@ -413,11 +418,15 @@ impl RunLoop {
                 created_at,
             },
         )?;
+        let provider_state = provider_state_for_output(model, run_id, output)?;
         let assistant_message_id = journal
             .store
             .lock()
             .unwrap()
-            .decode_and_append_provider_payload(&payload_id)
+            .decode_and_append_provider_payload_with_provider_state(
+                &payload_id,
+                provider_state.as_ref(),
+            )
             .map_err(persistence_error)?;
         Ok(JournaledProviderPayload {
             id: payload_id,
@@ -875,6 +884,22 @@ fn prune_stored_tool_results_for_encoding(
         .map_err(persistence_error)
 }
 
+fn load_provider_state(
+    journal: Option<ProviderJournal<'_>>,
+    run_id: &RunId,
+) -> Result<Option<ProviderState>, OpenAiCompletionsError> {
+    let Some(journal) = journal else {
+        return Ok(None);
+    };
+
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .get_provider_state(run_id)
+        .map_err(persistence_error)
+}
+
 fn append_tool_turns(
     journal: ProviderJournal<'_>,
     run_id: &RunId,
@@ -914,6 +939,32 @@ fn persisted_api_kind_name(api: crate::models::ApiKind) -> &'static str {
         crate::models::ApiKind::OpenAiResponses => "openai-responses",
         crate::models::ApiKind::AnthropicMessages => "anthropic-messages",
     }
+}
+
+fn provider_state_for_output(
+    model: &ResolvedModelConfig,
+    run_id: &RunId,
+    output: &ModelTurnOutput,
+) -> Result<Option<ProviderState>, OpenAiCompletionsError> {
+    if !matches!(model.api, ApiKind::OpenAiResponses) {
+        return Ok(None);
+    }
+
+    let Some(previous_response_id) = &output.provider_response_id else {
+        return Ok(None);
+    };
+    if previous_response_id.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let state_json =
+        serde_json::to_string(&json!({ "previous_response_id": previous_response_id }))
+            .map_err(json_error)?;
+    Ok(Some(ProviderState {
+        run_id: run_id.clone(),
+        api_kind: api_kind_name(model).to_string(),
+        state_json,
+    }))
 }
 
 fn provider_tool_call_value(tool_call: &ToolCall) -> Value {

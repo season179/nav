@@ -3,6 +3,7 @@ use nav_protocol::rpc::methods;
 pub const KNOWN_METHODS: &[&str] = &[
     methods::INITIALIZE,
     methods::SESSION_CREATE,
+    methods::SESSION_UPDATE_SETTINGS,
     methods::SESSION_SEND_MESSAGE,
     methods::SESSION_TOTALS,
     methods::RUN_CANCEL,
@@ -14,6 +15,7 @@ pub const KNOWN_METHODS: &[&str] = &[
 pub const ROUTED_METHODS: &[&str] = &[
     methods::INITIALIZE,
     methods::SESSION_CREATE,
+    methods::SESSION_UPDATE_SETTINGS,
     methods::SESSION_SEND_MESSAGE,
     methods::SESSION_TOTALS,
     methods::RUN_CANCEL,
