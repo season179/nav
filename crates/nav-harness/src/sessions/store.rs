@@ -739,6 +739,12 @@ impl SessionStore {
         self.decode_and_append_provider_payload_with_decoders(id, DEFAULT_PAYLOAD_DECODERS, None)
     }
 
+    /// Decode a journaled provider payload and persist provider state with it.
+    ///
+    /// Prefer this variant when the caller has provider-specific state to save,
+    /// such as an OpenAI Responses `previous_response_id`. `id` selects the
+    /// payload to decode, and `provider_state` is written in the same append
+    /// path used by the default payload decoders.
     pub fn decode_and_append_provider_payload_with_provider_state(
         &self,
         id: &ProviderPayloadId,

@@ -724,6 +724,13 @@ fn session_update_settings_switches_model_and_drops_provider_state() {
     wait_for_run_status(&server, &first_run_id, RunStatus::Completed);
     assert_eq!(responses_provider.request().path, "/v1/responses");
 
+    let first_store = SqliteSessionStore::open(db.path()).expect("store should reopen");
+    let first_state = first_store
+        .get_provider_state(&RunId::try_new(&first_run_id).unwrap())
+        .expect("provider state lookup should succeed")
+        .expect("first run should persist provider state before switching models");
+    assert_eq!(first_state.api_kind, "openai-responses");
+
     let update_response = server.handle_request(HttpRequest::post(
         "/rpc",
         json!({
@@ -755,7 +762,7 @@ fn session_update_settings_switches_model_and_drops_provider_state() {
     let store = SqliteSessionStore::open(db.path()).expect("store should reopen");
     assert!(
         store
-            .get_provider_state(&RunId::try_new(first_run_id).unwrap())
+            .get_provider_state(&RunId::try_new(&first_run_id).unwrap())
             .expect("provider state lookup should succeed")
             .is_none()
     );
