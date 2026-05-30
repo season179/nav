@@ -17,7 +17,8 @@ use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
 };
-use crate::guardrails::{GuardrailError, ToolCallContext, ToolCallContextParams};
+use crate::guardrails::step_budget::{StepBudget, StepBudgetError};
+use crate::guardrails::{DoomLoopGuard, GuardrailError, ToolCallContext, ToolCallContextParams};
 use crate::models::{
     ApiKind, DialectHttpRequest, EncodedRequest, OpenAiCompletionsCancellationToken,
     OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsRequest,
@@ -194,6 +195,9 @@ impl RunLoop {
         let mut payload_sequence = 0;
         let mut overflow_attempts = 0;
         let mut reload_store_turns = journal.is_some();
+        let mut step_budget = StepBudget::default();
+        let disabled_tool_registry = ToolRegistry::new();
+        let mut doom_loop_guard = DoomLoopGuard::default();
 
         loop {
             if reload_store_turns && let Some(journal) = journal {
@@ -207,15 +211,37 @@ impl RunLoop {
             {
                 return RunLoopResult::Failed(error);
             }
+
+            let step_decision = match step_budget.next_step() {
+                Ok(decision) => decision,
+                Err(error) => return RunLoopResult::Failed(step_budget_error(error)),
+            };
+            if let Some(message) = step_decision.synthetic_message() {
+                let message = message.clone();
+                turns.push(message.clone());
+                if let Some(journal) = journal {
+                    if let Err(error) = append_run_turns(journal, request.run_id, vec![message]) {
+                        return RunLoopResult::Failed(error);
+                    }
+                } else {
+                    new_turns.push(message);
+                }
+            }
+
             let turns_for_model = project_turns_for_encoding(&turns, model, journal.is_some());
             let provider_state = match load_provider_state(journal, request.run_id) {
                 Ok(provider_state) => provider_state,
                 Err(error) => return RunLoopResult::Failed(error),
             };
+            let step_tool_registry = if step_decision.tools_enabled() {
+                request.tool_registry
+            } else {
+                &disabled_tool_registry
+            };
             let encoded = encode_request(
                 model.api,
                 &turns_for_model,
-                request.tool_registry,
+                step_tool_registry,
                 request.tool_preset,
                 provider_state.as_ref(),
                 &ContextReminders::new(),
@@ -232,7 +258,7 @@ impl RunLoop {
                 }
                 payload_sequence += 1;
             }
-            let model_turn = match self.stream_turn(StreamTurnRequest {
+            let mut model_turn = match self.stream_turn(StreamTurnRequest {
                 runtime: &runtime,
                 model,
                 encoded: &encoded,
@@ -279,6 +305,9 @@ impl RunLoop {
                     return RunLoopResult::Failed(error);
                 }
             };
+            if !step_decision.tools_enabled() {
+                model_turn = text_only_final_step(model.api, model_turn);
+            }
 
             let revert_message_id = if let Some(journal) = journal {
                 let message_id = match self.journal_response_payload(
@@ -327,23 +356,26 @@ impl RunLoop {
             };
             let dispatch_context =
                 tool_context_with_revert_recorder(request.tool_context, journal, revert_message_id);
-            match dispatch_tool_calls(ToolDispatchRequest {
-                tool_calls: &tool_calls,
-                registry: request.tool_registry,
-                tool_preset: request.tool_preset,
-                context: &dispatch_context,
-                cancel: tool_cancel,
-                run_cancel: Some(request.cancellation_token.clone()),
-                pending_confirmations: request.pending_confirmations,
-                run_id: request.run_id,
-                ids,
-                emit: &mut emit,
-                base_metadata: &tool_dispatch_metadata,
-            }) {
+            match dispatch_guarded_tool_calls(
+                ToolDispatchRequest {
+                    tool_calls: &tool_calls,
+                    registry: request.tool_registry,
+                    tool_preset: request.tool_preset,
+                    context: &dispatch_context,
+                    cancel: tool_cancel,
+                    run_cancel: Some(request.cancellation_token.clone()),
+                    pending_confirmations: request.pending_confirmations,
+                    run_id: request.run_id,
+                    ids,
+                    emit: &mut emit,
+                    base_metadata: &tool_dispatch_metadata,
+                },
+                &mut doom_loop_guard,
+            ) {
                 ToolDispatchResult::Completed(tool_turns) => {
                     turns.extend(tool_turns.clone());
                     if let Some(journal) = journal {
-                        if let Err(error) = append_tool_turns(journal, request.run_id, tool_turns) {
+                        if let Err(error) = append_run_turns(journal, request.run_id, tool_turns) {
                             return RunLoopResult::Failed(error);
                         }
                     } else {
@@ -1158,7 +1190,7 @@ fn model_tool_call_ids(tool_call: &ToolCall) -> Vec<String> {
     ids
 }
 
-fn append_tool_turns(
+fn append_run_turns(
     journal: ProviderJournal<'_>,
     run_id: &RunId,
     turns: Vec<ModelTurn>,
@@ -1275,6 +1307,14 @@ fn payload_created_at(sequence: u32) -> i64 {
     unix_millis().saturating_add(i64::from(sequence))
 }
 
+fn step_budget_error(error: StepBudgetError) -> OpenAiCompletionsError {
+    match error {
+        StepBudgetError::Exhausted { max_steps } => OpenAiCompletionsError::MalformedResponse {
+            message: format!("step budget exhausted after {max_steps} steps"),
+        },
+    }
+}
+
 fn json_error(error: serde_json::Error) -> OpenAiCompletionsError {
     OpenAiCompletionsError::MalformedResponse {
         message: format!("failed to serialize provider payload: {error}"),
@@ -1336,6 +1376,75 @@ struct ModelTurnOutput {
     terminal_events: Vec<HarnessEventEnvelope>,
     response_payload: Value,
     provider_response_id: Option<String>,
+}
+
+fn text_only_final_step(api: ApiKind, mut output: ModelTurnOutput) -> ModelTurnOutput {
+    if output.tool_calls.is_empty() {
+        return output;
+    }
+
+    let text = output
+        .assistant_turn
+        .as_ref()
+        .map(ModelTurn::text_content)
+        .unwrap_or_default();
+    output.assistant_turn = (!text.is_empty()).then(|| ModelTurn::assistant_text(text.clone()));
+    output.tool_calls.clear();
+    output.response_payload = text_only_response_payload(api, output.response_payload, &text);
+    output
+}
+
+fn text_only_response_payload(api: ApiKind, mut payload: Value, text: &str) -> Value {
+    match api {
+        ApiKind::AnthropicMessages => remove_anthropic_tool_uses(&mut payload, text),
+        ApiKind::OpenAiResponses => remove_responses_function_calls(&mut payload),
+        ApiKind::OpenAiCompletions | ApiKind::ChatGptSubscription => {
+            remove_chat_completion_tool_calls(&mut payload, text)
+        }
+    }
+    payload
+}
+
+fn remove_anthropic_tool_uses(payload: &mut Value, text: &str) {
+    let Some(content) = payload.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    content.retain(|block| block.get("type").and_then(Value::as_str) != Some("tool_use"));
+    if content.is_empty() && !text.is_empty() {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("stop_reason".to_string(), json!("end_turn"));
+    }
+}
+
+fn remove_responses_function_calls(payload: &mut Value) {
+    let Some(output) = payload.get_mut("output").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    output.retain(|item| item.get("type").and_then(Value::as_str) != Some("function_call"));
+}
+
+fn remove_chat_completion_tool_calls(payload: &mut Value, text: &str) {
+    let Some(choices) = payload.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for choice in choices {
+        if choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls")
+            && let Some(object) = choice.as_object_mut()
+        {
+            object.insert("finish_reason".to_string(), json!("stop"));
+        }
+        let Some(message) = choice.get_mut("message").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        message.remove("tool_calls");
+        message.remove("function_call");
+        message.insert("content".to_string(), json!(text));
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1509,6 +1618,62 @@ fn split_run_completion_events(
 enum ToolDispatchResult {
     Completed(Vec<ModelTurn>),
     Cancelled,
+}
+
+fn dispatch_guarded_tool_calls<Ids, Emit>(
+    request: ToolDispatchRequest<'_, Ids, Emit>,
+    doom_loop_guard: &mut DoomLoopGuard,
+) -> ToolDispatchResult
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let ToolDispatchRequest {
+        tool_calls,
+        registry,
+        tool_preset,
+        context,
+        cancel,
+        run_cancel,
+        pending_confirmations,
+        run_id,
+        ids,
+        emit,
+        base_metadata,
+    } = request;
+    let mut turns = Vec::new();
+
+    for tool_call in tool_calls {
+        if let Ok(arguments) = serde_json::from_str::<Value>(&tool_call.arguments)
+            && let Err(error) = doom_loop_guard.observe_tool_call(&tool_call.name, &arguments)
+        {
+            let message = error.synthetic_message();
+            emit_tool_call_failed(ids, emit, run_id, tool_call, &message, base_metadata);
+            turns.push(ModelTurn::tool_result(&tool_call.id, message));
+            continue;
+        }
+
+        match dispatch_tool_calls(ToolDispatchRequest {
+            tool_calls: std::slice::from_ref(tool_call),
+            registry,
+            tool_preset,
+            context,
+            cancel: cancel.clone(),
+            run_cancel: run_cancel.clone(),
+            pending_confirmations,
+            run_id,
+            ids,
+            emit,
+            base_metadata,
+        }) {
+            ToolDispatchResult::Completed(mut tool_turns) => turns.append(&mut tool_turns),
+            ToolDispatchResult::Cancelled => {
+                return ToolDispatchResult::Cancelled;
+            }
+        }
+    }
+
+    ToolDispatchResult::Completed(turns)
 }
 
 struct ToolDispatchRequest<'a, Ids, Emit>
