@@ -397,3 +397,242 @@ fn anthropic_thinking_signature_round_trips() {
     );
     assert_eq!(thinking_block["signature"], "sig_01thinking");
 }
+
+// ---------------------------------------------------------------------------
+// cache_control breakpoints (plans/context-management.md §2.4)
+// ---------------------------------------------------------------------------
+
+fn tool(name: &str) -> AnthropicToolDefinition {
+    AnthropicToolDefinition {
+        name: name.to_string(),
+        description: format!("{name} tool"),
+        input_schema: serde_json::json!({ "type": "object" }),
+    }
+}
+
+fn ephemeral() -> serde_json::Value {
+    serde_json::json!({ "type": "ephemeral" })
+}
+
+#[test]
+fn cache_control_marks_only_the_last_tool_definition() {
+    let request = <AnthropicMessagesEncoder as Encoder>::encode(
+        &AnthropicMessagesEncoder::new().with_tools(vec![tool("bash"), tool("edit"), tool("read")]),
+        &[ModelTurn::user_text("hi")],
+    )
+    .expect("encoding should succeed");
+
+    let body = request.to_request_body();
+    let tools = body["tools"].as_array().expect("tools array");
+
+    assert_eq!(tools.len(), 3);
+    assert!(tools[0].get("cache_control").is_none());
+    assert!(tools[1].get("cache_control").is_none());
+    assert_eq!(tools[2]["cache_control"], ephemeral());
+}
+
+#[test]
+fn cache_control_marks_the_static_system_block_and_drops_boundary_markers() {
+    use nav_harness::context::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY as B;
+
+    let system = format!("STATIC{B}SEMI-STATIC{B}VOLATILE");
+    let request = AnthropicMessagesEncoder::new()
+        .with_system(system)
+        .encode(&[])
+        .expect("encoding should succeed");
+
+    let body = request.to_request_body();
+    let blocks = body["system"].as_array().expect("system array");
+
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "STATIC");
+    assert_eq!(blocks[0]["cache_control"], ephemeral());
+    assert_eq!(blocks[1]["text"], "SEMI-STATIC");
+    assert!(blocks[1].get("cache_control").is_none());
+    assert_eq!(blocks[2]["text"], "VOLATILE");
+    assert!(blocks[2].get("cache_control").is_none());
+
+    // The boundary sentinel must never reach the model.
+    assert!(!body.to_string().contains("DYNAMIC_BOUNDARY"));
+}
+
+/// `cache_control` on a message attaches to the last block of its `content`.
+fn message_cache_control(message: &serde_json::Value) -> Option<&serde_json::Value> {
+    message["content"]
+        .as_array()
+        .and_then(|content| content.last())
+        .and_then(|block| block.get("cache_control"))
+}
+
+#[test]
+fn cache_control_rolls_over_the_last_two_messages() {
+    let request = <AnthropicMessagesEncoder as Encoder>::encode(
+        &AnthropicMessagesEncoder::new(),
+        &[
+            ModelTurn::user_text("one"),
+            ModelTurn::assistant_text("two"),
+            ModelTurn::user_text("three"),
+        ],
+    )
+    .expect("encoding should succeed");
+
+    let body = request.to_request_body();
+    let messages = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(messages.len(), 3);
+    assert!(message_cache_control(&messages[0]).is_none());
+    assert_eq!(message_cache_control(&messages[1]), Some(&ephemeral()));
+    assert_eq!(message_cache_control(&messages[2]), Some(&ephemeral()));
+}
+
+#[test]
+fn cache_control_survives_a_turn_with_more_than_twenty_tool_result_blocks() {
+    // A single agentic turn can append far more than 20 tool-result blocks; the
+    // marker is message-level so it still lands on the message's last block.
+    let bulky: Vec<serde_json::Value> = (0..25)
+        .map(|i| {
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": format!("call-{i}"),
+                "content": "ok"
+            })
+        })
+        .collect();
+    let messages = vec![
+        serde_json::json!({ "role": "assistant", "content": [{ "type": "text", "text": "earlier" }] }),
+        serde_json::json!({ "role": "user", "content": bulky }),
+    ];
+
+    let body = nav_harness::models::AnthropicMessagesRequest::new(messages).to_request_body();
+    let messages = body["messages"].as_array().expect("messages array");
+
+    // Both the second-to-last and the last message carry the breakpoint, and on
+    // the last message it sits on the 25th (final) content block — not block 20.
+    assert_eq!(message_cache_control(&messages[0]), Some(&ephemeral()));
+    let last_content = messages[1]["content"].as_array().unwrap();
+    assert_eq!(last_content.len(), 25);
+    assert_eq!(last_content[24]["cache_control"], ephemeral());
+    assert!(
+        last_content[..24]
+            .iter()
+            .all(|block| block.get("cache_control").is_none())
+    );
+}
+
+#[test]
+fn subagent_fork_shifts_the_rolling_pair_one_message_earlier() {
+    // The fork's throwaway last message must stay out of the shared cache, so
+    // the pair lands on the two messages *before* the tail.
+    let request = <AnthropicMessagesEncoder as Encoder>::encode(
+        &AnthropicMessagesEncoder::new().subagent_fork(true),
+        &[
+            ModelTurn::user_text("one"),
+            ModelTurn::assistant_text("two"),
+            ModelTurn::user_text("three"),
+            ModelTurn::assistant_text("four"),
+        ],
+    )
+    .expect("encoding should succeed");
+
+    let body = request.to_request_body();
+    let messages = body["messages"].as_array().expect("messages array");
+
+    assert_eq!(messages.len(), 4);
+    assert!(message_cache_control(&messages[0]).is_none());
+    assert_eq!(message_cache_control(&messages[1]), Some(&ephemeral()));
+    assert_eq!(message_cache_control(&messages[2]), Some(&ephemeral()));
+    assert!(message_cache_control(&messages[3]).is_none());
+}
+
+fn count_cache_control(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            let here = usize::from(map.contains_key("cache_control"));
+            here + map.values().map(count_cache_control).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(count_cache_control).sum(),
+        _ => 0,
+    }
+}
+
+#[test]
+fn cache_control_uses_at_most_four_breakpoints() {
+    use nav_harness::context::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY as B;
+
+    // A full request — system (3 blocks), tools, and many messages — exercises
+    // every breakpoint: tools-end, static-system-end, and the rolling pair.
+    let request = <AnthropicMessagesEncoder as Encoder>::encode(
+        &AnthropicMessagesEncoder::new()
+            .with_system(format!("STATIC{B}SEMI{B}VOLATILE"))
+            .with_tools(vec![tool("bash"), tool("edit"), tool("read")]),
+        &[
+            ModelTurn::user_text("one"),
+            ModelTurn::assistant_text("two"),
+            ModelTurn::user_text("three"),
+            ModelTurn::assistant_text("four"),
+            ModelTurn::user_text("five"),
+        ],
+    )
+    .expect("encoding should succeed");
+
+    let body = request.to_request_body();
+
+    // Anthropic caps requests at 4 cache_control breakpoints.
+    assert_eq!(count_cache_control(&body), 4);
+}
+
+#[test]
+fn body_omits_tools_when_there_are_none() {
+    // An empty `tools: []` is noise; the body should omit the key entirely
+    // (matching the OpenAI completions request builder).
+    let request = AnthropicMessagesEncoder::new()
+        .encode(&[turn(
+            TurnRole::User,
+            1,
+            vec![Part::Text {
+                text: "hi".to_string(),
+                synthetic: None,
+            }],
+        )])
+        .expect("encoding should succeed");
+
+    let body = request.to_request_body();
+
+    assert!(body.get("tools").is_none());
+}
+
+#[test]
+fn body_omits_system_when_unset() {
+    let request = AnthropicMessagesEncoder::new()
+        .encode(&[turn(
+            TurnRole::User,
+            1,
+            vec![Part::Text {
+                text: "hi".to_string(),
+                synthetic: None,
+            }],
+        )])
+        .expect("encoding should succeed");
+
+    let body = request.to_request_body();
+
+    assert!(body.get("system").is_none());
+}
+
+#[test]
+fn cache_control_marks_a_system_prompt_with_no_boundary() {
+    // A system prompt that carries no boundary sentinel is wholly static, so the
+    // single block still gets the static-system-end breakpoint.
+    let request = AnthropicMessagesEncoder::new()
+        .with_system("All static.")
+        .encode(&[])
+        .expect("encoding should succeed");
+
+    let body = request.to_request_body();
+    let blocks = body["system"].as_array().expect("system array");
+
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["text"], "All static.");
+    assert_eq!(blocks[0]["cache_control"], ephemeral());
+}
