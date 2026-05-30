@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::Notify;
 
 use crate::sessions::{ModelTurn, ModelTurnRole, ToolCall};
-use crate::tools::{NavTool, ToolPreset, ToolRegistry};
+use crate::tools::{ToolPreset, ToolRegistry};
 
 use super::dialect::{ANTHROPIC_VERSION, AuthStyle, DialectHttpRequest};
 use super::{
@@ -70,11 +70,7 @@ impl OpenAiCompletionsRequest {
         preset: ToolPreset,
     ) -> Self {
         let mut request = Self::from_turns(turns);
-        request.tools = registry
-            .preset_tools(preset)
-            .into_iter()
-            .map(|tool| ChatCompletionToolDefinition::from_tool(tool.as_ref()))
-            .collect();
+        request.tools = super::encode::openai_tools_from_registry(registry, preset);
         request
     }
 }
@@ -84,16 +80,6 @@ pub struct ChatCompletionToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
-}
-
-impl ChatCompletionToolDefinition {
-    pub(crate) fn from_tool(tool: &dyn NavTool) -> Self {
-        Self {
-            name: tool.name().to_string(),
-            description: tool.description().to_string(),
-            parameters: tool.parameters(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
