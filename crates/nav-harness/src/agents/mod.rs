@@ -2,7 +2,7 @@
 
 pub mod auto_title;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +15,7 @@ use crate::compaction::breaker::{
 };
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
 use crate::compaction::summary::CompactionSummaryAgent;
-use crate::context::ContextReminders;
+use crate::context::{ContextBudget, ContextReminders, truncate_model_turns};
 use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
@@ -223,21 +223,28 @@ impl RunLoop {
         });
         let mut payload_sequence = 0;
         let mut overflow_attempts = 0;
+        let mut reload_store_turns = journal.is_some();
 
         loop {
-            if let Some(journal) = journal {
-                if let Err(error) = prune_stored_tool_results_for_encoding(journal) {
-                    return RunLoopResult::Failed(error);
-                }
-                project_model_turns_for_tool_result_pruning(&mut turns);
+            if reload_store_turns && let Some(journal) = journal {
+                turns = match turns_for_encoding(journal, model) {
+                    Ok(turns) => turns,
+                    Err(error) => return RunLoopResult::Failed(error),
+                };
+                reload_store_turns = false;
+            } else if let Some(journal) = journal
+                && let Err(error) = prune_stored_tool_results_for_encoding(journal)
+            {
+                return RunLoopResult::Failed(error);
             }
+            let turns_for_model = project_turns_for_encoding(&turns, model, journal.is_some());
             let provider_state = match load_provider_state(journal, request.run_id) {
                 Ok(provider_state) => provider_state,
                 Err(error) => return RunLoopResult::Failed(error),
             };
             let encoded = encode_request(
                 model.api,
-                &turns,
+                &turns_for_model,
                 request.tool_registry,
                 request.tool_preset,
                 provider_state.as_ref(),
@@ -288,6 +295,7 @@ impl RunLoop {
                         ) {
                             Ok(recovered_turns) => {
                                 turns = recovered_turns;
+                                reload_store_turns = true;
                                 continue;
                             }
                             Err(recovery_error) => return RunLoopResult::Failed(recovery_error),
@@ -1146,6 +1154,22 @@ fn prune_stored_tool_results_for_encoding(
         .map_err(persistence_error)
 }
 
+fn turns_for_encoding(
+    journal: ProviderJournal<'_>,
+    model: &ResolvedModelConfig,
+) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .try_turns_for_encoding(
+            journal.session_id,
+            model.api,
+            ContextBudget::from_model(&model.model, 0),
+        )
+        .map_err(persistence_error)
+}
+
 fn load_provider_state(
     journal: Option<ProviderJournal<'_>>,
     run_id: &RunId,
@@ -1160,6 +1184,158 @@ fn load_provider_state(
         .unwrap()
         .get_provider_state(run_id)
         .map_err(persistence_error)
+}
+
+fn project_turns_for_encoding(
+    turns: &[ModelTurn],
+    model: &ResolvedModelConfig,
+    store_backed: bool,
+) -> Vec<ModelTurn> {
+    let mut projected = turns.to_vec();
+    if store_backed {
+        project_model_turns_for_tool_result_pruning(&mut projected);
+    }
+    let truncated = truncate_model_turns(projected, ContextBudget::from_model(&model.model, 0));
+    degrade_unpaired_model_tool_activity(truncated)
+}
+
+fn degrade_unpaired_model_tool_activity(turns: Vec<ModelTurn>) -> Vec<ModelTurn> {
+    let paired_call_ids = paired_model_tool_call_ids(&turns);
+    let mut projected_turns = Vec::new();
+
+    for turn in turns {
+        let mut current_role = None;
+        let mut current_parts = Vec::with_capacity(turn.parts.len());
+        for part in turn.parts {
+            let (role, part) = project_model_tool_part(turn.role, part, &paired_call_ids);
+            push_projected_model_part(
+                &mut projected_turns,
+                &mut current_role,
+                &mut current_parts,
+                role,
+                part,
+            );
+        }
+        flush_projected_model_turn(&mut projected_turns, &mut current_role, &mut current_parts);
+    }
+
+    projected_turns
+}
+
+fn project_model_tool_part(
+    original_role: ModelTurnRole,
+    part: TurnPart,
+    paired_call_ids: &HashSet<String>,
+) -> (ModelTurnRole, TurnPart) {
+    match part {
+        TurnPart::Text { .. } => (text_projection_role(original_role), part),
+        TurnPart::ToolCall(tool_call) => {
+            if model_tool_call_ids(&tool_call)
+                .iter()
+                .any(|id| paired_call_ids.contains(id.as_str()))
+            {
+                (ModelTurnRole::Assistant, TurnPart::ToolCall(tool_call))
+            } else {
+                (
+                    ModelTurnRole::Assistant,
+                    TurnPart::Text {
+                        text: format!("[Tool call: {}({})]", tool_call.name, tool_call.arguments),
+                        synthetic: Some(true),
+                    },
+                )
+            }
+        }
+        TurnPart::ToolResult {
+            tool_call_id,
+            content,
+        } => {
+            if paired_call_ids.contains(tool_call_id.as_str()) {
+                (
+                    ModelTurnRole::Tool,
+                    TurnPart::ToolResult {
+                        tool_call_id,
+                        content,
+                    },
+                )
+            } else {
+                (
+                    ModelTurnRole::Assistant,
+                    TurnPart::Text {
+                        text: format!("[Tool result: {content}]"),
+                        synthetic: Some(true),
+                    },
+                )
+            }
+        }
+    }
+}
+
+fn text_projection_role(role: ModelTurnRole) -> ModelTurnRole {
+    if role == ModelTurnRole::Tool {
+        ModelTurnRole::Assistant
+    } else {
+        role
+    }
+}
+
+fn push_projected_model_part(
+    projected_turns: &mut Vec<ModelTurn>,
+    current_role: &mut Option<ModelTurnRole>,
+    current_parts: &mut Vec<TurnPart>,
+    role: ModelTurnRole,
+    part: TurnPart,
+) {
+    if current_role.is_some_and(|current| current != role) {
+        flush_projected_model_turn(projected_turns, current_role, current_parts);
+    }
+
+    *current_role = Some(role);
+    current_parts.push(part);
+}
+
+fn flush_projected_model_turn(
+    projected_turns: &mut Vec<ModelTurn>,
+    current_role: &mut Option<ModelTurnRole>,
+    current_parts: &mut Vec<TurnPart>,
+) {
+    let Some(role) = current_role.take() else {
+        return;
+    };
+    if current_parts.is_empty() {
+        return;
+    }
+
+    projected_turns.push(ModelTurn {
+        role,
+        parts: std::mem::take(current_parts),
+    });
+}
+
+fn paired_model_tool_call_ids(turns: &[ModelTurn]) -> HashSet<String> {
+    let mut call_ids = HashSet::new();
+    let mut result_ids = HashSet::new();
+
+    for part in turns.iter().flat_map(|turn| &turn.parts) {
+        match part {
+            TurnPart::ToolCall(tool_call) => {
+                call_ids.extend(model_tool_call_ids(tool_call));
+            }
+            TurnPart::ToolResult { tool_call_id, .. } => {
+                result_ids.insert(tool_call_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    call_ids.intersection(&result_ids).cloned().collect()
+}
+
+fn model_tool_call_ids(tool_call: &ToolCall) -> Vec<String> {
+    let mut ids = vec![tool_call.id.clone()];
+    if let Some(tool_call_id) = &tool_call.tool_call_id {
+        ids.push(tool_call_id.to_string());
+    }
+    ids
 }
 
 fn append_tool_turns(
@@ -2369,6 +2545,50 @@ mod tests {
             persisted_api_kind_name(crate::models::ApiKind::OpenAiResponses),
             "openai-responses"
         );
+    }
+
+    #[test]
+    fn model_tool_degrade_splits_mixed_tool_result_turns_by_role() {
+        let paired_id = NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000051").unwrap();
+        let orphan_id = NavToolCallId::try_new("019f2f6f-f178-7a72-9f28-000000000052").unwrap();
+        let turns = vec![
+            ModelTurn::assistant_tool_calls(vec![ToolCall {
+                id: "provider-call".to_string(),
+                tool_call_id: Some(paired_id.clone()),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+            }]),
+            ModelTurn {
+                role: ModelTurnRole::Tool,
+                parts: vec![
+                    TurnPart::ToolResult {
+                        tool_call_id: paired_id.to_string(),
+                        content: "paired output".to_string(),
+                    },
+                    TurnPart::ToolResult {
+                        tool_call_id: orphan_id.to_string(),
+                        content: "orphan output".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        let projected = degrade_unpaired_model_tool_activity(turns);
+
+        assert_eq!(projected.len(), 3);
+        assert_eq!(projected[0].role, ModelTurnRole::Assistant);
+        assert_eq!(projected[1].role, ModelTurnRole::Tool);
+        assert!(matches!(
+            projected[1].parts.as_slice(),
+            [TurnPart::ToolResult { tool_call_id, content }]
+                if tool_call_id == paired_id.as_str() && content == "paired output"
+        ));
+        assert_eq!(projected[2].role, ModelTurnRole::Assistant);
+        assert!(matches!(
+            projected[2].parts.as_slice(),
+            [TurnPart::Text { text, synthetic: Some(true) }]
+                if text.contains("orphan output")
+        ));
     }
 
     #[test]

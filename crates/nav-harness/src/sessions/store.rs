@@ -15,16 +15,19 @@ use serde_json::{Value, json};
 
 use crate::compaction::{
     COMPACTION_REPLAY_TEXT, COMPACTION_SUMMARY_PLACEHOLDER,
+    degrade::{DialectCaps, degrade_for_dialect},
     overflow::OVERFLOW_CONTINUATION_TEXT,
     prune::tool_result_part_ids_to_prune,
     replay::{DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_TAIL_TURNS, project_for_replay},
     summary::CompactionSummaryRequest,
     validate::{SummaryValidationError, validate_compaction_summary},
 };
+use crate::context::{ContextBudget, truncate};
 use crate::models::{
-    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ChatGptSubscriptionDecodeInput,
-    ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder, OpenAiChatCompletionsDecodeInput,
-    OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
+    AnthropicMessagesDecodeInput, AnthropicMessagesDecoder, ApiKind,
+    ChatGptSubscriptionDecodeInput, ChatGptSubscriptionDecoder, DecodedProviderPayload, Decoder,
+    OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder, OpenAiResponsesDecodeInput,
+    OpenAiResponsesDecoder,
 };
 use crate::workspace::snapshot::{WORKSPACE_SNAPSHOT_MIME, WorkspaceSnapshot};
 
@@ -733,6 +736,17 @@ impl SessionStore {
         Ok(model_turns_for_replay(&turns))
     }
 
+    pub fn try_turns_for_encoding(
+        &self,
+        session_id: &SessionId,
+        api_kind: ApiKind,
+        budget: ContextBudget,
+    ) -> Result<Vec<ModelTurn>, SqliteStoreError> {
+        self.prune_tool_results_for_session(session_id)?;
+        let page = self.session_turns_chronological(session_id)?;
+        Ok(model_turns_for_encoding(&page, api_kind, budget))
+    }
+
     pub fn provider_payload_recovery_report(
         &self,
     ) -> Result<PayloadRecoveryReport, SqliteStoreError> {
@@ -1326,6 +1340,22 @@ fn model_turn_from_projected_turn((turn, parts): (Turn, Vec<Part>)) -> Option<Mo
 
 fn model_turns_for_replay(turns: &[StoredTurn]) -> Vec<ModelTurn> {
     project_for_replay(turns, DEFAULT_TAIL_TURNS)
+        .into_iter()
+        .filter_map(model_turn_from_projected_turn)
+        .collect()
+}
+
+fn model_turns_for_encoding(
+    turns: &[StoredTurn],
+    api_kind: ApiKind,
+    budget: ContextBudget,
+) -> Vec<ModelTurn> {
+    let projected = project_for_replay(turns, DEFAULT_TAIL_TURNS);
+    let truncated = truncate(projected, budget);
+    let degraded = degrade_for_dialect(truncated, DialectCaps::for_api_kind(api_kind));
+
+    degraded
+        .turns
         .into_iter()
         .filter_map(model_turn_from_projected_turn)
         .collect()
