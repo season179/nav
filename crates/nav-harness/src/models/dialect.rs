@@ -5,10 +5,13 @@
 //! the HTTP endpoint to send it to, the wire body, and the auth style — so the
 //! loop never hardcodes a single dialect.
 
+use std::borrow::Cow;
+
 use reqwest::Url;
 use serde_json::{Map, Value, json};
 
 use crate::context::reminders::ContextReminders;
+use crate::context::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
 use crate::sessions::{ModelTurn, ProviderState};
 use crate::tools::{ToolPreset, ToolRegistry};
 
@@ -39,6 +42,14 @@ pub enum EncodedRequest {
 
 /// Encode canonical turns into the dialect selected by `api`.
 ///
+/// `system` is the assembled system prompt (rendered by `SystemPromptBuilder`):
+/// it is prepended as a leading `System`-role turn so each dialect's existing
+/// system handling carries it to the provider. The Anthropic dialect keeps the
+/// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] markers so its request serializer can split
+/// the prompt into cache-stable blocks (plans/context-management.md §2.4); the
+/// OpenAI dialects have no such splitter, so the markers are stripped to plain
+/// text there.
+///
 /// `reminders` are injected as a `<system-reminder>` block in the last user
 /// message of the Anthropic dialect (plans/context-management.md §2.3); the
 /// OpenAI dialects do not carry the cache-stable system/message split this
@@ -50,25 +61,56 @@ pub fn encode_request(
     tool_preset: ToolPreset,
     provider_state: Option<&ProviderState>,
     reminders: &ContextReminders,
+    system: Option<&str>,
 ) -> EncodedRequest {
     match api {
         ApiKind::OpenAiResponses => {
+            let turns = turns_with_system(turns, system, false);
             let encoder =
                 OpenAiResponsesEncoder::new().with_provider_state(provider_state.cloned());
-            EncodedRequest::Responses(infallible(Encoder::encode(&encoder, turns)))
+            EncodedRequest::Responses(infallible(Encoder::encode(&encoder, turns.as_ref())))
         }
         ApiKind::AnthropicMessages => {
+            let turns = turns_with_system(turns, system, true);
             let encoder = AnthropicMessagesEncoder::new()
                 .with_tool_registry(tool_registry, tool_preset)
                 .with_reminders(reminders.clone());
-            EncodedRequest::Anthropic(infallible(Encoder::encode(&encoder, turns)))
+            EncodedRequest::Anthropic(infallible(Encoder::encode(&encoder, turns.as_ref())))
         }
         // Chat Completions and (for now) ChatGPT subscription both encode as
         // Chat Completions.
         ApiKind::OpenAiCompletions | ApiKind::ChatGptSubscription => {
+            let turns = turns_with_system(turns, system, false);
             let encoder =
                 OpenAiChatCompletionsEncoder::new().with_tool_registry(tool_registry, tool_preset);
-            EncodedRequest::Completions(infallible(Encoder::encode(&encoder, turns)))
+            EncodedRequest::Completions(infallible(Encoder::encode(&encoder, turns.as_ref())))
+        }
+    }
+}
+
+/// Prepend the assembled system prompt as a leading `System`-role turn.
+///
+/// Returns the turns borrowed unchanged when there is no system prompt. When
+/// `keep_boundary` is false the [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`] markers are
+/// removed (the OpenAI dialects send the prompt as a single instruction/system
+/// message and never split on the markers, so they must not leak to the model).
+fn turns_with_system<'a>(
+    turns: &'a [ModelTurn],
+    system: Option<&str>,
+    keep_boundary: bool,
+) -> Cow<'a, [ModelTurn]> {
+    match system.filter(|prompt| !prompt.is_empty()) {
+        None => Cow::Borrowed(turns),
+        Some(prompt) => {
+            let text = if keep_boundary {
+                prompt.to_owned()
+            } else {
+                prompt.replace(SYSTEM_PROMPT_DYNAMIC_BOUNDARY, "")
+            };
+            let mut combined = Vec::with_capacity(turns.len() + 1);
+            combined.push(ModelTurn::system_text(text));
+            combined.extend_from_slice(turns);
+            Cow::Owned(combined)
         }
     }
 }
@@ -373,6 +415,7 @@ mod tests {
             ToolPreset::Coding,
             None,
             &ContextReminders::new(),
+            None,
         );
         assert!(matches!(encoded, EncodedRequest::Anthropic(_)));
     }
@@ -387,6 +430,7 @@ mod tests {
             ToolPreset::Coding,
             None,
             &ContextReminders::new().plan_mode(true),
+            None,
         );
         let EncodedRequest::Anthropic(request) = encoded else {
             panic!("expected an Anthropic request");
@@ -411,6 +455,7 @@ mod tests {
             ToolPreset::Coding,
             None,
             &ContextReminders::new(),
+            None,
         );
         assert!(matches!(encoded, EncodedRequest::Responses(_)));
     }
@@ -425,6 +470,7 @@ mod tests {
             ToolPreset::Coding,
             None,
             &ContextReminders::new(),
+            None,
         );
         assert!(matches!(encoded, EncodedRequest::Completions(_)));
     }
@@ -439,6 +485,7 @@ mod tests {
             ToolPreset::Coding,
             None,
             &ContextReminders::new(),
+            None,
         );
         assert!(matches!(encoded, EncodedRequest::Completions(_)));
     }

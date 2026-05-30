@@ -78,6 +78,21 @@ impl SkillRegistry {
         Self::with_scanner(StdSkillScanner { root: root.into() })
     }
 
+    /// Discover skills across several roots, merging the results and
+    /// de-duplicating by `(name, path)`. Used to assemble the full skill listing
+    /// for the system prompt from the configured and workspace-local roots,
+    /// keeping the `(name, path)` ordering stable so the cached prefix never
+    /// churns.
+    pub fn discover_all(roots: &[PathBuf]) -> Self {
+        let mut skills: Vec<Skill> = roots
+            .iter()
+            .flat_map(|root| Self::discover(root).skills)
+            .collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+        skills.dedup_by(|a, b| a.name == b.name && a.path == b.path);
+        Self { skills }
+    }
+
     /// Build a registry from a scanner, parsing and sorting discovered skills.
     pub fn with_scanner(scanner: impl SkillScanner) -> Self {
         let mut skills: Vec<Skill> = scanner
@@ -321,6 +336,39 @@ mod tests {
         assert_eq!(registry.skills()[0].path, commit.join("SKILL.md"));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn discover_all_merges_roots_and_dedups_by_name_and_path() {
+        let base =
+            std::env::temp_dir().join(format!("nav-skills-discover-all-{}", std::process::id()));
+        let root_a = base.join("a");
+        let root_b = base.join("b");
+        // `commit` lives under root_a; `review` under root_b.
+        for (root, name, desc) in [
+            (&root_a, "commit", "Make a commit."),
+            (&root_b, "review", "Review the diff."),
+        ] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\n---\nbody"),
+            )
+            .unwrap();
+        }
+        // The same root passed twice must not duplicate its skills.
+        let registry = SkillRegistry::discover_all(&[
+            root_a.clone(),
+            root_b.clone(),
+            root_a.clone(),
+            base.join("missing"),
+        ]);
+
+        let names: Vec<&str> = registry.skills().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["commit", "review"]);
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

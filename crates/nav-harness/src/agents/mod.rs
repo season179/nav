@@ -3,7 +3,7 @@
 pub mod auto_title;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -17,8 +17,10 @@ use crate::compaction::breaker::{
 };
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
 use crate::compaction::summary::{CompactionSummaryAgent, CompactionSummaryRequest};
+use crate::context::files::ContextFileCache;
+use crate::context::system_prompt::{SystemClock, SystemCwd, SystemPromptBuilder};
 use crate::context::{
-    ContextBudget, ContextReminders, DEFAULT_COMPLETION_BUFFER_TOKENS,
+    ContextBudget, ContextReminders, DEFAULT_COMPLETION_BUFFER_TOKENS, estimate_text_tokens,
     estimate_tokens_for_model_turns, truncate_model_turns,
 };
 use crate::events::{
@@ -297,6 +299,41 @@ fn skill_roots_for_request(
     roots
 }
 
+/// Assemble the session system prompt once at run start: the static identity
+/// block, the semi-static environment / tool / skill listing, and the volatile
+/// date plus project conventions (CLAUDE.md/AGENTS.md). Returns the rendered
+/// three-block prompt, with [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`](crate::context::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+/// markers intact so the dialect encoder can place its cache breakpoints.
+///
+/// Built a single time per run: CLAUDE.md/AGENTS.md flow through
+/// [`ContextFileCache`] so mid-session edits never churn the cached prefix
+/// (plans/context-management.md §2.1).
+fn assemble_system_prompt(tool_registry: &ToolRegistry, workspace_root: Option<&Path>) -> String {
+    let clock = SystemClock;
+    let cwd = SystemCwd;
+
+    let skill_roots = skill_roots_for_request(
+        &default_skill_roots(),
+        workspace_root.map(Path::to_path_buf).as_ref(),
+    );
+    let skills = SkillRegistry::discover_all(&skill_roots);
+
+    let conventions = workspace_root
+        .map(|root| {
+            let mut cache = ContextFileCache::new(root.to_path_buf());
+            cache.load().to_string()
+        })
+        .unwrap_or_default();
+
+    // The builder omits empty skills/conventions sections itself, so pass them
+    // unconditionally rather than re-guarding here.
+    SystemPromptBuilder::new(&clock, &cwd)
+        .tools(tool_registry)
+        .skills(&skills)
+        .conventions(&conventions)
+        .render()
+}
+
 fn latest_user_query(turns: &[ModelTurn]) -> Option<String> {
     turns
         .iter()
@@ -495,9 +532,23 @@ impl RunLoop {
         let disabled_tool_registry = ToolRegistry::new();
         let mut doom_loop_guard = DoomLoopGuard::default();
 
+        // Assemble the system prompt once at run start and send it with every
+        // request (issue #524). The full tool registry — not the per-step,
+        // possibly-disabled one — keeps the cached prefix stable across steps.
+        let workspace_root = request
+            .tool_context
+            .path_policy()
+            .map(|policy| policy.workspace_root().to_path_buf());
+        let system_prompt =
+            assemble_system_prompt(request.tool_registry, workspace_root.as_deref());
+        // The assembled prompt is a cache-stable prefix that the budget checks
+        // must account for: skills + conventions can be large, so ignoring it
+        // would let an "in-budget" request overflow the provider window (#524).
+        let system_prompt_tokens = estimate_text_tokens(&system_prompt);
+
         loop {
             let mut should_project_pruned_tool_results =
-                journal.is_some() && should_prune_for_budget(model, &turns);
+                journal.is_some() && should_prune_for_budget(model, &turns, system_prompt_tokens);
             if let Some(journal) = journal
                 && should_project_pruned_tool_results
             {
@@ -508,7 +559,7 @@ impl RunLoop {
             }
             if let Some(journal) = journal
                 && !proactive_compaction_attempted
-                && should_compact_for_budget(model, &turns)
+                && should_compact_for_budget(model, &turns, system_prompt_tokens)
             {
                 proactive_compaction_attempted = true;
                 let tokens_before_compaction = estimate_model_turn_tokens(&turns);
@@ -551,7 +602,7 @@ impl RunLoop {
 
             if let Some(journal) = journal
                 && !proactive_compaction_attempted
-                && should_compact_for_budget(model, &turns)
+                && should_compact_for_budget(model, &turns, system_prompt_tokens)
             {
                 proactive_compaction_attempted = true;
                 let tokens_before_compaction = estimate_model_turn_tokens(&turns);
@@ -571,7 +622,8 @@ impl RunLoop {
             }
 
             should_project_pruned_tool_results = should_project_pruned_tool_results
-                || (journal.is_some() && should_prune_for_budget(model, &turns));
+                || (journal.is_some()
+                    && should_prune_for_budget(model, &turns, system_prompt_tokens));
             let mut turns_for_model =
                 project_turns_for_encoding(&turns, model, should_project_pruned_tool_results);
             apply_prefetched_turn_context(
@@ -594,6 +646,7 @@ impl RunLoop {
                 request.tool_preset,
                 provider_state.as_ref(),
                 &ContextReminders::new(),
+                Some(system_prompt.as_str()),
             );
             if let Some(journal) = journal {
                 if let Err(error) = self.journal_request_payload(
@@ -1601,20 +1654,28 @@ fn prune_stored_tool_results_for_encoding(
         .map_err(persistence_error)
 }
 
-fn should_prune_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -> bool {
-    let budget = ContextBudget::from_model(&model.model, 0);
-    let active_tokens = estimate_tokens_for_model_turns(turns);
+fn should_prune_for_budget(
+    model: &ResolvedModelConfig,
+    turns: &[ModelTurn],
+    prefix_tokens: u64,
+) -> bool {
+    let budget = ContextBudget::from_model(&model.model, prefix_tokens);
+    let active_tokens = prefix_tokens + estimate_tokens_for_model_turns(turns);
     budget.body_after_prefix(active_tokens) > budget.prune_threshold()
 }
 
-fn should_compact_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -> bool {
-    let budget = ContextBudget::from_model(&model.model, 0);
+fn should_compact_for_budget(
+    model: &ResolvedModelConfig,
+    turns: &[ModelTurn],
+    prefix_tokens: u64,
+) -> bool {
+    let budget = ContextBudget::from_model(&model.model, prefix_tokens);
     let completion_buffer = model
         .model
         .max_tokens
         .map(u64::from)
         .unwrap_or(DEFAULT_COMPLETION_BUFFER_TOKENS);
-    let active_tokens = estimate_tokens_for_model_turns(turns);
+    let active_tokens = prefix_tokens + estimate_tokens_for_model_turns(turns);
     let threshold = budget.usable_threshold(completion_buffer);
     threshold > 0 && budget.body_after_prefix(active_tokens) >= threshold
 }
