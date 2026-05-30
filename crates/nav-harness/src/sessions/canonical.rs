@@ -70,6 +70,16 @@ impl ModelTurn {
         Self::text(ModelTurnRole::Assistant, text)
     }
 
+    pub fn assistant_synthetic_text(text: impl Into<String>) -> Self {
+        Self::with_parts(
+            ModelTurnRole::Assistant,
+            vec![TurnPart::Text {
+                text: text.into(),
+                synthetic: Some(true),
+            }],
+        )
+    }
+
     pub fn system_text(text: impl Into<String>) -> Self {
         Self::text(ModelTurnRole::System, text)
     }
@@ -85,7 +95,10 @@ impl ModelTurn {
         text: impl Into<String>,
         tool_calls: Vec<ToolCall>,
     ) -> Self {
-        let mut parts = vec![TurnPart::Text(text.into())];
+        let mut parts = vec![TurnPart::Text {
+            text: text.into(),
+            synthetic: None,
+        }];
         parts.extend(tool_calls.into_iter().map(TurnPart::ToolCall));
         Self::with_parts(ModelTurnRole::Assistant, parts)
     }
@@ -126,7 +139,13 @@ impl ModelTurn {
     }
 
     fn text(role: ModelTurnRole, text: impl Into<String>) -> Self {
-        Self::with_parts(role, vec![TurnPart::Text(text.into())])
+        Self::with_parts(
+            role,
+            vec![TurnPart::Text {
+                text: text.into(),
+                synthetic: None,
+            }],
+        )
     }
 
     fn with_parts(role: ModelTurnRole, parts: Vec<TurnPart>) -> Self {
@@ -508,7 +527,10 @@ pub enum ImageSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnPart {
-    Text(String),
+    Text {
+        text: String,
+        synthetic: Option<bool>,
+    },
     ToolCall(ToolCall),
     ToolResult {
         tool_call_id: String,
@@ -519,7 +541,7 @@ pub enum TurnPart {
 impl TurnPart {
     fn text(&self) -> Option<&str> {
         match self {
-            Self::Text(text) => Some(text),
+            Self::Text { text, .. } => Some(text),
             Self::ToolCall(_) => None,
             Self::ToolResult { content, .. } => Some(content),
         }

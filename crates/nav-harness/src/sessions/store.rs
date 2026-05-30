@@ -1032,9 +1032,9 @@ fn model_part(
     tool_call_ids: &mut HashMap<String, ToolCallId>,
 ) -> Part {
     match part {
-        TurnPart::Text(text) => Part::Text {
+        TurnPart::Text { text, synthetic } => Part::Text {
             text: text.clone(),
-            synthetic: None,
+            synthetic: *synthetic,
         },
         TurnPart::ToolCall(tool_call) => {
             let id = tool_call
@@ -1434,7 +1434,7 @@ fn turn_role_name(role: TurnRole) -> &'static str {
 
 fn model_part_from_projected_part(part: Part) -> Option<TurnPart> {
     match part {
-        Part::Text { text, .. } => Some(TurnPart::Text(text)),
+        Part::Text { text, synthetic } => Some(TurnPart::Text { text, synthetic }),
         Part::ToolCall {
             id,
             name,
@@ -1452,7 +1452,10 @@ fn model_part_from_projected_part(part: Part) -> Option<TurnPart> {
             tool_call_id: call_id.to_string(),
             content,
         }),
-        Part::Compaction { .. } => Some(TurnPart::Text(COMPACTION_REPLAY_TEXT.to_string())),
+        Part::Compaction { .. } => Some(TurnPart::Text {
+            text: COMPACTION_REPLAY_TEXT.to_string(),
+            synthetic: Some(true),
+        }),
         _ => None,
     }
 }

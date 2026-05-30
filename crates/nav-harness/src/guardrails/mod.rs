@@ -12,6 +12,8 @@
 //! to the model, so first-party hooks can redact or normalize results at one
 //! boundary.
 
+pub mod step_budget;
+
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;

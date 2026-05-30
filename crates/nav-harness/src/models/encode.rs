@@ -667,7 +667,9 @@ fn encode_subscription_model_turn(turn: &ModelTurn) -> Vec<ChatGptSubscriptionIt
     let mut content = Vec::new();
     for part in &turn.parts {
         match part {
-            TurnPart::Text(text) => content.push(subscription_text_content_for_role(role, text)),
+            TurnPart::Text { text, .. } => {
+                content.push(subscription_text_content_for_role(role, text))
+            }
             TurnPart::ToolCall(tool_call) => {
                 push_subscription_message(&mut items, None, role, &mut content);
                 items.push(ChatGptSubscriptionItem::ToolCall(
@@ -939,7 +941,7 @@ fn encode_responses_model_turn(turn: &ModelTurn) -> Vec<Value> {
         .parts
         .iter()
         .filter_map(|part| match part {
-            TurnPart::Text(text) => Some(text.as_str()),
+            TurnPart::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -966,7 +968,7 @@ fn encode_responses_model_turn(turn: &ModelTurn) -> Vec<Value> {
                 tool_call_id,
                 content,
             } => input.push(responses_function_call_output_item(tool_call_id, content)),
-            TurnPart::Text(_) => {}
+            TurnPart::Text { .. } => {}
         }
     }
 
@@ -1042,8 +1044,8 @@ fn anthropic_model_message(turn: &ModelTurn) -> Option<Value> {
 
 fn anthropic_model_content_block(part: &TurnPart) -> Option<Value> {
     match part {
-        TurnPart::Text(text) if !text.is_empty() => Some(anthropic_text_block(text)),
-        TurnPart::Text(_) => None,
+        TurnPart::Text { text, .. } if !text.is_empty() => Some(anthropic_text_block(text)),
+        TurnPart::Text { .. } => None,
         TurnPart::ToolCall(tool_call) => Some(json!({
             "type": "tool_use",
             "id": model_tool_call_id(tool_call),
