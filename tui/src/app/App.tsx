@@ -1,5 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react';
-import {Box, Text, useApp, useInput} from 'ink';
+import {Box, useApp, useInput} from 'ink';
 import {useTerminalSize} from './use-terminal-size.js';
 import {
 	COMPOSER_HEIGHT,
@@ -54,18 +54,6 @@ export type AppBackendClient = {
 
 const IDLE_HINT = 'Enter send · /model · /exit · Esc clear · Ctrl+C quit';
 
-function formatCost(cost: number): string {
-	if (cost < 0.01) return `$${cost.toFixed(4)}`;
-	if (cost < 1) return `$${cost.toFixed(3)}`;
-	return `$${cost.toFixed(2)}`;
-}
-
-function formatTokens(count: number): string {
-	if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
-	if (count >= 1_000) return `${(count / 1_000).toFixed(1)}K`;
-	return String(count);
-}
-
 export function App({backendPath = '', backendClient}: Props) {
 	const {exit} = useApp();
 	const {columns, rows} = useTerminalSize();
@@ -109,7 +97,7 @@ export function App({backendPath = '', backendClient}: Props) {
 		},
 	);
 
-	const historyHeight = Math.max(1, rows - COMPOSER_HEIGHT - (sessionTotals ? 1 : 0));
+	const historyHeight = Math.max(1, rows - COMPOSER_HEIGHT);
 
 	return (
 		<Box flexDirection="column" width={columns} height={rows}>
@@ -121,34 +109,13 @@ export function App({backendPath = '', backendClient}: Props) {
 			>
 				{renderMainRegion()}
 			</Box>
-			{sessionTotals && (
-				<Box
-					width={columns}
-					height={1}
-					flexShrink={0}
-					borderStyle="single"
-					borderBottom={false}
-					borderLeft={false}
-					borderRight={false}
-					borderTop={true}
-					justifyContent="space-between"
-					paddingX={1}
-				>
-					<Box>
-						<Text color="yellow">Cost: {formatCost(sessionTotals.cost)}</Text>
-					</Box>
-					<Box gap={2}>
-						<Text color="cyan">In: {formatTokens(sessionTotals.tokensInput)}</Text>
-						<Text color="green">Out: {formatTokens(sessionTotals.tokensOutput)}</Text>
-					</Box>
-				</Box>
-			)}
 			<ComposerRegion
 				value={input}
 				busy={busy}
 				hint={hint}
 				width={columns}
 				focused={!modelPickerOpen && !approvalRequest}
+				sessionTotals={sessionTotals}
 				onChange={setInput}
 				onSubmit={submitted => {
 					void handleSubmit(submitted);
@@ -606,17 +573,7 @@ function appendTextPartDelta(
 			contentVersion: nextContentVersion(placeholder),
 			text: delta,
 		};
-		if (placeholderIndex < messages.length - 1) {
-			return [
-				...messages.slice(0, placeholderIndex),
-				...messages.slice(placeholderIndex + 1),
-				updatedPlaceholder,
-			];
-		}
-
-		return messages.map((entry, entryIndex) =>
-			entryIndex === placeholderIndex ? updatedPlaceholder : entry,
-		);
+		return replaceFloatingToEnd(messages, placeholderIndex, updatedPlaceholder);
 	}
 
 	return [
@@ -661,22 +618,31 @@ function updateAssistantText(
 		contentVersion: nextContentVersion(assistant),
 		text: updateText(assistant.text),
 	};
-	// The live backend emits each turn's text before that turn's tool calls, and
-	// every turn of a run accumulates into this one cell. Whenever fresh text
-	// arrives while tool calls (or other cells) already sit after it, float the
-	// cell to the end so the latest assistant prose — including the final answer
-	// — renders chronologically below the tools it followed, rather than staying
-	// anchored above them. Text never touched again keeps its place.
+	return replaceFloatingToEnd(messages, index, updatedAssistant);
+}
+
+// Replace the cell at `index` with `updated`. The live backend emits each turn's
+// text before that turn's tool calls, and every turn of a run accumulates into
+// one assistant cell. Whenever fresh text arrives while tool calls (or other
+// cells) already sit after it, float the cell to the end so the latest assistant
+// prose — including the final answer — renders chronologically below the tools
+// it followed, rather than staying anchored above them. A cell that is already
+// last keeps its place.
+function replaceFloatingToEnd(
+	messages: HistoryMessage[],
+	index: number,
+	updated: HistoryMessage,
+): HistoryMessage[] {
 	if (index < messages.length - 1) {
 		return [
 			...messages.slice(0, index),
 			...messages.slice(index + 1),
-			updatedAssistant,
+			updated,
 		];
 	}
 
 	return messages.map((entry, entryIndex) =>
-		entryIndex === index ? updatedAssistant : entry,
+		entryIndex === index ? updated : entry,
 	);
 }
 

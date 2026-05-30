@@ -8,4 +8,6 @@ export const theme = {
 	userMessageBackground: '#073642', // base02 — highlighted message panel
 	error: '#dc322f', // red
 	success: '#859900', // green
+	warning: '#b58900', // yellow
+	info: '#2aa198', // cyan
 } as const;
