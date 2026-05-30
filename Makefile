@@ -8,7 +8,7 @@ test:
 	cd tui && bun run typecheck
 
 run-tui:
-	cd tui && bun run start
+	NAV_WORKSPACE=$(CURDIR) sh -c 'cd tui && bun run start'
 
 run-backend:
 	cargo run -p nav-backend -- serve-http

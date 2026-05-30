@@ -285,7 +285,10 @@ export class NavBackendClient {
 		}
 
 		await this.startBackend();
-		const cwd = process.cwd();
+		// navd launches the TUI with cwd=tui/ (so bun finds package.json) but
+		// forwards the user's real invocation directory in NAV_WORKSPACE. Prefer
+		// it so the backend roots the session at the actual project, not tui/.
+		const cwd = process.env.NAV_WORKSPACE?.trim() || process.cwd();
 		const params: SessionCreateParams = {
 			cwd,
 			source: 'tui',

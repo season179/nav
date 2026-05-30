@@ -57,12 +57,25 @@ func runLocalNav(root string, args []string) error {
 		return fmt.Errorf("ink tui not found at %s", tuiDir)
 	}
 
+	// Capture the directory the user invoked navd from before we point bun at
+	// tuiDir. cmd.Dir only changes the child process, so os.Getwd() here is the
+	// real invocation cwd — the workspace the user expects nav to operate on.
+	// Without this, the TUI would fall back to process.cwd() (= tuiDir) and jail
+	// the backend to tui/ instead of the actual project root.
+	workspace, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("navd cannot determine the working directory: %w", err)
+	}
+
 	cmdArgs := []string{"run", "start"}
 	cmdArgs = append(cmdArgs, args...)
 
 	cmd := exec.Command("bun", cmdArgs...)
 	cmd.Dir = tuiDir
-	cmd.Env = append(os.Environ(), "NAV_BACKEND="+backendPath)
+	cmd.Env = append(os.Environ(),
+		"NAV_BACKEND="+backendPath,
+		"NAV_WORKSPACE="+workspace,
+	)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -146,7 +159,7 @@ func update(args []string) error {
 		},
 		{
 			name: "tui dependencies",
-			cmd: bunInstall,
+			cmd:  bunInstall,
 		},
 		{
 			name: "navd launcher",
