@@ -1,4 +1,4 @@
-use nav_types::{ApprovalId, MessageId, RequestId, RunId, SessionId};
+use nav_types::{ApprovalId, MessageId, PartId, RequestId, RunId, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -7,6 +7,7 @@ pub mod methods {
     pub const SESSION_CREATE: &str = "session.create";
     pub const SESSION_UPDATE_SETTINGS: &str = "session.updateSettings";
     pub const SESSION_SEND_MESSAGE: &str = "session.sendMessage";
+    pub const SESSION_SEARCH: &str = "session.search";
     pub const SESSION_TOTALS: &str = "session.totals";
     pub const RUN_CANCEL: &str = "run.cancel";
     pub const TOOL_APPROVE: &str = "tool.approve";
@@ -176,6 +177,63 @@ pub struct SessionSendMessageResult {
     pub message_id: MessageId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchIndex {
+    Unicode,
+    #[default]
+    Trigram,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchParams {
+    pub query: String,
+    #[serde(default = "default_session_search_limit")]
+    pub limit: usize,
+    #[serde(default = "default_session_search_surrounding_turns")]
+    pub surrounding_turns: usize,
+    #[serde(default)]
+    pub index: SessionSearchIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchResult {
+    pub hits: Vec<SessionSearchHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchHit {
+    pub session_id: SessionId,
+    pub turn_id: MessageId,
+    pub part_id: PartId,
+    pub rank: f64,
+    pub text: String,
+    pub anchored_turns: Vec<SessionSearchTurn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchTurn {
+    pub turn_id: MessageId,
+    pub run_id: RunId,
+    pub role: String,
+    pub created_at: i64,
+    pub parts: Vec<SessionSearchTurnPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchTurnPart {
+    pub part_id: PartId,
+    pub part_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunCancelParams {
@@ -239,4 +297,12 @@ pub struct SessionCloseParams {
 #[serde(rename_all = "camelCase")]
 pub struct SettingsReloadResult {
     pub success: bool,
+}
+
+fn default_session_search_limit() -> usize {
+    20
+}
+
+fn default_session_search_surrounding_turns() -> usize {
+    2
 }

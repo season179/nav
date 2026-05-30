@@ -11,7 +11,7 @@ use nav_harness::models::{
     ProviderConfig,
 };
 use nav_harness::sessions::{
-    Part, PendingConfirmation, RevertInfo, SessionStore, SqliteSessionStore,
+    ModelTurn, Part, PendingConfirmation, RevertInfo, SessionStore, SqliteSessionStore,
 };
 use nav_harness::tools::{ToolRegistry, bash};
 use nav_protocol::rpc::{SessionSource, ToolsPreset};
@@ -59,6 +59,101 @@ fn session_create_accepts_omitted_params() {
     let events = parse_sse(event_response.body());
     assert_eq!(event_names(&events), vec!["session.created"]);
     assert_protocol_event_ids(&events, session_id);
+}
+
+#[test]
+fn session_search_returns_cjk_substring_hit_with_anchored_bookends() {
+    let db = TestSessionDb::new("fts-search-route-cjk");
+    let config = HttpServerConfig {
+        session_db_path: Some(db.path().to_path_buf()),
+        ..HttpServerConfig::default()
+    };
+    let mut server = HttpServer::with_model_settings(config, model_settings());
+    let session_id = SessionId::try_new(create_session(&mut server)).unwrap();
+    let run_id = RunId::new_unchecked("019f2f6f-f178-7a72-9f28-000000000479");
+    let tool_call_id = ToolCallId::new_unchecked("019f2f6f-f178-7a72-9f28-00000000047a");
+    let seed_store = SessionStore::open(db.path()).expect("seed store should open");
+
+    seed_store
+        .start_run(&session_id, run_id.clone())
+        .expect("run should start");
+    for (index, text) in [
+        "goal: inspect session search",
+        "opening assistant context",
+        "nearby setup detail",
+        "我们在火星基地测试量子导航",
+        "after the target",
+        "resolution verified",
+        "done shipping search",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let message_id =
+            MessageId::new_unchecked(format!("019f2f6f-f178-7a72-9f28-0000000004{:02x}", index));
+        let turn = if text.contains("火星基地") {
+            ModelTurn::tool_result(tool_call_id.as_str(), text)
+        } else if index % 2 == 0 {
+            ModelTurn::user_text(text)
+        } else {
+            ModelTurn::assistant_text(text)
+        };
+        seed_store
+            .append_turn(&run_id, message_id, turn)
+            .expect("turn should append");
+    }
+
+    let search_response = server.handle_request(HttpRequest::post(
+        "/rpc",
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id(479),
+            "method": "session.search",
+            "params": {
+                "query": "星基地",
+                "limit": 1,
+                "surroundingTurns": 1,
+                "index": "trigram"
+            }
+        })
+        .to_string(),
+    ));
+
+    assert_eq!(search_response.status(), 200);
+    let body: Value = serde_json::from_str(search_response.body()).unwrap();
+    let hit = &body["result"]["hits"][0];
+    assert_eq!(hit["sessionId"], session_id.as_str());
+    assert_eq!(
+        hit["anchoredTurns"][3]["parts"][0]["partType"],
+        "tool_result"
+    );
+    assert_eq!(hit["text"], "我们在火星基地测试量子导航");
+
+    let context_texts = hit["anchoredTurns"]
+        .as_array()
+        .expect("anchored turns should be present")
+        .iter()
+        .flat_map(|turn| {
+            turn["parts"]
+                .as_array()
+                .expect("turn parts should be present")
+                .iter()
+                .map(|part| part["text"].as_str().expect("text part should expose text"))
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        context_texts,
+        vec![
+            "goal: inspect session search",
+            "opening assistant context",
+            "nearby setup detail",
+            "我们在火星基地测试量子导航",
+            "after the target",
+            "resolution verified",
+            "done shipping search",
+        ]
+    );
 }
 
 #[test]
