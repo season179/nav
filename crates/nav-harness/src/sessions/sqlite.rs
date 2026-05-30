@@ -1506,19 +1506,37 @@ impl SqliteSessionStore {
             let Some(existing) = read_existing_part_for_turn(tx, turn_id, part_id)? else {
                 return Ok(0);
             };
-            let changed = tx.execute(
-                "DELETE FROM turn_parts WHERE id = ?1 AND turn_id = ?2",
-                params![part_id.as_str(), turn_id.as_str()],
-            )?;
-            if changed > 0 {
-                let cost_delta = cost_delta_for_part_removal(&existing.part)?;
-                if cost_delta.has_value() {
-                    update_session_cost_in_tx(tx, &existing.session_id, cost_delta)?;
-                }
-            }
-            Ok(changed)
+            remove_existing_part_in_tx(tx, turn_id, part_id, &existing)
         })?;
         ensure_row_changed(changed, "turn_part", part_id.as_str())
+    }
+
+    pub fn remove_parts(&self, parts: &[(MessageId, PartId)]) -> Result<(), SqliteStoreError> {
+        if parts.is_empty() {
+            return Ok(());
+        }
+
+        self.execute_write(|tx| {
+            let mut existing_parts = Vec::with_capacity(parts.len());
+            for (turn_id, part_id) in parts {
+                let Some(existing) = read_existing_part_for_turn(tx, turn_id, part_id)? else {
+                    return Ok(Err(SqliteStoreError::NotFound {
+                        entity: "turn_part",
+                        id: part_id.to_string(),
+                    }));
+                };
+                existing_parts.push(existing);
+            }
+
+            for ((turn_id, part_id), existing) in parts.iter().zip(&existing_parts) {
+                let changed = remove_existing_part_in_tx(tx, turn_id, part_id, existing)?;
+                if changed == 0 {
+                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                }
+            }
+
+            Ok(Ok(()))
+        })?
     }
 
     /// Query the `turn_parts_text` projection for a session.
@@ -2113,6 +2131,25 @@ fn read_existing_part_row(row: &Row<'_>) -> rusqlite::Result<ExistingPart> {
         session_id: row.get("session_id")?,
         part: parse_json(&data_json)?,
     })
+}
+
+fn remove_existing_part_in_tx(
+    tx: &Transaction,
+    turn_id: &MessageId,
+    part_id: &PartId,
+    existing: &ExistingPart,
+) -> rusqlite::Result<usize> {
+    let changed = tx.execute(
+        "DELETE FROM turn_parts WHERE id = ?1 AND turn_id = ?2",
+        params![part_id.as_str(), turn_id.as_str()],
+    )?;
+    if changed > 0 {
+        let cost_delta = cost_delta_for_part_removal(&existing.part)?;
+        if cost_delta.has_value() {
+            update_session_cost_in_tx(tx, &existing.session_id, cost_delta)?;
+        }
+    }
+    Ok(changed)
 }
 
 /// Drop cached provider continuations for `session_id` whose dialect no longer

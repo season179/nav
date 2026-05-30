@@ -208,6 +208,21 @@ impl CompactionFailureBreaker {
             && !self.cooldown_active(session_id, now)
     }
 
+    /// Warning to surface when automatic compaction is currently disabled.
+    pub fn auto_compaction_warning(
+        &self,
+        session_id: &SessionId,
+        now: Duration,
+    ) -> Option<&'static str> {
+        if self.consecutive_failures(session_id) >= self.threshold {
+            return Some(COMPACTION_BREAKER_WARNING);
+        }
+        if self.cooldown_active(session_id, now) {
+            return Some(TRANSIENT_COOLDOWN_WARNING);
+        }
+        None
+    }
+
     /// Whether a transient cooldown is still active for the session.
     /// `now` is the current time as a `Duration` from an arbitrary epoch.
     pub fn cooldown_active(&self, session_id: &SessionId, now: Duration) -> bool {
