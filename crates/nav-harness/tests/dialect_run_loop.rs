@@ -19,7 +19,7 @@ use nav_harness::models::{
     OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, ProviderConfig,
     ResolvedModelConfig,
 };
-use nav_harness::sessions::{ModelTurn, ModelTurnRole, SessionStore};
+use nav_harness::sessions::{ModelTurn, ModelTurnRole, ProviderState, SessionStore};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};
 use nav_types::{ApprovalId, EventId, MessageId, RunId, SessionId, ToolCallId};
 
@@ -95,6 +95,88 @@ fn openai_responses_run_completes_end_to_end() {
         .find(|turn| turn.role == ModelTurnRole::Assistant)
         .expect("an assistant turn should be persisted");
     assert_eq!(assistant.text_content(), "Hello from Responses!");
+}
+
+#[test]
+fn openai_responses_run_attaches_cached_previous_response_id() {
+    let body = r#"{
+        "id": "resp_02",
+        "model": "gpt-test",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "continued", "annotations": []}]
+        }]
+    }"#;
+    let server = FakeProviderServer::start(vec![CannedResponse::json(body)]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "continue");
+    store
+        .lock()
+        .unwrap()
+        .set_provider_state(ProviderState {
+            run_id: run_id.clone(),
+            api_kind: "openai-responses".to_string(),
+            state_json: r#"{"previous_response_id":"resp_cached"}"#.to_string(),
+        })
+        .expect("provider state should persist");
+
+    let model = responses_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "responses run should complete, got {result:?}"
+    );
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected one provider request");
+    let request: serde_json::Value =
+        serde_json::from_str(&requests[0]).expect("request body should be JSON");
+    assert_eq!(request["previous_response_id"], "resp_cached");
+}
+
+#[test]
+fn openai_responses_run_persists_provider_state() {
+    let body = r#"{
+        "id": "resp_saved",
+        "model": "gpt-test",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "state saved", "annotations": []}]
+        }]
+    }"#;
+    let server = FakeProviderServer::start(vec![CannedResponse::json(body)]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "remember this");
+
+    let model = responses_model(server.base_url());
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "responses run should complete, got {result:?}"
+    );
+    let state = store
+        .lock()
+        .unwrap()
+        .get_provider_state(&run_id)
+        .expect("provider state should be readable")
+        .expect("responses run should persist provider state");
+    assert_eq!(state.api_kind, "openai-responses");
+    assert_eq!(state.state_json, r#"{"previous_response_id":"resp_saved"}"#);
 }
 
 #[test]

@@ -9,7 +9,7 @@ use reqwest::Url;
 use serde_json::{Map, Value, json};
 
 use crate::context::reminders::ContextReminders;
-use crate::sessions::ModelTurn;
+use crate::sessions::{ModelTurn, ProviderState};
 use crate::tools::{ToolPreset, ToolRegistry};
 
 use super::encode::{
@@ -48,11 +48,13 @@ pub fn encode_request(
     turns: &[ModelTurn],
     tool_registry: &ToolRegistry,
     tool_preset: ToolPreset,
+    provider_state: Option<&ProviderState>,
     reminders: &ContextReminders,
 ) -> EncodedRequest {
     match api {
         ApiKind::OpenAiResponses => {
-            let encoder = OpenAiResponsesEncoder::new();
+            let encoder =
+                OpenAiResponsesEncoder::new().with_provider_state(provider_state.cloned());
             EncodedRequest::Responses(infallible(Encoder::encode(&encoder, turns)))
         }
         ApiKind::AnthropicMessages => {
@@ -369,6 +371,7 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            None,
             &ContextReminders::new(),
         );
         assert!(matches!(encoded, EncodedRequest::Anthropic(_)));
@@ -382,6 +385,7 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            None,
             &ContextReminders::new().plan_mode(true),
         );
         let EncodedRequest::Anthropic(request) = encoded else {
@@ -405,6 +409,7 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            None,
             &ContextReminders::new(),
         );
         assert!(matches!(encoded, EncodedRequest::Responses(_)));
@@ -418,6 +423,7 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            None,
             &ContextReminders::new(),
         );
         assert!(matches!(encoded, EncodedRequest::Completions(_)));
@@ -431,6 +437,7 @@ mod tests {
             &turns,
             &registry(),
             ToolPreset::Coding,
+            None,
             &ContextReminders::new(),
         );
         assert!(matches!(encoded, EncodedRequest::Completions(_)));

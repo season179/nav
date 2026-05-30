@@ -52,6 +52,24 @@ impl ModelResolver {
         self.resolve_ref_with_env(&model_ref, env)
     }
 
+    pub fn resolve_api_kind(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<ApiKind, ResolveModelError> {
+        let model_ref = ModelRef {
+            provider: provider_id.to_string(),
+            model: model_id.to_string(),
+        };
+
+        self.resolve_ref_api_kind(&model_ref)
+    }
+
+    pub fn resolve_ref_api_kind(&self, model_ref: &ModelRef) -> Result<ApiKind, ResolveModelError> {
+        let (_, provider, model) = self.find_model(model_ref)?;
+        Ok(model.api.unwrap_or(provider.api))
+    }
+
     pub fn resolve_ref_with_env(
         &self,
         model_ref: &ModelRef,

@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use nav_harness::agents::{RunLoop, RunLoopRequest, RunLoopResult};
 use nav_harness::models::{
-    ModelResolver, OpenAiCompletionsCancellationToken, OpenAiCompletionsError, ResolveModelError,
-    ResolvedModelConfig,
+    ModelRef, ModelResolver, OpenAiCompletionsCancellationToken, OpenAiCompletionsError,
+    ResolveModelError, ResolvedModelConfig,
 };
 use nav_harness::sessions::{
     ModelTurn, PendingConfirmation, PendingConfirmationRegistry, SessionStore,
@@ -71,6 +71,7 @@ pub(super) struct ModelRunRequest<'a> {
     pub run_id: &'a RunId,
     pub message_id: &'a MessageId,
     pub turns: &'a [ModelTurn],
+    pub model_ref: Option<ModelRef>,
     pub tool_registry: &'a ToolRegistry,
     pub tool_preset: ToolPreset,
     pub tool_context: &'a ToolContext,
@@ -84,7 +85,7 @@ impl ModelRunService {
         cancellation_token: OpenAiCompletionsCancellationToken,
         request: ModelRunRequest<'_>,
     ) -> RunStatus {
-        let model = match resolver.resolve_default() {
+        let model = match resolve_run_model(resolver, request.model_ref.as_ref()) {
             Ok(model) => model,
             Err(error) => {
                 publish_run_failure(
@@ -178,6 +179,16 @@ impl ModelRunService {
                 RunStatus::Failed
             }
         }
+    }
+}
+
+fn resolve_run_model(
+    resolver: &ModelResolver,
+    model_ref: Option<&ModelRef>,
+) -> Result<ResolvedModelConfig, ResolveModelError> {
+    match model_ref {
+        Some(model_ref) => resolver.resolve(&model_ref.provider, &model_ref.model),
+        None => resolver.resolve_default(),
     }
 }
 

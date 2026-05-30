@@ -27,7 +27,7 @@ use crate::models::{
 use crate::sessions::{
     CompactionConfig, ConfirmationDecision, ModelTurn, ModelTurnRole, NewProviderPayload,
     PendingConfirmation, PendingConfirmationReceiver, PendingConfirmationRegistry,
-    ProviderPayloadDirection, SessionStore, ToolCall, TurnPart,
+    ProviderPayloadDirection, ProviderState, SessionStore, ToolCall, TurnPart,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
@@ -42,6 +42,85 @@ const TOOL_OUTPUT_BUFFER: usize = 64;
 /// second consecutive overflow indicates compaction is not shrinking the
 /// request, so the run fails instead of looping.
 const MAX_OVERFLOW_ATTEMPTS: usize = 1;
+
+/// How many agent-loop rounds an agent may run before its loop must stop.
+///
+/// Each subagent gets its own budget ([`Default`] = 50 rounds) so a child's
+/// rounds are never drawn from its parent's remaining allowance — the isolation
+/// that makes [`crate::tools::task::MAX_TASK_DEPTH`] necessary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IterationBudget {
+    remaining: u32,
+}
+
+impl IterationBudget {
+    /// Default rounds granted to a freshly spawned subagent.
+    pub const SUBAGENT_DEFAULT: u32 = 50;
+
+    /// Create a budget with `rounds` remaining.
+    pub fn new(rounds: u32) -> Self {
+        Self { remaining: rounds }
+    }
+
+    /// Rounds still available to this agent.
+    pub fn remaining(self) -> u32 {
+        self.remaining
+    }
+
+    /// Whether the budget is spent and the loop must stop.
+    pub fn is_exhausted(self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Spend one round, returning `false` if the budget was already exhausted.
+    pub fn try_consume(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
+impl Default for IterationBudget {
+    fn default() -> Self {
+        Self::new(Self::SUBAGENT_DEFAULT)
+    }
+}
+
+/// The isolated runtime a freshly spawned subagent runs under: its position in
+/// the delegation tree and an independent [`IterationBudget`].
+///
+/// Each child is built with [`IterationBudget::default`] so its rounds are never
+/// drawn from its parent's remaining allowance. The child's tool pool is shaped
+/// by its [`depth`](Self::depth): the `task` tool is depth-gated, so a child at
+/// [`crate::tools::task::MAX_TASK_DEPTH`] cannot delegate further.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubagentRuntime {
+    depth: u32,
+    iteration_budget: IterationBudget,
+}
+
+impl SubagentRuntime {
+    /// Build the runtime for a child at `depth`, granting it a fresh default
+    /// iteration budget.
+    pub fn for_depth(depth: u32) -> Self {
+        Self {
+            depth,
+            iteration_budget: IterationBudget::default(),
+        }
+    }
+
+    /// This child's depth in the delegation tree (root agent = 0).
+    pub fn depth(self) -> u32 {
+        self.depth
+    }
+
+    /// The child's own iteration budget, independent of its parent's.
+    pub fn iteration_budget(self) -> IterationBudget {
+        self.iteration_budget
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct AgentCatalog;
@@ -129,11 +208,16 @@ impl RunLoop {
                 return RunLoopResult::Failed(error);
             }
             let turns_for_model = project_turns_for_encoding(&turns, model, journal.is_some());
+            let provider_state = match load_provider_state(journal, request.run_id) {
+                Ok(provider_state) => provider_state,
+                Err(error) => return RunLoopResult::Failed(error),
+            };
             let encoded = encode_request(
                 model.api,
                 &turns_for_model,
                 request.tool_registry,
                 request.tool_preset,
+                provider_state.as_ref(),
                 &ContextReminders::new(),
             );
             if let Some(journal) = journal {
@@ -424,11 +508,15 @@ impl RunLoop {
                 created_at,
             },
         )?;
+        let provider_state = provider_state_for_output(model, run_id, output)?;
         let assistant_message_id = journal
             .store
             .lock()
             .unwrap()
-            .decode_and_append_provider_payload(&payload_id)
+            .decode_and_append_provider_payload_with_provider_state(
+                &payload_id,
+                provider_state.as_ref(),
+            )
             .map_err(persistence_error)?;
         Ok(JournaledProviderPayload {
             id: payload_id,
@@ -902,6 +990,22 @@ fn turns_for_encoding(
         .map_err(persistence_error)
 }
 
+fn load_provider_state(
+    journal: Option<ProviderJournal<'_>>,
+    run_id: &RunId,
+) -> Result<Option<ProviderState>, OpenAiCompletionsError> {
+    let Some(journal) = journal else {
+        return Ok(None);
+    };
+
+    journal
+        .store
+        .lock()
+        .unwrap()
+        .get_provider_state(run_id)
+        .map_err(persistence_error)
+}
+
 fn project_turns_for_encoding(
     turns: &[ModelTurn],
     model: &ResolvedModelConfig,
@@ -1093,6 +1197,32 @@ fn persisted_api_kind_name(api: crate::models::ApiKind) -> &'static str {
         crate::models::ApiKind::OpenAiResponses => "openai-responses",
         crate::models::ApiKind::AnthropicMessages => "anthropic-messages",
     }
+}
+
+fn provider_state_for_output(
+    model: &ResolvedModelConfig,
+    run_id: &RunId,
+    output: &ModelTurnOutput,
+) -> Result<Option<ProviderState>, OpenAiCompletionsError> {
+    if !matches!(model.api, ApiKind::OpenAiResponses) {
+        return Ok(None);
+    }
+
+    let Some(previous_response_id) = &output.provider_response_id else {
+        return Ok(None);
+    };
+    if previous_response_id.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let state_json =
+        serde_json::to_string(&json!({ "previous_response_id": previous_response_id }))
+            .map_err(json_error)?;
+    Ok(Some(ProviderState {
+        run_id: run_id.clone(),
+        api_kind: api_kind_name(model).to_string(),
+        state_json,
+    }))
 }
 
 fn provider_tool_call_value(tool_call: &ToolCall) -> Value {
@@ -3629,5 +3759,50 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn iteration_budget_defaults_to_fifty_independent_rounds() {
+        let mut first = IterationBudget::default();
+        let second = IterationBudget::default();
+
+        assert_eq!(first.remaining(), 50);
+        assert_eq!(second.remaining(), 50);
+
+        // Consuming one budget must not touch another: each subagent's budget is
+        // its own.
+        assert!(first.try_consume());
+        assert_eq!(first.remaining(), 49);
+        assert_eq!(second.remaining(), 50);
+    }
+
+    #[test]
+    fn iteration_budget_refuses_to_consume_past_exhaustion() {
+        let mut budget = IterationBudget::new(2);
+
+        assert!(!budget.is_exhausted());
+        assert!(budget.try_consume());
+        assert!(budget.try_consume());
+
+        assert!(budget.is_exhausted());
+        assert!(!budget.try_consume());
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn each_child_runtime_gets_its_own_default_budget() {
+        let first = SubagentRuntime::for_depth(1);
+        let second = SubagentRuntime::for_depth(3);
+
+        assert_eq!(first.depth(), 1);
+        assert_eq!(second.depth(), 3);
+        assert_eq!(
+            first.iteration_budget().remaining(),
+            IterationBudget::SUBAGENT_DEFAULT
+        );
+        assert_eq!(
+            second.iteration_budget().remaining(),
+            IterationBudget::SUBAGENT_DEFAULT
+        );
     }
 }

@@ -7,11 +7,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nav_harness::guardrails::{GuardrailRunner, default_guardrails};
-use nav_harness::models::{ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken};
+use nav_harness::models::{
+    ApiKind, ModelRef, ModelResolver, ModelSettings, OpenAiCompletionsCancellationToken,
+    ResolvedModelConfig,
+};
 use nav_harness::sessions::{
-    ConfirmationDecision, CreateSession, ModelTurn, PendingConfirmation, PendingConfirmationError,
-    PendingConfirmationReceiver, PendingConfirmationRegistry, RunStatus as StoredRunStatus,
-    SessionStore, SessionTotals, SqliteStoreError,
+    AnchoredSearchHit, ConfirmationDecision, CreateSession, ModelTurn, Part, PendingConfirmation,
+    PendingConfirmationError, PendingConfirmationReceiver, PendingConfirmationRegistry,
+    RunStatus as StoredRunStatus, SessionSearchIndex as StoreSessionSearchIndex,
+    SessionSearchOptions, SessionSettings, SessionStore, SessionTotals, SqliteStoreError,
+    StoredPart, StoredTurn, TurnRole,
 };
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry, bash, edit, read, write};
 use nav_harness::workspace::path::WorkspacePathPolicy;
@@ -19,9 +24,12 @@ use nav_protocol::rpc::SessionSource;
 use nav_protocol::rpc::{
     InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     JsonRpcVersion, ProtocolCapabilities, RunCancelParams, RunCancelResult, SessionCreateParams,
-    SessionCreateResult, SessionSendMessageParams, SessionSendMessageResult, SessionTotalsParams,
-    SessionTotalsResult, SettingsReloadResult, ToolApproveParams, ToolConfirmationOutcome,
-    ToolConfirmationResult, ToolRejectParams, ToolsPreset, methods,
+    SessionCreateResult, SessionSearchHit, SessionSearchIndex, SessionSearchParams,
+    SessionSearchResult, SessionSearchTurn, SessionSearchTurnPart, SessionSendMessageParams,
+    SessionSendMessageResult, SessionTotalsParams, SessionTotalsResult,
+    SessionUpdateSettingsParams, SessionUpdateSettingsResult, SettingsReloadResult,
+    ToolApproveParams, ToolConfirmationOutcome, ToolConfirmationResult, ToolRejectParams,
+    ToolsPreset, methods,
 };
 use nav_protocol::{BACKEND_EVENT_TYPES, BackendEvent, EventEnvelope};
 use nav_types::{EventId, RunId, SessionId};
@@ -233,11 +241,21 @@ impl HttpServer {
         self.pending_confirmations.lock().unwrap().register(pending)
     }
 
+    fn session_has_running_run(&self, session_id: &SessionId) -> bool {
+        self.runs
+            .lock()
+            .unwrap()
+            .values()
+            .any(|run| run.session_id == *session_id && matches!(run.status, RunStatus::Running))
+    }
+
     fn handle_rpc_request(&mut self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
         match request.method.as_str() {
             methods::INITIALIZE => self.handle_initialize(request),
             methods::SESSION_CREATE => self.handle_session_create(request),
+            methods::SESSION_UPDATE_SETTINGS => self.handle_session_update_settings(request),
             methods::SESSION_SEND_MESSAGE => self.handle_session_send_message(request),
+            methods::SESSION_SEARCH => self.handle_session_search(request),
             methods::SESSION_TOTALS => self.handle_session_totals(request),
             methods::RUN_CANCEL => self.handle_run_cancel(request),
             methods::TOOL_APPROVE => self.handle_tool_approve(request),
@@ -295,6 +313,11 @@ impl HttpServer {
             },
             None => SessionCreateParams::default(),
         };
+        if let Err(error) =
+            session_model_ref_from_settings(&self.model_resolver, params.settings_json.as_ref())
+        {
+            return rpc_error(request.id, -32602, error);
+        }
 
         let session_id = self.next_session_id();
         let event = EventEnvelope {
@@ -321,6 +344,86 @@ impl HttpServer {
         rpc_result(request.id, SessionCreateResult { session_id })
     }
 
+    fn handle_session_update_settings(
+        &mut self,
+        request: JsonRpcRequest<Value>,
+    ) -> JsonRpcResponse<Value> {
+        let params = match parse_params::<SessionUpdateSettingsParams>(request.params) {
+            Ok(params) => params,
+            Err(error) => return rpc_error(request.id, -32602, error),
+        };
+
+        let existing = match self.session_metadata_for_send(&params.session_id) {
+            Ok(metadata) => metadata,
+            Err(SessionLookupError::NotFound) => {
+                return rpc_error(request.id, -32004, "session not found");
+            }
+            Err(SessionLookupError::Store(error)) => {
+                return rpc_error(
+                    request.id,
+                    -32603,
+                    format!("failed to load session: {error}"),
+                );
+            }
+        };
+        if self.session_has_running_run(&params.session_id) {
+            return rpc_error(request.id, -32005, "session has a running run");
+        }
+
+        let settings_json = params
+            .settings_json
+            .clone()
+            .or_else(|| existing.settings_json.clone());
+        let model_ref =
+            match session_model_ref_from_settings(&self.model_resolver, settings_json.as_ref()) {
+                Ok(model_ref) => model_ref,
+                Err(error) => return rpc_error(request.id, -32602, error),
+            };
+        let api_kind = match model_ref
+            .as_ref()
+            .map(|model_ref| resolved_api_kind(&self.model_resolver, model_ref))
+        {
+            Some(Ok(api_kind)) => Some(api_kind),
+            Some(Err(error)) => return rpc_error(request.id, -32602, error),
+            None => None,
+        };
+        let tools_preset = params.tools_preset.unwrap_or(existing.tools_preset);
+        let storage_settings =
+            session_settings_to_storage(settings_json.as_ref(), Some(tools_preset));
+
+        if let Err(error) = self.session_store.lock().unwrap().update_session_settings(
+            &params.session_id,
+            SessionSettings {
+                settings_json: storage_settings,
+                updated_at: unix_millis(),
+                api_kind,
+            },
+        ) {
+            return rpc_error(
+                request.id,
+                -32603,
+                format!("failed to update session settings: {error}"),
+            );
+        }
+
+        self.sessions.insert(
+            params.session_id.clone(),
+            SessionMetadata {
+                cwd: existing.cwd,
+                source: existing.source,
+                settings_json,
+                tools_preset,
+            },
+        );
+
+        rpc_result(
+            request.id,
+            SessionUpdateSettingsResult {
+                session_id: params.session_id,
+            },
+        )
+    }
+
     fn handle_session_totals(&self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
         let params = match parse_params::<SessionTotalsParams>(request.params) {
             Ok(params) => params,
@@ -338,6 +441,32 @@ impl HttpServer {
                 request.id,
                 -32603,
                 format!("failed to get session totals: {error}"),
+            ),
+        }
+    }
+
+    fn handle_session_search(&self, request: JsonRpcRequest<Value>) -> JsonRpcResponse<Value> {
+        let params = match parse_params::<SessionSearchParams>(request.params) {
+            Ok(params) => params,
+            Err(error) => return rpc_error(request.id, -32602, error),
+        };
+        let options = SessionSearchOptions {
+            limit: params.limit,
+            surrounding_turns: params.surrounding_turns,
+            index: store_session_search_index(params.index),
+        };
+
+        match self
+            .session_store
+            .lock()
+            .unwrap()
+            .search_turn_parts_with_anchored_view(&params.query, options)
+        {
+            Ok(hits) => rpc_result(request.id, session_search_result(hits)),
+            Err(error) => rpc_error(
+                request.id,
+                -32603,
+                format!("failed to search sessions: {error}"),
             ),
         }
     }
@@ -367,6 +496,13 @@ impl HttpServer {
                     format!("failed to load session: {error}"),
                 );
             }
+        };
+        let model_ref = match session_model_ref_from_settings(
+            &self.model_resolver,
+            session_metadata.settings_json(),
+        ) {
+            Ok(model_ref) => model_ref,
+            Err(error) => return rpc_error(request.id, -32602, error),
         };
 
         let run_id = self.next_run_id();
@@ -421,14 +557,15 @@ impl HttpServer {
                 run_id: run_id.clone(),
             },
         });
-        self.spawn_model_run(
-            params.session_id.clone(),
-            run_id.clone(),
-            message_id.clone(),
+        self.spawn_model_run(SpawnModelRunRequest {
+            session_id: params.session_id.clone(),
+            run_id: run_id.clone(),
+            message_id: message_id.clone(),
             turns,
             session_metadata,
+            model_ref,
             cancellation_token,
-        );
+        });
 
         rpc_result(
             request.id,
@@ -562,15 +699,16 @@ impl HttpServer {
         }
     }
 
-    fn spawn_model_run(
-        &self,
-        session_id: SessionId,
-        run_id: RunId,
-        message_id: nav_types::MessageId,
-        turns: Vec<ModelTurn>,
-        session_metadata: SessionMetadata,
-        cancellation_token: OpenAiCompletionsCancellationToken,
-    ) {
+    fn spawn_model_run(&self, request: SpawnModelRunRequest) {
+        let SpawnModelRunRequest {
+            session_id,
+            run_id,
+            message_id,
+            turns,
+            session_metadata,
+            model_ref,
+            cancellation_token,
+        } = request;
         let model_run_service = self.model_run_service.clone();
         let model_resolver = self.model_resolver.clone();
         let ids = Arc::clone(&self.ids);
@@ -602,6 +740,7 @@ impl HttpServer {
                     run_id: &run_id,
                     message_id: &message_id,
                     turns: &turns,
+                    model_ref: model_ref.clone(),
                     tool_registry: tool_registry.as_ref(),
                     tool_preset,
                     tool_context: &tool_context,
@@ -637,7 +776,7 @@ impl HttpServer {
             // Auto-title generation after first successful exchange
             // This is done after the run status is updated so it doesn't block completion
             if final_status == RunStatus::Completed
-                && let Ok(model) = model_resolver.resolve_default()
+                && let Ok(model) = resolve_session_model(&model_resolver, model_ref.as_ref())
             {
                 let store_clone = Arc::clone(&session_store);
                 let sid = session_id.clone();
@@ -829,6 +968,40 @@ fn tools_preset_from_storage(settings_json: &str) -> ToolsPreset {
         .unwrap_or_default()
 }
 
+fn session_model_ref_from_settings(
+    resolver: &ModelResolver,
+    settings_json: Option<&Value>,
+) -> Result<Option<ModelRef>, String> {
+    let Some(model_ref) = settings_json.and_then(|settings| settings.get("modelRef")) else {
+        return Ok(None);
+    };
+
+    let model_ref = serde_json::from_value::<ModelRef>(model_ref.clone())
+        .map(Some)
+        .map_err(|error| format!("invalid modelRef: {error}"))?;
+
+    if let Some(model_ref) = &model_ref {
+        resolved_api_kind(resolver, model_ref)?;
+    }
+    Ok(model_ref)
+}
+
+fn resolved_api_kind(resolver: &ModelResolver, model_ref: &ModelRef) -> Result<ApiKind, String> {
+    resolver
+        .resolve_api_kind(&model_ref.provider, &model_ref.model)
+        .map_err(|error| format!("invalid modelRef: {error:?}"))
+}
+
+fn resolve_session_model(
+    resolver: &ModelResolver,
+    model_ref: Option<&ModelRef>,
+) -> Result<ResolvedModelConfig, nav_harness::models::ResolveModelError> {
+    match model_ref {
+        Some(model_ref) => resolver.resolve(&model_ref.provider, &model_ref.model),
+        None => resolver.resolve_default(),
+    }
+}
+
 fn tools_preset_storage_name(preset: ToolsPreset) -> &'static str {
     match preset {
         ToolsPreset::Coding => "coding",
@@ -861,6 +1034,70 @@ fn totals_updated_event(totals: SessionTotals) -> BackendEvent {
         tokens_reasoning: totals.tokens_reasoning,
         tokens_cache_read: totals.tokens_cache_read,
         tokens_cache_write: totals.tokens_cache_write,
+    }
+}
+
+fn store_session_search_index(index: SessionSearchIndex) -> StoreSessionSearchIndex {
+    match index {
+        SessionSearchIndex::Unicode => StoreSessionSearchIndex::Unicode,
+        SessionSearchIndex::Trigram => StoreSessionSearchIndex::Trigram,
+    }
+}
+
+fn session_search_result(hits: Vec<AnchoredSearchHit>) -> SessionSearchResult {
+    SessionSearchResult {
+        hits: hits.into_iter().map(session_search_hit).collect(),
+    }
+}
+
+fn session_search_hit(hit: AnchoredSearchHit) -> SessionSearchHit {
+    SessionSearchHit {
+        session_id: hit.hit.session_id,
+        turn_id: hit.hit.turn_id,
+        part_id: hit.hit.part_id,
+        rank: hit.hit.rank,
+        text: hit.hit.text,
+        anchored_turns: hit
+            .anchored_turns
+            .into_iter()
+            .map(session_search_turn)
+            .collect(),
+    }
+}
+
+fn session_search_turn(turn: StoredTurn) -> SessionSearchTurn {
+    let (turn, parts) = turn;
+    SessionSearchTurn {
+        turn_id: turn.id,
+        run_id: turn.run_id,
+        role: turn_role_name(turn.role).to_string(),
+        created_at: turn.created_at,
+        parts: parts.into_iter().map(session_search_turn_part).collect(),
+    }
+}
+
+fn session_search_turn_part(part: StoredPart) -> SessionSearchTurnPart {
+    SessionSearchTurnPart {
+        part_id: part.id,
+        part_type: part.part.type_name().to_string(),
+        text: session_search_part_text(&part.part),
+        created_at: part.created_at,
+    }
+}
+
+fn session_search_part_text(part: &Part) -> Option<String> {
+    match part {
+        Part::Text { text, .. } => Some(text.clone()),
+        Part::ToolResult { content, .. } => Some(content.clone()),
+        Part::Thinking { text, .. } => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn turn_role_name(role: TurnRole) -> &'static str {
+    match role {
+        TurnRole::User => "user",
+        TurnRole::Assistant => "assistant",
     }
 }
 
@@ -1004,6 +1241,16 @@ impl SessionMetadata {
 enum SessionLookupError {
     NotFound,
     Store(SqliteStoreError),
+}
+
+struct SpawnModelRunRequest {
+    session_id: SessionId,
+    run_id: RunId,
+    message_id: nav_types::MessageId,
+    turns: Vec<ModelTurn>,
+    session_metadata: SessionMetadata,
+    model_ref: Option<ModelRef>,
+    cancellation_token: OpenAiCompletionsCancellationToken,
 }
 
 #[derive(Debug, Clone)]
