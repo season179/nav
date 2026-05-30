@@ -31,6 +31,14 @@ fn turn(role: TurnRole, seq: u32, parts: Vec<Part>) -> (Turn, Vec<Part>) {
     )
 }
 
+/// A turn tagged with the model that produced it, so reasoning fidelity can be
+/// exercised against an active-model match (issue #476).
+fn turn_for_model(role: TurnRole, seq: u32, model_id: &str, parts: Vec<Part>) -> (Turn, Vec<Part>) {
+    let (mut envelope, parts) = turn(role, seq, parts);
+    envelope.meta.model_id = Some(model_id.to_string());
+    (envelope, parts)
+}
+
 #[test]
 fn api_kind_accepts_anthropic_messages_spellings() {
     let hyphenated: ApiKind = serde_json::from_str(r#""anthropic-messages""#).unwrap();
@@ -319,9 +327,10 @@ fn canonical_tool_result_splits_following_assistant_text() {
 
 #[test]
 fn canonical_thinking_part_produces_thinking_content_block() {
-    let turns = vec![turn(
+    let turns = vec![turn_for_model(
         TurnRole::Assistant,
         1,
+        "claude-opus-4",
         vec![Part::Thinking {
             text: "I should inspect the manifest first.".to_string(),
             provider_hint: Some("anthropic".to_string()),
@@ -330,6 +339,7 @@ fn canonical_thinking_part_produces_thinking_content_block() {
     )];
 
     let request = AnthropicMessagesEncoder::new()
+        .with_active_model(Some("claude-opus-4"))
         .encode(&turns)
         .expect("encoding should succeed");
 
@@ -379,9 +389,15 @@ fn anthropic_thinking_signature_round_trips() {
         .iter()
         .map(|part| part.part.clone())
         .collect();
-    let turns = vec![turn(TurnRole::Assistant, 1, parts)];
+    let turns = vec![turn_for_model(
+        TurnRole::Assistant,
+        1,
+        "claude-opus-4",
+        parts,
+    )];
 
     let request = AnthropicMessagesEncoder::new()
+        .with_active_model(Some("claude-opus-4"))
         .encode(&turns)
         .expect("encoding should succeed");
 

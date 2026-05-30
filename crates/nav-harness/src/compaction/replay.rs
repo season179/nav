@@ -46,18 +46,22 @@ pub fn project_for_replay(turns: &[StoredTurn], tail_turns: usize) -> Vec<(Turn,
         .enumerate()
         .map(|(index, (turn, parts))| {
             let strip_images = !kept_image_turn_indices.contains(&index);
-            let truncate_arguments = index < truncate_boundary;
+            let before_tail = index < truncate_boundary;
             (
                 turn.clone(),
                 parts
                     .iter()
+                    // Reasoning blocks older than the retained tail are dropped
+                    // entirely to save tokens; the tail keeps them for the
+                    // producer-match decision made at encode time.
+                    .filter(|part| !(before_tail && matches!(part.part, Part::Thinking { .. })))
                     .map(|part| {
                         project_stored_part(
                             part,
                             &duplicate_tool_results,
                             &tool_names,
                             strip_images,
-                            truncate_arguments,
+                            before_tail,
                         )
                     })
                     .collect::<Vec<_>>(),
@@ -276,4 +280,98 @@ fn truncate_argument_string(text: &str) -> String {
         .collect::<String>();
     truncated.push_str(TRUNCATED_MARKER);
     truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions::TurnMeta;
+    use nav_types::RunId;
+
+    fn stored_part(id: &str, part: Part) -> StoredPart {
+        StoredPart {
+            id: PartId::new_unchecked(id),
+            part,
+            provider_payload_id: None,
+            provider_json_pointer: None,
+            compacted_at: None,
+            created_at: 0,
+        }
+    }
+
+    fn assistant_turn(seq: u32, model_id: Option<&str>, parts: Vec<Part>) -> StoredTurn {
+        let turn = Turn {
+            id: MessageId::new_unchecked(format!("msg-{seq}")),
+            run_id: RunId::new_unchecked("run"),
+            seq,
+            role: TurnRole::Assistant,
+            meta: TurnMeta {
+                model_id: model_id.map(str::to_string),
+                ..TurnMeta::default()
+            },
+            created_at: 0,
+        };
+        let parts = parts
+            .into_iter()
+            .enumerate()
+            .map(|(index, part)| stored_part(&format!("prt-{seq}-{index}"), part))
+            .collect();
+        (turn, parts)
+    }
+
+    fn thinking(text: &str) -> Part {
+        Part::Thinking {
+            text: text.to_string(),
+            provider_hint: Some("thinking".to_string()),
+            signature: Some("sig".to_string()),
+        }
+    }
+
+    fn text(text: &str) -> Part {
+        Part::Text {
+            text: text.to_string(),
+            synthetic: None,
+        }
+    }
+
+    fn has_thinking(parts: &[Part]) -> bool {
+        parts
+            .iter()
+            .any(|part| matches!(part, Part::Thinking { .. }))
+    }
+
+    #[test]
+    fn reasoning_older_than_tail_is_dropped() {
+        let turns = vec![
+            assistant_turn(0, Some("m"), vec![thinking("t0"), text("a")]),
+            assistant_turn(1, Some("m"), vec![thinking("t1"), text("b")]),
+            assistant_turn(2, Some("m"), vec![thinking("t2"), text("c")]),
+            assistant_turn(3, Some("m"), vec![thinking("t3"), text("d")]),
+        ];
+
+        let projected = project_for_replay(&turns, 2);
+
+        // Turns 0 and 1 fall before the retained tail: their reasoning is dropped.
+        assert!(!has_thinking(&projected[0].1));
+        assert!(!has_thinking(&projected[1].1));
+        // The retained tail (turns 2 and 3) keeps its reasoning verbatim.
+        assert!(has_thinking(&projected[2].1));
+        assert!(has_thinking(&projected[3].1));
+        // Dropping reasoning never removes the turn's other content.
+        assert_eq!(projected[0].1, vec![text("a")]);
+    }
+
+    #[test]
+    fn reasoning_inside_the_tail_is_always_kept() {
+        let turns = vec![
+            assistant_turn(0, Some("m"), vec![thinking("t0"), text("a")]),
+            assistant_turn(1, Some("m"), vec![thinking("t1"), text("b")]),
+        ];
+
+        // A tail large enough to cover every turn drops no reasoning.
+        let projected = project_for_replay(&turns, turns.len());
+
+        assert!(has_thinking(&projected[0].1));
+        assert!(has_thinking(&projected[1].1));
+    }
 }
