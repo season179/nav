@@ -179,6 +179,140 @@ fn anthropic_tool_call_round_trips_to_a_second_request() {
 }
 
 #[test]
+fn anthropic_second_request_truncates_after_tool_output_without_breaking_tool_pair() {
+    let tool_use = r#"{
+        "id": "msg_tool",
+        "model": "claude-test",
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "toolu_1", "name": "mystery_tool", "input": {"q": 1}}],
+        "stop_reason": "tool_use"
+    }"#;
+    let final_answer = r#"{
+        "id": "msg_final",
+        "model": "claude-test",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "All done"}],
+        "stop_reason": "end_turn"
+    }"#;
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json(tool_use),
+        CannedResponse::json(final_answer),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    {
+        let store = store.lock().unwrap();
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turn(
+                &run_id,
+                message_id(1),
+                ModelTurn::user_text(format!("OLD_CONTEXT_{}", "x".repeat(90))),
+            )
+            .unwrap();
+        store
+            .append_turn(&run_id, message_id(2), ModelTurn::user_text("use a tool"))
+            .unwrap();
+    }
+
+    let model = anthropic_model_with_window(server.base_url(), Some(40));
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "tool round trip should complete, got {result:?}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "expected two provider requests");
+    let second: serde_json::Value =
+        serde_json::from_str(&requests[1]).expect("second request body should be JSON");
+    let wire = second["messages"].to_string();
+    assert!(
+        !wire.contains("OLD_CONTEXT_"),
+        "second request should drop old context after the tool exchange grows the prompt: {wire}"
+    );
+    let messages = second["messages"]
+        .as_array()
+        .expect("anthropic request carries a messages array");
+    let tool_use_id = messages
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .find(|block| block["type"] == "tool_use")
+        .and_then(|block| block["id"].as_str())
+        .expect("assistant tool_use block should be re-encoded");
+    let tool_result_id = messages
+        .iter()
+        .flat_map(|message| message["content"].as_array().into_iter().flatten())
+        .find(|block| block["type"] == "tool_result")
+        .and_then(|block| block["tool_use_id"].as_str())
+        .expect("tool_result block should be re-encoded");
+    assert_eq!(
+        tool_use_id, tool_result_id,
+        "truncate must not break the re-encoded tool_use/tool_result pair"
+    );
+}
+
+#[test]
+fn anthropic_second_request_degrades_tool_result_when_budget_cannot_keep_pair() {
+    let tool_use = r#"{
+        "id": "msg_tool",
+        "model": "claude-test",
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "toolu_1", "name": "mystery_tool", "input": {"q": 1}}],
+        "stop_reason": "tool_use"
+    }"#;
+    let final_answer = r#"{
+        "id": "msg_final",
+        "model": "claude-test",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "All done"}],
+        "stop_reason": "end_turn"
+    }"#;
+    let server = FakeProviderServer::start(vec![
+        CannedResponse::json(tool_use),
+        CannedResponse::json(final_answer),
+    ]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    seed_user_turn(&store, &session_id, &run_id, "use a tool");
+
+    let model = anthropic_model_with_window(server.base_url(), Some(1));
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "tool round trip should complete, got {result:?}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "expected two provider requests");
+    let second: serde_json::Value =
+        serde_json::from_str(&requests[1]).expect("second request body should be JSON");
+    let messages = second["messages"]
+        .as_array()
+        .expect("anthropic request carries a messages array");
+    assert!(
+        !messages
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .any(|block| block["type"] == "tool_result"),
+        "split tool result should degrade before encode: {messages:?}"
+    );
+    assert!(
+        second["messages"].to_string().contains("unknown tool"),
+        "degraded text should preserve the tool output diagnostic: {messages:?}"
+    );
+}
+
+#[test]
 fn openai_responses_tool_call_round_trips_to_a_second_request() {
     // The Responses encoder resolves tool-call ids through a different path than
     // Anthropic (`function_call`/`function_call_output` items keyed by
@@ -298,6 +432,115 @@ fn cancelling_a_run_aborts_the_in_flight_dialect_request() {
     );
 }
 
+#[test]
+fn chat_completions_degrades_orphaned_tool_result_before_encode() {
+    let server = FakeProviderServer::start(vec![CannedResponse::sse("All set")]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    {
+        let store = store.lock().unwrap();
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turn(&run_id, message_id(1), ModelTurn::user_text("continue"))
+            .unwrap();
+        store
+            .append_turn(
+                &run_id,
+                message_id(2),
+                ModelTurn::tool_result("missing-call", "orphaned output"),
+            )
+            .unwrap();
+        store
+            .append_turn(&run_id, message_id(3), ModelTurn::user_text("finish"))
+            .unwrap();
+    }
+
+    let model = chat_model(server.base_url(), None);
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "chat run should complete, got {result:?}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected one provider request");
+    let body: serde_json::Value =
+        serde_json::from_str(&requests[0]).expect("request body should be JSON");
+    let messages = body["messages"]
+        .as_array()
+        .expect("chat completions request carries messages");
+    assert!(
+        !messages.iter().any(|message| message["role"] == "tool"),
+        "orphaned tool result should not be sent as a tool message: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message["role"] == "assistant"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("orphaned output"))
+        }),
+        "orphaned tool result should be preserved as synthetic assistant text: {messages:?}"
+    );
+}
+
+#[test]
+fn chat_completions_truncates_history_to_model_context_budget_before_encode() {
+    let server = FakeProviderServer::start(vec![CannedResponse::sse("Done")]);
+
+    let store = Arc::new(Mutex::new(SessionStore::default()));
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let bulky_old_turn = format!("OLD_CONTEXT_{}", "x".repeat(600));
+    {
+        let store = store.lock().unwrap();
+        store.create_session(session_id.clone()).unwrap();
+        store.start_run(&session_id, run_id.clone()).unwrap();
+        store
+            .append_turn(
+                &run_id,
+                message_id(1),
+                ModelTurn::user_text(&bulky_old_turn),
+            )
+            .unwrap();
+        store
+            .append_turn(
+                &run_id,
+                message_id(2),
+                ModelTurn::user_text("latest prompt"),
+            )
+            .unwrap();
+    }
+
+    let model = chat_model(server.base_url(), Some(32));
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+    let result = run_loop_once(&model, &store, &session_id, &run_id, &turns);
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "chat run should complete, got {result:?}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected one provider request");
+    let body: serde_json::Value =
+        serde_json::from_str(&requests[0]).expect("request body should be JSON");
+    let wire = body["messages"].to_string();
+    assert!(
+        !wire.contains("OLD_CONTEXT_"),
+        "oversized old context should be dropped before encode: {wire}"
+    );
+    assert!(
+        wire.contains("latest prompt"),
+        "latest prompt must survive truncation: {wire}"
+    );
+}
+
 fn run_loop_once(
     model: &ResolvedModelConfig,
     store: &Arc<Mutex<SessionStore>>,
@@ -365,11 +608,38 @@ fn anthropic_model(base_url: &str) -> ResolvedModelConfig {
     resolved_model(base_url, ApiKind::AnthropicMessages, "claude-test")
 }
 
+fn anthropic_model_with_window(base_url: &str, context_window: Option<u32>) -> ResolvedModelConfig {
+    resolved_model_with_window(
+        base_url,
+        ApiKind::AnthropicMessages,
+        "claude-test",
+        context_window,
+    )
+}
+
 fn responses_model(base_url: &str) -> ResolvedModelConfig {
     resolved_model(base_url, ApiKind::OpenAiResponses, "gpt-test")
 }
 
+fn chat_model(base_url: &str, context_window: Option<u32>) -> ResolvedModelConfig {
+    resolved_model_with_window(
+        base_url,
+        ApiKind::OpenAiCompletions,
+        "gpt-chat-test",
+        context_window,
+    )
+}
+
 fn resolved_model(base_url: &str, api: ApiKind, model_id: &str) -> ResolvedModelConfig {
+    resolved_model_with_window(base_url, api, model_id, None)
+}
+
+fn resolved_model_with_window(
+    base_url: &str,
+    api: ApiKind,
+    model_id: &str,
+    context_window: Option<u32>,
+) -> ResolvedModelConfig {
     let mut providers = BTreeMap::new();
     providers.insert(
         "test-provider".to_string(),
@@ -387,7 +657,7 @@ fn resolved_model(base_url: &str, api: ApiKind, model_id: &str) -> ResolvedModel
                 base_url: None,
                 reasoning: false,
                 input: Vec::new(),
-                context_window: None,
+                context_window,
                 max_tokens: Some(256),
                 compat: Default::default(),
             }],
@@ -419,6 +689,16 @@ impl CannedResponse {
             status: 200,
             content_type: "application/json",
             body: body.to_string(),
+        }
+    }
+
+    fn sse(text: &str) -> Self {
+        Self {
+            status: 200,
+            content_type: "text/event-stream",
+            body: format!(
+                "data: {{\"id\":\"chatcmpl_test\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"id\":\"chatcmpl_test\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+            ),
         }
     }
 }
