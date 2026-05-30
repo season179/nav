@@ -19,7 +19,7 @@ use crate::events::{
 };
 use crate::guardrails::{GuardrailError, ToolCallContext, ToolCallContextParams};
 use crate::models::{
-    ApiKind, DialectHttpRequest, EncodedRequest, OpenAiCompletionsCancellationToken,
+    ApiKind, DialectHttpRequest, EncodedRequest, ModelResolver, OpenAiCompletionsCancellationToken,
     OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsRequest,
     OpenAiCompletionsRequestContext, ResolvedModelConfig, anthropic_http_request, encode_request,
     extract_turn, responses_http_request,
@@ -141,6 +141,7 @@ pub struct RunLoopRequest<'a> {
     pub tool_context: &'a ToolContext,
     pub session_store: Option<&'a Arc<Mutex<SessionStore>>>,
     pub pending_confirmations: Option<&'a Arc<Mutex<PendingConfirmationRegistry>>>,
+    pub compaction_model_resolver: Option<&'a ModelResolver>,
     pub cancellation_token: OpenAiCompletionsCancellationToken,
 }
 
@@ -255,7 +256,12 @@ impl RunLoop {
                         && overflow_attempts < MAX_OVERFLOW_ATTEMPTS
                     {
                         overflow_attempts += 1;
-                        match self.recover_from_overflow(journal, model, request.run_id) {
+                        match self.recover_from_overflow(
+                            journal,
+                            model,
+                            request.compaction_model_resolver,
+                            request.run_id,
+                        ) {
                             Ok(recovered_turns) => {
                                 turns = recovered_turns;
                                 reload_store_turns = true;
@@ -366,6 +372,7 @@ impl RunLoop {
         &self,
         journal: ProviderJournal<'_>,
         model: &ResolvedModelConfig,
+        compaction_model_resolver: Option<&ModelResolver>,
         run_id: &RunId,
     ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
         let session_id = journal.session_id;
@@ -375,8 +382,17 @@ impl RunLoop {
             .unwrap()
             .compaction_summary_request(session_id, CompactionConfig::default())
             .map_err(persistence_error)?;
-        let summary = CompactionSummaryAgent::with_client(self.client.clone())
-            .generate(model, &summary_request)?;
+        let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
+        let compaction_model_override = match compaction_model_resolver {
+            Some(resolver) => resolver.resolve_compaction_model_override()?,
+            None => None,
+        };
+        let summary = match compaction_model_override {
+            Some(ref summary_model) => {
+                summary_agent.generate_stripped(summary_model, &summary_request)
+            }
+            None => summary_agent.generate(model, &summary_request),
+        }?;
 
         {
             let store = journal.store.lock().unwrap();

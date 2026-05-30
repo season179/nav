@@ -665,6 +665,7 @@ fn run_loop_with_token(
             tool_context: &context,
             session_store: Some(store),
             pending_confirmations: None,
+            compaction_model_resolver: None,
             cancellation_token,
         },
         &mut ids,
@@ -753,6 +754,7 @@ fn resolved_model_with_window(
             model: model_id.to_string(),
         }),
         providers,
+        ..ModelSettings::default()
     })
     .resolve_default()
     .unwrap()

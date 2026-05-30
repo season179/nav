@@ -14,7 +14,7 @@ use nav_harness::models::{
     OpenAiCompletionsCancellationToken, OpenAiCompletionsClient, ProviderConfig,
     ResolvedModelConfig,
 };
-use nav_harness::sessions::{ModelTurn, ModelTurnRole, SessionStore};
+use nav_harness::sessions::{ModelTurn, ModelTurnRole, SessionStore, TurnPart};
 use nav_harness::tools::{ToolContext, ToolPreset, ToolRegistry};
 use nav_types::{ApprovalId, EventId, MessageId, RunId, SessionId, ToolCallId};
 
@@ -114,6 +114,82 @@ fn overflow_error_triggers_compaction_and_completes_on_retry() {
             .any(|turn| turn.text_content().contains("Finish the overflow handler")),
         "the compaction summary should remain in the replay window"
     );
+
+    let request_bodies = server.request_bodies();
+    assert_eq!(request_bodies.len(), 3);
+    assert!(
+        request_bodies[1].contains("\"model\":\"overflow-model\""),
+        "without an override, the summary request should use the session model:\n{}",
+        request_bodies[1]
+    );
+}
+
+#[test]
+fn overflow_compaction_uses_model_override_when_configured() {
+    let session_server = FakeProviderServer::start(vec![
+        canned_context_limit(),
+        canned_stream_completion("Done."),
+    ]);
+    let summary_server =
+        FakeProviderServer::start(vec![canned_summary("## Active Task\nUse cheaper summary.")]);
+    let oversized_result = "x".repeat(6_000);
+    let store = oversize_session_with_strippable_summary_payload(&oversized_result);
+    let session_id = session_id();
+    let run_id = run_id(1);
+    let trigger_id = message_id(99);
+
+    let session_model = resolved_model_with_id(session_server.base_url(), "session-model");
+    let summary_model_resolver =
+        compaction_override_resolver(summary_server.base_url(), "summary-model");
+    let store = Arc::new(Mutex::new(store));
+    let turns = store.lock().unwrap().try_turns(&session_id).unwrap();
+
+    let result = run_overflow_loop_with_override(
+        &session_model,
+        Some(&summary_model_resolver),
+        &store,
+        &session_id,
+        &run_id,
+        &trigger_id,
+        &turns,
+    );
+
+    assert!(
+        matches!(result, RunLoopResult::Completed(_)),
+        "overflow recovery should complete with an override model, got {result:?}"
+    );
+    assert_eq!(
+        session_server.handled(),
+        2,
+        "session model should only receive the failed request and retry"
+    );
+    assert_eq!(
+        summary_server.handled(),
+        1,
+        "override model should receive the compaction summary request"
+    );
+
+    let summary_bodies = summary_server.request_bodies();
+    assert_eq!(summary_bodies.len(), 1);
+    assert!(
+        summary_bodies[0].contains("\"model\":\"summary-model\""),
+        "summary request should target override model but was:\n{}",
+        summary_bodies[0]
+    );
+    assert!(
+        !summary_bodies[0].contains("[image elided]"),
+        "override summary request should strip image placeholders:\n{}",
+        summary_bodies[0]
+    );
+    assert!(
+        !summary_bodies[0].contains(&oversized_result),
+        "override summary request should truncate oversized tool results"
+    );
+    assert!(
+        !summary_bodies[0].contains("\"tools\""),
+        "override summary request should not carry tool definitions:\n{}",
+        summary_bodies[0]
+    );
 }
 
 #[test]
@@ -159,6 +235,18 @@ fn run_overflow_loop(
     message_id: &MessageId,
     turns: &[ModelTurn],
 ) -> RunLoopResult {
+    run_overflow_loop_with_override(model, None, store, session_id, run_id, message_id, turns)
+}
+
+fn run_overflow_loop_with_override(
+    model: &ResolvedModelConfig,
+    compaction_model_resolver: Option<&ModelResolver>,
+    store: &Arc<Mutex<SessionStore>>,
+    session_id: &SessionId,
+    run_id: &RunId,
+    message_id: &MessageId,
+    turns: &[ModelTurn],
+) -> RunLoopResult {
     let run_loop = RunLoop::with_client(OpenAiCompletionsClient::new());
     let registry = ToolRegistry::default();
     let context = ToolContext::default();
@@ -176,6 +264,7 @@ fn run_overflow_loop(
             tool_context: &context,
             session_store: Some(store),
             pending_confirmations: None,
+            compaction_model_resolver,
             cancellation_token: OpenAiCompletionsCancellationToken::new(),
         },
         &mut ids,
@@ -209,6 +298,65 @@ fn oversize_session() -> SessionStore {
     store
 }
 
+fn oversize_session_with_strippable_summary_payload(oversized_result: &str) -> SessionStore {
+    let store = SessionStore::default();
+    let session_id = session_id();
+    let run_id = run_id(1);
+
+    store.create_session(session_id.clone()).unwrap();
+    store.start_run(&session_id, run_id.clone()).unwrap();
+    for index in 0..8 {
+        let turn = if index % 2 == 0 {
+            ModelTurn::user_text(format!("user turn {index} with a long oversize body"))
+        } else {
+            ModelTurn::assistant_text(format!("assistant turn {index} with a long oversize body"))
+        };
+        store.append_turn(&run_id, message_id(index), turn).unwrap();
+    }
+    store
+        .append_turn(
+            &run_id,
+            message_id(20),
+            ModelTurn {
+                role: ModelTurnRole::User,
+                parts: vec![
+                    TurnPart::Text {
+                        text: "[image elided]".to_string(),
+                        synthetic: Some(true),
+                    },
+                    TurnPart::Text {
+                        text: "Please continue from the screenshot.".to_string(),
+                        synthetic: None,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    store
+        .append_turn(
+            &run_id,
+            message_id(21),
+            ModelTurn::tool_result("tc1", oversized_result),
+        )
+        .unwrap();
+    store
+        .append_turn(
+            &run_id,
+            message_id(98),
+            ModelTurn::assistant_text("tail assistant turn"),
+        )
+        .unwrap();
+    store
+        .append_turn(
+            &run_id,
+            message_id(99),
+            ModelTurn::user_text("please finish the overflow handler"),
+        )
+        .unwrap();
+
+    store
+}
+
 fn continuation_count(turns: &[ModelTurn]) -> usize {
     turns
         .iter()
@@ -224,6 +372,10 @@ fn last_user_turn(turns: &[ModelTurn]) -> Option<&ModelTurn> {
 }
 
 fn resolved_model(base_url: &str) -> ResolvedModelConfig {
+    resolved_model_with_id(base_url, "overflow-model")
+}
+
+fn resolved_model_with_id(base_url: &str, model_id: &str) -> ResolvedModelConfig {
     let mut providers = BTreeMap::new();
     providers.insert(
         "test-provider".to_string(),
@@ -235,7 +387,7 @@ fn resolved_model(base_url: &str) -> ResolvedModelConfig {
                 inline: "test-secret".to_string(),
             },
             models: vec![ModelConfig {
-                id: "overflow-model".to_string(),
+                id: model_id.to_string(),
                 name: None,
                 api: None,
                 base_url: None,
@@ -252,12 +404,50 @@ fn resolved_model(base_url: &str) -> ResolvedModelConfig {
     ModelResolver::new(ModelSettings {
         default_model: Some(ModelRef {
             provider: "test-provider".to_string(),
-            model: "overflow-model".to_string(),
+            model: model_id.to_string(),
         }),
         providers,
+        ..ModelSettings::default()
     })
     .resolve_default()
     .unwrap()
+}
+
+fn compaction_override_resolver(base_url: &str, model_id: &str) -> ModelResolver {
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        "summary-provider".to_string(),
+        ProviderConfig {
+            name: None,
+            api: ApiKind::OpenAiCompletions,
+            base_url: base_url.to_string(),
+            api_key: ApiKeyConfig::Inline {
+                inline: "test-secret".to_string(),
+            },
+            models: vec![ModelConfig {
+                id: model_id.to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: Vec::new(),
+                context_window: None,
+                max_tokens: None,
+                compat: Default::default(),
+            }],
+            compat: Default::default(),
+        },
+    );
+    let mut settings = ModelSettings {
+        providers,
+        ..ModelSettings::default()
+    };
+    settings.compaction.model_override = Some(ModelRef {
+        provider: "summary-provider".to_string(),
+        model: model_id.to_string(),
+    });
+
+    ModelResolver::new(settings)
 }
 
 #[derive(Clone)]
@@ -304,6 +494,7 @@ fn canned_stream_completion(text: &str) -> CannedResponse {
 struct FakeProviderServer {
     base_url: String,
     handled: Arc<AtomicUsize>,
+    request_bodies: Arc<Mutex<Vec<String>>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -316,6 +507,8 @@ impl FakeProviderServer {
         let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         let handled = Arc::new(AtomicUsize::new(0));
         let handled_in_thread = Arc::clone(&handled);
+        let request_bodies = Arc::new(Mutex::new(Vec::new()));
+        let request_bodies_in_thread = Arc::clone(&request_bodies);
 
         let handle = thread::spawn(move || {
             for response in responses {
@@ -325,7 +518,8 @@ impl FakeProviderServer {
                 let Some(mut stream) = accept_before(&listener, Duration::from_secs(10)) else {
                     return;
                 };
-                drain_http_request(&mut stream);
+                let body = drain_http_request(&mut stream);
+                request_bodies_in_thread.lock().unwrap().push(body);
 
                 let header = format!(
                     "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -348,6 +542,7 @@ impl FakeProviderServer {
         Self {
             base_url,
             handled,
+            request_bodies,
             handle: Some(handle),
         }
     }
@@ -358,6 +553,10 @@ impl FakeProviderServer {
 
     fn handled(&self) -> usize {
         self.handled.load(Ordering::SeqCst)
+    }
+
+    fn request_bodies(&self) -> Vec<String> {
+        self.request_bodies.lock().unwrap().clone()
     }
 }
 
@@ -390,13 +589,13 @@ fn accept_before(listener: &TcpListener, timeout: Duration) -> Option<TcpStream>
     }
 }
 
-fn drain_http_request(stream: &mut TcpStream) {
+fn drain_http_request(stream: &mut TcpStream) -> String {
     let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).expect("header should read") == 0 {
-            return;
+            return String::new();
         }
         if line == "\r\n" || line == "\n" {
             break;
@@ -409,6 +608,7 @@ fn drain_http_request(stream: &mut TcpStream) {
     }
     let mut body = vec![0; content_length];
     reader.read_exact(&mut body).expect("body should read");
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 fn reason_phrase(status: u16) -> &'static str {

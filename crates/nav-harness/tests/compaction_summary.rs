@@ -8,12 +8,15 @@ use std::time::Duration;
 use nav_harness::compaction::COMPACTION_REPLAY_TEXT;
 use nav_harness::compaction::summary::{
     CompactionSummaryAgent, CompactionSummaryRequest, build_compaction_summary_request,
+    build_stripped_compaction_summary_request,
 };
 use nav_harness::models::{
     ApiKeyConfig, ApiKind, ModelConfig, ModelRef, ModelResolver, ModelSettings,
     OpenAiCompletionsError, ProviderConfig,
 };
-use nav_harness::sessions::{CompactionConfig, ModelTurn, SessionStore, ToolCall};
+use nav_harness::sessions::{
+    CompactionConfig, ModelTurn, ModelTurnRole, SessionStore, ToolCall, TurnPart,
+};
 use nav_types::{MessageId, RunId, SessionId};
 
 #[test]
@@ -215,6 +218,52 @@ fn summary_prompt_shows_none_when_previous_summary_has_no_files_section() {
     assert_eq!(
         cumulative_modified, "None",
         "cumulative Modified should be None when previous summary has no Files section"
+    );
+}
+
+#[test]
+fn stripped_summary_prompt_removes_image_placeholders_and_truncates_tool_results() {
+    let oversized_result = "x".repeat(6_000);
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: None,
+        head_turns: vec![
+            ModelTurn {
+                role: ModelTurnRole::User,
+                parts: vec![
+                    TurnPart::Text {
+                        text: "[image elided]".to_string(),
+                        synthetic: Some(true),
+                    },
+                    TurnPart::Text {
+                        text: "Please continue from the screenshot.".to_string(),
+                        synthetic: None,
+                    },
+                ],
+            },
+            ModelTurn::tool_result("tc1", oversized_result.clone()),
+        ],
+        tail_start_id: None,
+    };
+    let request = build_stripped_compaction_summary_request(&summary_request);
+    let prompt = request.messages[1]
+        .content
+        .as_ref()
+        .expect("user prompt should have content")
+        .as_str()
+        .expect("user prompt content should be text");
+
+    assert!(
+        !prompt.contains("[image elided]"),
+        "stripped prompt should not spend summary tokens on image placeholders:\n{prompt}"
+    );
+    assert!(prompt.contains("Please continue from the screenshot."));
+    assert!(
+        !prompt.contains(&oversized_result),
+        "stripped prompt should not include the full oversized tool result"
+    );
+    assert!(
+        prompt.contains("[truncated"),
+        "stripped prompt should label truncated tool result content:\n{prompt}"
     );
 }
 
@@ -561,6 +610,41 @@ fn compaction_summary_agent_calls_model_and_returns_assistant_text() {
 }
 
 #[test]
+fn compaction_summary_agent_uses_responses_dialect_for_responses_model() {
+    let server = SequencedResponseServer::new(vec![SequencedResponse::ok(
+        "{\"id\":\"resp_1\",\"model\":\"summary-model\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"## Active Task\\nResponses summary\"}]}]}",
+    )]);
+    let model = resolved_model_with_api(server.base_url(), ApiKind::OpenAiResponses);
+    let agent = CompactionSummaryAgent::new();
+    let summary_request = CompactionSummaryRequest {
+        previous_summary: None,
+        head_turns: vec![ModelTurn::user_text("summarize using responses")],
+        tail_start_id: None,
+    };
+
+    let summary = agent.generate_stripped(&model, &summary_request).unwrap();
+
+    assert_eq!(summary, "## Active Task\nResponses summary");
+    let request_bodies = server.request_bodies();
+    assert_eq!(request_bodies.len(), 1);
+    assert!(
+        request_bodies[0].contains("\"input\""),
+        "responses summary call should use Responses input shape:\n{}",
+        request_bodies[0]
+    );
+    assert!(
+        !request_bodies[0].contains("\"messages\""),
+        "responses summary call should not use Chat Completions messages:\n{}",
+        request_bodies[0]
+    );
+    assert!(
+        !request_bodies[0].contains("\"tools\""),
+        "summary override payload should not include tool definitions:\n{}",
+        request_bodies[0]
+    );
+}
+
+#[test]
 fn compaction_call_overflow_drops_oldest_head_turns_and_retries() {
     let overflow_body = "{\"error\":{\"message\":\"This model's maximum context length is exceeded\",\"code\":\"context_length_exceeded\"}}";
     let success_body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"## Active Task\\nRetried summary\"}}]}";
@@ -744,12 +828,19 @@ Incremental compaction carries prior completed actions forward."#
 }
 
 fn resolved_model(base_url: &str) -> nav_harness::models::ResolvedModelConfig {
+    resolved_model_with_api(base_url, ApiKind::OpenAiCompletions)
+}
+
+fn resolved_model_with_api(
+    base_url: &str,
+    api: ApiKind,
+) -> nav_harness::models::ResolvedModelConfig {
     let mut providers = BTreeMap::new();
     providers.insert(
         "test-provider".to_string(),
         ProviderConfig {
             name: None,
-            api: ApiKind::OpenAiCompletions,
+            api,
             base_url: base_url.to_string(),
             api_key: ApiKeyConfig::Inline {
                 inline: "test-secret".to_string(),
@@ -775,6 +866,7 @@ fn resolved_model(base_url: &str) -> nav_harness::models::ResolvedModelConfig {
             model: "summary-model".to_string(),
         }),
         providers,
+        ..ModelSettings::default()
     })
     .resolve_default()
     .unwrap()

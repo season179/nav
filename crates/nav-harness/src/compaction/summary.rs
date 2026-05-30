@@ -2,15 +2,21 @@
 
 use std::collections::BTreeSet;
 
+use crate::context::ContextReminders;
 use crate::models::{
-    ChatCompletionRequestMessage, ChatCompletionResponse, OpenAiCompletionsClient,
-    OpenAiCompletionsError, OpenAiCompletionsRequest, ResolvedModelConfig,
+    ApiKind, ChatCompletionRequestMessage, ChatCompletionResponse, DialectHttpRequest,
+    EncodedRequest, OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsRequest,
+    OpenAiCompletionsRequestContext, ResolvedModelConfig, anthropic_http_request, encode_request,
+    extract_turn, responses_http_request,
 };
 use crate::sessions::{ModelTurn, ModelTurnRole, TurnPart};
+use crate::tools::{ToolPreset, ToolRegistry};
 use nav_types::MessageId;
+use serde_json::Value;
 
 const SUMMARY_MAX_TOKENS: u32 = 1_200;
 const SUMMARY_TEMPERATURE: f64 = 0.2;
+const STRIPPED_TOOL_RESULT_MAX_CHARS: usize = 2_000;
 
 /// Maximum number of drop-oldest retries after the compaction call itself
 /// overflows the provider's context window. Bounds the PTL (Prompt Too Long)
@@ -81,6 +87,23 @@ impl CompactionSummaryAgent {
         model: &ResolvedModelConfig,
         request: &CompactionSummaryRequest,
     ) -> Result<String, OpenAiCompletionsError> {
+        self.generate_with_payload(model, request, SummaryPayload::Full)
+    }
+
+    pub fn generate_stripped(
+        &self,
+        model: &ResolvedModelConfig,
+        request: &CompactionSummaryRequest,
+    ) -> Result<String, OpenAiCompletionsError> {
+        self.generate_with_payload(model, request, SummaryPayload::Stripped)
+    }
+
+    fn generate_with_payload(
+        &self,
+        model: &ResolvedModelConfig,
+        request: &CompactionSummaryRequest,
+        payload: SummaryPayload,
+    ) -> Result<String, OpenAiCompletionsError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -99,10 +122,8 @@ impl CompactionSummaryAgent {
                 head_turns: head_turns.to_vec(),
                 tail_start_id: request.tail_start_id.clone(),
             };
-            let completion_request = build_compaction_summary_request(&attempt);
-
-            match runtime.block_on(self.client.complete(model, &completion_request)) {
-                Ok(response) => return summary_from_response(response),
+            match self.complete_summary(&runtime, model, &attempt, payload) {
+                Ok(summary) => return Ok(summary),
                 Err(OpenAiCompletionsError::ContextLimit(error)) => {
                     let smaller = drop_oldest_head_turns(head_turns);
                     if retries_left == 0 || smaller.len() == head_turns.len() {
@@ -115,6 +136,45 @@ impl CompactionSummaryAgent {
             }
         }
     }
+
+    fn complete_summary(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        model: &ResolvedModelConfig,
+        request: &CompactionSummaryRequest,
+        payload: SummaryPayload,
+    ) -> Result<String, OpenAiCompletionsError> {
+        match model.api {
+            ApiKind::OpenAiCompletions | ApiKind::ChatGptSubscription => {
+                let completion_request =
+                    build_compaction_summary_request_with_payload(request, payload);
+                let response =
+                    runtime.block_on(self.client.complete(model, &completion_request))?;
+                summary_from_response(response)
+            }
+            ApiKind::OpenAiResponses | ApiKind::AnthropicMessages => {
+                let turns = compaction_prompt_turns(request, payload);
+                let registry = ToolRegistry::default();
+                let encoded = encode_request(
+                    model.api,
+                    &turns,
+                    &registry,
+                    ToolPreset::Coding,
+                    None,
+                    &ContextReminders::new(),
+                );
+                let http_request = dialect_http_request(model, &encoded)?;
+                let request_context = OpenAiCompletionsRequestContext::new();
+                let response = runtime.block_on(self.client.send_non_streaming(
+                    model,
+                    &http_request,
+                    &request_context,
+                ))?;
+
+                summary_from_dialect_response(model.api, &response)
+            }
+        }
+    }
 }
 
 fn summary_from_response(
@@ -124,10 +184,26 @@ fn summary_from_response(
         .choices
         .first()
         .and_then(|choice| choice.message.content.clone())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+        .unwrap_or_default();
 
+    summary_from_text(summary)
+}
+
+fn summary_from_dialect_response(
+    api: ApiKind,
+    raw_bytes: &[u8],
+) -> Result<String, OpenAiCompletionsError> {
+    let response: Value = serde_json::from_slice(raw_bytes).map_err(|error| {
+        OpenAiCompletionsError::MalformedResponse {
+            message: format!("failed to parse compaction response: {error}"),
+        }
+    })?;
+    let extracted = extract_turn(api, &response);
+    summary_from_text(extracted.text)
+}
+
+fn summary_from_text(summary: impl AsRef<str>) -> Result<String, OpenAiCompletionsError> {
+    let summary = summary.as_ref().trim().to_string();
     if summary.is_empty() {
         return Err(OpenAiCompletionsError::MalformedResponse {
             message: "summary response did not include assistant text".to_string(),
@@ -135,6 +211,17 @@ fn summary_from_response(
     }
 
     Ok(summary)
+}
+
+fn dialect_http_request(
+    model: &ResolvedModelConfig,
+    encoded: &EncodedRequest,
+) -> Result<DialectHttpRequest, OpenAiCompletionsError> {
+    match encoded {
+        EncodedRequest::Responses(request) => responses_http_request(model, request),
+        EncodedRequest::Anthropic(request) => anthropic_http_request(model, request),
+        EncodedRequest::Completions(_) => unreachable!("Chat Completions uses complete()"),
+    }
 }
 
 /// Drop the oldest head turns ahead of a PTL retry, removing the front half so
@@ -150,12 +237,31 @@ fn drop_oldest_head_turns(turns: &[ModelTurn]) -> &[ModelTurn] {
     &turns[drop..]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryPayload {
+    Full,
+    Stripped,
+}
+
 pub fn build_compaction_summary_request(
     request: &CompactionSummaryRequest,
 ) -> OpenAiCompletionsRequest {
+    build_compaction_summary_request_with_payload(request, SummaryPayload::Full)
+}
+
+pub fn build_stripped_compaction_summary_request(
+    request: &CompactionSummaryRequest,
+) -> OpenAiCompletionsRequest {
+    build_compaction_summary_request_with_payload(request, SummaryPayload::Stripped)
+}
+
+fn build_compaction_summary_request_with_payload(
+    request: &CompactionSummaryRequest,
+    payload: SummaryPayload,
+) -> OpenAiCompletionsRequest {
     let mut completion_request = OpenAiCompletionsRequest::new(vec![
         ChatCompletionRequestMessage::system(SYSTEM_PROMPT),
-        ChatCompletionRequestMessage::user(summary_user_prompt(request)),
+        ChatCompletionRequestMessage::user(summary_user_prompt(request, payload)),
     ]);
     completion_request.max_tokens = Some(SUMMARY_MAX_TOKENS);
     completion_request.temperature = Some(SUMMARY_TEMPERATURE);
@@ -163,13 +269,23 @@ pub fn build_compaction_summary_request(
     completion_request
 }
 
-fn summary_user_prompt(request: &CompactionSummaryRequest) -> String {
+fn compaction_prompt_turns(
+    request: &CompactionSummaryRequest,
+    payload: SummaryPayload,
+) -> Vec<ModelTurn> {
+    vec![
+        ModelTurn::system_text(SYSTEM_PROMPT),
+        ModelTurn::user_text(summary_user_prompt(request, payload)),
+    ]
+}
+
+fn summary_user_prompt(request: &CompactionSummaryRequest, payload: SummaryPayload) -> String {
     let previous_summary = request
         .previous_summary
         .as_deref()
         .filter(|summary| !summary.trim().is_empty())
         .unwrap_or("None");
-    let head_turns = format_head_turns(&request.head_turns);
+    let head_turns = format_head_turns(&request.head_turns, payload);
     let (read_list, modified_list) = collect_file_lists(previous_summary, &request.head_turns);
 
     format!(
@@ -200,7 +316,7 @@ Cumulative file tracking (merge these into your ## Files section):
     )
 }
 
-fn format_head_turns(turns: &[ModelTurn]) -> String {
+fn format_head_turns(turns: &[ModelTurn], payload: SummaryPayload) -> String {
     if turns.is_empty() {
         return "None".to_string();
     }
@@ -208,7 +324,13 @@ fn format_head_turns(turns: &[ModelTurn]) -> String {
     turns
         .iter()
         .enumerate()
-        .map(|(index, turn)| format!("{}: {}", turn_label(index + 1, turn.role), turn_text(turn)))
+        .map(|(index, turn)| {
+            format!(
+                "{}: {}",
+                turn_label(index + 1, turn.role),
+                turn_text(turn, payload)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -224,11 +346,11 @@ fn turn_label(index: usize, role: ModelTurnRole) -> String {
     format!("Turn {index} ({role_name})")
 }
 
-fn turn_text(turn: &ModelTurn) -> String {
+fn turn_text(turn: &ModelTurn, payload: SummaryPayload) -> String {
     let text = turn
         .parts
         .iter()
-        .map(part_text)
+        .map(|part| part_text(part, payload))
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
@@ -240,9 +362,9 @@ fn turn_text(turn: &ModelTurn) -> String {
     }
 }
 
-fn part_text(part: &TurnPart) -> String {
+fn part_text(part: &TurnPart, payload: SummaryPayload) -> String {
     match part {
-        TurnPart::Text { text, .. } => text.clone(),
+        TurnPart::Text { text, .. } => text_for_payload(text, payload),
         TurnPart::ToolCall(tool_call) => {
             format!("[tool call: {} {}]", tool_call.name, tool_call.arguments)
         }
@@ -250,9 +372,41 @@ fn part_text(part: &TurnPart) -> String {
             tool_call_id,
             content,
         } => {
+            let content = tool_result_for_payload(content, payload);
             format!("[tool result: {tool_call_id}]\n{content}")
         }
     }
+}
+
+fn text_for_payload(text: &str, payload: SummaryPayload) -> String {
+    match payload {
+        SummaryPayload::Full => text.to_string(),
+        SummaryPayload::Stripped => text
+            .lines()
+            .filter(|line| line.trim() != "[image elided]")
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn tool_result_for_payload(content: &str, payload: SummaryPayload) -> String {
+    match payload {
+        SummaryPayload::Full => content.to_string(),
+        SummaryPayload::Stripped => truncate_tool_result(content),
+    }
+}
+
+fn truncate_tool_result(content: &str) -> String {
+    if content.chars().count() <= STRIPPED_TOOL_RESULT_MAX_CHARS {
+        return content.to_string();
+    }
+
+    let truncated = content
+        .chars()
+        .take(STRIPPED_TOOL_RESULT_MAX_CHARS)
+        .collect::<String>();
+
+    format!("{truncated}\n[truncated tool result: kept {STRIPPED_TOOL_RESULT_MAX_CHARS} chars]")
 }
 
 fn collect_file_lists(previous_summary: &str, head_turns: &[ModelTurn]) -> (String, String) {

@@ -2458,6 +2458,21 @@ fn session_send_message_streams_run_failed_when_default_model_cannot_resolve() {
 }
 
 #[test]
+fn session_send_message_does_not_resolve_compaction_override_until_compaction() {
+    let provider = successful_provider_with_text("hello without compaction");
+    let mut server = HttpServer::with_model_settings(
+        HttpServerConfig::default(),
+        model_settings_with_missing_compaction_override_key(provider.base_url()),
+    );
+    let session_id = create_session(&mut server);
+
+    let run_id = send_message_text(&mut server, &session_id, "normal run");
+
+    assert_eq!(provider.request().path, "/v1/chat/completions");
+    wait_for_run_status(&server, &run_id, RunStatus::Completed);
+}
+
+#[test]
 fn run_cancel_rejects_completed_runs_without_adding_events() {
     let provider = successful_provider_with_text("hello");
     let mut server = HttpServer::with_model_settings(
@@ -3087,14 +3102,49 @@ fn missing_key_model_settings() -> ModelSettings {
         .providers
         .get_mut("compatible-gateway")
         .expect("fixture should include provider");
-    let missing_env_var = (0u32..)
-        .map(|index| format!("NAV_TEST_MISSING_API_KEY_{}_{}", std::process::id(), index))
-        .find(|name| std::env::var_os(name).is_none())
-        .expect("should find an unset env var name for test fixture");
     provider.api_key = ApiKeyConfig::EnvVar {
-        env_var: missing_env_var,
+        env_var: missing_api_key_env_var(),
     };
     settings
+}
+
+fn model_settings_with_missing_compaction_override_key(base_url: String) -> ModelSettings {
+    let mut settings = model_settings_with_base_url(base_url);
+    settings.compaction.model_override = Some(ModelRef {
+        provider: "summary-gateway".to_string(),
+        model: "summary-model".to_string(),
+    });
+    settings.providers.insert(
+        "summary-gateway".to_string(),
+        ProviderConfig {
+            name: Some("Summary Gateway".to_string()),
+            api: ApiKind::OpenAiCompletions,
+            base_url: "https://summary.example.com/v1".to_string(),
+            api_key: ApiKeyConfig::EnvVar {
+                env_var: missing_api_key_env_var(),
+            },
+            models: vec![ModelConfig {
+                id: "summary-model".to_string(),
+                name: None,
+                api: None,
+                base_url: None,
+                reasoning: false,
+                input: vec![ModelInput::Text],
+                context_window: None,
+                max_tokens: None,
+                compat: ProviderCompat::default(),
+            }],
+            compat: ProviderCompat::default(),
+        },
+    );
+    settings
+}
+
+fn missing_api_key_env_var() -> String {
+    (0u32..)
+        .map(|index| format!("NAV_TEST_MISSING_API_KEY_{}_{}", std::process::id(), index))
+        .find(|name| std::env::var_os(name).is_none())
+        .expect("should find an unset env var name for test fixture")
 }
 
 fn request_id(index: u64) -> String {

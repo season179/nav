@@ -30,6 +30,23 @@ impl ModelResolver {
         self.resolve_ref_with_env(model_ref, env)
     }
 
+    pub fn resolve_compaction_model_override(
+        &self,
+    ) -> Result<Option<ResolvedModelConfig>, ResolveModelError> {
+        self.resolve_compaction_model_override_with_env(process_env)
+    }
+
+    pub fn resolve_compaction_model_override_with_env(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Option<ResolvedModelConfig>, ResolveModelError> {
+        let Some(model_ref) = self.settings.compaction.model_override.as_ref() else {
+            return Ok(None);
+        };
+
+        self.resolve_ref_with_env(model_ref, env).map(Some)
+    }
+
     pub fn resolve(
         &self,
         provider_id: &str,
