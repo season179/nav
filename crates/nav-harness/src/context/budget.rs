@@ -17,7 +17,7 @@ const DENSE_CHARS_PER_TOKEN: f64 = 2.0;
 
 /// Pixels per token for the pixel-based image estimate
 /// (provider-documented `tokens ≈ width × height / 750`).
-const IMAGE_PIXELS_PER_TOKEN: f64 = 750.0;
+const IMAGE_PIXELS_PER_TOKEN: u64 = 750;
 
 /// Conservative flat token estimate for a resized image whose pixel
 /// dimensions are unknown. Deliberately errs high: under-counting media is the
@@ -121,7 +121,10 @@ fn estimate_tokens_for_part(part: &Part) -> u64 {
 pub fn estimate_image_tokens(dimensions: Option<(u32, u32)>) -> u64 {
     match dimensions {
         Some((width, height)) => {
-            (f64::from(width) * f64::from(height) / IMAGE_PIXELS_PER_TOKEN).ceil() as u64
+            // Integer ceil-division: exact, with no float rounding that could
+            // silently under-count a very large image.
+            let pixels = u128::from(width) * u128::from(height);
+            pixels.div_ceil(u128::from(IMAGE_PIXELS_PER_TOKEN)) as u64
         }
         None => IMAGE_FLAT_FALLBACK_TOKENS,
     }
