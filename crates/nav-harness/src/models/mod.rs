@@ -5,6 +5,7 @@ pub mod compat;
 pub mod config;
 pub mod context_limit;
 pub mod decode;
+pub mod dialect;
 pub mod encode;
 pub mod model;
 pub mod openai_completions;
@@ -22,6 +23,10 @@ pub use decode::{
     ChatGptSubscriptionDecoder, DecodeError, DecodedPart, DecodedProviderPayload, DecodedTurn,
     Decoder, OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
     OpenAiResponsesDecodeInput, OpenAiResponsesDecoder,
+};
+pub use dialect::{
+    AuthStyle, DialectHttpRequest, EncodedRequest, ExtractedToolCall, ExtractedTurn,
+    anthropic_http_request, encode_request, extract_turn, responses_http_request,
 };
 pub use encode::{
     AnthropicMessagesEncoder, AnthropicMessagesRequest, AnthropicToolDefinition,

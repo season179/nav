@@ -633,6 +633,43 @@ impl SessionStore {
             )
     }
 
+    /// Decode a journaled response payload with the decoder registered for its
+    /// stored `api_kind`, persist the decoded turns, and return the assistant
+    /// turn's message id (if any).
+    ///
+    /// This is the live-loop counterpart to the pending-payload recovery path:
+    /// it dispatches the decoder by dialect rather than assuming Chat
+    /// Completions.
+    pub fn decode_and_append_provider_payload(
+        &self,
+        id: &ProviderPayloadId,
+    ) -> Result<Option<MessageId>, SqliteStoreError> {
+        let payload = self.sqlite.get_provider_payload(id)?;
+        let Some(decoder) =
+            decoder_for_api_kind(DEFAULT_PAYLOAD_DECODERS, payload.api_kind.as_str())
+        else {
+            return Err(SqliteStoreError::ReadFailed(format!(
+                "no decoder registered for api_kind `{}`",
+                payload.api_kind
+            )));
+        };
+
+        let raw_bytes = self
+            .read_provider_payload_bytes(&payload)
+            .map_err(SqliteStoreError::ReadFailed)?;
+        let decoded = (decoder.decode)(&payload, raw_bytes).map_err(SqliteStoreError::ReadFailed)?;
+        let assistant_message_id = decoded
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| turn.turn.role == TurnRole::Assistant)
+            .map(|turn| turn.turn.id.clone());
+
+        self.sqlite
+            .append_decoded_provider_payload(id, decoder.version, &decoded)?;
+        Ok(assistant_message_id)
+    }
+
     pub fn get_provider_state(
         &self,
         run_id: &RunId,

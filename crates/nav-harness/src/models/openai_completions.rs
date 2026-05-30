@@ -17,6 +17,7 @@ use tokio::sync::Notify;
 use crate::sessions::{ModelTurn, ModelTurnRole, ToolCall};
 use crate::tools::{NavTool, ToolPreset, ToolRegistry};
 
+use super::dialect::{ANTHROPIC_VERSION, AuthStyle, DialectHttpRequest};
 use super::{
     ApiKind, ContextLimitError, MaxTokensField, ProviderRoutingCompat, ResolveModelError,
     ResolvedModelConfig, ThinkingFormat, classify_context_limit, classify_streamed_context_limit,
@@ -561,7 +562,7 @@ impl OpenAiCompletionsRequestContext {
         self
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.cancellation_token
             .as_ref()
             .is_some_and(OpenAiCompletionsCancellationToken::is_cancelled)
@@ -660,6 +661,63 @@ impl OpenAiCompletionsClient {
             endpoint: chat_completions_endpoint(&model.base_url)?,
             body: request_body(model, request),
         })
+    }
+
+    /// Send a non-streaming request for a dialect other than Chat Completions
+    /// (OpenAI Responses, Anthropic Messages) and return the raw response body.
+    ///
+    /// Unlike [`Self::complete`], this does not assume a Chat Completions body or
+    /// endpoint — the caller supplies the dialect's endpoint, body, and auth via
+    /// [`DialectHttpRequest`].
+    pub async fn send_non_streaming(
+        &self,
+        model: &ResolvedModelConfig,
+        request: &DialectHttpRequest,
+    ) -> Result<Vec<u8>, OpenAiCompletionsError> {
+        let api_key = model.api_key.expose_secret();
+        if api_key.trim().is_empty() {
+            return Err(OpenAiCompletionsError::MissingApiKey {
+                provider_id: model.provider_id.clone(),
+                env_var: None,
+            });
+        }
+
+        let builder = self
+            .http
+            .post(&request.endpoint)
+            .timeout(OPENAI_COMPLETIONS_REQUEST_TIMEOUT)
+            .json(&request.body);
+        let builder = match request.auth {
+            AuthStyle::Bearer => builder.bearer_auth(api_key),
+            AuthStyle::AnthropicApiKey => builder
+                .header("x-api-key", api_key)
+                .header("anthropic-version", ANTHROPIC_VERSION),
+        };
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|error| OpenAiCompletionsError::Transport {
+                message: redact_secret(&error.to_string(), api_key),
+            })?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| OpenAiCompletionsError::Transport {
+                message: redact_secret(&error.to_string(), api_key),
+            })?;
+
+        if !status.is_success() {
+            return Err(OpenAiCompletionsResponseParser::parse_error_response(
+                status.as_u16(),
+                &body,
+                api_key,
+            ));
+        }
+
+        Ok(body.into_bytes())
     }
 
     pub async fn complete(

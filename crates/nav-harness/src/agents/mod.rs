@@ -17,15 +17,15 @@ use crate::events::{
 };
 use crate::guardrails::{GuardrailError, ToolCallContext, ToolCallContextParams};
 use crate::models::{
-    Decoder, Encoder, OpenAiChatCompletionsDecodeInput, OpenAiChatCompletionsDecoder,
-    OpenAiChatCompletionsEncoder, OpenAiCompletionsCancellationToken, OpenAiCompletionsClient,
-    OpenAiCompletionsError, OpenAiCompletionsRequest, OpenAiCompletionsRequestContext,
-    ResolvedModelConfig,
+    ApiKind, DialectHttpRequest, EncodedRequest, OpenAiCompletionsCancellationToken,
+    OpenAiCompletionsClient, OpenAiCompletionsError, OpenAiCompletionsRequest,
+    OpenAiCompletionsRequestContext, ResolvedModelConfig, anthropic_http_request, encode_request,
+    extract_turn, responses_http_request,
 };
 use crate::sessions::{
-    CompactionConfig, ConfirmationDecision, ModelTurn, NewProviderPayload,
-    OPENAI_CHAT_COMPLETIONS_DECODER_VERSION, PendingConfirmation, PendingConfirmationReceiver,
-    PendingConfirmationRegistry, ProviderPayloadDirection, SessionStore, ToolCall, TurnRole,
+    CompactionConfig, ConfirmationDecision, ModelTurn, NewProviderPayload, PendingConfirmation,
+    PendingConfirmationReceiver, PendingConfirmationRegistry, ProviderPayloadDirection,
+    SessionStore, ToolCall,
 };
 use crate::tools::{
     NavTool, ToolCancellationToken, ToolContext, ToolOutput, ToolOutputDelta, ToolOutputReceiver,
@@ -120,13 +120,13 @@ impl RunLoop {
                 }
                 project_model_turns_for_tool_result_pruning(&mut turns);
             }
-            let completion_request =
-                encode_completion_request(&turns, request.tool_registry, request.tool_preset);
+            let encoded =
+                encode_request(model.api, &turns, request.tool_registry, request.tool_preset);
             if let Some(journal) = journal {
                 if let Err(error) = self.journal_request_payload(
                     journal,
                     model,
-                    &completion_request,
+                    &encoded,
                     request.run_id,
                     payload_sequence,
                 ) {
@@ -134,10 +134,10 @@ impl RunLoop {
                 }
                 payload_sequence += 1;
             }
-            let model_turn = match self.stream_model_turn(StreamModelTurnRequest {
+            let model_turn = match self.stream_turn(StreamTurnRequest {
                 runtime: &runtime,
                 model,
-                completion_request: &completion_request,
+                encoded: &encoded,
                 request_context: &request_context,
                 output_context: &output_context,
                 ids,
@@ -301,11 +301,11 @@ impl RunLoop {
         &self,
         journal: ProviderJournal<'_>,
         model: &ResolvedModelConfig,
-        request: &OpenAiCompletionsRequest,
+        encoded: &EncodedRequest,
         run_id: &RunId,
         sequence: u32,
     ) -> Result<ProviderPayloadId, OpenAiCompletionsError> {
-        let raw_bytes = streaming_request_body(&self.client, model, request)?;
+        let raw_bytes = encoded_request_body(&self.client, model, encoded)?;
         append_provider_payload(
             journal,
             NewProviderPayload {
@@ -405,12 +405,16 @@ impl RunLoop {
                 sequence,
                 provider_payload_id: output.provider_response_id.clone(),
                 mime: "application/json".to_string(),
-                raw_bytes: raw_bytes.clone(),
+                raw_bytes,
                 created_at,
             },
         )?;
-        let assistant_message_id =
-            append_decoded_response(journal, &payload_id, raw_bytes).map_err(persistence_error)?;
+        let assistant_message_id = journal
+            .store
+            .lock()
+            .unwrap()
+            .decode_and_append_provider_payload(&payload_id)
+            .map_err(persistence_error)?;
         Ok(JournaledProviderPayload {
             id: payload_id,
             assistant_message_id,
@@ -442,6 +446,95 @@ impl RunLoop {
                 created_at: payload_created_at(sequence),
             },
         )
+    }
+
+    /// Drive one model turn for the resolved dialect: Chat Completions streams
+    /// token-by-token; other dialects fetch a single non-streaming response and
+    /// synthesize the equivalent events.
+    fn stream_turn<Ids, Emit>(
+        &self,
+        request: StreamTurnRequest<'_, Ids, Emit>,
+    ) -> Result<ModelTurnOutput, Box<ModelTurnStreamError>>
+    where
+        Ids: HarnessEventIdSource,
+        Emit: FnMut(Vec<HarnessEventEnvelope>),
+    {
+        let StreamTurnRequest {
+            runtime,
+            model,
+            encoded,
+            request_context,
+            output_context,
+            ids,
+            emit,
+        } = request;
+
+        match encoded {
+            EncodedRequest::Completions(completion_request) => {
+                self.stream_model_turn(StreamModelTurnRequest {
+                    runtime,
+                    model,
+                    completion_request,
+                    request_context,
+                    output_context,
+                    ids,
+                    emit,
+                })
+            }
+            EncodedRequest::Responses(_) | EncodedRequest::Anthropic(_) => self
+                .fetch_dialect_turn(FetchDialectTurnRequest {
+                    runtime,
+                    model,
+                    encoded,
+                    request_context,
+                    output_context,
+                    ids,
+                    emit,
+                }),
+        }
+    }
+
+    /// Fetch a single non-streaming response for a non-Chat-Completions dialect
+    /// and project it into the same `ModelTurnOutput` the streaming path yields.
+    fn fetch_dialect_turn<Ids, Emit>(
+        &self,
+        request: FetchDialectTurnRequest<'_, Ids, Emit>,
+    ) -> Result<ModelTurnOutput, Box<ModelTurnStreamError>>
+    where
+        Ids: HarnessEventIdSource,
+        Emit: FnMut(Vec<HarnessEventEnvelope>),
+    {
+        let FetchDialectTurnRequest {
+            runtime,
+            model,
+            encoded,
+            request_context,
+            output_context,
+            ids,
+            emit,
+        } = request;
+
+        if request_context.is_cancelled() {
+            return Err(dialect_stream_error(OpenAiCompletionsError::Cancelled));
+        }
+
+        let http_request = dialect_http_request(model, encoded).map_err(dialect_stream_error)?;
+        let raw_bytes = runtime
+            .block_on(self.client.send_non_streaming(model, &http_request))
+            .map_err(dialect_stream_error)?;
+        let response: Value = serde_json::from_slice(&raw_bytes).map_err(|error| {
+            dialect_stream_error(OpenAiCompletionsError::MalformedResponse {
+                message: format!("failed to parse provider response: {error}"),
+            })
+        })?;
+
+        Ok(dialect_model_turn_output(
+            model.api,
+            response,
+            output_context,
+            ids,
+            emit,
+        ))
     }
 
     fn stream_model_turn<Ids, Emit>(
@@ -548,14 +641,31 @@ fn tool_context_with_revert_recorder(
         ))
 }
 
-fn encode_completion_request(
-    turns: &[ModelTurn],
-    tool_registry: &ToolRegistry,
-    tool_preset: ToolPreset,
-) -> OpenAiCompletionsRequest {
-    let encoder =
-        OpenAiChatCompletionsEncoder::new().with_tool_registry(tool_registry, tool_preset);
-    Encoder::encode(&encoder, turns).unwrap_or_else(|never| match never {})
+/// Serialize the wire body for a journaled request envelope, per dialect.
+fn encoded_request_body(
+    client: &OpenAiCompletionsClient,
+    model: &ResolvedModelConfig,
+    encoded: &EncodedRequest,
+) -> Result<Vec<u8>, OpenAiCompletionsError> {
+    match encoded {
+        EncodedRequest::Completions(request) => streaming_request_body(client, model, request),
+        EncodedRequest::Responses(_) | EncodedRequest::Anthropic(_) => {
+            let http_request = dialect_http_request(model, encoded)?;
+            serde_json::to_vec(&http_request.body).map_err(json_error)
+        }
+    }
+}
+
+/// Build the non-streaming HTTP request for a non-Chat-Completions dialect.
+fn dialect_http_request(
+    model: &ResolvedModelConfig,
+    encoded: &EncodedRequest,
+) -> Result<DialectHttpRequest, OpenAiCompletionsError> {
+    match encoded {
+        EncodedRequest::Responses(request) => responses_http_request(model, request),
+        EncodedRequest::Anthropic(request) => anthropic_http_request(model, request),
+        EncodedRequest::Completions(_) => unreachable!("Chat Completions uses the streaming path"),
+    }
 }
 
 fn streaming_request_body(
@@ -567,6 +677,171 @@ fn streaming_request_body(
     streaming_request.stream = true;
     let plan = client.build_request(model, &streaming_request)?;
     serde_json::to_vec(&plan.body).map_err(json_error)
+}
+
+fn dialect_stream_error(error: OpenAiCompletionsError) -> Box<ModelTurnStreamError> {
+    Box::new(ModelTurnStreamError {
+        error,
+        partial_output: None,
+    })
+}
+
+/// Project a non-streaming dialect response into a `ModelTurnOutput`, emitting
+/// the same event sequence the Chat Completions streaming path produces (text
+/// delta, tool-call lifecycle, message completion) and reserving `RunCompleted`
+/// as a terminal event.
+fn dialect_model_turn_output<Ids, Emit>(
+    api: ApiKind,
+    response: Value,
+    output_context: &ModelOutputContext,
+    ids: &mut Ids,
+    emit: &mut Emit,
+) -> ModelTurnOutput
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    let extracted = extract_turn(api, &response);
+    let base_metadata = ProviderEventMetadata {
+        provider_id: output_context.provider_id.clone(),
+        configured_model_id: output_context.configured_model_id.clone(),
+        provider_response_id: extracted.provider_response_id.clone(),
+        provider_model: extracted.provider_model.clone(),
+        choice_index: None,
+        provider_tool_call_id: None,
+        usage: None,
+    };
+
+    let mut stream_events = Vec::new();
+    if !extracted.text.is_empty() {
+        push_dialect_event(
+            &mut stream_events,
+            ids,
+            HarnessEvent::ModelTextDelta {
+                run_id: output_context.run_id.clone(),
+                message_id: output_context.message_id.clone(),
+                delta: extracted.text.clone(),
+                metadata: base_metadata.clone(),
+            },
+        );
+    }
+
+    let mut tool_calls = Vec::new();
+    for extracted_call in &extracted.tool_calls {
+        let tool_call_id = ids.next_tool_call_id();
+        let metadata = ProviderEventMetadata {
+            provider_tool_call_id: Some(extracted_call.provider_id.clone()),
+            ..base_metadata.clone()
+        };
+        push_dialect_event(
+            &mut stream_events,
+            ids,
+            HarnessEvent::ToolCallStarted {
+                run_id: output_context.run_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                name: Some(extracted_call.name.clone()),
+                metadata: metadata.clone(),
+            },
+        );
+        push_dialect_event(
+            &mut stream_events,
+            ids,
+            HarnessEvent::ToolCallDelta {
+                run_id: output_context.run_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                arguments_delta: extracted_call.arguments.clone(),
+                metadata: metadata.clone(),
+            },
+        );
+        push_dialect_event(
+            &mut stream_events,
+            ids,
+            HarnessEvent::ToolCallCompleted {
+                run_id: output_context.run_id.clone(),
+                tool_call_id: tool_call_id.clone(),
+                name: Some(extracted_call.name.clone()),
+                arguments: extracted_call.arguments.clone(),
+                output: None,
+                output_lossy: None,
+                metadata: metadata.clone(),
+            },
+        );
+        // The Responses/Anthropic ModelTurn encoders resolve a tool call's wire
+        // id via `model_tool_call_id`, which prefers the nav `tool_call_id`,
+        // while tool-result dispatch keys off `ToolCall.id`. Carry the nav id in
+        // both so the re-encoded `tool_use`/`tool_result` pair share an id (the
+        // raw provider id stays on `provider_tool_call_id` for event metadata).
+        tool_calls.push(ToolCall {
+            id: tool_call_id.to_string(),
+            tool_call_id: Some(tool_call_id),
+            name: extracted_call.name.clone(),
+            arguments: extracted_call.arguments.clone(),
+        });
+    }
+
+    push_dialect_event(
+        &mut stream_events,
+        ids,
+        HarnessEvent::MessageCompleted {
+            run_id: output_context.run_id.clone(),
+            message_id: output_context.message_id.clone(),
+            finish_reason: extracted.finish_reason.clone(),
+            metadata: base_metadata.clone(),
+        },
+    );
+
+    if !stream_events.is_empty() {
+        emit(stream_events);
+    }
+
+    let terminal_events = vec![dialect_event_envelope(
+        ids,
+        HarnessEvent::RunCompleted {
+            run_id: output_context.run_id.clone(),
+            metadata: base_metadata,
+        },
+    )];
+
+    ModelTurnOutput {
+        assistant_turn: dialect_assistant_turn(&extracted.text, &tool_calls),
+        tool_calls,
+        terminal_events,
+        response_payload: response,
+        provider_response_id: extracted.provider_response_id,
+    }
+}
+
+fn dialect_assistant_turn(text: &str, tool_calls: &[ToolCall]) -> Option<ModelTurn> {
+    if tool_calls.is_empty() {
+        return (!text.is_empty()).then(|| ModelTurn::assistant_text(text.to_string()));
+    }
+
+    if text.is_empty() {
+        Some(ModelTurn::assistant_tool_calls(tool_calls.to_vec()))
+    } else {
+        Some(ModelTurn::assistant_text_with_tool_calls(
+            text.to_string(),
+            tool_calls.to_vec(),
+        ))
+    }
+}
+
+fn push_dialect_event(
+    events: &mut Vec<HarnessEventEnvelope>,
+    ids: &mut impl HarnessEventIdSource,
+    event: HarnessEvent,
+) {
+    events.push(dialect_event_envelope(ids, event));
+}
+
+fn dialect_event_envelope(
+    ids: &mut impl HarnessEventIdSource,
+    event: HarnessEvent,
+) -> HarnessEventEnvelope {
+    HarnessEventEnvelope {
+        event_id: ids.next_event_id(),
+        event,
+    }
 }
 
 fn append_provider_payload(
@@ -590,48 +865,6 @@ fn prune_stored_tool_results_for_encoding(
         .unwrap()
         .prune_tool_results_for_session(journal.session_id)
         .map_err(persistence_error)
-}
-
-fn append_decoded_response(
-    journal: ProviderJournal<'_>,
-    payload_id: &ProviderPayloadId,
-    raw_bytes: Vec<u8>,
-) -> Result<Option<MessageId>, String> {
-    let payload = journal
-        .store
-        .lock()
-        .unwrap()
-        .get_provider_payload(payload_id)
-        .map_err(|error| error.to_string())?;
-    let decoded = OpenAiChatCompletionsDecoder::new()
-        .decode(&OpenAiChatCompletionsDecodeInput {
-            provider_payload_id: payload.id.clone(),
-            raw_artifact_id: payload.artifact_id,
-            run_id: payload.run_id,
-            provider_id: payload.provider_id,
-            raw_json: raw_bytes,
-            created_at: payload.created_at,
-        })
-        .map_err(|error| error.to_string())?;
-    let assistant_message_id = decoded
-        .turns
-        .iter()
-        .rev()
-        .find(|turn| turn.turn.role == TurnRole::Assistant)
-        .map(|turn| turn.turn.id.clone());
-
-    journal
-        .store
-        .lock()
-        .unwrap()
-        .append_decoded_provider_payload(
-            payload_id,
-            OPENAI_CHAT_COMPLETIONS_DECODER_VERSION,
-            &decoded,
-        )
-        .map_err(|error| error.to_string())?;
-
-    Ok(assistant_message_id)
 }
 
 fn append_tool_turns(
@@ -735,6 +968,34 @@ fn persistence_error(error: impl ToString) -> OpenAiCompletionsError {
     OpenAiCompletionsError::MalformedResponse {
         message: format!("failed to persist provider payload: {}", error.to_string()),
     }
+}
+
+struct StreamTurnRequest<'a, Ids, Emit>
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    runtime: &'a tokio::runtime::Runtime,
+    model: &'a ResolvedModelConfig,
+    encoded: &'a EncodedRequest,
+    request_context: &'a OpenAiCompletionsRequestContext,
+    output_context: &'a ModelOutputContext,
+    ids: &'a mut Ids,
+    emit: &'a mut Emit,
+}
+
+struct FetchDialectTurnRequest<'a, Ids, Emit>
+where
+    Ids: HarnessEventIdSource,
+    Emit: FnMut(Vec<HarnessEventEnvelope>),
+{
+    runtime: &'a tokio::runtime::Runtime,
+    model: &'a ResolvedModelConfig,
+    encoded: &'a EncodedRequest,
+    request_context: &'a OpenAiCompletionsRequestContext,
+    output_context: &'a ModelOutputContext,
+    ids: &'a mut Ids,
+    emit: &'a mut Emit,
 }
 
 struct StreamModelTurnRequest<'a, Ids, Emit>
