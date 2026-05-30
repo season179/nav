@@ -1,8 +1,11 @@
-//! Token budget estimator tests (issue #461, BUD-01; issue #469, BUD-03).
+//! Token budget estimator tests (issue #461, BUD-01; issue #468, BUD-02;
+//! issue #469, BUD-03).
 
-use nav_harness::context::budget::{ContextBudget, active_context_size, estimate_tokens_for_parts};
+use nav_harness::context::budget::{
+    ContextBudget, active_context_size, estimate_image_tokens, estimate_tokens_for_parts,
+};
 use nav_harness::models::{DEFAULT_CONTEXT_WINDOW, ModelConfig};
-use nav_harness::sessions::{Part, TokenUsage};
+use nav_harness::sessions::{ImageSource, Part, TokenUsage};
 
 // ── Slice 1: text estimation uses chars/3.8 ──────────────────────────────
 
@@ -240,4 +243,46 @@ fn body_budget_saturates_at_zero_when_prefix_exceeds_window() {
 fn body_after_prefix_saturates_at_zero_when_active_below_prefix() {
     let budget = ContextBudget::new(200_000, 30_000);
     assert_eq!(budget.body_after_prefix(10_000), 0);
+}
+
+// ── Slice 7: image estimation (issue #468, BUD-02) ───────────────────────
+
+fn image_part() -> Part {
+    Part::Image {
+        mime: "image/png".into(),
+        source: ImageSource::InlineBytes { bytes: Vec::new() },
+    }
+}
+
+#[test]
+fn image_part_uses_flat_fallback_when_dimensions_unknown() {
+    // The Part::Image variant carries no pixel dimensions, so estimation uses
+    // the conservative flat fallback rather than collapsing to zero.
+    assert_eq!(estimate_tokens_for_parts(&[image_part()]), 1600);
+}
+
+#[test]
+fn pixel_based_estimate_uses_width_times_height_over_750() {
+    // 1000×1000 / 750 = 1333.33 → rounds up to 1334.
+    assert_eq!(estimate_image_tokens(Some((1000, 1000))), 1334);
+}
+
+#[test]
+fn pixel_based_estimate_always_rounds_up() {
+    // Exact multiple of the divisor is unchanged.
+    assert_eq!(estimate_image_tokens(Some((750, 1))), 1);
+    // One pixel over the boundary rounds up rather than truncating.
+    assert_eq!(estimate_image_tokens(Some((751, 1))), 2);
+}
+
+#[test]
+fn image_heavy_corpus_counts_every_image() {
+    // 380 chars of text (100 tokens at 3.8) plus two images: each image is
+    // counted at the flat fallback, so none undershoots to zero.
+    let text = Part::Text {
+        text: "a".repeat(380),
+        synthetic: None,
+    };
+    let parts = vec![text, image_part(), image_part()];
+    assert_eq!(estimate_tokens_for_parts(&parts), 100 + 1600 + 1600);
 }

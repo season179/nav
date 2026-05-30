@@ -1,9 +1,10 @@
 //! Hybrid token estimator and active-context-size formula.
 //!
-//! Estimates tokens using `chars / 3.8` for standard text and `chars / 2.0`
-//! for dense JSON tool inputs/outputs. The active context size is computed as
-//! the exact `usage.input_tokens` from the last provider response plus a
-//! heuristic estimate for messages appended after it.
+//! Estimates tokens using `chars / 3.8` for standard text, `chars / 2.0` for
+//! dense JSON tool inputs/outputs, and a pixel-based (or conservative flat)
+//! estimate for images. The active context size is computed as the exact
+//! `usage.input_tokens` from the last provider response plus a heuristic
+//! estimate for messages appended after it.
 
 use crate::models::ModelConfig;
 use crate::sessions::{Part, TokenUsage};
@@ -14,12 +15,22 @@ const TEXT_CHARS_PER_TOKEN: f64 = 3.8;
 /// Characters per token for dense JSON (tool arguments, tool results).
 const DENSE_CHARS_PER_TOKEN: f64 = 2.0;
 
+/// Pixels per token for the pixel-based image estimate
+/// (provider-documented `tokens ≈ width × height / 750`).
+const IMAGE_PIXELS_PER_TOKEN: u64 = 750;
+
+/// Conservative flat token estimate for a resized image whose pixel
+/// dimensions are unknown. Deliberately errs high: under-counting media is the
+/// single most common cause of a session reading "well under threshold" yet
+/// still hitting a hard `prompt_too_long`.
+const IMAGE_FLAT_FALLBACK_TOKENS: u64 = 1600;
+
 /// Estimate the total token count for a slice of [`Part`]s.
 ///
 /// Text and thinking parts use the natural-language ratio (chars/3.8).
 /// Tool-call arguments and tool-result content use the dense-JSON ratio
-/// (chars/2.0). Other part variants (step start/finish, images, etc.)
-/// contribute zero tokens at this estimation level.
+/// (chars/2.0). Images use [`estimate_image_tokens`]. Other part variants
+/// (step start/finish, etc.) contribute zero tokens at this estimation level.
 pub fn estimate_tokens_for_parts(parts: &[Part]) -> u64 {
     parts.iter().map(estimate_tokens_for_part).sum()
 }
@@ -97,7 +108,25 @@ fn estimate_tokens_for_part(part: &Part) -> u64 {
             estimate_chars(&arguments.to_string(), DENSE_CHARS_PER_TOKEN)
         }
         Part::ToolResult { content, .. } => estimate_chars(content, DENSE_CHARS_PER_TOKEN),
+        Part::Image { .. } => estimate_image_tokens(None),
         _ => 0,
+    }
+}
+
+/// Estimate the token cost of an image, rounding up.
+///
+/// When pixel `dimensions` are known, uses the `width × height / 750`
+/// formula; otherwise falls back to a conservative flat estimate. Rounding up
+/// guards against the under-counting that triggers `prompt_too_long`.
+pub fn estimate_image_tokens(dimensions: Option<(u32, u32)>) -> u64 {
+    match dimensions {
+        Some((width, height)) => {
+            // Integer ceil-division: exact, with no float rounding that could
+            // silently under-count a very large image.
+            let pixels = u128::from(width) * u128::from(height);
+            pixels.div_ceil(u128::from(IMAGE_PIXELS_PER_TOKEN)) as u64
+        }
+        None => IMAGE_FLAT_FALLBACK_TOKENS,
     }
 }
 
