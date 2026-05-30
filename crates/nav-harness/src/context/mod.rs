@@ -8,8 +8,9 @@ pub mod system_prompt;
 use crate::sessions::{ModelTurn, Part, Turn, TurnPart};
 
 pub use budget::{
-    ContextBudget, active_context_size, estimate_dense_tokens, estimate_image_tokens,
-    estimate_text_tokens, estimate_tokens_for_parts,
+    ContextBudget, DEFAULT_COMPLETION_BUFFER_TOKENS, active_context_size, estimate_dense_tokens,
+    estimate_image_tokens, estimate_text_tokens, estimate_tokens_for_model_turns,
+    estimate_tokens_for_parts,
 };
 pub use files::ContextFileCache;
 pub use reminders::ContextReminders;

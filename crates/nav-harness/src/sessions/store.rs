@@ -700,7 +700,6 @@ impl SessionStore {
     }
 
     pub fn try_turns(&self, session_id: &SessionId) -> Result<Vec<ModelTurn>, SqliteStoreError> {
-        self.prune_tool_results_for_session(session_id)?;
         let mut page = self
             .sqlite
             .list_turns_for_session(session_id, None, usize::MAX)?
@@ -728,7 +727,6 @@ impl SessionStore {
     }
 
     pub fn try_turns_for_run(&self, run_id: &RunId) -> Result<Vec<ModelTurn>, SqliteStoreError> {
-        self.prune_tool_results_for_run(run_id)?;
         let turns = self.sqlite.list_turns_for_run(run_id)?;
         Ok(model_turns_for_replay(&turns))
     }
@@ -739,7 +737,6 @@ impl SessionStore {
         api_kind: ApiKind,
         budget: ContextBudget,
     ) -> Result<Vec<ModelTurn>, SqliteStoreError> {
-        self.prune_tool_results_for_session(session_id)?;
         let page = self.session_turns_chronological(session_id)?;
         Ok(model_turns_for_encoding(&page, api_kind, budget))
     }
@@ -887,11 +884,6 @@ impl SessionStore {
             .sqlite
             .list_turns_for_session(session_id, None, usize::MAX)?
             .items;
-        self.prune_tool_results(turns)
-    }
-
-    fn prune_tool_results_for_run(&self, run_id: &RunId) -> Result<(), SqliteStoreError> {
-        let turns = self.sqlite.list_turns_for_run(run_id)?;
         self.prune_tool_results(turns)
     }
 
@@ -2340,7 +2332,7 @@ mod tests {
     }
 
     #[test]
-    fn try_turns_prunes_old_tool_results_to_protect_budget_without_deleting_rows() {
+    fn prune_tool_results_marks_old_tool_results_without_deleting_rows() {
         let store = SessionStore::default();
         let session_id = session_id();
         let run_id = run_id();
@@ -2364,6 +2356,8 @@ mod tests {
 
         let raw_before = store.sqlite.list_turns_for_run(&run_id).unwrap();
         assert_eq!(raw_before.len(), 20);
+
+        store.prune_tool_results_for_session(&session_id).unwrap();
 
         let reloaded = store.try_turns(&session_id).unwrap();
         let pruned_count = reloaded
@@ -2489,7 +2483,7 @@ mod tests {
     }
 
     #[test]
-    fn try_turns_keeps_protected_skill_tool_results_visible_when_old() {
+    fn prune_tool_results_keeps_protected_skill_tool_results_visible_when_old() {
         let store = SessionStore::default();
         let session_id = session_id();
         let run_id = run_id();
@@ -2512,6 +2506,8 @@ mod tests {
             ModelTurn::tool_result(tool_call_id_string(200 + index), large_output.clone())
         }));
         store.append_turns(&run_id, turns).unwrap();
+
+        store.prune_tool_results_for_session(&session_id).unwrap();
 
         let reloaded = store.try_turns(&session_id).unwrap();
 
@@ -2538,7 +2534,7 @@ mod tests {
     }
 
     #[test]
-    fn try_turns_keeps_protected_skill_result_visible_after_separate_tool_write() {
+    fn prune_tool_results_keeps_protected_skill_result_visible_after_separate_tool_write() {
         let store = SessionStore::default();
         let session_id = session_id();
         let run_id = run_id();
@@ -2557,6 +2553,8 @@ mod tests {
             )
             .unwrap();
 
+        store.prune_tool_results_for_session(&session_id).unwrap();
+
         let reloaded = store.try_turns(&session_id).unwrap();
 
         assert!(
@@ -2573,7 +2571,7 @@ mod tests {
     }
 
     #[test]
-    fn try_turns_keeps_protected_skill_result_visible_when_provider_id_is_uuid() {
+    fn prune_tool_results_keeps_protected_skill_result_visible_when_provider_id_is_uuid() {
         let store = SessionStore::default();
         let session_id = session_id();
         let run_id = run_id();
@@ -2593,6 +2591,8 @@ mod tests {
             )
             .unwrap();
 
+        store.prune_tool_results_for_session(&session_id).unwrap();
+
         let reloaded = store.try_turns(&session_id).unwrap();
 
         assert!(
@@ -2609,7 +2609,7 @@ mod tests {
     }
 
     #[test]
-    fn try_turns_pruning_keeps_raw_tool_result_artifact_readable() {
+    fn prune_tool_results_keeps_raw_tool_result_artifact_readable() {
         let store = SessionStore::default();
         let session_id = session_id();
         let run_id = run_id();
@@ -2651,6 +2651,8 @@ mod tests {
                 }],
             )
             .unwrap();
+
+        store.prune_tool_results_for_session(&session_id).unwrap();
 
         let reloaded = store.try_turns(&session_id).unwrap();
         let raw_after = store.sqlite.list_turns_for_run(&run_id).unwrap();

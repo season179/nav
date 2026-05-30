@@ -17,7 +17,10 @@ use crate::compaction::breaker::{
 };
 use crate::compaction::prune::project_model_turns_for_tool_result_pruning;
 use crate::compaction::summary::CompactionSummaryAgent;
-use crate::context::{ContextBudget, ContextReminders, truncate_model_turns};
+use crate::context::{
+    ContextBudget, ContextReminders, DEFAULT_COMPLETION_BUFFER_TOKENS,
+    estimate_tokens_for_model_turns, truncate_model_turns,
+};
 use crate::events::{
     HarnessEvent, HarnessEventEnvelope, HarnessEventIdSource, ModelOutputContext,
     ProviderEventMetadata,
@@ -468,22 +471,44 @@ impl RunLoop {
         let mut next_turn_context = PrefetchedTurnContext::default();
         let mut payload_sequence = 0;
         let mut overflow_attempts = 0;
+        let mut proactive_compaction_attempted = false;
         let mut reload_store_turns = journal.is_some();
         let mut step_budget = StepBudget::default();
         let disabled_tool_registry = ToolRegistry::new();
         let mut doom_loop_guard = DoomLoopGuard::default();
 
         loop {
+            let mut should_project_pruned_tool_results =
+                journal.is_some() && should_prune_for_budget(model, &turns);
+            if let Some(journal) = journal
+                && should_project_pruned_tool_results
+            {
+                if let Err(error) = prune_stored_tool_results_for_encoding(journal) {
+                    return RunLoopResult::Failed(error);
+                }
+                project_model_turns_for_tool_result_pruning(&mut turns);
+            }
+            if let Some(journal) = journal
+                && !proactive_compaction_attempted
+                && should_compact_for_budget(model, &turns)
+            {
+                proactive_compaction_attempted = true;
+                let tokens_before_compaction = estimate_model_turn_tokens(&turns);
+                match self.compact_for_budget(journal, model, tokens_before_compaction) {
+                    Ok(compacted_turns) => {
+                        turns = compacted_turns;
+                        reload_store_turns = true;
+                        continue;
+                    }
+                    Err(error) => return RunLoopResult::Failed(error),
+                }
+            }
             if reload_store_turns && let Some(journal) = journal {
                 turns = match turns_for_encoding(journal, model) {
                     Ok(turns) => turns,
                     Err(error) => return RunLoopResult::Failed(error),
                 };
                 reload_store_turns = false;
-            } else if let Some(journal) = journal
-                && let Err(error) = prune_stored_tool_results_for_encoding(journal)
-            {
-                return RunLoopResult::Failed(error);
             }
             let step_decision = match step_budget.next_step() {
                 Ok(decision) => decision,
@@ -501,7 +526,26 @@ impl RunLoop {
                 }
             }
 
-            let mut turns_for_model = project_turns_for_encoding(&turns, model, journal.is_some());
+            if let Some(journal) = journal
+                && !proactive_compaction_attempted
+                && should_compact_for_budget(model, &turns)
+            {
+                proactive_compaction_attempted = true;
+                let tokens_before_compaction = estimate_model_turn_tokens(&turns);
+                match self.compact_for_budget(journal, model, tokens_before_compaction) {
+                    Ok(compacted_turns) => {
+                        turns = compacted_turns;
+                        reload_store_turns = true;
+                        continue;
+                    }
+                    Err(error) => return RunLoopResult::Failed(error),
+                }
+            }
+
+            should_project_pruned_tool_results = should_project_pruned_tool_results
+                || (journal.is_some() && should_prune_for_budget(model, &turns));
+            let mut turns_for_model =
+                project_turns_for_encoding(&turns, model, should_project_pruned_tool_results);
             apply_prefetched_turn_context(
                 &mut turns_for_model,
                 std::mem::take(&mut next_turn_context),
@@ -771,6 +815,56 @@ impl RunLoop {
             estimate_model_turn_tokens(&recovered_turns),
         );
         Ok(recovered_turns)
+    }
+
+    fn compact_for_budget(
+        &self,
+        journal: ProviderJournal<'_>,
+        model: &ResolvedModelConfig,
+        tokens_before_compaction: usize,
+    ) -> Result<Vec<ModelTurn>, OpenAiCompletionsError> {
+        let session_id = journal.session_id;
+        self.ensure_auto_compaction_enabled(session_id)?;
+        let summary_request = journal
+            .store
+            .lock()
+            .unwrap()
+            .compaction_summary_request(session_id, CompactionConfig::default())
+            .map_err(persistence_error)?;
+        let summary_agent = CompactionSummaryAgent::with_client(self.client.clone());
+        let summary = match summary_agent.generate(model, &summary_request) {
+            Ok(summary) => summary,
+            Err(error) => {
+                self.record_compaction_error(session_id, &error);
+                return Err(error);
+            }
+        };
+
+        {
+            let store = journal.store.lock().unwrap();
+            if let Err(error) = store.compact_session_with_validated_summary(
+                session_id,
+                &summary_request,
+                summary,
+                CompactionKind::Auto,
+            ) {
+                self.record_compaction_commit_error(session_id, &error);
+                return Err(persistence_error(error));
+            }
+        }
+        let compacted_turns = journal
+            .store
+            .lock()
+            .unwrap()
+            .try_turns(session_id)
+            .map_err(persistence_error)?;
+        self.record_compaction_success(session_id);
+        self.record_compaction_savings(
+            session_id,
+            tokens_before_compaction,
+            estimate_model_turn_tokens(&compacted_turns),
+        );
+        Ok(compacted_turns)
     }
 
     fn ensure_auto_compaction_enabled(
@@ -1445,6 +1539,24 @@ fn prune_stored_tool_results_for_encoding(
         .map_err(persistence_error)
 }
 
+fn should_prune_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -> bool {
+    let budget = ContextBudget::from_model(&model.model, 0);
+    let active_tokens = estimate_tokens_for_model_turns(turns);
+    budget.body_after_prefix(active_tokens) > budget.prune_threshold()
+}
+
+fn should_compact_for_budget(model: &ResolvedModelConfig, turns: &[ModelTurn]) -> bool {
+    let budget = ContextBudget::from_model(&model.model, 0);
+    let completion_buffer = model
+        .model
+        .max_tokens
+        .map(u64::from)
+        .unwrap_or(DEFAULT_COMPLETION_BUFFER_TOKENS);
+    let active_tokens = estimate_tokens_for_model_turns(turns);
+    let threshold = budget.usable_threshold(completion_buffer);
+    threshold > 0 && budget.body_after_prefix(active_tokens) >= threshold
+}
+
 fn turns_for_encoding(
     journal: ProviderJournal<'_>,
     model: &ResolvedModelConfig,
@@ -1480,10 +1592,10 @@ fn load_provider_state(
 fn project_turns_for_encoding(
     turns: &[ModelTurn],
     model: &ResolvedModelConfig,
-    store_backed: bool,
+    project_pruned_tool_results: bool,
 ) -> Vec<ModelTurn> {
     let mut projected = turns.to_vec();
-    if store_backed {
+    if project_pruned_tool_results {
         project_model_turns_for_tool_result_pruning(&mut projected);
     }
     let truncated = truncate_model_turns(projected, ContextBudget::from_model(&model.model, 0));
