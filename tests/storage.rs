@@ -1,7 +1,7 @@
 //! Durable session storage: a fresh database is created from the canonical
 //! schema, and a full exchange is persisted into the shared table shapes.
 
-use nav::{ChatMessage, Role, Storage, ToolCall};
+use nav::{ChatMessage, Role, Storage, TokenUsage, ToolCall};
 use rusqlite::Connection;
 
 /// A throwaway database path under the OS temp dir.
@@ -214,6 +214,35 @@ fn a_failed_run_records_the_error() {
         .unwrap();
     assert_eq!(status, "failed");
     assert!(error_json.unwrap().contains("provider exploded"));
+}
+
+#[test]
+fn token_usage_accumulates_on_the_session() {
+    let path = temp_db();
+    let _cleanup = TempDb(path.clone());
+    let storage = Storage::open(&path).expect("open database");
+
+    storage.create_session("s", "nav").unwrap();
+    storage
+        .record_token_usage(
+            "s",
+            &TokenUsage::provider_reported(10, 4, 2, 3, 1, Some(14)),
+        )
+        .unwrap();
+    storage
+        .record_token_usage("s", &TokenUsage::provider_reported(5, 6, 0, 1, 0, Some(11)))
+        .unwrap();
+
+    let conn = Connection::open(&path).expect("reopen for assertions");
+    let usage: (i64, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write
+             FROM sessions WHERE id = 's'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(usage, (15, 10, 2, 4, 1));
 }
 
 #[test]

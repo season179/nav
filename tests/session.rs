@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use nav::{
     ChatMessage, ChatModel, Event, MockModel, ModelContext, ModelError, ModelResponse,
-    SessionStore, Storage, ToolDef,
+    SessionStore, Storage, TokenUsage, ToolDef,
 };
 
 #[test]
@@ -102,6 +102,73 @@ fn a_model_failure_emits_run_failed_with_the_error() {
     let failure = events.last().unwrap();
     assert_eq!(failure.status.as_deref(), Some("failed"));
     assert_eq!(failure.error.as_deref(), Some("model is offline"));
+}
+
+#[test]
+fn provider_token_usage_is_recorded_for_the_session() {
+    let path = std::env::temp_dir().join(format!("nav_session_tokens_{}.db", uuid::Uuid::now_v7()));
+    let storage = Arc::new(Storage::open(&path).expect("open storage"));
+    let store = SessionStore::new(Arc::new(UsageModel)).with_storage(storage);
+    let session_id = store.create_session();
+
+    store.send_message(&session_id, "count me").unwrap();
+
+    let conn = rusqlite::Connection::open(&path).expect("reopen db");
+    let usage: (i64, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write
+             FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(usage, (21, 8, 3, 5, 0));
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn missing_provider_token_usage_falls_back_to_an_estimate() {
+    let path = std::env::temp_dir().join(format!(
+        "nav_session_estimated_tokens_{}.db",
+        uuid::Uuid::now_v7()
+    ));
+    let storage = Arc::new(Storage::open(&path).expect("open storage"));
+    let store = SessionStore::new(Arc::new(RecordingModel::new())).with_storage(storage);
+    let session_id = store.create_session();
+
+    store.send_message(&session_id, "count me locally").unwrap();
+
+    let conn = rusqlite::Connection::open(&path).expect("reopen db");
+    let (input, output): (i64, i64) = conn
+        .query_row(
+            "SELECT tokens_input, tokens_output FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        input > 0,
+        "fallback accounting should estimate input tokens"
+    );
+    assert!(
+        output > 0,
+        "fallback accounting should estimate output tokens"
+    );
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }
 
 #[test]
@@ -240,5 +307,19 @@ impl ChatModel for FailingModel {
         _tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
         Err(ModelError::new("model is offline"))
+    }
+}
+
+struct UsageModel;
+
+impl ChatModel for UsageModel {
+    fn respond(
+        &self,
+        _context: &ModelContext,
+        _tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
+        let mut response = ModelResponse::text("counted reply");
+        response.token_usage = Some(TokenUsage::provider_reported(21, 8, 3, 5, 0, Some(29)));
+        Ok(response)
     }
 }

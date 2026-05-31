@@ -13,6 +13,10 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ResolvedModelConfig};
 use crate::context::ModelContext;
+use crate::tokens::{
+    HeuristicTokenCounter, TextTokenCounter, TokenEstimate, TokenUsage, counter_from_compat,
+    estimate_assistant_output, estimate_model_context,
+};
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -148,6 +152,9 @@ pub struct ModelResponse {
     /// Tool calls the model wants executed before the next turn.
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
+    /// Token counts reported by the provider, when present. If this is `None`,
+    /// the agent loop records an explicit local estimate instead.
+    pub token_usage: Option<TokenUsage>,
 }
 
 impl ModelResponse {
@@ -157,6 +164,7 @@ impl ModelResponse {
             content: Some(content.into()),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
+            token_usage: None,
         }
     }
 }
@@ -192,6 +200,22 @@ pub trait ChatModel: Send + Sync {
         context: &ModelContext,
         tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError>;
+
+    /// Estimate the tokens the next request will send. Future compaction can
+    /// use this before a model call, independent of whether the provider later
+    /// reports usage.
+    fn estimate_context_tokens(&self, context: &ModelContext, tools: &[ToolDef]) -> TokenEstimate {
+        estimate_model_context(context, tools, &HeuristicTokenCounter)
+    }
+
+    /// Estimate assistant output when the provider omits usage.
+    fn estimate_output_tokens(&self, response: &ModelResponse) -> TokenEstimate {
+        estimate_assistant_output(
+            response.content.as_deref(),
+            &response.tool_calls,
+            &HeuristicTokenCounter,
+        )
+    }
 }
 
 /// Which text model the backend should use.
@@ -258,6 +282,8 @@ impl ModelChoice {
                     // No display name over env config, so the id is the label.
                     name: model.clone(),
                     model,
+                    context_window: None,
+                    compat: None,
                 })
             }
             _ => ModelChoice::NotConfigured,
@@ -328,6 +354,11 @@ pub struct OpenAiConfig {
     /// Human-friendly display name for the model (from settings.json `name`,
     /// falling back to the model id). Shown in the app's model indicator.
     pub name: String,
+    /// Model context window from settings, used by future budget checks.
+    pub context_window: Option<u64>,
+    /// Provider/model compatibility metadata. May include an optional local
+    /// tokenizer path for HF-tokenizer estimates.
+    pub compat: Option<Value>,
 }
 
 impl From<ResolvedModelConfig> for OpenAiConfig {
@@ -340,6 +371,8 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
             model: config.model,
             base_url: config.base_url,
             name: config.name,
+            context_window: config.context_window,
+            compat: config.compat,
         }
     }
 }
@@ -347,11 +380,16 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
 /// Real text model: one non-streaming `POST /chat/completions` call.
 pub struct OpenAiModel {
     config: OpenAiConfig,
+    token_counter: Arc<dyn TextTokenCounter>,
 }
 
 impl OpenAiModel {
     pub fn new(config: OpenAiConfig) -> Self {
-        Self { config }
+        let token_counter = counter_from_compat(&config.model, config.compat.as_ref());
+        Self {
+            config,
+            token_counter,
+        }
     }
 }
 
@@ -384,6 +422,18 @@ impl ChatModel for OpenAiModel {
             .map_err(|error| ModelError::new(format!("could not read model response: {error}")))?;
 
         parse_chat_completion(&payload)
+    }
+
+    fn estimate_context_tokens(&self, context: &ModelContext, tools: &[ToolDef]) -> TokenEstimate {
+        estimate_model_context(context, tools, self.token_counter.as_ref())
+    }
+
+    fn estimate_output_tokens(&self, response: &ModelResponse) -> TokenEstimate {
+        estimate_assistant_output(
+            response.content.as_deref(),
+            &response.tool_calls,
+            self.token_counter.as_ref(),
+        )
     }
 }
 
@@ -475,6 +525,51 @@ fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
         content,
         tool_calls,
         finish_reason,
+        token_usage: parse_token_usage(payload),
+    })
+}
+
+fn parse_token_usage(payload: &Value) -> Option<TokenUsage> {
+    let usage = payload.get("usage")?;
+    let input = usage_u64(usage, "prompt_tokens").unwrap_or(0);
+    let output = usage_u64(usage, "completion_tokens").unwrap_or(0);
+    let total = usage_u64(usage, "total_tokens");
+    let reasoning = usage
+        .get("completion_tokens_details")
+        .and_then(|details| usage_u64(details, "reasoning_tokens"))
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| usage_u64(details, "cached_tokens"))
+        .unwrap_or(0);
+    let cache_write = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| usage_u64(details, "cache_write_tokens"))
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| usage_u64(details, "cache_creation_tokens"))
+        })
+        .unwrap_or(0);
+
+    let saw_usage = input > 0
+        || output > 0
+        || reasoning > 0
+        || cache_read > 0
+        || cache_write > 0
+        || total.is_some();
+    saw_usage.then(|| {
+        TokenUsage::provider_reported(input, output, reasoning, cache_read, cache_write, total)
+    })
+}
+
+fn usage_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|number| {
+        number.as_u64().or_else(|| {
+            number
+                .as_i64()
+                .and_then(|signed| u64::try_from(signed).ok())
+        })
     })
 }
 

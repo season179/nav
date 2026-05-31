@@ -26,6 +26,7 @@ mod context;
 mod model;
 mod session;
 mod storage;
+mod tokens;
 mod tools;
 
 pub use config::{ConfigError, ResolvedModelConfig, resolve_config, resolve_default_config};
@@ -36,6 +37,10 @@ pub use model::{
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
 pub use storage::{SessionSummary, Storage, StorageError};
+pub use tokens::{
+    HeuristicTokenCounter, HfTokenizerCounter, TextTokenCounter, TokenCountConfidence,
+    TokenCountSource, TokenEstimate, TokenUsage,
+};
 
 /// Command-line configuration for the backend binary.
 pub struct BackendConfig {

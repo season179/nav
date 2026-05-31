@@ -19,6 +19,7 @@ use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop};
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, Role, ToolCall};
 use crate::storage::{SessionSummary, Storage};
+use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
 
 /// How a session originates, recorded on the persisted `sessions` row.
@@ -549,6 +550,11 @@ impl AgentRunSink for SessionRunSink<'_> {
                 event.message_id = Some(message_id.clone());
                 event.run_id = Some(self.run_id.to_owned());
             });
+        })?;
+        // Clear the run before emitting `run.completed` so a subscriber can
+        // immediately send a follow-up when it sees the terminal event.
+        self.store.clear_active_run(self.session_id, self.run_id);
+        self.store.with_session(self.session_id, |session| {
             session.emit("run.completed", |event| {
                 event.run_id = Some(self.run_id.to_owned());
                 event.status = Some("completed".to_owned());
@@ -656,6 +662,16 @@ impl AgentRunSink for SessionRunSink<'_> {
             );
         }
         self.seq += 1;
+        Ok(())
+    }
+
+    fn token_usage(&mut self, usage: &TokenUsage) -> Result<(), Self::Error> {
+        if let Some(storage) = &self.store.storage {
+            log_storage(
+                "record_token_usage",
+                storage.record_token_usage(self.session_id, usage),
+            );
+        }
         Ok(())
     }
 }
