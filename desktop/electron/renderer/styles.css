@@ -214,7 +214,7 @@ body {
   flex: 0 0 auto;
   width: 14px;
   height: 11px;
-  border: 1px solid currentColor;
+  border: 1px solid currentcolor;
   border-radius: 2px;
   opacity: 0.85;
 }
@@ -225,7 +225,7 @@ body {
   left: 1px;
   width: 7px;
   height: 4px;
-  border: 1px solid currentColor;
+  border: 1px solid currentcolor;
   border-bottom: 0;
   border-radius: 2px 2px 0 0;
   content: "";

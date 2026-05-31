@@ -51,8 +51,15 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
       backendUrl: backend.url,
       method: "session.list",
     });
+    const listedProjectSession = listedWithProject.result.sessions.find(
+      (session) => session.sessionId === projectSession.result.sessionId,
+    );
+    assert.ok(
+      listedProjectSession,
+      "session.list returns the newly created project session",
+    );
     assert.equal(
-      listedWithProject.result.sessions[0].workspaceRoot,
+      listedProjectSession.workspaceRoot,
       fs.realpathSync(projectRoot),
       "new project sessions list under their selected directory",
     );

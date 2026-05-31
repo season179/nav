@@ -271,20 +271,28 @@ async function refreshSessions() {
 
   sessionListNode.replaceChildren();
   if (sessions.length === 0) {
-    const empty = document.createElement("li");
-    empty.className = "sidebar-empty";
-    empty.textContent = "No sessions yet";
-    sessionListNode.append(empty);
+    renderEmptySessionList();
     return;
   }
 
-  sessionListNode.append(
-    ...groupSessionsByProject(sessions).map(renderProject),
-  );
+  const projects = groupSessionsByProject(sessions);
+  if (projects.length === 0) {
+    renderEmptySessionList();
+    return;
+  }
+
+  sessionListNode.append(...projects.map(renderProject));
 
   // One place decides which item is highlighted, for both fresh lists and
   // in-place selection changes.
   markActiveSession();
+}
+
+function renderEmptySessionList() {
+  const empty = document.createElement("li");
+  empty.className = "sidebar-empty";
+  empty.textContent = "No sessions yet";
+  sessionListNode.append(empty);
 }
 
 function sessionTitle(session) {
@@ -305,7 +313,7 @@ function renderProject(project) {
 function renderProjectHeading(project) {
   const heading = document.createElement("div");
   heading.className = "project-heading";
-  heading.title = project.path;
+  heading.title = project.path || project.name;
 
   const icon = document.createElement("span");
   icon.className = "project-icon";
@@ -348,17 +356,15 @@ function groupSessionsByProject(sessions) {
 
   for (const session of sessions) {
     const path = normalizeProjectPath(session.workspaceRoot);
-    if (!path) {
-      continue;
-    }
-    let project = projects.get(path);
+    const key = path || "__no_project__";
+    let project = projects.get(key);
     if (!project) {
       project = {
         path,
-        name: projectName(path),
+        name: path ? projectName(path) : "No project",
         sessions: [],
       };
-      projects.set(path, project);
+      projects.set(key, project);
     }
     project.sessions.push(session);
   }
