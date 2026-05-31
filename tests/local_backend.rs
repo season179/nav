@@ -1,117 +1,43 @@
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Shutdown, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
-const BACKEND_BIN: &str = env!("CARGO_BIN_EXE_nav-local-backend");
-const FIXTURE_SESSION_ID: &str = "019f2f6f-f178-7a72-9f28-000000000100";
-const FIRST_EVENT_ID: &str = "019f2f6f-f178-7a72-9f28-000000000101";
+use nav::{MockModel, SessionStore};
+use serde_json::{Value, json};
 
-#[test]
-fn fixture_sse_endpoint_streams_ordered_events() {
-    let mut backend = TestBackend::start();
-
-    let response = backend.request(&format!(
-        "GET /sessions/{FIXTURE_SESSION_ID}/events HTTP/1.1\r\n\
-         Host: localhost\r\n\
-         Connection: close\r\n\
-         \r\n"
-    ));
-
-    assert!(
-        response.starts_with("HTTP/1.1 200 OK"),
-        "unexpected response:\n{response}"
-    );
-    assert!(
-        response.contains("content-type: text/event-stream"),
-        "unexpected response headers:\n{response}"
-    );
-    assert!(
-        response.contains(&format!("id: {FIRST_EVENT_ID}\nevent: session.created\n")),
-        "missing first SSE frame:\n{response}"
-    );
-    assert!(
-        response.contains(&format!(
-            "\"event_id\":\"{FIRST_EVENT_ID}\",\"session_id\":\"{FIXTURE_SESSION_ID}\",\"type\":\"session.created\""
-        )),
-        "missing documented event envelope:\n{response}"
-    );
-    assert!(
-        response.contains("event: message.completed"),
-        "fixture stream should include a completed message event:\n{response}"
-    );
-}
-
-#[test]
-fn rpc_endpoint_is_explicitly_deferred() {
-    let mut backend = TestBackend::start();
-    let body = r#"{"jsonrpc":"2.0","id":"request-1","method":"initialize"}"#;
-
-    let response = backend.request(&format!(
-        "POST /rpc HTTP/1.1\r\n\
-         Host: localhost\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len()
-    ));
-
-    assert!(
-        response.starts_with("HTTP/1.1 501 Not Implemented"),
-        "unexpected response:\n{response}"
-    );
-    assert!(
-        response.contains(r#""error":"rpc_deferred""#),
-        "RPC response should document the deferred command channel:\n{response}"
-    );
-}
-
+/// An in-process backend bound to an ephemeral loopback port, driven over raw
+/// TCP so tests exercise the real HTTP/SSE wire format with the deterministic
+/// mock model.
 struct TestBackend {
-    child: Child,
-    base_url: String,
+    address: String,
 }
 
 impl TestBackend {
     fn start() -> Self {
-        let mut child = Command::new(BACKEND_BIN)
-            .args(["--bind", "127.0.0.1:0"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start nav-local-backend");
+        let store = Arc::new(SessionStore::new(Arc::new(MockModel::new())));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let address = listener.local_addr().expect("read local addr").to_string();
 
-        let stdout = child.stdout.take().expect("capture backend stdout");
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut stdout = BufReader::new(stdout);
-            let mut line = String::new();
-            let result = stdout.read_line(&mut line).map(|_| line);
-            let _ = tx.send(result);
+        thread::spawn(move || {
+            let _ = nav::serve(listener, store);
         });
 
-        let startup_output = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("backend should print its local URL")
-            .expect("read backend stdout");
-        let base_url = startup_output
-            .lines()
-            .find_map(|line| line.strip_prefix("nav local backend listening on "))
-            .expect("backend should print a discoverable URL")
-            .to_owned();
-
-        Self { child, base_url }
+        Self { address }
     }
 
-    fn request(&mut self, request: &str) -> String {
-        let address = self
-            .base_url
-            .strip_prefix("http://")
-            .expect("backend URL should be HTTP");
-        let mut stream = TcpStream::connect(address).expect("connect to backend");
+    fn connect(&self) -> TcpStream {
+        let stream = TcpStream::connect(&self.address).expect("connect to backend");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        stream
+    }
 
+    /// Send one buffered request/response exchange (connection closed after).
+    fn request(&self, request: &str) -> String {
+        let mut stream = self.connect();
         stream
             .write_all(request.as_bytes())
             .expect("send HTTP request");
@@ -123,11 +49,192 @@ impl TestBackend {
             .expect("read HTTP response");
         response
     }
+
+    /// Parse the JSON-RPC response body from one `/rpc` exchange.
+    fn rpc(&self, body: &str) -> Value {
+        let response = self.request(&format!(
+            "POST /rpc HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        ));
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or(&response);
+        serde_json::from_str(body).expect("RPC response is valid JSON")
+    }
+
+    fn create_session(&self) -> String {
+        let response = self.rpc(r#"{"jsonrpc":"2.0","id":"create","method":"session.create"}"#);
+        response["result"]["sessionId"]
+            .as_str()
+            .expect("session.create returns a sessionId")
+            .to_owned()
+    }
+
+    fn send_message(&self, session_id: &str, text: &str) {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "send",
+            "method": "session.sendMessage",
+            "params": { "sessionId": session_id, "text": text },
+        });
+        let response = self.rpc(&request.to_string());
+        assert_eq!(
+            response["result"]["accepted"],
+            Value::Bool(true),
+            "sendMessage should be accepted: {response}"
+        );
+    }
+
+    /// Open a live SSE connection for a session.
+    fn open_events(&self, session_id: &str) -> TcpStream {
+        let mut stream = self.connect();
+        write!(
+            stream,
+            "GET /sessions/{session_id}/events HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        )
+        .expect("send SSE request");
+        stream
+    }
 }
 
-impl Drop for TestBackend {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+/// One SSE event reduced to the fields the chat UI cares about.
+struct SseEvent {
+    kind: String,
+    text: Option<String>,
+}
+
+/// Read SSE frames until `completions` terminal run events have arrived.
+fn read_until_completions(stream: TcpStream, completions: usize) -> Vec<SseEvent> {
+    let mut reader = BufReader::new(stream);
+    let mut events = Vec::new();
+    let mut seen = 0;
+
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let event: Value = serde_json::from_str(payload.trim()).expect("SSE data is JSON");
+        let kind = event["type"].as_str().unwrap_or_default().to_owned();
+        let text = event["text"].as_str().map(str::to_owned);
+        let terminal = kind == "run.completed" || kind == "run.failed";
+        events.push(SseEvent { kind, text });
+        if terminal {
+            seen += 1;
+            if seen >= completions {
+                break;
+            }
+        }
     }
+
+    events
+}
+
+fn kinds(events: &[SseEvent]) -> Vec<&str> {
+    events.iter().map(|event| event.kind.as_str()).collect()
+}
+
+#[test]
+fn create_session_returns_a_session_id() {
+    let backend = TestBackend::start();
+
+    let response = backend.rpc(r#"{"jsonrpc":"2.0","id":"req-1","method":"session.create"}"#);
+
+    assert_eq!(
+        response["id"], "req-1",
+        "response should echo the request id"
+    );
+    let session_id = response["result"]["sessionId"]
+        .as_str()
+        .expect("a sessionId is returned");
+    assert!(!session_id.is_empty(), "sessionId should not be empty");
+}
+
+#[test]
+fn sending_to_an_unknown_session_is_rejected() {
+    let backend = TestBackend::start();
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "send",
+        "method": "session.sendMessage",
+        "params": { "sessionId": "no-such-session", "text": "hello" },
+    });
+    let response = backend.rpc(&request.to_string());
+
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown session"),
+        "unknown sessions should be rejected: {response}"
+    );
+}
+
+#[test]
+fn a_multi_turn_chat_streams_user_and_assistant_events_with_context() {
+    let backend = TestBackend::start();
+    let session_id = backend.create_session();
+
+    // Subscribe before sending so the whole conversation is observed live.
+    let stream = backend.open_events(&session_id);
+
+    // One turn at a time: send, await its run.completed, then send the next.
+    backend.send_message(&session_id, "my name is Ada");
+    let first_turn = read_until_completions(backend.open_events(&session_id), 1);
+    assert_eq!(
+        kinds(&first_turn),
+        [
+            "session.created",
+            "user.message",
+            "run.started",
+            "message.completed",
+            "run.completed",
+        ],
+    );
+
+    backend.send_message(&session_id, "what is my name?");
+    let events = read_until_completions(stream, 2);
+
+    assert_eq!(
+        kinds(&events),
+        [
+            "session.created",
+            "user.message",
+            "run.started",
+            "message.completed",
+            "run.completed",
+            "user.message",
+            "run.started",
+            "message.completed",
+            "run.completed",
+        ],
+    );
+
+    // The second assistant reply proves prior context was forwarded: the mock
+    // recalls the opening turn.
+    let second_reply = events
+        .iter()
+        .filter(|event| event.kind == "message.completed")
+        .nth(1)
+        .and_then(|event| event.text.as_deref())
+        .expect("a second assistant message");
+    assert!(
+        second_reply.contains("what is my name?"),
+        "reply should echo the latest message: {second_reply}"
+    );
+    assert!(
+        second_reply.contains("my name is Ada"),
+        "reply should recall the earlier turn: {second_reply}"
+    );
 }

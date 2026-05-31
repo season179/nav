@@ -1,57 +1,88 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
-const { subscribeToSessionEvents } = require("../desktop/electron/backend-client.cjs");
+const {
+  subscribeToSessionEvents,
+  sendRpc,
+} = require("../desktop/electron/backend-client.cjs");
 const { startLocalBackend } = require("../desktop/electron/backend-process.cjs");
 
-const FIXTURE_SESSION_ID = "019f2f6f-f178-7a72-9f28-000000000100";
-
-test("Electron backend client streams fixture session events over HTTP/SSE", async () => {
-  const backend = await startFixtureBackend();
+test("Electron backend client runs a multi-turn chat over RPC + SSE", async () => {
+  const backend = await startMockBackend();
   const controller = new AbortController();
   const events = [];
 
   try {
+    const created = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.create",
+    });
+    const sessionId = created.result.sessionId;
+    assert.ok(sessionId, "session.create returns a sessionId");
+
     await new Promise((resolve, reject) => {
+      let completions = 0;
       subscribeToSessionEvents({
         backendUrl: backend.url,
-        sessionId: FIXTURE_SESSION_ID,
+        sessionId,
         signal: controller.signal,
         onEvent(event) {
           events.push(event);
           if (event.type === "run.completed") {
-            resolve();
+            completions += 1;
+            if (completions === 1) {
+              // First turn done; send a follow-up that depends on it.
+              sendRpc({
+                backendUrl: backend.url,
+                method: "session.sendMessage",
+                params: { sessionId, text: "what is my name?" },
+              }).catch(reject);
+            } else {
+              resolve();
+            }
           }
         },
         onError: reject,
       });
+
+      // First turn.
+      sendRpc({
+        backendUrl: backend.url,
+        method: "session.sendMessage",
+        params: { sessionId, text: "my name is Ada" },
+      }).catch(reject);
     });
   } finally {
     controller.abort();
     backend.stop();
   }
 
-  assert.deepEqual(
-    events.map((event) => event.type),
-    [
-      "session.created",
-      "run.started",
-      "message.delta",
-      "message.completed",
-      "run.completed",
-    ],
+  const types = events.map((event) => event.type);
+  assert.deepEqual(types, [
+    "session.created",
+    "user.message",
+    "run.started",
+    "message.completed",
+    "run.completed",
+    "user.message",
+    "run.started",
+    "message.completed",
+    "run.completed",
+  ]);
+
+  const assistantReplies = events.filter(
+    (event) => event.type === "message.completed",
   );
-  assert.equal(events[0].session_id, FIXTURE_SESSION_ID);
-  assert.equal(
-    events[2].text,
-    "Hello from the deterministic nav local backend fixture.",
-  );
+  // The second reply proves prior context was forwarded to the model.
+  assert.match(assistantReplies[1].text, /what is my name\?/);
+  assert.match(assistantReplies[1].text, /my name is Ada/);
 });
 
-async function startFixtureBackend() {
+async function startMockBackend() {
   const backend = await startLocalBackend({
     projectRoot: process.cwd(),
-    startupAttempts: 40,
+    startupAttempts: 80,
+    env: { NAV_MOCK_MODEL: "1" },
   });
 
   return {

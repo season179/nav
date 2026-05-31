@@ -1,5 +1,6 @@
 const http = require("node:http");
 const https = require("node:https");
+const { randomUUID } = require("node:crypto");
 
 function subscribeToSessionEvents({ backendUrl, sessionId, signal, onEvent, onError }) {
   const eventsUrl = new URL(`/sessions/${sessionId}/events`, backendUrl);
@@ -68,6 +69,55 @@ function parseSseBuffer(buffer) {
   return { events, remainder };
 }
 
+function sendRpc({ backendUrl, method, params }) {
+  const rpcUrl = new URL("/rpc", backendUrl);
+  const transport = rpcUrl.protocol === "https:" ? https : http;
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: randomUUID(),
+    method,
+    ...(params ? { params } : {}),
+  });
+
+  return new Promise((resolve, reject) => {
+    const request = transport.request(
+      rpcUrl,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+        },
+      },
+      (response) => {
+        let payload = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          payload += chunk;
+        });
+        response.on("end", () => {
+          let parsed;
+          try {
+            parsed = JSON.parse(payload);
+          } catch (error) {
+            reject(new Error(`RPC ${method} returned invalid JSON: ${error.message}`));
+            return;
+          }
+          if (parsed.error) {
+            reject(new Error(`RPC ${method} failed: ${parsed.error.message}`));
+            return;
+          }
+          resolve(parsed);
+        });
+      },
+    );
+
+    request.on("error", reject);
+    request.write(body);
+    request.end();
+  });
+}
+
 function parseSseFrame(frame) {
   const dataLine = frame
     .split(/\n/)
@@ -81,4 +131,5 @@ function parseSseFrame(frame) {
 
 module.exports = {
   subscribeToSessionEvents,
+  sendRpc,
 };

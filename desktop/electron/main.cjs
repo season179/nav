@@ -1,62 +1,72 @@
-const { app, BrowserWindow } = require("electron");
+const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("node:path");
-const { subscribeToSessionEvents } = require("./backend-client.cjs");
+const { subscribeToSessionEvents, sendRpc } = require("./backend-client.cjs");
 const { startLocalBackend } = require("./backend-process.cjs");
 const { createWindowOptions } = require("./window-options.cjs");
 
-const FIXTURE_SESSION_ID = "019f2f6f-f178-7a72-9f28-000000000100";
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
+const smokeMode = process.argv.includes("--smoke");
 
 let backendProcess = null;
 let eventSubscription = null;
-const smokeMode = process.argv.includes("--smoke");
+let backendUrl = null;
+let sessionId = null;
 
 app.whenReady().then(async () => {
   const window = createMainWindow();
-  await startReadOnlyStream(window);
+  await startChatSession(window);
 });
 
-app.on("before-quit", () => {
-  stopBackend();
-});
-
+app.on("before-quit", stopBackend);
 app.on("window-all-closed", () => {
   stopBackend();
   app.quit();
 });
 
+// The renderer can only ask Main to send a chat message; Main owns all backend
+// transport.
+ipcMain.handle("nav:send-message", async (_event, text) => {
+  if (!backendUrl || !sessionId) {
+    throw new Error("chat session is not ready");
+  }
+  await sendRpc({
+    backendUrl,
+    method: "session.sendMessage",
+    params: { sessionId, text },
+  });
+});
+
 function createMainWindow() {
   const window = new BrowserWindow(
-    createWindowOptions({
-      preloadPath: path.join(__dirname, "preload.cjs"),
-    }),
+    createWindowOptions({ preloadPath: path.join(__dirname, "preload.cjs") }),
   );
-
   window.loadFile(path.join(__dirname, "renderer", "index.html"));
   return window;
 }
 
-async function startReadOnlyStream(window) {
+async function startChatSession(window) {
   sendStatus(window, { state: "starting-backend" });
 
   try {
-    const backend = await startLocalBackend({ projectRoot: PROJECT_ROOT });
-    backendProcess = backend.child;
-    sendStatus(window, {
-      state: "connected",
-      backendUrl: backend.url,
-      sessionId: FIXTURE_SESSION_ID,
+    // Tests and offline smoke use the deterministic mock; a real launch
+    // inherits the user's environment (NAV_API_KEY, etc.).
+    const backend = await startLocalBackend({
+      projectRoot: PROJECT_ROOT,
+      env: smokeMode ? { NAV_MOCK_MODEL: "1" } : {},
     });
+    backendProcess = backend.child;
+    backendUrl = backend.url;
+
+    const created = await sendRpc({ backendUrl, method: "session.create" });
+    sessionId = created.result.sessionId;
+
+    sendStatus(window, { state: "connected", backendUrl, sessionId });
 
     eventSubscription = subscribeToSessionEvents({
-      backendUrl: backend.url,
-      sessionId: FIXTURE_SESSION_ID,
+      backendUrl,
+      sessionId,
       onEvent(event) {
-        window.webContents.send("nav:session-event", event);
-        if (smokeMode && event.type === "run.completed") {
-          console.log("nav electron smoke received run.completed");
-          app.quit();
-        }
+        forwardEvent(window, event);
       },
       onError(error) {
         sendStatus(window, { state: "stream-error", message: error.message });
@@ -66,6 +76,10 @@ async function startReadOnlyStream(window) {
         }
       },
     });
+
+    if (smokeMode) {
+      await runSmokeTurn();
+    }
   } catch (error) {
     sendStatus(window, { state: "backend-error", message: error.message });
     if (smokeMode) {
@@ -73,6 +87,28 @@ async function startReadOnlyStream(window) {
       app.exit(1);
     }
   }
+}
+
+function forwardEvent(window, event) {
+  if (!window.isDestroyed()) {
+    window.webContents.send("nav:session-event", event);
+  }
+  if (smokeMode && event.type === "run.completed") {
+    console.log("nav electron smoke received run.completed");
+    app.quit();
+  }
+  if (smokeMode && event.type === "run.failed") {
+    console.error(`nav electron smoke run failed: ${event.error}`);
+    app.exit(1);
+  }
+}
+
+async function runSmokeTurn() {
+  await sendRpc({
+    backendUrl,
+    method: "session.sendMessage",
+    params: { sessionId, text: "smoke test message" },
+  });
 }
 
 function sendStatus(window, status) {
