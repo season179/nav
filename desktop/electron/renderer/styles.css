@@ -305,7 +305,7 @@ body {
   font-weight: 600;
 }
 
-.project-show-more {
+.project-session-toggle {
   width: 100%;
   padding: 8px 10px;
   border: 1px solid transparent;
@@ -322,12 +322,12 @@ body {
     color 150ms ease-out;
 }
 
-.project-show-more:hover {
+.project-session-toggle:hover {
   background: var(--surface-raised);
   color: var(--ink-dim);
 }
 
-.project-show-more:focus-visible {
+.project-session-toggle:focus-visible {
   outline: none;
   border-color: var(--primary-dim);
   box-shadow: 0 0 0 2px var(--primary-tint);
@@ -799,7 +799,7 @@ h1 {
   .project-add,
   .project-chat-add,
   .session-item,
-  .project-show-more,
+  .project-session-toggle,
   .composer-input,
   .composer-send,
   .composer-stop,
