@@ -65,6 +65,7 @@ fn model(base_url: String) -> OpenAiModel {
         api_key: TEST_API_KEY.to_owned(),
         model: "test-model".to_owned(),
         base_url,
+        name: "test-model".to_owned(),
     })
 }
 

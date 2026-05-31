@@ -31,17 +31,25 @@
         </section>
 
         <form class="composer" id="composer">
-          <input
-            type="text"
-            id="composer-input"
-            class="composer-input"
-            placeholder="Send a message…"
-            autocomplete="off"
-            disabled
-          />
-          <button type="submit" id="composer-send" class="composer-send" disabled>
-            Send
-          </button>
+          <div class="composer-row">
+            <input
+              type="text"
+              id="composer-input"
+              class="composer-input"
+              placeholder="Send a message…"
+              autocomplete="off"
+              disabled
+            />
+            <button
+              type="submit"
+              id="composer-send"
+              class="composer-send"
+              disabled
+            >
+              Send
+            </button>
+          </div>
+          <span class="composer-model" id="composer-model" aria-live="polite"></span>
         </form>
       </main>
     </div>

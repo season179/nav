@@ -45,6 +45,14 @@ ipcMain.handle("nav:list-sessions", async () => {
   return response.result.sessions;
 });
 
+ipcMain.handle("nav:model-info", async () => {
+  if (!backendUrl) {
+    throw new Error("chat session is not ready");
+  }
+  const response = await sendRpc({ backendUrl, method: "session.modelInfo" });
+  return response.result;
+});
+
 ipcMain.handle("nav:switch-session", async (_event, id) => {
   if (!backendUrl) {
     throw new Error("chat session is not ready");

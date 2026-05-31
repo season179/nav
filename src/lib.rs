@@ -127,6 +127,9 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
             let latest = store.latest_session_id();
             write_rpc_result(stream, &id, json!({ "sessionId": latest }))
         }
+        Some("session.modelInfo") => {
+            write_rpc_result(stream, &id, json!({ "label": store.model_label() }))
+        }
         Some("session.list") => {
             let sessions: Vec<Value> = store
                 .list_sessions()

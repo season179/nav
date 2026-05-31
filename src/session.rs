@@ -132,6 +132,8 @@ pub struct SessionStore {
     storage: Option<Arc<Storage>>,
     /// Identifier of the active model, tagged onto persisted assistant turns.
     model_id: Option<String>,
+    /// Human-friendly name of the active model, shown in the app's UI.
+    model_label: String,
     /// The tools the model may call during a run.
     registry: Arc<Registry>,
     /// Directory tools operate in (the backend process cwd by default).
@@ -145,6 +147,7 @@ impl SessionStore {
             model,
             storage: None,
             model_id: None,
+            model_label: "unknown model".to_owned(),
             registry: Arc::new(Registry::coding()),
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
@@ -160,6 +163,17 @@ impl SessionStore {
     pub fn with_model_id(mut self, model_id: Option<String>) -> Self {
         self.model_id = model_id;
         self
+    }
+
+    /// Set the human-friendly model name surfaced to the UI.
+    pub fn with_model_label(mut self, model_label: String) -> Self {
+        self.model_label = model_label;
+        self
+    }
+
+    /// The human-friendly name of the active model, for the app's indicator.
+    pub fn model_label(&self) -> &str {
+        &self.model_label
     }
 
     /// Override the toolset offered to the model (defaults to the coding tools).

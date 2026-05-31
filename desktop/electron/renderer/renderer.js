@@ -4,6 +4,7 @@ const newChatButton = document.querySelector("#new-chat");
 const composer = document.querySelector("#composer");
 const input = document.querySelector("#composer-input");
 const sendButton = document.querySelector("#composer-send");
+const modelNode = document.querySelector("#composer-model");
 
 let connected = false;
 let running = false;
@@ -52,6 +53,21 @@ function handleBackendStatus(status) {
     }
     setRunning(false);
     refreshSessions();
+    refreshModelName();
+  }
+}
+
+// Show which model the backend is configured to use, just below the composer.
+// The model can't change mid-session, so one fetch on connect is enough.
+async function refreshModelName() {
+  if (!window.nav) {
+    return;
+  }
+  try {
+    const info = await window.nav.modelInfo();
+    modelNode.textContent = info?.label ?? "";
+  } catch {
+    // The indicator is best-effort; never let it disrupt the chat.
   }
 }
 
