@@ -150,7 +150,7 @@ fn load_context_file_from_dir(dir: &Path) -> Option<ContextFile> {
                     });
                 }
                 Err(error) => {
-                    eprintln!("nav: could not read {}: {error}", path.display());
+                    tracing::error!(path = %path.display(), %error, "could not read context file");
                 }
             }
         }

@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 mod agent;
 mod config;
 mod context;
+pub mod logging;
 mod model;
 mod session;
 mod storage;
