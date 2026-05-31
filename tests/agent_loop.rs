@@ -72,6 +72,7 @@ impl ChatModel for ScriptedModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: Some("I should inspect the workspace.".to_owned()),
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_owned(),
                     name: "ls".to_owned(),
@@ -102,6 +103,7 @@ impl ChatModel for SleepThenTextModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_owned(),
                     name: "bash".to_owned(),
@@ -133,6 +135,7 @@ impl ChatModel for SleepThenWriteModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![
                     ToolCall {
                         id: "call-bash".to_owned(),
@@ -169,6 +172,8 @@ enum GatedReply {
     },
     /// Reply with plain text, ending the turn.
     Text(String),
+    /// Reply with plain text plus provider reasoning.
+    TextWithReasoning { text: String, reasoning: String },
 }
 
 /// A model the test steps one call at a time. Each `respond` records the context
@@ -240,6 +245,7 @@ impl ChatModel for GatedModel {
         Ok(match self.script[nth].clone() {
             GatedReply::Tool { id, name, args } => ModelResponse {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![ToolCall {
                     id,
                     name,
@@ -249,6 +255,13 @@ impl ChatModel for GatedModel {
                 token_usage: None,
             },
             GatedReply::Text(text) => ModelResponse::text(text),
+            GatedReply::TextWithReasoning { text, reasoning } => ModelResponse {
+                content: Some(text),
+                reasoning_content: Some(reasoning),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                token_usage: None,
+            },
         })
     }
 }
@@ -434,6 +447,15 @@ fn a_tool_run_persists_its_result_and_replays_on_resume() {
         .expect("count tool_result parts");
     assert_eq!(tool_results, 1);
 
+    let thinking_parts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turn_parts WHERE type = 'thinking'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count thinking parts");
+    assert_eq!(thinking_parts, 1);
+
     let tool_turns: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM turns WHERE role = 'tool'",
@@ -558,7 +580,10 @@ fn a_message_sent_as_the_reply_lands_continues_the_run() {
     // Two plain replies: the run would end after the first, but a steer message
     // queued before it finalizes keeps the same run going for a second reply.
     let model = Arc::new(GatedModel::new(vec![
-        GatedReply::Text("first reply".to_owned()),
+        GatedReply::TextWithReasoning {
+            text: "first reply".to_owned(),
+            reasoning: "first reply reasoning".to_owned(),
+        },
         GatedReply::Text("second reply".to_owned()),
     ]));
     let store = Arc::new(SessionStore::new(model.clone()).with_workspace(workspace.path.clone()));
@@ -587,6 +612,14 @@ fn a_message_sent_as_the_reply_lands_continues_the_run() {
             .iter()
             .any(|message| message.role == Role::User && message.content == "keep going"),
         "the steered message should continue the same run: {second_context:?}",
+    );
+    assert!(
+        second_context.iter().any(|message| {
+            message.role == Role::Assistant
+                && message.content == "first reply"
+                && message.reasoning_content.as_deref() == Some("first reply reasoning")
+        }),
+        "the assistant reply that triggered steering should remain in context: {second_context:?}",
     );
 
     let events = store.events(&session_id).unwrap();

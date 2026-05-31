@@ -281,7 +281,7 @@ impl SessionStore {
                     event.role = Some(Role::User.as_str().to_owned());
                     event.text = Some(message.content.clone());
                 }),
-                // An assistant turn that requested tools: replay its reasoning
+                // An assistant turn that requested tools: replay its visible
                 // text (if any) and open a tool line per call, exactly as live.
                 Role::Assistant if !message.tool_calls.is_empty() => {
                     let content = message.content.clone();
@@ -571,13 +571,19 @@ struct SessionRunSink<'a> {
 impl AgentRunSink for SessionRunSink<'_> {
     type Error = SendError;
 
-    fn assistant_text(&mut self, content: &str) -> Result<(), Self::Error> {
+    fn assistant_text(
+        &mut self,
+        content: &str,
+        reasoning_content: Option<&str>,
+    ) -> Result<(), Self::Error> {
         // Record the reply only. Whether this reply ends the run or it continues
         // with steering that arrived mid-run is decided by the agent loop's
         // following `next_input_or_finish` call, which also emits `run.completed`.
         let message_id = new_id();
         self.store.with_session(self.session_id, |session| {
-            session.turns.push(ChatMessage::assistant(content));
+            let mut message = ChatMessage::assistant(content);
+            message.reasoning_content = reasoning_content.map(str::to_owned);
+            session.turns.push(message);
             session.emit("message.completed", |event| {
                 event.role = Some(Role::Assistant.as_str().to_owned());
                 event.text = Some(content.to_owned());
@@ -588,11 +594,12 @@ impl AgentRunSink for SessionRunSink<'_> {
         if let Some(storage) = &self.store.storage {
             log_storage(
                 "record_assistant_text",
-                storage.record_assistant_text(
+                storage.record_assistant_text_with_reasoning(
                     self.session_id,
                     self.run_id,
                     self.seq,
                     content,
+                    reasoning_content,
                     self.store.model_id.as_deref(),
                 ),
             );
@@ -643,12 +650,13 @@ impl AgentRunSink for SessionRunSink<'_> {
     fn assistant_tool_calls(
         &mut self,
         content: &str,
+        reasoning_content: Option<&str>,
         calls: &[ToolCall],
     ) -> Result<(), Self::Error> {
         self.store.with_session(self.session_id, |session| {
-            session
-                .turns
-                .push(ChatMessage::assistant_tool_calls(content, calls.to_vec()));
+            let mut message = ChatMessage::assistant_tool_calls(content, calls.to_vec());
+            message.reasoning_content = reasoning_content.map(str::to_owned);
+            session.turns.push(message);
             session.emit("assistant.tool_calls", |event| {
                 event.role = Some(Role::Assistant.as_str().to_owned());
                 event.run_id = Some(self.run_id.to_owned());
@@ -661,11 +669,11 @@ impl AgentRunSink for SessionRunSink<'_> {
             let text = (!content.is_empty()).then_some(content);
             log_storage(
                 "record_assistant_tool_calls",
-                storage.record_assistant_tool_calls(
+                storage.record_assistant_tool_calls_with_reasoning(
                     self.session_id,
                     self.run_id,
                     self.seq,
-                    text,
+                    (text, reasoning_content),
                     calls,
                     self.store.model_id.as_deref(),
                 ),
