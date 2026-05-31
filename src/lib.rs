@@ -16,9 +16,11 @@ use std::thread;
 
 use serde_json::{Value, json};
 
+mod config;
 mod model;
 mod session;
 
+pub use config::{ConfigError, ResolvedModelConfig, resolve_config, resolve_default_config};
 pub use model::{
     ChatMessage, ChatModel, MockModel, ModelChoice, ModelError, OpenAiConfig, OpenAiModel, Role,
 };
