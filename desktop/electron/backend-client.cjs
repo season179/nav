@@ -8,6 +8,7 @@ function subscribeToSessionEvents({
   signal,
   onEvent,
   onError,
+  onOpen,
 }) {
   const eventsUrl = new URL(`/sessions/${sessionId}/events`, backendUrl);
   const transport = eventsUrl.protocol === "https:" ? https : http;
@@ -21,6 +22,7 @@ function subscribeToSessionEvents({
       return;
     }
 
+    onOpen?.({ statusCode: response.statusCode });
     response.setEncoding("utf8");
     response.on("data", (chunk) => {
       buffer += chunk;

@@ -7,7 +7,9 @@ async function startLocalBackend({
   projectRoot,
   startupAttempts = 80,
   env = {},
+  trace,
 }) {
+  trace?.mark("electron.backend.spawn.start");
   const child = spawn(
     "cargo",
     [
@@ -27,6 +29,7 @@ async function startLocalBackend({
       env: { ...process.env, ...env },
     },
   );
+  trace?.mark("electron.backend.process.spawned", { pid: child.pid });
 
   let stdout = "";
   let stderr = "";
@@ -40,10 +43,14 @@ async function startLocalBackend({
   for (let attempt = 0; attempt < startupAttempts; attempt += 1) {
     const url = findBackendUrl(stdout);
     if (url) {
+      trace?.mark("electron.backend.url.detected", { attempt });
       return { child, url };
     }
 
     if (child.exitCode !== null) {
+      trace?.mark("electron.backend.exited_before_startup", {
+        exit_code: child.exitCode,
+      });
       throw new Error(`backend exited before startup: ${stderr.trim()}`);
     }
 
@@ -51,6 +58,7 @@ async function startLocalBackend({
   }
 
   child.kill();
+  trace?.mark("electron.backend.startup.timeout");
   throw new Error("backend did not print a local URL");
 }
 
