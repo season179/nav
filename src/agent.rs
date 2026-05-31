@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use crate::context::ModelContext;
 use crate::model::{ChatMessage, ChatModel, ModelError, ToolCall};
@@ -45,27 +45,45 @@ impl Agent {
     /// The sink is notified as each visible step happens, before long-running
     /// tool calls start and immediately after they finish. A model error stops
     /// the loop; a tool error is returned to the model as an error tool result.
+    ///
+    /// The shared `cancel` flag lets a caller stop the run cooperatively: a
+    /// long-running tool (e.g. `bash`) is interrupted in place, and the loop
+    /// checks the flag before each model call so it never starts new work after
+    /// a stop was requested. An in-flight model request still finishes before
+    /// the loop can observe the stop, since the HTTP call itself is blocking.
+    /// Returns how the run ended so the caller can emit the right terminal event.
     pub(crate) fn run_turn<S>(
         &self,
         mut context: ModelContext,
+        cancel: &CancelFlag,
         sink: &mut S,
-    ) -> Result<(), AgentRunError<S::Error>>
+    ) -> Result<RunStop, AgentRunError<S::Error>>
     where
         S: AgentRunSink,
     {
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
         let tool_defs = self.registry.defs();
 
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(RunStop::Cancelled);
+            }
+
             let response = self
                 .model
                 .respond(&context, &tool_defs)
                 .map_err(AgentRunError::Model)?;
 
+            // A stop requested during the (blocking) model call takes effect now,
+            // before the reply is emitted, so a cancelled run produces no final
+            // assistant turn.
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(RunStop::Cancelled);
+            }
+
             if response.tool_calls.is_empty() {
                 let reply = response.content.unwrap_or_default();
                 sink.assistant_text(&reply).map_err(AgentRunError::Sink)?;
-                return Ok(());
+                return Ok(RunStop::Completed);
             }
 
             let content = response.content.unwrap_or_default();
@@ -75,8 +93,32 @@ impl Agent {
                 .map_err(AgentRunError::Sink)?;
 
             for call in &calls {
+                // A stop requested mid-batch must not let a later call in the
+                // same turn start — writing tools (`write`/`edit`) don't poll the
+                // flag, so only skipping them here keeps a cancel from mutating
+                // the workspace. Each skipped call still gets a result so every
+                // tool call keeps its matching result and the saved history stays
+                // replayable.
+                if cancel.load(Ordering::Relaxed) {
+                    let note = "[cancelled before execution]";
+                    context.push(ChatMessage::tool_result(&call.id, note, true));
+                    sink.tool_result(call, note, true)
+                        .map_err(AgentRunError::Sink)?;
+                    continue;
+                }
                 sink.tool_started(call).map_err(AgentRunError::Sink)?;
-                let result = self.registry.execute_call(call, &self.workspace, &cancel);
+                // Re-check at the dispatch boundary: `tool_started` took the
+                // session lock and emitted an event, a window in which a stop
+                // could land. Closing it here keeps a non-polling tool
+                // (`write`/`edit`) from running after a stop was requested.
+                if cancel.load(Ordering::Relaxed) {
+                    let note = "[cancelled before execution]";
+                    context.push(ChatMessage::tool_result(&call.id, note, true));
+                    sink.tool_result(call, note, true)
+                        .map_err(AgentRunError::Sink)?;
+                    continue;
+                }
+                let result = self.registry.execute_call(call, &self.workspace, cancel);
                 context.push(ChatMessage::tool_result(
                     &call.id,
                     &result.content,
@@ -87,6 +129,14 @@ impl Agent {
             }
         }
     }
+}
+
+/// How an agent run ended once `run_turn` returned without error.
+pub(crate) enum RunStop {
+    /// The model produced a final assistant reply.
+    Completed,
+    /// The run was stopped by the shared cancel flag before completing.
+    Cancelled,
 }
 
 /// Adapter notified by the agent loop as visible run steps happen.

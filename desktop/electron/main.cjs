@@ -37,6 +37,17 @@ ipcMain.handle("nav:send-message", async (_event, text) => {
   });
 });
 
+ipcMain.handle("nav:stop", async () => {
+  if (!backendUrl || !sessionId) {
+    throw new Error("chat session is not ready");
+  }
+  await sendRpc({
+    backendUrl,
+    method: "session.stop",
+    params: { sessionId },
+  });
+});
+
 ipcMain.handle("nav:list-sessions", async () => {
   if (!backendUrl) {
     throw new Error("chat session is not ready");

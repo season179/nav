@@ -8,17 +8,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::agent::{Agent, AgentRunError, AgentRunSink};
+use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop};
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, Role, ToolCall};
 use crate::storage::{SessionSummary, Storage};
-use crate::tools::Registry;
+use crate::tools::{CancelFlag, Registry};
 
 /// How a session originates, recorded on the persisted `sessions` row.
 const SESSION_SOURCE: &str = "nav";
@@ -76,6 +77,9 @@ struct Session {
     turns: TurnHistory,
     events: Vec<Event>,
     subscribers: Vec<Sender<Event>>,
+    /// The in-flight run's id and its cancel flag, set while a run is executing
+    /// so [`SessionStore::stop_run`] can interrupt it. `None` when idle.
+    active_run: Option<(String, CancelFlag)>,
 }
 
 impl Session {
@@ -85,6 +89,7 @@ impl Session {
             turns: TurnHistory::new(),
             events: Vec::new(),
             subscribers: Vec::new(),
+            active_run: None,
         }
     }
 
@@ -104,6 +109,10 @@ impl Session {
 pub enum SendError {
     /// No session exists with the given id.
     UnknownSession,
+    /// The session already has a run in flight. Only one run per session is
+    /// allowed, so its single cancel flag can always stop the right one and its
+    /// events stay ordered.
+    RunInProgress,
 }
 
 /// A live feed of one session's events: the backlog already emitted before
@@ -349,12 +358,22 @@ impl SessionStore {
     /// and emit its events.
     pub fn send_message(&self, session_id: &str, text: &str) -> Result<String, SendError> {
         let run_id = new_id();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
 
         // Seq 0 is the user turn; every later turn (assistant tool-calls, each
         // tool result, the final assistant text) takes the next number.
         let mut seq: i64 = 0;
-        self.with_session(session_id, |session| {
+        // Refuse to start a second run while one is already in flight: a session
+        // tracks a single cancel flag, so overlapping runs would leave the older
+        // one un-stoppable and interleave the two runs' events.
+        let started = self.with_session(session_id, |session| {
+            if session.active_run.is_some() {
+                return false;
+            }
             session.turns.push(ChatMessage::user(text));
+            // Register the run so `stop_run` can find its cancel flag while it
+            // executes; cleared on every exit path below.
+            session.active_run = Some((run_id.clone(), Arc::clone(&cancel)));
             session.emit("user.message", |event| {
                 event.role = Some(Role::User.as_str().to_owned());
                 event.text = Some(text.to_owned());
@@ -362,7 +381,11 @@ impl SessionStore {
             session.emit("run.started", |event| {
                 event.run_id = Some(run_id.clone());
             });
+            true
         })?;
+        if !started {
+            return Err(SendError::RunInProgress);
+        }
 
         // Persist the run and the user turn before the model call so a crash
         // mid-response still leaves the question on record.
@@ -386,14 +409,66 @@ impl SessionStore {
             run_id: &run_id,
             seq,
         };
-        match self.agent.run_turn(context, &mut sink) {
-            Ok(()) => Ok(run_id),
+        let outcome = self.agent.run_turn(context, &cancel, &mut sink);
+        // The run is over (or stopped); release its cancel flag before reporting.
+        self.clear_active_run(session_id, &run_id);
+        match outcome {
+            Ok(RunStop::Completed) => Ok(run_id),
+            Ok(RunStop::Cancelled) => {
+                self.cancel_run(session_id, &run_id)?;
+                Ok(run_id)
+            }
             Err(AgentRunError::Model(error)) => {
                 self.fail_run(session_id, &run_id, &error.message)?;
                 Ok(run_id)
             }
             Err(AgentRunError::Sink(error)) => Err(error),
         }
+    }
+
+    /// Request that the session's in-flight run stop. Returns `true` if a run was
+    /// active to signal. Cancellation is cooperative: a running tool is killed in
+    /// place and the loop halts before its next model call, so the run ends with
+    /// a `run.cancelled` event shortly after.
+    pub fn stop_run(&self, session_id: &str) -> bool {
+        self.with_session(session_id, |session| {
+            if let Some((_, cancel)) = &session.active_run {
+                cancel.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// Forget the active run, but only if it is still the one identified by
+    /// `run_id`, so a later run started for the same session is left untouched.
+    fn clear_active_run(&self, session_id: &str, run_id: &str) {
+        let _ = self.with_session(session_id, |session| {
+            if session
+                .active_run
+                .as_ref()
+                .is_some_and(|(id, _)| id == run_id)
+            {
+                session.active_run = None;
+            }
+        });
+    }
+
+    /// Emit a `run.cancelled` event and record the stop. Mirrors [`Self::fail_run`]
+    /// for the user-initiated stop path.
+    fn cancel_run(&self, session_id: &str, run_id: &str) -> Result<(), SendError> {
+        self.with_session(session_id, |session| {
+            session.emit("run.cancelled", |event| {
+                event.run_id = Some(run_id.to_owned());
+                event.status = Some("cancelled".to_owned());
+            });
+        })?;
+        if let Some(storage) = &self.storage {
+            log_storage("cancel_run", storage.cancel_run(run_id));
+        }
+        Ok(())
     }
 
     /// Emit a `run.failed` event and persist the failure. Shared by the
