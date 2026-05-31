@@ -1,16 +1,20 @@
 const statusNode = document.querySelector("#backend-status");
 const sessionNode = document.querySelector("#session-id");
 const messageListNode = document.querySelector("#message-list");
+const sessionListNode = document.querySelector("#session-list");
+const newChatButton = document.querySelector("#new-chat");
 const composer = document.querySelector("#composer");
 const input = document.querySelector("#composer-input");
 const sendButton = document.querySelector("#composer-send");
 
 let connected = false;
 let running = false;
+let activeSessionId = null;
 
 if (window.nav) {
   window.nav.onBackendStatus(handleBackendStatus);
   window.nav.onSessionEvent(handleSessionEvent);
+  newChatButton.addEventListener("click", startNewChat);
 } else {
   renderBackendStatus({
     state: "preload-missing",
@@ -39,7 +43,11 @@ function handleBackendStatus(status) {
   renderBackendStatus(status);
   if (status.state === "connected") {
     connected = true;
+    if (status.sessionId) {
+      activeSessionId = status.sessionId;
+    }
     setRunning(false);
+    refreshSessions();
   }
 }
 
@@ -56,14 +64,103 @@ function handleSessionEvent(event) {
       break;
     case "run.completed":
       setRunning(false);
+      // A title or recency may have changed; keep the sidebar current.
+      refreshSessions();
       break;
     case "run.failed":
       appendMessage("error", event.error ?? "the run failed");
       setRunning(false);
+      refreshSessions();
       break;
     default:
       break;
   }
+}
+
+// Replace the active conversation with an existing session. The transcript is
+// cleared up front; the resumed history streams back in as session events.
+async function selectSession(sessionId) {
+  if (sessionId === activeSessionId || running || !connected) {
+    return;
+  }
+  clearTranscript();
+  activeSessionId = sessionId;
+  markActiveSession();
+  try {
+    await window.nav.switchSession(sessionId);
+  } catch (error) {
+    appendMessage("error", `Could not open session: ${error.message}`);
+  }
+}
+
+async function startNewChat() {
+  if (running || !connected) {
+    return;
+  }
+  clearTranscript();
+  try {
+    activeSessionId = await window.nav.newSession();
+    markActiveSession();
+  } catch (error) {
+    appendMessage("error", `Could not start a new chat: ${error.message}`);
+  }
+}
+
+async function refreshSessions() {
+  if (!window.nav) {
+    return;
+  }
+  let sessions;
+  try {
+    sessions = await window.nav.listSessions();
+  } catch {
+    // Listing is best-effort; never let it disrupt the chat.
+    return;
+  }
+
+  sessionListNode.replaceChildren();
+  if (sessions.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "sidebar-empty";
+    empty.textContent = "No sessions yet";
+    sessionListNode.append(empty);
+    return;
+  }
+
+  for (const session of sessions) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "session-item";
+    item.dataset.sessionId = session.sessionId;
+    item.textContent = sessionTitle(session);
+    if (session.sessionId === activeSessionId) {
+      item.setAttribute("aria-current", "true");
+    }
+    item.addEventListener("click", () => selectSession(session.sessionId));
+
+    const row = document.createElement("li");
+    row.append(item);
+    sessionListNode.append(row);
+  }
+}
+
+function sessionTitle(session) {
+  const title = (session.title ?? "").trim();
+  return title.length > 0 ? title : "New chat";
+}
+
+function markActiveSession() {
+  for (const item of sessionListNode.querySelectorAll(".session-item")) {
+    if (item.dataset.sessionId === activeSessionId) {
+      item.setAttribute("aria-current", "true");
+    } else {
+      item.removeAttribute("aria-current");
+    }
+  }
+}
+
+function clearTranscript() {
+  messageListNode.replaceChildren();
 }
 
 function appendMessage(role, text) {
@@ -99,6 +196,8 @@ function setRunning(isRunning) {
   const disabled = isRunning || !connected;
   input.disabled = disabled;
   sendButton.disabled = disabled;
+  // New chat / session switching are blocked mid-run to avoid racing a turn.
+  newChatButton.disabled = disabled;
   if (!disabled) {
     input.focus();
   }

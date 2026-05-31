@@ -11,10 +11,11 @@ let backendProcess = null;
 let eventSubscription = null;
 let backendUrl = null;
 let sessionId = null;
+let mainWindow = null;
 
 app.whenReady().then(async () => {
-  const window = createMainWindow();
-  await startChatSession(window);
+  mainWindow = createMainWindow();
+  await startChatSession(mainWindow);
 });
 
 app.on("before-quit", stopBackend);
@@ -34,6 +35,35 @@ ipcMain.handle("nav:send-message", async (_event, text) => {
     method: "session.sendMessage",
     params: { sessionId, text },
   });
+});
+
+ipcMain.handle("nav:list-sessions", async () => {
+  if (!backendUrl) {
+    throw new Error("chat session is not ready");
+  }
+  const response = await sendRpc({ backendUrl, method: "session.list" });
+  return response.result.sessions;
+});
+
+ipcMain.handle("nav:switch-session", async (_event, id) => {
+  if (!backendUrl) {
+    throw new Error("chat session is not ready");
+  }
+  await sendRpc({
+    backendUrl,
+    method: "session.resume",
+    params: { sessionId: id },
+  });
+  activateSession(mainWindow, id);
+});
+
+ipcMain.handle("nav:new-session", async () => {
+  if (!backendUrl) {
+    throw new Error("chat session is not ready");
+  }
+  const created = await sendRpc({ backendUrl, method: "session.create" });
+  activateSession(mainWindow, created.result.sessionId);
+  return created.result.sessionId;
 });
 
 function createMainWindow() {
@@ -57,24 +87,7 @@ async function startChatSession(window) {
     backendProcess = backend.child;
     backendUrl = backend.url;
 
-    sessionId = await openSession();
-
-    sendStatus(window, { state: "connected", backendUrl, sessionId });
-
-    eventSubscription = subscribeToSessionEvents({
-      backendUrl,
-      sessionId,
-      onEvent(event) {
-        forwardEvent(window, event);
-      },
-      onError(error) {
-        sendStatus(window, { state: "stream-error", message: error.message });
-        if (smokeMode) {
-          console.error(error);
-          app.exit(1);
-        }
-      },
-    });
+    activateSession(window, await openSession());
 
     if (smokeMode) {
       await runSmokeTurn();
@@ -86,6 +99,29 @@ async function startChatSession(window) {
       app.exit(1);
     }
   }
+}
+
+// Make `id` the active conversation: point the event stream at it (replacing any
+// prior subscription) and tell the renderer it's connected. The session's
+// backlog replays over the stream, so switching redraws the transcript.
+function activateSession(window, id) {
+  sessionId = id;
+  eventSubscription?.close();
+  eventSubscription = subscribeToSessionEvents({
+    backendUrl,
+    sessionId: id,
+    onEvent(event) {
+      forwardEvent(window, event);
+    },
+    onError(error) {
+      sendStatus(window, { state: "stream-error", message: error.message });
+      if (smokeMode) {
+        console.error(error);
+        app.exit(1);
+      }
+    },
+  });
+  sendStatus(window, { state: "connected", backendUrl, sessionId: id });
 }
 
 // Reopen the most recent conversation so sessions persist across launches.

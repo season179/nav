@@ -14,7 +14,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::model::{ChatMessage, ChatModel, Role};
-use crate::storage::Storage;
+use crate::storage::{SessionSummary, Storage};
 
 /// How a session originates, recorded on the persisted `sessions` row.
 const SESSION_SOURCE: &str = "nav";
@@ -218,6 +218,21 @@ impl SessionStore {
             .unwrap()
             .insert(session_id.to_owned(), session);
         true
+    }
+
+    /// Summaries of all persisted nav sessions, newest first. Empty when no
+    /// durable storage is attached.
+    pub fn list_sessions(&self) -> Vec<SessionSummary> {
+        let Some(storage) = &self.storage else {
+            return Vec::new();
+        };
+        match storage.list_sessions(SESSION_SOURCE) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                eprintln!("nav: failed to list sessions: {error}");
+                Vec::new()
+            }
+        }
     }
 
     /// The most recent persisted nav session id, if durable storage is attached

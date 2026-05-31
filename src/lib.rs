@@ -3,7 +3,7 @@
 //! Two routes back the chat loop:
 //!
 //! - `POST /rpc` — JSON-RPC `session.create`, `session.resume`,
-//!   `session.latest`, and `session.sendMessage`.
+//!   `session.latest`, `session.list`, and `session.sendMessage`.
 //! - `GET /sessions/{id}/events` — a live Server-Sent Events feed of one
 //!   session's ordered events.
 //!
@@ -28,7 +28,7 @@ pub use model::{
     ChatMessage, ChatModel, MockModel, ModelChoice, ModelError, OpenAiConfig, OpenAiModel, Role,
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
-pub use storage::{Storage, StorageError};
+pub use storage::{SessionSummary, Storage, StorageError};
 
 /// Command-line configuration for the backend binary.
 pub struct BackendConfig {
@@ -124,6 +124,20 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
         Some("session.latest") => {
             let latest = store.latest_session_id();
             write_rpc_result(stream, &id, json!({ "sessionId": latest }))
+        }
+        Some("session.list") => {
+            let sessions: Vec<Value> = store
+                .list_sessions()
+                .into_iter()
+                .map(|session| {
+                    json!({
+                        "sessionId": session.id,
+                        "title": session.title,
+                        "updatedAt": session.updated_at,
+                    })
+                })
+                .collect();
+            write_rpc_result(stream, &id, json!({ "sessions": sessions }))
         }
         Some("session.resume") => {
             let session_id = request

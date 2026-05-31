@@ -20,12 +20,21 @@ type SessionEvent = {
   error?: string;
 };
 
+type SessionSummary = {
+  sessionId: string;
+  title: string | null;
+  updatedAt: number;
+};
+
 declare global {
   interface Window {
     nav: {
       onBackendStatus(callback: (status: BackendStatus) => void): () => void;
       onSessionEvent(callback: (event: SessionEvent) => void): () => void;
       sessionSendMessage(text: string): Promise<void>;
+      listSessions(): Promise<SessionSummary[]>;
+      switchSession(sessionId: string): Promise<void>;
+      newSession(): Promise<string>;
     };
   }
 }

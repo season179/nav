@@ -12,6 +12,18 @@ function normalizeMessageText(value) {
   return text;
 }
 
+function normalizeSessionId(value) {
+  if (typeof value !== "string") {
+    throw new TypeError("session id must be a string");
+  }
+  const id = value.trim();
+  if (id.length === 0) {
+    throw new Error("session id must not be empty");
+  }
+  return id;
+}
+
 module.exports = {
   normalizeMessageText,
+  normalizeSessionId,
 };
