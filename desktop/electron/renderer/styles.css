@@ -598,6 +598,17 @@ h1 {
     0 0 0 4px var(--primary-dim);
 }
 
+/* Mid-run the action button turns into a Stop control. */
+.composer-send.is-stop {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.composer-send.is-stop:hover:not(:disabled) {
+  background: oklch(0.62 0.18 25);
+  box-shadow: 0 0 16px var(--danger-tint);
+}
+
 .composer-input:disabled,
 .composer-send:disabled {
   opacity: 0.45;

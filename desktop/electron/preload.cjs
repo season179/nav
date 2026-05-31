@@ -39,6 +39,10 @@ contextBridge.exposeInMainWorld("nav", {
   sessionSendMessage(text) {
     return ipcRenderer.invoke("nav:send-message", normalizeMessageText(text));
   },
+  // Stop the active session's in-flight run.
+  sessionStop() {
+    return ipcRenderer.invoke("nav:stop");
+  },
   // List persisted sessions for the sidebar.
   listSessions() {
     return ipcRenderer.invoke("nav:list-sessions");

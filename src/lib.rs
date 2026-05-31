@@ -3,7 +3,8 @@
 //! Two routes back the chat loop:
 //!
 //! - `POST /rpc` — JSON-RPC `session.create`, `session.resume`,
-//!   `session.latest`, `session.list`, and `session.sendMessage`.
+//!   `session.latest`, `session.list`, `session.sendMessage`, and
+//!   `session.stop`.
 //! - `GET /sessions/{id}/events` — a live Server-Sent Events feed of one
 //!   session's ordered events.
 //!
@@ -185,6 +186,19 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                     &id,
                     "session.sendMessage requires sessionId and text",
                 ),
+            }
+        }
+        Some("session.stop") => {
+            let session_id = request
+                .get("params")
+                .and_then(|p| p.get("sessionId"))
+                .and_then(Value::as_str);
+            match session_id {
+                Some(session_id) => {
+                    let stopped = store.stop_run(session_id);
+                    write_rpc_result(stream, &id, json!({ "stopped": stopped }))
+                }
+                None => write_rpc_error(stream, &id, "session.stop requires sessionId"),
             }
         }
         Some(method) => write_rpc_error(stream, &id, &format!("unknown method: {method}")),

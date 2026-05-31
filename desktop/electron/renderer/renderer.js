@@ -50,8 +50,13 @@ input.addEventListener("keydown", (keyEvent) => {
 
 composer.addEventListener("submit", async (submitEvent) => {
   submitEvent.preventDefault();
+  // Mid-run the action button is a Stop control rather than Send.
+  if (running) {
+    await stopRun();
+    return;
+  }
   const text = input.value.trim();
-  if (!text || running || !connected) {
+  if (!text || !connected) {
     return;
   }
 
@@ -65,6 +70,22 @@ composer.addEventListener("submit", async (submitEvent) => {
     setRunning(false);
   }
 });
+
+// Ask the backend to stop the active run. The button is disabled until the run
+// actually ends (a `run.cancelled` event), since an in-flight model call must
+// finish before the loop can observe the stop.
+async function stopRun() {
+  if (!window.nav) {
+    return;
+  }
+  sendButton.disabled = true;
+  try {
+    await window.nav.sessionStop();
+  } catch (error) {
+    appendMessage("error", `Could not stop: ${error.message}`);
+    sendButton.disabled = false;
+  }
+}
 
 function handleBackendStatus(status) {
   renderBackendStatus(status);
@@ -125,6 +146,7 @@ function handleSessionEvent(event) {
       appendMessage("assistant", event.text);
       break;
     case "run.completed":
+    case "run.cancelled":
       setRunning(false);
       // A title or recency may have changed; keep the sidebar current.
       refreshSessions();
@@ -349,12 +371,15 @@ function previewText(text) {
 
 function setRunning(isRunning) {
   running = isRunning;
-  const disabled = isRunning || !connected;
-  input.disabled = disabled;
-  sendButton.disabled = disabled;
+  // The composer is locked mid-run, but its action button stays live as a Stop
+  // control so the user can interrupt the turn.
+  input.disabled = isRunning || !connected;
+  sendButton.disabled = !connected;
+  sendButton.textContent = isRunning ? "Stop" : "Send";
+  sendButton.classList.toggle("is-stop", isRunning);
   // New chat / session switching are blocked mid-run to avoid racing a turn.
-  newChatButton.disabled = disabled;
-  if (!disabled) {
+  newChatButton.disabled = isRunning || !connected;
+  if (!isRunning && connected) {
     input.focus();
   }
 }

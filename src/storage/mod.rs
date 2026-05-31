@@ -240,6 +240,16 @@ impl Storage {
         Ok(())
     }
 
+    /// Mark a run cancelled after a user-requested stop.
+    pub fn cancel_run(&self, run_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE runs SET status = 'cancelled', finished_at = ?2 WHERE id = ?1",
+            params![run_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// All sessions from `source`, most-recently-updated first, for listing in
     /// the sidebar. `title` is the session's first user message (callers
     /// truncate and supply a fallback for empty sessions).
