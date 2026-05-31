@@ -1,5 +1,20 @@
 const { contextBridge, ipcRenderer } = require("electron");
-const { normalizeMessageText } = require("./request-validation.cjs");
+
+// This preload runs sandboxed (`sandbox: true`), where `require` is limited to
+// `electron` and a few builtins — it cannot load relative project files. So the
+// boundary validation is inlined here rather than imported from
+// `request-validation.cjs`. That standalone module is kept in lockstep and is
+// what the unit tests exercise; see tests/electron_request_validation.test.cjs.
+function normalizeMessageText(value) {
+  if (typeof value !== "string") {
+    throw new TypeError("message text must be a string");
+  }
+  const text = value.trim();
+  if (text.length === 0) {
+    throw new Error("message text must not be empty");
+  }
+  return text;
+}
 
 contextBridge.exposeInMainWorld("nav", {
   onBackendStatus(callback) {
