@@ -34,7 +34,7 @@ impl Tool for GrepTool {
     }
 
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Search file contents for patterns (respects .gitignore)")
+        Some("Search file contents for patterns (skips .git and common vendor directories)")
     }
 
     fn parameters(&self) -> Value {

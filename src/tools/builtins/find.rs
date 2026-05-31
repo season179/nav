@@ -26,7 +26,7 @@ impl Tool for FindTool {
     }
 
     fn prompt_snippet(&self) -> Option<&'static str> {
-        Some("Find files by glob pattern (respects .gitignore)")
+        Some("Find files by glob pattern (skips .git and common vendor directories)")
     }
 
     fn parameters(&self) -> Value {
