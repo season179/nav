@@ -81,6 +81,8 @@ struct Session {
     /// The in-flight run's id and its cancel flag, set while a run is executing
     /// so [`SessionStore::stop_run`] can interrupt it. `None` when idle.
     active_run: Option<(String, CancelFlag)>,
+    /// Latest model-call context usage for this session.
+    token_usage: Option<u64>,
 }
 
 impl Session {
@@ -91,6 +93,7 @@ impl Session {
             events: Vec::new(),
             subscribers: Vec::new(),
             active_run: None,
+            token_usage: None,
         }
     }
 
@@ -159,6 +162,8 @@ impl SessionStore {
             model_info: ModelInfo {
                 label: "unknown model".to_owned(),
                 thinking: None,
+                context_window: None,
+                token_usage: None,
             },
         }
     }
@@ -182,8 +187,17 @@ impl SessionStore {
     }
 
     /// Renderer-facing model metadata for the app's composer.
-    pub fn model_info(&self) -> &ModelInfo {
-        &self.model_info
+    pub fn model_info(&self, session_id: Option<&str>) -> ModelInfo {
+        let used_tokens = session_id.and_then(|session_id| self.token_usage(session_id));
+        self.model_info.with_used_tokens(used_tokens)
+    }
+
+    fn token_usage(&self, session_id: &str) -> Option<u64> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|session| session.token_usage)
     }
 
     /// Override the toolset offered to the model (defaults to the coding tools).
@@ -669,6 +683,10 @@ impl AgentRunSink for SessionRunSink<'_> {
     }
 
     fn token_usage(&mut self, usage: &TokenUsage) -> Result<(), Self::Error> {
+        let used_tokens = usage.context_used();
+        self.store.with_session(self.session_id, |session| {
+            session.token_usage = Some(used_tokens);
+        })?;
         if let Some(storage) = &self.store.storage {
             log_storage(
                 "record_token_usage",

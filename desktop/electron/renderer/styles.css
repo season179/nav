@@ -510,9 +510,17 @@ h1 {
   min-height: 16px;
 }
 
+.composer-meta-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+}
+
 /* The model metadata currently in use — small, dim, just under the input. */
 .composer-model,
-.composer-thinking {
+.composer-thinking,
+.composer-token-usage {
   color: var(--ink-faint);
   font-size: 12px;
   letter-spacing: 0.02em;
@@ -523,13 +531,15 @@ h1 {
   padding-left: 2px;
 }
 
-.composer-thinking {
-  margin-left: auto;
+.composer-token-usage {
+  font-variant-numeric: tabular-nums;
   text-align: right;
+  white-space: nowrap;
 }
 
 .composer-model:empty,
-.composer-thinking:empty {
+.composer-thinking:empty,
+.composer-token-usage:empty {
   display: none;
 }
 

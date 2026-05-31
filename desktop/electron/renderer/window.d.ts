@@ -35,7 +35,11 @@ declare global {
       onSessionEvent(callback: (event: SessionEvent) => void): () => void;
       sessionSendMessage(text: string): Promise<void>;
       listSessions(): Promise<SessionSummary[]>;
-      modelInfo(): Promise<{ label: string; thinking?: string | null }>;
+      modelInfo(sessionId?: string): Promise<{
+        label: string;
+        thinking?: string | null;
+        tokenUsage?: { used: number; contextWindow: number } | null;
+      }>;
       switchSession(sessionId: string): Promise<void>;
       newSession(): Promise<string>;
     };

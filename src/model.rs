@@ -234,10 +234,34 @@ pub enum ModelChoice {
 
 /// Small, renderer-facing summary of the active model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    #[serde(skip)]
+    pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenBudgetInfo>,
+}
+
+/// Current context usage against the active model's window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBudgetInfo {
+    pub used: u64,
+    pub context_window: u64,
+}
+
+impl ModelInfo {
+    pub fn with_used_tokens(&self, used: Option<u64>) -> Self {
+        let mut info = self.clone();
+        info.token_usage = self.context_window.map(|context_window| TokenBudgetInfo {
+            used: used.unwrap_or(0),
+            context_window,
+        });
+        info
+    }
 }
 
 impl ModelChoice {
@@ -325,6 +349,8 @@ impl ModelChoice {
         ModelInfo {
             label: self.label(),
             thinking: self.thinking_label(),
+            context_window: self.context_window(),
+            token_usage: None,
         }
     }
 
@@ -352,6 +378,13 @@ impl ModelChoice {
                     (false, false) => None,
                 }
             }
+            _ => None,
+        }
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        match self {
+            ModelChoice::OpenAi(config) => config.context_window,
             _ => None,
         }
     }

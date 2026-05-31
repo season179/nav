@@ -152,6 +152,7 @@ fn resolve_surfaces_reasoning_thinking_metadata() {
         choice.info().thinking.as_deref(),
         Some("Reasoning / Thinking")
     );
+    assert_eq!(choice.info().context_window, Some(128_000));
 }
 
 #[test]
