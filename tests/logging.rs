@@ -2,9 +2,9 @@
 //! ~10 MiB on disk (oldest segments dropped) while retaining the newest lines.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use nav::logging::{SEGMENT_BYTES, SEGMENTS, build_file_rotate, log_file_path};
+use nav::logging::{SEGMENT_BYTES, SEGMENTS, build_file_rotate};
 use uuid::Uuid;
 
 /// Sum the bytes of the active log plus every rotated segment beside it.
@@ -64,13 +64,4 @@ fn file_sink_stays_within_the_size_cap_and_keeps_newest_lines() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn nav_log_path_honors_env_override() {
-    // SAFETY: single-threaded test process; we set then clear the override.
-    let custom = PathBuf::from("/tmp/nav-custom.log");
-    unsafe { std::env::set_var("NAV_LOG_PATH", &custom) };
-    assert_eq!(log_file_path(), Some(custom));
-    unsafe { std::env::remove_var("NAV_LOG_PATH") };
 }

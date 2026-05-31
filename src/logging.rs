@@ -18,6 +18,7 @@
 //! deleted. The on-disk footprint therefore stays at roughly
 //! `SEGMENTS * SEGMENT_BYTES` ≈ 10 MiB.
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -38,11 +39,19 @@ pub const SEGMENT_BYTES: usize = 2 * 1024 * 1024;
 /// `~/.nav/nav.log`. `None` when no home directory can be resolved and no
 /// override is given (the file sink is then skipped).
 pub fn log_file_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("NAV_LOG_PATH").filter(|value| !value.is_empty()) {
+    resolve_log_path(
+        std::env::var_os("NAV_LOG_PATH"),
+        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+    )
+}
+
+/// Pure resolution behind [`log_file_path`], split out so it can be unit-tested
+/// without mutating process-global environment variables.
+fn resolve_log_path(override_path: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    if let Some(path) = override_path.filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".nav").join("nav.log"))
+    Some(PathBuf::from(home?).join(".nav").join("nav.log"))
 }
 
 /// Build the size-capped rotating writer for `path`, creating the parent
@@ -111,4 +120,26 @@ pub fn init() {
         .with(stderr_layer)
         .with(file_layer)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn override_takes_precedence_over_home() {
+        let resolved = resolve_log_path(Some("/tmp/custom.log".into()), Some("/home/u".into()));
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/custom.log")));
+    }
+
+    #[test]
+    fn empty_override_falls_back_to_home() {
+        let resolved = resolve_log_path(Some(OsString::new()), Some("/home/u".into()));
+        assert_eq!(resolved, Some(PathBuf::from("/home/u/.nav/nav.log")));
+    }
+
+    #[test]
+    fn no_home_and_no_override_yields_none() {
+        assert_eq!(resolve_log_path(None, None), None);
+    }
 }
