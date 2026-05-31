@@ -1,15 +1,16 @@
 const statusNode = document.querySelector("#backend-status");
 const sessionNode = document.querySelector("#session-id");
-const eventListNode = document.querySelector("#event-list");
+const messageListNode = document.querySelector("#message-list");
+const composer = document.querySelector("#composer");
+const input = document.querySelector("#composer-input");
+const sendButton = document.querySelector("#composer-send");
 
-const events = [];
+let connected = false;
+let running = false;
 
 if (window.nav) {
-  window.nav.onBackendStatus(renderBackendStatus);
-  window.nav.onSessionEvent((event) => {
-    events.push(event);
-    renderEvents();
-  });
+  window.nav.onBackendStatus(handleBackendStatus);
+  window.nav.onSessionEvent(handleSessionEvent);
 } else {
   renderBackendStatus({
     state: "preload-missing",
@@ -17,33 +18,98 @@ if (window.nav) {
   });
 }
 
-function renderBackendStatus(status) {
-  statusNode.textContent = formatStatus(status);
-  statusNode.dataset.state = status.state;
+composer.addEventListener("submit", async (submitEvent) => {
+  submitEvent.preventDefault();
+  const text = input.value.trim();
+  if (!text || running || !connected) {
+    return;
+  }
 
-  if (status.sessionId) {
-    sessionNode.textContent = status.sessionId;
+  input.value = "";
+  setRunning(true);
+  try {
+    await window.nav.sessionSendMessage(text);
+  } catch (error) {
+    appendMessage("error", `Could not send message: ${error.message}`);
+    setRunning(false);
+  }
+});
+
+function handleBackendStatus(status) {
+  renderBackendStatus(status);
+  if (status.state === "connected") {
+    connected = true;
+    setRunning(false);
   }
 }
 
-function renderEvents() {
-  eventListNode.replaceChildren(
-    ...events.map((event) => {
-      const row = document.createElement("li");
-      row.className = "event-row";
+function handleSessionEvent(event) {
+  switch (event.type) {
+    case "user.message":
+      appendMessage("user", event.text);
+      break;
+    case "run.started":
+      setRunning(true);
+      break;
+    case "message.completed":
+      appendMessage("assistant", event.text);
+      break;
+    case "run.completed":
+      setRunning(false);
+      break;
+    case "run.failed":
+      appendMessage("error", event.error ?? "the run failed");
+      setRunning(false);
+      break;
+    default:
+      break;
+  }
+}
 
-      const type = document.createElement("span");
-      type.className = "event-type";
-      type.textContent = event.type;
+function appendMessage(role, text) {
+  const item = document.createElement("li");
+  item.className = `message message-${role}`;
 
-      const summary = document.createElement("span");
-      summary.className = "event-summary";
-      summary.textContent = summarizeEvent(event);
+  const who = document.createElement("span");
+  who.className = "message-role";
+  who.textContent = roleLabel(role);
 
-      row.append(type, summary);
-      return row;
-    }),
-  );
+  const body = document.createElement("span");
+  body.className = "message-text";
+  body.textContent = text;
+
+  item.append(who, body);
+  messageListNode.append(item);
+  item.scrollIntoView({ block: "end" });
+}
+
+function roleLabel(role) {
+  switch (role) {
+    case "user":
+      return "You";
+    case "assistant":
+      return "nav";
+    default:
+      return "error";
+  }
+}
+
+function setRunning(isRunning) {
+  running = isRunning;
+  const disabled = isRunning || !connected;
+  input.disabled = disabled;
+  sendButton.disabled = disabled;
+  if (!disabled) {
+    input.focus();
+  }
+}
+
+function renderBackendStatus(status) {
+  statusNode.textContent = formatStatus(status);
+  statusNode.dataset.state = status.state;
+  if (status.sessionId) {
+    sessionNode.textContent = `Session ${status.sessionId}`;
+  }
 }
 
 function formatStatus(status) {
@@ -59,24 +125,4 @@ function formatStatus(status) {
     default:
       return status.message ?? status.state;
   }
-}
-
-function summarizeEvent(event) {
-  if (event.text) {
-    return event.text;
-  }
-
-  if (event.finish_reason) {
-    return `finish_reason=${event.finish_reason}`;
-  }
-
-  if (event.status) {
-    return `status=${event.status}`;
-  }
-
-  if (event.run_id) {
-    return event.run_id;
-  }
-
-  return event.event_id;
 }

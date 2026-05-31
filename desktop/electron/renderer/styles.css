@@ -19,8 +19,8 @@ body {
 
 .shell {
   display: grid;
-  grid-template-rows: auto 1fr;
-  min-height: 100vh;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
 }
 
 .topbar {
@@ -67,49 +67,106 @@ p {
 }
 
 .status[data-state="stream-error"],
-.status[data-state="backend-error"] {
+.status[data-state="backend-error"],
+.status[data-state="preload-missing"] {
   border-color: #c47b74;
   background: #f8e9e6;
   color: #8b332d;
 }
 
-.stream {
+.chat {
   min-height: 0;
-  padding: 28px;
+  padding: 24px 28px;
   overflow: auto;
 }
 
-.event-list {
+.message-list {
   display: grid;
-  gap: 10px;
+  gap: 12px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.event-row {
+.message {
   display: grid;
-  grid-template-columns: minmax(168px, 220px) 1fr;
-  gap: 18px;
-  align-items: start;
-  padding: 13px 14px;
+  gap: 4px;
+  max-width: 78%;
+  padding: 12px 14px;
   border: 1px solid #d8d1c6;
-  border-radius: 8px;
+  border-radius: 12px;
   background: #fffdf8;
 }
 
-.event-type {
-  color: #2f5f76;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 13px;
-  font-weight: 700;
-  line-height: 1.45;
+.message-user {
+  justify-self: end;
+  border-color: #9bb7d4;
+  background: #eaf2f9;
 }
 
-.event-summary {
-  color: #35302b;
-  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 13px;
-  line-height: 1.45;
+.message-assistant {
+  justify-self: start;
+}
+
+.message-error {
+  justify-self: start;
+  border-color: #c47b74;
+  background: #f8e9e6;
+  color: #8b332d;
+}
+
+.message-role {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b6258;
+}
+
+.message-text {
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.composer {
+  display: flex;
+  gap: 12px;
+  padding: 18px 28px;
+  border-top: 1px solid #d8d1c6;
+  background: #fffdf8;
+}
+
+.composer-input {
+  flex: 1;
+  padding: 11px 14px;
+  border: 1px solid #c9c1b5;
+  border-radius: 8px;
+  background: #fff;
+  color: #1f2328;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.composer-input:focus {
+  outline: 2px solid #9bb7d4;
+  outline-offset: 0;
+}
+
+.composer-send {
+  padding: 11px 20px;
+  border: 1px solid #2f5f76;
+  border-radius: 8px;
+  background: #2f5f76;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.composer-input:disabled,
+.composer-send:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }

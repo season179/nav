@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer } = require("electron");
+const { normalizeMessageText } = require("./request-validation.cjs");
 
 contextBridge.exposeInMainWorld("nav", {
   onBackendStatus(callback) {
@@ -6,6 +7,11 @@ contextBridge.exposeInMainWorld("nav", {
   },
   onSessionEvent(callback) {
     return subscribe("nav:session-event", callback);
+  },
+  // Send one chat message. The text is validated here so the renderer can only
+  // ever hand Main a clean string — never an arbitrary IPC payload.
+  sessionSendMessage(text) {
+    return ipcRenderer.invoke("nav:send-message", normalizeMessageText(text));
   },
 });
 

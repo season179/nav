@@ -16,9 +16,23 @@
         <div class="status" id="backend-status">Starting</div>
       </header>
 
-      <section class="stream" aria-label="Session event stream">
-        <ol class="event-list" id="event-list"></ol>
+      <section class="chat" aria-label="Chat transcript">
+        <ol class="message-list" id="message-list"></ol>
       </section>
+
+      <form class="composer" id="composer">
+        <input
+          type="text"
+          id="composer-input"
+          class="composer-input"
+          placeholder="Send a message…"
+          autocomplete="off"
+          disabled
+        />
+        <button type="submit" id="composer-send" class="composer-send" disabled>
+          Send
+        </button>
+      </form>
     </main>
     <script src="./renderer.js"></script>
   </body>

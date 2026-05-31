@@ -3,13 +3,16 @@ const { setTimeout: delay } = require("node:timers/promises");
 
 const STARTUP_PREFIX = "nav local backend listening on ";
 
-async function startLocalBackend({ projectRoot, startupAttempts = 80 }) {
+async function startLocalBackend({ projectRoot, startupAttempts = 80, env = {} }) {
   const child = spawn(
     "cargo",
     ["run", "--quiet", "--bin", "nav-local-backend", "--", "--bind", "127.0.0.1:0"],
     {
       cwd: projectRoot,
       stdio: ["ignore", "pipe", "pipe"],
+      // Inherit the user's environment (so a real NAV_API_KEY flows through),
+      // with caller overrides such as forcing the mock model.
+      env: { ...process.env, ...env },
     },
   );
 

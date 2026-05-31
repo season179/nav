@@ -14,9 +14,10 @@ type SessionEvent = {
   sequence?: number;
   run_id?: string;
   message_id?: string;
+  role?: string;
   text?: string;
-  finish_reason?: string;
   status?: string;
+  error?: string;
 };
 
 declare global {
@@ -24,6 +25,7 @@ declare global {
     nav: {
       onBackendStatus(callback: (status: BackendStatus) => void): () => void;
       onSessionEvent(callback: (event: SessionEvent) => void): () => void;
+      sessionSendMessage(text: string): Promise<void>;
     };
   }
 }
