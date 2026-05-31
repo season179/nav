@@ -93,13 +93,21 @@ async function startChatSession(window) {
 async function openSession() {
   if (!smokeMode) {
     const latest = await sendRpc({ backendUrl, method: "session.latest" });
-    if (latest.result.sessionId) {
-      const resumed = await sendRpc({
-        backendUrl,
-        method: "session.resume",
-        params: { sessionId: latest.result.sessionId },
-      });
-      return resumed.result.sessionId;
+    if (latest.result?.sessionId) {
+      // If resumption fails (pruned session, corrupt DB, schema mismatch), fall
+      // back to a fresh session rather than leaving the app stuck on launch.
+      try {
+        const resumed = await sendRpc({
+          backendUrl,
+          method: "session.resume",
+          params: { sessionId: latest.result.sessionId },
+        });
+        return resumed.result.sessionId;
+      } catch (error) {
+        console.error(
+          `failed to resume session ${latest.result.sessionId}, starting fresh: ${error.message}`,
+        );
+      }
     }
   }
   const created = await sendRpc({ backendUrl, method: "session.create" });

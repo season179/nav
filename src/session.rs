@@ -180,8 +180,13 @@ impl SessionStore {
         let Some(storage) = &self.storage else {
             return false;
         };
-        if !matches!(storage.session_exists(session_id), Ok(true)) {
-            return false;
+        match storage.session_exists(session_id) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                eprintln!("nav: failed to check session {session_id}: {error}");
+                return false;
+            }
         }
         let history = match storage.load_history(session_id) {
             Ok(history) => history,

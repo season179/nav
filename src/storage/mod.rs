@@ -191,15 +191,25 @@ impl Storage {
 
     /// Replay a session's text turns in order, so a session can be resumed with
     /// its prior conversation context intact across restarts.
+    ///
+    /// One message per turn: a turn's text parts are concatenated (a turn may
+    /// hold several parts in the shared schema), and turns are ordered by run
+    /// start then sequence, with the run id as a stable tiebreaker.
     pub fn load_history(&self, session_id: &str) -> Result<Vec<ChatMessage>, StorageError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT t.role, json_extract(p.data_json, '$.text') AS text
-             FROM turn_parts p
-             JOIN turns t ON t.id = p.turn_id
+            "SELECT t.role,
+                    (SELECT group_concat(json_extract(tp.data_json, '$.text'), '')
+                     FROM turn_parts tp
+                     WHERE tp.turn_id = t.id AND tp.type = 'text') AS text
+             FROM turns t
              JOIN runs r ON r.id = t.run_id
-             WHERE p.session_id = ?1 AND p.type = 'text'
-             ORDER BY r.started_at, t.seq, p.created_at",
+             WHERE r.session_id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM turn_parts tp2
+                   WHERE tp2.turn_id = t.id AND tp2.type = 'text'
+               )
+             ORDER BY r.started_at, r.id, t.seq",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             let role: String = row.get(0)?;
@@ -270,21 +280,39 @@ struct TurnRecord<'a> {
 }
 
 fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
-    let has_sessions = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
+    // Distinguish a truly empty database from a populated one. Only the former
+    // gets bootstrapped; we never scribble our tables into an unrelated DB.
+    let user_tables: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
 
-    if !has_sessions {
+    if user_tables == 0 {
         conn.execute_batch(SCHEMA)?;
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![SCHEMA_VERSION, now_ms()],
         )?;
+        return Ok(());
+    }
+
+    // A non-empty database must already be a nav/pi database. If the expected
+    // tables are missing, it belongs to something else — refuse to modify it.
+    for table in ["sessions", "schema_migrations"] {
+        let present = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !present {
+            return Err(StorageError(format!(
+                "database is not a nav/pi database (missing table '{table}'); refusing to modify it"
+            )));
+        }
     }
     Ok(())
 }

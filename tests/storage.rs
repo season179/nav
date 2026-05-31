@@ -163,6 +163,58 @@ fn a_failed_run_records_the_error() {
 }
 
 #[test]
+fn opening_a_foreign_non_nav_database_is_refused() {
+    let path = temp_db();
+    let _cleanup = TempDb(path.clone());
+
+    // A populated database that is not a nav/pi database.
+    {
+        let conn = Connection::open(&path).expect("create foreign database");
+        conn.execute_batch("CREATE TABLE widgets (id INTEGER PRIMARY KEY);")
+            .unwrap();
+    }
+
+    assert!(
+        Storage::open(&path).is_err(),
+        "nav must not scribble its schema into an unrelated database"
+    );
+}
+
+#[test]
+fn load_history_collapses_a_multi_part_turn_into_one_message() {
+    let path = temp_db();
+    let _cleanup = TempDb(path.clone());
+    let storage = Storage::open(&path).expect("open database");
+
+    storage.create_session("s", "nav").unwrap();
+    storage.start_run("r", "s").unwrap();
+    storage.record_user_text("s", "r", 0, "hello").unwrap();
+
+    // The shared schema allows several parts per turn; inject a second one.
+    {
+        let conn = Connection::open(&path).expect("reopen to inject a part");
+        let turn_id: String = conn
+            .query_row(
+                "SELECT id FROM turns WHERE run_id = 'r' AND seq = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO turn_parts (id, turn_id, session_id, type, data_json, created_at)
+             VALUES ('part-2', ?1, 's', 'text', ?2, 99999999999999)",
+            rusqlite::params![turn_id, r#"{"type":"text","text":"world"}"#],
+        )
+        .unwrap();
+    }
+
+    let history = storage.load_history("s").unwrap();
+    assert_eq!(history.len(), 1, "both parts belong to a single turn");
+    assert!(history[0].content.contains("hello"));
+    assert!(history[0].content.contains("world"));
+}
+
+#[test]
 fn reopening_an_existing_database_is_a_no_op() {
     let path = temp_db();
     let _cleanup = TempDb(path.clone());
