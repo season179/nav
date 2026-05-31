@@ -224,12 +224,16 @@ async function selectSession(sessionId) {
 }
 
 async function startNewChat() {
+  await startNewChatInProject(activeProjectPath());
+}
+
+async function startNewChatInProject(projectPath) {
   if (running || !connected || !window.nav) {
     return;
   }
   clearTranscript();
   try {
-    const sessionId = await window.nav.newSession(activeProjectPath());
+    const sessionId = await window.nav.newSession(projectPath || null);
     await activateCreatedSession(sessionId);
   } catch (error) {
     appendMessage("error", `Could not start a new chat: ${error.message}`);
@@ -329,7 +333,22 @@ function renderProjectHeading(project) {
   name.className = "project-name";
   name.textContent = project.name;
 
-  heading.append(icon, name);
+  const label = document.createElement("span");
+  label.className = "project-label";
+  label.append(icon, name);
+
+  const addChatButton = document.createElement("button");
+  addChatButton.type = "button";
+  addChatButton.className = "project-chat-add";
+  addChatButton.textContent = "+";
+  addChatButton.title = `New chat in ${project.name}`;
+  addChatButton.setAttribute("aria-label", `New chat in ${project.name}`);
+  addChatButton.disabled = running || !connected;
+  addChatButton.addEventListener("click", () =>
+    startNewChatInProject(project.path),
+  );
+
+  heading.append(label, addChatButton);
   return heading;
 }
 
@@ -525,6 +544,11 @@ function setRunning(isRunning) {
   // New chat / session switching are blocked mid-run to avoid racing a turn.
   newChatButton.disabled = isRunning || !connected;
   newProjectButton.disabled = isRunning || !connected;
+  for (const addChatButton of sessionListNode.querySelectorAll(
+    ".project-chat-add",
+  )) {
+    addChatButton.disabled = isRunning || !connected;
+  }
   if (connected) {
     input.focus();
   }
