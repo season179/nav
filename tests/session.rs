@@ -302,6 +302,39 @@ fn a_persisted_session_resumes_with_its_history_after_a_restart() {
 }
 
 #[test]
+fn resume_session_fails_when_workspace_lookup_errors() {
+    let path = std::env::temp_dir().join(format!(
+        "nav_session_workspace_error_{}.db",
+        uuid::Uuid::now_v7()
+    ));
+    let model = Arc::new(RecordingModel::new());
+
+    let session_id = {
+        let storage = Arc::new(Storage::open(&path).expect("open storage"));
+        let store = SessionStore::new(model.clone()).with_storage(storage);
+        let session_id = store.create_session();
+        store.send_message(&session_id, "persist me").unwrap();
+        session_id
+    };
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("reopen db");
+        conn.execute("ALTER TABLE sessions DROP COLUMN workspace_root", [])
+            .expect("make workspace lookup fail without breaking session/history reads");
+    }
+
+    let storage = Arc::new(Storage::open(&path).expect("reopen storage"));
+    let store = SessionStore::new(model).with_storage(storage);
+
+    assert!(!store.resume_session(&session_id));
+    assert!(store.events(&session_id).is_none());
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
 fn resuming_an_unknown_session_fails_and_latest_is_none_without_storage() {
     let store = SessionStore::new(Arc::new(MockModel::new()));
     // No storage attached: nothing to discover or resume.

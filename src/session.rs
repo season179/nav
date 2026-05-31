@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
-use crate::storage::{SessionSummary, Storage};
+use crate::storage::{SessionSummary, Storage, StorageError};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
 
@@ -298,7 +298,13 @@ impl SessionStore {
             }
         };
 
-        let workspace = self.stored_workspace_or_default(storage, session_id);
+        let workspace = match self.stored_workspace_or_default(storage, session_id) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                tracing::error!(%session_id, %error, "failed to load session workspace");
+                return false;
+            }
+        };
         let mut session = Session::new(session_id.to_owned(), workspace);
         session.emit("session.created", |_| {});
         // A tool line is rendered by its name, but a stored tool result carries
@@ -605,14 +611,16 @@ impl SessionStore {
             .collect()
     }
 
-    fn stored_workspace_or_default(&self, storage: &Storage, session_id: &str) -> PathBuf {
-        storage
-            .session_workspace_root(session_id)
-            .ok()
-            .flatten()
+    fn stored_workspace_or_default(
+        &self,
+        storage: &Storage,
+        session_id: &str,
+    ) -> Result<PathBuf, StorageError> {
+        Ok(storage
+            .session_workspace_root(session_id)?
             .filter(|path| !path.trim().is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| self.agent.workspace().to_path_buf())
+            .unwrap_or_else(|| self.agent.workspace().to_path_buf()))
     }
 }
 
