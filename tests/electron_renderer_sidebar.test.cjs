@@ -4,6 +4,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 const { test } = require("node:test");
 
+const projectList = require("../desktop/electron/renderer/project-list.js");
+
 test("project sidebar shows five sessions before revealing older sessions", () => {
   const renderer = loadRenderer();
   const project = projectWithSessions(7);
@@ -61,12 +63,14 @@ function loadRenderer() {
           return markup;
         },
       },
+      localStorage: new FakeLocalStorage(),
       marked: {
         parse(sourceMarkdown) {
           return sourceMarkdown;
         },
         setOptions() {},
       },
+      navProjectList: projectList,
       nav: {
         onBackendStatus() {},
         onSessionEvent() {},
@@ -116,6 +120,20 @@ function visit(element, callback) {
   callback(element);
   for (const child of element.children) {
     visit(child, callback);
+  }
+}
+
+class FakeLocalStorage {
+  constructor() {
+    this.items = new Map();
+  }
+
+  getItem(key) {
+    return this.items.get(key) ?? null;
+  }
+
+  setItem(key, value) {
+    this.items.set(key, String(value));
   }
 }
 

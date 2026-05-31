@@ -9,14 +9,17 @@ const stopButton = document.querySelector("#composer-stop");
 const modelNode = document.querySelector("#composer-model");
 const thinkingNode = document.querySelector("#composer-thinking");
 const tokenUsageNode = document.querySelector("#composer-token-usage");
+const projectList = window.navProjectList;
 const tokenFormatter = new Intl.NumberFormat("en-US");
 const PROJECT_SESSION_PREVIEW_LIMIT = 5;
+const projectOrderStorageKey = "nav.projectOrder.v1";
 
 let connected = false;
 let running = false;
 let activeSessionId = null;
 let sessionSummaries = [];
 const expandedProjectKeys = new Set();
+let projectOrder = readProjectOrder();
 // Set when Stop is pressed; re-applied on `run.started` in case the press landed
 // before the backend had registered the run (when a stop is a no-op).
 let stopRequested = false;
@@ -280,11 +283,14 @@ function renderSessionList(sessions) {
     return;
   }
 
-  const projects = groupSessionsByProject(sessions);
+  const projects = projectList.groupSessionsByProject(sessions, projectOrder);
   if (projects.length === 0) {
     renderEmptySessionList();
     return;
   }
+
+  projectOrder = projects.map((project) => project.key);
+  saveProjectOrder(projectOrder);
 
   sessionListNode.append(...projects.map(renderProject));
 
@@ -385,53 +391,32 @@ function renderProjectSession(session) {
   return row;
 }
 
-function groupSessionsByProject(sessions) {
-  const projects = new Map();
-
-  for (const session of sessions) {
-    const path = normalizeProjectPath(session.workspaceRoot);
-    const key = path || "__no_project__";
-    let project = projects.get(key);
-    if (!project) {
-      project = {
-        key,
-        path,
-        name: path ? projectName(path) : "No project",
-        sessions: [],
-      };
-      projects.set(key, project);
-    }
-    project.sessions.push(session);
-  }
-
-  return Array.from(projects.values());
-}
-
-function normalizeProjectPath(path) {
-  if (typeof path !== "string") {
-    return "";
-  }
-  const trimmed = path.trim().replaceAll("\\", "/");
-  if (trimmed.length === 0) {
-    return "";
-  }
-  const normalized = trimmed.replace(/\/+$/, "");
-  return normalized.length > 0 ? normalized : "/";
-}
-
-function projectName(path) {
-  if (path === "/") {
-    return "/";
-  }
-  const parts = path.split("/").filter(Boolean);
-  return parts.at(-1) ?? path;
-}
-
 function activeProjectPath() {
   return (
     sessionSummaries.find((session) => session.sessionId === activeSessionId)
       ?.workspaceRoot ?? null
   );
+}
+
+function readProjectOrder() {
+  try {
+    const raw = window.localStorage.getItem(projectOrderStorageKey);
+    const parsed = JSON.parse(raw ?? "[]");
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((key) => typeof key === "string");
+  } catch {
+    return [];
+  }
+}
+
+function saveProjectOrder(order) {
+  try {
+    window.localStorage.setItem(projectOrderStorageKey, JSON.stringify(order));
+  } catch {
+    // Sidebar order is a convenience; private storage failures should not break chat.
+  }
 }
 
 function markActiveSession() {
