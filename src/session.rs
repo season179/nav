@@ -108,6 +108,10 @@ impl Session {
 pub enum SendError {
     /// No session exists with the given id.
     UnknownSession,
+    /// The session already has a run in flight. Only one run per session is
+    /// allowed, so its single cancel flag can always stop the right one and its
+    /// events stay ordered.
+    RunInProgress,
 }
 
 /// A live feed of one session's events: the backlog already emitted before
@@ -355,7 +359,13 @@ impl SessionStore {
         // Seq 0 is the user turn; every later turn (assistant tool-calls, each
         // tool result, the final assistant text) takes the next number.
         let mut seq: i64 = 0;
-        self.with_session(session_id, |session| {
+        // Refuse to start a second run while one is already in flight: a session
+        // tracks a single cancel flag, so overlapping runs would leave the older
+        // one un-stoppable and interleave the two runs' events.
+        let started = self.with_session(session_id, |session| {
+            if session.active_run.is_some() {
+                return false;
+            }
             session.messages.push(ChatMessage::user(text));
             // Register the run so `stop_run` can find its cancel flag while it
             // executes; cleared on every exit path below.
@@ -367,7 +377,11 @@ impl SessionStore {
             session.emit("run.started", |event| {
                 event.run_id = Some(run_id.clone());
             });
+            true
         })?;
+        if !started {
+            return Err(SendError::RunInProgress);
+        }
 
         // Persist the run and the user turn before the model call so a crash
         // mid-response still leaves the question on record.

@@ -137,10 +137,11 @@ impl ChatModel for SleepThenWriteModel {
                     ToolCall {
                         id: "call-write".to_owned(),
                         name: "write".to_owned(),
-                        arguments: format!(
-                            r#"{{"path":"{}","content":"should not be written"}}"#,
-                            self.target
-                        ),
+                        arguments: serde_json::json!({
+                            "path": self.target,
+                            "content": "should not be written",
+                        })
+                        .to_string(),
                     },
                 ],
                 finish_reason: FinishReason::ToolCalls,
