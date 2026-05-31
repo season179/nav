@@ -257,14 +257,14 @@ impl SessionStore {
             Ok(true) => {}
             Ok(false) => return false,
             Err(error) => {
-                eprintln!("nav: failed to check session {session_id}: {error}");
+                tracing::error!(%session_id, %error, "failed to check session");
                 return false;
             }
         }
         let history = match storage.load_history(session_id) {
             Ok(history) => history,
             Err(error) => {
-                eprintln!("nav: failed to load history for {session_id}: {error}");
+                tracing::error!(%session_id, %error, "failed to load history");
                 return false;
             }
         };
@@ -347,7 +347,7 @@ impl SessionStore {
         match storage.list_sessions(SESSION_SOURCE) {
             Ok(sessions) => sessions,
             Err(error) => {
-                eprintln!("nav: failed to list sessions: {error}");
+                tracing::error!(%error, "failed to list sessions");
                 Vec::new()
             }
         }
@@ -360,7 +360,7 @@ impl SessionStore {
         match storage.most_recent_session(SESSION_SOURCE) {
             Ok(id) => id,
             Err(error) => {
-                eprintln!("nav: failed to look up latest session: {error}");
+                tracing::error!(%error, "failed to look up latest session");
                 None
             }
         }
@@ -785,6 +785,6 @@ fn new_id() -> String {
 /// stays usable; the operator sees which write was dropped.
 fn log_storage(operation: &str, result: Result<(), crate::storage::StorageError>) {
     if let Err(error) = result {
-        eprintln!("nav: failed to persist {operation}: {error}");
+        tracing::error!(%operation, %error, "failed to persist");
     }
 }

@@ -181,8 +181,9 @@ pub fn counter_from_compat(
     match HfTokenizerCounter::from_file(tokenizer_id, path) {
         Ok(counter) => Arc::new(counter),
         Err(error) => {
-            eprintln!(
-                "nav: failed to load tokenizer; falling back to heuristic token counts: {error}"
+            tracing::error!(
+                %error,
+                "failed to load tokenizer; falling back to heuristic token counts"
             );
             Arc::new(HeuristicTokenCounter)
         }

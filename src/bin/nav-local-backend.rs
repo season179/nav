@@ -14,13 +14,15 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("nav-local-backend: {error}");
+            tracing::error!(%error, "nav-local-backend failed");
             ExitCode::FAILURE
         }
     }
 }
 
 fn run() -> io::Result<()> {
+    nav::logging::init();
+
     let trace = StartupTrace::from_env();
     trace.event(
         "backend.process.start",
@@ -47,10 +49,10 @@ fn run() -> io::Result<()> {
     // posture). Binding to a non-loopback interface would expose that to the
     // network, so warn loudly if someone does.
     if !local_addr.ip().is_loopback() {
-        eprintln!(
-            "nav-local-backend: WARNING binding to non-loopback address {local_addr}; \
-             the agent's tools run with this process's privileges and would be reachable \
-             from the network"
+        tracing::warn!(
+            %local_addr,
+            "binding to non-loopback address; the agent's tools run with this process's \
+             privileges and would be reachable from the network"
         );
     }
 
@@ -63,7 +65,7 @@ fn run() -> io::Result<()> {
             "model_kind": model_kind(&model),
         }),
     );
-    eprintln!("nav-local-backend: using {}", model.describe());
+    tracing::info!(model = %model.describe(), "resolved model");
     let model_id = model.model_id();
     let model_label = model.label();
 
@@ -98,7 +100,7 @@ fn run() -> io::Result<()> {
                     "location": storage_location,
                 }),
             );
-            eprintln!("nav-local-backend: persisting sessions to {location}");
+            tracing::info!(%location, "persisting sessions");
             store = store.with_storage(Arc::new(storage));
         }
         Err(error) => {
@@ -109,7 +111,7 @@ fn run() -> io::Result<()> {
                     "location": storage_location,
                 }),
             );
-            eprintln!("nav-local-backend: storage unavailable, sessions will not persist: {error}");
+            tracing::error!(%error, "storage unavailable, sessions will not persist");
         }
     }
     let store = Arc::new(store);
