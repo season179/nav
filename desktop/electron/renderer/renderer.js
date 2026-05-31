@@ -207,7 +207,7 @@ function appendMessage(role, text) {
 // line is reused as it moves from running → done/failed, keyed by its id, so a
 // tool shows as one evolving line rather than two separate bubbles.
 function upsertToolLine(toolCallId, state, toolName, detail) {
-  const selector = toolCallId ? `[data-tool-call-id="${toolCallId}"]` : null;
+  const selector = toolCallId ? `[data-tool-call-id="${CSS.escape(toolCallId)}"]` : null;
   let item = selector ? messageListNode.querySelector(selector) : null;
   if (item) {
     item.replaceChildren();

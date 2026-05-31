@@ -13,39 +13,28 @@ pub fn glob_to_regex(pattern: &str) -> Result<Regex, ToolError> {
     let mut re = String::with_capacity(pattern.len() * 2 + 2);
     re.push('^');
 
-    let bytes = pattern.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] as char {
+    // Iterate by Unicode scalar so multi-byte literals stay intact.
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
             '*' => {
-                let double = i + 1 < bytes.len() && bytes[i + 1] == b'*';
-                if double {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
                     // `**/` matches any number of leading path segments
                     // (including none); a bare `**` matches anything.
-                    if i + 2 < bytes.len() && bytes[i + 2] == b'/' {
+                    if chars.peek() == Some(&'/') {
+                        chars.next();
                         re.push_str("(?:.*/)?");
-                        i += 3;
                     } else {
                         re.push_str(".*");
-                        i += 2;
                     }
                 } else {
                     re.push_str("[^/]*");
-                    i += 1;
                 }
             }
-            '?' => {
-                re.push_str("[^/]");
-                i += 1;
-            }
-            other => {
-                // Escape regex metacharacters; pass everything else literally.
-                if "\\.+()|[]{}^$".contains(other) {
-                    re.push('\\');
-                }
-                re.push(other);
-                i += 1;
-            }
+            '?' => re.push_str("[^/]"),
+            // Escape regex metacharacters; pass everything else literally.
+            other => re.push_str(&regex::escape(&other.to_string())),
         }
     }
 
@@ -84,5 +73,13 @@ mod tests {
     fn literal_dots_are_escaped() {
         assert!(matches("a.txt", "a.txt"));
         assert!(!matches("a.txt", "axtxt"));
+    }
+
+    #[test]
+    fn multibyte_literals_match() {
+        // Char-wise iteration must keep multi-byte literals intact.
+        assert!(matches("café/*.rs", "café/main.rs"));
+        assert!(matches("**/票据.txt", "a/b/票据.txt"));
+        assert!(!matches("café/*.rs", "cafe/main.rs"));
     }
 }

@@ -16,6 +16,9 @@ use super::{
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LINE_LENGTH: usize = 1000;
+/// Upper bound on requested context lines, so a huge `context` can't blow up
+/// the output (and runtime) per match.
+const MAX_CONTEXT_LINES: usize = 20;
 
 pub struct GrepTool;
 
@@ -58,8 +61,11 @@ impl Tool for GrepTool {
         let limit = arg_opt_u64(args, "limit")
             .map(|value| value as usize)
             .unwrap_or(DEFAULT_LIMIT);
+        if limit == 0 {
+            return Err(ToolError::new("limit must be >= 1"));
+        }
         let context = arg_opt_u64(args, "context")
-            .map(|value| value as usize)
+            .map(|value| (value as usize).min(MAX_CONTEXT_LINES))
             .unwrap_or(0);
 
         let needle = if arg_opt_bool(args, "literal") {

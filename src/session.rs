@@ -23,10 +23,6 @@ use crate::tools::{CancelFlag, Registry};
 /// How a session originates, recorded on the persisted `sessions` row.
 const SESSION_SOURCE: &str = "nav";
 
-/// Upper bound on model⇄tool round-trips in one run before the run is failed,
-/// so a model that never stops calling tools can't loop forever.
-const MAX_TOOL_ITERATIONS: usize = 16;
-
 /// One ordered, renderable session event. The flat shape matches what the
 /// Electron renderer already consumes over SSE.
 #[derive(Clone, Debug, Serialize)]
@@ -285,10 +281,11 @@ impl SessionStore {
         }
     }
 
-    /// Run one chat turn as a bounded agent loop: record the user message, then
+    /// Run one chat turn as an agent loop: record the user message, then
     /// repeatedly call the model and execute any tool calls it returns, feeding
-    /// each tool result back, until the model replies with plain text (or the
-    /// iteration cap is hit). Ordered events are emitted throughout.
+    /// each tool result back, until the model replies with plain text. Like pi's
+    /// agent loop, this is unbounded — it ends when the model stops calling
+    /// tools (or the model call errors). Ordered events are emitted throughout.
     ///
     /// A turn with no tool calls emits exactly `user.message`, `run.started`,
     /// `message.completed`, `run.completed` — unchanged from the pre-tools loop.
@@ -327,7 +324,7 @@ impl SessionStore {
         }
         seq += 1;
 
-        for _ in 0..MAX_TOOL_ITERATIONS {
+        loop {
             // Snapshot the history under the lock, then call the model unlocked.
             let history = self.with_session(session_id, |session| session.messages.clone())?;
             let response = match self.model.respond(&history, &tool_defs) {
@@ -447,10 +444,6 @@ impl SessionStore {
                 seq += 1;
             }
         }
-
-        // The model never settled on a final answer within the cap.
-        self.fail_run(session_id, &run_id, "tool iteration limit reached")?;
-        Ok(run_id)
     }
 
     /// Execute one tool call with the lock released, returning its output text

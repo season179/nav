@@ -411,11 +411,17 @@ fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
         .get("content")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .map(|calls| calls.iter().filter_map(parse_tool_call).collect::<Vec<_>>())
-        .unwrap_or_default();
+    // A malformed tool call must fail the parse rather than be silently dropped:
+    // skipping one would make the run continue without executing a tool the model
+    // asked for, and an empty id breaks the follow-up `tool` message OpenAI
+    // requires to reference it.
+    let tool_calls = match message.get("tool_calls").and_then(Value::as_array) {
+        Some(calls) => calls
+            .iter()
+            .map(parse_tool_call)
+            .collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
 
     if content.is_none() && tool_calls.is_empty() {
         return Err(unexpected());
@@ -437,20 +443,30 @@ fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
     })
 }
 
-fn parse_tool_call(value: &Value) -> Option<ToolCall> {
-    let function = value.get("function")?;
-    let name = function.get("name").and_then(Value::as_str)?.to_owned();
+fn parse_tool_call(value: &Value) -> Result<ToolCall, ModelError> {
+    let malformed = || ModelError::new(format!("unexpected tool call: {value}"));
+
+    let function = value.get("function").ok_or_else(malformed)?;
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(malformed)?
+        .to_owned();
     let arguments = function
         .get("arguments")
         .and_then(Value::as_str)
         .unwrap_or("{}")
         .to_owned();
+    // OpenAI requires a non-empty id so the matching `tool` result can reference
+    // it; reject anything that wouldn't round-trip.
     let id = value
         .get("id")
         .and_then(Value::as_str)
-        .unwrap_or_default()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(malformed)?
         .to_owned();
-    Some(ToolCall {
+    Ok(ToolCall {
         id,
         name,
         arguments,

@@ -40,11 +40,21 @@ fn cap(text: &str, keep_tail: bool) -> String {
 
     if out.len() > MAX_BYTES {
         truncated = true;
+    }
+
+    // When a marker will be appended, clip to leave room for it so the final
+    // string (content + marker) never exceeds MAX_BYTES.
+    let budget = if truncated {
+        MAX_BYTES.saturating_sub(TRUNCATION_MARKER.len())
+    } else {
+        MAX_BYTES
+    };
+    if out.len() > budget {
         if keep_tail {
-            let start = floor_char_boundary(&out, out.len() - MAX_BYTES);
+            let start = floor_char_boundary(&out, out.len() - budget);
             out = out[start..].to_owned();
         } else {
-            let end = floor_char_boundary(&out, MAX_BYTES);
+            let end = floor_char_boundary(&out, budget);
             out = out[..end].to_owned();
         }
     }
@@ -107,5 +117,17 @@ mod tests {
         let capped = cap_head(&text);
         // Must still be valid UTF-8 (no panic on slicing) and marked truncated.
         assert!(capped.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn final_output_never_exceeds_the_byte_cap() {
+        // The marker must fit within MAX_BYTES, not push the result past it.
+        let head = cap_head(&"x".repeat(MAX_BYTES * 2));
+        assert!(head.len() <= MAX_BYTES, "head len {}", head.len());
+        assert!(head.ends_with(TRUNCATION_MARKER));
+
+        let tail = cap_tail(&"y".repeat(MAX_BYTES * 2));
+        assert!(tail.len() <= MAX_BYTES, "tail len {}", tail.len());
+        assert!(tail.ends_with(TRUNCATION_MARKER));
     }
 }
