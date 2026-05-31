@@ -31,18 +31,21 @@
         </section>
 
         <form class="composer" id="composer">
-          <textarea
-            id="composer-input"
-            class="composer-input"
-            aria-label="Message"
-            placeholder="Send a message…"
-            autocomplete="off"
-            rows="1"
-            disabled
-          ></textarea>
-          <button type="submit" id="composer-send" class="composer-send" disabled>
-            Send
-          </button>
+          <div class="composer-row">
+            <textarea
+              id="composer-input"
+              class="composer-input"
+              aria-label="Message"
+              placeholder="Send a message…"
+              autocomplete="off"
+              rows="1"
+              disabled
+            ></textarea>
+            <button type="submit" id="composer-send" class="composer-send" disabled>
+              Send
+            </button>
+          </div>
+          <span class="composer-model" id="composer-model" aria-live="polite"></span>
         </form>
       </main>
     </div>

@@ -511,11 +511,32 @@ h1 {
 
 .composer {
   display: flex;
-  align-items: flex-end;
-  gap: 12px;
+  flex-direction: column;
+  gap: 8px;
   padding: 18px 28px;
   border-top: 1px solid var(--border);
   background: var(--bg);
+}
+
+/* Input + Send share one row; the model indicator sits below them. Send stays
+   bottom-aligned as the textarea grows with multi-line input. */
+.composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+/* The model currently in use — small, dim, just under the input. */
+.composer-model {
+  padding-left: 2px;
+  color: var(--ink-faint);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+}
+
+/* Render nothing (no stray padding) until the model name is known. */
+.composer-model:empty {
+  display: none;
 }
 
 .composer-input {

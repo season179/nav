@@ -16,7 +16,11 @@ struct TestBackend {
 
 impl TestBackend {
     fn start() -> Self {
-        let store = Arc::new(SessionStore::new(Arc::new(MockModel::new())));
+        Self::start_with(SessionStore::new(Arc::new(MockModel::new())))
+    }
+
+    fn start_with(store: SessionStore) -> Self {
+        let store = Arc::new(store);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let address = listener.local_addr().expect("read local addr").to_string();
 
@@ -172,6 +176,21 @@ fn listing_sessions_without_storage_returns_an_empty_array() {
     assert!(
         sessions.is_empty(),
         "an in-memory backend has no persisted sessions: {response}"
+    );
+}
+
+#[test]
+fn model_info_returns_the_configured_label() {
+    let backend = TestBackend::start_with(
+        SessionStore::new(Arc::new(MockModel::new()))
+            .with_model_label("Claude Opus 4.8".to_owned()),
+    );
+
+    let response = backend.rpc(r#"{"jsonrpc":"2.0","id":"model","method":"session.modelInfo"}"#);
+
+    assert_eq!(
+        response["result"]["label"], "Claude Opus 4.8",
+        "session.modelInfo returns the configured model label: {response}"
     );
 }
 

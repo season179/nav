@@ -249,11 +249,16 @@ impl ModelChoice {
         }
 
         match get("NAV_API_KEY") {
-            Some(api_key) if !api_key.is_empty() => ModelChoice::OpenAi(OpenAiConfig {
-                api_key,
-                model: non_empty(get("NAV_MODEL"), DEFAULT_OPENAI_MODEL),
-                base_url: non_empty(get("NAV_BASE_URL"), DEFAULT_OPENAI_BASE_URL),
-            }),
+            Some(api_key) if !api_key.is_empty() => {
+                let model = non_empty(get("NAV_MODEL"), DEFAULT_OPENAI_MODEL);
+                ModelChoice::OpenAi(OpenAiConfig {
+                    api_key,
+                    base_url: non_empty(get("NAV_BASE_URL"), DEFAULT_OPENAI_BASE_URL),
+                    // No display name over env config, so the id is the label.
+                    name: model.clone(),
+                    model,
+                })
+            }
             _ => ModelChoice::NotConfigured,
         }
     }
@@ -274,6 +279,18 @@ impl ModelChoice {
             ModelChoice::OpenAi(config) => format!("OpenAI-compatible model {}", config.model),
             ModelChoice::NotConfigured => "model not configured".to_owned(),
             ModelChoice::Unavailable(reason) => format!("model unavailable: {reason}"),
+        }
+    }
+
+    /// A concise, human-friendly model name for the app's model indicator.
+    /// Unlike [`describe`](Self::describe), this drops protocol jargon so the
+    /// UI can show just the model the user configured.
+    pub fn label(&self) -> String {
+        match self {
+            ModelChoice::Mock => "Mock model".to_owned(),
+            ModelChoice::OpenAi(config) => config.name.clone(),
+            ModelChoice::NotConfigured => "No model configured".to_owned(),
+            ModelChoice::Unavailable(_) => "Model unavailable".to_owned(),
         }
     }
 
@@ -307,6 +324,9 @@ pub struct OpenAiConfig {
     pub api_key: String,
     pub model: String,
     pub base_url: String,
+    /// Human-friendly display name for the model (from settings.json `name`,
+    /// falling back to the model id). Shown in the app's model indicator.
+    pub name: String,
 }
 
 impl From<ResolvedModelConfig> for OpenAiConfig {
@@ -318,6 +338,7 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
             api_key: config.api_key,
             model: config.model,
             base_url: config.base_url,
+            name: config.name,
         }
     }
 }

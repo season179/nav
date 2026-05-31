@@ -43,6 +43,10 @@ contextBridge.exposeInMainWorld("nav", {
   listSessions() {
     return ipcRenderer.invoke("nav:list-sessions");
   },
+  // The active model's display info, shown beneath the composer.
+  modelInfo() {
+    return ipcRenderer.invoke("nav:model-info");
+  },
   // Switch the active conversation to an existing session.
   switchSession(sessionId) {
     return ipcRenderer.invoke(
