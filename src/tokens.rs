@@ -222,6 +222,12 @@ pub fn estimate_model_context(
             .saturating_add(content.tokens)
             .saturating_add(4);
 
+        if let Some(reasoning_content) = &message.reasoning_content {
+            let reasoning = counter.count_text(reasoning_content);
+            collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &reasoning);
+            total = total.saturating_add(reasoning.tokens).saturating_add(2);
+        }
+
         if let Role::Tool = message.role {
             let call_id = counter.count_text(message.tool_call_id.as_deref().unwrap_or_default());
             collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &call_id);
@@ -266,6 +272,7 @@ pub fn estimate_model_context(
 /// usage.
 pub fn estimate_assistant_output(
     content: Option<&str>,
+    reasoning_content: Option<&str>,
     calls: &[ToolCall],
     counter: &dyn TextTokenCounter,
 ) -> TokenEstimate {
@@ -276,6 +283,12 @@ pub fn estimate_assistant_output(
 
     if let Some(content) = content {
         let estimate = counter.count_text(content);
+        collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &estimate);
+        total = total.saturating_add(estimate.tokens);
+    }
+
+    if let Some(reasoning_content) = reasoning_content {
+        let estimate = counter.count_text(reasoning_content);
         collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &estimate);
         total = total.saturating_add(estimate.tokens);
     }

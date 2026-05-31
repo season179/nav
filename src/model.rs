@@ -66,6 +66,9 @@ pub struct ToolCall {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Provider reasoning/thinking payload for assistant turns. Some
+    /// OpenAI-compatible thinking models require this to be replayed verbatim.
+    pub reasoning_content: Option<String>,
     /// Tool calls requested by an assistant turn (empty for every other turn).
     pub tool_calls: Vec<ToolCall>,
     /// For a [`Role::Tool`] turn, the assistant tool call this result answers.
@@ -81,6 +84,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
             is_error: false,
@@ -91,10 +95,17 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
             is_error: false,
         }
+    }
+
+    /// Attach provider reasoning/thinking payload to an assistant turn.
+    pub fn with_reasoning_content(mut self, reasoning_content: impl Into<String>) -> Self {
+        self.reasoning_content = Some(reasoning_content.into());
+        self
     }
 
     /// An assistant turn that requests one or more tool calls. `content` may be
@@ -103,10 +114,21 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            reasoning_content: None,
             tool_calls,
             tool_call_id: None,
             is_error: false,
         }
+    }
+
+    /// An assistant tool-call turn that carries provider reasoning/thinking
+    /// payload to replay on later model calls.
+    pub fn assistant_tool_calls_with_reasoning(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        reasoning_content: impl Into<String>,
+    ) -> Self {
+        Self::assistant_tool_calls(content, tool_calls).with_reasoning_content(reasoning_content)
     }
 
     /// A tool result answering a specific assistant tool call. `is_error` marks
@@ -119,6 +141,7 @@ impl ChatMessage {
         Self {
             role: Role::Tool,
             content: content.into(),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             is_error,
@@ -149,6 +172,8 @@ pub enum FinishReason {
 pub struct ModelResponse {
     /// Assistant text, if any. `None` when the turn is purely tool calls.
     pub content: Option<String>,
+    /// Provider reasoning/thinking payload, if returned separately from text.
+    pub reasoning_content: Option<String>,
     /// Tool calls the model wants executed before the next turn.
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
@@ -162,6 +187,7 @@ impl ModelResponse {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             token_usage: None,
@@ -212,6 +238,7 @@ pub trait ChatModel: Send + Sync {
     fn estimate_output_tokens(&self, response: &ModelResponse) -> TokenEstimate {
         estimate_assistant_output(
             response.content.as_deref(),
+            response.reasoning_content.as_deref(),
             &response.tool_calls,
             &HeuristicTokenCounter,
         )
@@ -377,6 +404,16 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
     }
 }
 
+impl OpenAiConfig {
+    fn requires_reasoning_content(&self) -> bool {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.get("requiresReasoningContentOnAssistantMessages"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
 /// Real text model: one non-streaming `POST /chat/completions` call.
 pub struct OpenAiModel {
     config: OpenAiConfig,
@@ -405,7 +442,13 @@ impl ChatModel for OpenAiModel {
         if let Some(system_prompt) = context.system_prompt() {
             messages.push(json!({ "role": "system", "content": system_prompt }));
         }
-        messages.extend(context.messages().iter().map(message_json));
+        let include_reasoning_content = self.config.requires_reasoning_content();
+        messages.extend(
+            context
+                .messages()
+                .iter()
+                .map(|message| message_json(message, include_reasoning_content)),
+        );
         let mut body = json!({ "model": self.config.model, "messages": messages });
         // Some OpenAI-compatible providers reject an empty `tools` array, so the
         // key is sent only when tools are actually offered.
@@ -437,6 +480,7 @@ impl ChatModel for OpenAiModel {
     fn estimate_output_tokens(&self, response: &ModelResponse) -> TokenEstimate {
         estimate_assistant_output(
             response.content.as_deref(),
+            response.reasoning_content.as_deref(),
             &response.tool_calls,
             self.token_counter.as_ref(),
         )
@@ -444,7 +488,7 @@ impl ChatModel for OpenAiModel {
 }
 
 /// Serialize one Model Context message into OpenAI chat-completions wire shape.
-fn message_json(message: &ChatMessage) -> Value {
+fn message_json(message: &ChatMessage, include_reasoning_content: bool) -> Value {
     match message.role {
         Role::Tool => json!({
             "role": "tool",
@@ -469,9 +513,23 @@ fn message_json(message: &ChatMessage) -> Value {
             } else {
                 Value::String(message.content.clone())
             };
-            json!({ "role": "assistant", "content": content, "tool_calls": tool_calls })
+            let mut payload =
+                json!({ "role": "assistant", "content": content, "tool_calls": tool_calls });
+            if include_reasoning_content && let Some(reasoning_content) = &message.reasoning_content
+            {
+                payload["reasoning_content"] = Value::String(reasoning_content.clone());
+            }
+            payload
         }
-        _ => json!({ "role": message.role.as_str(), "content": message.content }),
+        Role::Assistant => {
+            let mut payload = json!({ "role": "assistant", "content": message.content });
+            if include_reasoning_content && let Some(reasoning_content) = &message.reasoning_content
+            {
+                payload["reasoning_content"] = Value::String(reasoning_content.clone());
+            }
+            payload
+        }
+        Role::User => json!({ "role": "user", "content": message.content }),
     }
 }
 
@@ -502,6 +560,10 @@ fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
         .get("content")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let reasoning_content = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     // A malformed tool call must fail the parse rather than be silently dropped:
     // skipping one would make the run continue without executing a tool the model
     // asked for, and an empty id breaks the follow-up `tool` message OpenAI
@@ -529,6 +591,7 @@ fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
 
     Ok(ModelResponse {
         content,
+        reasoning_content,
         tool_calls,
         finish_reason,
         token_usage: parse_token_usage(payload),

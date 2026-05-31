@@ -6,7 +6,8 @@ use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use nav::{ChatMessage, ChatModel, ModelContext, OpenAiConfig, OpenAiModel};
+use nav::{ChatMessage, ChatModel, ModelContext, OpenAiConfig, OpenAiModel, ToolCall};
+use serde_json::json;
 
 const TEST_API_KEY: &str = "sk-secret-must-not-leak";
 
@@ -61,13 +62,17 @@ fn fake_provider(status_line: &'static str, body: &'static str) -> (String, Rece
 }
 
 fn model(base_url: String) -> OpenAiModel {
+    model_with_compat(base_url, None)
+}
+
+fn model_with_compat(base_url: String, compat: Option<serde_json::Value>) -> OpenAiModel {
     OpenAiModel::new(OpenAiConfig {
         api_key: TEST_API_KEY.to_owned(),
         model: "test-model".to_owned(),
         base_url,
         name: "test-model".to_owned(),
         context_window: None,
-        compat: None,
+        compat,
     })
 }
 
@@ -139,6 +144,59 @@ fn prepends_the_system_prompt_as_a_leading_system_message() {
         "You are an expert coding assistant operating inside nav."
     );
     assert_eq!(messages[1]["role"], "user");
+}
+
+#[test]
+fn captures_provider_reasoning_content_when_present() {
+    let (base_url, _requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok","reasoning_content":"worked it out"}}]}"#,
+    );
+    let model = model(base_url);
+
+    let reply = model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect("provider returns a reply");
+
+    assert_eq!(reply.content.as_deref(), Some("ok"));
+    assert_eq!(reply.reasoning_content.as_deref(), Some("worked it out"));
+}
+
+#[test]
+fn replays_reasoning_content_when_provider_requires_it() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    );
+    let model = model_with_compat(
+        base_url,
+        Some(json!({ "requiresReasoningContentOnAssistantMessages": true })),
+    );
+
+    let calls = vec![ToolCall {
+        id: "call-1".to_owned(),
+        name: "ls".to_owned(),
+        arguments: "{}".to_owned(),
+    }];
+    let context = context(vec![
+        ChatMessage::user("list files"),
+        ChatMessage::assistant_tool_calls_with_reasoning("", calls, "I need to inspect files."),
+        ChatMessage::tool_result("call-1", "Cargo.toml", false),
+        ChatMessage::user("continue"),
+    ]);
+    model
+        .respond(&context, &[])
+        .expect("provider returns a reply");
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    let assistant = body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|message| message["role"] == "assistant" && message.get("tool_calls").is_some())
+        .expect("assistant tool-call message");
+    assert_eq!(assistant["reasoning_content"], "I need to inspect files.");
 }
 
 #[test]

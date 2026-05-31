@@ -72,6 +72,7 @@ impl ChatModel for ScriptedModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: Some("I should inspect the workspace.".to_owned()),
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_owned(),
                     name: "ls".to_owned(),
@@ -102,6 +103,7 @@ impl ChatModel for SleepThenTextModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_owned(),
                     name: "bash".to_owned(),
@@ -133,6 +135,7 @@ impl ChatModel for SleepThenWriteModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![
                     ToolCall {
                         id: "call-bash".to_owned(),
@@ -240,6 +243,7 @@ impl ChatModel for GatedModel {
         Ok(match self.script[nth].clone() {
             GatedReply::Tool { id, name, args } => ModelResponse {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![ToolCall {
                     id,
                     name,
@@ -433,6 +437,15 @@ fn a_tool_run_persists_its_result_and_replays_on_resume() {
         )
         .expect("count tool_result parts");
     assert_eq!(tool_results, 1);
+
+    let thinking_parts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turn_parts WHERE type = 'thinking'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count thinking parts");
+    assert_eq!(thinking_parts, 1);
 
     let tool_turns: i64 = conn
         .query_row(

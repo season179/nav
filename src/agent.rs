@@ -111,9 +111,12 @@ impl Agent {
                 return Ok(RunStop::Cancelled);
             }
 
+            let reasoning_content = response.reasoning_content.clone();
+
             if response.tool_calls.is_empty() {
                 let reply = response.content.unwrap_or_default();
-                sink.assistant_text(&reply).map_err(AgentRunError::Sink)?;
+                sink.assistant_text(&reply, reasoning_content.as_deref())
+                    .map_err(AgentRunError::Sink)?;
                 // The reply ends the run unless a message arrived while it was
                 // produced, in which case the run continues with that message
                 // folded into the context (mid-run steering).
@@ -130,8 +133,10 @@ impl Agent {
 
             let content = response.content.unwrap_or_default();
             let calls = response.tool_calls;
-            context.push(ChatMessage::assistant_tool_calls(&content, calls.clone()));
-            sink.assistant_tool_calls(&content, &calls)
+            let mut assistant_turn = ChatMessage::assistant_tool_calls(&content, calls.clone());
+            assistant_turn.reasoning_content = reasoning_content.clone();
+            context.push(assistant_turn);
+            sink.assistant_tool_calls(&content, reasoning_content.as_deref(), &calls)
                 .map_err(AgentRunError::Sink)?;
 
             for call in &calls {
@@ -205,11 +210,16 @@ pub(crate) enum TurnContinuation {
 pub(crate) trait AgentRunSink {
     type Error;
 
-    fn assistant_text(&mut self, content: &str) -> Result<(), Self::Error>;
+    fn assistant_text(
+        &mut self,
+        content: &str,
+        reasoning_content: Option<&str>,
+    ) -> Result<(), Self::Error>;
 
     fn assistant_tool_calls(
         &mut self,
         content: &str,
+        reasoning_content: Option<&str>,
         calls: &[ToolCall],
     ) -> Result<(), Self::Error>;
 
