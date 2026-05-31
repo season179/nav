@@ -22,24 +22,36 @@ mock model`.
 
 ## Model Configuration
 
-The backend resolves one text model from the environment:
+The backend resolves one text model. The preferred source is the Pi-style
+`~/.nav/settings.json` default model (issue #531); a few environment variables
+remain as fallbacks.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `NAV_MOCK_MODEL` | If set (any non-empty value), use the deterministic mock model. Wins over `NAV_API_KEY`. | unset |
-| `NAV_API_KEY` | API key for an OpenAI-compatible provider. Selects the real model. | unset |
-| `NAV_MODEL` | Model name for the real provider. | `gpt-4o-mini` |
-| `NAV_BASE_URL` | Base URL for the OpenAI-compatible API. | `https://api.openai.com/v1` |
+| `NAV_MOCK_MODEL` | If set (any non-empty value), use the deterministic mock model. Wins over everything else. | unset |
+| `NAV_API_KEY` | API key for an OpenAI-compatible provider. Used only when no settings file exists. | unset |
+| `NAV_MODEL` | Model name for the env fallback. | `gpt-4o-mini` |
+| `NAV_BASE_URL` | Base URL for the env fallback. | `https://api.openai.com/v1` |
 
 Resolution order:
 
 1. `NAV_MOCK_MODEL` set → deterministic mock (used by tests and offline smoke).
-2. otherwise `NAV_API_KEY` set → real OpenAI-compatible model.
-3. otherwise → not configured. Sending a message emits a `run.failed` event
+2. otherwise `~/.nav/settings.json` resolves a default model → real
+   OpenAI-compatible model built from the resolved `apiKey`, `model`, and
+   `baseUrl`. Only `api: "openai-completions"` is supported.
+3. otherwise, if **no settings file exists**, fall back to `NAV_API_KEY` → real
+   OpenAI-compatible model.
+4. otherwise → not configured. Sending a message emits a `run.failed` event
    with a clear "model not configured" message instead of guessing or
    hardcoding any secret.
 
-No API keys are read from anywhere except the environment, and none are logged.
+A settings file that exists but cannot be used (unsupported API, missing
+provider/model, malformed JSON, unresolvable key) does **not** silently fall
+back: the backend stays up and reports the specific reason on the first
+`session.sendMessage` as a `run.failed` event.
+
+Only the resolved API key — never logged, never sent to the renderer, and
+redacted in debug output — is used as the provider `Authorization` header.
 
 ## Command Channel: `POST /rpc`
 
@@ -106,3 +118,39 @@ curl -s -X POST http://127.0.0.1:8787/rpc \
 # Then send a follow-up like "what is my name?" with the same sessionId; the
 # mock reply recalls the earlier turn, proving multi-turn context.
 ```
+
+## Manual Verification (real model via `~/.nav/settings.json`)
+
+This is the end-to-end path through the Electron app and the configured default
+model (e.g. `provider: commandcode`, `model: Qwen/Qwen3.7-Max`,
+`api: openai-completions`).
+
+1. Confirm the settings file resolves a default model (issue #531). With no
+   `NAV_MOCK_MODEL`/`NAV_API_KEY` set, the backend prints the resolved model to
+   stderr on startup:
+
+   ```sh
+   cargo run --bin nav-local-backend -- --bind 127.0.0.1:8788
+   # stderr: nav-local-backend: using OpenAI-compatible model Qwen/Qwen3.7-Max
+   ```
+
+   If it instead prints `model unavailable: ...`, the file exists but is not
+   usable — the message names the reason (unsupported API, missing provider,
+   etc.).
+
+2. Launch the Electron app (it spawns the backend itself and inherits your
+   environment, so leave `NAV_MOCK_MODEL` unset to reach the real model):
+
+   ```sh
+   npm run electron:dev
+   ```
+
+3. Send an initial message (e.g. `my name is Ada`) and confirm a **real**
+   assistant response renders.
+4. Send a follow-up that depends on it (e.g. `what is my name?`) and confirm the
+   reply reflects the earlier turn — proving prior conversation context was
+   forwarded to the provider.
+
+If the provider request fails or returns an unexpected shape, the app renders a
+`run.failed` event with the reason and stays usable; no API key or auth header
+appears in logs, errors, or the renderer.

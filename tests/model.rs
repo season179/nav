@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use nav::{ChatMessage, ChatModel, MockModel, ModelChoice};
+use nav::{ChatMessage, ChatModel, ConfigError, MockModel, ModelChoice, ResolvedModelConfig};
 
 fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     let map: HashMap<String, String> = pairs
@@ -8,6 +9,22 @@ fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
         .collect();
     move |key: &str| map.get(key).cloned()
+}
+
+/// A resolved settings.json model, as #531's resolver would produce.
+fn resolved(api_key: &str, model: &str, base_url: &str) -> ResolvedModelConfig {
+    ResolvedModelConfig {
+        api_key: api_key.to_owned(),
+        model: model.to_owned(),
+        base_url: base_url.to_owned(),
+        name: model.to_owned(),
+        reasoning: false,
+        input: vec!["text".to_owned()],
+        context_window: Some(128_000),
+        max_tokens: Some(16_384),
+        compat: None,
+        thinking_level_map: None,
+    }
 }
 
 #[test]
@@ -73,6 +90,82 @@ fn missing_configuration_resolves_to_not_configured() {
 fn explicit_mock_request_wins_over_an_api_key() {
     let choice = ModelChoice::from_env(env(&[("NAV_MOCK_MODEL", "1"), ("NAV_API_KEY", "sk-test")]));
     assert!(matches!(choice, ModelChoice::Mock));
+}
+
+#[test]
+fn resolve_prefers_the_explicit_mock_over_settings() {
+    let choice = ModelChoice::resolve(env(&[("NAV_MOCK_MODEL", "1")]), || {
+        Ok(resolved(
+            "sk-settings",
+            "Qwen/Qwen3.7-Max",
+            "https://example/v1",
+        ))
+    });
+    assert!(matches!(choice, ModelChoice::Mock));
+}
+
+#[test]
+fn resolve_uses_the_settings_default_model() {
+    let choice = ModelChoice::resolve(env(&[]), || {
+        Ok(resolved(
+            "sk-settings",
+            "Qwen/Qwen3.7-Max",
+            "https://commandcode.example/v1",
+        ))
+    });
+    match choice {
+        ModelChoice::OpenAi(config) => {
+            assert_eq!(config.api_key, "sk-settings");
+            assert_eq!(config.model, "Qwen/Qwen3.7-Max");
+            assert_eq!(config.base_url, "https://commandcode.example/v1");
+        }
+        other => panic!("expected OpenAi from settings, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_falls_back_to_env_when_no_settings_file_exists() {
+    let choice = ModelChoice::resolve(env(&[("NAV_API_KEY", "sk-env")]), || {
+        Err(ConfigError::FileNotFound(PathBuf::from(
+            "~/.nav/settings.json",
+        )))
+    });
+    match choice {
+        ModelChoice::OpenAi(config) => assert_eq!(config.api_key, "sk-env"),
+        other => panic!("expected env-backed OpenAi, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_surfaces_an_unusable_settings_file() {
+    let choice = ModelChoice::resolve(env(&[]), || {
+        Err(ConfigError::UnsupportedApi {
+            provider: "anthropic".to_owned(),
+            api: "anthropic-messages".to_owned(),
+        })
+    });
+    match choice {
+        ModelChoice::Unavailable(reason) => {
+            assert!(
+                reason.contains("anthropic-messages"),
+                "the reason should explain the unsupported API, got: {reason}"
+            );
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unavailable_model_fails_with_its_config_reason() {
+    let model = ModelChoice::Unavailable("settings.json is broken".to_owned()).into_model();
+    let error = model
+        .respond(&[ChatMessage::user("hi")])
+        .expect_err("an unavailable model must refuse to respond");
+    assert!(
+        error.message.contains("settings.json is broken"),
+        "error should carry the config reason, got: {}",
+        error.message
+    );
 }
 
 #[test]
