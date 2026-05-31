@@ -350,26 +350,35 @@ function renderProjectSessions(project) {
     projectSessions.append(renderProjectSession(session));
   }
 
-  if (!expanded && project.sessions.length > PROJECT_SESSION_PREVIEW_LIMIT) {
-    projectSessions.append(renderProjectShowMore(project));
+  if (project.sessions.length > PROJECT_SESSION_PREVIEW_LIMIT) {
+    projectSessions.append(renderProjectSessionToggle(project, expanded));
   }
 
   return projectSessions;
 }
 
-function renderProjectShowMore(project) {
+function renderProjectSessionToggle(project, expanded) {
   const button = document.createElement("button");
   button.type = "button";
-  button.className = "project-show-more";
-  button.textContent = "Show more";
-  const hiddenCount = project.sessions.length - PROJECT_SESSION_PREVIEW_LIMIT;
-  const sessionLabel = hiddenCount === 1 ? "session" : "sessions";
-  button.setAttribute(
-    "aria-label",
-    `Show ${hiddenCount} more ${sessionLabel} in ${project.name}`,
-  );
+  button.className = "project-session-toggle";
+  if (expanded) {
+    button.textContent = "Show less";
+    button.setAttribute("aria-label", `Show fewer sessions in ${project.name}`);
+  } else {
+    const hiddenCount = project.sessions.length - PROJECT_SESSION_PREVIEW_LIMIT;
+    const sessionLabel = hiddenCount === 1 ? "session" : "sessions";
+    button.textContent = "Show more";
+    button.setAttribute(
+      "aria-label",
+      `Show ${hiddenCount} more ${sessionLabel} in ${project.name}`,
+    );
+  }
   button.addEventListener("click", () => {
-    expandedProjectKeys.add(project.key);
+    if (expanded) {
+      expandedProjectKeys.delete(project.key);
+    } else {
+      expandedProjectKeys.add(project.key);
+    }
     renderSessionList(sessionSummaries);
   });
 

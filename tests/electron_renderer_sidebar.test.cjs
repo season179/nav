@@ -19,7 +19,7 @@ test("project sidebar shows five sessions before revealing older sessions", () =
     "Session 5",
   ]);
 
-  const showMore = findByClass(collapsed, "project-show-more");
+  const showMore = findByClass(collapsed, "project-session-toggle");
   assert.ok(
     showMore,
     "projects with more than five sessions get a reveal button",
@@ -36,16 +36,32 @@ test("project sidebar shows five sessions before revealing older sessions", () =
     sessionButtonLabels(expanded),
     project.sessions.map((session) => session.title),
   );
-  assert.equal(findByClass(expanded, "project-show-more"), null);
+  const showLess = findByClass(expanded, "project-session-toggle");
+  assert.ok(showLess, "expanded projects get a collapse button");
+  assert.equal(showLess.textContent, "Show less");
+  assert.equal(
+    showLess.getAttribute("aria-label"),
+    "Show fewer sessions in nav",
+  );
+
+  showLess.click();
+  const collapsedAgain = renderer.renderProjectSessions(project);
+  assert.deepEqual(sessionButtonLabels(collapsedAgain), [
+    "Session 1",
+    "Session 2",
+    "Session 3",
+    "Session 4",
+    "Session 5",
+  ]);
 });
 
-test("project sidebar omits show more for five sessions", () => {
+test("project sidebar omits session toggle for five sessions", () => {
   const renderer = loadRenderer();
   const project = projectWithSessions(5);
 
   const list = renderer.renderProjectSessions(project);
   assert.equal(sessionButtonLabels(list).length, 5);
-  assert.equal(findByClass(list, "project-show-more"), null);
+  assert.equal(findByClass(list, "project-session-toggle"), null);
 });
 
 function loadRenderer() {
