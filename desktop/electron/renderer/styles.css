@@ -278,6 +278,34 @@ body {
   font-weight: 600;
 }
 
+.project-show-more {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-faint);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.project-show-more:hover {
+  background: var(--surface-raised);
+  color: var(--ink-dim);
+}
+
+.project-show-more:focus-visible {
+  outline: none;
+  border-color: var(--primary-dim);
+  box-shadow: 0 0 0 2px var(--primary-tint);
+}
+
 .sidebar-empty {
   padding: 4px 16px;
   color: var(--ink-faint);
@@ -743,6 +771,7 @@ h1 {
   .new-chat,
   .project-add,
   .session-item,
+  .project-show-more,
   .composer-input,
   .composer-send,
   .composer-stop,
