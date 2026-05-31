@@ -68,12 +68,12 @@ impl Agent {
                 return Ok(RunStop::Cancelled);
             }
 
-            let input_estimate = self.model.estimate_context_tokens(&context, &tool_defs);
             let response = self
                 .model
                 .respond(&context, &tool_defs)
                 .map_err(AgentRunError::Model)?;
             let usage = response.token_usage.clone().unwrap_or_else(|| {
+                let input_estimate = self.model.estimate_context_tokens(&context, &tool_defs);
                 let output_estimate = self.model.estimate_output_tokens(&response);
                 crate::tokens::TokenUsage::estimated(input_estimate, output_estimate)
             });

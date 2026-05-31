@@ -154,7 +154,7 @@ impl HfTokenizerCounter {
 
 impl TextTokenCounter for HfTokenizerCounter {
     fn count_text(&self, text: &str) -> TokenEstimate {
-        match self.tokenizer.encode(text, false) {
+        match self.tokenizer.encode_fast(text, false) {
             Ok(encoding) => TokenEstimate::tokenizer(encoding.len() as u64, &self.tokenizer_id),
             Err(_) => HeuristicTokenCounter.count_text(text),
         }
