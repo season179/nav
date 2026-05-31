@@ -36,7 +36,7 @@ fn run() -> io::Result<()> {
     let model = ModelChoice::resolve(|key| std::env::var(key).ok(), nav::resolve_default_config);
     eprintln!("nav-local-backend: using {}", model.describe());
     let model_id = model.model_id();
-    let model_label = model.label();
+    let model_info = model.info();
 
     // Persist sessions and exchanges so conversations survive restarts. The
     // default is the shared ~/.nav/nav.db; NAV_DB_PATH overrides it (tests point
@@ -44,7 +44,7 @@ fn run() -> io::Result<()> {
     // the store can't be opened, keep serving an in-memory-only chat.
     let mut store = SessionStore::new(model.into_model())
         .with_model_id(model_id)
-        .with_model_label(model_label);
+        .with_model_info(model_info);
     let db_override = std::env::var("NAV_DB_PATH")
         .ok()
         .filter(|path| !path.is_empty());

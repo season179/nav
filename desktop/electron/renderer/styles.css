@@ -494,24 +494,42 @@ h1 {
   background: var(--bg);
 }
 
-/* Input + Send share one row; the model indicator sits below them. Send stays
-   bottom-aligned as the textarea grows with multi-line input. */
+/* Input + Send share one row. Send stays bottom-aligned as the textarea grows
+   with multi-line input. */
 .composer-row {
   display: flex;
   align-items: flex-end;
   gap: 12px;
 }
 
-/* The model currently in use — small, dim, just under the input. */
-.composer-model {
-  padding-left: 2px;
+/* Lower metadata row for the model indicator and future inline controls. */
+.composer-meta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 16px;
+}
+
+/* The model metadata currently in use — small, dim, just under the input. */
+.composer-model,
+.composer-thinking {
   color: var(--ink-faint);
   font-size: 12px;
   letter-spacing: 0.02em;
+  line-height: 16px;
 }
 
-/* Render nothing (no stray padding) until the model name is known. */
-.composer-model:empty {
+.composer-model {
+  padding-left: 2px;
+}
+
+.composer-thinking {
+  margin-left: auto;
+  text-align: right;
+}
+
+.composer-model:empty,
+.composer-thinking:empty {
   display: none;
 }
 

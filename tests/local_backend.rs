@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use nav::{MockModel, SessionStore};
+use nav::{MockModel, ModelInfo, SessionStore};
 use serde_json::{Value, json};
 
 /// An in-process backend bound to an ephemeral loopback port, driven over raw
@@ -180,10 +180,13 @@ fn listing_sessions_without_storage_returns_an_empty_array() {
 }
 
 #[test]
-fn model_info_returns_the_configured_label() {
+fn model_info_returns_the_configured_metadata() {
+    let model_info = ModelInfo {
+        label: "Claude Opus 4.8".to_owned(),
+        thinking: Some("Reasoning".to_owned()),
+    };
     let backend = TestBackend::start_with(
-        SessionStore::new(Arc::new(MockModel::new()))
-            .with_model_label("Claude Opus 4.8".to_owned()),
+        SessionStore::new(Arc::new(MockModel::new())).with_model_info(model_info),
     );
 
     let response = backend.rpc(r#"{"jsonrpc":"2.0","id":"model","method":"session.modelInfo"}"#);
@@ -191,6 +194,10 @@ fn model_info_returns_the_configured_label() {
     assert_eq!(
         response["result"]["label"], "Claude Opus 4.8",
         "session.modelInfo returns the configured model label: {response}"
+    );
+    assert_eq!(
+        response["result"]["thinking"], "Reasoning",
+        "session.modelInfo returns optional thinking metadata: {response}"
     );
 }
 

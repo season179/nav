@@ -5,6 +5,7 @@ const composer = document.querySelector("#composer");
 const input = document.querySelector("#composer-input");
 const sendButton = document.querySelector("#composer-send");
 const modelNode = document.querySelector("#composer-model");
+const thinkingNode = document.querySelector("#composer-thinking");
 
 let connected = false;
 let running = false;
@@ -101,19 +102,20 @@ function handleBackendStatus(status) {
     }
     setRunning(false);
     refreshSessions();
-    refreshModelName();
+    refreshModelInfo();
   }
 }
 
 // Show which model the backend is configured to use, just below the composer.
 // The model can't change mid-session, so one fetch on connect is enough.
-async function refreshModelName() {
+async function refreshModelInfo() {
   if (!window.nav) {
     return;
   }
   try {
     const info = await window.nav.modelInfo();
     modelNode.textContent = info?.label ?? "";
+    thinkingNode.textContent = info?.thinking ?? "";
   } catch {
     // The indicator is best-effort; never let it disrupt the chat.
   }

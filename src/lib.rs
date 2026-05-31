@@ -32,8 +32,8 @@ mod tools;
 pub use config::{ConfigError, ResolvedModelConfig, resolve_config, resolve_default_config};
 pub use context::{ContextAssembler, ModelContext, TurnHistory};
 pub use model::{
-    ChatMessage, ChatModel, FinishReason, MockModel, ModelChoice, ModelError, ModelResponse,
-    OpenAiConfig, OpenAiModel, Role, ToolCall, ToolDef,
+    ChatMessage, ChatModel, FinishReason, MockModel, ModelChoice, ModelError, ModelInfo,
+    ModelResponse, OpenAiConfig, OpenAiModel, Role, ToolCall, ToolDef,
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
 pub use storage::{SessionSummary, Storage, StorageError};
@@ -137,9 +137,7 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
             let latest = store.latest_session_id();
             write_rpc_result(stream, &id, json!({ "sessionId": latest }))
         }
-        Some("session.modelInfo") => {
-            write_rpc_result(stream, &id, json!({ "label": store.model_label() }))
-        }
+        Some("session.modelInfo") => write_rpc_result(stream, &id, json!(store.model_info())),
         Some("session.list") => {
             let sessions: Vec<Value> = store
                 .list_sessions()

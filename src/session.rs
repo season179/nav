@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop};
 use crate::context::{ContextAssembler, TurnHistory};
-use crate::model::{ChatMessage, ChatModel, Role, ToolCall};
+use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
 use crate::storage::{SessionSummary, Storage};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
@@ -144,8 +144,8 @@ pub struct SessionStore {
     storage: Option<Arc<Storage>>,
     /// Identifier of the active model, tagged onto persisted assistant turns.
     model_id: Option<String>,
-    /// Human-friendly name of the active model, shown in the app's UI.
-    model_label: String,
+    /// Renderer-facing model metadata shown in the app's composer.
+    model_info: ModelInfo,
 }
 
 impl SessionStore {
@@ -156,7 +156,10 @@ impl SessionStore {
             context_assembler: ContextAssembler::new(),
             storage: None,
             model_id: None,
-            model_label: "unknown model".to_owned(),
+            model_info: ModelInfo {
+                label: "unknown model".to_owned(),
+                thinking: None,
+            },
         }
     }
 
@@ -172,15 +175,15 @@ impl SessionStore {
         self
     }
 
-    /// Set the human-friendly model name surfaced to the UI.
-    pub fn with_model_label(mut self, model_label: String) -> Self {
-        self.model_label = model_label;
+    /// Set renderer-facing model metadata surfaced to the UI.
+    pub fn with_model_info(mut self, model_info: ModelInfo) -> Self {
+        self.model_info = model_info;
         self
     }
 
-    /// The human-friendly name of the active model, for the app's indicator.
-    pub fn model_label(&self) -> &str {
-        &self.model_label
+    /// Renderer-facing model metadata for the app's composer.
+    pub fn model_info(&self) -> &ModelInfo {
+        &self.model_info
     }
 
     /// Override the toolset offered to the model (defaults to the coding tools).

@@ -66,8 +66,10 @@ fn model(base_url: String) -> OpenAiModel {
         model: "test-model".to_owned(),
         base_url,
         name: "test-model".to_owned(),
+        reasoning: false,
         context_window: None,
         compat: None,
+        thinking_level_map: None,
     })
 }
 

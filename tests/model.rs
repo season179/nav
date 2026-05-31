@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use nav::{
     ChatMessage, ChatModel, ConfigError, MockModel, ModelChoice, ModelContext, ResolvedModelConfig,
 };
+use serde_json::json;
 
 fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     let map: HashMap<String, String> = pairs
@@ -133,6 +134,24 @@ fn resolve_uses_the_settings_default_model() {
         }
         other => panic!("expected OpenAi from settings, got {other:?}"),
     }
+}
+
+#[test]
+fn resolve_surfaces_reasoning_thinking_metadata() {
+    let mut config = resolved(
+        "sk-settings",
+        "Qwen/Qwen3.7-Max",
+        "https://commandcode.example/v1",
+    );
+    config.reasoning = true;
+    config.thinking_level_map = Some(json!({ "high": "xhigh" }));
+
+    let choice = ModelChoice::resolve(env(&[]), || Ok(config));
+
+    assert_eq!(
+        choice.info().thinking.as_deref(),
+        Some("Reasoning / Thinking")
+    );
 }
 
 #[test]
