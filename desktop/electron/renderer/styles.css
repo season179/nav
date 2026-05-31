@@ -620,6 +620,7 @@ h1 {
   .session-item,
   .composer-input,
   .composer-send,
+  .composer-stop,
   .message-time {
     transition: none;
   }
