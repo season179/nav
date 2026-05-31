@@ -3,6 +3,7 @@
 
 use nav::{ChatMessage, Role, Storage, TokenUsage, ToolCall};
 use rusqlite::Connection;
+use std::path::Path;
 
 /// A throwaway database path under the OS temp dir.
 fn temp_db() -> std::path::PathBuf {
@@ -98,6 +99,30 @@ fn a_full_exchange_is_persisted_into_sessions_runs_turns_and_parts() {
         hits >= 1,
         "the persisted text should be full-text searchable"
     );
+}
+
+#[test]
+fn created_sessions_can_record_their_workspace_root() {
+    let path = temp_db();
+    let _cleanup = TempDb(path.clone());
+    let storage = Storage::open(&path).expect("open database");
+
+    storage
+        .create_session_with_workspace("s", "nav", Some(Path::new("/projects/nav")))
+        .unwrap();
+
+    let conn = Connection::open(&path).expect("reopen for assertions");
+    let workspace_root: Option<String> = conn
+        .query_row(
+            "SELECT workspace_root FROM sessions WHERE id = 's'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(workspace_root.as_deref(), Some("/projects/nav"));
+
+    let sessions = storage.list_sessions("nav").unwrap();
+    assert_eq!(sessions[0].workspace_root.as_deref(), Some("/projects/nav"));
 }
 
 #[test]

@@ -138,6 +138,51 @@ fn provider_token_usage_is_recorded_for_the_session() {
 }
 
 #[test]
+fn persisted_session_summaries_include_a_workspace_root() {
+    let path =
+        std::env::temp_dir().join(format!("nav_session_workspace_{}.db", uuid::Uuid::now_v7()));
+    let workspace = std::env::temp_dir().join(format!(
+        "nav_session_workspace_root_{}",
+        uuid::Uuid::now_v7()
+    ));
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    let expected = workspace.to_string_lossy().replace('\\', "/");
+    let storage = Arc::new(Storage::open(&path).expect("open storage"));
+    storage
+        .create_session("legacy-without-root", "nav")
+        .expect("seed legacy session");
+    let store = SessionStore::new(Arc::new(MockModel::new()))
+        .with_storage(Arc::clone(&storage))
+        .with_workspace(workspace.clone());
+
+    let session_id = store.create_session();
+
+    let conn = rusqlite::Connection::open(&path).expect("reopen db");
+    let persisted_root: Option<String> = conn
+        .query_row(
+            "SELECT workspace_root FROM sessions WHERE id = ?1",
+            [session_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_root.as_deref(), Some(expected.as_str()));
+
+    let summaries = store.list_sessions();
+    assert!(
+        summaries
+            .iter()
+            .all(|session| session.workspace_root.as_deref() == Some(expected.as_str())),
+        "new and legacy nav sessions should list under a workspace: {summaries:?}"
+    );
+
+    drop(conn);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn missing_provider_token_usage_falls_back_to_an_estimate() {
     let path = std::env::temp_dir().join(format!(
         "nav_session_estimated_tokens_{}.db",
@@ -250,6 +295,39 @@ fn a_persisted_session_resumes_with_its_history_after_a_restart() {
             ChatMessage::user("what is my name?"),
         ],
     );
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn resume_session_fails_when_workspace_lookup_errors() {
+    let path = std::env::temp_dir().join(format!(
+        "nav_session_workspace_error_{}.db",
+        uuid::Uuid::now_v7()
+    ));
+    let model = Arc::new(RecordingModel::new());
+
+    let session_id = {
+        let storage = Arc::new(Storage::open(&path).expect("open storage"));
+        let store = SessionStore::new(model.clone()).with_storage(storage);
+        let session_id = store.create_session();
+        store.send_message(&session_id, "persist me").unwrap();
+        session_id
+    };
+
+    {
+        let conn = rusqlite::Connection::open(&path).expect("reopen db");
+        conn.execute("ALTER TABLE sessions DROP COLUMN workspace_root", [])
+            .expect("make workspace lookup fail without breaking session/history reads");
+    }
+
+    let storage = Arc::new(Storage::open(&path).expect("reopen storage"));
+    let store = SessionStore::new(model).with_storage(storage);
+
+    assert!(!store.resume_session(&session_id));
+    assert!(store.events(&session_id).is_none());
 
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

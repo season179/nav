@@ -19,6 +19,7 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
   const backend = await startMockBackend();
   const controller = new AbortController();
   const events = [];
+  let projectRoot = null;
 
   try {
     const created = await sendRpc({
@@ -27,6 +28,41 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
     });
     const sessionId = created.result.sessionId;
     assert.ok(sessionId, "session.create returns a sessionId");
+    const listed = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.list",
+    });
+    assert.equal(
+      listed.result.sessions[0].workspaceRoot,
+      process.cwd(),
+      "session.list includes the backend project root",
+    );
+    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nav-project-"));
+    const projectSession = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.create",
+      params: { cwd: projectRoot },
+    });
+    assert.ok(
+      projectSession.result.sessionId,
+      "session.create accepts a project cwd",
+    );
+    const listedWithProject = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.list",
+    });
+    const listedProjectSession = listedWithProject.result.sessions.find(
+      (session) => session.sessionId === projectSession.result.sessionId,
+    );
+    assert.ok(
+      listedProjectSession,
+      "session.list returns the newly created project session",
+    );
+    assert.equal(
+      listedProjectSession.workspaceRoot,
+      fs.realpathSync(projectRoot),
+      "new project sessions list under their selected directory",
+    );
 
     await new Promise((resolve, reject) => {
       let completions = 0;
@@ -63,6 +99,9 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
   } finally {
     controller.abort();
     backend.stop();
+    if (projectRoot) {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
   }
 
   const types = events.map((event) => event.type);

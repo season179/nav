@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
-use crate::storage::{SessionSummary, Storage};
+use crate::storage::{SessionSummary, Storage, StorageError};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
 
@@ -75,6 +75,7 @@ impl Event {
 
 struct Session {
     id: String,
+    workspace: PathBuf,
     turns: TurnHistory,
     events: Vec<Event>,
     subscribers: Vec<Sender<Event>>,
@@ -97,9 +98,10 @@ struct ActiveRun {
 }
 
 impl Session {
-    fn new(id: String) -> Self {
+    fn new(id: String, workspace: PathBuf) -> Self {
         Self {
             id,
+            workspace,
             turns: TurnHistory::new(),
             events: Vec::new(),
             subscribers: Vec::new(),
@@ -233,14 +235,24 @@ impl SessionStore {
 
     /// Create a new session and emit its `session.created` event.
     pub fn create_session(&self) -> String {
+        self.create_session_in_workspace(self.agent.workspace().to_path_buf())
+    }
+
+    /// Create a new session bound to `workspace` and emit its `session.created`
+    /// event.
+    pub fn create_session_in_workspace(&self, workspace: PathBuf) -> String {
         let session_id = new_id();
-        let mut session = Session::new(session_id.clone());
+        let mut session = Session::new(session_id.clone(), workspace);
         session.emit("session.created", |_| {});
 
         if let Some(storage) = &self.storage {
             log_storage(
                 "create_session",
-                storage.create_session(&session_id, SESSION_SOURCE),
+                storage.create_session_with_workspace(
+                    &session_id,
+                    SESSION_SOURCE,
+                    Some(&session.workspace),
+                ),
             );
         }
 
@@ -286,7 +298,14 @@ impl SessionStore {
             }
         };
 
-        let mut session = Session::new(session_id.to_owned());
+        let workspace = match self.stored_workspace_or_default(storage, session_id) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                tracing::error!(%session_id, %error, "failed to load session workspace");
+                return false;
+            }
+        };
+        let mut session = Session::new(session_id.to_owned(), workspace);
         session.emit("session.created", |_| {});
         // A tool line is rendered by its name, but a stored tool result carries
         // only the id it answers — remember each call's name from the requesting
@@ -362,7 +381,7 @@ impl SessionStore {
             return Vec::new();
         };
         match storage.list_sessions(SESSION_SOURCE) {
-            Ok(sessions) => sessions,
+            Ok(sessions) => self.with_default_workspace(sessions),
             Err(error) => {
                 tracing::error!(%error, "failed to list sessions");
                 Vec::new()
@@ -409,10 +428,11 @@ impl SessionStore {
         // drain-or-finish decision both run under the store lock, so a message
         // either joins this run or (if it lands after the run finalizes) starts
         // a fresh one — it is never lost.
-        let queued_onto = self.with_session(session_id, |session| {
+        let (queued_onto, workspace) = self.with_session(session_id, |session| {
+            let workspace = session.workspace.clone();
             if let Some(active) = session.active_run.as_mut() {
                 active.steer.push_back(text.to_owned());
-                return Some(active.id.clone());
+                return (Some(active.id.clone()), workspace);
             }
             session.turns.push(ChatMessage::user(text));
             // Register the run so `stop_run` can find its cancel flag and senders
@@ -429,7 +449,7 @@ impl SessionStore {
             session.emit("run.started", |event| {
                 event.run_id = Some(run_id.clone());
             });
-            None
+            (None, workspace)
         })?;
         if let Some(active_run_id) = queued_onto {
             // Folded into the in-flight run; nothing more to do on this thread.
@@ -458,7 +478,7 @@ impl SessionStore {
             run_id: &run_id,
             seq,
         };
-        let outcome = self.agent.run_turn(context, &cancel, &mut sink);
+        let outcome = self.agent.run_turn(context, &workspace, &cancel, &mut sink);
         match outcome {
             // A completed run already finalized itself inside the loop
             // (`next_input_or_finish` cleared the run and emitted `run.completed`
@@ -571,6 +591,36 @@ impl SessionStore {
             .unwrap()
             .get(session_id)
             .map(|session| session.events.clone())
+    }
+
+    fn with_default_workspace(&self, sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
+        let fallback = self.agent.workspace().to_string_lossy().replace('\\', "/");
+        sessions
+            .into_iter()
+            .map(|mut session| {
+                let missing = session
+                    .workspace_root
+                    .as_deref()
+                    .map(|path| path.trim().is_empty())
+                    .unwrap_or(true);
+                if missing {
+                    session.workspace_root = Some(fallback.clone());
+                }
+                session
+            })
+            .collect()
+    }
+
+    fn stored_workspace_or_default(
+        &self,
+        storage: &Storage,
+        session_id: &str,
+    ) -> Result<PathBuf, StorageError> {
+        Ok(storage
+            .session_workspace_root(session_id)?
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.agent.workspace().to_path_buf()))
     }
 }
 

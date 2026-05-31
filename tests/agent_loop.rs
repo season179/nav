@@ -420,6 +420,35 @@ fn a_tool_call_turn_emits_the_full_event_sequence_and_runs_the_tool() {
 }
 
 #[test]
+fn tool_calls_run_in_the_session_project_workspace() {
+    let default_workspace = TempDir::new("default_ws");
+    fs::write(default_workspace.path.join("default-only.txt"), "nope").expect("seed default file");
+    let project_workspace = TempDir::new("project_ws");
+    fs::write(project_workspace.path.join("project-only.txt"), "hi").expect("seed project file");
+
+    let store = SessionStore::new(Arc::new(ScriptedModel::new()))
+        .with_workspace(default_workspace.path.clone());
+    let session_id = store.create_session_in_workspace(project_workspace.path.clone());
+
+    store.send_message(&session_id, "list the files").unwrap();
+
+    let events = store.events(&session_id).unwrap();
+    let completed = events
+        .iter()
+        .find(|event| event.kind == "tool.completed")
+        .expect("tool completed");
+    let output = completed.text.as_deref().unwrap_or_default();
+    assert!(
+        output.contains("project-only.txt"),
+        "tool output should use the session project workspace: {output:?}"
+    );
+    assert!(
+        !output.contains("default-only.txt"),
+        "tool output must not use the store default workspace: {output:?}"
+    );
+}
+
+#[test]
 fn a_tool_run_persists_its_result_and_replays_on_resume() {
     let workspace = TempDir::new("agent_ws");
     fs::write(workspace.path.join("hello.txt"), "hi").expect("seed file");

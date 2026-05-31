@@ -6,7 +6,7 @@
 //! adapter to mirror those steps into session state, event streams, and
 //! persistence.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -41,15 +41,19 @@ impl Agent {
         self
     }
 
+    pub(crate) fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     /// Build the system prompt for this run from the toolset, workspace, and any
     /// project context files. Rebuilt per run so the date and project context
     /// stay current.
-    fn system_prompt(&self) -> String {
+    fn system_prompt(&self, workspace: &Path) -> String {
         let tool_snippets = self.registry.prompt_snippets();
         let prompt_guidelines = self.registry.prompt_guidelines();
         let selected_tools = self.registry.tool_names();
         let context_files = system_prompt::load_project_context_files(
-            &self.workspace,
+            workspace,
             system_prompt::nav_agent_dir().as_deref(),
         );
         let date = system_prompt::current_date();
@@ -57,7 +61,7 @@ impl Agent {
             selected_tools: &selected_tools,
             tool_snippets: &tool_snippets,
             prompt_guidelines: &prompt_guidelines,
-            cwd: &self.workspace,
+            cwd: workspace,
             context_files: &context_files,
             date: &date,
         })
@@ -78,6 +82,7 @@ impl Agent {
     pub(crate) fn run_turn<S>(
         &self,
         mut context: ModelContext,
+        workspace: &Path,
         cancel: &CancelFlag,
         sink: &mut S,
     ) -> Result<RunStop, AgentRunError<S::Error>>
@@ -86,7 +91,7 @@ impl Agent {
     {
         let tool_defs = self.registry.defs();
         // Attach the system prompt once; it leads every model call this run.
-        context = context.with_system_prompt(self.system_prompt());
+        context = context.with_system_prompt(self.system_prompt(workspace));
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -168,7 +173,7 @@ impl Agent {
                         .map_err(AgentRunError::Sink)?;
                     continue;
                 }
-                let result = self.registry.execute_call(call, &self.workspace, cancel);
+                let result = self.registry.execute_call(call, workspace, cancel);
                 context.push(ChatMessage::tool_result(
                     &call.id,
                     &result.content,

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const path = require("node:path");
 const { subscribeToSessionEvents, sendRpc } = require("./backend-client.cjs");
 const { startLocalBackend } = require("./backend-process.cjs");
@@ -85,13 +85,31 @@ ipcMain.handle("nav:switch-session", async (_event, id) => {
   activateSession(mainWindow, id);
 });
 
-ipcMain.handle("nav:new-session", async () => {
+ipcMain.handle("nav:create-project", async () => {
+  if (!backendUrl || !mainWindow) {
+    throw new Error("chat session is not ready");
+  }
+  const selection = await dialog.showOpenDialog(mainWindow, {
+    title: "Add Project",
+    buttonLabel: "Add Project",
+    properties: ["openDirectory"],
+  });
+  const cwd = selection.canceled ? null : selection.filePaths[0];
+  if (!cwd) {
+    return null;
+  }
+  const createdSessionId = await createBackendSession(cwd);
+  activateSession(mainWindow, createdSessionId);
+  return createdSessionId;
+});
+
+ipcMain.handle("nav:new-session", async (_event, cwd) => {
   if (!backendUrl) {
     throw new Error("chat session is not ready");
   }
-  const created = await sendRpc({ backendUrl, method: "session.create" });
-  activateSession(mainWindow, created.result.sessionId);
-  return created.result.sessionId;
+  const createdSessionId = await createBackendSession(cwd);
+  activateSession(mainWindow, createdSessionId);
+  return createdSessionId;
 });
 
 function createMainWindow() {
@@ -227,6 +245,16 @@ async function openSession() {
   }
   const created = await tracedRpc("session.create");
   trace.mark("electron.session.open.end", { mode: "created" });
+  return created.result.sessionId;
+}
+
+async function createBackendSession(cwd) {
+  const params = cwd ? { cwd } : undefined;
+  const created = await sendRpc({
+    backendUrl,
+    method: "session.create",
+    params,
+  });
   return created.result.sessionId;
 }
 

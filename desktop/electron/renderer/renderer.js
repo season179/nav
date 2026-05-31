@@ -1,6 +1,7 @@
 const messageListNode = document.querySelector("#message-list");
 const sessionListNode = document.querySelector("#session-list");
 const newChatButton = document.querySelector("#new-chat");
+const newProjectButton = document.querySelector("#new-project");
 const composer = document.querySelector("#composer");
 const input = document.querySelector("#composer-input");
 const sendButton = document.querySelector("#composer-send");
@@ -13,6 +14,7 @@ const tokenFormatter = new Intl.NumberFormat("en-US");
 let connected = false;
 let running = false;
 let activeSessionId = null;
+let sessionSummaries = [];
 // Set when Stop is pressed; re-applied on `run.started` in case the press landed
 // before the backend had registered the run (when a stop is a no-op).
 let stopRequested = false;
@@ -26,13 +28,15 @@ let lastPartyRole = null;
 if (window.nav) {
   window.nav.onBackendStatus(handleBackendStatus);
   window.nav.onSessionEvent(handleSessionEvent);
-  newChatButton.addEventListener("click", startNewChat);
 } else {
   renderBackendStatus({
     state: "preload-missing",
     message: "Electron preload API unavailable",
   });
 }
+
+newChatButton.addEventListener("click", startNewChat);
+newProjectButton.addEventListener("click", createProject);
 
 // Grow the textarea to fit its content so long, multi-line prompts stay
 // visible, up to the max-height set in CSS (past which it scrolls).
@@ -217,17 +221,39 @@ async function selectSession(sessionId) {
 }
 
 async function startNewChat() {
-  if (running || !connected) {
+  if (running || !connected || !window.nav) {
     return;
   }
   clearTranscript();
   try {
-    activeSessionId = await window.nav.newSession();
-    markActiveSession();
-    refreshModelInfo();
+    const sessionId = await window.nav.newSession(activeProjectPath());
+    await activateCreatedSession(sessionId);
   } catch (error) {
     appendMessage("error", `Could not start a new chat: ${error.message}`);
   }
+}
+
+async function createProject() {
+  if (running || !connected || !window.nav) {
+    return;
+  }
+  try {
+    const sessionId = await window.nav.createProject();
+    if (!sessionId) {
+      return;
+    }
+    clearTranscript();
+    await activateCreatedSession(sessionId);
+  } catch (error) {
+    appendMessage("error", `Could not create project: ${error.message}`);
+  }
+}
+
+async function activateCreatedSession(sessionId) {
+  activeSessionId = sessionId;
+  await refreshSessions();
+  markActiveSession();
+  refreshModelInfo();
 }
 
 async function refreshSessions() {
@@ -241,37 +267,136 @@ async function refreshSessions() {
     // Listing is best-effort; never let it disrupt the chat.
     return;
   }
+  sessionSummaries = sessions;
 
   sessionListNode.replaceChildren();
   if (sessions.length === 0) {
-    const empty = document.createElement("li");
-    empty.className = "sidebar-empty";
-    empty.textContent = "No sessions yet";
-    sessionListNode.append(empty);
+    renderEmptySessionList();
     return;
   }
 
-  for (const session of sessions) {
-    const item = document.createElement("button");
-    item.type = "button";
-    item.className = "session-item";
-    item.dataset.sessionId = session.sessionId;
-    item.textContent = sessionTitle(session);
-    item.addEventListener("click", () => selectSession(session.sessionId));
-
-    const row = document.createElement("li");
-    row.append(item);
-    sessionListNode.append(row);
+  const projects = groupSessionsByProject(sessions);
+  if (projects.length === 0) {
+    renderEmptySessionList();
+    return;
   }
+
+  sessionListNode.append(...projects.map(renderProject));
 
   // One place decides which item is highlighted, for both fresh lists and
   // in-place selection changes.
   markActiveSession();
 }
 
+function renderEmptySessionList() {
+  const empty = document.createElement("li");
+  empty.className = "sidebar-empty";
+  empty.textContent = "No sessions yet";
+  sessionListNode.append(empty);
+}
+
 function sessionTitle(session) {
   const title = (session.title ?? "").trim();
   return title.length > 0 ? title : "New chat";
+}
+
+function renderProject(project) {
+  const projectRow = document.createElement("li");
+  projectRow.className = "project-group";
+  projectRow.append(
+    renderProjectHeading(project),
+    renderProjectSessions(project),
+  );
+  return projectRow;
+}
+
+function renderProjectHeading(project) {
+  const heading = document.createElement("div");
+  heading.className = "project-heading";
+  heading.title = project.path || project.name;
+
+  const icon = document.createElement("span");
+  icon.className = "project-icon";
+  icon.setAttribute("aria-hidden", "true");
+
+  const name = document.createElement("span");
+  name.className = "project-name";
+  name.textContent = project.name;
+
+  heading.append(icon, name);
+  return heading;
+}
+
+function renderProjectSessions(project) {
+  const projectSessions = document.createElement("ul");
+  projectSessions.className = "project-session-list";
+
+  for (const session of project.sessions) {
+    projectSessions.append(renderProjectSession(session));
+  }
+
+  return projectSessions;
+}
+
+function renderProjectSession(session) {
+  const item = document.createElement("button");
+  item.type = "button";
+  item.className = "session-item";
+  item.dataset.sessionId = session.sessionId;
+  item.textContent = sessionTitle(session);
+  item.addEventListener("click", () => selectSession(session.sessionId));
+
+  const row = document.createElement("li");
+  row.append(item);
+  return row;
+}
+
+function groupSessionsByProject(sessions) {
+  const projects = new Map();
+
+  for (const session of sessions) {
+    const path = normalizeProjectPath(session.workspaceRoot);
+    const key = path || "__no_project__";
+    let project = projects.get(key);
+    if (!project) {
+      project = {
+        path,
+        name: path ? projectName(path) : "No project",
+        sessions: [],
+      };
+      projects.set(key, project);
+    }
+    project.sessions.push(session);
+  }
+
+  return Array.from(projects.values());
+}
+
+function normalizeProjectPath(path) {
+  if (typeof path !== "string") {
+    return "";
+  }
+  const trimmed = path.trim().replaceAll("\\", "/");
+  if (trimmed.length === 0) {
+    return "";
+  }
+  const normalized = trimmed.replace(/\/+$/, "");
+  return normalized.length > 0 ? normalized : "/";
+}
+
+function projectName(path) {
+  if (path === "/") {
+    return "/";
+  }
+  const parts = path.split("/").filter(Boolean);
+  return parts.at(-1) ?? path;
+}
+
+function activeProjectPath() {
+  return (
+    sessionSummaries.find((session) => session.sessionId === activeSessionId)
+      ?.workspaceRoot ?? null
+  );
 }
 
 function markActiveSession() {
@@ -413,6 +538,7 @@ function setRunning(isRunning) {
   stopButton.disabled = !connected;
   // New chat / session switching are blocked mid-run to avoid racing a turn.
   newChatButton.disabled = isRunning || !connected;
+  newProjectButton.disabled = isRunning || !connected;
   if (connected) {
     input.focus();
   }

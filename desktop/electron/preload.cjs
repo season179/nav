@@ -6,25 +6,29 @@ const { contextBridge, ipcRenderer } = require("electron");
 // `request-validation.cjs`. That standalone module is kept in lockstep and is
 // what the unit tests exercise; see tests/electron_request_validation.test.cjs.
 function normalizeMessageText(value) {
-  if (typeof value !== "string") {
-    throw new TypeError("message text must be a string");
-  }
-  const text = value.trim();
-  if (text.length === 0) {
-    throw new Error("message text must not be empty");
-  }
-  return text;
+  return normalizeRequiredString(value, "message text");
 }
 
 function normalizeSessionId(value) {
+  return normalizeRequiredString(value, "session id");
+}
+
+function normalizeOptionalWorkspaceRoot(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return normalizeRequiredString(value, "workspace root");
+}
+
+function normalizeRequiredString(value, label) {
   if (typeof value !== "string") {
-    throw new TypeError("session id must be a string");
+    throw new TypeError(`${label} must be a string`);
   }
-  const id = value.trim();
-  if (id.length === 0) {
-    throw new Error("session id must not be empty");
+  const text = value.trim();
+  if (text.length === 0) {
+    throw new Error(`${label} must not be empty`);
   }
-  return id;
+  return text;
 }
 
 contextBridge.exposeInMainWorld("nav", {
@@ -47,6 +51,10 @@ contextBridge.exposeInMainWorld("nav", {
   listSessions() {
     return ipcRenderer.invoke("nav:list-sessions");
   },
+  // Pick a directory and create a fresh session inside it.
+  createProject() {
+    return ipcRenderer.invoke("nav:create-project");
+  },
   // The active model's display info, shown beneath the composer.
   modelInfo(sessionId) {
     return ipcRenderer.invoke(
@@ -62,8 +70,11 @@ contextBridge.exposeInMainWorld("nav", {
     );
   },
   // Start a fresh conversation and make it active.
-  newSession() {
-    return ipcRenderer.invoke("nav:new-session");
+  newSession(workspaceRoot) {
+    return ipcRenderer.invoke(
+      "nav:new-session",
+      normalizeOptionalWorkspaceRoot(workspaceRoot),
+    );
   },
 });
 
