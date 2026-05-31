@@ -65,6 +65,10 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     /// For a [`Role::Tool`] turn, the assistant tool call this result answers.
     pub tool_call_id: Option<String>,
+    /// For a [`Role::Tool`] turn, whether the tool failed. Always `false` for
+    /// other turns. Not sent to the model — it only lets a resumed session
+    /// replay a failed tool with the same styling it had live.
+    pub is_error: bool,
 }
 
 impl ChatMessage {
@@ -74,6 +78,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            is_error: false,
         }
     }
 
@@ -83,6 +88,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            is_error: false,
         }
     }
 
@@ -94,16 +100,23 @@ impl ChatMessage {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            is_error: false,
         }
     }
 
-    /// A tool result answering a specific assistant tool call.
-    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    /// A tool result answering a specific assistant tool call. `is_error` marks
+    /// a failed tool run (an unknown tool, bad arguments, or a tool error).
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            is_error,
         }
     }
 }

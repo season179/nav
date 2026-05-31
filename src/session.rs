@@ -198,10 +198,13 @@ impl SessionStore {
     /// prior conversation intact across backend restarts.
     ///
     /// The stored history is loaded both as model context and as replayed
-    /// `user.message` / `message.completed` events, so a subscriber sees the
-    /// full backlog and the UI redraws the earlier turns. Idempotent: a session
-    /// already live is a no-op success. Returns `false` when the session cannot
-    /// be found in storage (or no storage is attached).
+    /// events, so a subscriber sees the full backlog and the UI redraws the
+    /// earlier turns — including tool history: an assistant tool-call turn
+    /// re-emits `assistant.tool_calls` plus a `tool.started` per call, and each
+    /// stored tool result re-emits `tool.completed`/`tool.failed`, matching what
+    /// the renderer saw live. Idempotent: a session already live is a no-op
+    /// success. Returns `false` when the session cannot be found in storage (or
+    /// no storage is attached).
     pub fn resume_session(&self, session_id: &str) -> bool {
         if self.sessions.lock().unwrap().contains_key(session_id) {
             return true;
@@ -228,20 +231,62 @@ impl SessionStore {
 
         let mut session = Session::new(session_id.to_owned());
         session.emit("session.created", |_| {});
+        // A tool line is rendered by its name, but a stored tool result carries
+        // only the id it answers — remember each call's name from the requesting
+        // assistant turn so the result can be replayed with it.
+        let mut tool_names: HashMap<String, String> = HashMap::new();
         for message in &history {
             match message.role {
                 Role::User => session.emit("user.message", |event| {
                     event.role = Some(Role::User.as_str().to_owned());
                     event.text = Some(message.content.clone());
                 }),
+                // An assistant turn that requested tools: replay its reasoning
+                // text (if any) and open a tool line per call, exactly as live.
+                Role::Assistant if !message.tool_calls.is_empty() => {
+                    let content = message.content.clone();
+                    session.emit("assistant.tool_calls", |event| {
+                        event.role = Some(Role::Assistant.as_str().to_owned());
+                        if !content.is_empty() {
+                            event.text = Some(content);
+                        }
+                    });
+                    for call in &message.tool_calls {
+                        tool_names.insert(call.id.clone(), call.name.clone());
+                        session.emit("tool.started", |event| {
+                            event.tool_call_id = Some(call.id.clone());
+                            event.tool_name = Some(call.name.clone());
+                        });
+                    }
+                }
                 Role::Assistant => session.emit("message.completed", |event| {
                     event.role = Some(Role::Assistant.as_str().to_owned());
                     event.text = Some(message.content.clone());
                     event.message_id = Some(new_id());
                 }),
-                // Tool turns are not part of text-only rehydration (load_history
-                // returns only user/assistant text), so there is nothing to replay.
-                Role::Tool => {}
+                // A stored tool result closes its line as completed or failed.
+                Role::Tool => {
+                    let kind = if message.is_error {
+                        "tool.failed"
+                    } else {
+                        "tool.completed"
+                    };
+                    let tool_call_id = message.tool_call_id.clone();
+                    let tool_name = tool_call_id
+                        .as_ref()
+                        .and_then(|id| tool_names.get(id).cloned());
+                    let content = message.content.clone();
+                    let is_error = message.is_error;
+                    session.emit(kind, |event| {
+                        event.tool_call_id = tool_call_id;
+                        event.tool_name = tool_name;
+                        if is_error {
+                            event.error = Some(content);
+                        } else {
+                            event.text = Some(content);
+                        }
+                    });
+                }
             }
         }
         session.messages = history;
@@ -421,7 +466,7 @@ impl SessionStore {
                 self.with_session(session_id, |session| {
                     session
                         .messages
-                        .push(ChatMessage::tool_result(&call.id, &output));
+                        .push(ChatMessage::tool_result(&call.id, &output, is_error));
                     session.emit(kind, |event| {
                         event.run_id = Some(run_id.clone());
                         event.tool_call_id = Some(call.id.clone());

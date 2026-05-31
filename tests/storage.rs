@@ -1,7 +1,7 @@
 //! Durable session storage: a fresh database is created from the canonical
 //! schema, and a full exchange is persisted into the shared table shapes.
 
-use nav::{ChatMessage, Role, Storage};
+use nav::{ChatMessage, Role, Storage, ToolCall};
 use rusqlite::Connection;
 
 /// A throwaway database path under the OS temp dir.
@@ -137,6 +137,60 @@ fn load_history_replays_a_session_in_order_for_resume() {
     );
     // Sanity on roles to guard the user/assistant mapping.
     assert_eq!(history[1].role, Role::Assistant);
+}
+
+#[test]
+fn load_history_reconstructs_tool_calls_and_results_for_resume() {
+    let path = temp_db();
+    let _cleanup = TempDb(path.clone());
+    let storage = Storage::open(&path).expect("open database");
+
+    let session_id = "tool-session";
+    storage.create_session(session_id, "nav").unwrap();
+    storage.start_run("run", session_id).unwrap();
+
+    // User asks; assistant requests two tools (with some reasoning text); each
+    // tool result is recorded — one succeeds, one fails; assistant then replies.
+    storage
+        .record_user_text(session_id, "run", 0, "do the thing")
+        .unwrap();
+    let calls = vec![
+        ToolCall {
+            id: "call-a".to_owned(),
+            name: "ls".to_owned(),
+            arguments: "{}".to_owned(),
+        },
+        ToolCall {
+            id: "call-b".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"x"}"#.to_owned(),
+        },
+    ];
+    storage
+        .record_assistant_tool_calls(session_id, "run", 1, Some("on it"), &calls, Some("m"))
+        .unwrap();
+    storage
+        .record_tool_result(session_id, "run", 2, "call-a", "a.txt\nb.txt", false)
+        .unwrap();
+    storage
+        .record_tool_result(session_id, "run", 3, "call-b", "no such file", true)
+        .unwrap();
+    storage
+        .record_assistant_text(session_id, "run", 4, "all done", Some("m"))
+        .unwrap();
+    storage.complete_run("run").unwrap();
+
+    let history = storage.load_history(session_id).unwrap();
+    assert_eq!(
+        history,
+        vec![
+            ChatMessage::user("do the thing"),
+            ChatMessage::assistant_tool_calls("on it", calls),
+            ChatMessage::tool_result("call-a", "a.txt\nb.txt", false),
+            ChatMessage::tool_result("call-b", "no such file", true),
+            ChatMessage::assistant("all done"),
+        ]
+    );
 }
 
 #[test]

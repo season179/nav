@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nav::{
-    ChatMessage, ChatModel, Event, ModelError, ModelResponse, Role, SessionStore, Storage,
-    ToolCall, ToolDef,
+    ChatMessage, ChatModel, Event, ModelError, ModelResponse, SessionStore, Storage, ToolCall,
+    ToolDef,
 };
 
 /// A throwaway directory, removed on drop.
@@ -128,7 +128,7 @@ fn a_tool_call_turn_emits_the_full_event_sequence_and_runs_the_tool() {
 }
 
 #[test]
-fn a_tool_run_persists_its_result_and_resumes_as_text_only() {
+fn a_tool_run_persists_its_result_and_replays_on_resume() {
     let workspace = TempDir::new("agent_ws");
     fs::write(workspace.path.join("hello.txt"), "hi").expect("seed file");
     let db = TempDir::new("agent_db");
@@ -165,8 +165,8 @@ fn a_tool_run_persists_its_result_and_resumes_as_text_only() {
     assert_eq!(tool_turns, 1);
     drop(conn);
 
-    // Resume in a fresh store: history is text-only (the user prompt + the final
-    // assistant text), with no tool turns rethreaded for v1.
+    // Resume in a fresh store: the full turn sequence replays, tool history
+    // included, so the renderer redraws the tool line just as it saw it live.
     let storage = Arc::new(Storage::open(&db_path).expect("reopen storage"));
     let store = SessionStore::new(Arc::new(ScriptedModel::new()))
         .with_storage(storage)
@@ -176,22 +176,32 @@ fn a_tool_run_persists_its_result_and_resumes_as_text_only() {
     let events = store.events(&session_id).unwrap();
     assert_eq!(
         kinds(&events),
-        ["session.created", "user.message", "message.completed"],
+        [
+            "session.created",
+            "user.message",
+            "assistant.tool_calls",
+            "tool.started",
+            "tool.completed",
+            "message.completed",
+        ],
     );
     assert_eq!(events[1].text.as_deref(), Some("list the files"));
-    assert_eq!(events[2].text.as_deref(), Some("done"));
 
-    // The resumed model history carries only user/assistant text.
-    let roles: Vec<Role> = store
-        .events(&session_id)
-        .into_iter()
-        .flatten()
-        .filter_map(|event| event.role)
-        .map(|role| match role.as_str() {
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            other => panic!("unexpected rehydrated role: {other}"),
-        })
-        .collect();
-    assert_eq!(roles, [Role::User, Role::Assistant]);
+    // The replayed tool line keeps its name, id, and output.
+    let started = &events[3];
+    assert_eq!(started.tool_name.as_deref(), Some("ls"));
+    assert_eq!(started.tool_call_id.as_deref(), Some("call-1"));
+    let completed = &events[4];
+    assert_eq!(completed.tool_name.as_deref(), Some("ls"));
+    assert_eq!(completed.tool_call_id.as_deref(), Some("call-1"));
+    assert!(
+        completed
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hello.txt"),
+        "replayed tool output should list the seeded file: {:?}",
+        completed.text
+    );
+    assert_eq!(events[5].text.as_deref(), Some("done"));
 }

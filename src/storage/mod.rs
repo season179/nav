@@ -305,42 +305,56 @@ impl Storage {
             .is_some())
     }
 
-    /// Replay a session's text turns in order, so a session can be resumed with
-    /// its prior conversation context intact across restarts.
+    /// Replay a session's turns in order, so a session can be resumed with its
+    /// prior conversation — text *and* tool calls/results — intact across
+    /// restarts.
     ///
-    /// One message per turn: a turn's text parts are concatenated (a turn may
-    /// hold several parts in the shared schema), and turns are ordered by run
-    /// start then sequence, with the run id as a stable tiebreaker.
+    /// Every part of every turn is read and grouped back into messages: a user
+    /// or assistant turn's text parts are concatenated; an assistant turn's
+    /// `tool_call` parts rebuild its requested calls; a `tool` turn's
+    /// `tool_result` parts each become a tool-result message. Turns are ordered
+    /// by run start then sequence (run id as a stable tiebreaker), and a turn's
+    /// parts by creation, so the rebuilt history matches what was recorded.
     pub fn load_history(&self, session_id: &str) -> Result<Vec<ChatMessage>, StorageError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT t.role,
-                    (SELECT group_concat(json_extract(tp.data_json, '$.text'), '')
-                     FROM turn_parts tp
-                     WHERE tp.turn_id = t.id AND tp.type = 'text') AS text
+            "SELECT t.id, t.role, tp.type, tp.data_json
              FROM turns t
              JOIN runs r ON r.id = t.run_id
+             JOIN turn_parts tp ON tp.turn_id = t.id
              WHERE r.session_id = ?1
-               AND EXISTS (
-                   SELECT 1 FROM turn_parts tp2
-                   WHERE tp2.turn_id = t.id AND tp2.type = 'text'
-               )
-             ORDER BY r.started_at, r.id, t.seq",
+             ORDER BY r.started_at, r.id, t.seq, tp.created_at, tp.id",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
-            let role: String = row.get(0)?;
-            let text: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-            Ok((role, text))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
         })?;
 
+        // The ordering keeps every part of a turn contiguous, so accumulate the
+        // parts of the current turn and flush a turn's messages when the next
+        // turn id appears.
         let mut history = Vec::new();
+        let mut current: Option<TurnAccum> = None;
         for row in rows {
-            let (role, text) = row?;
-            let message = match role.as_str() {
-                "assistant" => ChatMessage::assistant(text),
-                _ => ChatMessage::user(text),
+            let (turn_id, role, part_type, data_json) = row?;
+            let mut acc = match current.take() {
+                Some(acc) if acc.turn_id == turn_id => acc,
+                finished => {
+                    if let Some(turn) = finished {
+                        turn.flush(&mut history);
+                    }
+                    TurnAccum::new(turn_id, role)
+                }
             };
-            history.push(message);
+            acc.push_part(&part_type, &data_json);
+            current = Some(acc);
+        }
+        if let Some(acc) = current {
+            acc.flush(&mut history);
         }
         Ok(history)
     }
@@ -407,6 +421,76 @@ struct TurnRecord<'a> {
 struct TurnPart {
     part_type: &'static str,
     data_json: String,
+}
+
+/// Accumulates the parts of one turn while [`Storage::load_history`] streams
+/// them, then flushes the reconstructed [`ChatMessage`]s for that turn.
+struct TurnAccum {
+    turn_id: String,
+    role: String,
+    /// Concatenated `text` parts (a turn may hold several).
+    text: String,
+    /// `tool_call` parts rebuilt into the assistant's requested calls.
+    tool_calls: Vec<ToolCall>,
+    /// `tool_result` parts as `(tool_call_id, content, is_error)`.
+    tool_results: Vec<(String, String, bool)>,
+}
+
+impl TurnAccum {
+    fn new(turn_id: String, role: String) -> Self {
+        Self {
+            turn_id,
+            role,
+            text: String::new(),
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        }
+    }
+
+    /// Fold one part into the turn. Unknown or malformed parts are skipped
+    /// rather than failing the whole resume — a single bad part shouldn't make
+    /// a session unopenable.
+    fn push_part(&mut self, part_type: &str, data_json: &str) {
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(data_json) else {
+            return;
+        };
+        let field = |key: &str| data.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+        match part_type {
+            "text" => self.text.push_str(field("text")),
+            "tool_call" => self.tool_calls.push(ToolCall {
+                id: field("id").to_owned(),
+                name: field("name").to_owned(),
+                arguments: field("arguments").to_owned(),
+            }),
+            "tool_result" => self.tool_results.push((
+                field("tool_call_id").to_owned(),
+                field("content").to_owned(),
+                data.get("is_error")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )),
+            _ => {}
+        }
+    }
+
+    /// Append this turn's reconstructed message(s) to `history`.
+    fn flush(self, history: &mut Vec<ChatMessage>) {
+        match self.role.as_str() {
+            "assistant" if !self.tool_calls.is_empty() => {
+                history.push(ChatMessage::assistant_tool_calls(
+                    self.text,
+                    self.tool_calls,
+                ));
+            }
+            "assistant" => history.push(ChatMessage::assistant(self.text)),
+            "tool" => {
+                for (tool_call_id, content, is_error) in self.tool_results {
+                    history.push(ChatMessage::tool_result(tool_call_id, content, is_error));
+                }
+            }
+            _ => history.push(ChatMessage::user(self.text)),
+        }
+    }
 }
 
 /// A single `text` part wrapping `text`.
