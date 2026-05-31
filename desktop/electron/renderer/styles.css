@@ -574,19 +574,38 @@ h1 {
     0 0 0 4px var(--primary-dim);
 }
 
-/* Mid-run the action button turns into a Stop control. */
-.composer-send.is-stop {
-  border-color: var(--danger);
+/* Shown alongside Send only while a run is in flight, so the user can keep
+   sending (steering) the live run yet still interrupt it. */
+.composer-stop {
+  padding: 11px 22px;
+  border: 1px solid var(--danger);
+  border-radius: 8px;
   background: var(--danger);
+  color: var(--bg);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    box-shadow 150ms ease-out,
+    background 150ms ease-out;
 }
 
-.composer-send.is-stop:hover:not(:disabled) {
+.composer-stop:hover:not(:disabled) {
   background: oklch(0.62 0.18 25);
   box-shadow: 0 0 16px var(--danger-tint);
 }
 
+.composer-stop:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--surface),
+    0 0 0 4px var(--danger);
+}
+
 .composer-input:disabled,
-.composer-send:disabled {
+.composer-send:disabled,
+.composer-stop:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
@@ -601,6 +620,7 @@ h1 {
   .session-item,
   .composer-input,
   .composer-send,
+  .composer-stop,
   .message-time {
     transition: none;
   }
