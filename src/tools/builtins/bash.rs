@@ -32,6 +32,10 @@ impl Tool for BashTool {
          Provide an optional timeout in seconds (default 120)."
     }
 
+    fn prompt_snippet(&self) -> Option<&'static str> {
+        Some("Execute bash commands (ls, grep, find, etc.)")
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

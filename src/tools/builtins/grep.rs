@@ -33,6 +33,10 @@ impl Tool for GrepTool {
          Output is truncated to 100 matches."
     }
 
+    fn prompt_snippet(&self) -> Option<&'static str> {
+        Some("Search file contents for patterns (skips .git and common vendor directories)")
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

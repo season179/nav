@@ -137,6 +137,25 @@ impl Storage {
         text: &str,
         model_id: Option<&str>,
     ) -> Result<(), StorageError> {
+        self.record_assistant_text_with_reasoning(session_id, run_id, seq, text, None, model_id)
+    }
+
+    /// Persist the assistant's reply, preserving provider reasoning/thinking
+    /// content when the active model requires it for replay.
+    pub fn record_assistant_text_with_reasoning(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        seq: i64,
+        text: &str,
+        reasoning_content: Option<&str>,
+        model_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let mut parts = Vec::with_capacity(1 + usize::from(reasoning_content.is_some()));
+        if let Some(reasoning_content) = reasoning_content {
+            parts.push(thinking_part(reasoning_content));
+        }
+        parts.push(text_part(text));
         self.record_turn(TurnRecord {
             session_id,
             run_id,
@@ -144,7 +163,7 @@ impl Storage {
             role: "assistant",
             model_id,
             meta_json: assistant_meta(model_id),
-            parts: vec![text_part(text)],
+            parts,
         })
     }
 
@@ -160,7 +179,36 @@ impl Storage {
         calls: &[ToolCall],
         model_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        let mut parts = Vec::with_capacity(calls.len() + 1);
+        self.record_assistant_tool_calls_with_reasoning(
+            session_id,
+            run_id,
+            seq,
+            (content, None),
+            calls,
+            model_id,
+        )
+    }
+
+    /// Persist an assistant tool-call turn while preserving provider
+    /// reasoning/thinking content for future replay.
+    pub fn record_assistant_tool_calls_with_reasoning(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        seq: i64,
+        content: (Option<&str>, Option<&str>),
+        calls: &[ToolCall],
+        model_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let (content, reasoning_content) = content;
+        let mut parts = Vec::with_capacity(
+            calls.len()
+                + usize::from(content.is_some_and(|text| !text.is_empty()))
+                + usize::from(reasoning_content.is_some()),
+        );
+        if let Some(reasoning_content) = reasoning_content {
+            parts.push(thinking_part(reasoning_content));
+        }
         if let Some(content) = content.filter(|text| !text.is_empty()) {
             parts.push(text_part(content));
         }
@@ -473,6 +521,8 @@ struct TurnAccum {
     role: String,
     /// Concatenated `text` parts (a turn may hold several).
     text: String,
+    /// Provider reasoning/thinking payload from `thinking` parts.
+    reasoning_content: Option<String>,
     /// `tool_call` parts rebuilt into the assistant's requested calls.
     tool_calls: Vec<ToolCall>,
     /// `tool_result` parts as `(tool_call_id, content, is_error)`.
@@ -485,6 +535,7 @@ impl TurnAccum {
             turn_id,
             role,
             text: String::new(),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
         }
@@ -500,6 +551,10 @@ impl TurnAccum {
         let field = |key: &str| data.get(key).and_then(|v| v.as_str()).unwrap_or_default();
         match part_type {
             "text" => self.text.push_str(field("text")),
+            "thinking" => match &mut self.reasoning_content {
+                Some(reasoning_content) => reasoning_content.push_str(field("text")),
+                None => self.reasoning_content = Some(field("text").to_owned()),
+            },
             "tool_call" => self.tool_calls.push(ToolCall {
                 id: field("id").to_owned(),
                 name: field("name").to_owned(),
@@ -520,12 +575,15 @@ impl TurnAccum {
     fn flush(self, history: &mut TurnHistory) {
         match self.role.as_str() {
             "assistant" if !self.tool_calls.is_empty() => {
-                history.push(ChatMessage::assistant_tool_calls(
-                    self.text,
-                    self.tool_calls,
-                ));
+                let mut message = ChatMessage::assistant_tool_calls(self.text, self.tool_calls);
+                message.reasoning_content = self.reasoning_content;
+                history.push(message);
             }
-            "assistant" => history.push(ChatMessage::assistant(self.text)),
+            "assistant" => {
+                let mut message = ChatMessage::assistant(self.text);
+                message.reasoning_content = self.reasoning_content;
+                history.push(message);
+            }
             "tool" => {
                 for (tool_call_id, content, is_error) in self.tool_results {
                     history.push(ChatMessage::tool_result(tool_call_id, content, is_error));
@@ -541,6 +599,20 @@ fn text_part(text: &str) -> TurnPart {
     TurnPart {
         part_type: "text",
         data_json: serde_json::json!({ "type": "text", "text": text }).to_string(),
+    }
+}
+
+/// A provider reasoning/thinking part. The shared schema already mirrors
+/// `thinking.text` into FTS, and nav uses it to replay DeepSeek-style messages.
+fn thinking_part(text: &str) -> TurnPart {
+    TurnPart {
+        part_type: "thinking",
+        data_json: serde_json::json!({
+            "type": "thinking",
+            "text": text,
+            "provider_hint": "reasoning_content",
+        })
+        .to_string(),
     }
 }
 

@@ -6,7 +6,7 @@
 //! [`Storage`] attached, each session, run, and turn is also persisted, and a
 //! prior session can be reopened with [`SessionStore::resume_session`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop};
+use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
 use crate::storage::{SessionSummary, Storage};
@@ -78,11 +78,22 @@ struct Session {
     turns: TurnHistory,
     events: Vec<Event>,
     subscribers: Vec<Sender<Event>>,
-    /// The in-flight run's id and its cancel flag, set while a run is executing
-    /// so [`SessionStore::stop_run`] can interrupt it. `None` when idle.
-    active_run: Option<(String, CancelFlag)>,
+    /// The in-flight run, set while a run is executing. `None` when idle.
+    active_run: Option<ActiveRun>,
     /// Latest model-call context usage for this session.
     token_usage: Option<u64>,
+}
+
+/// The run currently executing in a session.
+struct ActiveRun {
+    /// The run's id, so [`SessionStore::clear_active_run`] only forgets its own.
+    id: String,
+    /// Cooperative stop signal read by the agent loop; set by [`SessionStore::stop_run`].
+    cancel: CancelFlag,
+    /// Messages sent while this run is in flight, awaiting fold-in by the loop
+    /// at its next model call (mid-run steering). Drained by the run, never by
+    /// the sender, so a message either joins this run or starts a fresh one.
+    steer: VecDeque<String>,
 }
 
 impl Session {
@@ -106,6 +117,18 @@ impl Session {
         self.subscribers
             .retain(|subscriber| subscriber.send(event.clone()).is_ok());
     }
+
+    /// Forget the active run, but only if it is still the one identified by
+    /// `run_id`, so a later run started for the same session is left untouched.
+    fn clear_run(&mut self, run_id: &str) {
+        if self
+            .active_run
+            .as_ref()
+            .is_some_and(|active| active.id == run_id)
+        {
+            self.active_run = None;
+        }
+    }
 }
 
 /// Why a chat command could not be applied.
@@ -113,10 +136,6 @@ impl Session {
 pub enum SendError {
     /// No session exists with the given id.
     UnknownSession,
-    /// The session already has a run in flight. Only one run per session is
-    /// allowed, so its single cancel flag can always stop the right one and its
-    /// events stay ordered.
-    RunInProgress,
 }
 
 /// A live feed of one session's events: the backlog already emitted before
@@ -255,14 +274,14 @@ impl SessionStore {
             Ok(true) => {}
             Ok(false) => return false,
             Err(error) => {
-                eprintln!("nav: failed to check session {session_id}: {error}");
+                tracing::error!(%session_id, %error, "failed to check session");
                 return false;
             }
         }
         let history = match storage.load_history(session_id) {
             Ok(history) => history,
             Err(error) => {
-                eprintln!("nav: failed to load history for {session_id}: {error}");
+                tracing::error!(%session_id, %error, "failed to load history");
                 return false;
             }
         };
@@ -279,7 +298,7 @@ impl SessionStore {
                     event.role = Some(Role::User.as_str().to_owned());
                     event.text = Some(message.content.clone());
                 }),
-                // An assistant turn that requested tools: replay its reasoning
+                // An assistant turn that requested tools: replay its visible
                 // text (if any) and open a tool line per call, exactly as live.
                 Role::Assistant if !message.tool_calls.is_empty() => {
                     let content = message.content.clone();
@@ -345,7 +364,7 @@ impl SessionStore {
         match storage.list_sessions(SESSION_SOURCE) {
             Ok(sessions) => sessions,
             Err(error) => {
-                eprintln!("nav: failed to list sessions: {error}");
+                tracing::error!(%error, "failed to list sessions");
                 Vec::new()
             }
         }
@@ -358,7 +377,7 @@ impl SessionStore {
         match storage.most_recent_session(SESSION_SOURCE) {
             Ok(id) => id,
             Err(error) => {
-                eprintln!("nav: failed to look up latest session: {error}");
+                tracing::error!(%error, "failed to look up latest session");
                 None
             }
         }
@@ -381,17 +400,28 @@ impl SessionStore {
         // Seq 0 is the user turn; every later turn (assistant tool-calls, each
         // tool result, the final assistant text) takes the next number.
         let mut seq: i64 = 0;
-        // Refuse to start a second run while one is already in flight: a session
-        // tracks a single cancel flag, so overlapping runs would leave the older
-        // one un-stoppable and interleave the two runs' events.
-        let started = self.with_session(session_id, |session| {
-            if session.active_run.is_some() {
-                return false;
+        // Only one run executes per session at a time. A message sent while a
+        // run is in flight is queued onto that run's steer buffer instead of
+        // starting a second run: the running loop folds it into the live turn at
+        // its next model call (mid-run steering). The queued message records no
+        // event here — that happens when the loop drains it, keeping its turn,
+        // event, and persisted sequence in one place. Queuing and the loop's
+        // drain-or-finish decision both run under the store lock, so a message
+        // either joins this run or (if it lands after the run finalizes) starts
+        // a fresh one — it is never lost.
+        let queued_onto = self.with_session(session_id, |session| {
+            if let Some(active) = session.active_run.as_mut() {
+                active.steer.push_back(text.to_owned());
+                return Some(active.id.clone());
             }
             session.turns.push(ChatMessage::user(text));
-            // Register the run so `stop_run` can find its cancel flag while it
-            // executes; cleared on every exit path below.
-            session.active_run = Some((run_id.clone(), Arc::clone(&cancel)));
+            // Register the run so `stop_run` can find its cancel flag and senders
+            // can queue steering while it executes; cleared on every exit below.
+            session.active_run = Some(ActiveRun {
+                id: run_id.clone(),
+                cancel: Arc::clone(&cancel),
+                steer: VecDeque::new(),
+            });
             session.emit("user.message", |event| {
                 event.role = Some(Role::User.as_str().to_owned());
                 event.text = Some(text.to_owned());
@@ -399,10 +429,11 @@ impl SessionStore {
             session.emit("run.started", |event| {
                 event.run_id = Some(run_id.clone());
             });
-            true
+            None
         })?;
-        if !started {
-            return Err(SendError::RunInProgress);
+        if let Some(active_run_id) = queued_onto {
+            // Folded into the in-flight run; nothing more to do on this thread.
+            return Ok(active_run_id);
         }
 
         // Persist the run and the user turn before the model call so a crash
@@ -428,19 +459,27 @@ impl SessionStore {
             seq,
         };
         let outcome = self.agent.run_turn(context, &cancel, &mut sink);
-        // The run is over (or stopped); release its cancel flag before reporting.
-        self.clear_active_run(session_id, &run_id);
         match outcome {
+            // A completed run already finalized itself inside the loop
+            // (`next_input_or_finish` cleared the run and emitted `run.completed`
+            // once no steering remained), so there is nothing to clean up here.
             Ok(RunStop::Completed) => Ok(run_id),
+            // The other exits stop short of finalizing: release the run (dropping
+            // any still-queued steering) and emit the right terminal event.
             Ok(RunStop::Cancelled) => {
+                self.clear_active_run(session_id, &run_id);
                 self.cancel_run(session_id, &run_id)?;
                 Ok(run_id)
             }
             Err(AgentRunError::Model(error)) => {
+                self.clear_active_run(session_id, &run_id);
                 self.fail_run(session_id, &run_id, &error.message)?;
                 Ok(run_id)
             }
-            Err(AgentRunError::Sink(error)) => Err(error),
+            Err(AgentRunError::Sink(error)) => {
+                self.clear_active_run(session_id, &run_id);
+                Err(error)
+            }
         }
     }
 
@@ -450,8 +489,8 @@ impl SessionStore {
     /// a `run.cancelled` event shortly after.
     pub fn stop_run(&self, session_id: &str) -> bool {
         self.with_session(session_id, |session| {
-            if let Some((_, cancel)) = &session.active_run {
-                cancel.store(true, Ordering::Relaxed);
+            if let Some(active) = &session.active_run {
+                active.cancel.store(true, Ordering::Relaxed);
                 true
             } else {
                 false
@@ -463,15 +502,7 @@ impl SessionStore {
     /// Forget the active run, but only if it is still the one identified by
     /// `run_id`, so a later run started for the same session is left untouched.
     fn clear_active_run(&self, session_id: &str, run_id: &str) {
-        let _ = self.with_session(session_id, |session| {
-            if session
-                .active_run
-                .as_ref()
-                .is_some_and(|(id, _)| id == run_id)
-            {
-                session.active_run = None;
-            }
-        });
+        let _ = self.with_session(session_id, |session| session.clear_run(run_id));
     }
 
     /// Emit a `run.cancelled` event and record the stop. Mirrors [`Self::fail_run`]
@@ -557,10 +588,19 @@ struct SessionRunSink<'a> {
 impl AgentRunSink for SessionRunSink<'_> {
     type Error = SendError;
 
-    fn assistant_text(&mut self, content: &str) -> Result<(), Self::Error> {
+    fn assistant_text(
+        &mut self,
+        content: &str,
+        reasoning_content: Option<&str>,
+    ) -> Result<(), Self::Error> {
+        // Record the reply only. Whether this reply ends the run or it continues
+        // with steering that arrived mid-run is decided by the agent loop's
+        // following `next_input_or_finish` call, which also emits `run.completed`.
         let message_id = new_id();
         self.store.with_session(self.session_id, |session| {
-            session.turns.push(ChatMessage::assistant(content));
+            let mut message = ChatMessage::assistant(content);
+            message.reasoning_content = reasoning_content.map(str::to_owned);
+            session.turns.push(message);
             session.emit("message.completed", |event| {
                 event.role = Some(Role::Assistant.as_str().to_owned());
                 event.text = Some(content.to_owned());
@@ -568,41 +608,72 @@ impl AgentRunSink for SessionRunSink<'_> {
                 event.run_id = Some(self.run_id.to_owned());
             });
         })?;
-        // Clear the run before emitting `run.completed` so a subscriber can
-        // immediately send a follow-up when it sees the terminal event.
-        self.store.clear_active_run(self.session_id, self.run_id);
-        self.store.with_session(self.session_id, |session| {
-            session.emit("run.completed", |event| {
-                event.run_id = Some(self.run_id.to_owned());
-                event.status = Some("completed".to_owned());
-            });
-        })?;
         if let Some(storage) = &self.store.storage {
             log_storage(
                 "record_assistant_text",
-                storage.record_assistant_text(
+                storage.record_assistant_text_with_reasoning(
                     self.session_id,
                     self.run_id,
                     self.seq,
                     content,
+                    reasoning_content,
                     self.store.model_id.as_deref(),
                 ),
             );
-            log_storage("complete_run", storage.complete_run(self.run_id));
         }
         self.seq += 1;
         Ok(())
     }
 
+    fn take_steer(&mut self) -> Result<Vec<String>, Self::Error> {
+        let run_id = self.run_id;
+        let texts = self.store.with_session(self.session_id, |session| {
+            drain_steer_locked(session, run_id)
+        })?;
+        self.persist_user_texts(&texts);
+        Ok(texts)
+    }
+
+    fn next_input_or_finish(&mut self) -> Result<TurnContinuation, Self::Error> {
+        let run_id = self.run_id;
+        // Drain-or-finish must be atomic with a sender queuing steering, so the
+        // whole decision runs in one critical section: if anything is queued we
+        // fold it in and continue; otherwise we clear the run and emit its
+        // terminal event. Clearing before `run.completed` keeps the existing
+        // contract that a subscriber may start a fresh run the instant it sees
+        // the terminal event.
+        let texts = self.store.with_session(self.session_id, |session| {
+            let texts = drain_steer_locked(session, run_id);
+            if texts.is_empty() {
+                session.clear_run(run_id);
+                session.emit("run.completed", |event| {
+                    event.run_id = Some(run_id.to_owned());
+                    event.status = Some("completed".to_owned());
+                });
+            }
+            texts
+        })?;
+        if texts.is_empty() {
+            if let Some(storage) = &self.store.storage {
+                log_storage("complete_run", storage.complete_run(self.run_id));
+            }
+            Ok(TurnContinuation::Done)
+        } else {
+            self.persist_user_texts(&texts);
+            Ok(TurnContinuation::Continue(texts))
+        }
+    }
+
     fn assistant_tool_calls(
         &mut self,
         content: &str,
+        reasoning_content: Option<&str>,
         calls: &[ToolCall],
     ) -> Result<(), Self::Error> {
         self.store.with_session(self.session_id, |session| {
-            session
-                .turns
-                .push(ChatMessage::assistant_tool_calls(content, calls.to_vec()));
+            let mut message = ChatMessage::assistant_tool_calls(content, calls.to_vec());
+            message.reasoning_content = reasoning_content.map(str::to_owned);
+            session.turns.push(message);
             session.emit("assistant.tool_calls", |event| {
                 event.role = Some(Role::Assistant.as_str().to_owned());
                 event.run_id = Some(self.run_id.to_owned());
@@ -615,11 +686,11 @@ impl AgentRunSink for SessionRunSink<'_> {
             let text = (!content.is_empty()).then_some(content);
             log_storage(
                 "record_assistant_tool_calls",
-                storage.record_assistant_tool_calls(
+                storage.record_assistant_tool_calls_with_reasoning(
                     self.session_id,
                     self.run_id,
                     self.seq,
-                    text,
+                    (text, reasoning_content),
                     calls,
                     self.store.model_id.as_deref(),
                 ),
@@ -697,6 +768,44 @@ impl AgentRunSink for SessionRunSink<'_> {
     }
 }
 
+impl SessionRunSink<'_> {
+    /// Persist steered user Turns drained from the run, advancing the run's
+    /// sequence so each lands after the turns already recorded. Their history
+    /// and events were written under the lock in [`drain_steer_locked`]; this is
+    /// the out-of-lock durable write that mirrors the initial user turn.
+    fn persist_user_texts(&mut self, texts: &[String]) {
+        for text in texts {
+            if let Some(storage) = &self.store.storage {
+                log_storage(
+                    "record_user_text",
+                    storage.record_user_text(self.session_id, self.run_id, self.seq, text),
+                );
+            }
+            self.seq += 1;
+        }
+    }
+}
+
+/// Within the store lock, move any steering queued on the active run into the
+/// Turn History as user Turns and emit each `user.message`, returning their
+/// texts so the caller can fold them into the live Model Context and persist
+/// them. A no-op (empty result) when nothing is queued or no run is active.
+fn drain_steer_locked(session: &mut Session, run_id: &str) -> Vec<String> {
+    let texts: Vec<String> = match session.active_run.as_mut() {
+        Some(active) => active.steer.drain(..).collect(),
+        None => Vec::new(),
+    };
+    for text in &texts {
+        session.turns.push(ChatMessage::user(text));
+        session.emit("user.message", |event| {
+            event.role = Some(Role::User.as_str().to_owned());
+            event.text = Some(text.clone());
+            event.run_id = Some(run_id.to_owned());
+        });
+    }
+    texts
+}
+
 fn new_id() -> String {
     Uuid::now_v7().to_string()
 }
@@ -705,6 +814,6 @@ fn new_id() -> String {
 /// stays usable; the operator sees which write was dropped.
 fn log_storage(operation: &str, result: Result<(), crate::storage::StorageError>) {
     if let Err(error) = result {
-        eprintln!("nav: failed to persist {operation}: {error}");
+        tracing::error!(%operation, %error, "failed to persist");
     }
 }

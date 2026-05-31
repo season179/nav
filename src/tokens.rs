@@ -85,11 +85,8 @@ impl TokenUsage {
     }
 
     pub fn context_used(&self) -> u64 {
-        self.total.unwrap_or_else(|| {
-            self.input
-                .saturating_add(self.output)
-                .saturating_add(self.reasoning)
-        })
+        self.total
+            .unwrap_or_else(|| self.input.saturating_add(self.output))
     }
 }
 
@@ -189,8 +186,9 @@ pub fn counter_from_compat(
     match HfTokenizerCounter::from_file(tokenizer_id, path) {
         Ok(counter) => Arc::new(counter),
         Err(error) => {
-            eprintln!(
-                "nav: failed to load tokenizer; falling back to heuristic token counts: {error}"
+            tracing::error!(
+                %error,
+                "failed to load tokenizer; falling back to heuristic token counts"
             );
             Arc::new(HeuristicTokenCounter)
         }
@@ -208,6 +206,18 @@ pub fn estimate_model_context(
     let mut confidence = TokenCountConfidence::High;
     let mut tokenizer_id: Option<String> = None;
 
+    // The system prompt rides ahead of the conversation as a leading message.
+    if let Some(system_prompt) = context.system_prompt() {
+        let role = counter.count_text("system");
+        let content = counter.count_text(system_prompt);
+        collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &role);
+        collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &content);
+        total = total
+            .saturating_add(role.tokens)
+            .saturating_add(content.tokens)
+            .saturating_add(4);
+    }
+
     for message in context.messages() {
         let role = counter.count_text(message.role.as_str());
         let content = counter.count_text(&message.content);
@@ -217,6 +227,12 @@ pub fn estimate_model_context(
             .saturating_add(role.tokens)
             .saturating_add(content.tokens)
             .saturating_add(4);
+
+        if let Some(reasoning_content) = &message.reasoning_content {
+            let reasoning = counter.count_text(reasoning_content);
+            collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &reasoning);
+            total = total.saturating_add(reasoning.tokens).saturating_add(2);
+        }
 
         if let Role::Tool = message.role {
             let call_id = counter.count_text(message.tool_call_id.as_deref().unwrap_or_default());
@@ -262,6 +278,7 @@ pub fn estimate_model_context(
 /// usage.
 pub fn estimate_assistant_output(
     content: Option<&str>,
+    reasoning_content: Option<&str>,
     calls: &[ToolCall],
     counter: &dyn TextTokenCounter,
 ) -> TokenEstimate {
@@ -272,6 +289,12 @@ pub fn estimate_assistant_output(
 
     if let Some(content) = content {
         let estimate = counter.count_text(content);
+        collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &estimate);
+        total = total.saturating_add(estimate.tokens);
+    }
+
+    if let Some(reasoning_content) = reasoning_content {
+        let estimate = counter.count_text(reasoning_content);
         collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &estimate);
         total = total.saturating_add(estimate.tokens);
     }

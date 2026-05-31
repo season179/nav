@@ -25,6 +25,10 @@ impl Tool for FindTool {
          vendor directories. Output is truncated to 1000 results."
     }
 
+    fn prompt_snippet(&self) -> Option<&'static str> {
+        Some("Find files by glob pattern (skips .git and common vendor directories)")
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

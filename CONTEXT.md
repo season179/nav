@@ -14,8 +14,15 @@ A resumable conversation with ordered messages and renderable events.
 _Avoid_: Chat, thread
 
 **Run**:
-One execution of the agent in response to a user message.
+One execution of the agent in response to a user message. A Run may fold in
+further user messages sent while it is in flight (steering), and completes only
+when the model has no more work and no steering is queued.
 _Avoid_: Request, job
+
+**Steering**:
+A user message sent while a Run is in flight, folded into that Run at its next
+model call instead of starting a new Run.
+_Avoid_: Interrupt, queue
 
 **Turn**:
 One persisted message-shaped entry in a session history.
@@ -60,7 +67,8 @@ _Avoid_: Output, response
 - A **Run** starts from one **Model Context** assembled from **Turn History**.
 - A **Run** can record **Token Usage** from provider telemetry or local estimates.
 - A **Token Estimate** is derived before a model call from **Model Context**.
-- A **Run** starts from one user **Turn** and produces assistant **Turns**.
+- A **Run** starts from one user **Turn**, may fold in further user **Turns**
+  sent while it runs (**Steering**), and produces assistant **Turns**.
 - A **Run** is executed by one or more **Agents**.
 - An **Agent** has access to many **Tools**.
 - An **Agent** may execute many **Tool Calls** during one **Run**.

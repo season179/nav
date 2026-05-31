@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 use crate::context::ModelContext;
 use crate::model::{ChatMessage, ChatModel, ModelError, ToolCall};
+use crate::system_prompt::{self, BuildSystemPromptOptions};
 use crate::tools::{CancelFlag, Registry};
 
 /// Runs one coding-agent turn with a configured model, toolset, and workspace.
@@ -40,6 +41,28 @@ impl Agent {
         self
     }
 
+    /// Build the system prompt for this run from the toolset, workspace, and any
+    /// project context files. Rebuilt per run so the date and project context
+    /// stay current.
+    fn system_prompt(&self) -> String {
+        let tool_snippets = self.registry.prompt_snippets();
+        let prompt_guidelines = self.registry.prompt_guidelines();
+        let selected_tools = self.registry.tool_names();
+        let context_files = system_prompt::load_project_context_files(
+            &self.workspace,
+            system_prompt::nav_agent_dir().as_deref(),
+        );
+        let date = system_prompt::current_date();
+        system_prompt::build_system_prompt(&BuildSystemPromptOptions {
+            selected_tools: &selected_tools,
+            tool_snippets: &tool_snippets,
+            prompt_guidelines: &prompt_guidelines,
+            cwd: &self.workspace,
+            context_files: &context_files,
+            date: &date,
+        })
+    }
+
     /// Run the model/tool loop from the assembled context for one Run.
     ///
     /// The sink is notified as each visible step happens, before long-running
@@ -62,6 +85,8 @@ impl Agent {
         S: AgentRunSink,
     {
         let tool_defs = self.registry.defs();
+        // Attach the system prompt once; it leads every model call this run.
+        context = context.with_system_prompt(self.system_prompt());
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -86,16 +111,35 @@ impl Agent {
                 return Ok(RunStop::Cancelled);
             }
 
+            let reasoning_content = response.reasoning_content.clone();
+
             if response.tool_calls.is_empty() {
                 let reply = response.content.unwrap_or_default();
-                sink.assistant_text(&reply).map_err(AgentRunError::Sink)?;
-                return Ok(RunStop::Completed);
+                sink.assistant_text(&reply, reasoning_content.as_deref())
+                    .map_err(AgentRunError::Sink)?;
+                let mut assistant_turn = ChatMessage::assistant(&reply);
+                assistant_turn.reasoning_content = reasoning_content.clone();
+                context.push(assistant_turn);
+                // The reply ends the run unless a message arrived while it was
+                // produced, in which case the run continues with that message
+                // folded into the context (mid-run steering).
+                match sink.next_input_or_finish().map_err(AgentRunError::Sink)? {
+                    TurnContinuation::Continue(messages) => {
+                        for message in messages {
+                            context.push(ChatMessage::user(&message));
+                        }
+                        continue;
+                    }
+                    TurnContinuation::Done => return Ok(RunStop::Completed),
+                }
             }
 
             let content = response.content.unwrap_or_default();
             let calls = response.tool_calls;
-            context.push(ChatMessage::assistant_tool_calls(&content, calls.clone()));
-            sink.assistant_tool_calls(&content, &calls)
+            let mut assistant_turn = ChatMessage::assistant_tool_calls(&content, calls.clone());
+            assistant_turn.reasoning_content = reasoning_content.clone();
+            context.push(assistant_turn);
+            sink.assistant_tool_calls(&content, reasoning_content.as_deref(), &calls)
                 .map_err(AgentRunError::Sink)?;
 
             for call in &calls {
@@ -133,6 +177,16 @@ impl Agent {
                 sink.tool_result(call, &result.content, result.is_error)
                     .map_err(AgentRunError::Sink)?;
             }
+
+            // Fold any message sent while this tool batch ran into the context so
+            // the next model call sees it. A stop takes precedence: a cancelled
+            // run drops its still-queued steering rather than acting on it.
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(RunStop::Cancelled);
+            }
+            for message in sink.take_steer().map_err(AgentRunError::Sink)? {
+                context.push(ChatMessage::user(&message));
+            }
         }
     }
 }
@@ -145,15 +199,30 @@ pub(crate) enum RunStop {
     Cancelled,
 }
 
+/// What a finished model reply means for the run: end it, or keep going because
+/// a message arrived mid-run and should be folded into the next model call.
+pub(crate) enum TurnContinuation {
+    /// Steering arrived during the run; fold these user messages into the live
+    /// context and continue the same run.
+    Continue(Vec<String>),
+    /// No steering queued; the run has been finalized.
+    Done,
+}
+
 /// Adapter notified by the agent loop as visible run steps happen.
 pub(crate) trait AgentRunSink {
     type Error;
 
-    fn assistant_text(&mut self, content: &str) -> Result<(), Self::Error>;
+    fn assistant_text(
+        &mut self,
+        content: &str,
+        reasoning_content: Option<&str>,
+    ) -> Result<(), Self::Error>;
 
     fn assistant_tool_calls(
         &mut self,
         content: &str,
+        reasoning_content: Option<&str>,
         calls: &[ToolCall],
     ) -> Result<(), Self::Error>;
 
@@ -165,6 +234,16 @@ pub(crate) trait AgentRunSink {
         output: &str,
         is_error: bool,
     ) -> Result<(), Self::Error>;
+
+    /// Drain any messages sent while the run has been executing, recording each
+    /// as a user turn, and return their texts so the loop can fold them into the
+    /// live context. Returns an empty vec when nothing is queued.
+    fn take_steer(&mut self) -> Result<Vec<String>, Self::Error>;
+
+    /// Called once the model returns a plain reply: fold in any queued steering
+    /// and continue, or finalize the run when nothing is queued. The decision is
+    /// made atomically with respect to a sender queuing more input.
+    fn next_input_or_finish(&mut self) -> Result<TurnContinuation, Self::Error>;
 
     fn token_usage(&mut self, _usage: &crate::tokens::TokenUsage) -> Result<(), Self::Error> {
         Ok(())

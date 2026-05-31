@@ -24,6 +24,10 @@ impl Tool for LsTool {
          truncated to 500 entries."
     }
 
+    fn prompt_snippet(&self) -> Option<&'static str> {
+        Some("List directory contents")
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

@@ -6,13 +6,13 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nav::{
-    ChatMessage, ChatModel, Event, FinishReason, ModelContext, ModelError, ModelResponse,
+    ChatMessage, ChatModel, Event, FinishReason, ModelContext, ModelError, ModelResponse, Role,
     SessionStore, Storage, ToolCall, ToolDef,
 };
 
@@ -72,6 +72,7 @@ impl ChatModel for ScriptedModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: Some("I should inspect the workspace.".to_owned()),
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_owned(),
                     name: "ls".to_owned(),
@@ -102,6 +103,7 @@ impl ChatModel for SleepThenTextModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_owned(),
                     name: "bash".to_owned(),
@@ -133,6 +135,7 @@ impl ChatModel for SleepThenWriteModel {
         if nth == 0 {
             Ok(ModelResponse {
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![
                     ToolCall {
                         id: "call-bash".to_owned(),
@@ -155,6 +158,111 @@ impl ChatModel for SleepThenWriteModel {
         } else {
             Ok(ModelResponse::text("should not reach a second turn"))
         }
+    }
+}
+
+/// One scripted reply for [`GatedModel`].
+#[derive(Clone)]
+enum GatedReply {
+    /// Request a single tool call.
+    Tool {
+        id: String,
+        name: String,
+        args: String,
+    },
+    /// Reply with plain text, ending the turn.
+    Text(String),
+    /// Reply with plain text plus provider reasoning.
+    TextWithReasoning { text: String, reasoning: String },
+}
+
+/// A model the test steps one call at a time. Each `respond` records the context
+/// it saw, announces that it has entered the call, then blocks until the test
+/// releases that call — letting the test queue steering at a precise point and
+/// assert what the next model call sees. Replies come from a fixed script.
+struct GatedModel {
+    script: Vec<GatedReply>,
+    calls: AtomicUsize,
+    histories: Mutex<Vec<Vec<ChatMessage>>>,
+    gate: Mutex<Gate>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct Gate {
+    /// How many calls have entered `respond` (1-based high-water mark).
+    entered: usize,
+    /// How many calls the test has allowed to return (1-based high-water mark).
+    released: usize,
+}
+
+impl GatedModel {
+    fn new(script: Vec<GatedReply>) -> Self {
+        Self {
+            script,
+            calls: AtomicUsize::new(0),
+            histories: Mutex::new(Vec::new()),
+            gate: Mutex::new(Gate::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Block until the model has entered at least its `n`th call (1-based).
+    fn wait_entered(&self, n: usize) {
+        let mut gate = self.gate.lock().unwrap();
+        while gate.entered < n {
+            gate = self.cv.wait(gate).unwrap();
+        }
+    }
+
+    /// Allow the model to return from its first `n` calls (1-based).
+    fn release(&self, n: usize) {
+        let mut gate = self.gate.lock().unwrap();
+        gate.released = gate.released.max(n);
+        self.cv.notify_all();
+    }
+}
+
+impl ChatModel for GatedModel {
+    fn respond(
+        &self,
+        context: &ModelContext,
+        _tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
+        self.histories
+            .lock()
+            .unwrap()
+            .push(context.messages().to_vec());
+        let nth = self.calls.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut gate = self.gate.lock().unwrap();
+            gate.entered = gate.entered.max(nth + 1);
+            self.cv.notify_all();
+            while gate.released < nth + 1 {
+                gate = self.cv.wait(gate).unwrap();
+            }
+        }
+        Ok(match self.script[nth].clone() {
+            GatedReply::Tool { id, name, args } => ModelResponse {
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                token_usage: None,
+            },
+            GatedReply::Text(text) => ModelResponse::text(text),
+            GatedReply::TextWithReasoning { text, reasoning } => ModelResponse {
+                content: Some(text),
+                reasoning_content: Some(reasoning),
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                token_usage: None,
+            },
+        })
     }
 }
 
@@ -339,6 +447,15 @@ fn a_tool_run_persists_its_result_and_replays_on_resume() {
         .expect("count tool_result parts");
     assert_eq!(tool_results, 1);
 
+    let thinking_parts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM turn_parts WHERE type = 'thinking'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count thinking parts");
+    assert_eq!(thinking_parts, 1);
+
     let tool_turns: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM turns WHERE role = 'tool'",
@@ -388,4 +505,186 @@ fn a_tool_run_persists_its_result_and_replays_on_resume() {
         completed.text
     );
     assert_eq!(events[5].text.as_deref(), Some("done"));
+}
+
+#[test]
+fn a_message_sent_during_a_tool_batch_is_folded_into_the_same_run() {
+    let workspace = TempDir::new("agent_ws");
+    let model = Arc::new(GatedModel::new(vec![
+        GatedReply::Tool {
+            id: "call-1".to_owned(),
+            name: "ls".to_owned(),
+            args: "{}".to_owned(),
+        },
+        GatedReply::Text("done".to_owned()),
+    ]));
+    let store = Arc::new(SessionStore::new(model.clone()).with_workspace(workspace.path.clone()));
+    let session_id = store.create_session();
+
+    let runner = {
+        let store = Arc::clone(&store);
+        let session_id = session_id.clone();
+        thread::spawn(move || store.send_message(&session_id, "list files").unwrap())
+    };
+
+    // While the first model call (the tool request) is parked, queue a steer
+    // message. It stays pending while `ls` runs and is folded in after the batch.
+    model.wait_entered(1);
+    store.send_message(&session_id, "also say hi").unwrap();
+    model.release(1);
+
+    // The second model call must see the steered message in its context.
+    model.wait_entered(2);
+    model.release(2);
+    runner.join().expect("run thread");
+
+    let histories = model.histories.lock().unwrap();
+    let second_context = &histories[1];
+    assert!(
+        second_context
+            .iter()
+            .any(|message| message.role == Role::User && message.content == "also say hi"),
+        "the steered message should be folded into the same run's context: {second_context:?}",
+    );
+
+    // It stayed one run: a single start, a single terminal event at the end.
+    let events = store.events(&session_id).unwrap();
+    let kinds = kinds(&events);
+    assert_eq!(
+        kinds.iter().filter(|kind| **kind == "run.started").count(),
+        1,
+        "steering must not start a second run: {kinds:?}",
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == "run.completed")
+            .count(),
+        1,
+        "the run completes exactly once: {kinds:?}",
+    );
+    assert_eq!(kinds.last().copied(), Some("run.completed"));
+    // Both the original and the steered message were echoed as user turns.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "user.message")
+            .count(),
+        2,
+    );
+}
+
+#[test]
+fn a_message_sent_as_the_reply_lands_continues_the_run() {
+    let workspace = TempDir::new("agent_ws");
+    // Two plain replies: the run would end after the first, but a steer message
+    // queued before it finalizes keeps the same run going for a second reply.
+    let model = Arc::new(GatedModel::new(vec![
+        GatedReply::TextWithReasoning {
+            text: "first reply".to_owned(),
+            reasoning: "first reply reasoning".to_owned(),
+        },
+        GatedReply::Text("second reply".to_owned()),
+    ]));
+    let store = Arc::new(SessionStore::new(model.clone()).with_workspace(workspace.path.clone()));
+    let session_id = store.create_session();
+
+    let runner = {
+        let store = Arc::clone(&store);
+        let session_id = session_id.clone();
+        thread::spawn(move || store.send_message(&session_id, "first").unwrap())
+    };
+
+    // Queue steering while the first reply is still parked in the model, so it is
+    // pending when the loop decides whether to finish — driving the Continue path.
+    model.wait_entered(1);
+    store.send_message(&session_id, "keep going").unwrap();
+    model.release(1);
+
+    model.wait_entered(2);
+    model.release(2);
+    runner.join().expect("run thread");
+
+    let histories = model.histories.lock().unwrap();
+    let second_context = &histories[1];
+    assert!(
+        second_context
+            .iter()
+            .any(|message| message.role == Role::User && message.content == "keep going"),
+        "the steered message should continue the same run: {second_context:?}",
+    );
+    assert!(
+        second_context.iter().any(|message| {
+            message.role == Role::Assistant
+                && message.content == "first reply"
+                && message.reasoning_content.as_deref() == Some("first reply reasoning")
+        }),
+        "the assistant reply that triggered steering should remain in context: {second_context:?}",
+    );
+
+    let events = store.events(&session_id).unwrap();
+    let kinds = kinds(&events);
+    // The first reply did not finalize the run; exactly one terminal event fires.
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == "run.completed")
+            .count(),
+        1,
+        "the first reply must not complete the run while steering is queued: {kinds:?}",
+    );
+    assert_eq!(kinds.last().copied(), Some("run.completed"));
+    // Order: first reply, then the steered user turn, then the second reply.
+    let user_after_first_reply = events.iter().position(|event| {
+        event.kind == "user.message" && event.text.as_deref() == Some("keep going")
+    });
+    let first_reply = events
+        .iter()
+        .position(|event| event.kind == "message.completed");
+    assert!(
+        matches!((first_reply, user_after_first_reply), (Some(reply), Some(steer)) if steer > reply),
+        "the steered turn is recorded after the reply that triggered it: {kinds:?}",
+    );
+}
+
+#[test]
+fn stopping_a_run_drops_a_message_queued_during_it() {
+    let workspace = TempDir::new("agent_ws");
+    let model = Arc::new(SleepThenTextModel {
+        calls: AtomicUsize::new(0),
+    });
+    let store = Arc::new(SessionStore::new(model.clone()).with_workspace(workspace.path.clone()));
+    let session_id = store.create_session();
+
+    let runner = {
+        let store = Arc::clone(&store);
+        let session_id = session_id.clone();
+        thread::spawn(move || {
+            store
+                .send_message(&session_id, "run a long command")
+                .unwrap()
+        })
+    };
+
+    // Queue a steer message while the long tool runs, then stop the run before it
+    // can be folded in.
+    wait_for_event(&store, &session_id, "tool.started");
+    store
+        .send_message(&session_id, "never mind, also do this")
+        .unwrap();
+    assert!(
+        store.stop_run(&session_id),
+        "a run should be active to stop"
+    );
+
+    runner.join().expect("run thread");
+
+    let events = store.events(&session_id).unwrap();
+    assert_eq!(kinds(&events).last().copied(), Some("run.cancelled"));
+    // The queued message was dropped with the run: it never became a user turn.
+    assert!(
+        !events.iter().any(|event| event.kind == "user.message"
+            && event.text.as_deref() == Some("never mind, also do this")),
+        "a message queued onto a cancelled run must not be folded in",
+    );
 }

@@ -2,18 +2,23 @@ const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("node:path");
 const { subscribeToSessionEvents, sendRpc } = require("./backend-client.cjs");
 const { startLocalBackend } = require("./backend-process.cjs");
+const { createStartupTrace } = require("./startup-trace.cjs");
 const { createWindowOptions } = require("./window-options.cjs");
 
 const PROJECT_ROOT = path.resolve(__dirname, "../..");
 const smokeMode = process.argv.includes("--smoke");
+const trace = createStartupTrace();
+trace.mark("electron.main.loaded", { smoke: smokeMode });
 
 let backendProcess = null;
 let eventSubscription = null;
 let backendUrl = null;
 let sessionId = null;
 let mainWindow = null;
+let firstSessionEventSeen = false;
 
 app.whenReady().then(async () => {
+  trace.mark("electron.app.ready");
   mainWindow = createMainWindow();
   await startChatSession(mainWindow);
 });
@@ -90,14 +95,37 @@ ipcMain.handle("nav:new-session", async () => {
 });
 
 function createMainWindow() {
+  trace.mark("electron.window.create.start");
   const window = new BrowserWindow(
     createWindowOptions({ preloadPath: path.join(__dirname, "preload.cjs") }),
   );
-  window.loadFile(path.join(__dirname, "renderer", "index.html"));
+  trace.mark("electron.window.create.end");
+  window.webContents.once("dom-ready", () => {
+    trace.mark("electron.renderer.dom_ready");
+  });
+  window.webContents.once("did-finish-load", () => {
+    trace.mark("electron.renderer.did_finish_load");
+  });
+  window.webContents.once("did-fail-load", (_event, code, description) => {
+    trace.mark("electron.renderer.did_fail_load", {
+      error_code: code,
+      error: description,
+    });
+  });
+  trace.mark("electron.window.load_file.start");
+  window
+    .loadFile(path.join(__dirname, "renderer", "index.html"))
+    .then(() => {
+      trace.mark("electron.window.load_file.end");
+    })
+    .catch((error) => {
+      trace.mark("electron.window.load_file.failed", { error: error.message });
+    });
   return window;
 }
 
 async function startChatSession(window) {
+  trace.mark("electron.chat.start");
   sendStatus(window, { state: "starting-backend" });
 
   try {
@@ -105,20 +133,24 @@ async function startChatSession(window) {
     // inherits the user's environment (NAV_API_KEY, etc.).
     const backend = await startLocalBackend({
       projectRoot: PROJECT_ROOT,
-      env: smokeMode ? { NAV_MOCK_MODEL: "1" } : {},
+      env: trace.childEnv(smokeMode ? { NAV_MOCK_MODEL: "1" } : {}),
+      trace,
     });
     backendProcess = backend.child;
     backendUrl = backend.url;
+    trace.mark("electron.backend.ready", { pid: backendProcess.pid });
 
-    activateSession(window, await openSession());
+    activateSession(window, await openSession(), { startup: true });
 
     if (smokeMode) {
       await runSmokeTurn();
     }
   } catch (error) {
+    trace.mark("electron.startup.failed", { error: error.message });
     sendStatus(window, { state: "backend-error", message: error.message });
     if (smokeMode) {
       console.error(error);
+      printStartupSummary();
       app.exit(1);
     }
   }
@@ -127,49 +159,74 @@ async function startChatSession(window) {
 // Make `id` the active conversation: point the event stream at it (replacing any
 // prior subscription) and tell the renderer it's connected. The session's
 // backlog replays over the stream, so switching redraws the transcript.
-function activateSession(window, id) {
+function activateSession(window, id, { startup = false } = {}) {
   sessionId = id;
   eventSubscription?.close();
+  markStartup(startup, "electron.sse.subscribe.start", { session_id: id });
   eventSubscription = subscribeToSessionEvents({
     backendUrl,
     sessionId: id,
+    onOpen({ statusCode } = {}) {
+      markStartup(startup, "electron.sse.open", {
+        session_id: id,
+        status_code: statusCode,
+      });
+      if (statusCode !== 200) {
+        return;
+      }
+      // Smoke mode drives the turn from Main and quits on `run.completed`;
+      // telling the renderer it is connected can start sidebar/model refreshes
+      // that race the intentional shutdown.
+      if (!smokeMode) {
+        sendStatus(window, { state: "connected", backendUrl, sessionId: id });
+      }
+      markStartup(startup, "electron.connected", { session_id: id });
+    },
     onEvent(event) {
+      if (startup) {
+        markFirstStartupEvent(id, event);
+      }
       forwardEvent(window, event);
     },
     onError(error) {
+      markStartup(startup, "electron.sse.error", { error: error.message });
       sendStatus(window, { state: "stream-error", message: error.message });
       if (smokeMode) {
         console.error(error);
+        printStartupSummary();
         app.exit(1);
       }
     },
   });
-  sendStatus(window, { state: "connected", backendUrl, sessionId: id });
 }
 
 // Reopen the most recent conversation so sessions persist across launches.
 // Smoke mode always starts fresh to stay deterministic.
 async function openSession() {
+  trace.mark("electron.session.open.start");
   if (!smokeMode) {
-    const latest = await sendRpc({ backendUrl, method: "session.latest" });
+    const latest = await tracedRpc("session.latest");
     if (latest.result?.sessionId) {
       // If resumption fails (pruned session, corrupt DB, schema mismatch), fall
       // back to a fresh session rather than leaving the app stuck on launch.
       try {
-        const resumed = await sendRpc({
-          backendUrl,
-          method: "session.resume",
-          params: { sessionId: latest.result.sessionId },
+        const resumed = await tracedRpc("session.resume", {
+          sessionId: latest.result.sessionId,
         });
+        trace.mark("electron.session.open.end", { mode: "resumed" });
         return resumed.result.sessionId;
       } catch (error) {
+        trace.mark("electron.session.resume.fallback", {
+          error: error.message,
+        });
         console.error(
           `failed to resume session ${latest.result.sessionId}, starting fresh: ${error.message}`,
         );
       }
     }
   }
-  const created = await sendRpc({ backendUrl, method: "session.create" });
+  const created = await tracedRpc("session.create");
+  trace.mark("electron.session.open.end", { mode: "created" });
   return created.result.sessionId;
 }
 
@@ -178,21 +235,28 @@ function forwardEvent(window, event) {
     window.webContents.send("nav:session-event", event);
   }
   if (smokeMode && event.type === "run.completed") {
+    trace.mark("electron.smoke.run_completed");
     console.log("nav electron smoke received run.completed");
+    printStartupSummary();
     app.quit();
   }
   if (smokeMode && event.type === "run.failed") {
+    trace.mark("electron.smoke.run_failed", {
+      error: event.error ?? "run failed",
+    });
     console.error(`nav electron smoke run failed: ${event.error}`);
+    printStartupSummary();
     app.exit(1);
   }
 }
 
 async function runSmokeTurn() {
-  await sendRpc({
-    backendUrl,
-    method: "session.sendMessage",
-    params: { sessionId, text: "smoke test message" },
+  trace.mark("electron.smoke.turn.start");
+  await tracedRpc("session.sendMessage", {
+    sessionId,
+    text: "smoke test message",
   });
+  trace.mark("electron.smoke.turn.accepted");
 }
 
 function sendStatus(window, status) {
@@ -206,4 +270,40 @@ function stopBackend() {
   eventSubscription = null;
   backendProcess?.kill();
   backendProcess = null;
+}
+
+async function tracedRpc(method, params) {
+  trace.mark(`electron.rpc.${method}.start`);
+  try {
+    const response = await sendRpc({ backendUrl, method, params });
+    trace.mark(`electron.rpc.${method}.end`);
+    return response;
+  } catch (error) {
+    trace.mark(`electron.rpc.${method}.failed`, { error: error.message });
+    throw error;
+  }
+}
+
+function printStartupSummary() {
+  const summary = trace.summaryLine();
+  if (summary) {
+    console.log(summary);
+  }
+}
+
+function markStartup(startup, event, fields) {
+  if (startup) {
+    trace.mark(event, fields);
+  }
+}
+
+function markFirstStartupEvent(id, event) {
+  if (firstSessionEventSeen) {
+    return;
+  }
+  firstSessionEventSeen = true;
+  trace.mark("electron.sse.first_event", {
+    session_id: id,
+    event_type: event.type,
+  });
 }

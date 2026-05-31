@@ -149,8 +149,8 @@ fn load_history_reconstructs_tool_calls_and_results_for_resume() {
     storage.create_session(session_id, "nav").unwrap();
     storage.start_run("run", session_id).unwrap();
 
-    // User asks; assistant requests two tools (with some reasoning text); each
-    // tool result is recorded — one succeeds, one fails; assistant then replies.
+    // User asks; assistant requests two tools and carries provider thinking;
+    // each tool result is recorded — one succeeds, one fails; assistant replies.
     storage
         .record_user_text(session_id, "run", 0, "do the thing")
         .unwrap();
@@ -167,7 +167,14 @@ fn load_history_reconstructs_tool_calls_and_results_for_resume() {
         },
     ];
     storage
-        .record_assistant_tool_calls(session_id, "run", 1, Some("on it"), &calls, Some("m"))
+        .record_assistant_tool_calls_with_reasoning(
+            session_id,
+            "run",
+            1,
+            (Some("on it"), Some("I should inspect the workspace.")),
+            &calls,
+            Some("m"),
+        )
         .unwrap();
     storage
         .record_tool_result(session_id, "run", 2, "call-a", "a.txt\nb.txt", false)
@@ -185,7 +192,11 @@ fn load_history_reconstructs_tool_calls_and_results_for_resume() {
         history.as_turns(),
         vec![
             ChatMessage::user("do the thing"),
-            ChatMessage::assistant_tool_calls("on it", calls),
+            ChatMessage::assistant_tool_calls_with_reasoning(
+                "on it",
+                calls,
+                "I should inspect the workspace.",
+            ),
             ChatMessage::tool_result("call-a", "a.txt\nb.txt", false),
             ChatMessage::tool_result("call-b", "no such file", true),
             ChatMessage::assistant("all done"),
