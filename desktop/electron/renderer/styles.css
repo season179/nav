@@ -518,9 +518,11 @@ h1 {
   background: var(--bg);
 }
 
-/* Input + Send share one row; the model indicator sits below them. */
+/* Input + Send share one row; the model indicator sits below them. Send stays
+   bottom-aligned as the textarea grows with multi-line input. */
 .composer-row {
   display: flex;
+  align-items: flex-end;
   gap: 12px;
 }
 
@@ -548,6 +550,10 @@ h1 {
   font-family: inherit;
   font-size: 14px;
   line-height: 1.4;
+  /* Grows with content (height set in JS); caps out before scrolling. */
+  resize: none;
+  overflow-y: auto;
+  max-height: 200px;
   transition:
     border-color 150ms ease-out,
     box-shadow 150ms ease-out;

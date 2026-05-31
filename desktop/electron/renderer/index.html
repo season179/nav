@@ -32,20 +32,16 @@
 
         <form class="composer" id="composer">
           <div class="composer-row">
-            <input
-              type="text"
+            <textarea
               id="composer-input"
               class="composer-input"
+              aria-label="Message"
               placeholder="Send a message…"
               autocomplete="off"
+              rows="1"
               disabled
-            />
-            <button
-              type="submit"
-              id="composer-send"
-              class="composer-send"
-              disabled
-            >
+            ></textarea>
+            <button type="submit" id="composer-send" class="composer-send" disabled>
               Send
             </button>
           </div>

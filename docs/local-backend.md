@@ -1,9 +1,10 @@
 # Local HTTP/SSE Backend
 
-This is the smallest runnable backend surface for the nav chat slice: an
-in-memory, multi-turn chat loop backed by one text model. It owns sessions,
-message history, the model call, and the session event stream. It has no tools,
-no file or shell access, no approvals, and no durable persistence.
+This is the smallest runnable backend surface for the nav chat slice: a
+multi-turn coding-agent loop backed by one text model. It owns sessions, message
+history, the model call, tool execution, durable session storage, and the
+session event stream. It has no approval flow yet, so the backend must stay
+bound to loopback.
 
 ## Start
 
@@ -100,6 +101,10 @@ The event types are:
 - `session.created`
 - `user.message`
 - `run.started`
+- `assistant.tool_calls`
+- `tool.started`
+- `tool.completed`
+- `tool.failed`
 - `message.completed`
 - `run.completed`
 - `run.failed`
