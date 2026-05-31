@@ -1,5 +1,3 @@
-const statusNode = document.querySelector("#backend-status");
-const sessionNode = document.querySelector("#session-id");
 const messageListNode = document.querySelector("#message-list");
 const sessionListNode = document.querySelector("#session-list");
 const newChatButton = document.querySelector("#new-chat");
@@ -72,7 +70,12 @@ function handleSessionEvent(event) {
       upsertToolLine(event.tool_call_id, "done", event.tool_name, event.text);
       break;
     case "tool.failed":
-      upsertToolLine(event.tool_call_id, "failed", event.tool_name, event.error);
+      upsertToolLine(
+        event.tool_call_id,
+        "failed",
+        event.tool_name,
+        event.error,
+      );
       break;
     case "message.completed":
       appendMessage("assistant", event.text);
@@ -207,7 +210,9 @@ function appendMessage(role, text) {
 // line is reused as it moves from running → done/failed, keyed by its id, so a
 // tool shows as one evolving line rather than two separate bubbles.
 function upsertToolLine(toolCallId, state, toolName, detail) {
-  const selector = toolCallId ? `[data-tool-call-id="${CSS.escape(toolCallId)}"]` : null;
+  const selector = toolCallId
+    ? `[data-tool-call-id="${CSS.escape(toolCallId)}"]`
+    : null;
   let item = selector ? messageListNode.querySelector(selector) : null;
   if (item) {
     item.replaceChildren();
@@ -270,25 +275,21 @@ function setRunning(isRunning) {
   }
 }
 
+// With the topbar gone there is nowhere to show ambient state, so only failures
+// are surfaced — as transcript errors — while healthy states stay silent.
 function renderBackendStatus(status) {
-  statusNode.textContent = formatStatus(status);
-  statusNode.dataset.state = status.state;
-  if (status.sessionId) {
-    sessionNode.textContent = `Session ${status.sessionId}`;
-  }
-}
-
-function formatStatus(status) {
   switch (status.state) {
     case "starting-backend":
-      return "Starting backend";
     case "connected":
-      return "Connected";
+      break;
     case "stream-error":
-      return `Stream error: ${status.message}`;
+      appendMessage("error", `Stream error: ${status.message}`);
+      break;
     case "backend-error":
-      return `Backend error: ${status.message}`;
+      appendMessage("error", `Backend error: ${status.message}`);
+      break;
     default:
-      return status.message ?? status.state;
+      appendMessage("error", status.message ?? status.state);
+      break;
   }
 }

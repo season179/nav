@@ -9,7 +9,9 @@ const {
   subscribeToSessionEvents,
   sendRpc,
 } = require("../desktop/electron/backend-client.cjs");
-const { startLocalBackend } = require("../desktop/electron/backend-process.cjs");
+const {
+  startLocalBackend,
+} = require("../desktop/electron/backend-process.cjs");
 
 test("Electron backend client runs a multi-turn chat over RPC + SSE", async () => {
   const backend = await startMockBackend();

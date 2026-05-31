@@ -2,7 +2,13 @@ const http = require("node:http");
 const https = require("node:https");
 const { randomUUID } = require("node:crypto");
 
-function subscribeToSessionEvents({ backendUrl, sessionId, signal, onEvent, onError }) {
+function subscribeToSessionEvents({
+  backendUrl,
+  sessionId,
+  signal,
+  onEvent,
+  onError,
+}) {
   const eventsUrl = new URL(`/sessions/${sessionId}/events`, backendUrl);
   const transport = eventsUrl.protocol === "https:" ? https : http;
   let buffer = "";
@@ -100,7 +106,11 @@ function sendRpc({ backendUrl, method, params }) {
           try {
             parsed = JSON.parse(payload);
           } catch (error) {
-            reject(new Error(`RPC ${method} returned invalid JSON: ${error.message}`));
+            reject(
+              new Error(
+                `RPC ${method} returned invalid JSON: ${error.message}`,
+              ),
+            );
             return;
           }
           if (parsed.error) {
@@ -119,9 +129,7 @@ function sendRpc({ backendUrl, method, params }) {
 }
 
 function parseSseFrame(frame) {
-  const dataLine = frame
-    .split(/\n/)
-    .find((line) => line.startsWith("data: "));
+  const dataLine = frame.split(/\n/).find((line) => line.startsWith("data: "));
   if (!dataLine) {
     return null;
   }

@@ -3,7 +3,9 @@ const { test } = require("node:test");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { createWindowOptions } = require("../desktop/electron/window-options.cjs");
+const {
+  createWindowOptions,
+} = require("../desktop/electron/window-options.cjs");
 
 test("Electron window keeps the renderer isolated from Node and Electron internals", () => {
   const options = createWindowOptions({ preloadPath: "/tmp/nav-preload.cjs" });
@@ -20,7 +22,13 @@ test("Electron window keeps the renderer isolated from Node and Electron interna
 // exposure so `window.nav` never appears and the chat composer stays disabled.
 // (See the inlined validation in preload.cjs.)
 test("sandboxed preload has no relative require() that would break window.nav", () => {
-  const preloadPath = path.join(__dirname, "..", "desktop", "electron", "preload.cjs");
+  const preloadPath = path.join(
+    __dirname,
+    "..",
+    "desktop",
+    "electron",
+    "preload.cjs",
+  );
   const source = fs.readFileSync(preloadPath, "utf8");
   // Strip line comments so the explanatory note in preload.cjs isn't matched.
   const code = source.replace(/\/\/.*$/gm, "");
