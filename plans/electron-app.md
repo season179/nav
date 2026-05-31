@@ -43,7 +43,7 @@ backend and protocol are settled.
 
 ## Transport Decision
 
-Prefer the existing `nav` protocol first:
+Decision: Electron will use the existing `nav` local HTTP/SSE protocol first.
 
 ```text
 commands: POST /rpc
