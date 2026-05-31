@@ -7,33 +7,49 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <header class="topbar">
-        <div>
-          <h1>nav</h1>
-          <p id="session-id">Waiting for backend</p>
+    <div class="app">
+      <aside class="sidebar" aria-label="Sidebar">
+        <div class="sidebar-header">
+          <h1 class="sidebar-brand">nav</h1>
+          <button type="button" id="new-chat" class="new-chat" disabled>
+            + New chat
+          </button>
         </div>
-        <div class="status" id="backend-status">Starting</div>
-      </header>
 
-      <section class="chat" aria-label="Chat transcript">
-        <ol class="message-list" id="message-list"></ol>
-      </section>
+        <nav class="sidebar-section" aria-label="Sessions">
+          <h2 class="sidebar-section-title">Sessions</h2>
+          <ul class="session-list" id="session-list"></ul>
+        </nav>
 
-      <form class="composer" id="composer">
-        <input
-          type="text"
-          id="composer-input"
-          class="composer-input"
-          placeholder="Send a message…"
-          autocomplete="off"
-          disabled
-        />
-        <button type="submit" id="composer-send" class="composer-send" disabled>
-          Send
-        </button>
-      </form>
-    </main>
+        <!-- Future sidebar sections (Settings, Plugins, Automations) mount here. -->
+        <div class="sidebar-footer"></div>
+      </aside>
+
+      <main class="shell">
+        <header class="topbar">
+          <p id="session-id">Waiting for backend</p>
+          <div class="status" id="backend-status">Starting</div>
+        </header>
+
+        <section class="chat" aria-label="Chat transcript">
+          <ol class="message-list" id="message-list"></ol>
+        </section>
+
+        <form class="composer" id="composer">
+          <input
+            type="text"
+            id="composer-input"
+            class="composer-input"
+            placeholder="Send a message…"
+            autocomplete="off"
+            disabled
+          />
+          <button type="submit" id="composer-send" class="composer-send" disabled>
+            Send
+          </button>
+        </form>
+      </main>
+    </div>
     <script src="./renderer.js"></script>
   </body>
 </html>

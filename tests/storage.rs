@@ -163,6 +163,62 @@ fn a_failed_run_records_the_error() {
 }
 
 #[test]
+fn list_sessions_orders_by_recency_and_titles_from_first_user_message() {
+    let path = temp_db();
+    let _cleanup = TempDb(path.clone());
+    let storage = Storage::open(&path).expect("open database");
+
+    storage.create_session("old", "nav").unwrap();
+    storage.start_run("r-old", "old").unwrap();
+    storage
+        .record_user_text("old", "r-old", 0, "first question about cats")
+        .unwrap();
+    storage
+        .record_assistant_text("old", "r-old", 1, "an answer", Some("m"))
+        .unwrap();
+    storage.complete_run("r-old").unwrap();
+
+    storage.create_session("new", "nav").unwrap();
+    storage.start_run("r-new", "new").unwrap();
+    storage
+        .record_user_text("new", "r-new", 0, "newest question")
+        .unwrap();
+    storage.complete_run("r-new").unwrap();
+
+    // A session with no turns yet — lists with no title.
+    storage.create_session("empty", "nav").unwrap();
+
+    // Pin distinct recency so ordering is deterministic regardless of clock
+    // granularity.
+    {
+        let conn = Connection::open(&path).expect("reopen to set updated_at");
+        conn.execute("UPDATE sessions SET updated_at = 100 WHERE id = 'old'", [])
+            .unwrap();
+        conn.execute("UPDATE sessions SET updated_at = 300 WHERE id = 'new'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE sessions SET updated_at = 200 WHERE id = 'empty'",
+            [],
+        )
+        .unwrap();
+    }
+
+    let sessions = storage.list_sessions("nav").unwrap();
+    let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["new", "empty", "old"], "most recently updated first");
+
+    let title = |id: &str| {
+        sessions
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.title.clone())
+    };
+    assert_eq!(title("old").as_deref(), Some("first question about cats"));
+    assert_eq!(title("new").as_deref(), Some("newest question"));
+    assert_eq!(title("empty"), None, "an untouched session has no title");
+}
+
+#[test]
 fn opening_a_foreign_non_nav_database_is_refused() {
     let path = temp_db();
     let _cleanup = TempDb(path.clone());

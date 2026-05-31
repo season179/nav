@@ -17,9 +17,122 @@ body {
   background: #f7f4ee;
 }
 
+.app {
+  display: grid;
+  grid-template-columns: 248px 1fr;
+  height: 100vh;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid #d8d1c6;
+  background: #f1ece2;
+}
+
+.sidebar-header {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 16px 14px;
+}
+
+.sidebar-brand {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.new-chat {
+  padding: 9px 12px;
+  border: 1px solid #c9c1b5;
+  border-radius: 8px;
+  background: #fffdf8;
+  color: #1f2328;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.new-chat:hover:not(:disabled) {
+  border-color: #2f5f76;
+  color: #2f5f76;
+}
+
+.new-chat:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.sidebar-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.sidebar-section-title {
+  margin: 0;
+  padding: 8px 16px;
+  color: #8a8175;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.session-list {
+  margin: 0;
+  padding: 0 8px 8px;
+  list-style: none;
+  overflow-y: auto;
+}
+
+.session-item {
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #453d35;
+  font-size: 13px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-item:hover {
+  background: #e7e0d4;
+}
+
+.session-item[aria-current="true"] {
+  border-color: #9bb7d4;
+  background: #eaf2f9;
+  color: #1f2328;
+  font-weight: 600;
+}
+
+.sidebar-empty {
+  padding: 4px 16px;
+  color: #8a8175;
+  font-size: 12px;
+}
+
+.sidebar-footer {
+  border-top: 1px solid #d8d1c6;
+}
+
 .shell {
   display: grid;
   grid-template-rows: auto 1fr auto;
+  min-width: 0;
   height: 100vh;
 }
 

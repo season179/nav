@@ -161,6 +161,21 @@ fn create_session_returns_a_session_id() {
 }
 
 #[test]
+fn listing_sessions_without_storage_returns_an_empty_array() {
+    let backend = TestBackend::start();
+
+    let response = backend.rpc(r#"{"jsonrpc":"2.0","id":"list","method":"session.list"}"#);
+
+    let sessions = response["result"]["sessions"]
+        .as_array()
+        .expect("session.list returns a sessions array");
+    assert!(
+        sessions.is_empty(),
+        "an in-memory backend has no persisted sessions: {response}"
+    );
+}
+
+#[test]
 fn sending_to_an_unknown_session_is_rejected() {
     let backend = TestBackend::start();
 

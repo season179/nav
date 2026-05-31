@@ -47,6 +47,15 @@ pub struct Storage {
     conn: Mutex<Connection>,
 }
 
+/// A session as shown in the sidebar listing: its id, a short title drawn from
+/// the first user message, and when it was last active.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub updated_at: i64,
+}
+
 impl Storage {
     /// Open (creating and migrating when empty) the session database at `path`.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
@@ -162,6 +171,44 @@ impl Storage {
         Ok(())
     }
 
+    /// All sessions from `source`, most-recently-updated first, for listing in
+    /// the sidebar. `title` is the session's first user message (callers
+    /// truncate and supply a fallback for empty sessions).
+    pub fn list_sessions(&self, source: &str) -> Result<Vec<SessionSummary>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        // The title reads from the derived `turn_parts_text` table (kept in sync
+        // by triggers) rather than scanning `turn_parts` and json_extract-ing
+        // each row: its `idx_turn_parts_text_turn_id` index turns the per-session
+        // lookup into an indexed join. `turn_parts_text` already drops empty
+        // parts, so the first non-empty user text wins.
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.updated_at,
+                    (SELECT tpt.text
+                     FROM turn_parts_text tpt
+                     JOIN turns t ON t.id = tpt.turn_id
+                     JOIN runs r ON r.id = t.run_id
+                     WHERE r.session_id = s.id AND t.role = 'user' AND tpt.part_type = 'text'
+                     ORDER BY r.started_at, t.seq, tpt.part_id
+                     LIMIT 1) AS title
+             FROM sessions s
+             WHERE s.source = ?1
+             ORDER BY s.updated_at DESC, s.created_at DESC, s.id DESC",
+        )?;
+        let rows = stmt.query_map(params![source], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                updated_at: row.get(1)?,
+                title: row.get::<_, Option<String>>(2)?,
+            })
+        })?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row?);
+        }
+        Ok(sessions)
+    }
+
     /// The id of the most recently active session from `source`, if any. Used
     /// to reopen the last conversation when the app restarts.
     pub fn most_recent_session(&self, source: &str) -> Result<Option<String>, StorageError> {
@@ -169,7 +216,7 @@ impl Storage {
         Ok(conn
             .query_row(
                 "SELECT id FROM sessions WHERE source = ?1
-                 ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+                 ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
                 params![source],
                 |row| row.get::<_, String>(0),
             )

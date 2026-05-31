@@ -16,6 +16,17 @@ function normalizeMessageText(value) {
   return text;
 }
 
+function normalizeSessionId(value) {
+  if (typeof value !== "string") {
+    throw new TypeError("session id must be a string");
+  }
+  const id = value.trim();
+  if (id.length === 0) {
+    throw new Error("session id must not be empty");
+  }
+  return id;
+}
+
 contextBridge.exposeInMainWorld("nav", {
   onBackendStatus(callback) {
     return subscribe("nav:backend-status", callback);
@@ -27,6 +38,18 @@ contextBridge.exposeInMainWorld("nav", {
   // ever hand Main a clean string — never an arbitrary IPC payload.
   sessionSendMessage(text) {
     return ipcRenderer.invoke("nav:send-message", normalizeMessageText(text));
+  },
+  // List persisted sessions for the sidebar.
+  listSessions() {
+    return ipcRenderer.invoke("nav:list-sessions");
+  },
+  // Switch the active conversation to an existing session.
+  switchSession(sessionId) {
+    return ipcRenderer.invoke("nav:switch-session", normalizeSessionId(sessionId));
+  },
+  // Start a fresh conversation and make it active.
+  newSession() {
+    return ipcRenderer.invoke("nav:new-session");
   },
 });
 
