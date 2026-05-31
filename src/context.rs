@@ -36,15 +36,32 @@ impl TurnHistory {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelContext {
     messages: Vec<ChatMessage>,
+    /// System prompt the agent built for this run, sent ahead of the
+    /// conversation. `None` until the agent attaches one.
+    system_prompt: Option<String>,
 }
 
 impl ModelContext {
     pub fn from_messages(messages: Vec<ChatMessage>) -> Self {
-        Self { messages }
+        Self {
+            messages,
+            system_prompt: None,
+        }
+    }
+
+    /// Attach the system prompt to send ahead of the conversation.
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(system_prompt.into());
+        self
     }
 
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    /// The system prompt to send ahead of the conversation, if set.
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
     }
 
     pub(crate) fn push(&mut self, message: ChatMessage) {

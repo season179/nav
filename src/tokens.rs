@@ -200,6 +200,18 @@ pub fn estimate_model_context(
     let mut confidence = TokenCountConfidence::High;
     let mut tokenizer_id: Option<String> = None;
 
+    // The system prompt rides ahead of the conversation as a leading message.
+    if let Some(system_prompt) = context.system_prompt() {
+        let role = counter.count_text("system");
+        let content = counter.count_text(system_prompt);
+        collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &role);
+        collect_estimate(&mut source, &mut confidence, &mut tokenizer_id, &content);
+        total = total
+            .saturating_add(role.tokens)
+            .saturating_add(content.tokens)
+            .saturating_add(4);
+    }
+
     for message in context.messages() {
         let role = counter.count_text(message.role.as_str());
         let content = counter.count_text(&message.content);

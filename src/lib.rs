@@ -26,6 +26,7 @@ mod context;
 mod model;
 mod session;
 mod storage;
+mod system_prompt;
 mod tokens;
 mod tools;
 
@@ -37,6 +38,9 @@ pub use model::{
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
 pub use storage::{SessionSummary, Storage, StorageError};
+pub use system_prompt::{
+    BuildSystemPromptOptions, ContextFile, build_system_prompt, load_project_context_files,
+};
 pub use tokens::{
     HeuristicTokenCounter, HfTokenizerCounter, TextTokenCounter, TokenCountConfidence,
     TokenCountSource, TokenEstimate, TokenUsage,

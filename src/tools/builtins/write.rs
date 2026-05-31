@@ -21,6 +21,14 @@ impl Tool for WriteTool {
          files or complete rewrites; use edit for targeted changes."
     }
 
+    fn prompt_snippet(&self) -> Option<&'static str> {
+        Some("Create or overwrite files")
+    }
+
+    fn prompt_guidelines(&self) -> &'static [&'static str] {
+        &["Use write only for new files or complete rewrites."]
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

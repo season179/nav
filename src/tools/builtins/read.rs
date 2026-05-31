@@ -22,6 +22,14 @@ impl Tool for ReadTool {
          continue with offset until complete."
     }
 
+    fn prompt_snippet(&self) -> Option<&'static str> {
+        Some("Read file contents")
+    }
+
+    fn prompt_guidelines(&self) -> &'static [&'static str] {
+        &["Use read to examine files instead of cat or sed."]
+    }
+
     fn parameters(&self) -> Value {
         json!({
             "type": "object",

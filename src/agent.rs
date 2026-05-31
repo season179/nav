@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 use crate::context::ModelContext;
 use crate::model::{ChatMessage, ChatModel, ModelError, ToolCall};
+use crate::system_prompt::{self, BuildSystemPromptOptions};
 use crate::tools::{CancelFlag, Registry};
 
 /// Runs one coding-agent turn with a configured model, toolset, and workspace.
@@ -40,6 +41,28 @@ impl Agent {
         self
     }
 
+    /// Build the system prompt for this run from the toolset, workspace, and any
+    /// project context files. Rebuilt per run so the date and project context
+    /// stay current.
+    fn system_prompt(&self) -> String {
+        let tool_snippets = self.registry.prompt_snippets();
+        let prompt_guidelines = self.registry.prompt_guidelines();
+        let selected_tools = self.registry.tool_names();
+        let context_files = system_prompt::load_project_context_files(
+            &self.workspace,
+            system_prompt::nav_agent_dir().as_deref(),
+        );
+        let date = system_prompt::current_date();
+        system_prompt::build_system_prompt(&BuildSystemPromptOptions {
+            selected_tools: &selected_tools,
+            tool_snippets: &tool_snippets,
+            prompt_guidelines: &prompt_guidelines,
+            cwd: &self.workspace,
+            context_files: &context_files,
+            date: &date,
+        })
+    }
+
     /// Run the model/tool loop from the assembled context for one Run.
     ///
     /// The sink is notified as each visible step happens, before long-running
@@ -62,6 +85,8 @@ impl Agent {
         S: AgentRunSink,
     {
         let tool_defs = self.registry.defs();
+        // Attach the system prompt once; it leads every model call this run.
+        context = context.with_system_prompt(self.system_prompt());
 
         loop {
             if cancel.load(Ordering::Relaxed) {
