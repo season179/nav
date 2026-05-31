@@ -90,30 +90,6 @@ body {
   padding: 20px 16px 16px;
 }
 
-.sidebar-brand {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 700;
-  line-height: 1.2;
-  letter-spacing: 0.02em;
-  color: var(--primary);
-  text-shadow: 0 0 16px var(--glow);
-}
-
-/* Blinking terminal caret after the brand. */
-.sidebar-brand::after {
-  content: "▊";
-  margin-left: 2px;
-  color: var(--primary);
-  animation: caret-blink 1.1s steps(1) infinite;
-}
-
-@keyframes caret-blink {
-  50% {
-    opacity: 0;
-  }
-}
-
 .new-chat {
   padding: 9px 12px;
   border: 1px solid var(--primary-dim);
@@ -616,7 +592,6 @@ h1 {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .sidebar-brand::after,
   .message,
   .message-tool-running .message-role {
     animation: none;
