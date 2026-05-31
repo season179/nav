@@ -30,6 +30,16 @@ The model-visible view assembled for one Run from Turn History and, later,
 other context sources.
 _Avoid_: History, prompt
 
+**Token Usage**:
+The provider-reported or locally estimated token counts observed for model calls.
+Used for operational visibility and context management, not billing.
+_Avoid_: Cost, charge
+
+**Token Estimate**:
+A pre-call count produced from Model Context with an explicit source and
+confidence, used as the future foundation for budget checks.
+_Avoid_: Exact count, quota
+
 **Tool**:
 A model-visible capability with a schema and executor that may act against the
 local workspace.
@@ -48,6 +58,8 @@ _Avoid_: Output, response
 - A **Session** contains many **Runs**.
 - A **Session** owns one **Turn History**.
 - A **Run** starts from one **Model Context** assembled from **Turn History**.
+- A **Run** can record **Token Usage** from provider telemetry or local estimates.
+- A **Token Estimate** is derived before a model call from **Model Context**.
 - A **Run** starts from one user **Turn** and produces assistant **Turns**.
 - A **Run** is executed by one or more **Agents**.
 - An **Agent** has access to many **Tools**.

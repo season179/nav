@@ -54,6 +54,13 @@ back: the backend stays up and reports the specific reason on the first
 Only the resolved API key — never logged, never sent to the renderer, and
 redacted in debug output — is used as the provider `Authorization` header.
 
+Token counts are operational estimates for future context management, not
+billing data. When an OpenAI-compatible response includes `usage`, nav records
+that. Otherwise it estimates locally. A model `compat` block may opt into a
+Hugging Face tokenizer with either `tokenizerPath` or
+`tokenizer: { "path": "...", "id": "..." }`; when no tokenizer is configured or
+loadable, nav uses a conservative heuristic.
+
 ## Command Channel: `POST /rpc`
 
 JSON-RPC 2.0 over HTTP. Two methods back the chat loop.

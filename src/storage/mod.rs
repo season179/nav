@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::context::TurnHistory;
 use crate::model::{ChatMessage, ToolCall};
+use crate::tokens::TokenUsage;
 
 /// Canonical schema, captured verbatim from the live database.
 const SCHEMA: &str = include_str!("schema.sql");
@@ -247,6 +248,37 @@ impl Storage {
         conn.execute(
             "UPDATE runs SET status = 'cancelled', finished_at = ?2 WHERE id = ?1",
             params![run_id, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Add observed or estimated token counts to the session aggregate.
+    ///
+    /// The shared schema stores these on `sessions` rather than per run. nav
+    /// records them as operational telemetry for future context management, not
+    /// as billing data.
+    pub fn record_token_usage(
+        &self,
+        session_id: &str,
+        usage: &TokenUsage,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions
+             SET tokens_input = tokens_input + ?2,
+                 tokens_output = tokens_output + ?3,
+                 tokens_reasoning = tokens_reasoning + ?4,
+                 tokens_cache_read = tokens_cache_read + ?5,
+                 tokens_cache_write = tokens_cache_write + ?6
+             WHERE id = ?1",
+            params![
+                session_id,
+                sqlite_i64(usage.input),
+                sqlite_i64(usage.output),
+                sqlite_i64(usage.reasoning),
+                sqlite_i64(usage.cache_read),
+                sqlite_i64(usage.cache_write),
+            ],
         )?;
         Ok(())
     }
@@ -567,4 +599,8 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn sqlite_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }

@@ -68,10 +68,16 @@ impl Agent {
                 return Ok(RunStop::Cancelled);
             }
 
+            let input_estimate = self.model.estimate_context_tokens(&context, &tool_defs);
             let response = self
                 .model
                 .respond(&context, &tool_defs)
                 .map_err(AgentRunError::Model)?;
+            let usage = response.token_usage.clone().unwrap_or_else(|| {
+                let output_estimate = self.model.estimate_output_tokens(&response);
+                crate::tokens::TokenUsage::estimated(input_estimate, output_estimate)
+            });
+            sink.token_usage(&usage).map_err(AgentRunError::Sink)?;
 
             // A stop requested during the (blocking) model call takes effect now,
             // before the reply is emitted, so a cancelled run produces no final
@@ -159,6 +165,10 @@ pub(crate) trait AgentRunSink {
         output: &str,
         is_error: bool,
     ) -> Result<(), Self::Error>;
+
+    fn token_usage(&mut self, _usage: &crate::tokens::TokenUsage) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 /// Why an agent run stopped before producing a completed assistant response.

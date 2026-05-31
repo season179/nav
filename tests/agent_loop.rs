@@ -78,6 +78,7 @@ impl ChatModel for ScriptedModel {
                     arguments: "{}".to_owned(),
                 }],
                 finish_reason: nav::FinishReason::ToolCalls,
+                token_usage: None,
             })
         } else {
             Ok(ModelResponse::text("done"))
@@ -107,6 +108,7 @@ impl ChatModel for SleepThenTextModel {
                     arguments: r#"{"command":"sleep 30"}"#.to_owned(),
                 }],
                 finish_reason: FinishReason::ToolCalls,
+                token_usage: None,
             })
         } else {
             Ok(ModelResponse::text("should not reach a second turn"))
@@ -148,6 +150,7 @@ impl ChatModel for SleepThenWriteModel {
                     },
                 ],
                 finish_reason: FinishReason::ToolCalls,
+                token_usage: None,
             })
         } else {
             Ok(ModelResponse::text("should not reach a second turn"))

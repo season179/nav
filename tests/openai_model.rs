@@ -66,6 +66,8 @@ fn model(base_url: String) -> OpenAiModel {
         model: "test-model".to_owned(),
         base_url,
         name: "test-model".to_owned(),
+        context_window: None,
+        compat: None,
     })
 }
 
@@ -111,6 +113,34 @@ fn returns_assistant_content_and_forwards_full_history() {
         request.contains("test-model"),
         "request should name the configured model: {request}"
     );
+}
+
+#[test]
+fn parses_provider_token_usage_when_present() {
+    let (base_url, _requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}],
+           "usage":{
+             "prompt_tokens":12,
+             "completion_tokens":5,
+             "total_tokens":17,
+             "prompt_tokens_details":{"cached_tokens":3},
+             "completion_tokens_details":{"reasoning_tokens":2}
+           }}"#,
+    );
+    let model = model(base_url);
+
+    let reply = model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect("provider returns a reply");
+    let usage = reply.token_usage.expect("usage should parse");
+
+    assert_eq!(usage.input, 12);
+    assert_eq!(usage.output, 5);
+    assert_eq!(usage.total, Some(17));
+    assert_eq!(usage.cache_read, 3);
+    assert_eq!(usage.reasoning, 2);
+    assert_eq!(usage.source, nav::TokenCountSource::ProviderReported);
 }
 
 #[test]
