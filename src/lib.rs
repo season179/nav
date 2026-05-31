@@ -22,10 +22,12 @@ mod config;
 mod model;
 mod session;
 mod storage;
+mod tools;
 
 pub use config::{ConfigError, ResolvedModelConfig, resolve_config, resolve_default_config};
 pub use model::{
-    ChatMessage, ChatModel, MockModel, ModelChoice, ModelError, OpenAiConfig, OpenAiModel, Role,
+    ChatMessage, ChatModel, FinishReason, MockModel, ModelChoice, ModelError, ModelResponse,
+    OpenAiConfig, OpenAiModel, Role, ToolCall, ToolDef,
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
 pub use storage::{SessionSummary, Storage, StorageError};

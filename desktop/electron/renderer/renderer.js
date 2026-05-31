@@ -59,6 +59,21 @@ function handleSessionEvent(event) {
     case "run.started":
       setRunning(true);
       break;
+    case "assistant.tool_calls":
+      // The model's reasoning before it calls tools, if it sent any.
+      if (event.text) {
+        appendMessage("assistant", event.text);
+      }
+      break;
+    case "tool.started":
+      upsertToolLine(event.tool_call_id, "running", event.tool_name);
+      break;
+    case "tool.completed":
+      upsertToolLine(event.tool_call_id, "done", event.tool_name, event.text);
+      break;
+    case "tool.failed":
+      upsertToolLine(event.tool_call_id, "failed", event.tool_name, event.error);
+      break;
     case "message.completed":
       appendMessage("assistant", event.text);
       break;
@@ -185,6 +200,51 @@ function appendMessage(role, text) {
   item.append(who, body);
   messageListNode.append(item);
   item.scrollIntoView({ block: "end" });
+}
+
+// Render a compact tool line — a 🔧 marker, the tool name, and an optional
+// truncated preview of its output (or the error on failure). The same call's
+// line is reused as it moves from running → done/failed, keyed by its id, so a
+// tool shows as one evolving line rather than two separate bubbles.
+function upsertToolLine(toolCallId, state, toolName, detail) {
+  const selector = toolCallId ? `[data-tool-call-id="${toolCallId}"]` : null;
+  let item = selector ? messageListNode.querySelector(selector) : null;
+  if (item) {
+    item.replaceChildren();
+  } else {
+    item = document.createElement("li");
+    if (toolCallId) {
+      item.dataset.toolCallId = toolCallId;
+    }
+    messageListNode.append(item);
+  }
+  item.className = `message message-tool message-tool-${state}`;
+
+  const marker = document.createElement("span");
+  marker.className = "message-role";
+  marker.textContent = "🔧";
+
+  const name = document.createElement("span");
+  name.className = "tool-name";
+  name.textContent = toolName ?? "tool";
+
+  item.append(marker, name);
+
+  if (detail) {
+    const preview = document.createElement("span");
+    preview.className = "tool-detail";
+    preview.textContent = previewText(detail);
+    item.append(preview);
+  }
+
+  item.scrollIntoView({ block: "end" });
+}
+
+// Collapse tool output to a short single-line preview so the transcript stays
+// readable; the full result still lives in the session history.
+function previewText(text) {
+  const firstLine = text.split("\n", 1)[0];
+  return firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine;
 }
 
 function roleLabel(role) {

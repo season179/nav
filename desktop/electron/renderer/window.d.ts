@@ -18,6 +18,8 @@ type SessionEvent = {
   text?: string;
   status?: string;
   error?: string;
+  tool_call_id?: string;
+  tool_name?: string;
 };
 
 type SessionSummary = {

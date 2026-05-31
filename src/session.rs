@@ -7,17 +7,25 @@
 //! reopened with [`SessionStore::resume_session`].
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+use serde_json::Value;
 use uuid::Uuid;
 
-use crate::model::{ChatMessage, ChatModel, Role};
+use crate::model::{ChatMessage, ChatModel, Role, ToolCall};
 use crate::storage::{SessionSummary, Storage};
+use crate::tools::{CancelFlag, Registry};
 
 /// How a session originates, recorded on the persisted `sessions` row.
 const SESSION_SOURCE: &str = "nav";
+
+/// Upper bound on model⇄tool round-trips in one run before the run is failed,
+/// so a model that never stops calling tools can't loop forever.
+const MAX_TOOL_ITERATIONS: usize = 16;
 
 /// One ordered, renderable session event. The flat shape matches what the
 /// Electron renderer already consumes over SSE.
@@ -40,6 +48,12 @@ pub struct Event {
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set on `tool.*` events: the assistant tool call this event concerns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Set on `tool.*` events: the name of the tool being run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 impl Event {
@@ -55,6 +69,8 @@ impl Event {
             text: None,
             status: None,
             error: None,
+            tool_call_id: None,
+            tool_name: None,
         }
     }
 }
@@ -120,6 +136,10 @@ pub struct SessionStore {
     storage: Option<Arc<Storage>>,
     /// Identifier of the active model, tagged onto persisted assistant turns.
     model_id: Option<String>,
+    /// The tools the model may call during a run.
+    registry: Arc<Registry>,
+    /// Directory tools operate in (the backend process cwd by default).
+    workspace: PathBuf,
 }
 
 impl SessionStore {
@@ -129,6 +149,8 @@ impl SessionStore {
             model,
             storage: None,
             model_id: None,
+            registry: Arc::new(Registry::coding()),
+            workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -141,6 +163,18 @@ impl SessionStore {
     /// Record which model produced assistant replies (persisted on each turn).
     pub fn with_model_id(mut self, model_id: Option<String>) -> Self {
         self.model_id = model_id;
+        self
+    }
+
+    /// Override the toolset offered to the model (defaults to the coding tools).
+    pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Set the directory tools run in (defaults to the process cwd).
+    pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
+        self.workspace = workspace;
         self
     }
 
@@ -209,6 +243,9 @@ impl SessionStore {
                     event.text = Some(message.content.clone());
                     event.message_id = Some(new_id());
                 }),
+                // Tool turns are not part of text-only rehydration (load_history
+                // returns only user/assistant text), so there is nothing to replay.
+                Role::Tool => {}
             }
         }
         session.messages = history;
@@ -248,93 +285,225 @@ impl SessionStore {
         }
     }
 
-    /// Run one chat turn: record the user message, call the model with the full
-    /// history, and record the assistant reply — emitting ordered events along
-    /// the way. One turn at a time per session; callers send the next message
-    /// after the previous run completes.
+    /// Run one chat turn as a bounded agent loop: record the user message, then
+    /// repeatedly call the model and execute any tool calls it returns, feeding
+    /// each tool result back, until the model replies with plain text (or the
+    /// iteration cap is hit). Ordered events are emitted throughout.
     ///
-    /// The model call happens without holding the store lock, so other sessions
-    /// stay responsive while a model is thinking.
+    /// A turn with no tool calls emits exactly `user.message`, `run.started`,
+    /// `message.completed`, `run.completed` — unchanged from the pre-tools loop.
+    ///
+    /// Lock discipline: the model call and every tool run happen with the store
+    /// lock released, so other sessions stay responsive while one is working.
+    /// The lock is only taken for the tiny critical sections that mutate a
+    /// session's history and emit its events.
     pub fn send_message(&self, session_id: &str, text: &str) -> Result<String, SendError> {
-        let (run_id, history) = {
-            let mut sessions = self.sessions.lock().unwrap();
-            let session = sessions
-                .get_mut(session_id)
-                .ok_or(SendError::UnknownSession)?;
+        let run_id = new_id();
+        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+        let tool_defs = self.registry.defs();
 
+        // Seq 0 is the user turn; every later turn (assistant tool-calls, each
+        // tool result, the final assistant text) takes the next number.
+        let mut seq: i64 = 0;
+        self.with_session(session_id, |session| {
             session.messages.push(ChatMessage::user(text));
             session.emit("user.message", |event| {
                 event.role = Some(Role::User.as_str().to_owned());
                 event.text = Some(text.to_owned());
             });
-
-            let run_id = new_id();
             session.emit("run.started", |event| {
                 event.run_id = Some(run_id.clone());
             });
+        })?;
 
-            (run_id, session.messages.clone())
-        };
-
-        // Persist the run and the user turn (seq 0) before the model call so a
-        // crash mid-response still leaves the question on record.
+        // Persist the run and the user turn before the model call so a crash
+        // mid-response still leaves the question on record.
         if let Some(storage) = &self.storage {
             log_storage("start_run", storage.start_run(&run_id, session_id));
             log_storage(
                 "record_user_text",
-                storage.record_user_text(session_id, &run_id, 0, text),
+                storage.record_user_text(session_id, &run_id, seq, text),
             );
         }
+        seq += 1;
 
-        let reply = self.model.respond(&history);
+        for _ in 0..MAX_TOOL_ITERATIONS {
+            // Snapshot the history under the lock, then call the model unlocked.
+            let history = self.with_session(session_id, |session| session.messages.clone())?;
+            let response = match self.model.respond(&history, &tool_defs) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.fail_run(session_id, &run_id, &error.message)?;
+                    return Ok(run_id);
+                }
+            };
 
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or(SendError::UnknownSession)?;
-        match reply {
-            Ok(reply) => {
-                session.messages.push(ChatMessage::assistant(&reply));
+            // Plain text reply ⇒ the run is done.
+            if response.tool_calls.is_empty() {
+                let reply = response.content.unwrap_or_default();
                 let message_id = new_id();
-                session.emit("message.completed", |event| {
-                    event.role = Some(Role::Assistant.as_str().to_owned());
-                    event.text = Some(reply.clone());
-                    event.message_id = Some(message_id.clone());
-                    event.run_id = Some(run_id.clone());
-                });
-                session.emit("run.completed", |event| {
-                    event.run_id = Some(run_id.clone());
-                    event.status = Some("completed".to_owned());
-                });
-
+                self.with_session(session_id, |session| {
+                    session.messages.push(ChatMessage::assistant(&reply));
+                    session.emit("message.completed", |event| {
+                        event.role = Some(Role::Assistant.as_str().to_owned());
+                        event.text = Some(reply.clone());
+                        event.message_id = Some(message_id.clone());
+                        event.run_id = Some(run_id.clone());
+                    });
+                    session.emit("run.completed", |event| {
+                        event.run_id = Some(run_id.clone());
+                        event.status = Some("completed".to_owned());
+                    });
+                })?;
                 if let Some(storage) = &self.storage {
                     log_storage(
                         "record_assistant_text",
                         storage.record_assistant_text(
                             session_id,
                             &run_id,
-                            1,
+                            seq,
                             &reply,
                             self.model_id.as_deref(),
                         ),
                     );
                     log_storage("complete_run", storage.complete_run(&run_id));
                 }
+                return Ok(run_id);
             }
-            Err(error) => {
-                session.emit("run.failed", |event| {
-                    event.run_id = Some(run_id.clone());
-                    event.status = Some("failed".to_owned());
-                    event.error = Some(error.message.clone());
-                });
 
+            // The model wants tools: record the requesting assistant turn, then
+            // execute each call and feed its result back into the history.
+            let content = response.content.clone().unwrap_or_default();
+            let calls = response.tool_calls.clone();
+            self.with_session(session_id, |session| {
+                session
+                    .messages
+                    .push(ChatMessage::assistant_tool_calls(&content, calls.clone()));
+                session.emit("assistant.tool_calls", |event| {
+                    event.role = Some(Role::Assistant.as_str().to_owned());
+                    event.run_id = Some(run_id.clone());
+                    if !content.is_empty() {
+                        event.text = Some(content.clone());
+                    }
+                });
+            })?;
+            if let Some(storage) = &self.storage {
+                let text = (!content.is_empty()).then_some(content.as_str());
+                log_storage(
+                    "record_assistant_tool_calls",
+                    storage.record_assistant_tool_calls(
+                        session_id,
+                        &run_id,
+                        seq,
+                        text,
+                        &calls,
+                        self.model_id.as_deref(),
+                    ),
+                );
+            }
+            seq += 1;
+
+            for call in &calls {
+                self.with_session(session_id, |session| {
+                    session.emit("tool.started", |event| {
+                        event.run_id = Some(run_id.clone());
+                        event.tool_call_id = Some(call.id.clone());
+                        event.tool_name = Some(call.name.clone());
+                    });
+                })?;
+
+                // Tools run with the lock released.
+                let (output, is_error) = self.run_tool(call, &cancel);
+
+                let kind = if is_error {
+                    "tool.failed"
+                } else {
+                    "tool.completed"
+                };
+                let output_for_event = output.clone();
+                self.with_session(session_id, |session| {
+                    session
+                        .messages
+                        .push(ChatMessage::tool_result(&call.id, &output));
+                    session.emit(kind, |event| {
+                        event.run_id = Some(run_id.clone());
+                        event.tool_call_id = Some(call.id.clone());
+                        event.tool_name = Some(call.name.clone());
+                        if is_error {
+                            event.error = Some(output_for_event.clone());
+                        } else {
+                            event.text = Some(output_for_event.clone());
+                        }
+                    });
+                })?;
                 if let Some(storage) = &self.storage {
-                    log_storage("fail_run", storage.fail_run(&run_id, &error.message));
+                    log_storage(
+                        "record_tool_result",
+                        storage.record_tool_result(
+                            session_id, &run_id, seq, &call.id, &output, is_error,
+                        ),
+                    );
                 }
+                seq += 1;
             }
         }
 
+        // The model never settled on a final answer within the cap.
+        self.fail_run(session_id, &run_id, "tool iteration limit reached")?;
         Ok(run_id)
+    }
+
+    /// Execute one tool call with the lock released, returning its output text
+    /// and whether it failed. A failure (unknown tool, bad arguments, or a tool
+    /// error) becomes an error tool result fed back to the model — never a run
+    /// failure — so the model can recover.
+    fn run_tool(&self, call: &ToolCall, cancel: &CancelFlag) -> (String, bool) {
+        let Some(tool) = self.registry.get(&call.name) else {
+            return (format!("unknown tool: {}", call.name), true);
+        };
+        let trimmed = call.arguments.trim();
+        let args: Value = if trimmed.is_empty() {
+            Value::Object(Default::default())
+        } else {
+            match serde_json::from_str(trimmed) {
+                Ok(args) => args,
+                Err(error) => return (format!("invalid tool arguments: {error}"), true),
+            }
+        };
+        match tool.execute(&args, &self.workspace, cancel) {
+            Ok(output) => (output.content, false),
+            Err(error) => (error.message, true),
+        }
+    }
+
+    /// Emit a `run.failed` event and persist the failure. Shared by the
+    /// model-error and iteration-cap paths.
+    fn fail_run(&self, session_id: &str, run_id: &str, message: &str) -> Result<(), SendError> {
+        self.with_session(session_id, |session| {
+            session.emit("run.failed", |event| {
+                event.run_id = Some(run_id.to_owned());
+                event.status = Some("failed".to_owned());
+                event.error = Some(message.to_owned());
+            });
+        })?;
+        if let Some(storage) = &self.storage {
+            log_storage("fail_run", storage.fail_run(run_id, message));
+        }
+        Ok(())
+    }
+
+    /// Run a critical section against one live session under the store lock,
+    /// returning [`SendError::UnknownSession`] if it has gone away.
+    fn with_session<T>(
+        &self,
+        session_id: &str,
+        body: impl FnOnce(&mut Session) -> T,
+    ) -> Result<T, SendError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or(SendError::UnknownSession)?;
+        Ok(body(session))
     }
 
     /// Subscribe to a session's event feed: the current backlog plus all future
