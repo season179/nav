@@ -192,15 +192,11 @@ function appendMessage(role, text) {
   const item = document.createElement("li");
   item.className = `message message-${role}`;
 
-  const who = document.createElement("span");
-  who.className = "message-role";
-  who.textContent = roleLabel(role);
-
   const body = document.createElement("span");
   body.className = "message-text";
   body.textContent = text;
 
-  item.append(who, body);
+  item.append(body);
   messageListNode.append(item);
   item.scrollIntoView({ block: "end" });
 }
@@ -227,7 +223,7 @@ function upsertToolLine(toolCallId, state, toolName, detail) {
 
   const marker = document.createElement("span");
   marker.className = "message-role";
-  marker.textContent = "🔧";
+  marker.textContent = toolMarker(state);
 
   const name = document.createElement("span");
   name.className = "tool-name";
@@ -245,22 +241,23 @@ function upsertToolLine(toolCallId, state, toolName, detail) {
   item.scrollIntoView({ block: "end" });
 }
 
+// A terminal-style status glyph for a tool line, keyed by its lifecycle state.
+function toolMarker(state) {
+  switch (state) {
+    case "running":
+      return "▸";
+    case "failed":
+      return "✕";
+    default:
+      return "●";
+  }
+}
+
 // Collapse tool output to a short single-line preview so the transcript stays
 // readable; the full result still lives in the session history.
 function previewText(text) {
   const firstLine = text.split("\n", 1)[0];
   return firstLine.length > 120 ? `${firstLine.slice(0, 117)}…` : firstLine;
-}
-
-function roleLabel(role) {
-  switch (role) {
-    case "user":
-      return "You";
-    case "assistant":
-      return "nav";
-    default:
-      return "error";
-  }
 }
 
 function setRunning(isRunning) {

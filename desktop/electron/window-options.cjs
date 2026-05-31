@@ -5,7 +5,7 @@ function createWindowOptions({ preloadPath }) {
     minWidth: 720,
     minHeight: 480,
     title: "nav",
-    backgroundColor: "#f7f4ee",
+    backgroundColor: "#0b0f0d",
     webPreferences: {
       preload: preloadPath,
       contextIsolation: true,
