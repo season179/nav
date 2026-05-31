@@ -2,28 +2,33 @@
 // preload (which needs Electron) lets the boundary checks be unit tested.
 
 function normalizeMessageText(value) {
+  return normalizeRequiredString(value, "message text");
+}
+
+function normalizeSessionId(value) {
+  return normalizeRequiredString(value, "session id");
+}
+
+function normalizeOptionalWorkspaceRoot(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return normalizeRequiredString(value, "workspace root");
+}
+
+function normalizeRequiredString(value, label) {
   if (typeof value !== "string") {
-    throw new TypeError("message text must be a string");
+    throw new TypeError(`${label} must be a string`);
   }
   const text = value.trim();
   if (text.length === 0) {
-    throw new Error("message text must not be empty");
+    throw new Error(`${label} must not be empty`);
   }
   return text;
 }
 
-function normalizeSessionId(value) {
-  if (typeof value !== "string") {
-    throw new TypeError("session id must be a string");
-  }
-  const id = value.trim();
-  if (id.length === 0) {
-    throw new Error("session id must not be empty");
-  }
-  return id;
-}
-
 module.exports = {
   normalizeMessageText,
+  normalizeOptionalWorkspaceRoot,
   normalizeSessionId,
 };

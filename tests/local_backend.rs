@@ -1,10 +1,12 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::{env, fs};
 
-use nav::{MockModel, ModelInfo, SessionStore};
+use nav::{MockModel, ModelInfo, SessionStore, Storage};
 use serde_json::{Value, json};
 
 /// An in-process backend bound to an ephemeral loopback port, driven over raw
@@ -12,6 +14,24 @@ use serde_json::{Value, json};
 /// mock model.
 struct TestBackend {
     address: String,
+}
+
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let path = env::temp_dir().join(format!("nav_{tag}_{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(&path).expect("create temp dir");
+        Self { path }
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 impl TestBackend {
@@ -162,6 +182,39 @@ fn create_session_returns_a_session_id() {
         .as_str()
         .expect("a sessionId is returned");
     assert!(!session_id.is_empty(), "sessionId should not be empty");
+}
+
+#[test]
+fn create_session_accepts_cwd_and_lists_the_project_root() {
+    let workspace = TempDir::new("rpc_ws");
+    let db = TempDir::new("rpc_db");
+    let db_path = db.path.join("nav.db");
+    let storage = Arc::new(Storage::open(&db_path).expect("open storage"));
+    let backend = TestBackend::start_with(
+        SessionStore::new(Arc::new(MockModel::new())).with_storage(storage),
+    );
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "create",
+        "method": "session.create",
+        "params": { "cwd": workspace.path },
+    });
+
+    let created = backend.rpc(&request.to_string());
+    assert!(
+        created["result"]["sessionId"].as_str().is_some(),
+        "session.create returns a session id: {created}"
+    );
+
+    let listed = backend.rpc(r#"{"jsonrpc":"2.0","id":"list","method":"session.list"}"#);
+    let expected = fs::canonicalize(&workspace.path)
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert_eq!(
+        listed["result"]["sessions"][0]["workspaceRoot"], expected,
+        "session.list should expose the selected cwd as project root: {listed}"
+    );
 }
 
 #[test]

@@ -3,6 +3,7 @@ const { test } = require("node:test");
 
 const {
   normalizeMessageText,
+  normalizeOptionalWorkspaceRoot,
   normalizeSessionId,
 } = require("../desktop/electron/request-validation.cjs");
 
@@ -29,4 +30,21 @@ test("preload session id validation rejects non-strings and blanks", () => {
   assert.throws(() => normalizeSessionId(42), TypeError);
   assert.throws(() => normalizeSessionId(undefined), TypeError);
   assert.throws(() => normalizeSessionId("   "));
+});
+
+test("preload workspace root validation trims valid paths", () => {
+  assert.equal(
+    normalizeOptionalWorkspaceRoot("  /Users/season/Personal/nav  "),
+    "/Users/season/Personal/nav",
+  );
+});
+
+test("preload workspace root validation allows omitted values", () => {
+  assert.equal(normalizeOptionalWorkspaceRoot(undefined), null);
+  assert.equal(normalizeOptionalWorkspaceRoot(null), null);
+});
+
+test("preload workspace root validation rejects non-strings and blanks", () => {
+  assert.throws(() => normalizeOptionalWorkspaceRoot(42), TypeError);
+  assert.throws(() => normalizeOptionalWorkspaceRoot("   "));
 });

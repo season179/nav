@@ -25,6 +25,7 @@ type SessionEvent = {
 type SessionSummary = {
   sessionId: string;
   title: string | null;
+  workspaceRoot: string | null;
   updatedAt: number;
 };
 
@@ -35,13 +36,14 @@ declare global {
       onSessionEvent(callback: (event: SessionEvent) => void): () => void;
       sessionSendMessage(text: string): Promise<void>;
       listSessions(): Promise<SessionSummary[]>;
+      createProject(): Promise<string | null>;
       modelInfo(sessionId?: string): Promise<{
         label: string;
         thinking?: string | null;
         tokenUsage?: { used: number; contextWindow: number } | null;
       }>;
       switchSession(sessionId: string): Promise<void>;
-      newSession(): Promise<string>;
+      newSession(workspaceRoot?: string | null): Promise<string>;
     };
   }
 }

@@ -49,12 +49,13 @@ pub struct Storage {
     conn: Mutex<Connection>,
 }
 
-/// A session as shown in the sidebar listing: its id, a short title drawn from
-/// the first user message, and when it was last active.
+/// A session as shown in the sidebar listing: its project workspace, id, a short
+/// title drawn from the first user message, and when it was last active.
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub id: String,
     pub title: Option<String>,
+    pub workspace_root: Option<String>,
     pub updated_at: i64,
 }
 
@@ -87,12 +88,29 @@ impl Storage {
 
     /// Record a freshly created chat session.
     pub fn create_session(&self, session_id: &str, source: &str) -> Result<(), StorageError> {
+        self.create_session_with_workspace(session_id, source, None)
+    }
+
+    /// Record a freshly created chat session, including the workspace it belongs to.
+    pub fn create_session_with_workspace(
+        &self,
+        session_id: &str,
+        source: &str,
+        workspace_root: Option<&Path>,
+    ) -> Result<(), StorageError> {
         let now = now_ms();
+        let workspace_root = workspace_root_string(workspace_root);
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO sessions (id, source, settings_json, version, created_at, updated_at)
-             VALUES (?1, ?2, '{}', ?3, ?4, ?4)",
-            params![session_id, source, env!("CARGO_PKG_VERSION"), now],
+            "INSERT INTO sessions (id, source, workspace_root, settings_json, version, created_at, updated_at)
+             VALUES (?1, ?2, ?3, '{}', ?4, ?5, ?5)",
+            params![
+                session_id,
+                source,
+                workspace_root,
+                env!("CARGO_PKG_VERSION"),
+                now
+            ],
         )?;
         Ok(())
     }
@@ -342,7 +360,7 @@ impl Storage {
         // lookup into an indexed join. `turn_parts_text` already drops empty
         // parts, so the first non-empty user text wins.
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.updated_at,
+            "SELECT s.id, s.updated_at, s.workspace_root,
                     (SELECT tpt.text
                      FROM turn_parts_text tpt
                      JOIN turns t ON t.id = tpt.turn_id
@@ -358,7 +376,8 @@ impl Storage {
             Ok(SessionSummary {
                 id: row.get(0)?,
                 updated_at: row.get(1)?,
-                title: row.get::<_, Option<String>>(2)?,
+                workspace_root: row.get::<_, Option<String>>(2)?,
+                title: row.get::<_, Option<String>>(3)?,
             })
         })?;
 
@@ -394,6 +413,19 @@ impl Storage {
             )
             .optional()?
             .is_some())
+    }
+
+    /// The workspace root recorded for a persisted session, if any.
+    pub fn session_workspace_root(&self, session_id: &str) -> Result<Option<String>, StorageError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT workspace_root FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Rebuild a Session's Turn History in order, so it can be resumed with its
@@ -664,6 +696,12 @@ fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
 
 fn new_id() -> String {
     Uuid::now_v7().to_string()
+}
+
+fn workspace_root_string(workspace_root: Option<&Path>) -> Option<String> {
+    workspace_root
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .filter(|path| !path.trim().is_empty())
 }
 
 fn now_ms() -> i64 {

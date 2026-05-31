@@ -15,6 +15,7 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -135,7 +136,14 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
 
     match request.get("method").and_then(Value::as_str) {
         Some("session.create") => {
-            let session_id = store.create_session();
+            let workspace = match requested_session_workspace(&request) {
+                Ok(workspace) => workspace,
+                Err(message) => return write_rpc_error(stream, &id, &message),
+            };
+            let session_id = match workspace {
+                Some(workspace) => store.create_session_in_workspace(workspace),
+                None => store.create_session(),
+            };
             write_rpc_result(stream, &id, json!({ "sessionId": session_id }))
         }
         Some("session.latest") => {
@@ -157,6 +165,7 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                     json!({
                         "sessionId": session.id,
                         "title": session.title,
+                        "workspaceRoot": session.workspace_root,
                         "updatedAt": session.updated_at,
                     })
                 })
@@ -220,6 +229,26 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
         Some(method) => write_rpc_error(stream, &id, &format!("unknown method: {method}")),
         None => write_rpc_error(stream, &id, "missing method"),
     }
+}
+
+fn requested_session_workspace(request: &Value) -> Result<Option<PathBuf>, String> {
+    let Some(cwd_value) = request.get("params").and_then(|params| params.get("cwd")) else {
+        return Ok(None);
+    };
+    let Some(cwd) = cwd_value.as_str() else {
+        return Err("session.create cwd must be a string".to_owned());
+    };
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Err("session.create cwd must not be empty".to_owned());
+    }
+
+    let canonical = std::fs::canonicalize(cwd)
+        .map_err(|error| format!("session.create cwd is not accessible: {error}"))?;
+    if !canonical.is_dir() {
+        return Err("session.create cwd must be a directory".to_owned());
+    }
+    Ok(Some(canonical))
 }
 
 fn stream_session_events(
