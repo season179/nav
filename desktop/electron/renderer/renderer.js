@@ -11,12 +11,14 @@ const thinkingNode = document.querySelector("#composer-thinking");
 const tokenUsageNode = document.querySelector("#composer-token-usage");
 const projectList = window.navProjectList;
 const tokenFormatter = new Intl.NumberFormat("en-US");
+const PROJECT_SESSION_PREVIEW_LIMIT = 5;
 const projectOrderStorageKey = "nav.projectOrder.v1";
 
 let connected = false;
 let running = false;
 let activeSessionId = null;
 let sessionSummaries = [];
+const expandedProjectKeys = new Set();
 let projectOrder = readProjectOrder();
 // Set when Stop is pressed; re-applied on `run.started` in case the press landed
 // before the backend had registered the run (when a stop is a no-op).
@@ -275,7 +277,10 @@ async function refreshSessions() {
     return;
   }
   sessionSummaries = sessions;
+  renderSessionList(sessions);
+}
 
+function renderSessionList(sessions) {
   sessionListNode.replaceChildren();
   if (sessions.length === 0) {
     renderEmptySessionList();
@@ -355,12 +360,41 @@ function renderProjectHeading(project) {
 function renderProjectSessions(project) {
   const projectSessions = document.createElement("ul");
   projectSessions.className = "project-session-list";
+  const expanded = expandedProjectKeys.has(project.key);
+  const visibleSessions = expanded
+    ? project.sessions
+    : project.sessions.slice(0, PROJECT_SESSION_PREVIEW_LIMIT);
 
-  for (const session of project.sessions) {
+  for (const session of visibleSessions) {
     projectSessions.append(renderProjectSession(session));
   }
 
+  if (!expanded && project.sessions.length > PROJECT_SESSION_PREVIEW_LIMIT) {
+    projectSessions.append(renderProjectShowMore(project));
+  }
+
   return projectSessions;
+}
+
+function renderProjectShowMore(project) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "project-show-more";
+  button.textContent = "Show more";
+  const hiddenCount = project.sessions.length - PROJECT_SESSION_PREVIEW_LIMIT;
+  const sessionLabel = hiddenCount === 1 ? "session" : "sessions";
+  button.setAttribute(
+    "aria-label",
+    `Show ${hiddenCount} more ${sessionLabel} in ${project.name}`,
+  );
+  button.addEventListener("click", () => {
+    expandedProjectKeys.add(project.key);
+    renderSessionList(sessionSummaries);
+  });
+
+  const row = document.createElement("li");
+  row.append(button);
+  return row;
 }
 
 function renderProjectSession(session) {
