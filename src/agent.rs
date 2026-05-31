@@ -1,14 +1,16 @@
 //! Agent loop over one model and one tool registry.
 //!
-//! The agent owns the behavioral loop: call the model with the current history,
-//! execute requested tools, feed tool results back, and stop when the model
-//! returns a plain assistant message. Callers provide an [`AgentRunSink`] adapter
-//! to mirror those steps into session state, event streams, and persistence.
+//! The agent owns the behavioral loop: call the model with the current Model
+//! Context, execute requested tools, feed tool results back, and stop when the
+//! model returns a plain assistant message. Callers provide an [`AgentRunSink`]
+//! adapter to mirror those steps into session state, event streams, and
+//! persistence.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use crate::context::ModelContext;
 use crate::model::{ChatMessage, ChatModel, ModelError, ToolCall};
 use crate::tools::{CancelFlag, Registry};
 
@@ -38,7 +40,7 @@ impl Agent {
         self
     }
 
-    /// Run the model/tool loop from a starting history.
+    /// Run the model/tool loop from the assembled context for one Run.
     ///
     /// The sink is notified as each visible step happens, before long-running
     /// tool calls start and immediately after they finish. A model error stops
@@ -52,7 +54,7 @@ impl Agent {
     /// Returns how the run ended so the caller can emit the right terminal event.
     pub(crate) fn run_turn<S>(
         &self,
-        mut history: Vec<ChatMessage>,
+        mut context: ModelContext,
         cancel: &CancelFlag,
         sink: &mut S,
     ) -> Result<RunStop, AgentRunError<S::Error>>
@@ -68,7 +70,7 @@ impl Agent {
 
             let response = self
                 .model
-                .respond(&history, &tool_defs)
+                .respond(&context, &tool_defs)
                 .map_err(AgentRunError::Model)?;
 
             // A stop requested during the (blocking) model call takes effect now,
@@ -86,7 +88,7 @@ impl Agent {
 
             let content = response.content.unwrap_or_default();
             let calls = response.tool_calls;
-            history.push(ChatMessage::assistant_tool_calls(&content, calls.clone()));
+            context.push(ChatMessage::assistant_tool_calls(&content, calls.clone()));
             sink.assistant_tool_calls(&content, &calls)
                 .map_err(AgentRunError::Sink)?;
 
@@ -99,14 +101,14 @@ impl Agent {
                 // replayable.
                 if cancel.load(Ordering::Relaxed) {
                     let note = "[cancelled before execution]";
-                    history.push(ChatMessage::tool_result(&call.id, note, true));
+                    context.push(ChatMessage::tool_result(&call.id, note, true));
                     sink.tool_result(call, note, true)
                         .map_err(AgentRunError::Sink)?;
                     continue;
                 }
                 sink.tool_started(call).map_err(AgentRunError::Sink)?;
                 let result = self.registry.execute_call(call, &self.workspace, cancel);
-                history.push(ChatMessage::tool_result(
+                context.push(ChatMessage::tool_result(
                     &call.id,
                     &result.content,
                     result.is_error,

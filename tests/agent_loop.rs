@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nav::{
-    ChatMessage, ChatModel, Event, FinishReason, ModelError, ModelResponse, SessionStore, Storage,
-    ToolCall, ToolDef,
+    ChatMessage, ChatModel, Event, FinishReason, ModelContext, ModelError, ModelResponse,
+    SessionStore, Storage, ToolCall, ToolDef,
 };
 
 /// A throwaway directory, removed on drop.
@@ -58,12 +58,15 @@ impl ScriptedModel {
 impl ChatModel for ScriptedModel {
     fn respond(
         &self,
-        history: &[ChatMessage],
+        context: &ModelContext,
         tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
         // The loop must advertise the coding tools to the model.
         assert!(tools.iter().any(|tool| tool.name == "ls"));
-        self.histories.lock().unwrap().push(history.to_vec());
+        self.histories
+            .lock()
+            .unwrap()
+            .push(context.messages().to_vec());
 
         let nth = self.calls.fetch_add(1, Ordering::SeqCst);
         if nth == 0 {
@@ -91,7 +94,7 @@ struct SleepThenTextModel {
 impl ChatModel for SleepThenTextModel {
     fn respond(
         &self,
-        _history: &[ChatMessage],
+        _context: &ModelContext,
         _tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
         let nth = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -121,7 +124,7 @@ struct SleepThenWriteModel {
 impl ChatModel for SleepThenWriteModel {
     fn respond(
         &self,
-        _history: &[ChatMessage],
+        _context: &ModelContext,
         _tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
         let nth = self.calls.fetch_add(1, Ordering::SeqCst);

@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
+use crate::context::TurnHistory;
 use crate::model::{ChatMessage, ToolCall};
 
 /// Canonical schema, captured verbatim from the live database.
@@ -315,7 +316,7 @@ impl Storage {
             .is_some())
     }
 
-    /// Replay a session's turns in order, so a session can be resumed with its
+    /// Rebuild a Session's Turn History in order, so it can be resumed with its
     /// prior conversation — text *and* tool calls/results — intact across
     /// restarts.
     ///
@@ -324,8 +325,8 @@ impl Storage {
     /// `tool_call` parts rebuild its requested calls; a `tool` turn's
     /// `tool_result` parts each become a tool-result message. Turns are ordered
     /// by run start then sequence (run id as a stable tiebreaker), and a turn's
-    /// parts by creation, so the rebuilt history matches what was recorded.
-    pub fn load_history(&self, session_id: &str) -> Result<Vec<ChatMessage>, StorageError> {
+    /// parts by creation, so the rebuilt Turn History matches what was recorded.
+    pub fn load_history(&self, session_id: &str) -> Result<TurnHistory, StorageError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT t.id, t.role, tp.type, tp.data_json
@@ -347,7 +348,7 @@ impl Storage {
         // The ordering keeps every part of a turn contiguous, so accumulate the
         // parts of the current turn and flush a turn's messages when the next
         // turn id appears.
-        let mut history = Vec::new();
+        let mut history = TurnHistory::new();
         let mut current: Option<TurnAccum> = None;
         for row in rows {
             let (turn_id, role, part_type, data_json) = row?;
@@ -483,8 +484,8 @@ impl TurnAccum {
         }
     }
 
-    /// Append this turn's reconstructed message(s) to `history`.
-    fn flush(self, history: &mut Vec<ChatMessage>) {
+    /// Append this turn's reconstructed message(s) to the rebuilt Turn History.
+    fn flush(self, history: &mut TurnHistory) {
         match self.role.as_str() {
             "assistant" if !self.tool_calls.is_empty() => {
                 history.push(ChatMessage::assistant_tool_calls(

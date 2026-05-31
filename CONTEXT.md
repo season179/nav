@@ -21,6 +21,15 @@ _Avoid_: Request, job
 One persisted message-shaped entry in a session history.
 _Avoid_: Event, log line
 
+**Turn History**:
+The ordered Turns that belong to a Session and remain the raw source of truth.
+_Avoid_: Transcript, chat log
+
+**Model Context**:
+The model-visible view assembled for one Run from Turn History and, later,
+other context sources.
+_Avoid_: History, prompt
+
 **Tool**:
 A model-visible capability with a schema and executor that may act against the
 local workspace.
@@ -37,6 +46,8 @@ _Avoid_: Output, response
 ## Relationships
 
 - A **Session** contains many **Runs**.
+- A **Session** owns one **Turn History**.
+- A **Run** starts from one **Model Context** assembled from **Turn History**.
 - A **Run** starts from one user **Turn** and produces assistant **Turns**.
 - A **Run** is executed by one or more **Agents**.
 - An **Agent** has access to many **Tools**.

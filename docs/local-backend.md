@@ -2,9 +2,9 @@
 
 This is the smallest runnable backend surface for the nav chat slice: a
 multi-turn coding-agent loop backed by one text model. It owns sessions, message
-history, the model call, tool execution, durable session storage, and the
-session event stream. It has no approval flow yet, so the backend must stay
-bound to loopback.
+history, context assembly, the model call, tool execution, durable session
+storage, and the session event stream. It has no approval flow yet, so the
+backend must stay bound to loopback.
 
 ## Start
 
@@ -77,7 +77,8 @@ curl -s -X POST http://127.0.0.1:54321/rpc \
 ```
 
 Send one message per turn: wait for a turn's `run.completed` before sending the
-next so the model sees a consistent, ordered history.
+next so the model sees consistent Model Context assembled from ordered Turn
+History.
 
 ## Session Event Stream: `GET /sessions/{id}/events`
 

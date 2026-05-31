@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use nav::{ChatMessage, ChatModel, ConfigError, MockModel, ModelChoice, ResolvedModelConfig};
+use nav::{
+    ChatMessage, ChatModel, ConfigError, MockModel, ModelChoice, ModelContext, ResolvedModelConfig,
+};
 
 fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
     let map: HashMap<String, String> = pairs
@@ -31,9 +33,10 @@ fn resolved(api_key: &str, model: &str, base_url: &str) -> ResolvedModelConfig {
 fn mock_model_reflects_the_latest_user_message() {
     let model = MockModel::new();
     let history = vec![ChatMessage::user("hello there")];
+    let context = ModelContext::from_messages(history);
 
     let reply = model
-        .respond(&history, &[])
+        .respond(&context, &[])
         .expect("mock model always responds")
         .content
         .expect("the mock returns text");
@@ -52,9 +55,10 @@ fn mock_model_recalls_an_earlier_turn_on_a_follow_up() {
         ChatMessage::assistant("[mock] You said: \"my name is Ada\""),
         ChatMessage::user("what is my name?"),
     ];
+    let context = ModelContext::from_messages(history);
 
     let reply = model
-        .respond(&history, &[])
+        .respond(&context, &[])
         .expect("mock model always responds")
         .content
         .expect("the mock returns text");
@@ -166,8 +170,9 @@ fn resolve_surfaces_an_unusable_settings_file() {
 #[test]
 fn an_unavailable_model_fails_with_its_config_reason() {
     let model = ModelChoice::Unavailable("settings.json is broken".to_owned()).into_model();
+    let context = ModelContext::from_messages(vec![ChatMessage::user("hi")]);
     let error = model
-        .respond(&[ChatMessage::user("hi")], &[])
+        .respond(&context, &[])
         .expect_err("an unavailable model must refuse to respond");
     assert!(
         error.message.contains("settings.json is broken"),
@@ -179,8 +184,9 @@ fn an_unavailable_model_fails_with_its_config_reason() {
 #[test]
 fn an_unconfigured_model_fails_with_a_clear_message() {
     let model = ModelChoice::NotConfigured.into_model();
+    let context = ModelContext::from_messages(vec![ChatMessage::user("hi")]);
     let error = model
-        .respond(&[ChatMessage::user("hi")], &[])
+        .respond(&context, &[])
         .expect_err("an unconfigured model must refuse to respond");
     assert!(
         error.message.contains("not configured"),

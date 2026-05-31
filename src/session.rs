@@ -1,10 +1,10 @@
 //! Chat sessions and their ordered event log.
 //!
 //! This is the smallest useful chat loop: append the user message to a
-//! session's history, call one text model, append the assistant reply, and
-//! emit ordered events that frontends render. With a [`Storage`] attached,
-//! each session, run, and turn is also persisted, and a prior session can be
-//! reopened with [`SessionStore::resume_session`].
+//! Session's Turn History, assemble Model Context, call one text model, append
+//! the assistant reply, and emit ordered events that frontends render. With a
+//! [`Storage`] attached, each session, run, and turn is also persisted, and a
+//! prior session can be reopened with [`SessionStore::resume_session`].
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop};
+use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, Role, ToolCall};
 use crate::storage::{SessionSummary, Storage};
 use crate::tools::{CancelFlag, Registry};
@@ -73,7 +74,7 @@ impl Event {
 
 struct Session {
     id: String,
-    messages: Vec<ChatMessage>,
+    turns: TurnHistory,
     events: Vec<Event>,
     subscribers: Vec<Sender<Event>>,
     /// The in-flight run's id and its cancel flag, set while a run is executing
@@ -85,7 +86,7 @@ impl Session {
     fn new(id: String) -> Self {
         Self {
             id,
-            messages: Vec::new(),
+            turns: TurnHistory::new(),
             events: Vec::new(),
             subscribers: Vec::new(),
             active_run: None,
@@ -128,7 +129,8 @@ impl Subscription {
     }
 }
 
-/// In-memory store of chat sessions, each with its own history and event log.
+/// In-memory store of chat sessions, each with its own Turn History and event
+/// log.
 ///
 /// When a [`Storage`] is attached, every session, run, and turn is also written
 /// to the durable `~/.nav/nav.db` database so no exchange is lost across
@@ -137,6 +139,7 @@ impl Subscription {
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
     agent: Agent,
+    context_assembler: ContextAssembler,
     storage: Option<Arc<Storage>>,
     /// Identifier of the active model, tagged onto persisted assistant turns.
     model_id: Option<String>,
@@ -149,6 +152,7 @@ impl SessionStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             agent: Agent::new(model),
+            context_assembler: ContextAssembler::new(),
             storage: None,
             model_id: None,
             model_label: "unknown model".to_owned(),
@@ -213,7 +217,7 @@ impl SessionStore {
     /// Reopen a persisted session into memory so it can be continued with its
     /// prior conversation intact across backend restarts.
     ///
-    /// The stored history is loaded both as model context and as replayed
+    /// The stored history is loaded both for Model Context assembly and replayed
     /// events, so a subscriber sees the full backlog and the UI redraws the
     /// earlier turns — including tool history: an assistant tool-call turn
     /// re-emits `assistant.tool_calls` plus a `tool.started` per call, and each
@@ -251,7 +255,7 @@ impl SessionStore {
         // only the id it answers — remember each call's name from the requesting
         // assistant turn so the result can be replayed with it.
         let mut tool_names: HashMap<String, String> = HashMap::new();
-        for message in &history {
+        for message in history.as_turns() {
             match message.role {
                 Role::User => session.emit("user.message", |event| {
                     event.role = Some(Role::User.as_str().to_owned());
@@ -305,7 +309,7 @@ impl SessionStore {
                 }
             }
         }
-        session.messages = history;
+        session.turns = history;
 
         self.sessions
             .lock()
@@ -350,8 +354,8 @@ impl SessionStore {
     ///
     /// Lock discipline: agent work happens with the store lock released, so
     /// other sessions stay responsive while one is working. The lock is only
-    /// taken for the tiny critical sections that mutate a session's history and
-    /// emit its events.
+    /// taken for the tiny critical sections that mutate a Session's Turn History
+    /// and emit its events.
     pub fn send_message(&self, session_id: &str, text: &str) -> Result<String, SendError> {
         let run_id = new_id();
         let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
@@ -366,7 +370,7 @@ impl SessionStore {
             if session.active_run.is_some() {
                 return false;
             }
-            session.messages.push(ChatMessage::user(text));
+            session.turns.push(ChatMessage::user(text));
             // Register the run so `stop_run` can find its cancel flag while it
             // executes; cleared on every exit path below.
             session.active_run = Some((run_id.clone(), Arc::clone(&cancel)));
@@ -394,15 +398,18 @@ impl SessionStore {
         }
         seq += 1;
 
-        // Snapshot the history under the lock, then let the agent run unlocked.
-        let history = self.with_session(session_id, |session| session.messages.clone())?;
+        // Assemble model context under the lock, then let the agent run
+        // unlocked. The raw Session history remains the source of truth.
+        let context = self.with_session(session_id, |session| {
+            self.context_assembler.assemble(&session.turns)
+        })?;
         let mut sink = SessionRunSink {
             store: self,
             session_id,
             run_id: &run_id,
             seq,
         };
-        let outcome = self.agent.run_turn(history, &cancel, &mut sink);
+        let outcome = self.agent.run_turn(context, &cancel, &mut sink);
         // The run is over (or stopped); release its cancel flag before reporting.
         self.clear_active_run(session_id, &run_id);
         match outcome {
@@ -535,7 +542,7 @@ impl AgentRunSink for SessionRunSink<'_> {
     fn assistant_text(&mut self, content: &str) -> Result<(), Self::Error> {
         let message_id = new_id();
         self.store.with_session(self.session_id, |session| {
-            session.messages.push(ChatMessage::assistant(content));
+            session.turns.push(ChatMessage::assistant(content));
             session.emit("message.completed", |event| {
                 event.role = Some(Role::Assistant.as_str().to_owned());
                 event.text = Some(content.to_owned());
@@ -571,7 +578,7 @@ impl AgentRunSink for SessionRunSink<'_> {
     ) -> Result<(), Self::Error> {
         self.store.with_session(self.session_id, |session| {
             session
-                .messages
+                .turns
                 .push(ChatMessage::assistant_tool_calls(content, calls.to_vec()));
             session.emit("assistant.tool_calls", |event| {
                 event.role = Some(Role::Assistant.as_str().to_owned());
@@ -622,7 +629,7 @@ impl AgentRunSink for SessionRunSink<'_> {
         };
         self.store.with_session(self.session_id, |session| {
             session
-                .messages
+                .turns
                 .push(ChatMessage::tool_result(&call.id, output, is_error));
             session.emit(kind, |event| {
                 event.run_id = Some(self.run_id.to_owned());
