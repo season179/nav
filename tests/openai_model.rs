@@ -200,6 +200,43 @@ fn replays_reasoning_content_when_provider_requires_it() {
 }
 
 #[test]
+fn omits_reasoning_content_when_provider_does_not_require_it() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    );
+    let model = model_with_compat(base_url, None);
+
+    let calls = vec![ToolCall {
+        id: "call-1".to_owned(),
+        name: "ls".to_owned(),
+        arguments: "{}".to_owned(),
+    }];
+    let context = context(vec![
+        ChatMessage::user("list files"),
+        ChatMessage::assistant_tool_calls_with_reasoning("", calls, "I need to inspect files."),
+        ChatMessage::tool_result("call-1", "Cargo.toml", false),
+        ChatMessage::user("continue"),
+    ]);
+    model
+        .respond(&context, &[])
+        .expect("provider returns a reply");
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    let assistant = body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|message| message["role"] == "assistant" && message.get("tool_calls").is_some())
+        .expect("assistant tool-call message");
+    assert!(
+        assistant.get("reasoning_content").is_none(),
+        "reasoning_content should not be sent unless compat requires it: {request}"
+    );
+}
+
+#[test]
 fn omits_the_system_message_when_no_system_prompt_is_set() {
     let (base_url, requests) = fake_provider(
         "200 OK",

@@ -117,6 +117,9 @@ impl Agent {
                 let reply = response.content.unwrap_or_default();
                 sink.assistant_text(&reply, reasoning_content.as_deref())
                     .map_err(AgentRunError::Sink)?;
+                let mut assistant_turn = ChatMessage::assistant(&reply);
+                assistant_turn.reasoning_content = reasoning_content.clone();
+                context.push(assistant_turn);
                 // The reply ends the run unless a message arrived while it was
                 // produced, in which case the run continues with that message
                 // folded into the context (mid-run steering).
