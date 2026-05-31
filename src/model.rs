@@ -1,12 +1,15 @@
-//! Text-model abstraction for the minimal chat loop.
+//! Text-model abstraction for the chat/agent loop.
 //!
-//! A [`ChatModel`] turns a conversation history into one assistant reply. Two
+//! A [`ChatModel`] turns a conversation history (plus the tools it may call)
+//! into one assistant turn: free text, one or more tool calls, or both. Two
 //! implementations share this interface: [`MockModel`] is deterministic and
 //! used by tests and offline UI smoke, while the real OpenAI-compatible client
 //! talks to a configured provider.
 
 use std::fmt;
 use std::sync::Arc;
+
+use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ResolvedModelConfig};
 
@@ -23,6 +26,8 @@ const NOT_CONFIGURED_MESSAGE: &str = "model not configured: add a default model 
 pub enum Role {
     User,
     Assistant,
+    /// A tool result fed back to the model after executing a tool call.
+    Tool,
 }
 
 impl Role {
@@ -31,15 +36,35 @@ impl Role {
         match self {
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::Tool => "tool",
         }
     }
 }
 
+/// One tool call requested by an assistant turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCall {
+    /// Provider-assigned id; tool results refer back to it.
+    pub id: String,
+    /// Tool name the model wants to invoke.
+    pub name: String,
+    /// Raw JSON arguments string, exactly as the provider emitted them.
+    pub arguments: String,
+}
+
 /// One turn in a conversation history.
+///
+/// Plain user and assistant turns carry only `content`. An assistant turn may
+/// additionally carry `tool_calls`; a [`Role::Tool`] turn carries the
+/// `tool_call_id` it answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// Tool calls requested by an assistant turn (empty for every other turn).
+    pub tool_calls: Vec<ToolCall>,
+    /// For a [`Role::Tool`] turn, the assistant tool call this result answers.
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -47,6 +72,8 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -54,6 +81,68 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// An assistant turn that requests one or more tool calls. `content` may be
+    /// empty when the model returned only tool calls.
+    pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// A tool result answering a specific assistant tool call.
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
+/// A tool advertised to the model in a request.
+#[derive(Clone, Debug)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema object describing the tool's parameters.
+    pub parameters: Value,
+}
+
+/// Why the model stopped producing output for a turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    Other(String),
+}
+
+/// One assistant turn produced by the model: text, tool calls, or both.
+#[derive(Clone, Debug)]
+pub struct ModelResponse {
+    /// Assistant text, if any. `None` when the turn is purely tool calls.
+    pub content: Option<String>,
+    /// Tool calls the model wants executed before the next turn.
+    pub tool_calls: Vec<ToolCall>,
+    pub finish_reason: FinishReason,
+}
+
+impl ModelResponse {
+    /// A plain text reply that requests no tools.
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::Stop,
         }
     }
 }
@@ -80,9 +169,15 @@ impl fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-/// A text model that produces one assistant reply from a conversation history.
+/// A model that produces one assistant turn from a history and the available
+/// tools. Returning [`ModelResponse::tool_calls`] asks the caller to execute
+/// those tools and continue the conversation with their results.
 pub trait ChatModel: Send + Sync {
-    fn respond(&self, history: &[ChatMessage]) -> Result<String, ModelError>;
+    fn respond(
+        &self,
+        history: &[ChatMessage],
+        tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError>;
 }
 
 /// Which text model the backend should use.
@@ -226,14 +321,18 @@ impl OpenAiModel {
 }
 
 impl ChatModel for OpenAiModel {
-    fn respond(&self, history: &[ChatMessage]) -> Result<String, ModelError> {
-        let messages: Vec<serde_json::Value> = history
-            .iter()
-            .map(|message| {
-                serde_json::json!({ "role": message.role.as_str(), "content": message.content })
-            })
-            .collect();
-        let body = serde_json::json!({ "model": self.config.model, "messages": messages });
+    fn respond(
+        &self,
+        history: &[ChatMessage],
+        tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
+        let messages: Vec<Value> = history.iter().map(message_json).collect();
+        let mut body = json!({ "model": self.config.model, "messages": messages });
+        // Some OpenAI-compatible providers reject an empty `tools` array, so the
+        // key is sent only when tools are actually offered.
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools.iter().map(tool_json).collect());
+        }
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -244,16 +343,134 @@ impl ChatModel for OpenAiModel {
             .send_json(&body)
             .map_err(|error| ModelError::new(format!("model request failed: {error}")))?;
 
-        let payload: serde_json::Value = response
+        let payload: Value = response
             .body_mut()
             .read_json()
             .map_err(|error| ModelError::new(format!("could not read model response: {error}")))?;
 
-        payload["choices"][0]["message"]["content"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| ModelError::new(format!("unexpected model response: {payload}")))
+        parse_chat_completion(&payload)
     }
+}
+
+/// Serialize one history message into OpenAI chat-completions wire shape.
+fn message_json(message: &ChatMessage) -> Value {
+    match message.role {
+        Role::Tool => json!({
+            "role": "tool",
+            "tool_call_id": message.tool_call_id.as_deref().unwrap_or_default(),
+            "content": message.content,
+        }),
+        Role::Assistant if !message.tool_calls.is_empty() => {
+            let tool_calls: Vec<Value> = message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": { "name": call.name, "arguments": call.arguments },
+                    })
+                })
+                .collect();
+            // A pure tool-call turn has no text; providers expect null there.
+            let content = if message.content.is_empty() {
+                Value::Null
+            } else {
+                Value::String(message.content.clone())
+            };
+            json!({ "role": "assistant", "content": content, "tool_calls": tool_calls })
+        }
+        _ => json!({ "role": message.role.as_str(), "content": message.content }),
+    }
+}
+
+/// Serialize one tool definition into the OpenAI `tools` entry shape.
+fn tool_json(tool: &ToolDef) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    })
+}
+
+/// Parse a chat-completions payload into a [`ModelResponse`]. A response that
+/// carries neither text nor tool calls is treated as malformed.
+fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
+    let unexpected = || ModelError::new(format!("unexpected model response: {payload}"));
+
+    let choice = payload
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .ok_or_else(unexpected)?;
+    let message = choice.get("message").ok_or_else(unexpected)?;
+
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    // A malformed tool call must fail the parse rather than be silently dropped:
+    // skipping one would make the run continue without executing a tool the model
+    // asked for, and an empty id breaks the follow-up `tool` message OpenAI
+    // requires to reference it.
+    let tool_calls = match message.get("tool_calls").and_then(Value::as_array) {
+        Some(calls) => calls
+            .iter()
+            .map(parse_tool_call)
+            .collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
+
+    if content.is_none() && tool_calls.is_empty() {
+        return Err(unexpected());
+    }
+
+    let finish_reason = match choice.get("finish_reason").and_then(Value::as_str) {
+        Some("stop") => FinishReason::Stop,
+        Some("tool_calls") => FinishReason::ToolCalls,
+        Some("length") => FinishReason::Length,
+        Some(other) => FinishReason::Other(other.to_owned()),
+        None if !tool_calls.is_empty() => FinishReason::ToolCalls,
+        None => FinishReason::Stop,
+    };
+
+    Ok(ModelResponse {
+        content,
+        tool_calls,
+        finish_reason,
+    })
+}
+
+fn parse_tool_call(value: &Value) -> Result<ToolCall, ModelError> {
+    let malformed = || ModelError::new(format!("unexpected tool call: {value}"));
+
+    let function = value.get("function").ok_or_else(malformed)?;
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(malformed)?
+        .to_owned();
+    let arguments = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}")
+        .to_owned();
+    // OpenAI requires a non-empty id so the matching `tool` result can reference
+    // it; reject anything that wouldn't round-trip.
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(malformed)?
+        .to_owned();
+    Ok(ToolCall {
+        id,
+        name,
+        arguments,
+    })
 }
 
 /// Stand-in used when no usable model is configured; every turn fails with a
@@ -271,7 +488,11 @@ impl FailingModel {
 }
 
 impl ChatModel for FailingModel {
-    fn respond(&self, _history: &[ChatMessage]) -> Result<String, ModelError> {
+    fn respond(
+        &self,
+        _history: &[ChatMessage],
+        _tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
         Err(ModelError::new(self.message.clone()))
     }
 }
@@ -280,6 +501,7 @@ impl ChatModel for FailingModel {
 ///
 /// Its reply echoes the latest user message and references earlier turns, so a
 /// follow-up visibly proves the backend forwarded prior conversation context.
+/// It never requests tools, so it drives the loop through the plain text path.
 pub struct MockModel;
 
 impl MockModel {
@@ -295,7 +517,11 @@ impl Default for MockModel {
 }
 
 impl ChatModel for MockModel {
-    fn respond(&self, history: &[ChatMessage]) -> Result<String, ModelError> {
+    fn respond(
+        &self,
+        history: &[ChatMessage],
+        _tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
         let user_messages: Vec<&str> = history
             .iter()
             .filter(|message| message.role == Role::User)
@@ -311,6 +537,6 @@ impl ChatModel for MockModel {
             reply.push_str(&format!(". Earlier you said: \"{}\"", user_messages[0]));
         }
 
-        Ok(reply)
+        Ok(ModelResponse::text(reply))
     }
 }

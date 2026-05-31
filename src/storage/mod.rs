@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::model::ChatMessage;
+use crate::model::{ChatMessage, ToolCall};
 
 /// Canonical schema, captured verbatim from the live database.
 const SCHEMA: &str = include_str!("schema.sql");
@@ -119,9 +119,9 @@ impl Storage {
             run_id,
             seq,
             role: "user",
-            text,
             model_id: None,
             meta_json: "{}".to_owned(),
+            parts: vec![text_part(text)],
         })
     }
 
@@ -135,18 +135,87 @@ impl Storage {
         text: &str,
         model_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        let meta_json = match model_id {
-            Some(id) => serde_json::json!({ "model_id": id, "api_kind": API_KIND }).to_string(),
-            None => "{}".to_owned(),
-        };
         self.record_turn(TurnRecord {
             session_id,
             run_id,
             seq,
             role: "assistant",
-            text,
             model_id,
-            meta_json,
+            meta_json: assistant_meta(model_id),
+            parts: vec![text_part(text)],
+        })
+    }
+
+    /// Persist an assistant turn that requested tool calls: an optional text
+    /// part plus one `tool_call` part per call. `tool_call` parts are not
+    /// mirrored to the FTS index (by design — they aren't free text).
+    pub fn record_assistant_tool_calls(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        seq: i64,
+        content: Option<&str>,
+        calls: &[ToolCall],
+        model_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let mut parts = Vec::with_capacity(calls.len() + 1);
+        if let Some(content) = content.filter(|text| !text.is_empty()) {
+            parts.push(text_part(content));
+        }
+        for call in calls {
+            parts.push(TurnPart {
+                part_type: "tool_call",
+                data_json: serde_json::json!({
+                    "type": "tool_call",
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+                .to_string(),
+            });
+        }
+
+        self.record_turn(TurnRecord {
+            session_id,
+            run_id,
+            seq,
+            role: "assistant",
+            model_id,
+            meta_json: assistant_meta(model_id),
+            parts,
+        })
+    }
+
+    /// Persist a tool result as a `tool`-role turn with a single `tool_result`
+    /// part. The result text lives under `data_json.content` so the existing FTS
+    /// trigger mirrors it into search.
+    pub fn record_tool_result(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        seq: i64,
+        tool_call_id: &str,
+        content: &str,
+        is_error: bool,
+    ) -> Result<(), StorageError> {
+        let part = TurnPart {
+            part_type: "tool_result",
+            data_json: serde_json::json!({
+                "type": "tool_result",
+                "tool_call_id": tool_call_id,
+                "content": content,
+                "is_error": is_error,
+            })
+            .to_string(),
+        };
+        self.record_turn(TurnRecord {
+            session_id,
+            run_id,
+            seq,
+            role: "tool",
+            model_id: None,
+            meta_json: "{}".to_owned(),
+            parts: vec![part],
         })
     }
 
@@ -278,9 +347,7 @@ impl Storage {
 
     fn record_turn(&self, turn: TurnRecord) -> Result<(), StorageError> {
         let turn_id = new_id();
-        let part_id = new_id();
         let now = now_ms();
-        let data_json = serde_json::json!({ "type": "text", "text": turn.text }).to_string();
 
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
@@ -297,13 +364,23 @@ impl Storage {
                 turn.model_id
             ],
         )?;
-        // The turn_parts insert trigger mirrors the text into turn_parts_text and
-        // the FTS indexes automatically.
-        tx.execute(
-            "INSERT INTO turn_parts (id, turn_id, session_id, type, data_json, created_at)
-             VALUES (?1, ?2, ?3, 'text', ?4, ?5)",
-            params![part_id, turn_id, turn.session_id, data_json, now],
-        )?;
+        // One row per part. The turn_parts insert trigger mirrors text and
+        // tool_result parts into turn_parts_text and the FTS indexes; tool_call
+        // parts are intentionally not mirrored.
+        for part in &turn.parts {
+            tx.execute(
+                "INSERT INTO turn_parts (id, turn_id, session_id, type, data_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    new_id(),
+                    turn_id,
+                    turn.session_id,
+                    part.part_type,
+                    part.data_json,
+                    now
+                ],
+            )?;
+        }
         // Keep the session's updated_at fresh so listings sort sensibly.
         tx.execute(
             "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
@@ -321,9 +398,31 @@ struct TurnRecord<'a> {
     run_id: &'a str,
     seq: i64,
     role: &'a str,
-    text: &'a str,
     model_id: Option<&'a str>,
     meta_json: String,
+    parts: Vec<TurnPart>,
+}
+
+/// One persisted part of a turn: its `turn_parts.type` and `data_json` payload.
+struct TurnPart {
+    part_type: &'static str,
+    data_json: String,
+}
+
+/// A single `text` part wrapping `text`.
+fn text_part(text: &str) -> TurnPart {
+    TurnPart {
+        part_type: "text",
+        data_json: serde_json::json!({ "type": "text", "text": text }).to_string(),
+    }
+}
+
+/// `turns.meta_json` for an assistant turn, tagging the producing model.
+fn assistant_meta(model_id: Option<&str>) -> String {
+    match model_id {
+        Some(id) => serde_json::json!({ "model_id": id, "api_kind": API_KIND }).to_string(),
+        None => "{}".to_owned(),
+    }
 }
 
 fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {

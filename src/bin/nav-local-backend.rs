@@ -19,7 +19,19 @@ fn main() -> ExitCode {
 fn run() -> io::Result<()> {
     let config = nav::BackendConfig::from_args(std::env::args().skip(1))?;
     let listener = TcpListener::bind(&config.bind_address)?;
-    let local_url = format!("http://{}", listener.local_addr()?);
+    let local_addr = listener.local_addr()?;
+    let local_url = format!("http://{local_addr}");
+
+    // The agent's tools run with this process's privileges (trusted-local
+    // posture). Binding to a non-loopback interface would expose that to the
+    // network, so warn loudly if someone does.
+    if !local_addr.ip().is_loopback() {
+        eprintln!(
+            "nav-local-backend: WARNING binding to non-loopback address {local_addr}; \
+             the agent's tools run with this process's privileges and would be reachable \
+             from the network"
+        );
+    }
 
     let model = ModelChoice::resolve(|key| std::env::var(key).ok(), nav::resolve_default_config);
     eprintln!("nav-local-backend: using {}", model.describe());

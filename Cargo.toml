@@ -8,6 +8,7 @@ name = "nav-local-backend"
 path = "src/bin/nav-local-backend.rs"
 
 [dependencies]
+regex = "1.12.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

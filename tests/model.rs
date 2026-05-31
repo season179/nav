@@ -32,7 +32,11 @@ fn mock_model_reflects_the_latest_user_message() {
     let model = MockModel::new();
     let history = vec![ChatMessage::user("hello there")];
 
-    let reply = model.respond(&history).expect("mock model always responds");
+    let reply = model
+        .respond(&history, &[])
+        .expect("mock model always responds")
+        .content
+        .expect("the mock returns text");
 
     assert!(
         reply.contains("hello there"),
@@ -49,7 +53,11 @@ fn mock_model_recalls_an_earlier_turn_on_a_follow_up() {
         ChatMessage::user("what is my name?"),
     ];
 
-    let reply = model.respond(&history).expect("mock model always responds");
+    let reply = model
+        .respond(&history, &[])
+        .expect("mock model always responds")
+        .content
+        .expect("the mock returns text");
 
     assert!(
         reply.contains("what is my name?"),
@@ -159,7 +167,7 @@ fn resolve_surfaces_an_unusable_settings_file() {
 fn an_unavailable_model_fails_with_its_config_reason() {
     let model = ModelChoice::Unavailable("settings.json is broken".to_owned()).into_model();
     let error = model
-        .respond(&[ChatMessage::user("hi")])
+        .respond(&[ChatMessage::user("hi")], &[])
         .expect_err("an unavailable model must refuse to respond");
     assert!(
         error.message.contains("settings.json is broken"),
@@ -172,7 +180,7 @@ fn an_unavailable_model_fails_with_its_config_reason() {
 fn an_unconfigured_model_fails_with_a_clear_message() {
     let model = ModelChoice::NotConfigured.into_model();
     let error = model
-        .respond(&[ChatMessage::user("hi")])
+        .respond(&[ChatMessage::user("hi")], &[])
         .expect_err("an unconfigured model must refuse to respond");
     assert!(
         error.message.contains("not configured"),

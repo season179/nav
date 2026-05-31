@@ -81,8 +81,10 @@ fn returns_assistant_content_and_forwards_full_history() {
         ChatMessage::assistant("Hello, Ada."),
         ChatMessage::user("what is my name?"),
     ];
-    let reply = model.respond(&history).expect("provider returns a reply");
-    assert_eq!(reply, "Your name is Ada.");
+    let reply = model
+        .respond(&history, &[])
+        .expect("provider returns a reply");
+    assert_eq!(reply.content.as_deref(), Some("Your name is Ada."));
 
     // The request must carry the full multi-turn history so a follow-up can
     // depend on earlier context.
@@ -111,7 +113,7 @@ fn a_provider_failure_is_reported_without_leaking_the_key() {
     let model = model(base_url);
 
     let error = model
-        .respond(&[ChatMessage::user("hi")])
+        .respond(&[ChatMessage::user("hi")], &[])
         .expect_err("a 5xx response must surface as an error");
     assert!(
         !error.message.contains(TEST_API_KEY),
@@ -126,11 +128,51 @@ fn a_malformed_response_is_reported() {
     let model = model(base_url);
 
     let error = model
-        .respond(&[ChatMessage::user("hi")])
+        .respond(&[ChatMessage::user("hi")], &[])
         .expect_err("a response without choices must surface as an error");
     assert!(
         error.message.contains("unexpected model response"),
         "error should explain the malformed response, got: {}",
+        error.message
+    );
+}
+
+#[test]
+fn parses_a_well_formed_tool_call() {
+    let (base_url, _requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+           "tool_calls":[{"id":"call_1","type":"function",
+           "function":{"name":"ls","arguments":"{}"}}]}}]}"#,
+    );
+    let model = model(base_url);
+
+    let reply = model
+        .respond(&[ChatMessage::user("list files")], &[])
+        .expect("a tool-call response parses");
+    assert_eq!(reply.tool_calls.len(), 1);
+    assert_eq!(reply.tool_calls[0].id, "call_1");
+    assert_eq!(reply.tool_calls[0].name, "ls");
+}
+
+#[test]
+fn a_tool_call_with_an_empty_id_is_rejected() {
+    // OpenAI requires a non-empty id so the follow-up `tool` message can
+    // reference it; an empty id must fail rather than be silently accepted.
+    let (base_url, _requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":null,
+           "tool_calls":[{"id":"","type":"function",
+           "function":{"name":"ls","arguments":"{}"}}]}}]}"#,
+    );
+    let model = model(base_url);
+
+    let error = model
+        .respond(&[ChatMessage::user("hi")], &[])
+        .expect_err("an empty tool-call id must surface as an error");
+    assert!(
+        error.message.contains("unexpected tool call"),
+        "error should explain the malformed tool call, got: {}",
         error.message
     );
 }

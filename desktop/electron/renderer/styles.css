@@ -236,6 +236,44 @@ p {
   color: #6b6258;
 }
 
+/* Tool activity: a compact, monospace line distinct from chat bubbles. */
+.message-tool {
+  justify-self: start;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  max-width: 78%;
+  padding: 6px 12px;
+  border-color: #cfd8cf;
+  background: #f3f6f2;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.message-tool .message-role {
+  font-size: 13px;
+}
+
+.message-tool .tool-name {
+  font-weight: 600;
+  color: #4a5a48;
+}
+
+.message-tool .tool-detail {
+  color: #6b6258;
+  overflow-wrap: anywhere;
+}
+
+.message-tool-failed {
+  border-color: #c47b74;
+  background: #f8e9e6;
+}
+
+.message-tool-failed .tool-name,
+.message-tool-failed .tool-detail {
+  color: #8b332d;
+}
+
 .message-text {
   font-size: 14px;
   line-height: 1.5;
