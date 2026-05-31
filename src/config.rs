@@ -43,12 +43,15 @@ pub enum ConfigError {
     Io(String),
     Json(String),
     MissingDefaultModel,
+    MissingProviders,
     MissingProvider(String),
     MissingModel { provider: String, model: String },
     MissingBaseUrl(String),
     MissingApiKey(String),
+    MissingApi { provider: String },
     UnsupportedApi { provider: String, api: String },
     ResolutionError(String),
+    HomeDirUnavailable,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -64,6 +67,9 @@ impl std::fmt::Display for ConfigError {
                     f,
                     "Configuration is missing or invalid 'defaultModel' setup"
                 )
+            }
+            ConfigError::MissingProviders => {
+                write!(f, "Configuration is missing 'providers' setup")
             }
             ConfigError::MissingProvider(provider) => {
                 write!(
@@ -89,6 +95,13 @@ impl std::fmt::Display for ConfigError {
             ConfigError::MissingApiKey(provider) => {
                 write!(f, "Provider '{}' is missing 'apiKey'", provider)
             }
+            ConfigError::MissingApi { provider } => {
+                write!(
+                    f,
+                    "Provider '{}' (or selected model) is missing 'api' type",
+                    provider
+                )
+            }
             ConfigError::UnsupportedApi { provider, api } => {
                 write!(
                     f,
@@ -98,6 +111,12 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::ResolutionError(msg) => {
                 write!(f, "Failed to resolve configuration value: {}", msg)
+            }
+            ConfigError::HomeDirUnavailable => {
+                write!(
+                    f,
+                    "Failed to resolve user's home directory to locate settings.json"
+                )
             }
         }
     }
@@ -248,11 +267,9 @@ fn resolve_command_config_value(cmd_str: &str) -> Result<String, ConfigError> {
     })?;
 
     if !output.status.success() {
-        let stderr_lossy = String::from_utf8_lossy(&output.stderr);
         return Err(ConfigError::ResolutionError(format!(
-            "Shell command exited with failure status {}. Stderr: {}",
-            output.status,
-            stderr_lossy.trim()
+            "Shell command exited with failure status {}",
+            output.status
         )));
     }
 
@@ -313,7 +330,7 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
     let default_ref = settings
         .default_model
         .ok_or(ConfigError::MissingDefaultModel)?;
-    let providers = settings.providers.ok_or(ConfigError::MissingDefaultModel)?;
+    let providers = settings.providers.ok_or(ConfigError::MissingProviders)?;
 
     let provider_config = providers
         .get(&default_ref.provider)
@@ -339,9 +356,8 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
         .api
         .as_ref()
         .or(provider_config.api.as_ref())
-        .ok_or_else(|| ConfigError::UnsupportedApi {
+        .ok_or_else(|| ConfigError::MissingApi {
             provider: default_ref.provider.clone(),
-            api: "".to_string(),
         })?;
 
     if api != "openai-completions" {
@@ -404,7 +420,7 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
 pub fn resolve_default_config() -> Result<ResolvedModelConfig, ConfigError> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| ConfigError::FileNotFound(PathBuf::from("~/.nav/settings.json")))?;
+        .map_err(|_| ConfigError::HomeDirUnavailable)?;
     let path = PathBuf::from(home).join(".nav").join("settings.json");
     resolve_config(&path)
 }

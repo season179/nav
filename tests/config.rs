@@ -6,8 +6,8 @@ fn with_temp_settings<F>(content: &str, f: F)
 where
     F: FnOnce(&Path),
 {
-    // Generate a unique filename in the workspace to avoid conflicts.
-    let path = std::path::PathBuf::from(format!("settings_test_{}.json", uuid::Uuid::now_v7()));
+    // Generate a unique filename in the OS temp dir to keep the workspace clean.
+    let path = std::env::temp_dir().join(format!("settings_test_{}.json", uuid::Uuid::now_v7()));
     std::fs::write(&path, content).unwrap();
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -271,6 +271,7 @@ fn test_curly_env_var_api_key() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn test_command_api_key_success() {
     let settings = json!({
@@ -299,8 +300,12 @@ fn test_command_api_key_success() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn test_command_api_key_failure() {
+    // The command writes a secret to stdout and a diagnostic to stderr, then
+    // fails. This proves the resolver never embeds the command's stdout (the
+    // resolved secret) into the error message.
     let settings = json!({
         "defaultModel": {
             "provider": "openai",
@@ -309,7 +314,7 @@ fn test_command_api_key_failure() {
         "providers": {
             "openai": {
                 "baseUrl": "https://api.example.com",
-                "apiKey": "!sh -c 'echo \"failed execution\" >&2; exit 3'",
+                "apiKey": "!sh -c 'echo my-secret-key-from-cmd; echo \"failed execution\" >&2; exit 3'",
                 "api": "openai-completions",
                 "models": [
                     {
@@ -327,8 +332,7 @@ fn test_command_api_key_failure() {
         let err = res.unwrap_err();
         if let ConfigError::ResolutionError(msg) = &err {
             assert!(msg.contains("failure status"));
-            assert!(msg.contains("failed execution"));
-            // Ensure no secret output leak in error message
+            // The error must not leak the command's stdout (the resolved secret).
             assert!(!msg.contains("my-secret-key-from-cmd"));
         } else {
             panic!("Expected ResolutionError, got {:?}", err);
