@@ -292,6 +292,33 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+/* Human turns get a subtle, borderless bubble that hugs the text; the
+   timestamp stays below it, outside the fill. */
+.message-user .message-text {
+  display: inline-block;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--surface-raised);
+  text-align: left;
+}
+
+/* Timestamp footer on the last message of a party's run. Hidden until the
+   message is hovered, then it fades in. */
+.message-time {
+  display: block;
+  margin-top: 4px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+
+.message:hover .message-time {
+  opacity: 1;
+}
+
 /* Tool activity: a compact mono line, distinct from chat messages. */
 .message-tool {
   justify-self: start;
@@ -422,7 +449,8 @@ h1 {
   .new-chat,
   .session-item,
   .composer-input,
-  .composer-send {
+  .composer-send,
+  .message-time {
     transition: none;
   }
 }

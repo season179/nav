@@ -9,6 +9,12 @@ let connected = false;
 let running = false;
 let activeSessionId = null;
 
+// The most recent user/assistant message and its role. Only the last message in
+// a consecutive run from one party keeps its timestamp, so when the same party
+// speaks again we drop the stamp from its previous turn.
+let lastPartyMessage = null;
+let lastPartyRole = null;
+
 if (window.nav) {
   window.nav.onBackendStatus(handleBackendStatus);
   window.nav.onSessionEvent(handleSessionEvent);
@@ -186,6 +192,8 @@ function markActiveSession() {
 
 function clearTranscript() {
   messageListNode.replaceChildren();
+  lastPartyMessage = null;
+  lastPartyRole = null;
 }
 
 function appendMessage(role, text) {
@@ -197,8 +205,40 @@ function appendMessage(role, text) {
   body.textContent = text;
 
   item.append(body);
+  if (role === "user" || role === "assistant") {
+    stampLatestTurn(item, role);
+  }
+
   messageListNode.append(item);
   item.scrollIntoView({ block: "end" });
+}
+
+// Add a timestamp to a user/assistant turn, keeping it only on the last message
+// of a consecutive run from one party: when that party speaks again, drop the
+// stamp from its prior turn.
+function stampLatestTurn(item, role) {
+  if (lastPartyMessage && lastPartyRole === role) {
+    lastPartyMessage.querySelector(".message-time")?.remove();
+  }
+
+  const now = new Date();
+  const time = document.createElement("time");
+  time.className = "message-time";
+  time.dateTime = now.toISOString();
+  time.textContent = formatTimestamp(now);
+  item.append(time);
+
+  lastPartyMessage = item;
+  lastPartyRole = role;
+}
+
+// "dd MMM HH:MM" in 24-hour time, e.g. "31 May 15:46".
+function formatTimestamp(date) {
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = date.toLocaleString("en-US", { month: "short" });
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${day} ${month} ${hours}:${minutes}`;
 }
 
 // Render a compact tool line — a 🔧 marker, the tool name, and an optional
