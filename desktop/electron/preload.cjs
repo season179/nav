@@ -45,7 +45,10 @@ contextBridge.exposeInMainWorld("nav", {
   },
   // Switch the active conversation to an existing session.
   switchSession(sessionId) {
-    return ipcRenderer.invoke("nav:switch-session", normalizeSessionId(sessionId));
+    return ipcRenderer.invoke(
+      "nav:switch-session",
+      normalizeSessionId(sessionId),
+    );
   },
   // Start a fresh conversation and make it active.
   newSession() {

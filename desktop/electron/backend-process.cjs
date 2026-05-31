@@ -3,10 +3,22 @@ const { setTimeout: delay } = require("node:timers/promises");
 
 const STARTUP_PREFIX = "nav local backend listening on ";
 
-async function startLocalBackend({ projectRoot, startupAttempts = 80, env = {} }) {
+async function startLocalBackend({
+  projectRoot,
+  startupAttempts = 80,
+  env = {},
+}) {
   const child = spawn(
     "cargo",
-    ["run", "--quiet", "--bin", "nav-local-backend", "--", "--bind", "127.0.0.1:0"],
+    [
+      "run",
+      "--quiet",
+      "--bin",
+      "nav-local-backend",
+      "--",
+      "--bind",
+      "127.0.0.1:0",
+    ],
     {
       cwd: projectRoot,
       stdio: ["ignore", "pipe", "pipe"],

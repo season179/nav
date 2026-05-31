@@ -5,9 +5,13 @@
   "scripts": {
     "electron:dev": "electron desktop/electron/main.cjs",
     "electron:smoke": "electron desktop/electron/main.cjs --smoke",
-    "check:electron": "node --test tests/*.test.cjs"
+    "check:electron": "node --test tests/*.test.cjs",
+    "lint": "biome check",
+    "lint:fix": "biome check --write",
+    "format": "biome format --write"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.4.15",
     "electron": "^42.2.0"
   }
 }
