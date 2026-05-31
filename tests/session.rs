@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use nav::{ChatMessage, ChatModel, Event, MockModel, ModelError, SessionStore};
+use nav::{ChatMessage, ChatModel, Event, MockModel, ModelError, SessionStore, Storage};
 
 #[test]
 fn creating_a_session_emits_session_created() {
@@ -132,6 +132,66 @@ fn a_subscriber_receives_backlog_then_live_events() {
     let live = subscription.next_event().expect("a live event arrives");
     assert_eq!(live.kind, "user.message");
     assert_eq!(live.text.as_deref(), Some("second"));
+}
+
+#[test]
+fn a_persisted_session_resumes_with_its_history_after_a_restart() {
+    let path = std::env::temp_dir().join(format!("nav_session_resume_{}.db", uuid::Uuid::now_v7()));
+    let model = Arc::new(RecordingModel::new());
+
+    // First "run" of the app: hold a conversation, persisting it.
+    let session_id = {
+        let storage = Arc::new(Storage::open(&path).expect("open storage"));
+        let store = SessionStore::new(model.clone()).with_storage(storage);
+        let session_id = store.create_session();
+        store.send_message(&session_id, "my name is Ada").unwrap();
+        session_id
+    };
+
+    // Second "run": a fresh store over the same database reopens the session.
+    let storage = Arc::new(Storage::open(&path).expect("reopen storage"));
+    let store = SessionStore::new(model.clone()).with_storage(storage);
+
+    // The most recent session is discoverable and resumes.
+    assert_eq!(
+        store.latest_session_id().as_deref(),
+        Some(session_id.as_str())
+    );
+    assert!(store.resume_session(&session_id));
+
+    // Its backlog replays the earlier turns so the UI can redraw them.
+    let events = store
+        .events(&session_id)
+        .expect("the session is live again");
+    assert_eq!(
+        kinds(&events),
+        ["session.created", "user.message", "message.completed"],
+    );
+    assert_eq!(events[1].text.as_deref(), Some("my name is Ada"));
+    assert_eq!(events[2].text.as_deref(), Some("recorded reply"));
+
+    // A new turn carries the resumed history as context to the model.
+    store.send_message(&session_id, "what is my name?").unwrap();
+    assert_eq!(
+        model.last_history(),
+        vec![
+            ChatMessage::user("my name is Ada"),
+            ChatMessage::assistant("recorded reply"),
+            ChatMessage::user("what is my name?"),
+        ],
+    );
+
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn resuming_an_unknown_session_fails_and_latest_is_none_without_storage() {
+    let store = SessionStore::new(Arc::new(MockModel::new()));
+    // No storage attached: nothing to discover or resume.
+    assert_eq!(store.latest_session_id(), None);
+    assert!(!store.resume_session("anything"));
 }
 
 /// A model that records the history it was asked to respond to.

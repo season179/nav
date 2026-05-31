@@ -1,8 +1,10 @@
-//! In-memory chat sessions and their ordered event log.
+//! Chat sessions and their ordered event log.
 //!
 //! This is the smallest useful chat loop: append the user message to a
 //! session's history, call one text model, append the assistant reply, and
-//! emit ordered events that frontends render. Nothing is persisted.
+//! emit ordered events that frontends render. With a [`Storage`] attached,
+//! each session, run, and turn is also persisted, and a prior session can be
+//! reopened with [`SessionStore::resume_session`].
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -12,6 +14,10 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::model::{ChatMessage, ChatModel, Role};
+use crate::storage::Storage;
+
+/// How a session originates, recorded on the persisted `sessions` row.
+const SESSION_SOURCE: &str = "nav";
 
 /// One ordered, renderable session event. The flat shape matches what the
 /// Electron renderer already consumes over SSE.
@@ -103,9 +109,17 @@ impl Subscription {
 }
 
 /// In-memory store of chat sessions, each with its own history and event log.
+///
+/// When a [`Storage`] is attached, every session, run, and turn is also written
+/// to the durable `~/.nav/nav.db` database so no exchange is lost across
+/// restarts. Persistence is best-effort: a storage failure is logged but never
+/// interrupts the live chat.
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
     model: Arc<dyn ChatModel>,
+    storage: Option<Arc<Storage>>,
+    /// Identifier of the active model, tagged onto persisted assistant turns.
+    model_id: Option<String>,
 }
 
 impl SessionStore {
@@ -113,7 +127,21 @@ impl SessionStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             model,
+            storage: None,
+            model_id: None,
         }
+    }
+
+    /// Attach durable storage so sessions and exchanges survive restarts.
+    pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Record which model produced assistant replies (persisted on each turn).
+    pub fn with_model_id(mut self, model_id: Option<String>) -> Self {
+        self.model_id = model_id;
+        self
     }
 
     /// Create a new session and emit its `session.created` event.
@@ -122,11 +150,82 @@ impl SessionStore {
         let mut session = Session::new(session_id.clone());
         session.emit("session.created", |_| {});
 
+        if let Some(storage) = &self.storage {
+            log_storage(
+                "create_session",
+                storage.create_session(&session_id, SESSION_SOURCE),
+            );
+        }
+
         self.sessions
             .lock()
             .unwrap()
             .insert(session_id.clone(), session);
         session_id
+    }
+
+    /// Reopen a persisted session into memory so it can be continued with its
+    /// prior conversation intact across backend restarts.
+    ///
+    /// The stored history is loaded both as model context and as replayed
+    /// `user.message` / `message.completed` events, so a subscriber sees the
+    /// full backlog and the UI redraws the earlier turns. Idempotent: a session
+    /// already live is a no-op success. Returns `false` when the session cannot
+    /// be found in storage (or no storage is attached).
+    pub fn resume_session(&self, session_id: &str) -> bool {
+        if self.sessions.lock().unwrap().contains_key(session_id) {
+            return true;
+        }
+
+        let Some(storage) = &self.storage else {
+            return false;
+        };
+        if !matches!(storage.session_exists(session_id), Ok(true)) {
+            return false;
+        }
+        let history = match storage.load_history(session_id) {
+            Ok(history) => history,
+            Err(error) => {
+                eprintln!("nav: failed to load history for {session_id}: {error}");
+                return false;
+            }
+        };
+
+        let mut session = Session::new(session_id.to_owned());
+        session.emit("session.created", |_| {});
+        for message in &history {
+            match message.role {
+                Role::User => session.emit("user.message", |event| {
+                    event.role = Some(Role::User.as_str().to_owned());
+                    event.text = Some(message.content.clone());
+                }),
+                Role::Assistant => session.emit("message.completed", |event| {
+                    event.role = Some(Role::Assistant.as_str().to_owned());
+                    event.text = Some(message.content.clone());
+                    event.message_id = Some(new_id());
+                }),
+            }
+        }
+        session.messages = history;
+
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), session);
+        true
+    }
+
+    /// The most recent persisted nav session id, if durable storage is attached
+    /// and holds at least one session.
+    pub fn latest_session_id(&self) -> Option<String> {
+        let storage = self.storage.as_ref()?;
+        match storage.most_recent_session(SESSION_SOURCE) {
+            Ok(id) => id,
+            Err(error) => {
+                eprintln!("nav: failed to look up latest session: {error}");
+                None
+            }
+        }
     }
 
     /// Run one chat turn: record the user message, call the model with the full
@@ -157,6 +256,16 @@ impl SessionStore {
             (run_id, session.messages.clone())
         };
 
+        // Persist the run and the user turn (seq 0) before the model call so a
+        // crash mid-response still leaves the question on record.
+        if let Some(storage) = &self.storage {
+            log_storage("start_run", storage.start_run(&run_id, session_id));
+            log_storage(
+                "record_user_text",
+                storage.record_user_text(session_id, &run_id, 0, text),
+            );
+        }
+
         let reply = self.model.respond(&history);
 
         let mut sessions = self.sessions.lock().unwrap();
@@ -177,6 +286,20 @@ impl SessionStore {
                     event.run_id = Some(run_id.clone());
                     event.status = Some("completed".to_owned());
                 });
+
+                if let Some(storage) = &self.storage {
+                    log_storage(
+                        "record_assistant_text",
+                        storage.record_assistant_text(
+                            session_id,
+                            &run_id,
+                            1,
+                            &reply,
+                            self.model_id.as_deref(),
+                        ),
+                    );
+                    log_storage("complete_run", storage.complete_run(&run_id));
+                }
             }
             Err(error) => {
                 session.emit("run.failed", |event| {
@@ -184,6 +307,10 @@ impl SessionStore {
                     event.status = Some("failed".to_owned());
                     event.error = Some(error.message.clone());
                 });
+
+                if let Some(storage) = &self.storage {
+                    log_storage("fail_run", storage.fail_run(&run_id, &error.message));
+                }
             }
         }
 
@@ -216,4 +343,12 @@ impl SessionStore {
 
 fn new_id() -> String {
     Uuid::now_v7().to_string()
+}
+
+/// Surface a persistence failure without interrupting the live chat. The chat
+/// stays usable; the operator sees which write was dropped.
+fn log_storage(operation: &str, result: Result<(), crate::storage::StorageError>) {
+    if let Err(error) = result {
+        eprintln!("nav: failed to persist {operation}: {error}");
+    }
 }

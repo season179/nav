@@ -2,12 +2,14 @@
 //!
 //! Two routes back the chat loop:
 //!
-//! - `POST /rpc` — JSON-RPC `session.create` and `session.sendMessage`.
+//! - `POST /rpc` — JSON-RPC `session.create`, `session.resume`,
+//!   `session.latest`, and `session.sendMessage`.
 //! - `GET /sessions/{id}/events` — a live Server-Sent Events feed of one
 //!   session's ordered events.
 //!
-//! State lives in memory only; there is no durable persistence, tools, or
-//! approvals here.
+//! Live session state is in memory, but each session and exchange is persisted
+//! to the shared `~/.nav/nav.db` so a conversation can be resumed across
+//! restarts. There are no tools or approvals here.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -19,12 +21,14 @@ use serde_json::{Value, json};
 mod config;
 mod model;
 mod session;
+mod storage;
 
 pub use config::{ConfigError, ResolvedModelConfig, resolve_config, resolve_default_config};
 pub use model::{
     ChatMessage, ChatModel, MockModel, ModelChoice, ModelError, OpenAiConfig, OpenAiModel, Role,
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
+pub use storage::{Storage, StorageError};
 
 /// Command-line configuration for the backend binary.
 pub struct BackendConfig {
@@ -116,6 +120,23 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
         Some("session.create") => {
             let session_id = store.create_session();
             write_rpc_result(stream, &id, json!({ "sessionId": session_id }))
+        }
+        Some("session.latest") => {
+            let latest = store.latest_session_id();
+            write_rpc_result(stream, &id, json!({ "sessionId": latest }))
+        }
+        Some("session.resume") => {
+            let session_id = request
+                .get("params")
+                .and_then(|p| p.get("sessionId"))
+                .and_then(Value::as_str);
+            match session_id {
+                Some(session_id) if store.resume_session(session_id) => {
+                    write_rpc_result(stream, &id, json!({ "sessionId": session_id }))
+                }
+                Some(_) => write_rpc_error(stream, &id, "unknown session"),
+                None => write_rpc_error(stream, &id, "session.resume requires sessionId"),
+            }
         }
         Some("session.sendMessage") => {
             let params = request.get("params");

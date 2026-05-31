@@ -57,8 +57,7 @@ async function startChatSession(window) {
     backendProcess = backend.child;
     backendUrl = backend.url;
 
-    const created = await sendRpc({ backendUrl, method: "session.create" });
-    sessionId = created.result.sessionId;
+    sessionId = await openSession();
 
     sendStatus(window, { state: "connected", backendUrl, sessionId });
 
@@ -87,6 +86,24 @@ async function startChatSession(window) {
       app.exit(1);
     }
   }
+}
+
+// Reopen the most recent conversation so sessions persist across launches.
+// Smoke mode always starts fresh to stay deterministic.
+async function openSession() {
+  if (!smokeMode) {
+    const latest = await sendRpc({ backendUrl, method: "session.latest" });
+    if (latest.result.sessionId) {
+      const resumed = await sendRpc({
+        backendUrl,
+        method: "session.resume",
+        params: { sessionId: latest.result.sessionId },
+      });
+      return resumed.result.sessionId;
+    }
+  }
+  const created = await sendRpc({ backendUrl, method: "session.create" });
+  return created.result.sessionId;
 }
 
 function forwardEvent(window, event) {
