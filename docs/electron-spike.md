@@ -46,6 +46,26 @@ bun run electron:smoke
 Launches Electron with the mock model, sends one message, prints
 `nav electron smoke received run.completed`, and exits.
 
+### Startup trace
+
+Electron startup tracing is off by default. To collect a local trace, enable it
+in `~/.nav/settings.json`:
+
+```json
+{
+  "observability": {
+    "startupTrace": true
+  }
+}
+```
+
+When enabled, Electron writes a small JSONL trace to
+`~/.nav/traces/startup.jsonl`. The trace is intentionally sanitized: it records
+phase timings, process ids, status, session ids, and model kind, but not prompts,
+message text, API keys, raw environment, or provider payloads. The file rotates
+after 1 MB, keeping five prior files. Smoke mode also prints a compact startup
+summary with total, backend, session-open, and renderer timings.
+
 ## Manual Verification
 
 1. Launch with a real model: `NAV_API_KEY=... bun run electron:dev`.

@@ -8,6 +8,7 @@ function subscribeToSessionEvents({
   signal,
   onEvent,
   onError,
+  onOpen,
 }) {
   const eventsUrl = new URL(`/sessions/${sessionId}/events`, backendUrl);
   const transport = eventsUrl.protocol === "https:" ? https : http;
@@ -15,6 +16,7 @@ function subscribeToSessionEvents({
   let closed = false;
 
   const request = transport.get(eventsUrl, (response) => {
+    onOpen?.({ statusCode: response.statusCode });
     if (response.statusCode !== 200) {
       response.resume();
       onError(new Error(`SSE request failed with HTTP ${response.statusCode}`));

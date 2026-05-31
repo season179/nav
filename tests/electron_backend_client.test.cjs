@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
@@ -10,6 +11,7 @@ const {
   sendRpc,
 } = require("../desktop/electron/backend-client.cjs");
 const {
+  collectStderrLines,
   startLocalBackend,
 } = require("../desktop/electron/backend-process.cjs");
 
@@ -84,6 +86,60 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
   assert.match(assistantReplies[1].text, /my name is Ada/);
 });
 
+test("SSE subscription reports non-200 response status before failing", async () => {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(503);
+    response.end("unavailable");
+  });
+  await listen(server);
+  const { port } = server.address();
+  const opened = [];
+
+  try {
+    await assert.rejects(
+      new Promise((resolve, reject) => {
+        subscribeToSessionEvents({
+          backendUrl: `http://127.0.0.1:${port}`,
+          sessionId: "session-id",
+          onEvent: resolve,
+          onError: reject,
+          onOpen(event) {
+            opened.push(event);
+          },
+        });
+      }),
+      /SSE request failed with HTTP 503/,
+    );
+  } finally {
+    await close(server);
+  }
+
+  assert.deepEqual(opened, [{ statusCode: 503 }]);
+});
+
+test("backend stderr collector preserves split trace lines", () => {
+  const lines = [];
+  const remainder = collectStderrLines({
+    chunk: 'nav startup trace {"event":"backend.',
+    onLine(line) {
+      lines.push(line);
+    },
+  });
+  const finalRemainder = collectStderrLines({
+    chunk: 'ready"}\nnav-local-backend: using mock\npartial',
+    previousRemainder: remainder,
+    onLine(line) {
+      lines.push(line);
+    },
+  });
+
+  assert.deepEqual(lines, [
+    'nav startup trace {"event":"backend.ready"}',
+    "nav-local-backend: using mock",
+  ]);
+  assert.equal(finalRemainder, "partial");
+});
+
 async function startMockBackend() {
   // Persist to a throwaway database so the test never touches ~/.nav/nav.db.
   const dbPath = path.join(
@@ -105,4 +161,22 @@ async function startMockBackend() {
       }
     },
   };
+}
+
+function listen(server) {
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+}
+
+function close(server) {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
 }
