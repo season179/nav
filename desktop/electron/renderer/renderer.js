@@ -26,6 +26,27 @@ if (window.nav) {
   });
 }
 
+// Grow the textarea to fit its content so long, multi-line prompts stay
+// visible, up to the max-height set in CSS (past which it scrolls).
+function autoResizeInput() {
+  input.style.height = "auto";
+  input.style.height = `${input.scrollHeight}px`;
+}
+
+input.addEventListener("input", autoResizeInput);
+
+// Enter sends; Shift+Enter inserts a newline. Ignore Enter while an IME
+// composition is active so committing a candidate doesn't send early.
+input.addEventListener("keydown", (keyEvent) => {
+  if (keyEvent.isComposing) {
+    return;
+  }
+  if (keyEvent.key === "Enter" && !keyEvent.shiftKey) {
+    keyEvent.preventDefault();
+    composer.requestSubmit();
+  }
+});
+
 composer.addEventListener("submit", async (submitEvent) => {
   submitEvent.preventDefault();
   const text = input.value.trim();
@@ -34,6 +55,7 @@ composer.addEventListener("submit", async (submitEvent) => {
   }
 
   input.value = "";
+  autoResizeInput();
   setRunning(true);
   try {
     await window.nav.sessionSendMessage(text);

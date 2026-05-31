@@ -511,6 +511,7 @@ h1 {
 
 .composer {
   display: flex;
+  align-items: flex-end;
   gap: 12px;
   padding: 18px 28px;
   border-top: 1px solid var(--border);
@@ -528,6 +529,10 @@ h1 {
   font-family: inherit;
   font-size: 14px;
   line-height: 1.4;
+  /* Grows with content (height set in JS); caps out before scrolling. */
+  resize: none;
+  overflow-y: auto;
+  max-height: 200px;
   transition:
     border-color 150ms ease-out,
     box-shadow 150ms ease-out;
