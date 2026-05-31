@@ -107,6 +107,17 @@ impl Agent {
                     continue;
                 }
                 sink.tool_started(call).map_err(AgentRunError::Sink)?;
+                // Re-check at the dispatch boundary: `tool_started` took the
+                // session lock and emitted an event, a window in which a stop
+                // could land. Closing it here keeps a non-polling tool
+                // (`write`/`edit`) from running after a stop was requested.
+                if cancel.load(Ordering::Relaxed) {
+                    let note = "[cancelled before execution]";
+                    context.push(ChatMessage::tool_result(&call.id, note, true));
+                    sink.tool_result(call, note, true)
+                        .map_err(AgentRunError::Sink)?;
+                    continue;
+                }
                 let result = self.registry.execute_call(call, &self.workspace, cancel);
                 context.push(ChatMessage::tool_result(
                     &call.id,
