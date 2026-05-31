@@ -218,6 +218,11 @@ Exit criteria:
 
 Prerequisite: a runnable local HTTP/SSE backend endpoint exists.
 
+Current state: this checkout has a minimal Electron spike under
+`desktop/electron/`. It starts the `nav-local-backend` fixture from Electron
+Main, receives the deterministic fixture stream over HTTP/SSE, and renders the
+events read-only. It is intentionally not a polished desktop product.
+
 - Add the smallest Electron shell.
 - Keep the renderer secure by default.
 - Start or attach to the backend from Electron Main.

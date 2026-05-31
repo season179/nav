@@ -1,0 +1,13 @@
+{
+  "name": "nav",
+  "private": true,
+  "description": "Learning project for building a coding agent.",
+  "scripts": {
+    "electron:dev": "electron desktop/electron/main.cjs",
+    "electron:smoke": "electron desktop/electron/main.cjs --smoke",
+    "check:electron": "node --test tests/*.test.cjs"
+  },
+  "devDependencies": {
+    "electron": "^42.2.0"
+  }
+}

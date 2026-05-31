@@ -21,6 +21,18 @@ cargo run --bin nav-local-backend -- --bind 127.0.0.1:0
 See [docs/local-backend.md](docs/local-backend.md) for the printed URL contract,
 fixture session ID, SSE event shape, and curl verification path.
 
+## Electron Spike
+
+The read-only Electron spike can render that fixture stream:
+
+```sh
+bun install
+bun run electron:dev
+```
+
+See [docs/electron-spike.md](docs/electron-spike.md) for the boundary and smoke
+verification path.
+
 ## License
 
 MIT. See `LICENSE`.

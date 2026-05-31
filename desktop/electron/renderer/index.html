@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>nav</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>nav</h1>
+          <p id="session-id">Waiting for backend</p>
+        </div>
+        <div class="status" id="backend-status">Starting</div>
+      </header>
+
+      <section class="stream" aria-label="Session event stream">
+        <ol class="event-list" id="event-list"></ol>
+      </section>
+    </main>
+    <script src="./renderer.js"></script>
+  </body>
+</html>
