@@ -5,8 +5,8 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::paths::resolve_in_cwd;
-use super::truncate::cap_head;
+use super::support::paths::resolve_in_cwd;
+use super::support::truncate::cap_head;
 use super::{CancelFlag, Tool, ToolError, ToolOutput, arg_opt_u64, arg_str};
 
 pub struct ReadTool;

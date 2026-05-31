@@ -5,8 +5,8 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::paths::resolve_in_cwd;
-use super::truncate::{TRUNCATION_MARKER, cap_head};
+use super::support::paths::resolve_in_cwd;
+use super::support::truncate::{TRUNCATION_MARKER, cap_head};
 use super::{CancelFlag, Tool, ToolError, ToolOutput, arg_opt_str, arg_opt_u64};
 
 const DEFAULT_LIMIT: usize = 500;

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::truncate::cap_tail;
+use super::support::truncate::cap_tail;
 use super::{CancelFlag, Tool, ToolError, ToolOutput, arg_opt_u64, arg_str};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;

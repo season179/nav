@@ -9,8 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use serde_json::Value;
-
 use crate::model::{ChatMessage, ChatModel, ModelError, ToolCall};
 use crate::tools::{CancelFlag, Registry};
 
@@ -76,32 +74,15 @@ impl Agent {
 
             for call in &calls {
                 sink.tool_started(call).map_err(AgentRunError::Sink)?;
-                let (output, is_error) = self.run_tool(call, &cancel);
-                history.push(ChatMessage::tool_result(&call.id, &output, is_error));
-                sink.tool_result(call, &output, is_error)
+                let result = self.registry.execute_call(call, &self.workspace, &cancel);
+                history.push(ChatMessage::tool_result(
+                    &call.id,
+                    &result.content,
+                    result.is_error,
+                ));
+                sink.tool_result(call, &result.content, result.is_error)
                     .map_err(AgentRunError::Sink)?;
             }
-        }
-    }
-
-    /// Execute one tool call, returning the text the next model call should see
-    /// and whether the result represents a tool failure.
-    fn run_tool(&self, call: &ToolCall, cancel: &CancelFlag) -> (String, bool) {
-        let Some(tool) = self.registry.get(&call.name) else {
-            return (format!("unknown tool: {}", call.name), true);
-        };
-        let trimmed = call.arguments.trim();
-        let args: Value = if trimmed.is_empty() {
-            Value::Object(Default::default())
-        } else {
-            match serde_json::from_str(trimmed) {
-                Ok(args) => args,
-                Err(error) => return (format!("invalid tool arguments: {error}"), true),
-            }
-        };
-        match tool.execute(&args, &self.workspace, cancel) {
-            Ok(output) => (output.content, false),
-            Err(error) => (error.message, true),
         }
     }
 }

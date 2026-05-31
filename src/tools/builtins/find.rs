@@ -4,10 +4,10 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::glob::glob_to_regex;
-use super::paths::{display_relative, resolve_in_cwd};
-use super::truncate::{TRUNCATION_MARKER, cap_head};
-use super::walk::walk_files;
+use super::support::glob::glob_to_regex;
+use super::support::paths::{display_relative, resolve_in_cwd};
+use super::support::truncate::{TRUNCATION_MARKER, cap_head};
+use super::support::walk::walk_files;
 use super::{CancelFlag, Tool, ToolError, ToolOutput, arg_opt_str, arg_opt_u64, arg_str};
 
 const DEFAULT_LIMIT: usize = 1000;

@@ -6,6 +6,10 @@
 //! tools refuse to escape the workspace, `bash` is time-bounded and exempt
 //! (it runs with your shell's privileges), and every tool caps its output. The
 //! backend is expected to stay bound to loopback.
+//!
+//! The [`Registry`] is the seam used by the agent: it advertises tool
+//! definitions and executes Tool Calls. Model-visible Tools live in
+//! `builtins/`; shared implementation helpers live in `support/`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,19 +17,10 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 
-use crate::model::ToolDef;
+use crate::model::{ToolCall, ToolDef};
 
-mod bash;
-mod edit;
-mod find;
-mod glob;
-mod grep;
-mod ls;
-mod paths;
-mod read;
-mod truncate;
-mod walk;
-mod write;
+mod builtins;
+mod support;
 
 #[cfg(test)]
 mod tests;
@@ -48,8 +43,8 @@ impl ToolOutput {
     }
 }
 
-/// A tool failure. The agent loop turns this into an error tool result fed back
-/// to the model (so it can recover), not a run failure.
+/// A tool implementation failure. The registry turns this into an error tool
+/// result fed back to the model (so it can recover), not a run failure.
 #[derive(Debug)]
 pub struct ToolError {
     pub message: String,
@@ -59,6 +54,30 @@ impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+        }
+    }
+}
+
+/// A completed tool call as the agent sees it: text plus whether it should be
+/// fed back to the model as an error result.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ToolResult {
+    pub content: String,
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    fn ok(output: ToolOutput) -> Self {
+        Self {
+            content: output.content,
+            is_error: false,
+        }
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            content: message.into(),
+            is_error: true,
         }
     }
 }
@@ -87,15 +106,7 @@ impl Registry {
     /// The default coding toolset: read, bash, edit, write, grep, find, ls.
     pub fn coding() -> Self {
         Self {
-            tools: vec![
-                Box::new(read::ReadTool),
-                Box::new(bash::BashTool),
-                Box::new(edit::EditTool),
-                Box::new(write::WriteTool),
-                Box::new(grep::GrepTool),
-                Box::new(find::FindTool),
-                Box::new(ls::LsTool),
-            ],
+            tools: builtins::coding_tools(),
         }
     }
 
@@ -111,12 +122,39 @@ impl Registry {
             .collect()
     }
 
-    /// Look up a tool by the name the model called.
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+    /// Execute one model-requested tool call.
+    ///
+    /// Tool failures are returned as error tool results, not as run failures,
+    /// so the model can recover on the next turn.
+    pub fn execute_call(&self, call: &ToolCall, cwd: &Path, cancel: &CancelFlag) -> ToolResult {
+        let Some(tool) = self.tool(&call.name) else {
+            return ToolResult::error(format!("unknown tool: {}", call.name));
+        };
+        let args = match parse_arguments(&call.arguments) {
+            Ok(args) => args,
+            Err(error) => return ToolResult::error(format!("invalid tool arguments: {error}")),
+        };
+
+        match tool.execute(&args, cwd, cancel) {
+            Ok(output) => ToolResult::ok(output),
+            Err(error) => ToolResult::error(error.message),
+        }
+    }
+
+    fn tool(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
             .iter()
             .find(|tool| tool.name() == name)
             .map(|tool| tool.as_ref())
+    }
+}
+
+fn parse_arguments(arguments: &str) -> Result<Value, serde_json::Error> {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        Ok(Value::Object(Default::default()))
+    } else {
+        serde_json::from_str(trimmed)
     }
 }
 

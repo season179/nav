@@ -7,7 +7,9 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::json;
 
-use super::{CancelFlag, Registry, ToolOutput};
+use crate::model::ToolCall;
+
+use super::{CancelFlag, Registry, ToolResult};
 
 /// A throwaway workspace directory, removed on drop.
 struct Workspace {
@@ -44,14 +46,27 @@ fn no_cancel() -> CancelFlag {
     Arc::new(AtomicBool::new(false))
 }
 
-/// Run a tool by name and require success.
-fn run(workspace: &Workspace, tool: &str, args: serde_json::Value) -> ToolOutput {
+fn tool_call(tool: &str, args: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: "call-1".to_owned(),
+        name: tool.to_owned(),
+        arguments: args.to_string(),
+    }
+}
+
+/// Execute a tool call through the registry and require success.
+fn run(workspace: &Workspace, tool: &str, args: serde_json::Value) -> ToolResult {
     let registry = Registry::coding();
-    registry
-        .get(tool)
-        .unwrap_or_else(|| panic!("tool {tool} is registered"))
-        .execute(&args, &workspace.path, &no_cancel())
-        .unwrap_or_else(|error| panic!("{tool} failed: {}", error.message))
+    let result = registry.execute_call(&tool_call(tool, args), &workspace.path, &no_cancel());
+    assert!(!result.is_error, "{tool} failed: {}", result.content);
+    result
+}
+
+fn run_error(workspace: &Workspace, tool: &str, args: serde_json::Value) -> ToolResult {
+    let registry = Registry::coding();
+    let result = registry.execute_call(&tool_call(tool, args), &workspace.path, &no_cancel());
+    assert!(result.is_error, "{tool} should have failed");
+    result
 }
 
 #[test]
@@ -118,16 +133,12 @@ fn edit_rejects_a_non_unique_match() {
     let workspace = Workspace::new();
     workspace.write("dup.txt", "x\nx\n");
 
-    let error = Registry::coding()
-        .get("edit")
-        .unwrap()
-        .execute(
-            &json!({ "path": "dup.txt", "edits": [{ "oldText": "x", "newText": "y" }] }),
-            &workspace.path,
-            &no_cancel(),
-        )
-        .expect_err("ambiguous match must fail");
-    assert!(error.message.contains("not unique"), "{}", error.message);
+    let error = run_error(
+        &workspace,
+        "edit",
+        json!({ "path": "dup.txt", "edits": [{ "oldText": "x", "newText": "y" }] }),
+    );
+    assert!(error.content.contains("not unique"), "{}", error.content);
     // The file is left untouched on failure.
     assert_eq!(workspace.read("dup.txt"), "x\nx\n");
 }
@@ -192,18 +203,44 @@ fn bash_reports_a_nonzero_exit_status() {
 #[test]
 fn path_tools_refuse_to_escape_the_workspace() {
     let workspace = Workspace::new();
-    let error = Registry::coding()
-        .get("read")
-        .unwrap()
-        .execute(
-            &json!({ "path": "../../etc/passwd" }),
-            &workspace.path,
-            &no_cancel(),
-        )
-        .expect_err("escaping the workspace must fail");
+    let error = run_error(&workspace, "read", json!({ "path": "../../etc/passwd" }));
     assert!(
-        error.message.contains("escapes the workspace"),
+        error.content.contains("escapes the workspace"),
         "{}",
-        error.message
+        error.content
+    );
+}
+
+#[test]
+fn registry_reports_unknown_tools_as_error_results() {
+    let workspace = Workspace::new();
+    let result = Registry::coding().execute_call(
+        &tool_call("nope", json!({})),
+        &workspace.path,
+        &no_cancel(),
+    );
+
+    assert!(result.is_error);
+    assert_eq!(result.content, "unknown tool: nope");
+}
+
+#[test]
+fn registry_reports_invalid_json_as_error_results() {
+    let workspace = Workspace::new();
+    let result = Registry::coding().execute_call(
+        &ToolCall {
+            id: "call-1".to_owned(),
+            name: "ls".to_owned(),
+            arguments: "{".to_owned(),
+        },
+        &workspace.path,
+        &no_cancel(),
+    );
+
+    assert!(result.is_error);
+    assert!(
+        result.content.contains("invalid tool arguments"),
+        "{}",
+        result.content
     );
 }

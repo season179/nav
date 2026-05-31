@@ -5,7 +5,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::paths::resolve_in_cwd;
+use super::support::paths::resolve_in_cwd;
 use super::{CancelFlag, Tool, ToolError, ToolOutput, arg_str};
 
 pub struct WriteTool;

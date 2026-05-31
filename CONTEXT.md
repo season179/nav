@@ -21,8 +21,13 @@ _Avoid_: Request, job
 One persisted message-shaped entry in a session history.
 _Avoid_: Event, log line
 
+**Tool**:
+A model-visible capability with a schema and executor that may act against the
+local workspace.
+_Avoid_: Helper, command
+
 **Tool Call**:
-A model-requested action that the agent may execute against the local workspace.
+A model-requested invocation of a Tool.
 _Avoid_: Command, function call
 
 **Tool Result**:
@@ -34,7 +39,9 @@ _Avoid_: Output, response
 - A **Session** contains many **Runs**.
 - A **Run** starts from one user **Turn** and produces assistant **Turns**.
 - A **Run** is executed by one or more **Agents**.
+- An **Agent** has access to many **Tools**.
 - An **Agent** may execute many **Tool Calls** during one **Run**.
+- Each **Tool Call** names exactly one **Tool**.
 - Each **Tool Call** produces exactly one **Tool Result**.
 
 ## Example dialogue
