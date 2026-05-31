@@ -12,12 +12,12 @@ Do not build the full Electron app as one milestone.
 
 The first Electron milestone should be a small viability slice:
 
-1. Decide whether Electron should attach to the existing local HTTP/SSE
-   protocol or introduce a separate child-process transport.
-2. Start a minimal Electron shell with a secure renderer/preload/main boundary.
-3. Launch or attach to the local Rust backend from Electron Main.
-4. Render one existing session event stream read-only.
-5. Add one command path, probably `session.sendMessage`.
+1. Record the HTTP/SSE transport decision.
+2. Create or verify a runnable local HTTP/SSE backend surface.
+3. Start a minimal Electron shell with a secure renderer/preload/main boundary.
+4. Launch or attach to the local Rust backend from Electron Main.
+5. Render one backend session event stream read-only.
+6. Add one command path, probably `session.sendMessage`.
 
 Approvals, durable replay, crash recovery, multi-window behavior, packaging,
 auto-update, and polished desktop UI should come later.
@@ -43,16 +43,23 @@ backend and protocol are settled.
 
 ## Transport Decision
 
-Decision: Electron will use the existing `nav` local HTTP/SSE protocol first.
+Decision: Electron will use the chosen `nav` local HTTP/SSE protocol first.
 
 ```text
 commands: POST /rpc
 events:   GET /sessions/{session_id}/events
 ```
 
-The current architecture docs describe JSON-RPC over HTTP for commands and SSE
-for ordered session events. Electron should start by acting as another frontend
+The architecture docs describe JSON-RPC over HTTP for commands and SSE for
+ordered session events. Electron should start by acting as another frontend
 client of that contract, not by inventing a second protocol.
+
+Current state: this checkout does not yet have a runnable `nav-server`
+implementation or a `crates/nav-protocol` crate. Treat those names as possible
+future implementation names, not as current components. Before desktop shell
+work starts, there must be a runnable local HTTP/SSE backend endpoint and a
+minimal protocol surface, or the desktop spike must stop and report that
+backend prerequisite instead of adding fake UI scaffolding.
 
 Recommended first shape:
 
@@ -61,7 +68,7 @@ Electron Renderer
   -> Electron Preload API
   -> Electron Main Process
   -> local HTTP/SSE client
-  -> nav-server
+  -> local nav backend endpoint
 ```
 
 Use a `stdin/stdout` transport only if there is a concrete reason the HTTP/SSE
@@ -193,16 +200,22 @@ transcripts or provider state.
 
 ### Phase 0: Transport Decision
 
-- Re-read the current protocol docs and implementation.
-- Confirm whether Electron can use local HTTP/SSE unchanged.
-- Document any reason to add a `stdin/stdout` adapter.
+- Re-read the archived protocol docs and the current checkout.
+- Confirm the selected transport is local HTTP/SSE.
+- Do not assume `nav-server` or `crates/nav-protocol` already exist.
+- Open or complete the prerequisite backend/protocol work needed for a runnable
+  local HTTP/SSE endpoint.
 - Do not create desktop UI scaffolding yet.
 
 Exit criteria:
 
-- One written decision: HTTP/SSE first, or a justified adapter.
+- One written decision: HTTP/SSE first.
+- One runnable local HTTP/SSE endpoint exists, or the Electron work is blocked
+  on a specific backend/protocol issue.
 
 ### Phase 1: Read-Only Desktop Spike
+
+Prerequisite: a runnable local HTTP/SSE backend endpoint exists.
 
 - Add the smallest Electron shell.
 - Keep the renderer secure by default.
@@ -212,7 +225,7 @@ Exit criteria:
 
 Exit criteria:
 
-- A local desktop window can display an existing session stream.
+- A local desktop window can display a backend session stream.
 - No command execution, approvals, filesystem access, or packaging work.
 
 ### Phase 2: One Command Path
@@ -261,7 +274,7 @@ Exit criteria:
 ## Key Design Rules
 
 - Electron is a frontend, not a second backend.
-- Use the existing protocol before creating a new transport.
+- Use the chosen HTTP/SSE protocol before creating a new transport.
 - Keep Electron-specific concepts out of the Rust harness.
 - Keep backend-owned side effects behind Rust protocol methods.
 - Keep the renderer isolated from Node, Electron internals, and process access.
