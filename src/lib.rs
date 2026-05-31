@@ -9,7 +9,8 @@
 //!
 //! Live session state is in memory, but each session and exchange is persisted
 //! to the shared `~/.nav/nav.db` so a conversation can be resumed across
-//! restarts. There are no tools or approvals here.
+//! restarts. The backend also owns the local coding-agent loop and its fixed
+//! tool registry.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +19,7 @@ use std::thread;
 
 use serde_json::{Value, json};
 
+mod agent;
 mod config;
 mod model;
 mod session;

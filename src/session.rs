@@ -8,17 +8,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use serde_json::Value;
 use uuid::Uuid;
 
+use crate::agent::{Agent, AgentRunError, AgentRunSink};
 use crate::model::{ChatMessage, ChatModel, Role, ToolCall};
 use crate::storage::{SessionSummary, Storage};
-use crate::tools::{CancelFlag, Registry};
+use crate::tools::Registry;
 
 /// How a session originates, recorded on the persisted `sessions` row.
 const SESSION_SOURCE: &str = "nav";
@@ -128,25 +127,19 @@ impl Subscription {
 /// interrupts the live chat.
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
-    model: Arc<dyn ChatModel>,
+    agent: Agent,
     storage: Option<Arc<Storage>>,
     /// Identifier of the active model, tagged onto persisted assistant turns.
     model_id: Option<String>,
-    /// The tools the model may call during a run.
-    registry: Arc<Registry>,
-    /// Directory tools operate in (the backend process cwd by default).
-    workspace: PathBuf,
 }
 
 impl SessionStore {
     pub fn new(model: Arc<dyn ChatModel>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            model,
+            agent: Agent::new(model),
             storage: None,
             model_id: None,
-            registry: Arc::new(Registry::coding()),
-            workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -164,13 +157,13 @@ impl SessionStore {
 
     /// Override the toolset offered to the model (defaults to the coding tools).
     pub fn with_registry(mut self, registry: Arc<Registry>) -> Self {
-        self.registry = registry;
+        self.agent = self.agent.with_registry(registry);
         self
     }
 
     /// Set the directory tools run in (defaults to the process cwd).
     pub fn with_workspace(mut self, workspace: PathBuf) -> Self {
-        self.workspace = workspace;
+        self.agent = self.agent.with_workspace(workspace);
         self
     }
 
@@ -326,23 +319,18 @@ impl SessionStore {
         }
     }
 
-    /// Run one chat turn as an agent loop: record the user message, then
-    /// repeatedly call the model and execute any tool calls it returns, feeding
-    /// each tool result back, until the model replies with plain text. Like pi's
-    /// agent loop, this is unbounded — it ends when the model stops calling
-    /// tools (or the model call errors). Ordered events are emitted throughout.
+    /// Start one run: record the user message, delegate model/tool execution to
+    /// the agent, and mirror the resulting steps into ordered session events.
     ///
     /// A turn with no tool calls emits exactly `user.message`, `run.started`,
     /// `message.completed`, `run.completed` — unchanged from the pre-tools loop.
     ///
-    /// Lock discipline: the model call and every tool run happen with the store
-    /// lock released, so other sessions stay responsive while one is working.
-    /// The lock is only taken for the tiny critical sections that mutate a
-    /// session's history and emit its events.
+    /// Lock discipline: agent work happens with the store lock released, so
+    /// other sessions stay responsive while one is working. The lock is only
+    /// taken for the tiny critical sections that mutate a session's history and
+    /// emit its events.
     pub fn send_message(&self, session_id: &str, text: &str) -> Result<String, SendError> {
         let run_id = new_id();
-        let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
-        let tool_defs = self.registry.defs();
 
         // Seq 0 is the user turn; every later turn (assistant tool-calls, each
         // tool result, the final assistant text) takes the next number.
@@ -369,148 +357,21 @@ impl SessionStore {
         }
         seq += 1;
 
-        loop {
-            // Snapshot the history under the lock, then call the model unlocked.
-            let history = self.with_session(session_id, |session| session.messages.clone())?;
-            let response = match self.model.respond(&history, &tool_defs) {
-                Ok(response) => response,
-                Err(error) => {
-                    self.fail_run(session_id, &run_id, &error.message)?;
-                    return Ok(run_id);
-                }
-            };
-
-            // Plain text reply ⇒ the run is done.
-            if response.tool_calls.is_empty() {
-                let reply = response.content.unwrap_or_default();
-                let message_id = new_id();
-                self.with_session(session_id, |session| {
-                    session.messages.push(ChatMessage::assistant(&reply));
-                    session.emit("message.completed", |event| {
-                        event.role = Some(Role::Assistant.as_str().to_owned());
-                        event.text = Some(reply.clone());
-                        event.message_id = Some(message_id.clone());
-                        event.run_id = Some(run_id.clone());
-                    });
-                    session.emit("run.completed", |event| {
-                        event.run_id = Some(run_id.clone());
-                        event.status = Some("completed".to_owned());
-                    });
-                })?;
-                if let Some(storage) = &self.storage {
-                    log_storage(
-                        "record_assistant_text",
-                        storage.record_assistant_text(
-                            session_id,
-                            &run_id,
-                            seq,
-                            &reply,
-                            self.model_id.as_deref(),
-                        ),
-                    );
-                    log_storage("complete_run", storage.complete_run(&run_id));
-                }
-                return Ok(run_id);
-            }
-
-            // The model wants tools: record the requesting assistant turn, then
-            // execute each call and feed its result back into the history.
-            let content = response.content.clone().unwrap_or_default();
-            let calls = response.tool_calls.clone();
-            self.with_session(session_id, |session| {
-                session
-                    .messages
-                    .push(ChatMessage::assistant_tool_calls(&content, calls.clone()));
-                session.emit("assistant.tool_calls", |event| {
-                    event.role = Some(Role::Assistant.as_str().to_owned());
-                    event.run_id = Some(run_id.clone());
-                    if !content.is_empty() {
-                        event.text = Some(content.clone());
-                    }
-                });
-            })?;
-            if let Some(storage) = &self.storage {
-                let text = (!content.is_empty()).then_some(content.as_str());
-                log_storage(
-                    "record_assistant_tool_calls",
-                    storage.record_assistant_tool_calls(
-                        session_id,
-                        &run_id,
-                        seq,
-                        text,
-                        &calls,
-                        self.model_id.as_deref(),
-                    ),
-                );
-            }
-            seq += 1;
-
-            for call in &calls {
-                self.with_session(session_id, |session| {
-                    session.emit("tool.started", |event| {
-                        event.run_id = Some(run_id.clone());
-                        event.tool_call_id = Some(call.id.clone());
-                        event.tool_name = Some(call.name.clone());
-                    });
-                })?;
-
-                // Tools run with the lock released.
-                let (output, is_error) = self.run_tool(call, &cancel);
-
-                let kind = if is_error {
-                    "tool.failed"
-                } else {
-                    "tool.completed"
-                };
-                let output_for_event = output.clone();
-                self.with_session(session_id, |session| {
-                    session
-                        .messages
-                        .push(ChatMessage::tool_result(&call.id, &output, is_error));
-                    session.emit(kind, |event| {
-                        event.run_id = Some(run_id.clone());
-                        event.tool_call_id = Some(call.id.clone());
-                        event.tool_name = Some(call.name.clone());
-                        if is_error {
-                            event.error = Some(output_for_event.clone());
-                        } else {
-                            event.text = Some(output_for_event.clone());
-                        }
-                    });
-                })?;
-                if let Some(storage) = &self.storage {
-                    log_storage(
-                        "record_tool_result",
-                        storage.record_tool_result(
-                            session_id, &run_id, seq, &call.id, &output, is_error,
-                        ),
-                    );
-                }
-                seq += 1;
-            }
-        }
-    }
-
-    /// Execute one tool call with the lock released, returning its output text
-    /// and whether it failed. A failure (unknown tool, bad arguments, or a tool
-    /// error) becomes an error tool result fed back to the model — never a run
-    /// failure — so the model can recover.
-    fn run_tool(&self, call: &ToolCall, cancel: &CancelFlag) -> (String, bool) {
-        let Some(tool) = self.registry.get(&call.name) else {
-            return (format!("unknown tool: {}", call.name), true);
+        // Snapshot the history under the lock, then let the agent run unlocked.
+        let history = self.with_session(session_id, |session| session.messages.clone())?;
+        let mut sink = SessionRunSink {
+            store: self,
+            session_id,
+            run_id: &run_id,
+            seq,
         };
-        let trimmed = call.arguments.trim();
-        let args: Value = if trimmed.is_empty() {
-            Value::Object(Default::default())
-        } else {
-            match serde_json::from_str(trimmed) {
-                Ok(args) => args,
-                Err(error) => return (format!("invalid tool arguments: {error}"), true),
+        match self.agent.run_turn(history, &mut sink) {
+            Ok(()) => Ok(run_id),
+            Err(AgentRunError::Model(error)) => {
+                self.fail_run(session_id, &run_id, &error.message)?;
+                Ok(run_id)
             }
-        };
-        match tool.execute(&args, &self.workspace, cancel) {
-            Ok(output) => (output.content, false),
-            Err(error) => (error.message, true),
+            Err(AgentRunError::Sink(error)) => Err(error),
         }
     }
 
@@ -565,6 +426,141 @@ impl SessionStore {
             .unwrap()
             .get(session_id)
             .map(|session| session.events.clone())
+    }
+}
+
+/// Session-side adapter for one agent run.
+///
+/// The agent owns the loop. This adapter mirrors each loop step into nav's
+/// event log and optional durable storage.
+struct SessionRunSink<'a> {
+    store: &'a SessionStore,
+    session_id: &'a str,
+    run_id: &'a str,
+    seq: i64,
+}
+
+impl AgentRunSink for SessionRunSink<'_> {
+    type Error = SendError;
+
+    fn assistant_text(&mut self, content: &str) -> Result<(), Self::Error> {
+        let message_id = new_id();
+        self.store.with_session(self.session_id, |session| {
+            session.messages.push(ChatMessage::assistant(content));
+            session.emit("message.completed", |event| {
+                event.role = Some(Role::Assistant.as_str().to_owned());
+                event.text = Some(content.to_owned());
+                event.message_id = Some(message_id.clone());
+                event.run_id = Some(self.run_id.to_owned());
+            });
+            session.emit("run.completed", |event| {
+                event.run_id = Some(self.run_id.to_owned());
+                event.status = Some("completed".to_owned());
+            });
+        })?;
+        if let Some(storage) = &self.store.storage {
+            log_storage(
+                "record_assistant_text",
+                storage.record_assistant_text(
+                    self.session_id,
+                    self.run_id,
+                    self.seq,
+                    content,
+                    self.store.model_id.as_deref(),
+                ),
+            );
+            log_storage("complete_run", storage.complete_run(self.run_id));
+        }
+        self.seq += 1;
+        Ok(())
+    }
+
+    fn assistant_tool_calls(
+        &mut self,
+        content: &str,
+        calls: &[ToolCall],
+    ) -> Result<(), Self::Error> {
+        self.store.with_session(self.session_id, |session| {
+            session
+                .messages
+                .push(ChatMessage::assistant_tool_calls(content, calls.to_vec()));
+            session.emit("assistant.tool_calls", |event| {
+                event.role = Some(Role::Assistant.as_str().to_owned());
+                event.run_id = Some(self.run_id.to_owned());
+                if !content.is_empty() {
+                    event.text = Some(content.to_owned());
+                }
+            });
+        })?;
+        if let Some(storage) = &self.store.storage {
+            let text = (!content.is_empty()).then_some(content);
+            log_storage(
+                "record_assistant_tool_calls",
+                storage.record_assistant_tool_calls(
+                    self.session_id,
+                    self.run_id,
+                    self.seq,
+                    text,
+                    calls,
+                    self.store.model_id.as_deref(),
+                ),
+            );
+        }
+        self.seq += 1;
+        Ok(())
+    }
+
+    fn tool_started(&mut self, call: &ToolCall) -> Result<(), Self::Error> {
+        self.store.with_session(self.session_id, |session| {
+            session.emit("tool.started", |event| {
+                event.run_id = Some(self.run_id.to_owned());
+                event.tool_call_id = Some(call.id.clone());
+                event.tool_name = Some(call.name.clone());
+            });
+        })
+    }
+
+    fn tool_result(
+        &mut self,
+        call: &ToolCall,
+        output: &str,
+        is_error: bool,
+    ) -> Result<(), Self::Error> {
+        let kind = if is_error {
+            "tool.failed"
+        } else {
+            "tool.completed"
+        };
+        self.store.with_session(self.session_id, |session| {
+            session
+                .messages
+                .push(ChatMessage::tool_result(&call.id, output, is_error));
+            session.emit(kind, |event| {
+                event.run_id = Some(self.run_id.to_owned());
+                event.tool_call_id = Some(call.id.clone());
+                event.tool_name = Some(call.name.clone());
+                if is_error {
+                    event.error = Some(output.to_owned());
+                } else {
+                    event.text = Some(output.to_owned());
+                }
+            });
+        })?;
+        if let Some(storage) = &self.store.storage {
+            log_storage(
+                "record_tool_result",
+                storage.record_tool_result(
+                    self.session_id,
+                    self.run_id,
+                    self.seq,
+                    &call.id,
+                    output,
+                    is_error,
+                ),
+            );
+        }
+        self.seq += 1;
+        Ok(())
     }
 }
 
