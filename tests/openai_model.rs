@@ -116,6 +116,55 @@ fn returns_assistant_content_and_forwards_full_history() {
 }
 
 #[test]
+fn prepends_the_system_prompt_as_a_leading_system_message() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    );
+    let model = model(base_url);
+
+    let context = context(vec![ChatMessage::user("hi")])
+        .with_system_prompt("You are an expert coding assistant operating inside nav.");
+    model
+        .respond(&context, &[])
+        .expect("provider returns a reply");
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    let messages = body["messages"].as_array().expect("messages array");
+    // The system prompt is the leading message, ahead of the user turn.
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(
+        messages[0]["content"],
+        "You are an expert coding assistant operating inside nav."
+    );
+    assert_eq!(messages[1]["role"], "user");
+}
+
+#[test]
+fn omits_the_system_message_when_no_system_prompt_is_set() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    );
+    let model = model(base_url);
+
+    model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect("provider returns a reply");
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    let messages = body["messages"].as_array().expect("messages array");
+    // With no system prompt set, the conversation leads with the user turn.
+    assert_eq!(messages[0]["role"], "user");
+    assert!(
+        messages.iter().all(|message| message["role"] != "system"),
+        "no system message should be sent when none is set: {request}"
+    );
+}
+
+#[test]
 fn parses_provider_token_usage_when_present() {
     let (base_url, _requests) = fake_provider(
         "200 OK",

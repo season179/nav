@@ -11,6 +11,7 @@
 //! definitions and executes Tool Calls. Model-visible Tools live in
 //! `builtins/`; shared implementation helpers live in `support/`.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -89,6 +90,17 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     /// JSON Schema object describing the tool's parameters.
     fn parameters(&self) -> Value;
+    /// One-line description shown in the system prompt's "Available tools" list.
+    /// Mirrors pi's per-tool `promptSnippet`; a tool that returns `None` is
+    /// omitted from that list.
+    fn prompt_snippet(&self) -> Option<&'static str> {
+        None
+    }
+    /// Extra guideline bullets this tool contributes to the system prompt.
+    /// Mirrors pi's per-tool `promptGuidelines`; empty by default.
+    fn prompt_guidelines(&self) -> &'static [&'static str] {
+        &[]
+    }
     fn execute(
         &self,
         args: &Value,
@@ -118,6 +130,37 @@ impl Registry {
                 name: tool.name().to_owned(),
                 description: tool.description().to_owned(),
                 parameters: tool.parameters(),
+            })
+            .collect()
+    }
+
+    /// Tool names in advertised order, for the system prompt's tool list.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect()
+    }
+
+    /// One-line prompt snippets keyed by tool name (only tools that declare one).
+    pub fn prompt_snippets(&self) -> HashMap<String, String> {
+        self.tools
+            .iter()
+            .filter_map(|tool| {
+                tool.prompt_snippet()
+                    .map(|snippet| (tool.name().to_owned(), snippet.to_owned()))
+            })
+            .collect()
+    }
+
+    /// Guideline bullets contributed by the tools, in advertised order.
+    pub fn prompt_guidelines(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .flat_map(|tool| {
+                tool.prompt_guidelines()
+                    .iter()
+                    .map(|guideline| (*guideline).to_owned())
             })
             .collect()
     }

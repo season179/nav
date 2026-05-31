@@ -399,7 +399,13 @@ impl ChatModel for OpenAiModel {
         context: &ModelContext,
         tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
-        let messages: Vec<Value> = context.messages().iter().map(message_json).collect();
+        let mut messages: Vec<Value> = Vec::with_capacity(context.messages().len() + 1);
+        // Mirror pi: the system prompt rides ahead of the conversation as a
+        // leading `system` message.
+        if let Some(system_prompt) = context.system_prompt() {
+            messages.push(json!({ "role": "system", "content": system_prompt }));
+        }
+        messages.extend(context.messages().iter().map(message_json));
         let mut body = json!({ "model": self.config.model, "messages": messages });
         // Some OpenAI-compatible providers reject an empty `tools` array, so the
         // key is sent only when tools are actually offered.
