@@ -64,7 +64,47 @@ test("project sidebar omits session toggle for five sessions", () => {
   assert.equal(findByClass(list, "project-session-toggle"), null);
 });
 
-function loadRenderer() {
+test("clicking a project heading collapses and expands its sessions", async () => {
+  const sessions = sessionRange(3).map((session) => ({
+    ...session,
+    workspaceRoot: "/projects/nav",
+  }));
+  const renderer = loadRenderer({ sessions });
+
+  await renderer.refreshSessions();
+
+  const sessionList = renderer.document.querySelector("#session-list");
+  assert.deepEqual(sessionButtonLabels(sessionList), [
+    "Session 1",
+    "Session 2",
+    "Session 3",
+  ]);
+
+  let projectToggle = findByClass(sessionList, "project-toggle");
+  assert.ok(projectToggle, "project heading renders as a toggle");
+  assert.equal(projectToggle.getAttribute("aria-expanded"), "true");
+  assert.equal(
+    projectToggle.getAttribute("aria-label"),
+    "Collapse project nav",
+  );
+
+  projectToggle.click();
+
+  assert.deepEqual(sessionButtonLabels(sessionList), []);
+  projectToggle = findByClass(sessionList, "project-toggle");
+  assert.equal(projectToggle.getAttribute("aria-expanded"), "false");
+  assert.equal(projectToggle.getAttribute("aria-label"), "Expand project nav");
+
+  projectToggle.click();
+
+  assert.deepEqual(sessionButtonLabels(sessionList), [
+    "Session 1",
+    "Session 2",
+    "Session 3",
+  ]);
+});
+
+function loadRenderer({ sessions = [] } = {}) {
   const source = fs.readFileSync(
     path.join(__dirname, "../desktop/electron/renderer/renderer.js"),
     "utf8",
@@ -90,6 +130,9 @@ function loadRenderer() {
       nav: {
         onBackendStatus() {},
         onSessionEvent() {},
+        async listSessions() {
+          return sessions;
+        },
       },
     },
   };
