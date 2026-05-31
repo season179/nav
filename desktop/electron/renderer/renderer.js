@@ -4,6 +4,7 @@ const newChatButton = document.querySelector("#new-chat");
 const composer = document.querySelector("#composer");
 const input = document.querySelector("#composer-input");
 const sendButton = document.querySelector("#composer-send");
+const stopButton = document.querySelector("#composer-stop");
 const modelNode = document.querySelector("#composer-model");
 
 let connected = false;
@@ -53,26 +54,33 @@ input.addEventListener("keydown", (keyEvent) => {
 
 composer.addEventListener("submit", async (submitEvent) => {
   submitEvent.preventDefault();
-  // Mid-run the action button is a Stop control rather than Send.
-  if (running) {
-    await stopRun();
-    return;
-  }
   const text = input.value.trim();
   if (!text || !connected) {
     return;
   }
 
+  // Sending while a run is in flight steers it: the backend folds the message
+  // into the live run at its next model call. Stay in the running state in that
+  // case rather than toggling it.
+  const wasRunning = running;
   input.value = "";
   autoResizeInput();
-  stopRequested = false;
-  setRunning(true);
+  if (!wasRunning) {
+    stopRequested = false;
+    setRunning(true);
+  }
   try {
     await window.nav.sessionSendMessage(text);
   } catch (error) {
     appendMessage("error", `Could not send message: ${error.message}`);
-    setRunning(false);
+    if (!wasRunning) {
+      setRunning(false);
+    }
   }
+});
+
+stopButton.addEventListener("click", () => {
+  stopRun();
 });
 
 // Ask the backend to stop the active run. The button is disabled until the run
@@ -83,12 +91,12 @@ async function stopRun() {
     return;
   }
   stopRequested = true;
-  sendButton.disabled = true;
+  stopButton.disabled = true;
   try {
     await window.nav.sessionStop();
   } catch (error) {
     appendMessage("error", `Could not stop: ${error.message}`);
-    sendButton.disabled = false;
+    stopButton.disabled = false;
   }
 }
 
@@ -381,15 +389,15 @@ function previewText(text) {
 
 function setRunning(isRunning) {
   running = isRunning;
-  // The composer is locked mid-run, but its action button stays live as a Stop
-  // control so the user can interrupt the turn.
-  input.disabled = isRunning || !connected;
+  // The composer stays open mid-run so the user can send follow-ups that steer
+  // the live run; a separate Stop button appears alongside Send to interrupt it.
+  input.disabled = !connected;
   sendButton.disabled = !connected;
-  sendButton.textContent = isRunning ? "Stop" : "Send";
-  sendButton.classList.toggle("is-stop", isRunning);
+  stopButton.hidden = !isRunning;
+  stopButton.disabled = !connected;
   // New chat / session switching are blocked mid-run to avoid racing a turn.
   newChatButton.disabled = isRunning || !connected;
-  if (!isRunning && connected) {
+  if (connected) {
     input.focus();
   }
 }
