@@ -6,6 +6,9 @@ const input = document.querySelector("#composer-input");
 const sendButton = document.querySelector("#composer-send");
 const stopButton = document.querySelector("#composer-stop");
 const modelNode = document.querySelector("#composer-model");
+const thinkingNode = document.querySelector("#composer-thinking");
+const tokenUsageNode = document.querySelector("#composer-token-usage");
+const tokenFormatter = new Intl.NumberFormat("en-US");
 
 let connected = false;
 let running = false;
@@ -109,22 +112,31 @@ function handleBackendStatus(status) {
     }
     setRunning(false);
     refreshSessions();
-    refreshModelName();
+    refreshModelInfo();
   }
 }
 
-// Show which model the backend is configured to use, just below the composer.
-// The model can't change mid-session, so one fetch on connect is enough.
-async function refreshModelName() {
+// Show the active model and context usage just below the composer.
+async function refreshModelInfo() {
   if (!window.nav) {
     return;
   }
   try {
-    const info = await window.nav.modelInfo();
+    const info = await window.nav.modelInfo(activeSessionId);
     modelNode.textContent = info?.label ?? "";
+    thinkingNode.textContent = info?.thinking ?? "";
+    tokenUsageNode.textContent = formatTokenUsage(info?.tokenUsage);
   } catch {
     // The indicator is best-effort; never let it disrupt the chat.
   }
+}
+
+function formatTokenUsage(tokenUsage) {
+  if (!tokenUsage?.contextWindow) {
+    return "";
+  }
+  const used = Number.isFinite(tokenUsage.used) ? tokenUsage.used : 0;
+  return `${tokenFormatter.format(used)}/${tokenFormatter.format(tokenUsage.contextWindow)}`;
 }
 
 function handleSessionEvent(event) {
@@ -168,11 +180,13 @@ function handleSessionEvent(event) {
       setRunning(false);
       // A title or recency may have changed; keep the sidebar current.
       refreshSessions();
+      refreshModelInfo();
       break;
     case "run.failed":
       appendMessage("error", event.error ?? "the run failed");
       setRunning(false);
       refreshSessions();
+      refreshModelInfo();
       break;
     default:
       break;
@@ -194,6 +208,7 @@ async function selectSession(sessionId) {
   markActiveSession();
   try {
     await window.nav.switchSession(sessionId);
+    refreshModelInfo();
   } catch (error) {
     activeSessionId = previousSessionId;
     markActiveSession();
@@ -209,6 +224,7 @@ async function startNewChat() {
   try {
     activeSessionId = await window.nav.newSession();
     markActiveSession();
+    refreshModelInfo();
   } catch (error) {
     appendMessage("error", `Could not start a new chat: ${error.message}`);
   }

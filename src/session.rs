@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
-use crate::model::{ChatMessage, ChatModel, Role, ToolCall};
+use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
 use crate::storage::{SessionSummary, Storage};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
@@ -80,6 +80,8 @@ struct Session {
     subscribers: Vec<Sender<Event>>,
     /// The in-flight run, set while a run is executing. `None` when idle.
     active_run: Option<ActiveRun>,
+    /// Latest model-call context usage for this session.
+    token_usage: Option<u64>,
 }
 
 /// The run currently executing in a session.
@@ -102,6 +104,7 @@ impl Session {
             events: Vec::new(),
             subscribers: Vec::new(),
             active_run: None,
+            token_usage: None,
         }
     }
 
@@ -163,8 +166,8 @@ pub struct SessionStore {
     storage: Option<Arc<Storage>>,
     /// Identifier of the active model, tagged onto persisted assistant turns.
     model_id: Option<String>,
-    /// Human-friendly name of the active model, shown in the app's UI.
-    model_label: String,
+    /// Renderer-facing model metadata shown in the app's composer.
+    model_info: ModelInfo,
 }
 
 impl SessionStore {
@@ -175,7 +178,12 @@ impl SessionStore {
             context_assembler: ContextAssembler::new(),
             storage: None,
             model_id: None,
-            model_label: "unknown model".to_owned(),
+            model_info: ModelInfo {
+                label: "unknown model".to_owned(),
+                thinking: None,
+                context_window: None,
+                token_usage: None,
+            },
         }
     }
 
@@ -191,15 +199,24 @@ impl SessionStore {
         self
     }
 
-    /// Set the human-friendly model name surfaced to the UI.
-    pub fn with_model_label(mut self, model_label: String) -> Self {
-        self.model_label = model_label;
+    /// Set renderer-facing model metadata surfaced to the UI.
+    pub fn with_model_info(mut self, model_info: ModelInfo) -> Self {
+        self.model_info = model_info;
         self
     }
 
-    /// The human-friendly name of the active model, for the app's indicator.
-    pub fn model_label(&self) -> &str {
-        &self.model_label
+    /// Renderer-facing model metadata for the app's composer.
+    pub fn model_info(&self, session_id: Option<&str>) -> ModelInfo {
+        let used_tokens = session_id.and_then(|session_id| self.token_usage(session_id));
+        self.model_info.with_used_tokens(used_tokens)
+    }
+
+    fn token_usage(&self, session_id: &str) -> Option<u64> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .and_then(|session| session.token_usage)
     }
 
     /// Override the toolset offered to the model (defaults to the coding tools).
@@ -737,6 +754,10 @@ impl AgentRunSink for SessionRunSink<'_> {
     }
 
     fn token_usage(&mut self, usage: &TokenUsage) -> Result<(), Self::Error> {
+        let used_tokens = usage.context_used();
+        self.store.with_session(self.session_id, |session| {
+            session.token_usage = Some(used_tokens);
+        })?;
         if let Some(storage) = &self.store.storage {
             log_storage(
                 "record_token_usage",

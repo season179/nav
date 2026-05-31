@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use nav::{MockModel, SessionStore};
+use nav::{MockModel, ModelInfo, SessionStore};
 use serde_json::{Value, json};
 
 /// An in-process backend bound to an ephemeral loopback port, driven over raw
@@ -180,10 +180,15 @@ fn listing_sessions_without_storage_returns_an_empty_array() {
 }
 
 #[test]
-fn model_info_returns_the_configured_label() {
+fn model_info_returns_the_configured_metadata() {
+    let model_info = ModelInfo {
+        label: "Claude Opus 4.8".to_owned(),
+        thinking: Some("Reasoning".to_owned()),
+        context_window: Some(200_000),
+        token_usage: None,
+    };
     let backend = TestBackend::start_with(
-        SessionStore::new(Arc::new(MockModel::new()))
-            .with_model_label("Claude Opus 4.8".to_owned()),
+        SessionStore::new(Arc::new(MockModel::new())).with_model_info(model_info),
     );
 
     let response = backend.rpc(r#"{"jsonrpc":"2.0","id":"model","method":"session.modelInfo"}"#);
@@ -192,6 +197,57 @@ fn model_info_returns_the_configured_label() {
         response["result"]["label"], "Claude Opus 4.8",
         "session.modelInfo returns the configured model label: {response}"
     );
+    assert_eq!(
+        response["result"]["thinking"], "Reasoning",
+        "session.modelInfo returns optional thinking metadata: {response}"
+    );
+    assert_eq!(
+        response["result"]["tokenUsage"]["used"], 0,
+        "session.modelInfo returns initial context usage: {response}"
+    );
+    assert_eq!(
+        response["result"]["tokenUsage"]["contextWindow"], 200_000,
+        "session.modelInfo returns context window metadata: {response}"
+    );
+}
+
+#[test]
+fn model_info_returns_latest_session_token_usage() {
+    let model_info = ModelInfo {
+        label: "Mock model".to_owned(),
+        thinking: None,
+        context_window: Some(128_000),
+        token_usage: None,
+    };
+    let backend = TestBackend::start_with(
+        SessionStore::new(Arc::new(MockModel::new())).with_model_info(model_info),
+    );
+    let session_id = backend.create_session();
+    let stream = backend.open_events(&session_id);
+
+    backend.send_message(&session_id, "count this context");
+    let events = read_until_completions(stream, 1);
+    assert_eq!(
+        events.last().map(|event| event.kind.as_str()),
+        Some("run.completed")
+    );
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "model",
+        "method": "session.modelInfo",
+        "params": { "sessionId": session_id },
+    });
+    let response = backend.rpc(&request.to_string());
+
+    let used = response["result"]["tokenUsage"]["used"]
+        .as_u64()
+        .expect("session.modelInfo returns used tokens");
+    assert!(
+        used > 0,
+        "used tokens should update after a run: {response}"
+    );
+    assert_eq!(response["result"]["tokenUsage"]["contextWindow"], 128_000);
 }
 
 #[test]

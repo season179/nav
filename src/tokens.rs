@@ -83,6 +83,11 @@ impl TokenUsage {
             confidence,
         }
     }
+
+    pub fn context_used(&self) -> u64 {
+        self.total
+            .unwrap_or_else(|| self.input.saturating_add(self.output))
+    }
 }
 
 /// A pre-call or output-side token estimate.

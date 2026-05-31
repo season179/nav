@@ -9,6 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ResolvedModelConfig};
@@ -258,6 +259,38 @@ pub enum ModelChoice {
     Unavailable(String),
 }
 
+/// Small, renderer-facing summary of the active model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip)]
+    pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenBudgetInfo>,
+}
+
+/// Current context usage against the active model's window.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBudgetInfo {
+    pub used: u64,
+    pub context_window: u64,
+}
+
+impl ModelInfo {
+    pub fn with_used_tokens(&self, used: Option<u64>) -> Self {
+        let mut info = self.clone();
+        info.token_usage = self.context_window.map(|context_window| TokenBudgetInfo {
+            used: used.unwrap_or(0),
+            context_window,
+        });
+        info
+    }
+}
+
 impl ModelChoice {
     /// Resolve the backend's model, preferring the Pi-style settings file.
     ///
@@ -309,8 +342,10 @@ impl ModelChoice {
                     // No display name over env config, so the id is the label.
                     name: model.clone(),
                     model,
+                    reasoning: false,
                     context_window: None,
                     compat: None,
+                    thinking_level_map: None,
                 })
             }
             _ => ModelChoice::NotConfigured,
@@ -336,15 +371,48 @@ impl ModelChoice {
         }
     }
 
+    /// A concise summary for the app's model indicator row.
+    pub fn info(&self) -> ModelInfo {
+        ModelInfo {
+            label: self.label(),
+            thinking: self.thinking_label(),
+            context_window: self.context_window(),
+            token_usage: None,
+        }
+    }
+
     /// A concise, human-friendly model name for the app's model indicator.
     /// Unlike [`describe`](Self::describe), this drops protocol jargon so the
     /// UI can show just the model the user configured.
-    pub fn label(&self) -> String {
+    fn label(&self) -> String {
         match self {
             ModelChoice::Mock => "Mock model".to_owned(),
             ModelChoice::OpenAi(config) => config.name.clone(),
             ModelChoice::NotConfigured => "No model configured".to_owned(),
             ModelChoice::Unavailable(_) => "Model unavailable".to_owned(),
+        }
+    }
+
+    /// Optional reasoning/thinking capability label for the app's model metadata
+    /// row. Providers use both terms, so preserve whichever metadata exists.
+    fn thinking_label(&self) -> Option<String> {
+        match self {
+            ModelChoice::OpenAi(config) => {
+                match (config.reasoning, config.thinking_level_map.is_some()) {
+                    (true, true) => Some("Reasoning / Thinking".to_owned()),
+                    (true, false) => Some("Reasoning".to_owned()),
+                    (false, true) => Some("Thinking".to_owned()),
+                    (false, false) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        match self {
+            ModelChoice::OpenAi(config) => config.context_window,
+            _ => None,
         }
     }
 
@@ -381,11 +449,16 @@ pub struct OpenAiConfig {
     /// Human-friendly display name for the model (from settings.json `name`,
     /// falling back to the model id). Shown in the app's model indicator.
     pub name: String,
+    /// Whether the model is marked as reasoning-capable in settings.json.
+    pub reasoning: bool,
     /// Model context window from settings, used by future budget checks.
     pub context_window: Option<u64>,
     /// Provider/model compatibility metadata. May include an optional local
     /// tokenizer path for HF-tokenizer estimates.
     pub compat: Option<Value>,
+    /// Provider-specific thinking level map, when the model exposes thinking
+    /// levels under names different from nav's UI.
+    pub thinking_level_map: Option<Value>,
 }
 
 impl From<ResolvedModelConfig> for OpenAiConfig {
@@ -398,8 +471,10 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
             model: config.model,
             base_url: config.base_url,
             name: config.name,
+            reasoning: config.reasoning,
             context_window: config.context_window,
             compat: config.compat,
+            thinking_level_map: config.thinking_level_map,
         }
     }
 }

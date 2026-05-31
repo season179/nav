@@ -71,8 +71,10 @@ fn model_with_compat(base_url: String, compat: Option<serde_json::Value>) -> Ope
         model: "test-model".to_owned(),
         base_url,
         name: "test-model".to_owned(),
+        reasoning: false,
         context_window: None,
         compat,
+        thinking_level_map: None,
     })
 }
 
