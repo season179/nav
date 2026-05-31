@@ -20,7 +20,7 @@ fn run() -> io::Result<()> {
     let listener = TcpListener::bind(&config.bind_address)?;
     let local_url = format!("http://{}", listener.local_addr()?);
 
-    let model = ModelChoice::from_env(|key| std::env::var(key).ok());
+    let model = ModelChoice::resolve(|key| std::env::var(key).ok(), nav::resolve_default_config);
     eprintln!("nav-local-backend: using {}", model.describe());
     let store = Arc::new(SessionStore::new(model.into_model()));
 

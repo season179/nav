@@ -8,8 +8,15 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::config::{ConfigError, ResolvedModelConfig};
+
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Message shown when no model can be resolved from settings or the environment.
+const NOT_CONFIGURED_MESSAGE: &str = "model not configured: add a default model to \
+     ~/.nav/settings.json, set NAV_API_KEY (and optionally NAV_MODEL/NAV_BASE_URL) for an \
+     OpenAI-compatible provider, or NAV_MOCK_MODEL=1 for the deterministic mock";
 
 /// Who authored a chat message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +85,7 @@ pub trait ChatModel: Send + Sync {
     fn respond(&self, history: &[ChatMessage]) -> Result<String, ModelError>;
 }
 
-/// Which text model the backend should use, resolved from the environment.
+/// Which text model the backend should use.
 pub enum ModelChoice {
     /// Deterministic mock, requested explicitly for tests and offline smoke.
     Mock,
@@ -86,10 +93,44 @@ pub enum ModelChoice {
     OpenAi(OpenAiConfig),
     /// No model configured; sending a message yields a clear failure.
     NotConfigured,
+    /// Settings resolved to a config the backend cannot use (e.g. unsupported
+    /// API or a missing provider). Sending a message fails with this reason.
+    Unavailable(String),
 }
 
 impl ModelChoice {
-    /// Resolve a model from environment lookups.
+    /// Resolve the backend's model, preferring the Pi-style settings file.
+    ///
+    /// Resolution order:
+    /// 1. Explicit `NAV_MOCK_MODEL` wins so tests and offline smoke never reach
+    ///    a real provider.
+    /// 2. A resolvable `~/.nav/settings.json` default model selects the real
+    ///    OpenAI-compatible provider.
+    /// 3. If no settings file exists, fall back to environment configuration so
+    ///    the bare `NAV_API_KEY` path keeps working.
+    /// 4. A present-but-unusable settings file surfaces its specific error.
+    ///
+    /// `load_config` is injected (rather than calling [`crate::resolve_default_config`]
+    /// directly) so this stays unit-testable without touching the filesystem.
+    pub fn resolve<F, L>(get: F, load_config: L) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+        L: FnOnce() -> Result<ResolvedModelConfig, ConfigError>,
+    {
+        if get("NAV_MOCK_MODEL").is_some_and(|value| !value.is_empty()) {
+            return ModelChoice::Mock;
+        }
+
+        match load_config() {
+            Ok(config) => ModelChoice::OpenAi(OpenAiConfig::from(config)),
+            Err(ConfigError::FileNotFound(_) | ConfigError::HomeDirUnavailable) => {
+                ModelChoice::from_env(get)
+            }
+            Err(error) => ModelChoice::Unavailable(error.to_string()),
+        }
+    }
+
+    /// Resolve a model from environment lookups only.
     ///
     /// Explicit `NAV_MOCK_MODEL` wins so tests and offline smoke never reach a
     /// real provider. Otherwise a present `NAV_API_KEY` selects the OpenAI
@@ -115,6 +156,7 @@ impl ModelChoice {
             ModelChoice::Mock => "mock model".to_owned(),
             ModelChoice::OpenAi(config) => format!("OpenAI-compatible model {}", config.model),
             ModelChoice::NotConfigured => "model not configured".to_owned(),
+            ModelChoice::Unavailable(reason) => format!("model unavailable: {reason}"),
         }
     }
 
@@ -123,7 +165,8 @@ impl ModelChoice {
         match self {
             ModelChoice::Mock => Arc::new(MockModel::new()),
             ModelChoice::OpenAi(config) => Arc::new(OpenAiModel::new(config)),
-            ModelChoice::NotConfigured => Arc::new(UnconfiguredModel),
+            ModelChoice::NotConfigured => Arc::new(FailingModel::new(NOT_CONFIGURED_MESSAGE)),
+            ModelChoice::Unavailable(reason) => Arc::new(FailingModel::new(reason)),
         }
     }
 }
@@ -147,6 +190,19 @@ pub struct OpenAiConfig {
     pub api_key: String,
     pub model: String,
     pub base_url: String,
+}
+
+impl From<ResolvedModelConfig> for OpenAiConfig {
+    /// Build provider connection settings from a resolved settings.json model.
+    /// The settings resolver (#531) already validated the API as
+    /// `openai-completions`, so only the connection fields are carried over.
+    fn from(config: ResolvedModelConfig) -> Self {
+        Self {
+            api_key: config.api_key,
+            model: config.model,
+            base_url: config.base_url,
+        }
+    }
 }
 
 /// Real text model: one non-streaming `POST /chat/completions` call.
@@ -191,15 +247,23 @@ impl ChatModel for OpenAiModel {
     }
 }
 
-/// Stand-in used when no model is configured; always fails clearly.
-struct UnconfiguredModel;
+/// Stand-in used when no usable model is configured; every turn fails with a
+/// fixed explanation (the not-configured hint, or a specific config error).
+struct FailingModel {
+    message: String,
+}
 
-impl ChatModel for UnconfiguredModel {
+impl FailingModel {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl ChatModel for FailingModel {
     fn respond(&self, _history: &[ChatMessage]) -> Result<String, ModelError> {
-        Err(ModelError::new(
-            "model not configured: set NAV_API_KEY (and optionally NAV_MODEL/NAV_BASE_URL) \
-             for a real model, or NAV_MOCK_MODEL=1 for the deterministic mock",
-        ))
+        Err(ModelError::new(self.message.clone()))
     }
 }
 
