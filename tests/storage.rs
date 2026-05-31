@@ -128,7 +128,7 @@ fn load_history_replays_a_session_in_order_for_resume() {
 
     let history = storage.load_history(session_id).unwrap();
     assert_eq!(
-        history,
+        history.as_turns(),
         vec![
             ChatMessage::user("first question"),
             ChatMessage::assistant("first answer"),
@@ -136,7 +136,7 @@ fn load_history_replays_a_session_in_order_for_resume() {
         ]
     );
     // Sanity on roles to guard the user/assistant mapping.
-    assert_eq!(history[1].role, Role::Assistant);
+    assert_eq!(history.as_turns()[1].role, Role::Assistant);
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn load_history_reconstructs_tool_calls_and_results_for_resume() {
 
     let history = storage.load_history(session_id).unwrap();
     assert_eq!(
-        history,
+        history.as_turns(),
         vec![
             ChatMessage::user("do the thing"),
             ChatMessage::assistant_tool_calls("on it", calls),
@@ -319,9 +319,13 @@ fn load_history_collapses_a_multi_part_turn_into_one_message() {
     }
 
     let history = storage.load_history("s").unwrap();
-    assert_eq!(history.len(), 1, "both parts belong to a single turn");
-    assert!(history[0].content.contains("hello"));
-    assert!(history[0].content.contains("world"));
+    assert_eq!(
+        history.as_turns().len(),
+        1,
+        "both parts belong to a single turn"
+    );
+    assert!(history.as_turns()[0].content.contains("hello"));
+    assert!(history.as_turns()[0].content.contains("world"));
 }
 
 #[test]

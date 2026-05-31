@@ -1,6 +1,6 @@
 //! Text-model abstraction for the chat/agent loop.
 //!
-//! A [`ChatModel`] turns a conversation history (plus the tools it may call)
+//! A [`ChatModel`] turns assembled Model Context (plus the tools it may call)
 //! into one assistant turn: free text, one or more tool calls, or both. Two
 //! implementations share this interface: [`MockModel`] is deterministic and
 //! used by tests and offline UI smoke, while the real OpenAI-compatible client
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ResolvedModelConfig};
+use crate::context::ModelContext;
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -52,7 +53,7 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// One turn in a conversation history.
+/// One message-shaped entry shared by Turn History and Model Context.
 ///
 /// Plain user and assistant turns carry only `content`. An assistant turn may
 /// additionally carry `tool_calls`; a [`Role::Tool`] turn carries the
@@ -182,13 +183,13 @@ impl fmt::Display for ModelError {
 
 impl std::error::Error for ModelError {}
 
-/// A model that produces one assistant turn from a history and the available
+/// A model that produces one assistant turn from Model Context and the available
 /// tools. Returning [`ModelResponse::tool_calls`] asks the caller to execute
 /// those tools and continue the conversation with their results.
 pub trait ChatModel: Send + Sync {
     fn respond(
         &self,
-        history: &[ChatMessage],
+        context: &ModelContext,
         tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError>;
 }
@@ -357,10 +358,10 @@ impl OpenAiModel {
 impl ChatModel for OpenAiModel {
     fn respond(
         &self,
-        history: &[ChatMessage],
+        context: &ModelContext,
         tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
-        let messages: Vec<Value> = history.iter().map(message_json).collect();
+        let messages: Vec<Value> = context.messages().iter().map(message_json).collect();
         let mut body = json!({ "model": self.config.model, "messages": messages });
         // Some OpenAI-compatible providers reject an empty `tools` array, so the
         // key is sent only when tools are actually offered.
@@ -386,7 +387,7 @@ impl ChatModel for OpenAiModel {
     }
 }
 
-/// Serialize one history message into OpenAI chat-completions wire shape.
+/// Serialize one Model Context message into OpenAI chat-completions wire shape.
 fn message_json(message: &ChatMessage) -> Value {
     match message.role {
         Role::Tool => json!({
@@ -524,7 +525,7 @@ impl FailingModel {
 impl ChatModel for FailingModel {
     fn respond(
         &self,
-        _history: &[ChatMessage],
+        _context: &ModelContext,
         _tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
         Err(ModelError::new(self.message.clone()))
@@ -553,10 +554,11 @@ impl Default for MockModel {
 impl ChatModel for MockModel {
     fn respond(
         &self,
-        history: &[ChatMessage],
+        context: &ModelContext,
         _tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
-        let user_messages: Vec<&str> = history
+        let user_messages: Vec<&str> = context
+            .messages()
             .iter()
             .filter(|message| message.role == Role::User)
             .map(|message| message.content.as_str())

@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use nav::{ChatMessage, ChatModel, OpenAiConfig, OpenAiModel};
+use nav::{ChatMessage, ChatModel, ModelContext, OpenAiConfig, OpenAiModel};
 
 const TEST_API_KEY: &str = "sk-secret-must-not-leak";
 
@@ -69,6 +69,10 @@ fn model(base_url: String) -> OpenAiModel {
     })
 }
 
+fn context(messages: Vec<ChatMessage>) -> ModelContext {
+    ModelContext::from_messages(messages)
+}
+
 #[test]
 fn returns_assistant_content_and_forwards_full_history() {
     let (base_url, requests) = fake_provider(
@@ -82,8 +86,9 @@ fn returns_assistant_content_and_forwards_full_history() {
         ChatMessage::assistant("Hello, Ada."),
         ChatMessage::user("what is my name?"),
     ];
+    let context = context(history);
     let reply = model
-        .respond(&history, &[])
+        .respond(&context, &[])
         .expect("provider returns a reply");
     assert_eq!(reply.content.as_deref(), Some("Your name is Ada."));
 
@@ -114,7 +119,7 @@ fn a_provider_failure_is_reported_without_leaking_the_key() {
     let model = model(base_url);
 
     let error = model
-        .respond(&[ChatMessage::user("hi")], &[])
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
         .expect_err("a 5xx response must surface as an error");
     assert!(
         !error.message.contains(TEST_API_KEY),
@@ -129,7 +134,7 @@ fn a_malformed_response_is_reported() {
     let model = model(base_url);
 
     let error = model
-        .respond(&[ChatMessage::user("hi")], &[])
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
         .expect_err("a response without choices must surface as an error");
     assert!(
         error.message.contains("unexpected model response"),
@@ -149,7 +154,7 @@ fn parses_a_well_formed_tool_call() {
     let model = model(base_url);
 
     let reply = model
-        .respond(&[ChatMessage::user("list files")], &[])
+        .respond(&context(vec![ChatMessage::user("list files")]), &[])
         .expect("a tool-call response parses");
     assert_eq!(reply.tool_calls.len(), 1);
     assert_eq!(reply.tool_calls[0].id, "call_1");
@@ -169,7 +174,7 @@ fn a_tool_call_with_an_empty_id_is_rejected() {
     let model = model(base_url);
 
     let error = model
-        .respond(&[ChatMessage::user("hi")], &[])
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
         .expect_err("an empty tool-call id must surface as an error");
     assert!(
         error.message.contains("unexpected tool call"),

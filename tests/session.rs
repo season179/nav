@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use nav::{
-    ChatMessage, ChatModel, Event, MockModel, ModelError, ModelResponse, SessionStore, Storage,
-    ToolDef,
+    ChatMessage, ChatModel, Event, MockModel, ModelContext, ModelError, ModelResponse,
+    SessionStore, Storage, ToolDef,
 };
 
 #[test]
@@ -222,10 +222,10 @@ impl RecordingModel {
 impl ChatModel for RecordingModel {
     fn respond(
         &self,
-        history: &[ChatMessage],
+        context: &ModelContext,
         _tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
-        self.calls.lock().unwrap().push(history.to_vec());
+        self.calls.lock().unwrap().push(context.messages().to_vec());
         Ok(ModelResponse::text("recorded reply"))
     }
 }
@@ -236,7 +236,7 @@ struct FailingModel;
 impl ChatModel for FailingModel {
     fn respond(
         &self,
-        _history: &[ChatMessage],
+        _context: &ModelContext,
         _tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
         Err(ModelError::new("model is offline"))

@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nav::{
-    ChatMessage, ChatModel, Event, ModelError, ModelResponse, SessionStore, Storage, ToolCall,
-    ToolDef,
+    ChatMessage, ChatModel, Event, ModelContext, ModelError, ModelResponse, SessionStore, Storage,
+    ToolCall, ToolDef,
 };
 
 /// A throwaway directory, removed on drop.
@@ -56,12 +56,15 @@ impl ScriptedModel {
 impl ChatModel for ScriptedModel {
     fn respond(
         &self,
-        history: &[ChatMessage],
+        context: &ModelContext,
         tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
         // The loop must advertise the coding tools to the model.
         assert!(tools.iter().any(|tool| tool.name == "ls"));
-        self.histories.lock().unwrap().push(history.to_vec());
+        self.histories
+            .lock()
+            .unwrap()
+            .push(context.messages().to_vec());
 
         let nth = self.calls.fetch_add(1, Ordering::SeqCst);
         if nth == 0 {

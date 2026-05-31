@@ -21,12 +21,14 @@ use serde_json::{Value, json};
 
 mod agent;
 mod config;
+mod context;
 mod model;
 mod session;
 mod storage;
 mod tools;
 
 pub use config::{ConfigError, ResolvedModelConfig, resolve_config, resolve_default_config};
+pub use context::{ContextAssembler, ModelContext, TurnHistory};
 pub use model::{
     ChatMessage, ChatModel, FinishReason, MockModel, ModelChoice, ModelError, ModelResponse,
     OpenAiConfig, OpenAiModel, Role, ToolCall, ToolDef,
