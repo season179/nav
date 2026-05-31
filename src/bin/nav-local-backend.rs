@@ -1,4 +1,3 @@
-use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -8,6 +7,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use nav::{ModelChoice, SessionStore, Storage};
 use serde_json::{Value, json};
+
+const STARTUP_TRACE_PREFIX: &str = "nav startup trace ";
 
 fn main() -> ExitCode {
     match run() {
@@ -121,7 +122,7 @@ fn run() -> io::Result<()> {
 }
 
 struct StartupTrace {
-    path: Option<String>,
+    stderr_enabled: bool,
     started_at: Instant,
     trace_id: Option<String>,
 }
@@ -129,9 +130,7 @@ struct StartupTrace {
 impl StartupTrace {
     fn from_env() -> Self {
         Self {
-            path: std::env::var("NAV_STARTUP_TRACE_PATH")
-                .ok()
-                .filter(|path| !path.is_empty()),
+            stderr_enabled: std::env::var("NAV_STARTUP_TRACE_STDERR").as_deref() == Ok("1"),
             started_at: Instant::now(),
             trace_id: std::env::var("NAV_STARTUP_TRACE_ID")
                 .ok()
@@ -140,7 +139,7 @@ impl StartupTrace {
     }
 
     fn event(&self, event: &str, fields: Value) {
-        let (Some(path), Some(trace_id)) = (&self.path, &self.trace_id) else {
+        let (true, Some(trace_id)) = (self.stderr_enabled, &self.trace_id) else {
             return;
         };
 
@@ -157,9 +156,8 @@ impl StartupTrace {
             }
         }
 
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{}", Value::Object(payload));
-        }
+        let line = Value::Object(payload).to_string();
+        let _ = writeln!(io::stderr().lock(), "{STARTUP_TRACE_PREFIX}{line}");
     }
 }
 

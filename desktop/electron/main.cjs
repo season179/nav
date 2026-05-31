@@ -162,8 +162,21 @@ function activateSession(window, id, { startup = false } = {}) {
   eventSubscription = subscribeToSessionEvents({
     backendUrl,
     sessionId: id,
-    onOpen() {
-      markStartup(startup, "electron.sse.open", { session_id: id });
+    onOpen({ statusCode } = {}) {
+      markStartup(startup, "electron.sse.open", {
+        session_id: id,
+        status_code: statusCode,
+      });
+      if (statusCode !== 200) {
+        return;
+      }
+      // Smoke mode drives the turn from Main and quits on `run.completed`;
+      // telling the renderer it is connected can start sidebar/model refreshes
+      // that race the intentional shutdown.
+      if (!smokeMode) {
+        sendStatus(window, { state: "connected", backendUrl, sessionId: id });
+      }
+      markStartup(startup, "electron.connected", { session_id: id });
     },
     onEvent(event) {
       if (startup) {
@@ -181,13 +194,6 @@ function activateSession(window, id, { startup = false } = {}) {
       }
     },
   });
-  // Smoke mode drives the turn from Main and quits on `run.completed`; telling
-  // the renderer it is connected can start sidebar/model refreshes that race the
-  // intentional shutdown.
-  if (!smokeMode) {
-    sendStatus(window, { state: "connected", backendUrl, sessionId: id });
-  }
-  markStartup(startup, "electron.connected", { session_id: id });
 }
 
 // Reopen the most recent conversation so sessions persist across launches.

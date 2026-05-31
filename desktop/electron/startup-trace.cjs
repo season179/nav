@@ -34,6 +34,10 @@ class NoopStartupTrace {
     return { ...overrides };
   }
 
+  writeBackendEvent() {
+    return null;
+  }
+
   summaryLine() {
     return null;
   }
@@ -88,8 +92,21 @@ class StartupTrace {
     return {
       ...overrides,
       NAV_STARTUP_TRACE_ID: this.traceId,
-      NAV_STARTUP_TRACE_PATH: this.traceFile,
+      NAV_STARTUP_TRACE_STDERR: "1",
     };
+  }
+
+  writeBackendEvent(entry) {
+    if (!entry || entry.trace_id !== this.traceId) {
+      return null;
+    }
+    const backendEntry = {
+      ...entry,
+      trace_id: this.traceId,
+      source: "backend",
+    };
+    this.write(backendEntry);
+    return backendEntry;
   }
 
   duration(startEvent, endEvent) {

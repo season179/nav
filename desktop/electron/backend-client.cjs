@@ -16,13 +16,13 @@ function subscribeToSessionEvents({
   let closed = false;
 
   const request = transport.get(eventsUrl, (response) => {
+    onOpen?.({ statusCode: response.statusCode });
     if (response.statusCode !== 200) {
       response.resume();
       onError(new Error(`SSE request failed with HTTP ${response.statusCode}`));
       return;
     }
 
-    onOpen?.({ statusCode: response.statusCode });
     response.setEncoding("utf8");
     response.on("data", (chunk) => {
       buffer += chunk;

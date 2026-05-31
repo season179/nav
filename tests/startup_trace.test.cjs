@@ -74,8 +74,40 @@ test("startup trace writes sanitized JSONL entries and child trace env", () => {
   assert.deepEqual(trace.childEnv({ NAV_MOCK_MODEL: "1" }), {
     NAV_MOCK_MODEL: "1",
     NAV_STARTUP_TRACE_ID: trace.traceId,
-    NAV_STARTUP_TRACE_PATH: traceFile,
+    NAV_STARTUP_TRACE_STDERR: "1",
   });
+});
+
+test("startup trace writes backend events from the Electron writer", () => {
+  const dir = tempDir("nav-startup-trace-backend-");
+  const traceFile = path.join(dir, "startup.jsonl");
+  const trace = createStartupTrace({
+    enabled: true,
+    performanceNow: monotonicClock([0, 1]),
+    traceFile,
+    traceId: "019e7bb2-7c00-7000-8000-000000000000",
+  });
+
+  const recorded = trace.writeBackendEvent({
+    trace_id: trace.traceId,
+    source: "backend",
+    event: "backend.ready",
+    timestamp_ms: 1_780_000_000_000,
+    elapsed_ms: 8,
+    model_kind: "mock",
+  });
+  trace.writeBackendEvent({
+    trace_id: "019e7bb2-7c00-7000-8000-111111111111",
+    event: "backend.ignored",
+  });
+
+  assert.equal(recorded.event, "backend.ready");
+  const lines = readJsonl(traceFile);
+  assert.equal(lines.at(-1).event, "backend.ready");
+  assert.equal(
+    lines.some((line) => line.event === "backend.ignored"),
+    false,
+  );
 });
 
 test("startup trace rotates the local JSONL file", () => {

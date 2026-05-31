@@ -2,6 +2,7 @@ const { spawn } = require("node:child_process");
 const { setTimeout: delay } = require("node:timers/promises");
 
 const STARTUP_PREFIX = "nav local backend listening on ";
+const STARTUP_TRACE_PREFIX = "nav startup trace ";
 
 async function startLocalBackend({
   projectRoot,
@@ -33,11 +34,36 @@ async function startLocalBackend({
 
   let stdout = "";
   let stderr = "";
+  let stderrRemainder = "";
+  const handleStderrLine = (line) => {
+    if (!line.startsWith(STARTUP_TRACE_PREFIX)) {
+      stderr += `${line}\n`;
+      return;
+    }
+
+    try {
+      trace?.writeBackendEvent(
+        JSON.parse(line.slice(STARTUP_TRACE_PREFIX.length)),
+      );
+    } catch (_error) {
+      stderr += `${line}\n`;
+    }
+  };
   child.stdout.on("data", (chunk) => {
     stdout += chunk.toString("utf8");
   });
   child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString("utf8");
+    stderrRemainder = collectStderrLines({
+      chunk: chunk.toString("utf8"),
+      previousRemainder: stderrRemainder,
+      onLine: handleStderrLine,
+    });
+  });
+  child.stderr.on("end", () => {
+    if (stderrRemainder) {
+      handleStderrLine(stderrRemainder);
+      stderrRemainder = "";
+    }
   });
 
   for (let attempt = 0; attempt < startupAttempts; attempt += 1) {
@@ -70,7 +96,17 @@ function findBackendUrl(stdout) {
   return line?.replace(STARTUP_PREFIX, "") ?? null;
 }
 
+function collectStderrLines({ chunk, previousRemainder = "", onLine }) {
+  const lines = `${previousRemainder}${chunk}`.split(/\r?\n/);
+  const remainder = lines.pop() ?? "";
+  for (const line of lines) {
+    onLine(line);
+  }
+  return remainder;
+}
+
 module.exports = {
+  collectStderrLines,
   findBackendUrl,
   startLocalBackend,
 };
