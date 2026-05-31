@@ -35,8 +35,12 @@ function autoResizeInput() {
 
 input.addEventListener("input", autoResizeInput);
 
-// Enter sends; Shift+Enter inserts a newline.
+// Enter sends; Shift+Enter inserts a newline. Ignore Enter while an IME
+// composition is active so committing a candidate doesn't send early.
 input.addEventListener("keydown", (keyEvent) => {
+  if (keyEvent.isComposing) {
+    return;
+  }
   if (keyEvent.key === "Enter" && !keyEvent.shiftKey) {
     keyEvent.preventDefault();
     composer.requestSubmit();
