@@ -176,14 +176,19 @@ impl Storage {
     /// truncate and supply a fallback for empty sessions).
     pub fn list_sessions(&self, source: &str) -> Result<Vec<SessionSummary>, StorageError> {
         let conn = self.conn.lock().unwrap();
+        // The title reads from the derived `turn_parts_text` table (kept in sync
+        // by triggers) rather than scanning `turn_parts` and json_extract-ing
+        // each row: its `idx_turn_parts_text_turn_id` index turns the per-session
+        // lookup into an indexed join. `turn_parts_text` already drops empty
+        // parts, so the first non-empty user text wins.
         let mut stmt = conn.prepare(
             "SELECT s.id, s.updated_at,
-                    (SELECT json_extract(tp.data_json, '$.text')
-                     FROM turn_parts tp
-                     JOIN turns t ON t.id = tp.turn_id
+                    (SELECT tpt.text
+                     FROM turn_parts_text tpt
+                     JOIN turns t ON t.id = tpt.turn_id
                      JOIN runs r ON r.id = t.run_id
-                     WHERE r.session_id = s.id AND t.role = 'user' AND tp.type = 'text'
-                     ORDER BY r.started_at, t.seq, tp.created_at
+                     WHERE r.session_id = s.id AND t.role = 'user' AND tpt.part_type = 'text'
+                     ORDER BY r.started_at, t.seq, tpt.part_id
                      LIMIT 1) AS title
              FROM sessions s
              WHERE s.source = ?1

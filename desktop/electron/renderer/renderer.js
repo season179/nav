@@ -83,12 +83,18 @@ async function selectSession(sessionId) {
   if (sessionId === activeSessionId || running || !connected) {
     return;
   }
+  // Update optimistically, but remember the previous session so a failed switch
+  // can roll the highlight back — otherwise the sidebar and backend disagree on
+  // which session is active and the next message routes to the wrong one.
+  const previousSessionId = activeSessionId;
   clearTranscript();
   activeSessionId = sessionId;
   markActiveSession();
   try {
     await window.nav.switchSession(sessionId);
   } catch (error) {
+    activeSessionId = previousSessionId;
+    markActiveSession();
     appendMessage("error", `Could not open session: ${error.message}`);
   }
 }
@@ -133,15 +139,16 @@ async function refreshSessions() {
     item.className = "session-item";
     item.dataset.sessionId = session.sessionId;
     item.textContent = sessionTitle(session);
-    if (session.sessionId === activeSessionId) {
-      item.setAttribute("aria-current", "true");
-    }
     item.addEventListener("click", () => selectSession(session.sessionId));
 
     const row = document.createElement("li");
     row.append(item);
     sessionListNode.append(row);
   }
+
+  // One place decides which item is highlighted, for both fresh lists and
+  // in-place selection changes.
+  markActiveSession();
 }
 
 function sessionTitle(session) {
