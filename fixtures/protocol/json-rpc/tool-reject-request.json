@@ -1,9 +1,0 @@
-{
-  "jsonrpc": "2.0",
-  "id": "019f2f6f-f178-7a72-9f28-000000000021",
-  "method": "tool.reject",
-  "params": {
-    "approval_id": "019f2f6f-f178-7a72-9f28-000000000041",
-    "reason": "user declined the tool request"
-  }
-}

@@ -1,8 +1,0 @@
-{
-  "jsonrpc": "2.0",
-  "id": "019f2f6f-f178-7a72-9f28-000000000020",
-  "method": "tool.approve",
-  "params": {
-    "approval_id": "019f2f6f-f178-7a72-9f28-000000000040"
-  }
-}

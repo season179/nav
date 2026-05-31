@@ -1,1 +1,0 @@
-{"type":"tool_call","id":"019f2f6f-f178-7a72-9f28-000000000050","name":"read","arguments":{"path":"Cargo.toml"},"raw_arguments_artifact_id":"art_0000018bcfe56800_0000000000000001"}
