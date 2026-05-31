@@ -1,5 +1,9 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
+const os = require("node:os");
+const path = require("node:path");
+const fs = require("node:fs");
+const crypto = require("node:crypto");
 
 const {
   subscribeToSessionEvents,
@@ -79,16 +83,24 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
 });
 
 async function startMockBackend() {
+  // Persist to a throwaway database so the test never touches ~/.nav/nav.db.
+  const dbPath = path.join(
+    os.tmpdir(),
+    `nav-electron-test-${crypto.randomUUID()}.db`,
+  );
   const backend = await startLocalBackend({
     projectRoot: process.cwd(),
     startupAttempts: 80,
-    env: { NAV_MOCK_MODEL: "1" },
+    env: { NAV_MOCK_MODEL: "1", NAV_DB_PATH: dbPath },
   });
 
   return {
     url: backend.url,
     stop() {
       backend.child.kill();
+      for (const suffix of ["", "-wal", "-shm"]) {
+        fs.rmSync(`${dbPath}${suffix}`, { force: true });
+      }
     },
   };
 }

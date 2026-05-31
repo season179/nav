@@ -150,6 +150,15 @@ impl ModelChoice {
         }
     }
 
+    /// The active model's identifier, when a real provider is configured. Used
+    /// to tag persisted assistant turns; `None` for the mock or no model.
+    pub fn model_id(&self) -> Option<String> {
+        match self {
+            ModelChoice::OpenAi(config) => Some(config.model.clone()),
+            _ => None,
+        }
+    }
+
     /// A short human-readable label for the backend status line.
     pub fn describe(&self) -> String {
         match self {
