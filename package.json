@@ -13,5 +13,9 @@
   "devDependencies": {
     "@biomejs/biome": "2.4.15",
     "electron": "^42.2.0"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.5",
+    "marked": "^18.0.4"
   }
 }

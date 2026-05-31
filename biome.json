@@ -6,7 +6,11 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["desktop/**", "tests/**/*.cjs"]
+    "includes": [
+      "desktop/**",
+      "tests/**/*.cjs",
+      "!desktop/electron/renderer/vendor"
+    ]
   },
   "formatter": {
     "enabled": true,

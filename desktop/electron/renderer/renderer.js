@@ -200,11 +200,20 @@ function appendMessage(role, text) {
   const item = document.createElement("li");
   item.className = `message message-${role}`;
 
-  const body = document.createElement("span");
-  body.className = "message-text";
-  body.textContent = text;
-
+  // Assistant turns are Markdown; everything else (user input, tool output,
+  // errors) is plain text and stays verbatim.
+  let body;
+  if (role === "assistant") {
+    body = document.createElement("div");
+    body.className = "message-text markdown";
+    renderMarkdownInto(body, text);
+  } else {
+    body = document.createElement("span");
+    body.className = "message-text";
+    body.textContent = text;
+  }
   item.append(body);
+
   if (role === "user" || role === "assistant") {
     stampLatestTurn(item, role);
   }
@@ -329,4 +338,32 @@ function renderBackendStatus(status) {
       appendMessage("error", status.message ?? status.state);
       break;
   }
+}
+
+// --- Markdown -------------------------------------------------------------
+//
+// Assistant turns are Markdown. `marked` parses it to HTML and `DOMPurify`
+// sanitizes that HTML before it reaches the DOM — we never hand-build the
+// markup. DOMPurify strips scripts, event-handler attributes, and javascript:
+// URLs from the untrusted model output, so assigning innerHTML here is safe.
+// Both are loaded as UMD globals by index.html.
+const marked = window.marked;
+const DOMPurify = window.DOMPurify;
+
+// gfm: tables/strikethrough/etc.; breaks: a lone newline becomes <br>, which
+// matches how chat text reads.
+marked.setOptions({ gfm: true, breaks: true });
+
+// Links must open in the user's browser, not navigate the app window. The hook
+// runs on every sanitize pass; noopener keeps the opened page off window.opener.
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A") {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
+// Render `source` Markdown into `element` as sanitized HTML.
+function renderMarkdownInto(element, source) {
+  element.innerHTML = DOMPurify.sanitize(marked.parse(source));
 }
