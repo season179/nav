@@ -54,12 +54,13 @@ The architecture docs describe JSON-RPC over HTTP for commands and SSE for
 ordered session events. Electron should start by acting as another frontend
 client of that contract, not by inventing a second protocol.
 
-Current state: this checkout does not yet have a runnable `nav-server`
-implementation or a `crates/nav-protocol` crate. Treat those names as possible
-future implementation names, not as current components. Before desktop shell
-work starts, there must be a runnable local HTTP/SSE backend endpoint and a
-minimal protocol surface, or the desktop spike must stop and report that
-backend prerequisite instead of adding fake UI scaffolding.
+Current state: this checkout has a minimal `nav-local-backend` fixture command
+documented in `docs/local-backend.md`. It is not a full `nav-server`
+implementation and there is still no `crates/nav-protocol` crate. Treat those
+names as possible future implementation names, not as current components.
+Electron spike work can attach to the fixture SSE endpoint for read-only
+protocol wiring, but command execution and live agent-loop behavior remain
+backend follow-up work.
 
 Recommended first shape:
 
