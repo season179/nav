@@ -56,6 +56,7 @@ pub struct SessionSummary {
     pub id: String,
     pub title: Option<String>,
     pub workspace_root: Option<String>,
+    pub project_root: Option<String>,
     pub updated_at: i64,
 }
 
@@ -373,10 +374,16 @@ impl Storage {
              ORDER BY s.updated_at DESC, s.created_at DESC, s.id DESC",
         )?;
         let rows = stmt.query_map(params![source], |row| {
+            let workspace_root = row
+                .get::<_, Option<String>>(2)?
+                .and_then(stored_workspace_root_string);
             Ok(SessionSummary {
                 id: row.get(0)?,
                 updated_at: row.get(1)?,
-                workspace_root: row.get::<_, Option<String>>(2)?,
+                project_root: workspace_root
+                    .as_deref()
+                    .map(|path| project_root_to_string(Path::new(path))),
+                workspace_root,
                 title: row.get::<_, Option<String>>(3)?,
             })
         })?;
@@ -449,7 +456,8 @@ impl Storage {
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
-            .flatten())
+            .flatten()
+            .and_then(stored_workspace_root_string))
     }
 
     /// Rebuild a Session's Turn History in order, so it can be resumed with its
@@ -722,10 +730,127 @@ fn new_id() -> String {
     Uuid::now_v7().to_string()
 }
 
+pub(crate) fn workspace_root_to_string(workspace_root: &Path) -> String {
+    workspace_root.to_string_lossy().replace('\\', "/")
+}
+
+pub(crate) fn project_root_to_string(workspace_root: &Path) -> String {
+    canonical_git_worktree_root(workspace_root)
+        .unwrap_or_else(|| workspace_root.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 fn workspace_root_string(workspace_root: Option<&Path>) -> Option<String> {
     workspace_root
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .map(workspace_root_to_string)
         .filter(|path| !path.trim().is_empty())
+}
+
+fn stored_workspace_root_string(workspace_root: String) -> Option<String> {
+    let trimmed = workspace_root.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(workspace_root_to_string(Path::new(trimmed)))
+    }
+}
+
+/// Return the main checkout root for a linked git worktree, or `None` for a
+/// regular checkout/non-git path. Reads `<workspace_root>/.git`, resolves its
+/// `gitdir` relative to `workspace_root` when needed, then resolves that git
+/// directory's `commondir`; for example `.git` containing
+/// `gitdir: /repo/.git/worktrees/nav` plus `commondir` of `../..` returns
+/// `Some(/repo)`.
+fn canonical_git_worktree_root(workspace_root: &Path) -> Option<PathBuf> {
+    let git_file = std::fs::read_to_string(workspace_root.join(".git")).ok()?;
+    let git_dir = parse_gitdir(&git_file)?;
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        workspace_root.join(git_dir)
+    };
+    let common_dir = common_git_dir(&git_dir)?;
+
+    if common_dir.file_name().is_some_and(|name| name == ".git") {
+        common_dir.parent().map(PathBuf::from)
+    } else {
+        None
+    }
+}
+
+/// Parse a `gitdir: <path>` line from a gitfile and return its path, preserving
+/// whether it is relative or absolute. Empty values and files without a
+/// `gitdir:` line return `None`; for example `gitdir: ../repo/.git/worktrees/a`
+/// returns `Some("../repo/.git/worktrees/a")`.
+fn parse_gitdir(git_file: &str) -> Option<PathBuf> {
+    git_file.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("gitdir:")?.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        }
+    })
+}
+
+/// Resolve the common git directory for a linked worktree git dir. A non-empty
+/// `commondir` file wins: relative values are joined to `git_dir`, absolute
+/// values are used as-is, and the result is canonicalized when possible or
+/// lexically normalized when the target is missing. Without `commondir`, this
+/// falls back to detecting `<repo>/.git/worktrees/<name>` and returning
+/// `<repo>/.git`; otherwise it returns `None`.
+/// Example: `git_dir=/repo/.git/worktrees/nav`, `commondir=../..` returns
+/// `/repo/.git`.
+fn common_git_dir(git_dir: &Path) -> Option<PathBuf> {
+    if let Ok(common_dir) = std::fs::read_to_string(git_dir.join("commondir")) {
+        let common_dir = common_dir.lines().next()?.trim();
+        if !common_dir.is_empty() {
+            let common_dir = PathBuf::from(common_dir);
+            let common_dir = if common_dir.is_absolute() {
+                common_dir
+            } else {
+                git_dir.join(common_dir)
+            };
+            return Some(match std::fs::canonicalize(&common_dir) {
+                Ok(path) => path,
+                Err(_) => normalize_absolute_path(&common_dir),
+            });
+        }
+    }
+
+    let worktrees_dir = git_dir.parent()?;
+    if worktrees_dir
+        .file_name()
+        .is_some_and(|name| name == "worktrees")
+    {
+        worktrees_dir.parent().map(PathBuf::from)
+    } else {
+        None
+    }
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+
+    normalized
 }
 
 fn now_ms() -> i64 {

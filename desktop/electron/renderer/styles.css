@@ -283,11 +283,23 @@ body {
   content: "";
 }
 
-.project-name {
+.project-title {
+  display: grid;
+  min-width: 0;
+}
+
+.project-name,
+.project-path-hint {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.project-path-hint {
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1.2;
 }
 
 .project-chat-add {

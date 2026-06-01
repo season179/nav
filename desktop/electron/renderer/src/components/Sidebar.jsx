@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { groupSessionsByProject } from "../lib/project-list.mjs";
-import { projectSessionView, projectToggleView } from "./sidebar-model.mjs";
+import {
+  projectLabel,
+  projectSessionView,
+  projectToggleView,
+} from "./sidebar-model.mjs";
 
 const projectOrderStorageKey = "nav.projectOrder.v1";
 
@@ -151,12 +155,14 @@ function ProjectHeading({
   onNewChatInProject,
   onToggleProject,
 }) {
+  const label = projectLabel(project);
+
   return (
     <div className="project-heading">
       <button
         type="button"
         className="project-toggle"
-        title={project.path || project.name}
+        title={project.path || label}
         aria-label={toggleView.ariaLabel}
         aria-expanded={toggleView.ariaExpanded}
         onClick={onToggleProject}
@@ -166,14 +172,19 @@ function ProjectHeading({
             {toggleView.disclosure}
           </span>
           <span className="project-icon" aria-hidden="true" />
-          <span className="project-name">{project.name}</span>
+          <span className="project-title">
+            <span className="project-name">{project.name}</span>
+            {project.pathHint ? (
+              <span className="project-path-hint">{project.pathHint}</span>
+            ) : null}
+          </span>
         </span>
       </button>
       <button
         type="button"
         className="project-chat-add"
-        title={`New chat in ${project.name}`}
-        aria-label={`New chat in ${project.name}`}
+        title={`New chat in ${label}`}
+        aria-label={`New chat in ${label}`}
         disabled={running || !connected}
         onClick={() => onNewChatInProject(project.path)}
       >

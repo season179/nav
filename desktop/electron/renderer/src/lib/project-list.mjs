@@ -4,7 +4,9 @@ export function groupSessionsByProject(sessions, projectOrder = []) {
   const projects = new Map();
 
   for (const [index, session] of sessions.entries()) {
-    const path = normalizeProjectPath(session.workspaceRoot);
+    const path = normalizeProjectPath(
+      session.projectRoot ?? session.workspaceRoot,
+    );
     const key = projectKey(path);
     let project = projects.get(key);
     if (!project) {
@@ -38,12 +40,61 @@ export function groupSessionsByProject(sessions, projectOrder = []) {
     return left.firstSeenIndex - right.firstSeenIndex;
   });
 
-  return orderedProjects.map((project) => ({
-    key: project.key,
-    path: project.path,
-    name: project.name,
-    sessions: sortSessionsByActivity(project.sessionEntries),
-  }));
+  return addProjectPathHints(
+    orderedProjects.map((project) => ({
+      key: project.key,
+      path: project.path,
+      name: project.name,
+      displayName: project.name,
+      pathHint: null,
+      sessions: sortSessionsByActivity(project.sessionEntries),
+    })),
+  );
+}
+
+function addProjectPathHints(projects) {
+  const projectsByName = new Map();
+
+  for (const project of projects) {
+    if (!project.path) {
+      continue;
+    }
+    const nameProjects = projectsByName.get(project.name) ?? [];
+    nameProjects.push(project);
+    projectsByName.set(project.name, nameProjects);
+  }
+
+  for (const nameProjects of projectsByName.values()) {
+    if (nameProjects.length <= 1) {
+      continue;
+    }
+
+    const peerParts = nameProjects.map((project) =>
+      projectPathParts(project.path),
+    );
+    for (const [index, project] of nameProjects.entries()) {
+      const pathHint = uniquePathSuffix(peerParts[index], peerParts, index);
+      project.pathHint = pathHint;
+      project.displayName = `${project.name} (${pathHint})`;
+    }
+  }
+
+  return projects;
+}
+
+function uniquePathSuffix(parts, peerParts, ownIndex) {
+  for (let length = 2; length <= parts.length; length += 1) {
+    const suffix = parts.slice(-length).join("/");
+    const isUnique = peerParts.every(
+      (peer, index) =>
+        index === ownIndex || peer.slice(-length).join("/") !== suffix,
+    );
+    if (isUnique) {
+      return suffix;
+    }
+  }
+
+  return parts.join("/");
 }
 
 function sortSessionsByActivity(sessions) {
@@ -87,4 +138,11 @@ export function projectName(path) {
   }
   const parts = path.split("/").filter(Boolean);
   return parts.at(-1) ?? path;
+}
+
+function projectPathParts(path) {
+  if (path === "/") {
+    return ["/"];
+  }
+  return path.split("/").filter(Boolean);
 }

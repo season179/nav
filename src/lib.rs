@@ -176,6 +176,7 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                         "sessionId": session.id,
                         "title": session.title,
                         "workspaceRoot": session.workspace_root,
+                        "projectRoot": session.project_root,
                         "updatedAt": session.updated_at,
                     })
                 })

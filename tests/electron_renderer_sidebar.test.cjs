@@ -64,6 +64,24 @@ test("project heading exposes collapse and expand state", async () => {
   });
 });
 
+test("project aria labels use a disambiguated display name", async () => {
+  const { projectSessionToggle, projectToggleView } = await loadSidebarModel();
+  const project = {
+    ...projectWithSessions(7),
+    displayName: "nav (Personal/nav)",
+    pathHint: "Personal/nav",
+  };
+
+  assert.equal(
+    projectToggleView(project, false).ariaLabel,
+    "Collapse project nav (Personal/nav)",
+  );
+  assert.equal(
+    projectSessionToggle(project, false).ariaLabel,
+    "Show 2 more sessions in nav (Personal/nav)",
+  );
+});
+
 function loadSidebarModel() {
   return import(
     pathToFileURL(

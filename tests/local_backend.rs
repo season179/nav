@@ -267,6 +267,10 @@ fn create_session_accepts_cwd_and_lists_the_project_root() {
         listed["result"]["sessions"][0]["workspaceRoot"], expected,
         "session.list should expose the selected cwd as project root: {listed}"
     );
+    assert_eq!(
+        listed["result"]["sessions"][0]["projectRoot"], expected,
+        "session.list should expose the selected cwd as sidebar project root: {listed}"
+    );
 }
 
 #[test]
@@ -356,6 +360,15 @@ fn create_session_worktree_mode_creates_a_linked_worktree_workspace() {
     assert!(
         workspace_root.starts_with(&expected_prefix),
         "worktree sessions should be rooted under .nav/worktrees: {workspace_root}"
+    );
+    let expected_project = fs::canonicalize(&repo.path)
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert_eq!(
+        session["projectRoot"].as_str(),
+        Some(expected_project.as_str()),
+        "worktree sessions should group under their main checkout: {session}"
     );
     assert!(
         Path::new(workspace_root).join("shared.txt").exists(),

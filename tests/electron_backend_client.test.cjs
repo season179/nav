@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const childProcess = require("node:child_process");
 const { test } = require("node:test");
 const http = require("node:http");
 const os = require("node:os");
@@ -36,7 +37,12 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
     assert.equal(
       listed.result.sessions[0].workspaceRoot,
       process.cwd(),
-      "session.list includes the backend project root",
+      "session.list includes the backend workspace root",
+    );
+    assert.equal(
+      listed.result.sessions[0].projectRoot,
+      currentRepoMainCheckout(),
+      "session.list includes the backend sidebar project root",
     );
     projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "nav-project-"));
     const projectSession = await sendRpc({
@@ -218,6 +224,19 @@ async function startMockBackend() {
       }
     },
   };
+}
+
+function currentRepoMainCheckout() {
+  const commonGitDir = childProcess
+    .execFileSync("git", ["rev-parse", "--git-common-dir"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+    })
+    .trim();
+  const resolvedCommonGitDir = path.resolve(process.cwd(), commonGitDir);
+  return path.basename(resolvedCommonGitDir) === ".git"
+    ? fs.realpathSync(path.dirname(resolvedCommonGitDir))
+    : process.cwd();
 }
 
 function listen(server) {
