@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const tokenFormatter = new Intl.NumberFormat("en-US");
 const sessionModeOptions = [
@@ -126,6 +126,14 @@ export default function Composer({
 function SessionModeMenu({ disabled, mode, onModeChange }) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef(null);
+  const triggerRef = useRef(null);
+
+  const closeMenu = useCallback(() => {
+    setOpen(false);
+    window.setTimeout(() => {
+      triggerRef.current?.focus();
+    }, 0);
+  }, []);
 
   useEffect(() => {
     if (!open) {
@@ -134,7 +142,7 @@ function SessionModeMenu({ disabled, mode, onModeChange }) {
 
     function closeOnOutsidePointer(event) {
       if (!menuRef.current?.contains(event.target)) {
-        setOpen(false);
+        closeMenu();
       }
     }
 
@@ -142,28 +150,29 @@ function SessionModeMenu({ disabled, mode, onModeChange }) {
     return () => {
       document.removeEventListener("pointerdown", closeOnOutsidePointer);
     };
-  }, [open]);
+  }, [open, closeMenu]);
 
   useEffect(() => {
     if (disabled) {
-      setOpen(false);
+      closeMenu();
     }
-  }, [disabled]);
+  }, [disabled, closeMenu]);
 
   function selectMode(value) {
     onModeChange(value);
-    setOpen(false);
+    closeMenu();
   }
 
   function closeOnEscape(event) {
     if (event.key === "Escape") {
-      setOpen(false);
+      closeMenu();
     }
   }
 
   return (
     <span className="composer-session-mode" ref={menuRef}>
       <button
+        ref={triggerRef}
         type="button"
         id="new-session-mode"
         className="session-mode-trigger"
