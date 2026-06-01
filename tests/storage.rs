@@ -137,6 +137,7 @@ fn most_recent_session_can_be_scoped_to_a_workspace_root() {
     storage
         .create_session_with_workspace("worktree-new", "nav", Some(Path::new("/worktrees/nav-a")))
         .unwrap();
+    storage.create_session("legacy-blank", "nav").unwrap();
     {
         let conn = Connection::open(&path).expect("reopen to set updated_at");
         conn.execute(
@@ -149,11 +150,16 @@ fn most_recent_session_can_be_scoped_to_a_workspace_root() {
             [],
         )
         .unwrap();
+        conn.execute(
+            "UPDATE sessions SET updated_at = 300 WHERE id = 'legacy-blank'",
+            [],
+        )
+        .unwrap();
     }
 
     assert_eq!(
         storage.most_recent_session("nav").unwrap().as_deref(),
-        Some("worktree-new"),
+        Some("legacy-blank"),
         "global latest remains most recent across all projects"
     );
     assert_eq!(
@@ -162,7 +168,15 @@ fn most_recent_session_can_be_scoped_to_a_workspace_root() {
             .unwrap()
             .as_deref(),
         Some("main-old"),
-        "workspace latest must not cross into another worktree"
+        "workspace latest must not cross into another worktree or legacy blank root"
+    );
+    assert_eq!(
+        storage
+            .most_recent_session_in_workspace("nav", Path::new(""))
+            .unwrap()
+            .as_deref(),
+        Some("legacy-blank"),
+        "legacy blank roots only match a blank requested workspace"
     );
 }
 

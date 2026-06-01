@@ -352,7 +352,7 @@ fn create_session_worktree_mode_creates_a_linked_worktree_workspace() {
         .join(".nav")
         .join("worktrees")
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
     assert!(
         workspace_root.starts_with(&expected_prefix),
         "worktree sessions should be rooted under .nav/worktrees: {workspace_root}"

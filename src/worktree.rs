@@ -15,7 +15,7 @@ pub(crate) fn create_session_worktree(cwd: &Path) -> Result<CreatedWorktree, Str
     let repo_root = git_stdout(cwd, &["rev-parse", "--show-toplevel"])?;
     let repo_root = PathBuf::from(repo_root.trim());
     let container_root = main_worktree_root(&repo_root).unwrap_or(repo_root);
-    ensure_local_nav_ignored(&container_root);
+    ensure_local_nav_ignored(&container_root)?;
 
     let base = base_ref(&container_root)?;
     let id = Uuid::now_v7().to_string();
@@ -59,13 +59,12 @@ fn base_ref(repo_root: &Path) -> Result<String, String> {
     Ok(head.to_owned())
 }
 
-fn ensure_local_nav_ignored(repo_root: &Path) {
-    let Ok(exclude) = git_stdout(repo_root, &["rev-parse", "--git-path", "info/exclude"]) else {
-        return;
-    };
+fn ensure_local_nav_ignored(repo_root: &Path) -> Result<(), String> {
+    let exclude = git_stdout(repo_root, &["rev-parse", "--git-path", "info/exclude"])
+        .map_err(|error| exclude_error(format!("could not locate git exclude file: {error}")))?;
     let exclude = exclude.trim();
     if exclude.is_empty() {
-        return;
+        return Err(exclude_error("git returned an empty exclude path"));
     }
     let exclude_path = if Path::new(exclude).is_absolute() {
         PathBuf::from(exclude)
@@ -73,31 +72,51 @@ fn ensure_local_nav_ignored(repo_root: &Path) {
         repo_root.join(exclude)
     };
 
-    let Ok(content) = fs::read_to_string(&exclude_path).or_else(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(String::new())
-        } else {
-            Err(error)
-        }
-    }) else {
-        return;
-    };
+    let content = fs::read_to_string(&exclude_path)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(String::new())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| {
+            exclude_error(format!(
+                "could not read {}: {error}",
+                exclude_path.display()
+            ))
+        })?;
     if content
         .lines()
         .any(|line| matches!(line.trim(), ".nav" | ".nav/"))
     {
-        return;
+        return Ok(());
     }
 
     if let Some(parent) = exclude_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent).map_err(|error| {
+            exclude_error(format!("could not create {}: {error}", parent.display()))
+        })?;
     }
     let separator = if content.is_empty() || content.ends_with('\n') {
         ""
     } else {
         "\n"
     };
-    let _ = fs::write(exclude_path, format!("{content}{separator}.nav/\n"));
+    fs::write(&exclude_path, format!("{content}{separator}.nav/\n")).map_err(|error| {
+        exclude_error(format!(
+            "could not write {}: {error}",
+            exclude_path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn exclude_error(reason: impl AsRef<str>) -> String {
+    format!(
+        "could not exclude .nav/ from Git tracking: {}",
+        reason.as_ref()
+    )
 }
 
 fn git_status(cwd: &Path, args: &[&str]) -> bool {

@@ -189,7 +189,7 @@ fn has_parent_traversal(command: &str) -> bool {
         }
         let previous_ok = index == 0 || is_path_separator(bytes[index - 1]);
         let next = bytes.get(index + 2).copied();
-        let next_ok = next.is_none_or(|byte| byte == b'/');
+        let next_ok = next.is_none_or(is_parent_traversal_suffix);
         if previous_ok && next_ok {
             return true;
         }
@@ -213,6 +213,10 @@ fn is_path_separator(byte: u8) -> bool {
             | b'>'
             | b'/'
     )
+}
+
+fn is_parent_traversal_suffix(byte: u8) -> bool {
+    matches!(byte, b'/' | b'\'' | b'"' | b'`')
 }
 
 fn display_path(path: &Path) -> String {

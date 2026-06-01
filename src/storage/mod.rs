@@ -403,8 +403,7 @@ impl Storage {
     }
 
     /// The most recently active session from `source` in `workspace_root`, if
-    /// any. Empty legacy workspace roots are treated as the caller's workspace
-    /// for compatibility with sessions created before nav persisted cwd.
+    /// any. Blank legacy workspace roots only match a blank requested workspace.
     pub fn most_recent_session_in_workspace(
         &self,
         source: &str,
@@ -416,7 +415,10 @@ impl Storage {
             .query_row(
                 "SELECT id FROM sessions
                  WHERE source = ?1
-                   AND COALESCE(NULLIF(TRIM(workspace_root), ''), ?2) = ?2
+                   AND (
+                     (NULLIF(TRIM(workspace_root), '') IS NULL AND ?2 = '')
+                     OR NULLIF(TRIM(workspace_root), '') = ?2
+                   )
                  ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
                 params![source, workspace_root],
                 |row| row.get::<_, String>(0),

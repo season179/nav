@@ -568,6 +568,25 @@ fn bash_blocks_sibling_worktree_paths_and_parent_traversal() {
         parent.content
     );
     assert!(!fixture.worktree.parent().unwrap().join("leak.txt").exists());
+
+    let quoted_parent = run_error_at(
+        &fixture.worktree,
+        "bash",
+        json!({ "command": "touch ..\"/quoted-leak.txt\"" }),
+    );
+    assert!(
+        quoted_parent.content.contains("parent-directory traversal"),
+        "{}",
+        quoted_parent.content
+    );
+    assert!(
+        !fixture
+            .worktree
+            .parent()
+            .unwrap()
+            .join("quoted-leak.txt")
+            .exists()
+    );
 }
 
 #[test]
