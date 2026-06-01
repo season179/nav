@@ -46,11 +46,12 @@ ipcMain.handle("nav:stop", async () => {
   if (!backendUrl || !sessionId) {
     throw new Error("chat session is not ready");
   }
-  await sendRpc({
+  const response = await sendRpc({
     backendUrl,
     method: "session.stop",
     params: { sessionId },
   });
+  return response.result.stopped === true;
 });
 
 ipcMain.handle("nav:list-sessions", async () => {
@@ -132,7 +133,7 @@ function createMainWindow() {
   });
   trace.mark("electron.window.load_file.start");
   window
-    .loadFile(path.join(__dirname, "renderer", "index.html"))
+    .loadFile(path.join(__dirname, "renderer", "dist", "index.html"))
     .then(() => {
       trace.mark("electron.window.load_file.end");
     })

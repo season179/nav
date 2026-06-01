@@ -3,12 +3,12 @@
 This is the smallest Electron frontend for nav: a minimal multi-turn chat
 window backed by the local HTTP/SSE backend. Electron Main starts the backend,
 creates a session, subscribes to its event stream, and relays the user's
-messages; the renderer only renders the transcript and submits text through a
-narrow preload API.
+messages; the React renderer renders the sidebar/transcript/composer UI and
+submits requests through a narrow preload API.
 
 ## Run
 
-Install the Electron dev dependency:
+Install the JavaScript dependencies:
 
 ```sh
 bun install
@@ -81,13 +81,13 @@ summary with total, backend, session-open, and renderer timings.
   `NAV_MOCK_MODEL=1` only in smoke mode.
 - Main reads the backend URL from stdout, creates a session over `POST /rpc`,
   and subscribes to `/sessions/{id}/events` over HTTP/SSE.
-- Preload exposes only `window.nav.onBackendStatus`, `window.nav.onSessionEvent`,
-  and `window.nav.sessionSendMessage(text)`. The send method validates the text
-  (must be a non-empty string) before invoking Main, so the renderer can never
-  pass an arbitrary IPC payload through.
-- The renderer renders the transcript and submits text. It has no access to
-  Node, Electron internals, the filesystem, the shell, the backend process, or
-  raw `ipcRenderer`.
+- Preload exposes only typed `window.nav` methods for backend status, session
+  events, sending/stopping runs, session switching, model metadata, and project
+  creation. Request values are validated before invoking Main, so the renderer
+  can never pass arbitrary IPC payloads through.
+- The React renderer renders the sidebar, transcript, and composer. It has no
+  access to Node, Electron internals, the filesystem, the shell, the backend
+  process, or raw `ipcRenderer`.
 
 Renderer isolation is enabled with `contextIsolation: true`,
 `nodeIntegration: false`, and `sandbox: true`.

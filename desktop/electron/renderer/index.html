@@ -4,83 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>nav</title>
-    <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <div class="app">
-      <aside class="sidebar" aria-label="Sidebar">
-        <div class="sidebar-header">
-          <button type="button" id="new-chat" class="new-chat" disabled>
-            + New chat
-          </button>
-        </div>
-
-        <nav class="sidebar-section" aria-label="Projects">
-          <div class="sidebar-section-heading">
-            <h2 class="sidebar-section-title">Projects</h2>
-            <button
-              type="button"
-              id="new-project"
-              class="project-add"
-              aria-label="Add project"
-              title="Add project"
-              disabled
-            >
-              +
-            </button>
-          </div>
-          <ul class="session-list" id="session-list"></ul>
-        </nav>
-
-        <!-- Future sidebar sections (Settings, Plugins, Automations) mount here. -->
-        <div class="sidebar-footer"></div>
-      </aside>
-
-      <main class="shell">
-        <section class="chat" aria-label="Chat transcript">
-          <ol class="message-list" id="message-list"></ol>
-        </section>
-
-        <form class="composer" id="composer">
-          <div class="composer-row">
-            <textarea
-              id="composer-input"
-              class="composer-input"
-              aria-label="Message"
-              placeholder="Send a message…"
-              autocomplete="off"
-              rows="1"
-              disabled
-            ></textarea>
-            <button type="submit" id="composer-send" class="composer-send" disabled>
-              Send
-            </button>
-            <button type="button" id="composer-stop" class="composer-stop" hidden>
-              Stop
-            </button>
-          </div>
-          <div class="composer-meta">
-            <span class="composer-model" id="composer-model" aria-live="polite"></span>
-            <span class="composer-meta-right">
-              <span
-                class="composer-thinking"
-                id="composer-thinking"
-                aria-live="polite"
-              ></span>
-              <span
-                class="composer-token-usage"
-                id="composer-token-usage"
-              ></span>
-            </span>
-          </div>
-        </form>
-      </main>
-    </div>
-    <!-- Markdown for assistant turns: marked parses, DOMPurify sanitizes.
-         Vendored UMD builds so the renderer stays self-contained over file://. -->
-    <script src="./vendor/marked.umd.js"></script>
-    <script src="./vendor/purify.min.js"></script>
-    <script src="./project-list.js"></script>
-    <script src="./renderer.js"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
