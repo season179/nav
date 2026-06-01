@@ -66,9 +66,10 @@ impl Tool for WriteTool {
         let existing = read_existing_file(path, &resolved)?;
         let plan = prepare_write(content, existing.as_deref());
 
+        ensure_not_cancelled(cancel, "before creating parent dirs")?;
         create_parent_dirs(path, &resolved)?;
         ensure_not_cancelled(cancel, "before writing file")?;
-        atomic_write(&resolved, path, &plan.bytes)?;
+        atomic_write(&resolved, path, &plan.bytes, cancel)?;
 
         Ok(ToolOutput::new(cap_head(&success_message(path, &plan))))
     }
@@ -176,7 +177,12 @@ fn prepare_write(content: &str, existing: Option<&[u8]>) -> WritePlan {
     }
 }
 
-fn atomic_write(resolved: &Path, path: &str, bytes: &[u8]) -> Result<(), ToolError> {
+fn atomic_write(
+    resolved: &Path,
+    path: &str,
+    bytes: &[u8],
+    cancel: &CancelFlag,
+) -> Result<(), ToolError> {
     let parent = resolved
         .parent()
         .ok_or_else(|| ToolError::new(format!("could not resolve parent directory for {path}")))?;
@@ -194,6 +200,10 @@ fn atomic_write(resolved: &Path, path: &str, bytes: &[u8]) -> Result<(), ToolErr
                 "could not preserve permissions for {path}: {error}"
             ))
         })?;
+    }
+    if let Err(error) = ensure_not_cancelled(cancel, "before committing write") {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
     fs::rename(&temp, resolved).map_err(|error| {
         let _ = fs::remove_file(&temp);
@@ -305,9 +315,40 @@ fn patch_lines(block: &str) -> Vec<&str> {
 }
 
 fn patch_range(start: usize, len: usize) -> String {
-    if len == 1 {
-        start.to_string()
-    } else {
-        format!("{start},{len}")
+    match len {
+        0 => "0,0".to_owned(),
+        1 => start.to_string(),
+        _ => format!("{start},{len}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use super::*;
+
+    #[test]
+    fn cancelled_atomic_write_does_not_publish_the_temp_file() {
+        let root = std::env::temp_dir().join(format!("nav_write_{}", Uuid::now_v7()));
+        fs::create_dir_all(&root).expect("create temp root");
+        let target = root.join("out.txt");
+        fs::write(&target, "before").expect("seed file");
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let result = atomic_write(&target, "out.txt", b"after", &cancel);
+
+        assert!(result.is_err(), "write should be cancelled");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        let temp_entries = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".nav-write-"))
+            .count();
+        assert_eq!(temp_entries, 0, "cancelled write should remove temp file");
+
+        let _ = fs::remove_dir_all(root);
     }
 }

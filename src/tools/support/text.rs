@@ -46,6 +46,15 @@ pub fn normalize_line_endings_to_lf(text: &str) -> String {
     normalized
 }
 
+/// Convert LF-normalized text into bytes while preserving file style.
+///
+/// Precondition: `text` must only use LF for line breaks. Call
+/// `normalize_line_endings_to_lf` first if needed.
+///
+/// Parameters:
+/// - `text`: LF-normalized content.
+/// - `had_bom`: whether to prefix the output with a UTF-8 BOM.
+/// - `line_ending`: target line-ending style to apply to normalized `text`.
 pub fn bytes_preserving_file_style(text: &str, had_bom: bool, line_ending: LineEnding) -> Vec<u8> {
     let mut output_bytes = Vec::new();
     if had_bom {
@@ -55,6 +64,10 @@ pub fn bytes_preserving_file_style(text: &str, had_bom: bool, line_ending: LineE
     output_bytes
 }
 
+/// Restore LF-normalized text to the requested line-ending style.
+///
+/// Precondition: `text` must only use LF for line breaks. Call
+/// `normalize_line_endings_to_lf` first if needed.
 fn restore_line_endings(text: &str, line_ending: LineEnding) -> String {
     match line_ending {
         LineEnding::Lf => text.to_owned(),

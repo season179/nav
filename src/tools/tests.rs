@@ -209,6 +209,42 @@ fn write_overwrites_files_and_reports_a_patch() {
 }
 
 #[test]
+fn write_patch_uses_zero_range_when_overwriting_empty_file() {
+    let workspace = Workspace::new();
+    workspace.write("empty.txt", "");
+
+    let output = run(
+        &workspace,
+        "write",
+        json!({ "path": "empty.txt", "content": "hello\n" }),
+    );
+
+    assert!(
+        output.content.contains("@@ -0,0 +1 @@"),
+        "{}",
+        output.content
+    );
+}
+
+#[test]
+fn write_patch_uses_zero_range_when_rewriting_to_empty_file() {
+    let workspace = Workspace::new();
+    workspace.write("gone.txt", "hello\n");
+
+    let output = run(
+        &workspace,
+        "write",
+        json!({ "path": "gone.txt", "content": "" }),
+    );
+
+    assert!(
+        output.content.contains("@@ -1 +0,0 @@"),
+        "{}",
+        output.content
+    );
+}
+
+#[test]
 fn write_preserves_bom_and_crlf_line_endings_when_overwriting() {
     let workspace = Workspace::new();
     workspace.write_bytes("win.txt", b"\xEF\xBB\xBFone\r\ntwo\r\n");
