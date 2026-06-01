@@ -1,7 +1,12 @@
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const fs = require("node:fs/promises");
 const path = require("node:path");
 const { subscribeToSessionEvents, sendRpc } = require("./backend-client.cjs");
 const { startLocalBackend } = require("./backend-process.cjs");
+const {
+  existingProjectSessionId,
+  normalizeWorkspaceRoot,
+} = require("./project-session.cjs");
 const { createStartupTrace } = require("./startup-trace.cjs");
 const { createWindowOptions } = require("./window-options.cjs");
 
@@ -16,6 +21,7 @@ let backendUrl = null;
 let sessionId = null;
 let mainWindow = null;
 let firstSessionEventSeen = false;
+const pendingProjectSessions = new Map();
 
 app.whenReady().then(async () => {
   trace.mark("electron.app.ready");
@@ -99,9 +105,10 @@ ipcMain.handle("nav:create-project", async () => {
   if (!cwd) {
     return null;
   }
-  const createdSessionId = await createBackendSession(cwd);
-  activateSession(mainWindow, createdSessionId);
-  return createdSessionId;
+  const workspaceRoot = normalizeWorkspaceRoot(await fs.realpath(cwd));
+  const projectSessionId = await openOrCreateProjectSession(workspaceRoot);
+  activateSession(mainWindow, projectSessionId);
+  return projectSessionId;
 });
 
 ipcMain.handle("nav:new-session", async (_event, cwd) => {
@@ -257,6 +264,33 @@ async function createBackendSession(cwd) {
     params,
   });
   return created.result.sessionId;
+}
+
+async function openOrCreateProjectSession(workspaceRoot) {
+  const pending = pendingProjectSessions.get(workspaceRoot);
+  if (pending) {
+    return pending;
+  }
+
+  const lookup = findExistingProjectSession(workspaceRoot).then(
+    (existingSessionId) =>
+      existingSessionId ?? createBackendSession(workspaceRoot),
+  );
+  pendingProjectSessions.set(workspaceRoot, lookup);
+
+  try {
+    return await lookup;
+  } finally {
+    pendingProjectSessions.delete(workspaceRoot);
+  }
+}
+
+async function findExistingProjectSession(workspaceRoot) {
+  const response = await sendRpc({
+    backendUrl,
+    method: "session.list",
+  });
+  return existingProjectSessionId(response.result.sessions, workspaceRoot);
 }
 
 function forwardEvent(window, event) {
