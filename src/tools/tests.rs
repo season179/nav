@@ -36,8 +36,20 @@ impl Workspace {
         fs::write(target, content).expect("seed file");
     }
 
+    fn write_bytes(&self, relative: &str, content: &[u8]) {
+        let target = self.path.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(target, content).expect("seed file");
+    }
+
     fn read(&self, relative: &str) -> String {
         fs::read_to_string(self.path.join(relative)).expect("read file")
+    }
+
+    fn read_bytes(&self, relative: &str) -> Vec<u8> {
+        fs::read(self.path.join(relative)).expect("read file")
     }
 }
 
@@ -170,7 +182,7 @@ fn edit_replaces_unique_text() {
     let workspace = Workspace::new();
     workspace.write("code.rs", "let a = 1;\nlet b = 2;\n");
 
-    run(
+    let output = run(
         &workspace,
         "edit",
         json!({
@@ -182,6 +194,9 @@ fn edit_replaces_unique_text() {
         }),
     );
     assert_eq!(workspace.read("code.rs"), "let a = 10;\nlet b = 20;\n");
+    assert!(output.content.contains("Patch:\n--- code.rs\n+++ code.rs"));
+    assert!(output.content.contains("-let a = 1;"));
+    assert!(output.content.contains("+let a = 10;"));
 }
 
 #[test]
@@ -197,6 +212,124 @@ fn edit_rejects_a_non_unique_match() {
     assert!(error.content.contains("not unique"), "{}", error.content);
     // The file is left untouched on failure.
     assert_eq!(workspace.read("dup.txt"), "x\nx\n");
+}
+
+#[test]
+fn edit_accepts_legacy_single_edit_args() {
+    let workspace = Workspace::new();
+    workspace.write("legacy.txt", "before\n");
+
+    run(
+        &workspace,
+        "edit",
+        json!({ "path": "legacy.txt", "oldText": "before", "newText": "after" }),
+    );
+
+    assert_eq!(workspace.read("legacy.txt"), "after\n");
+}
+
+#[test]
+fn edit_accepts_stringified_edits() {
+    let workspace = Workspace::new();
+    workspace.write("stringified.txt", "alpha\n");
+
+    run(
+        &workspace,
+        "edit",
+        json!({
+            "path": "stringified.txt",
+            "edits": r#"[{"oldText":"alpha","newText":"beta"}]"#
+        }),
+    );
+
+    assert_eq!(workspace.read("stringified.txt"), "beta\n");
+}
+
+#[test]
+fn edit_preserves_bom_and_crlf_line_endings() {
+    let workspace = Workspace::new();
+    workspace.write_bytes("win.txt", b"\xEF\xBB\xBFone\r\ntwo\r\n");
+
+    run(
+        &workspace,
+        "edit",
+        json!({
+            "path": "win.txt",
+            "edits": [{ "oldText": "two\n", "newText": "TWO\n" }]
+        }),
+    );
+
+    assert_eq!(
+        workspace.read_bytes("win.txt"),
+        b"\xEF\xBB\xBFone\r\nTWO\r\n"
+    );
+}
+
+#[test]
+fn edit_uses_fuzzy_matching_for_smart_punctuation_and_trailing_space() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "notes.txt",
+        "status \u{2013} ready  \nconsole.log(\u{201c}hello\u{201d});\n",
+    );
+
+    let output = run(
+        &workspace,
+        "edit",
+        json!({
+            "path": "notes.txt",
+            "edits": [
+                { "oldText": "status - ready\n", "newText": "status - done\n" },
+                { "oldText": "console.log(\"hello\");", "newText": "console.log(\"world\");" }
+            ]
+        }),
+    );
+
+    assert_eq!(
+        workspace.read("notes.txt"),
+        "status - done\nconsole.log(\"world\");\n"
+    );
+    assert!(output.content.contains("Fuzzy-normalized 2 match(es)"));
+}
+
+#[test]
+fn edit_uses_nfkc_compatibility_matching() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "unicode.txt",
+        "\u{ff21}\u{ff22}\u{ff23}\u{ff11}\u{ff12}\u{ff13}\ncafe\u{301}\n",
+    );
+
+    run(
+        &workspace,
+        "edit",
+        json!({
+            "path": "unicode.txt",
+            "edits": [{ "oldText": "ABC123\ncaf\u{e9}\n", "newText": "XYZ789\ncoffee\n" }]
+        }),
+    );
+
+    assert_eq!(workspace.read("unicode.txt"), "XYZ789\ncoffee\n");
+}
+
+#[test]
+fn edit_supports_replace_all_and_old_string_aliases() {
+    let workspace = Workspace::new();
+    workspace.write("repeat.txt", "foo foo foo\n");
+
+    let output = run(
+        &workspace,
+        "edit",
+        json!({
+            "path": "repeat.txt",
+            "old_string": "foo",
+            "new_string": "bar",
+            "replace_all": true
+        }),
+    );
+
+    assert_eq!(workspace.read("repeat.txt"), "bar bar bar\n");
+    assert!(output.content.contains("Applied 3 replacement(s)"));
 }
 
 #[test]
