@@ -15,7 +15,11 @@ Base profile values are OKLCH. Derived states use `color-mix()` so hover, border
 | Token | Value | Role |
 |---|---|---|
 | `--bg` | `oklch(0.21 0.004 95)` | App background |
-| `--sidebar-bg` | `var(--bg)` | Opaque sidebar |
+| `--sidebar-bg` | `oklch(0.28 0 195)` | Opaque sidebar base |
+| `--sidebar-glass` | derived neutral alpha mix | Sidebar glass sheen and hover fills |
+| `--sidebar-glass-strong` | derived neutral alpha mix | Raised sidebar control fill |
+| `--sidebar-glass-border` | derived neutral alpha mix | Glass control border |
+| `--sidebar-backdrop-filter` | `blur(18px) saturate(1.08)` | Sidebar glass blur |
 | `--surface` | `oklch(0.29 0.016 264)` | Chat and composer surface |
 | `--surface-raised` | `oklch(0.39 0.012 261)` | Inputs, menus, and cards |
 | `--surface-muted` | derived neutral mix | Hover and secondary fills |
@@ -53,6 +57,7 @@ Mono: `ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consola
 - **Composer input**: `--surface-raised`, active `caret-color`, focus gets `--active-border` and a subtle `--active-tint` ring.
 - **Session mode trigger**: fixed-width pill so switching Local/Worktree does not shift composer metadata.
 - **Send button**: neutral gray circle; it remains a primary action by placement, not by introducing another accent fill.
+- **Sidebar**: opaque charcoal base with a restrained glass treatment: subtle highlight, blur, and translucent neutral fills. The glass effect is decorative; contrast still comes from the solid base.
 - **New thread**: raised neutral control; hover uses the same neutral surface ramp.
 - **Session item**: `--ink-dim`; hover raises surface; current = `--active-tint` background + `--active-border` border.
 - **Scrollbar**: native behavior kept, thumb uses the neutral border ramp.

@@ -1,7 +1,15 @@
 :root {
   /* Three color profiles only: charcoal neutral, cyan-green state, muted red error. */
   --bg: oklch(0.21 0.004 95);
-  --sidebar-bg: var(--bg);
+  --sidebar-bg: oklch(0.28 0 195);
+  --sidebar-glass: color-mix(in oklab, var(--surface-raised) 36%, transparent);
+  --sidebar-glass-strong: color-mix(
+    in oklab,
+    var(--surface-raised) 54%,
+    transparent
+  );
+  --sidebar-glass-border: color-mix(in oklab, var(--ink) 18%, transparent);
+  --sidebar-backdrop-filter: blur(18px) saturate(1.08);
   --surface: oklch(0.29 0.016 264);
   --surface-raised: oklch(0.39 0.012 261);
   --surface-muted: color-mix(
@@ -89,7 +97,19 @@ body {
   flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--border);
-  background: var(--sidebar-bg);
+  background:
+    linear-gradient(
+      180deg,
+      rgb(255 255 255 / 0.052),
+      rgb(255 255 255 / 0.012) 38%,
+      rgb(0 0 0 / 0.075)
+    ),
+    var(--sidebar-bg);
+  box-shadow:
+    inset -1px 0 rgb(255 255 255 / 0.035),
+    12px 0 28px rgb(0 0 0 / 0.14);
+  -webkit-backdrop-filter: var(--sidebar-backdrop-filter);
+  backdrop-filter: var(--sidebar-backdrop-filter);
 }
 
 .sidebar-header {
@@ -102,9 +122,10 @@ body {
 
 .new-chat {
   padding: 10px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--sidebar-glass-border);
   border-radius: 12px;
-  background: var(--surface-raised);
+  background: var(--sidebar-glass-strong);
+  box-shadow: inset 0 1px rgb(255 255 255 / 0.05);
   color: var(--ink);
   font-family: inherit;
   font-size: 13px;
@@ -121,7 +142,7 @@ body {
 
 .new-chat:hover:not(:disabled) {
   border-color: var(--border-strong);
-  background: var(--surface-muted);
+  background: color-mix(in oklab, var(--surface-raised) 68%, transparent);
   box-shadow: 0 8px 18px rgb(0 0 0 / 0.16);
 }
 
@@ -188,7 +209,7 @@ body {
 .project-add:hover:not(:disabled),
 .project-chat-add:hover:not(:disabled) {
   border-color: var(--border-strong);
-  background: var(--surface-raised);
+  background: var(--sidebar-glass);
   color: var(--ink);
 }
 
@@ -354,7 +375,7 @@ body {
 }
 
 .session-item:hover {
-  background: var(--surface-muted);
+  background: var(--sidebar-glass);
   color: var(--ink);
 }
 
@@ -383,7 +404,7 @@ body {
 }
 
 .project-session-toggle:hover {
-  background: var(--surface-muted);
+  background: var(--sidebar-glass);
   color: var(--ink-dim);
 }
 
@@ -401,7 +422,9 @@ body {
 
 .sidebar-footer {
   border-top: 1px solid var(--border);
-  background: var(--sidebar-bg);
+  background: linear-gradient(0deg, var(--sidebar-glass), transparent);
+  -webkit-backdrop-filter: var(--sidebar-backdrop-filter);
+  backdrop-filter: var(--sidebar-backdrop-filter);
 }
 
 .shell {
