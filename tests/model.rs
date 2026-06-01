@@ -158,10 +158,30 @@ fn resolve_surfaces_reasoning_thinking_metadata() {
 
     let choice = ModelChoice::resolve(env(&[]), || Ok(config));
 
-    assert_eq!(choice.info().thinking.as_deref(), Some("medium"));
-    assert_eq!(choice.info().provider.as_deref(), Some("commandcode"));
-    assert_eq!(choice.info().model.as_deref(), Some("Qwen/Qwen3.7-Max"));
-    assert_eq!(choice.info().context_window, Some(128_000));
+    let info = choice.info();
+    assert_eq!(info.thinking.as_deref(), Some("medium"));
+    assert_eq!(
+        info.thinking_levels,
+        ["off", "minimal", "low", "medium", "high"]
+    );
+    assert_eq!(info.provider.as_deref(), Some("commandcode"));
+    assert_eq!(info.model.as_deref(), Some("Qwen/Qwen3.7-Max"));
+    assert_eq!(info.context_window, Some(128_000));
+}
+
+#[test]
+fn non_reasoning_model_info_does_not_show_thinking_metadata() {
+    let choice = ModelChoice::resolve(env(&[]), || {
+        Ok(resolved(
+            "sk-settings",
+            "plain-coder",
+            "https://commandcode.example/v1",
+        ))
+    });
+
+    let info = choice.info();
+    assert_eq!(info.thinking, None);
+    assert!(info.thinking_levels.is_empty());
 }
 
 #[test]

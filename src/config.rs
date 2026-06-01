@@ -67,6 +67,7 @@ pub struct ConfiguredModel {
     pub provider: String,
     pub model: String,
     pub name: String,
+    pub thinking_levels: Vec<String>,
 }
 
 /// Errors occurring during settings loading or resolution.
@@ -408,6 +409,19 @@ fn resolve_thinking_level(
     first_supported_thinking_level(reasoning, thinking_level_map).to_owned()
 }
 
+/// Pi-compatible list of thinking levels the selected model exposes.
+pub fn supported_thinking_levels(
+    reasoning: bool,
+    thinking_level_map: Option<&serde_json::Value>,
+) -> Vec<String> {
+    THINKING_LEVELS
+        .iter()
+        .copied()
+        .filter(|level| is_supported_thinking_level(reasoning, thinking_level_map, level))
+        .map(str::to_owned)
+        .collect()
+}
+
 fn first_supported_thinking_level(
     reasoning: bool,
     thinking_level_map: Option<&serde_json::Value>,
@@ -652,11 +666,21 @@ pub fn resolve_model_config(
     provider: &str,
     model: &str,
 ) -> Result<ResolvedModelConfig, ConfigError> {
+    resolve_model_config_with_thinking(path, provider, model, None)
+}
+
+/// Resolve a specific provider/model pair with a requested thinking level.
+pub fn resolve_model_config_with_thinking(
+    path: &Path,
+    provider: &str,
+    model: &str,
+    thinking_level: Option<&str>,
+) -> Result<ResolvedModelConfig, ConfigError> {
     let settings = read_settings(path)?;
     let requested = DefaultModelRef {
         provider: provider.to_owned(),
         model: model.to_owned(),
-        thinking_level: None,
+        thinking_level: thinking_level.map(str::to_owned),
     };
 
     resolve_settings_model(&settings, &requested)
@@ -764,9 +788,14 @@ pub fn list_configured_models(path: &Path) -> Result<Vec<ConfiguredModel>, Confi
             continue;
         };
         for model in provider_models {
+            let thinking_levels = supported_thinking_levels(
+                model.reasoning.unwrap_or(false),
+                model.thinking_level_map.as_ref(),
+            );
             models.push(ConfiguredModel {
                 provider: provider.clone(),
                 name: model.name.unwrap_or_else(|| model.id.clone()),
+                thinking_levels,
                 model: model.id,
             });
         }
@@ -807,8 +836,18 @@ pub fn resolve_default_model_config(
     provider: &str,
     model: &str,
 ) -> Result<ResolvedModelConfig, ConfigError> {
+    resolve_default_model_config_with_thinking(provider, model, None)
+}
+
+/// Resolve a specific provider/model pair from the default settings path with a
+/// requested thinking level.
+pub fn resolve_default_model_config_with_thinking(
+    provider: &str,
+    model: &str,
+    thinking_level: Option<&str>,
+) -> Result<ResolvedModelConfig, ConfigError> {
     let path = default_settings_path()?;
-    resolve_model_config(&path, provider, model)
+    resolve_model_config_with_thinking(&path, provider, model, thinking_level)
 }
 
 /// List configured models from the default settings path.

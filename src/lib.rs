@@ -4,7 +4,8 @@
 //!
 //! - `POST /rpc` — JSON-RPC `session.create`, `session.resume`,
 //!   `session.latest`, `session.list`, `session.models`,
-//!   `session.switchModel`, `session.sendMessage`, and `session.stop`.
+//!   `session.switchModel`, `session.switchThinking`,
+//!   `session.sendMessage`, and `session.stop`.
 //! - `GET /sessions/{id}/events` — a live Server-Sent Events feed of one
 //!   session's ordered events.
 //!
@@ -38,7 +39,8 @@ mod worktree;
 pub use config::{
     ConfigError, ConfiguredModel, ResolvedModelConfig, list_configured_models,
     list_default_configured_models, resolve_config, resolve_default_config,
-    resolve_default_model_config, resolve_model_config,
+    resolve_default_model_config, resolve_default_model_config_with_thinking, resolve_model_config,
+    resolve_model_config_with_thinking, supported_thinking_levels,
 };
 pub use context::{ContextAssembler, ModelContext, TurnHistory};
 pub use model::{
@@ -188,6 +190,7 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                             "provider": model.provider,
                             "model": model.model,
                             "label": model.name,
+                            "thinkingLevels": model.thinking_levels,
                         })
                     })
                     .collect();
@@ -210,12 +213,35 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                 Ok(model) => model,
                 Err(message) => return write_rpc_error(stream, &id, &message),
             };
-            match resolve_default_model_config(&provider, &model) {
-                Ok(config) => {
-                    let info = store
-                        .switch_model(ModelChoice::OpenAi(Box::new(OpenAiConfig::from(config))));
-                    write_rpc_result(stream, &id, json!({ "modelInfo": info }))
-                }
+            let requested_thinking =
+                match requested_optional_thinking_level(&request, "session.switchModel") {
+                    Ok(Some(level)) => Some(level),
+                    Ok(None) => store.active_thinking_level(),
+                    Err(message) => return write_rpc_error(stream, &id, &message),
+                };
+            match switch_configured_model(store, &provider, &model, requested_thinking.as_deref()) {
+                Ok(info) => write_rpc_result(stream, &id, json!({ "modelInfo": info })),
+                Err(error) => write_rpc_error(stream, &id, &error.to_string()),
+            }
+        }
+        Some("session.switchThinking") => {
+            if mock_model_forced() {
+                return write_rpc_error(
+                    stream,
+                    &id,
+                    "cannot switch thinking while NAV_MOCK_MODEL is set",
+                );
+            }
+            let thinking_level =
+                match requested_required_thinking_level(&request, "session.switchThinking") {
+                    Ok(level) => level,
+                    Err(message) => return write_rpc_error(stream, &id, &message),
+                };
+            let Some((provider, model)) = store.active_model_ref() else {
+                return write_rpc_error(stream, &id, "no configured model is active");
+            };
+            match switch_configured_model(store, &provider, &model, Some(&thinking_level)) {
+                Ok(info) => write_rpc_result(stream, &id, json!({ "modelInfo": info })),
                 Err(error) => write_rpc_error(stream, &id, &error.to_string()),
             }
         }
@@ -330,6 +356,17 @@ enum SessionMode {
     Worktree,
 }
 
+fn switch_configured_model(
+    store: &SessionStore,
+    provider: &str,
+    model: &str,
+    thinking_level: Option<&str>,
+) -> Result<ModelInfo, ConfigError> {
+    let config = resolve_default_model_config_with_thinking(provider, model, thinking_level)?;
+    let choice = ModelChoice::OpenAi(Box::new(OpenAiConfig::from(config)));
+    Ok(store.switch_model(choice))
+}
+
 fn create_session_with_options(
     store: &SessionStore,
     options: SessionCreateOptions,
@@ -422,6 +459,48 @@ fn requested_model(request: &Value, method: &str) -> Result<(String, String), St
     }
 
     Ok((provider.to_owned(), model.to_owned()))
+}
+
+fn requested_optional_thinking_level(
+    request: &Value,
+    method: &str,
+) -> Result<Option<String>, String> {
+    let Some(thinking_value) = request
+        .get("params")
+        .and_then(|params| params.get("thinkingLevel"))
+    else {
+        return Ok(None);
+    };
+    if thinking_value.is_null() {
+        return Ok(None);
+    }
+    normalize_thinking_level(thinking_value, method).map(Some)
+}
+
+fn requested_required_thinking_level(request: &Value, method: &str) -> Result<String, String> {
+    let params = request
+        .get("params")
+        .ok_or_else(|| format!("{method} requires thinkingLevel"))?;
+    let thinking_value = params
+        .get("thinkingLevel")
+        .ok_or_else(|| format!("{method} requires thinkingLevel"))?;
+    normalize_thinking_level(thinking_value, method)
+}
+
+fn normalize_thinking_level(value: &Value, method: &str) -> Result<String, String> {
+    let Some(level) = value.as_str() else {
+        return Err(format!("{method} thinkingLevel must be a string"));
+    };
+    let level = level.trim();
+    if level.is_empty() {
+        return Err(format!("{method} thinkingLevel must not be empty"));
+    }
+    match level {
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(level.to_owned()),
+        _ => Err(format!(
+            "{method} thinkingLevel must be off, minimal, low, medium, high, or xhigh"
+        )),
+    }
 }
 
 fn mock_model_forced() -> bool {

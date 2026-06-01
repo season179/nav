@@ -6,8 +6,10 @@ const {
   normalizeMessageText,
   normalizeModelProvider,
   normalizeOptionalSessionMode,
+  normalizeOptionalThinkingLevel,
   normalizeOptionalWorkspaceRoot,
   normalizeSessionId,
+  normalizeThinkingLevel,
 } = require("../desktop/electron/request-validation.cjs");
 
 test("preload message validation trims valid text", () => {
@@ -45,6 +47,19 @@ test("preload model switch validation rejects non-strings and blanks", () => {
   assert.throws(() => normalizeModelProvider("   "));
   assert.throws(() => normalizeModelId(undefined), TypeError);
   assert.throws(() => normalizeModelId(""));
+});
+
+test("preload thinking validation accepts supported levels", () => {
+  assert.equal(normalizeThinkingLevel(" high "), "high");
+  assert.equal(normalizeThinkingLevel("off"), "off");
+  assert.equal(normalizeOptionalThinkingLevel(undefined), null);
+  assert.equal(normalizeOptionalThinkingLevel(null), null);
+});
+
+test("preload thinking validation rejects unknown levels", () => {
+  assert.throws(() => normalizeThinkingLevel("max"));
+  assert.throws(() => normalizeThinkingLevel(""));
+  assert.throws(() => normalizeThinkingLevel(42), TypeError);
 });
 
 test("preload workspace root validation trims valid paths", () => {

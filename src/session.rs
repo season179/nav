@@ -193,6 +193,7 @@ impl SessionStore {
                 provider: None,
                 model: None,
                 thinking: None,
+                thinking_levels: Vec::new(),
                 context_window: None,
                 token_usage: None,
             }),
@@ -230,6 +231,19 @@ impl SessionStore {
             .read()
             .unwrap()
             .with_used_tokens(used_tokens)
+    }
+
+    /// Active configured provider/model ids, when the current model came from
+    /// settings rather than the mock or environment-only fallback.
+    pub fn active_model_ref(&self) -> Option<(String, String)> {
+        let info = self.model_info.read().unwrap();
+        Some((info.provider.clone()?, info.model.clone()?))
+    }
+
+    /// Current visible thinking level for preserving the user's choice across
+    /// model switches.
+    pub fn active_thinking_level(&self) -> Option<String> {
+        self.model_info.read().unwrap().thinking.clone()
     }
 
     /// Replace the active model used for future model calls.

@@ -45,6 +45,7 @@ fn model_info(label: &str) -> ModelInfo {
         provider: None,
         model: None,
         thinking: None,
+        thinking_levels: Vec::new(),
         context_window: None,
         token_usage: None,
     }

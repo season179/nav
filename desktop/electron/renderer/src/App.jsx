@@ -479,6 +479,25 @@ export default function App() {
     [appendMessage, refreshModelInfo],
   );
 
+  const switchThinking = useCallback(
+    async (level) => {
+      if (!connectedRef.current || !window.nav || !level) {
+        return;
+      }
+      setModelSwitching(true);
+      try {
+        const info = await window.nav.switchThinking(level);
+        setModelInfo(info ?? null);
+        await refreshModelInfo();
+      } catch (error) {
+        appendMessage("error", `Could not switch thinking: ${error.message}`);
+      } finally {
+        setModelSwitching(false);
+      }
+    },
+    [appendMessage, refreshModelInfo],
+  );
+
   const sendMessage = useCallback(
     async (text) => {
       if (!text || !connectedRef.current || !window.nav) {
@@ -550,6 +569,7 @@ export default function App() {
               stopPending={stopPending}
               onNewSessionModeChange={setNewSessionMode}
               onModelChange={switchModel}
+              onThinkingChange={switchThinking}
               onSend={sendMessage}
               onStop={stopRun}
             />

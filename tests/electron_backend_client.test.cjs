@@ -145,11 +145,13 @@ test("Electron backend client lists and switches configured models", async () =>
         provider: "local",
         model: "qwen-coder",
         label: "Qwen Coder",
+        thinkingLevels: ["off", "low", "medium"],
       },
       {
         provider: "openai",
         model: "gpt-default",
         label: "Default GPT",
+        thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
       },
     ]);
 
@@ -160,6 +162,15 @@ test("Electron backend client lists and switches configured models", async () =>
     assert.equal(before.result.label, "Default GPT");
     assert.equal(before.result.provider, "openai");
     assert.equal(before.result.model, "gpt-default");
+    assert.equal(before.result.thinking, "high");
+    assert.deepEqual(before.result.thinkingLevels, [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
 
     const switched = await sendRpc({
       backendUrl: backend.url,
@@ -169,6 +180,28 @@ test("Electron backend client lists and switches configured models", async () =>
     assert.equal(switched.result.modelInfo.label, "Qwen Coder");
     assert.equal(switched.result.modelInfo.provider, "local");
     assert.equal(switched.result.modelInfo.model, "qwen-coder");
+    assert.equal(switched.result.modelInfo.thinking, "medium");
+    assert.deepEqual(switched.result.modelInfo.thinkingLevels, [
+      "off",
+      "low",
+      "medium",
+    ]);
+
+    const thinkingOff = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.switchThinking",
+      params: { thinkingLevel: "off" },
+    });
+    assert.equal(thinkingOff.result.modelInfo.label, "Qwen Coder");
+    assert.equal(thinkingOff.result.modelInfo.thinking, "off");
+
+    const thinkingClamped = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.switchThinking",
+      params: { thinkingLevel: "xhigh" },
+    });
+    assert.equal(thinkingClamped.result.modelInfo.label, "Qwen Coder");
+    assert.equal(thinkingClamped.result.modelInfo.thinking, "medium");
 
     const after = await sendRpc({
       backendUrl: backend.url,
@@ -177,6 +210,7 @@ test("Electron backend client lists and switches configured models", async () =>
     assert.equal(after.result.label, "Qwen Coder");
     assert.equal(after.result.provider, "local");
     assert.equal(after.result.model, "qwen-coder");
+    assert.equal(after.result.thinking, "medium");
   } finally {
     backend.stop();
   }
@@ -287,6 +321,7 @@ async function startConfiguredBackend() {
         provider: "openai",
         model: "gpt-default",
       },
+      defaultThinkingLevel: "high",
       providers: {
         openai: {
           baseUrl: "https://api.openai.example/v1",
@@ -296,6 +331,10 @@ async function startConfiguredBackend() {
             {
               id: "gpt-default",
               name: "Default GPT",
+              reasoning: true,
+              thinkingLevelMap: {
+                xhigh: "xhigh",
+              },
             },
           ],
         },
@@ -307,6 +346,11 @@ async function startConfiguredBackend() {
             {
               id: "qwen-coder",
               name: "Qwen Coder",
+              reasoning: true,
+              thinkingLevelMap: {
+                minimal: null,
+                high: null,
+              },
             },
           ],
         },

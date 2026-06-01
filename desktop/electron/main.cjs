@@ -103,6 +103,18 @@ ipcMain.handle("nav:switch-model", async (_event, request) => {
   return response.result.modelInfo;
 });
 
+ipcMain.handle("nav:switch-thinking", async (_event, thinkingLevel) => {
+  if (!backendUrl) {
+    throw new Error("chat session is not ready");
+  }
+  const response = await sendRpc({
+    backendUrl,
+    method: "session.switchThinking",
+    params: { thinkingLevel },
+  });
+  return response.result.modelInfo;
+});
+
 ipcMain.handle("nav:session-stacks", async (_event, requestedSessionId) => {
   if (!backendUrl) {
     throw new Error("chat session is not ready");
