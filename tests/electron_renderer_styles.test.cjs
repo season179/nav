@@ -11,31 +11,20 @@ test("session mode trigger keeps a stable slot for local and worktree labels", (
   assert.match(triggerRule, /width:\s*96px;/);
 });
 
-test("sidebar keeps an opaque base with a glass treatment", () => {
+test("sidebar uses a flat opaque base color", () => {
   const styles = readRendererStyles();
 
   const rootRule = cssRule(styles, ":root");
   const sidebarRule = cssRule(styles, ".sidebar");
   const newChatRule = cssRule(styles, ".new-chat");
 
-  assert.match(rootRule, /--sidebar-bg:\s*oklch\(0\.28 0 195\);/);
+  assert.match(rootRule, /--sidebar-bg:\s*oklch\(0\.35 0\.024 266\);/);
   assert.match(rootRule, /--sidebar-glass:/);
-  assert.match(rootRule, /--sidebar-glass-highlight-start:/);
-  assert.match(rootRule, /--sidebar-glass-highlight-mid:/);
-  assert.match(rootRule, /--sidebar-glass-shadow:/);
-  assert.match(
-    rootRule,
-    /--sidebar-backdrop-filter:\s*blur\(18px\) saturate\(1\.08\);/,
-  );
-  assert.match(sidebarRule, /linear-gradient\(/);
-  assert.match(sidebarRule, /var\(--sidebar-glass-highlight-start\)/);
-  assert.match(sidebarRule, /var\(--sidebar-glass-highlight-mid\) 38%/);
-  assert.match(sidebarRule, /var\(--sidebar-glass-shadow\)/);
-  assert.match(sidebarRule, /var\(--sidebar-bg\);/);
-  assert.match(
-    sidebarRule,
-    /backdrop-filter:\s*var\(--sidebar-backdrop-filter\);/,
-  );
+  assert.doesNotMatch(rootRule, /--sidebar-glass-highlight-start:/);
+  assert.doesNotMatch(rootRule, /--sidebar-glass-highlight-mid:/);
+  assert.doesNotMatch(rootRule, /--sidebar-glass-shadow:/);
+  assert.match(sidebarRule, /background:\s*var\(--sidebar-bg\);/);
+  assert.doesNotMatch(sidebarRule, /linear-gradient\(/);
   assert.match(newChatRule, /background:\s*var\(--sidebar-glass-strong\);/);
 });
 

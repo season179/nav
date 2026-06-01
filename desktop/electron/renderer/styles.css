@@ -1,7 +1,7 @@
 :root {
   /* Three color profiles only: charcoal neutral, cyan-green state, muted red error. */
   --bg: oklch(0.21 0.004 95);
-  --sidebar-bg: oklch(0.28 0 195);
+  --sidebar-bg: oklch(0.35 0.024 266);
   --sidebar-glass: color-mix(in oklab, var(--surface-raised) 36%, transparent);
   --sidebar-glass-strong: color-mix(
     in oklab,
@@ -9,9 +9,6 @@
     transparent
   );
   --sidebar-glass-border: color-mix(in oklab, var(--ink) 18%, transparent);
-  --sidebar-glass-highlight-start: rgb(255 255 255 / 0.052);
-  --sidebar-glass-highlight-mid: rgb(255 255 255 / 0.012);
-  --sidebar-glass-shadow: rgb(0 0 0 / 0.075);
   --sidebar-backdrop-filter: blur(18px) saturate(1.08);
   --surface: oklch(0.29 0.016 264);
   --surface-raised: oklch(0.39 0.012 261);
@@ -24,9 +21,9 @@
   --border-strong: color-mix(in oklab, var(--ink) 28%, var(--surface));
 
   /* Ink ramp. */
-  --ink: oklch(0.92 0.004 95);
-  --ink-dim: oklch(0.76 0.004 95);
-  --ink-faint: oklch(0.58 0.004 95);
+  --ink: oklch(0.98 0.004 95);
+  --ink-dim: oklch(0.88 0.004 95);
+  --ink-faint: oklch(0.72 0.004 95);
 
   /* One accent profile, used only for active, focus, and running states. */
   --active: oklch(0.72 0.08 176);
@@ -100,14 +97,7 @@ body {
   flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--border);
-  background:
-    linear-gradient(
-      180deg,
-      var(--sidebar-glass-highlight-start),
-      var(--sidebar-glass-highlight-mid) 38%,
-      var(--sidebar-glass-shadow)
-    ),
-    var(--sidebar-bg);
+  background: var(--sidebar-bg);
   box-shadow:
     inset -1px 0 rgb(255 255 255 / 0.035),
     12px 0 28px rgb(0 0 0 / 0.14);
@@ -1129,12 +1119,7 @@ h1 {
 .model-trigger {
   justify-content: space-between;
   max-width: min(280px, 36vw);
-  padding: 0 2px;
-  border-color: transparent;
-  border-radius: 4px;
-  background: transparent;
   min-width: 0;
-  color: var(--ink-faint);
 }
 
 .model-trigger span:first-child {
@@ -1143,13 +1128,9 @@ h1 {
   white-space: nowrap;
 }
 
-.session-mode-trigger:hover:not(:disabled) {
-  border-color: var(--border-strong);
-  color: var(--ink);
-}
-
+.session-mode-trigger:hover:not(:disabled),
 .model-trigger:hover:not(:disabled) {
-  border-color: transparent;
+  border-color: var(--border-strong);
   color: var(--ink);
 }
 

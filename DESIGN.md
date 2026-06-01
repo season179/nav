@@ -15,22 +15,19 @@ Base profile values are OKLCH. Derived states use `color-mix()` so hover, border
 | Token | Value | Role |
 |---|---|---|
 | `--bg` | `oklch(0.21 0.004 95)` | App background |
-| `--sidebar-bg` | `oklch(0.28 0 195)` | Opaque sidebar base |
-| `--sidebar-glass` | derived neutral alpha mix | Sidebar glass sheen and hover fills |
+| `--sidebar-bg` | `oklch(0.35 0.024 266)` | Flat opaque sidebar base |
+| `--sidebar-glass` | derived neutral alpha mix | Sidebar hover fills |
 | `--sidebar-glass-strong` | derived neutral alpha mix | Raised sidebar control fill |
 | `--sidebar-glass-border` | derived neutral alpha mix | Glass control border |
-| `--sidebar-glass-highlight-start` | `rgb(255 255 255 / 0.052)` | Sidebar top highlight |
-| `--sidebar-glass-highlight-mid` | `rgb(255 255 255 / 0.012)` | Sidebar mid highlight |
-| `--sidebar-glass-shadow` | `rgb(0 0 0 / 0.075)` | Sidebar lower shade |
 | `--sidebar-backdrop-filter` | `blur(18px) saturate(1.08)` | Sidebar glass blur |
 | `--surface` | `oklch(0.29 0.016 264)` | Chat and composer surface |
 | `--surface-raised` | `oklch(0.39 0.012 261)` | Inputs, menus, and cards |
 | `--surface-muted` | derived neutral mix | Hover and secondary fills |
 | `--border` | derived neutral mix | Hairline dividers, control borders |
 | `--border-strong` | derived neutral mix | Emphasized borders |
-| `--ink` | `oklch(0.92 0.004 95)` | Primary text |
-| `--ink-dim` | `oklch(0.76 0.004 95)` | Secondary text, labels, placeholder |
-| `--ink-faint` | `oklch(0.58 0.004 95)` | Non-essential metadata |
+| `--ink` | `oklch(0.98 0.004 95)` | Primary text |
+| `--ink-dim` | `oklch(0.88 0.004 95)` | Secondary text, labels, placeholder |
+| `--ink-faint` | `oklch(0.72 0.004 95)` | Non-essential metadata |
 | `--active` | `oklch(0.72 0.08 176)` | Active, focus, running state |
 | `--active-dim` | derived accent mix | Quieter running state |
 | `--active-tint` | derived accent mix | Selected backgrounds and focus rings |
@@ -58,9 +55,9 @@ Mono: `ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consola
 - **Messages**: flat, no bubbles, no sender labels. Sender read from alignment: assistant left, user right. Both `--ink` for legibility. New lines fade+rise in (160ms, reduced-motion: instant).
 - **Tool line**: compact mono row on `--surface-muted` with a state glyph: running uses `--active-dim`, done uses `--active`, failed uses `--danger`. Failed row gets `--danger-tint` and `--danger` border.
 - **Composer input**: `--surface-raised`, active `caret-color`, focus gets `--active-border` and a subtle `--active-tint` ring.
-- **Session mode trigger**: fixed-width pill so switching Local/Worktree does not shift composer metadata.
+- **Session mode & model triggers**: matching neutral pills (bordered, `--surface-muted`, pill radius) so the composer metadata row reads as one control group. The session mode pill is fixed-width so switching Local/Worktree does not shift layout; the model pill is fluid with ellipsis for long names.
 - **Send button**: neutral gray circle; it remains a primary action by placement, not by introducing another accent fill.
-- **Sidebar**: opaque charcoal base with a restrained glass treatment: subtle highlight, blur, and translucent neutral fills. The glass effect is decorative; contrast still comes from the solid base.
+- **Sidebar**: flat opaque charcoal base, no gradient. Translucent neutral fills and a backdrop blur remain on raised controls within it; contrast comes from the solid base.
 - **New thread**: raised neutral control; hover uses the same neutral surface ramp.
 - **Session item**: `--ink-dim`; hover raises surface; current = `--active-tint` background + `--active-border` border.
 - **Scrollbar**: native behavior kept, thumb uses the neutral border ramp.
