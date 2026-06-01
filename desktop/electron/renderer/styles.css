@@ -2,8 +2,8 @@
   /* Three color profiles only: charcoal neutral, cyan-green state, muted red error. */
   --bg: oklch(0.21 0.004 95);
   --sidebar-bg: var(--bg);
-  --surface: oklch(0.23 0.004 95);
-  --surface-raised: oklch(0.285 0.004 95);
+  --surface: oklch(29% 4% 264deg);
+  --surface-raised: oklch(39% 3% 261deg);
   --surface-muted: color-mix(
     in oklab,
     var(--surface) 62%,
@@ -1079,7 +1079,9 @@ h1 {
 .session-mode-trigger {
   display: inline-flex;
   align-items: center;
+  justify-content: space-between;
   gap: 6px;
+  width: 96px;
   padding: 5px 10px;
   border: 1px solid var(--border);
   border-radius: 999px;

@@ -16,8 +16,8 @@ Base profile values are OKLCH. Derived states use `color-mix()` so hover, border
 |---|---|---|
 | `--bg` | `oklch(0.21 0.004 95)` | App background |
 | `--sidebar-bg` | `var(--bg)` | Opaque sidebar |
-| `--surface` | `oklch(0.23 0.004 95)` | Chat and composer surface |
-| `--surface-raised` | `oklch(0.285 0.004 95)` | Inputs, menus, and cards |
+| `--surface` | `oklch(29% 4% 264deg)` | Chat and composer surface |
+| `--surface-raised` | `oklch(39% 3% 261deg)` | Inputs, menus, and cards |
 | `--surface-muted` | derived neutral mix | Hover and secondary fills |
 | `--border` | derived neutral mix | Hairline dividers, control borders |
 | `--border-strong` | derived neutral mix | Emphasized borders |
@@ -51,6 +51,7 @@ Mono: `ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consola
 - **Messages**: flat, no bubbles, no sender labels. Sender read from alignment: assistant left, user right. Both `--ink` for legibility. New lines fade+rise in (160ms, reduced-motion: instant).
 - **Tool line**: compact mono row on `--surface-muted` with a state glyph: running uses `--active-dim`, done uses `--active`, failed uses `--danger`. Failed row gets `--danger-tint` and `--danger` border.
 - **Composer input**: `--surface-raised`, active `caret-color`, focus gets `--active-border` and a subtle `--active-tint` ring.
+- **Session mode trigger**: fixed-width pill so switching Local/Worktree does not shift composer metadata.
 - **Send button**: neutral gray circle; it remains a primary action by placement, not by introducing another accent fill.
 - **New thread**: raised neutral control; hover uses the same neutral surface ramp.
 - **Session item**: `--ink-dim`; hover raises surface; current = `--active-tint` background + `--active-border` border.
