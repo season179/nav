@@ -179,9 +179,12 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                 .get("params")
                 .and_then(|p| p.get("sessionId"))
                 .and_then(Value::as_str);
-            match session_id.and_then(|session_id| store.stacks(session_id)) {
-                Some(stacks) => write_rpc_result(stream, &id, json!({ "stacks": stacks })),
-                None => write_rpc_error(stream, &id, "unknown session"),
+            match session_id {
+                Some(session_id) => match store.stacks(session_id) {
+                    Some(stacks) => write_rpc_result(stream, &id, json!({ "stacks": stacks })),
+                    None => write_rpc_error(stream, &id, "unknown session"),
+                },
+                None => write_rpc_error(stream, &id, "missing parameter: sessionId"),
             }
         }
         Some("session.resume") => {

@@ -512,10 +512,30 @@ fn metadata_layer(input: &ModelCallStackInput) -> StackLayer {
             "startedAtMs": input.started_at_ms,
             "durationMs": input.duration_ms,
             "retries": 0,
-            "provider": trace,
+            "provider": provider_metadata_json(trace),
             "error": input.error,
         })),
     }
+}
+
+fn provider_metadata_json(trace: Option<&ProviderCallTrace>) -> Option<Value> {
+    trace.map(|trace| {
+        json!({
+            "apiKind": &trace.api_kind,
+            "url": &trace.url,
+            "modelId": &trace.model_id,
+            "providerModelId": trace.provider_model_id.as_deref(),
+            "responseId": trace.response_id.as_deref(),
+            "requestId": trace.request_id.as_deref(),
+            "statusCode": trace.status_code,
+            "error": trace.error.as_deref(),
+            "payloadLayers": {
+                "request": "provider_payload",
+                "response": "raw_response",
+            },
+            "hasResponsePayload": trace.response_payload.is_some(),
+        })
+    })
 }
 
 fn carried_forward_layer(
@@ -743,4 +763,65 @@ fn optional_label(value: Option<&str>) -> &str {
     value
         .filter(|value| !value.is_empty())
         .unwrap_or("(unavailable)")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_layer_keeps_provider_payloads_by_reference() {
+        let trace = ProviderCallTrace {
+            api_kind: "openai-chat-completions".to_owned(),
+            url: "https://api.example.test/chat/completions".to_owned(),
+            model_id: "configured-model".to_owned(),
+            request_payload: json!({ "messages": [{ "content": "request body" }] }),
+            response_payload: Some(json!({ "choices": [{ "message": { "content": "reply" } }] })),
+            provider_model_id: Some("provider-model".to_owned()),
+            response_id: Some("resp_123".to_owned()),
+            request_id: Some("req_123".to_owned()),
+            status_code: Some(200),
+            error: None,
+        };
+
+        let stack = build_model_call_stack(ModelCallStackInput {
+            id: "call".to_owned(),
+            run_id: "run".to_owned(),
+            status: "completed".to_owned(),
+            started_at_ms: 1,
+            duration_ms: 2.0,
+            system_prompt: SystemPromptTrace {
+                prompt: "system".to_owned(),
+                selected_tools: Vec::new(),
+                context_files: Vec::new(),
+                cwd: "/tmp".to_owned(),
+                date: "2026-06-01".to_owned(),
+            },
+            context_before: Vec::new(),
+            tools: Vec::new(),
+            provider_trace: Some(trace),
+            response: None,
+            token_usage: None,
+            context_after: Vec::new(),
+            steering_messages: Vec::new(),
+            error: None,
+        });
+
+        let metadata = stack
+            .layers
+            .iter()
+            .find(|layer| layer.kind == "metadata")
+            .expect("metadata layer");
+        let provider = metadata
+            .json
+            .as_ref()
+            .and_then(|json| json.get("provider"))
+            .expect("provider metadata");
+
+        assert!(provider.get("requestPayload").is_none());
+        assert!(provider.get("responsePayload").is_none());
+        assert_eq!(provider["responseId"], "resp_123");
+        assert_eq!(provider["payloadLayers"]["request"], "provider_payload");
+        assert_eq!(provider["payloadLayers"]["response"], "raw_response");
+    }
 }

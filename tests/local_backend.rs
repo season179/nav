@@ -358,6 +358,22 @@ fn session_stacks_rpc_returns_captured_model_calls() {
 }
 
 #[test]
+fn session_stacks_rpc_rejects_missing_session_id() {
+    let backend = TestBackend::start();
+
+    let response =
+        backend.rpc(r#"{"jsonrpc":"2.0","id":"stacks","method":"session.stacks","params":{}}"#);
+
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing parameter: sessionId"),
+        "missing session id should be a parameter error: {response}"
+    );
+}
+
+#[test]
 fn sending_to_an_unknown_session_is_rejected() {
     let backend = TestBackend::start();
 
