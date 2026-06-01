@@ -27,6 +27,7 @@ fn test_valid_pi_style_settings_resolution() {
             "provider": "commandcode",
             "model": "Qwen/Qwen3.7-Max"
         },
+        "defaultThinkingLevel": "high",
         "providers": {
             "commandcode": {
                 "baseUrl": "https://api.example.com",
@@ -63,6 +64,7 @@ fn test_valid_pi_style_settings_resolution() {
         assert_eq!(config.base_url, "https://api.example.com");
         assert_eq!(config.name, "Qwen 3.7 Max");
         assert!(config.reasoning);
+        assert_eq!(config.thinking_level, "high");
         assert_eq!(config.input, vec!["text".to_string(), "image".to_string()]);
         assert_eq!(config.context_window, Some(200000));
         assert_eq!(config.max_tokens, Some(32000));
@@ -75,6 +77,38 @@ fn test_valid_pi_style_settings_resolution() {
             .thinking_level_map
             .expect("Should have thinkingLevelMap");
         assert_eq!(thinking_map["high"], "xhigh");
+    });
+}
+
+#[test]
+fn test_non_reasoning_model_resolves_thinking_level_to_off() {
+    let settings = json!({
+        "defaultModel": {
+            "provider": "local",
+            "model": "plain-coder"
+        },
+        "defaultThinkingLevel": "high",
+        "providers": {
+            "local": {
+                "baseUrl": "https://api.example.com",
+                "apiKey": "test-key-literal",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "plain-coder",
+                        "reasoning": false
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let config = resolve_config(path).expect("Should resolve valid config");
+
+        assert!(!config.reasoning);
+        assert_eq!(config.thinking_level, "off");
     });
 }
 
