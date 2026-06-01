@@ -100,6 +100,7 @@ body {
   font-size: 13px;
   font-weight: 600;
   text-align: left;
+  white-space: nowrap;
   cursor: pointer;
   transition:
     background 150ms ease-out,
@@ -993,6 +994,13 @@ h1 {
   min-height: 16px;
 }
 
+.composer-meta-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
 .composer-meta-right {
   display: flex;
   align-items: center;
@@ -1012,6 +1020,106 @@ h1 {
 
 .composer-model {
   padding-left: 2px;
+}
+
+.composer-session-mode {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.session-mode-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.15;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.session-mode-trigger:hover:not(:disabled) {
+  border-color: var(--primary-dim);
+  color: var(--ink);
+}
+
+.session-mode-trigger:focus-visible {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-tint);
+}
+
+.session-mode-trigger:disabled {
+  color: var(--ink-faint);
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.session-mode-chevron {
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.session-mode-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: var(--z-overlay);
+  width: 184px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.34);
+}
+
+.session-mode-menu-title {
+  padding: 2px 8px 8px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.session-mode-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-mode-option:hover,
+.session-mode-option:focus-visible {
+  outline: none;
+  background: var(--primary-tint);
+  color: var(--ink);
+}
+
+.session-mode-option[aria-checked="true"] {
+  color: var(--ink);
+}
+
+.session-mode-check {
+  width: 14px;
+  color: var(--primary);
+  text-align: center;
 }
 
 .composer-token-usage {

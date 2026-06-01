@@ -37,7 +37,7 @@ declare global {
       sessionSendMessage(text: string): Promise<void>;
       sessionStop(): Promise<boolean>;
       listSessions(): Promise<SessionSummary[]>;
-      createProject(): Promise<string | null>;
+      createProject(mode?: "local" | "worktree" | null): Promise<string | null>;
       modelInfo(sessionId?: string): Promise<{
         label: string;
         thinking?: string | null;

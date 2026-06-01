@@ -14,6 +14,7 @@ export default function App() {
   const [stopPending, setStopPending] = useState(false);
   const [activeView, setActiveView] = useState("chat");
   const [stackRefreshKey, setStackRefreshKey] = useState(0);
+  const [newSessionMode, setNewSessionMode] = useState("local");
 
   const connectedRef = useRef(false);
   const runningRef = useRef(false);
@@ -345,7 +346,10 @@ export default function App() {
         return;
       }
       try {
-        const sessionId = await window.nav.newSession(projectPath || null);
+        const sessionId = await window.nav.newSession(
+          projectPath || null,
+          newSessionMode,
+        );
         if (!sessionId) {
           return;
         }
@@ -355,7 +359,7 @@ export default function App() {
         appendMessage("error", `Could not start a new chat: ${error.message}`);
       }
     },
-    [activateCreatedSession, appendMessage, clearTranscript],
+    [activateCreatedSession, appendMessage, clearTranscript, newSessionMode],
   );
 
   const createProject = useCallback(async () => {
@@ -363,7 +367,7 @@ export default function App() {
       return;
     }
     try {
-      const sessionId = await window.nav.createProject();
+      const sessionId = await window.nav.createProject(newSessionMode);
       if (!sessionId) {
         return;
       }
@@ -372,7 +376,7 @@ export default function App() {
     } catch (error) {
       appendMessage("error", `Could not create project: ${error.message}`);
     }
-  }, [activateCreatedSession, appendMessage, clearTranscript]);
+  }, [activateCreatedSession, appendMessage, clearTranscript, newSessionMode]);
 
   const sendMessage = useCallback(
     async (text) => {
@@ -436,8 +440,10 @@ export default function App() {
             <Composer
               connected={connected}
               modelInfo={modelInfo}
+              newSessionMode={newSessionMode}
               running={running}
               stopPending={stopPending}
+              onNewSessionModeChange={setNewSessionMode}
               onSend={sendMessage}
               onStop={stopRun}
             />
