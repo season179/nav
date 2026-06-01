@@ -62,8 +62,10 @@ contextBridge.exposeInMainWorld("nav", {
     return ipcRenderer.invoke("nav:list-sessions");
   },
   // Pick a directory and create a fresh session inside it.
-  createProject() {
-    return ipcRenderer.invoke("nav:create-project");
+  createProject(mode) {
+    return ipcRenderer.invoke("nav:create-project", {
+      mode: normalizeOptionalSessionMode(mode),
+    });
   },
   // The active model's display info, shown beneath the composer.
   modelInfo(sessionId) {

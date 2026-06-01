@@ -108,10 +108,11 @@ ipcMain.handle("nav:switch-session", async (_event, id) => {
   activateSession(mainWindow, id);
 });
 
-ipcMain.handle("nav:create-project", async () => {
+ipcMain.handle("nav:create-project", async (_event, request) => {
   if (!backendUrl || !mainWindow) {
     throw new Error("chat session is not ready");
   }
+  const { mode: requestedMode } = normalizeNewSessionRequest(request);
   const selection = await dialog.showOpenDialog(mainWindow, {
     title: "Add Project",
     buttonLabel: "Add Project",
@@ -122,7 +123,10 @@ ipcMain.handle("nav:create-project", async () => {
     return null;
   }
   const workspaceRoot = normalizeWorkspaceRoot(await fs.realpath(cwd));
-  const projectSessionId = await openOrCreateProjectSession(workspaceRoot);
+  const projectSessionId = await openOrCreateProjectSession(
+    workspaceRoot,
+    requestedMode ?? "local",
+  );
   if (!projectSessionId) {
     return null;
   }
@@ -135,10 +139,7 @@ ipcMain.handle("nav:new-session", async (_event, request) => {
     throw new Error("chat session is not ready");
   }
   const { cwd, mode: requestedMode } = normalizeNewSessionRequest(request);
-  const mode = requestedMode ?? (await chooseSessionMode(cwd ?? PROJECT_ROOT));
-  if (!mode) {
-    return null;
-  }
+  const mode = requestedMode ?? "local";
   const createdSessionId = await createBackendSession(cwd, mode);
   activateSession(mainWindow, createdSessionId);
   return createdSessionId;
@@ -293,7 +294,7 @@ async function createBackendSession(cwd, mode) {
   return created.result.sessionId;
 }
 
-async function openOrCreateProjectSession(workspaceRoot) {
+async function openOrCreateProjectSession(workspaceRoot, mode = "local") {
   const pending = pendingProjectSessions.get(workspaceRoot);
   if (pending) {
     return pending;
@@ -301,7 +302,7 @@ async function openOrCreateProjectSession(workspaceRoot) {
 
   const lookup = findExistingProjectSession(workspaceRoot).then(
     async (existingSessionId) =>
-      existingSessionId ?? createProjectSession(workspaceRoot),
+      existingSessionId ?? createProjectSession(workspaceRoot, mode),
   );
   pendingProjectSessions.set(workspaceRoot, lookup);
 
@@ -320,36 +321,8 @@ async function findExistingProjectSession(workspaceRoot) {
   return existingProjectSessionId(response.result.sessions, workspaceRoot);
 }
 
-async function createProjectSession(workspaceRoot) {
-  const mode = await chooseSessionMode(workspaceRoot);
-  if (!mode) {
-    return null;
-  }
+async function createProjectSession(workspaceRoot, mode) {
   return createBackendSession(workspaceRoot, mode);
-}
-
-async function chooseSessionMode(cwd) {
-  if (!mainWindow) {
-    return "local";
-  }
-  const { response } = await dialog.showMessageBox(mainWindow, {
-    type: "question",
-    message: "Start new session",
-    detail: `Workspace: ${cwd}\nChoose whether this session works in that checkout directly or in a new git worktree.`,
-    buttons: ["Local", "Worktree", "Cancel"],
-    defaultId: 0,
-    cancelId: 2,
-    noLink: true,
-  });
-
-  switch (response) {
-    case 0:
-      return "local";
-    case 1:
-      return "worktree";
-    default:
-      return null;
-  }
 }
 
 function normalizeNewSessionRequest(request) {

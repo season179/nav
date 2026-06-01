@@ -1,12 +1,18 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const tokenFormatter = new Intl.NumberFormat("en-US");
+const sessionModeOptions = [
+  { value: "local", label: "Work locally" },
+  { value: "worktree", label: "New worktree" },
+];
 
 export default function Composer({
   connected,
   modelInfo,
+  newSessionMode,
   running,
   stopPending,
+  onNewSessionModeChange,
   onSend,
   onStop,
 }) {
@@ -86,8 +92,19 @@ export default function Composer({
         ) : null}
       </div>
       <div className="composer-meta">
-        <span className="composer-model" id="composer-model" aria-live="polite">
-          {modelInfo?.label ?? ""}
+        <span className="composer-meta-left">
+          <SessionModeMenu
+            disabled={!connected || running}
+            mode={newSessionMode}
+            onModeChange={onNewSessionModeChange}
+          />
+          <span
+            className="composer-model"
+            id="composer-model"
+            aria-live="polite"
+          >
+            {modelInfo?.label ?? ""}
+          </span>
         </span>
         <span className="composer-meta-right">
           <span
@@ -103,6 +120,105 @@ export default function Composer({
         </span>
       </div>
     </form>
+  );
+}
+
+function SessionModeMenu({ disabled, mode, onModeChange }) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef(null);
+  const triggerRef = useRef(null);
+
+  const closeMenu = useCallback(() => {
+    setOpen(false);
+    window.setTimeout(() => {
+      triggerRef.current?.focus();
+    }, 0);
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+
+    function closeOnOutsidePointer(event) {
+      if (!menuRef.current?.contains(event.target)) {
+        closeMenu();
+      }
+    }
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+    };
+  }, [open, closeMenu]);
+
+  useEffect(() => {
+    if (disabled) {
+      closeMenu();
+    }
+  }, [disabled, closeMenu]);
+
+  function selectMode(value) {
+    onModeChange(value);
+    closeMenu();
+  }
+
+  function closeOnEscape(event) {
+    if (event.key === "Escape") {
+      closeMenu();
+    }
+  }
+
+  return (
+    <span className="composer-session-mode" ref={menuRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        id="new-session-mode"
+        className="session-mode-trigger"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={() => setOpen((isOpen) => !isOpen)}
+        onKeyDown={closeOnEscape}
+      >
+        <span>{sessionModeLabel(mode)}</span>
+        <span className="session-mode-chevron" aria-hidden="true">
+          v
+        </span>
+      </button>
+      {open ? (
+        <div
+          className="session-mode-menu"
+          role="menu"
+          onKeyDown={closeOnEscape}
+        >
+          <div className="session-mode-menu-title">Start in</div>
+          {sessionModeOptions.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              className="session-mode-option"
+              role="menuitemradio"
+              aria-checked={option.value === mode ? "true" : "false"}
+              onClick={() => selectMode(option.value)}
+            >
+              <span>{option.label}</span>
+              <span className="session-mode-check" aria-hidden="true">
+                {option.value === mode ? "✓" : ""}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </span>
+  );
+}
+
+function sessionModeLabel(mode) {
+  return (
+    sessionModeOptions.find((option) => option.value === mode)?.label ??
+    sessionModeOptions[0].label
   );
 }
 
