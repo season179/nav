@@ -26,6 +26,7 @@ type SessionSummary = {
   sessionId: string;
   title: string | null;
   workspaceRoot: string | null;
+  projectRoot: string | null;
   updatedAt: number;
 };
 

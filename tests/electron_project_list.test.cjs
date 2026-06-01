@@ -68,6 +68,68 @@ test("new project groups append after already-known projects", async () => {
   );
 });
 
+test("worktree sessions group under their project root", async () => {
+  const { groupSessionsByProject } = await loadProjectList();
+  const sessions = [
+    {
+      sessionId: "main",
+      workspaceRoot: "/Users/season/Personal/nav",
+      projectRoot: "/Users/season/Personal/nav",
+      updatedAt: 100,
+    },
+    {
+      sessionId: "worktree",
+      workspaceRoot: "/Users/season/.codex/worktrees/8f49/nav",
+      projectRoot: "/Users/season/Personal/nav",
+      updatedAt: 200,
+    },
+  ];
+
+  const projects = groupSessionsByProject(sessions);
+
+  assert.equal(projects.length, 1);
+  assert.equal(projects[0].path, "/Users/season/Personal/nav");
+  assert.deepEqual(
+    projects[0].sessions.map((session) => session.sessionId),
+    ["worktree", "main"],
+  );
+});
+
+test("same-named non-worktree project groups expose distinguishing path hints", async () => {
+  const { groupSessionsByProject } = await loadProjectList();
+  const sessions = [
+    {
+      sessionId: "personal",
+      workspaceRoot: "/Users/season/Personal/nav",
+      updatedAt: 200,
+    },
+    {
+      sessionId: "archive",
+      workspaceRoot: "/Users/season/Archive/nav",
+      updatedAt: 100,
+    },
+    {
+      sessionId: "experiments",
+      workspaceRoot: "/Users/season/Experiments",
+      updatedAt: 50,
+    },
+  ];
+
+  const projects = groupSessionsByProject(sessions);
+
+  assert.deepEqual(
+    projects.map((project) => ({
+      displayName: project.displayName,
+      pathHint: project.pathHint,
+    })),
+    [
+      { displayName: "nav (Personal/nav)", pathHint: "Personal/nav" },
+      { displayName: "nav (Archive/nav)", pathHint: "Archive/nav" },
+      { displayName: "Experiments", pathHint: null },
+    ],
+  );
+});
+
 test("project paths normalize into stable keys", async () => {
   const { normalizeProjectPath, projectKey } = await loadProjectList();
   assert.equal(

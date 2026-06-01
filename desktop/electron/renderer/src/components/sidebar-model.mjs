@@ -2,9 +2,10 @@ export const PROJECT_SESSION_PREVIEW_LIMIT = 5;
 export const PROJECT_SESSION_DISPLAY_LIMIT = 20;
 
 export function projectToggleView(project, collapsed) {
+  const label = projectLabel(project);
   return {
     ariaExpanded: String(!collapsed),
-    ariaLabel: `${collapsed ? "Expand" : "Collapse"} project ${project.name}`,
+    ariaLabel: `${collapsed ? "Expand" : "Collapse"} project ${label}`,
     disclosure: collapsed ? ">" : "v",
   };
 }
@@ -36,7 +37,7 @@ export function projectSessionToggle(project, expanded) {
   if (expanded) {
     return {
       label: "Show less",
-      ariaLabel: `Show fewer sessions in ${project.name}`,
+      ariaLabel: `Show fewer sessions in ${projectLabel(project)}`,
     };
   }
 
@@ -44,6 +45,10 @@ export function projectSessionToggle(project, expanded) {
   const sessionLabel = hiddenCount === 1 ? "session" : "sessions";
   return {
     label: "Show more",
-    ariaLabel: `Show ${hiddenCount} more ${sessionLabel} in ${project.name}`,
+    ariaLabel: `Show ${hiddenCount} more ${sessionLabel} in ${projectLabel(project)}`,
   };
+}
+
+export function projectLabel(project) {
+  return project.displayName ?? project.name;
 }

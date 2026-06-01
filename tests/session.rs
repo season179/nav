@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nav::{
@@ -223,6 +224,68 @@ fn persisted_session_summaries_include_a_workspace_root() {
 }
 
 #[test]
+fn git_worktree_sessions_list_under_the_main_checkout() {
+    let path = std::env::temp_dir().join(format!(
+        "nav_session_git_worktree_{}.db",
+        uuid::Uuid::now_v7()
+    ));
+    let repo = fake_git_worktree();
+    let main_root = workspace_string(
+        &std::fs::canonicalize(&repo.main_root).expect("canonicalize main checkout"),
+    );
+    let worktree_root = workspace_string(&repo.worktree_root);
+    let storage = Arc::new(Storage::open(&path).expect("open storage"));
+
+    storage
+        .create_session_with_workspace("new-worktree", "nav", Some(&repo.worktree_root))
+        .expect("persist worktree session");
+
+    let conn = rusqlite::Connection::open(&path).expect("reopen db");
+    let persisted_root: Option<String> = conn
+        .query_row(
+            "SELECT workspace_root FROM sessions WHERE id = 'new-worktree'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_root.as_deref(), Some(worktree_root.as_str()));
+
+    storage
+        .create_session_with_workspace("legacy-worktree", "nav", Some(&repo.main_root))
+        .expect("persist legacy session");
+    conn.execute(
+        "UPDATE sessions SET workspace_root = ?1 WHERE id = 'legacy-worktree'",
+        [&worktree_root],
+    )
+    .expect("seed pre-normalization worktree root");
+
+    assert_eq!(
+        storage
+            .session_workspace_root("legacy-worktree")
+            .expect("read legacy workspace")
+            .as_deref(),
+        Some(worktree_root.as_str()),
+    );
+
+    let store = SessionStore::new(Arc::new(MockModel::new()))
+        .with_storage(Arc::clone(&storage))
+        .with_workspace(repo.worktree_root.clone());
+    let summaries = store.list_sessions();
+    assert!(
+        summaries
+            .iter()
+            .all(|session| session.project_root.as_deref() == Some(main_root.as_str())),
+        "git worktree sessions should group under the main checkout: {summaries:?}"
+    );
+
+    drop(conn);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    let _ = std::fs::remove_dir_all(repo.temp_root);
+}
+
+#[test]
 fn missing_provider_token_usage_falls_back_to_an_estimate() {
     let path = std::env::temp_dir().join(format!(
         "nav_session_estimated_tokens_{}.db",
@@ -380,6 +443,44 @@ fn resuming_an_unknown_session_fails_and_latest_is_none_without_storage() {
     // No storage attached: nothing to discover or resume.
     assert_eq!(store.latest_session_id(), None);
     assert!(!store.resume_session("anything"));
+}
+
+struct FakeGitWorktree {
+    temp_root: PathBuf,
+    main_root: PathBuf,
+    worktree_root: PathBuf,
+}
+
+fn fake_git_worktree() -> FakeGitWorktree {
+    let temp_root =
+        std::env::temp_dir().join(format!("nav_fake_worktree_{}", uuid::Uuid::now_v7()));
+    let main_root = temp_root.join("Personal").join("nav");
+    let worktree_root = temp_root
+        .join(".codex")
+        .join("worktrees")
+        .join("8f49")
+        .join("nav");
+    let worktree_git_dir = main_root.join(".git").join("worktrees").join("nav-8f49");
+
+    std::fs::create_dir_all(&worktree_root).expect("create linked worktree");
+    std::fs::create_dir_all(&worktree_git_dir).expect("create git worktree metadata");
+    std::fs::write(
+        worktree_root.join(".git"),
+        format!("gitdir: {}\n", worktree_git_dir.display()),
+    )
+    .expect("write worktree git pointer");
+    std::fs::write(worktree_git_dir.join("commondir"), "../..")
+        .expect("write git common dir pointer");
+
+    FakeGitWorktree {
+        temp_root,
+        main_root,
+        worktree_root,
+    }
+}
+
+fn workspace_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// A model that records the history it was asked to respond to.

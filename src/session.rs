@@ -19,7 +19,9 @@ use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
 use crate::stacks::ModelCallStack;
-use crate::storage::{SessionSummary, Storage, StorageError};
+use crate::storage::{
+    SessionSummary, Storage, StorageError, project_root_to_string, workspace_root_to_string,
+};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
 
@@ -628,7 +630,8 @@ impl SessionStore {
     }
 
     fn with_default_workspace(&self, sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
-        let fallback = self.agent.workspace().to_string_lossy().replace('\\', "/");
+        let fallback_workspace = workspace_root_to_string(self.agent.workspace());
+        let fallback_project = project_root_to_string(self.agent.workspace());
         sessions
             .into_iter()
             .map(|mut session| {
@@ -638,7 +641,8 @@ impl SessionStore {
                     .map(|path| path.trim().is_empty())
                     .unwrap_or(true);
                 if missing {
-                    session.workspace_root = Some(fallback.clone());
+                    session.workspace_root = Some(fallback_workspace.clone());
+                    session.project_root = Some(fallback_project.clone());
                 }
                 session
             })
