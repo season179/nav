@@ -2,8 +2,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +12,8 @@ use serde_json::json;
 use crate::model::ToolCall;
 
 use super::{CancelFlag, Registry, ToolResult};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// A throwaway workspace directory, removed on drop.
 struct Workspace {
@@ -77,6 +79,41 @@ fn full_output_path(content: &str) -> &str {
         .nth(1)
         .and_then(|rest| rest.split(']').next())
         .expect("full output path")
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+
+    fn unset(key: &'static str) -> Self {
+        let original = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 #[test]
@@ -217,15 +254,16 @@ fn bash_interleaves_stdout_and_stderr_in_arrival_order() {
         &workspace,
         "bash",
         json!({
-            "command": "printf 'out1\\n'; sleep 0.1; printf 'err1\\n' >&2; sleep 0.1; printf 'out2\\n'"
+            "command": "printf 'err1\\n' >&2; printf 'out1\\n'; printf 'err2\\n' >&2; printf 'out2\\n'"
         }),
     );
 
-    let out1 = output.content.find("out1").expect("stdout chunk");
     let err1 = output.content.find("err1").expect("stderr chunk");
+    let out1 = output.content.find("out1").expect("stdout chunk");
+    let err2 = output.content.find("err2").expect("second stderr chunk");
     let out2 = output.content.find("out2").expect("second stdout chunk");
     assert!(
-        out1 < err1 && err1 < out2,
+        err1 < out1 && out1 < err2 && err2 < out2,
         "output should preserve chunk order: {}",
         output.content
     );
@@ -236,6 +274,9 @@ fn bash_uses_bash_when_available() {
     if !std::path::Path::new("/bin/bash").exists() {
         return;
     }
+
+    let _lock = ENV_LOCK.lock().expect("env lock");
+    let _guard = EnvVarGuard::unset("NAV_BASH_SHELL");
 
     let workspace = Workspace::new();
     let output = run(
@@ -252,6 +293,34 @@ fn bash_uses_bash_when_available() {
 }
 
 #[test]
+fn bash_shell_override_resolves_path_binary() {
+    if std::process::Command::new("bash")
+        .arg("-c")
+        .arg("exit 0")
+        .status()
+        .is_err()
+    {
+        return;
+    }
+
+    let _lock = ENV_LOCK.lock().expect("env lock");
+    let _guard = EnvVarGuard::set("NAV_BASH_SHELL", "bash");
+
+    let workspace = Workspace::new();
+    let output = run(
+        &workspace,
+        "bash",
+        json!({ "command": "echo ${BASH_VERSION}" }),
+    );
+
+    assert!(
+        !output.content.trim().is_empty(),
+        "PATH shell override should resolve bash: {}",
+        output.content
+    );
+}
+
+#[test]
 fn bash_sanitizes_ansi_and_binary_output() {
     let workspace = Workspace::new();
     let output = run(
@@ -260,12 +329,7 @@ fn bash_sanitizes_ansi_and_binary_output() {
         json!({ "command": "printf '\\033[31mred\\033[0m\\000blue\\001\\n'" }),
     );
 
-    assert!(output.content.contains("redblue"), "{}", output.content);
-    assert!(
-        !output.content.contains('\u{1b}') && !output.content.contains('\0'),
-        "control characters should be stripped: {:?}",
-        output.content
-    );
+    assert_eq!(output.content, "redblue");
 }
 
 #[test]

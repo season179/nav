@@ -5,10 +5,10 @@
 //! bounded by a timeout and the cancel flag, and its output is capped.
 
 use std::env;
-use std::fs;
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,8 +21,6 @@ use super::{CancelFlag, Tool, ToolError, ToolOutput, arg_opt_u64, arg_str};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
-const EXIT_PIPE_GRACE: Duration = Duration::from_millis(100);
-const READ_BUFFER_BYTES: usize = 8192;
 const SHELL_OVERRIDE_ENV: &str = "NAV_BASH_SHELL";
 
 pub struct BashTool;
@@ -88,27 +86,29 @@ impl LocalBashRunner {
         timeout: Duration,
         cancel: &CancelFlag,
     ) -> Result<BashRun, ToolError> {
+        let output = OutputCapture::new().map_err(|error| {
+            ToolError::new(format!("could not create command output capture: {error}"))
+        })?;
+        let stdout = output.stdio().map_err(|error| {
+            ToolError::new(format!("could not capture command stdout: {error}"))
+        })?;
+        let stderr = output.stdio().map_err(|error| {
+            ToolError::new(format!("could not capture command stderr: {error}"))
+        })?;
+
         let mut child = self.shell.command(command);
         child
             .current_dir(cwd)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(stdout)
+            .stderr(stderr);
         configure_child_process(&mut child);
 
-        let mut child = child
+        let child = child
             .spawn()
             .map_err(|error| ToolError::new(format!("could not start command: {error}")))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ToolError::new("could not capture command stdout pipe after spawn"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ToolError::new("could not capture command stderr pipe after spawn"))?;
 
-        collect_child_output(child, stdout, stderr, timeout, cancel)
+        collect_child_output(child, output, timeout, cancel)
     }
 }
 
@@ -133,6 +133,11 @@ impl ShellConfig {
                 let path = PathBuf::from(custom);
                 if path.exists() {
                     return Ok(Self::bash(path));
+                }
+                if path.components().count() == 1
+                    && let Some(found) = find_on_path(custom).into_iter().next()
+                {
+                    return Ok(Self::bash(found));
                 }
                 return Err(ToolError::new(format!(
                     "{SHELL_OVERRIDE_ENV} points to a missing shell: {custom}"
@@ -272,82 +277,42 @@ fn write_full_output(output: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg(unix)]
-fn collect_child_output(
-    mut child: Child,
-    mut stdout: ChildStdout,
-    mut stderr: ChildStderr,
-    timeout: Duration,
-    cancel: &CancelFlag,
-) -> Result<BashRun, ToolError> {
-    set_nonblocking(&stdout)
-        .map_err(|error| ToolError::new(format!("could not set stdout nonblocking: {error}")))?;
-    set_nonblocking(&stderr)
-        .map_err(|error| ToolError::new(format!("could not set stderr nonblocking: {error}")))?;
-
-    let deadline = Instant::now() + timeout;
-    let mut output = String::new();
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut outcome: Option<Outcome> = None;
-    let mut exited_at: Option<Instant> = None;
-
-    loop {
-        drain_if_open(&mut stdout_open, &mut stdout, &mut output)?;
-        drain_if_open(&mut stderr_open, &mut stderr, &mut output)?;
-
-        if outcome.is_none()
-            && let Some(done) = poll_child_outcome(&mut child)
-        {
-            outcome = Some(done);
-            exited_at = Some(Instant::now());
-        }
-
-        if outcome.is_none()
-            && let Some(stop) = requested_stop(cancel, deadline, timeout)
-        {
-            kill_process_tree(&mut child);
-            let _ = child.wait();
-            outcome = Some(stop);
-            exited_at = Some(Instant::now());
-        }
-
-        if outcome.is_some() && command_output_is_done(stdout_open, stderr_open, exited_at) {
-            break;
-        }
-
-        thread::sleep(POLL_INTERVAL);
-    }
-
-    Ok(BashRun {
-        output,
-        outcome: outcome.unwrap_or_else(|| Outcome::Error("command ended unexpectedly".to_owned())),
-    })
+struct OutputCapture {
+    path: PathBuf,
 }
 
-#[cfg(not(unix))]
+impl OutputCapture {
+    fn new() -> io::Result<Self> {
+        let path = env::temp_dir().join(format!("nav-bash-capture-{}.log", Uuid::now_v7()));
+        File::create_new(&path)?;
+        Ok(Self { path })
+    }
+
+    fn stdio(&self) -> io::Result<Stdio> {
+        let file = OpenOptions::new().append(true).open(&self.path)?;
+        Ok(Stdio::from(file))
+    }
+
+    fn read_sanitized(&self) -> io::Result<String> {
+        let bytes = fs::read(&self.path)?;
+        Ok(sanitize_output_chunk(&bytes))
+    }
+}
+
+impl Drop for OutputCapture {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn collect_child_output(
     mut child: Child,
-    stdout: ChildStdout,
-    stderr: ChildStderr,
+    output: OutputCapture,
     timeout: Duration,
     cancel: &CancelFlag,
 ) -> Result<BashRun, ToolError> {
-    use std::sync::mpsc;
-
-    let (tx, rx) = mpsc::channel::<String>();
-    let stdout_tx = tx.clone();
-    let stderr_tx = tx;
-    thread::spawn(move || drain_blocking(stdout, stdout_tx));
-    thread::spawn(move || drain_blocking(stderr, stderr_tx));
-
     let deadline = Instant::now() + timeout;
-    let mut output = String::new();
     let outcome = loop {
-        while let Ok(chunk) = rx.try_recv() {
-            output.push_str(&chunk);
-        }
-
         if let Some(done) = poll_child_outcome(&mut child) {
             break done;
         }
@@ -359,13 +324,9 @@ fn collect_child_output(
         thread::sleep(POLL_INTERVAL);
     };
 
-    let drain_until = Instant::now() + EXIT_PIPE_GRACE;
-    while Instant::now() < drain_until {
-        while let Ok(chunk) = rx.try_recv() {
-            output.push_str(&chunk);
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
+    let output = output
+        .read_sanitized()
+        .map_err(|error| ToolError::new(format!("could not read command output: {error}")))?;
 
     Ok(BashRun { output, outcome })
 }
@@ -385,77 +346,6 @@ fn requested_stop(cancel: &CancelFlag, deadline: Instant, timeout: Duration) -> 
         Some(Outcome::TimedOut(timeout.as_secs()))
     } else {
         None
-    }
-}
-
-#[cfg(unix)]
-fn drain_if_open(
-    open: &mut bool,
-    pipe: &mut impl Read,
-    output: &mut String,
-) -> Result<(), ToolError> {
-    if *open {
-        *open = drain_available(pipe, output)?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn command_output_is_done(
-    stdout_open: bool,
-    stderr_open: bool,
-    exited_at: Option<Instant>,
-) -> bool {
-    (!stdout_open && !stderr_open) || exited_at.is_some_and(|at| at.elapsed() >= EXIT_PIPE_GRACE)
-}
-
-#[cfg(not(unix))]
-fn drain_blocking(mut pipe: impl Read, tx: std::sync::mpsc::Sender<String>) {
-    let mut buffer = [0; READ_BUFFER_BYTES];
-    loop {
-        match pipe.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx.send(sanitize_output_chunk(&buffer[..n])).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-#[cfg(unix)]
-fn set_nonblocking<T: std::os::fd::AsRawFd>(pipe: &T) -> io::Result<()> {
-    let fd = pipe.as_raw_fd();
-    // SAFETY: fcntl is called with a live pipe fd owned by ChildStdout/Stderr.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: same fd as above; O_NONBLOCK only changes this descriptor's mode.
-    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn drain_available(pipe: &mut impl Read, output: &mut String) -> Result<bool, ToolError> {
-    let mut buffer = [0; READ_BUFFER_BYTES];
-    loop {
-        match pipe.read(&mut buffer) {
-            Ok(0) => return Ok(false),
-            Ok(n) => output.push_str(&sanitize_output_chunk(&buffer[..n])),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                return Err(ToolError::new(format!(
-                    "could not read command output: {error}"
-                )));
-            }
-        }
     }
 }
 
