@@ -10,18 +10,32 @@ pub const MAX_BYTES: usize = 50 * 1024;
 /// Marker appended when output was clipped.
 pub const TRUNCATION_MARKER: &str = "\n… [output truncated]";
 
+/// Output after applying a cap, plus whether any content was removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedOutput {
+    /// Text after applying the requested cap.
+    pub content: String,
+    /// Whether the original text exceeded the line or byte limit.
+    pub truncated: bool,
+}
+
 /// Cap output to the head (first lines/bytes) — for file reads and listings.
 pub fn cap_head(text: &str) -> String {
-    cap(text, false)
+    cap_with_meta(text, false).content
 }
 
 /// Cap output to the tail (last lines/bytes) — for command output where the
 /// end is usually the interesting part.
 pub fn cap_tail(text: &str) -> String {
-    cap(text, true)
+    cap_with_meta(text, true).content
 }
 
-fn cap(text: &str, keep_tail: bool) -> String {
+/// Cap output to the tail and report whether the original text was truncated.
+pub fn cap_tail_with_meta(text: &str) -> CappedOutput {
+    cap_with_meta(text, true)
+}
+
+fn cap_with_meta(text: &str, keep_tail: bool) -> CappedOutput {
     let lines: Vec<&str> = text.lines().collect();
     let mut truncated = false;
 
@@ -51,7 +65,7 @@ fn cap(text: &str, keep_tail: bool) -> String {
     };
     if out.len() > budget {
         if keep_tail {
-            let start = floor_char_boundary(&out, out.len() - budget);
+            let start = ceil_char_boundary(&out, out.len() - budget);
             out = out[start..].to_owned();
         } else {
             let end = floor_char_boundary(&out, budget);
@@ -62,7 +76,22 @@ fn cap(text: &str, keep_tail: bool) -> String {
     if truncated {
         out.push_str(TRUNCATION_MARKER);
     }
-    out
+    CappedOutput {
+        content: out,
+        truncated,
+    }
+}
+
+/// Smallest char boundary `>= index`.
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut boundary = index;
+    while boundary < text.len() && !text.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    boundary
 }
 
 /// Largest char boundary `<= index` (std's `floor_char_boundary` is unstable).
@@ -127,6 +156,14 @@ mod tests {
         assert!(head.ends_with(TRUNCATION_MARKER));
 
         let tail = cap_tail(&"y".repeat(MAX_BYTES * 2));
+        assert!(tail.len() <= MAX_BYTES, "tail len {}", tail.len());
+        assert!(tail.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn tail_byte_cap_respects_ceil_char_boundaries() {
+        let tail = cap_tail(&"é".repeat(MAX_BYTES));
+
         assert!(tail.len() <= MAX_BYTES, "tail len {}", tail.len());
         assert!(tail.ends_with(TRUNCATION_MARKER));
     }
