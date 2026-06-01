@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::context::TurnHistory;
-use crate::model::{ChatMessage, ToolCall};
+use crate::model::{ChatMessage, ResponseReasoningItem, ToolCall};
 use crate::tokens::TokenUsage;
 
 /// Canonical schema, captured verbatim from the live database.
@@ -156,7 +156,13 @@ impl Storage {
         text: &str,
         model_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        self.record_assistant_text_with_reasoning(session_id, run_id, seq, text, None, model_id)
+        self.record_assistant_text_with_reasoning(
+            session_id,
+            run_id,
+            seq,
+            (text, None, &[]),
+            model_id,
+        )
     }
 
     /// Persist the assistant's reply, preserving provider reasoning/thinking
@@ -166,13 +172,15 @@ impl Storage {
         session_id: &str,
         run_id: &str,
         seq: i64,
-        text: &str,
-        reasoning_content: Option<&str>,
+        content: (&str, Option<&str>, &[ResponseReasoningItem]),
         model_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        let mut parts = Vec::with_capacity(1 + usize::from(reasoning_content.is_some()));
-        if let Some(reasoning_content) = reasoning_content {
-            parts.push(thinking_part(reasoning_content));
+        let (text, reasoning_content, response_reasoning_items) = content;
+        let mut parts = Vec::with_capacity(
+            1 + usize::from(reasoning_content.is_some() || !response_reasoning_items.is_empty()),
+        );
+        if reasoning_content.is_some() || !response_reasoning_items.is_empty() {
+            parts.push(thinking_part(reasoning_content, response_reasoning_items));
         }
         parts.push(text_part(text));
         self.record_turn(TurnRecord {
@@ -202,7 +210,7 @@ impl Storage {
             session_id,
             run_id,
             seq,
-            (content, None),
+            (content, None, &[]),
             calls,
             model_id,
         )
@@ -215,18 +223,18 @@ impl Storage {
         session_id: &str,
         run_id: &str,
         seq: i64,
-        content: (Option<&str>, Option<&str>),
+        content: (Option<&str>, Option<&str>, &[ResponseReasoningItem]),
         calls: &[ToolCall],
         model_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        let (content, reasoning_content) = content;
+        let (content, reasoning_content, response_reasoning_items) = content;
         let mut parts = Vec::with_capacity(
             calls.len()
                 + usize::from(content.is_some_and(|text| !text.is_empty()))
-                + usize::from(reasoning_content.is_some()),
+                + usize::from(reasoning_content.is_some() || !response_reasoning_items.is_empty()),
         );
-        if let Some(reasoning_content) = reasoning_content {
-            parts.push(thinking_part(reasoning_content));
+        if reasoning_content.is_some() || !response_reasoning_items.is_empty() {
+            parts.push(thinking_part(reasoning_content, response_reasoning_items));
         }
         if let Some(content) = content.filter(|text| !text.is_empty()) {
             parts.push(text_part(content));
@@ -587,6 +595,8 @@ struct TurnAccum {
     text: String,
     /// Provider reasoning/thinking payload from `thinking` parts.
     reasoning_content: Option<String>,
+    /// Opaque Responses API reasoning payloads from `thinking` parts.
+    response_reasoning_items: Vec<ResponseReasoningItem>,
     /// `tool_call` parts rebuilt into the assistant's requested calls.
     tool_calls: Vec<ToolCall>,
     /// `tool_result` parts as `(tool_call_id, content, is_error)`.
@@ -600,6 +610,7 @@ impl TurnAccum {
             role,
             text: String::new(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
         }
@@ -615,10 +626,17 @@ impl TurnAccum {
         let field = |key: &str| data.get(key).and_then(|v| v.as_str()).unwrap_or_default();
         match part_type {
             "text" => self.text.push_str(field("text")),
-            "thinking" => match &mut self.reasoning_content {
-                Some(reasoning_content) => reasoning_content.push_str(field("text")),
-                None => self.reasoning_content = Some(field("text").to_owned()),
-            },
+            "thinking" => {
+                let text = field("text");
+                if !text.is_empty() {
+                    match &mut self.reasoning_content {
+                        Some(reasoning_content) => reasoning_content.push_str(text),
+                        None => self.reasoning_content = Some(text.to_owned()),
+                    }
+                }
+                self.response_reasoning_items
+                    .extend(response_reasoning_items_from_part(&data));
+            }
             "tool_call" => self.tool_calls.push(ToolCall {
                 id: field("id").to_owned(),
                 name: field("name").to_owned(),
@@ -641,11 +659,13 @@ impl TurnAccum {
             "assistant" if !self.tool_calls.is_empty() => {
                 let mut message = ChatMessage::assistant_tool_calls(self.text, self.tool_calls);
                 message.reasoning_content = self.reasoning_content;
+                message.response_reasoning_items = self.response_reasoning_items;
                 history.push(message);
             }
             "assistant" => {
                 let mut message = ChatMessage::assistant(self.text);
                 message.reasoning_content = self.reasoning_content;
+                message.response_reasoning_items = self.response_reasoning_items;
                 history.push(message);
             }
             "tool" => {
@@ -666,15 +686,33 @@ fn text_part(text: &str) -> TurnPart {
     }
 }
 
-/// A provider reasoning/thinking part. The shared schema already mirrors
-/// `thinking.text` into FTS, and nav uses it to replay DeepSeek-style messages.
-fn thinking_part(text: &str) -> TurnPart {
+fn response_reasoning_items_from_part(data: &serde_json::Value) -> Vec<ResponseReasoningItem> {
+    data.get("response_reasoning")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            Some(ResponseReasoningItem {
+                id: item.get("id")?.as_str()?.to_owned(),
+                encrypted_content: item.get("encrypted_content")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// A provider reasoning/thinking part. The shared schema mirrors `text` into
+/// FTS, while `response_reasoning` stays opaque and is only used for replay.
+fn thinking_part(
+    text: Option<&str>,
+    response_reasoning_items: &[ResponseReasoningItem],
+) -> TurnPart {
     TurnPart {
         part_type: "thinking",
         data_json: serde_json::json!({
             "type": "thinking",
-            "text": text,
+            "text": text.unwrap_or_default(),
             "provider_hint": "reasoning_content",
+            "response_reasoning": response_reasoning_items,
         })
         .to_string(),
     }

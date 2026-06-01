@@ -17,6 +17,7 @@ fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 /// A resolved settings.json model, as #531's resolver would produce.
 fn resolved(api_key: &str, model: &str, base_url: &str) -> ResolvedModelConfig {
     ResolvedModelConfig {
+        api: "openai-completions".to_owned(),
         api_key: api_key.to_owned(),
         provider: "commandcode".to_owned(),
         model: model.to_owned(),
@@ -29,6 +30,10 @@ fn resolved(api_key: &str, model: &str, base_url: &str) -> ResolvedModelConfig {
         max_tokens: Some(16_384),
         compat: None,
         thinking_level_map: None,
+        chatgpt_account_id: None,
+        chatgpt_plan_type: None,
+        chatgpt_fedramp: false,
+        service_tier: None,
     }
 }
 
@@ -87,6 +92,7 @@ fn an_api_key_resolves_to_the_openai_model() {
     let choice = ModelChoice::from_env(env(&[("NAV_API_KEY", "sk-test")]));
     match choice {
         ModelChoice::OpenAi(config) => {
+            assert_eq!(config.api, "openai-completions");
             assert_eq!(config.api_key, "sk-test");
             assert_eq!(config.base_url, "https://api.openai.com/v1");
             assert!(!config.model.is_empty(), "a default model name is required");

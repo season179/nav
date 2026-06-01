@@ -9,10 +9,13 @@
 use std::fmt;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::config::{ConfigError, ResolvedModelConfig};
+use crate::config::{
+    CODEX_RESPONSES_API, ConfigError, OPENAI_COMPLETIONS_API, OPENAI_RESPONSES_API,
+    ResolvedModelConfig,
+};
 use crate::context::ModelContext;
 use crate::tokens::{
     HeuristicTokenCounter, TextTokenCounter, TokenEstimate, TokenUsage, counter_from_compat,
@@ -21,7 +24,6 @@ use crate::tokens::{
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-const OPENAI_COMPLETIONS_API_KIND: &str = "openai-completions";
 
 /// Message shown when no model can be resolved from settings or the environment.
 const NOT_CONFIGURED_MESSAGE: &str = "model not configured: add a default model to \
@@ -59,6 +61,14 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Opaque Responses API reasoning state that must be replayed with an
+/// assistant turn in stateless follow-up requests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseReasoningItem {
+    pub id: String,
+    pub encrypted_content: String,
+}
+
 /// One message-shaped entry shared by Turn History and Model Context.
 ///
 /// Plain user and assistant turns carry only `content`. An assistant turn may
@@ -71,6 +81,9 @@ pub struct ChatMessage {
     /// Provider reasoning/thinking payload for assistant turns. Some
     /// OpenAI-compatible thinking models require this to be replayed verbatim.
     pub reasoning_content: Option<String>,
+    /// Opaque Responses API reasoning payloads for assistant turns. These are
+    /// sent back to OpenAI but are not user-visible reasoning text.
+    pub response_reasoning_items: Vec<ResponseReasoningItem>,
     /// Tool calls requested by an assistant turn (empty for every other turn).
     pub tool_calls: Vec<ToolCall>,
     /// For a [`Role::Tool`] turn, the assistant tool call this result answers.
@@ -87,6 +100,7 @@ impl ChatMessage {
             role: Role::User,
             content: content.into(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
             is_error: false,
@@ -98,6 +112,7 @@ impl ChatMessage {
             role: Role::Assistant,
             content: content.into(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
             is_error: false,
@@ -117,6 +132,7 @@ impl ChatMessage {
             role: Role::Assistant,
             content: content.into(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls,
             tool_call_id: None,
             is_error: false,
@@ -144,6 +160,7 @@ impl ChatMessage {
             role: Role::Tool,
             content: content.into(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             is_error,
@@ -176,6 +193,8 @@ pub struct ModelResponse {
     pub content: Option<String>,
     /// Provider reasoning/thinking payload, if returned separately from text.
     pub reasoning_content: Option<String>,
+    /// Opaque Responses API reasoning payloads to replay on later model calls.
+    pub response_reasoning_items: Vec<ResponseReasoningItem>,
     /// Tool calls the model wants executed before the next turn.
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
@@ -251,6 +270,7 @@ impl ModelResponse {
         Self {
             content: Some(content.into()),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             token_usage: None,
@@ -418,6 +438,7 @@ impl ModelChoice {
             Some(api_key) if !api_key.is_empty() => {
                 let model = non_empty(get("NAV_MODEL"), DEFAULT_OPENAI_MODEL);
                 ModelChoice::OpenAi(Box::new(OpenAiConfig {
+                    api: OPENAI_COMPLETIONS_API.to_owned(),
                     api_key,
                     provider: None,
                     base_url: non_empty(get("NAV_BASE_URL"), DEFAULT_OPENAI_BASE_URL),
@@ -429,6 +450,10 @@ impl ModelChoice {
                     context_window: None,
                     compat: None,
                     thinking_level_map: None,
+                    chatgpt_account_id: None,
+                    chatgpt_plan_type: None,
+                    chatgpt_fedramp: false,
+                    service_tier: None,
                 }))
             }
             _ => ModelChoice::NotConfigured,
@@ -511,6 +536,9 @@ impl ModelChoice {
     pub fn into_model(self) -> Arc<dyn ChatModel> {
         match self {
             ModelChoice::Mock => Arc::new(MockModel::new()),
+            ModelChoice::OpenAi(config) if config.is_responses_api() => {
+                Arc::new(OpenAiResponsesModel::new(*config))
+            }
             ModelChoice::OpenAi(config) => Arc::new(OpenAiModel::new(*config)),
             ModelChoice::NotConfigured => Arc::new(FailingModel::new(NOT_CONFIGURED_MESSAGE)),
             ModelChoice::Unavailable(reason) => Arc::new(FailingModel::new(reason)),
@@ -532,8 +560,9 @@ fn non_empty(value: Option<String>, fallback: &str) -> String {
     }
 }
 
-/// Connection settings for an OpenAI-compatible chat-completions provider.
+/// Connection settings for an OpenAI-compatible model provider.
 pub struct OpenAiConfig {
+    pub api: String,
     pub api_key: String,
     /// Provider id from settings.json when this model came from configured
     /// provider/model selection. Environment-only fallback models have none.
@@ -555,14 +584,25 @@ pub struct OpenAiConfig {
     /// Provider-specific thinking level map, when the model exposes thinking
     /// levels under names different from nav's UI.
     pub thinking_level_map: Option<Value>,
+    /// ChatGPT workspace/account id required by the Codex backend, when using
+    /// subscription-backed Codex auth.
+    pub chatgpt_account_id: Option<String>,
+    /// Plan metadata from Codex auth, used for future UI/status surfaces.
+    pub chatgpt_plan_type: Option<String>,
+    /// FedRAMP routing hint from Codex auth.
+    pub chatgpt_fedramp: bool,
+    /// Preferred Responses service tier. For Codex ChatGPT fast mode this is
+    /// the request value (`priority`) rather than the user-facing label.
+    pub service_tier: Option<String>,
 }
 
 impl From<ResolvedModelConfig> for OpenAiConfig {
     /// Build provider connection settings from a resolved settings.json model.
-    /// The settings resolver (#531) already validated the API as
-    /// `openai-completions`, so only the connection fields are carried over.
+    /// The settings resolver already validated the API kind and auth material,
+    /// so only the connection fields are carried over.
     fn from(config: ResolvedModelConfig) -> Self {
         Self {
+            api: config.api,
             api_key: config.api_key,
             provider: Some(config.provider),
             model: config.model,
@@ -573,11 +613,22 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
             context_window: config.context_window,
             compat: config.compat,
             thinking_level_map: config.thinking_level_map,
+            chatgpt_account_id: config.chatgpt_account_id,
+            chatgpt_plan_type: config.chatgpt_plan_type,
+            chatgpt_fedramp: config.chatgpt_fedramp,
+            service_tier: config.service_tier,
         }
     }
 }
 
 impl OpenAiConfig {
+    fn is_responses_api(&self) -> bool {
+        matches!(
+            self.api.as_str(),
+            OPENAI_RESPONSES_API | CODEX_RESPONSES_API
+        )
+    }
+
     fn requires_reasoning_content(&self) -> bool {
         self.compat
             .as_ref()
@@ -735,7 +786,7 @@ impl ChatModel for OpenAiModel {
             self.config.base_url.trim_end_matches('/')
         );
         let mut trace = ProviderCallTrace::new(
-            OPENAI_COMPLETIONS_API_KIND,
+            OPENAI_COMPLETIONS_API,
             url.clone(),
             self.config.model.clone(),
             body.clone(),
@@ -791,6 +842,227 @@ impl ChatModel for OpenAiModel {
             self.token_counter.as_ref(),
         )
     }
+}
+
+/// Real text model: one non-streaming `POST /responses` call.
+pub struct OpenAiResponsesModel {
+    config: OpenAiConfig,
+    token_counter: Arc<dyn TextTokenCounter>,
+}
+
+impl OpenAiResponsesModel {
+    pub fn new(config: OpenAiConfig) -> Self {
+        let token_counter = counter_from_compat(&config.model, config.compat.as_ref());
+        Self {
+            config,
+            token_counter,
+        }
+    }
+}
+
+impl ChatModel for OpenAiResponsesModel {
+    fn respond(
+        &self,
+        context: &ModelContext,
+        tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
+        self.respond_with_trace(context, tools)
+            .map(|traced| traced.response)
+    }
+
+    fn respond_with_trace(
+        &self,
+        context: &ModelContext,
+        tools: &[ToolDef],
+    ) -> Result<TracedModelResponse, ModelError> {
+        let input = context
+            .messages()
+            .iter()
+            .flat_map(response_input_json)
+            .collect::<Vec<_>>();
+        let mut body = json!({
+            "model": self.config.model,
+            "input": input,
+            "store": false,
+            "stream": false,
+        });
+        if let Some(system_prompt) = context.system_prompt() {
+            body["instructions"] = Value::String(system_prompt.to_owned());
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools.iter().map(responses_tool_json).collect());
+            body["tool_choice"] = Value::String("auto".to_owned());
+            body["parallel_tool_calls"] = Value::Bool(true);
+        }
+        if let Some(reasoning) = responses_reasoning_json(&self.config) {
+            body["reasoning"] = reasoning;
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        if let Some(service_tier) = &self.config.service_tier {
+            body["service_tier"] = Value::String(service_tier.clone());
+        }
+
+        let url = format!("{}/responses", self.config.base_url.trim_end_matches('/'));
+        let mut trace = ProviderCallTrace::new(
+            &self.config.api,
+            url.clone(),
+            self.config.model.clone(),
+            body.clone(),
+        );
+
+        let mut request =
+            ureq::post(&url).header("Authorization", format!("Bearer {}", self.config.api_key));
+        if let Some(account_id) = &self.config.chatgpt_account_id {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        if self.config.chatgpt_fedramp {
+            request = request.header("X-OpenAI-Fedramp", "true");
+        }
+
+        let mut response = request.send_json(&body).map_err(|error| {
+            let message = format!("model request failed: {error}");
+            ModelError::new(message.clone()).with_provider_trace(trace.clone().with_error(&message))
+        })?;
+        trace.status_code = Some(response.status().as_u16());
+        trace.request_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("request-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        let payload: Value = response.body_mut().read_json().map_err(|error| {
+            let message = format!("could not read model response: {error}");
+            ModelError::new(message.clone()).with_provider_trace(trace.clone().with_error(&message))
+        })?;
+        trace.provider_model_id = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        trace.response_id = payload.get("id").and_then(Value::as_str).map(str::to_owned);
+        trace.response_payload = Some(payload.clone());
+
+        parse_responses_payload(&payload)
+            .map(|response| TracedModelResponse {
+                response,
+                provider_trace: Some(trace.clone()),
+            })
+            .map_err(|error| {
+                let message = error.message.clone();
+                error.with_provider_trace(trace.with_error(&message))
+            })
+    }
+
+    fn estimate_context_tokens(&self, context: &ModelContext, tools: &[ToolDef]) -> TokenEstimate {
+        estimate_model_context(context, tools, self.token_counter.as_ref())
+    }
+
+    fn estimate_output_tokens(&self, response: &ModelResponse) -> TokenEstimate {
+        estimate_assistant_output(
+            response.content.as_deref(),
+            response.reasoning_content.as_deref(),
+            &response.tool_calls,
+            self.token_counter.as_ref(),
+        )
+    }
+}
+
+fn responses_reasoning_json(config: &OpenAiConfig) -> Option<Value> {
+    if !config.reasoning || !config.supports_reasoning_effort() {
+        return None;
+    }
+
+    responses_reasoning_effort(config).map(|effort| json!({ "effort": effort }))
+}
+
+fn responses_reasoning_effort(config: &OpenAiConfig) -> Option<String> {
+    if config.thinking_level == "off" {
+        return config
+            .thinking_level_map
+            .as_ref()
+            .and_then(|map| map.get("off"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| Some("none".to_owned()));
+    }
+
+    config.provider_thinking_level()
+}
+
+fn response_input_json(message: &ChatMessage) -> Vec<Value> {
+    match message.role {
+        Role::User => vec![responses_message_json(
+            "user",
+            "input_text",
+            &message.content,
+        )],
+        Role::Assistant if message.tool_calls.is_empty() => {
+            let mut items = responses_reasoning_items_json(&message.response_reasoning_items);
+            items.push(responses_message_json(
+                "assistant",
+                "output_text",
+                &message.content,
+            ));
+            items
+        }
+        Role::Assistant => {
+            let mut items = responses_reasoning_items_json(&message.response_reasoning_items);
+            if !message.content.is_empty() {
+                items.push(responses_message_json(
+                    "assistant",
+                    "output_text",
+                    &message.content,
+                ));
+            }
+            items.extend(message.tool_calls.iter().map(responses_function_call_json));
+            items
+        }
+        Role::Tool => vec![json!({
+            "type": "function_call_output",
+            "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
+            "output": message.content,
+        })],
+    }
+}
+
+fn responses_reasoning_items_json(reasoning: &[ResponseReasoningItem]) -> Vec<Value> {
+    reasoning
+        .iter()
+        .map(|item| {
+            json!({
+                "type": "reasoning",
+                "id": item.id,
+                "encrypted_content": item.encrypted_content,
+            })
+        })
+        .collect()
+}
+
+fn responses_message_json(role: &str, content_type: &str, text: &str) -> Value {
+    json!({
+        "type": "message",
+        "role": role,
+        "content": [{ "type": content_type, "text": text }],
+    })
+}
+
+fn responses_function_call_json(call: &ToolCall) -> Value {
+    json!({
+        "type": "function_call",
+        "id": call.id,
+        "call_id": call.id,
+        "name": call.name,
+        "arguments": call.arguments,
+    })
+}
+
+fn responses_tool_json(tool: &ToolDef) -> Value {
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+    })
 }
 
 /// Serialize one Model Context message into OpenAI chat-completions wire shape.
@@ -898,44 +1170,213 @@ fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
     Ok(ModelResponse {
         content,
         reasoning_content,
+        response_reasoning_items: Vec::new(),
         tool_calls,
         finish_reason,
         token_usage: parse_token_usage(payload),
     })
 }
 
+fn parse_responses_payload(payload: &Value) -> Result<ModelResponse, ModelError> {
+    let unexpected = || ModelError::new(format!("unexpected model response: {payload}"));
+    let output = payload
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(unexpected)?;
+
+    let content = response_output_text(output);
+    let response_reasoning = response_reasoning(output);
+    let tool_calls = output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .map(parse_response_function_call)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if content.is_none() && tool_calls.is_empty() {
+        return Err(unexpected());
+    }
+
+    let finish_reason = response_finish_reason(payload, !tool_calls.is_empty());
+
+    Ok(ModelResponse {
+        content,
+        reasoning_content: response_reasoning.summary,
+        response_reasoning_items: response_reasoning.items,
+        tool_calls,
+        finish_reason,
+        token_usage: parse_responses_token_usage(payload),
+    })
+}
+
+fn response_output_text(output: &[Value]) -> Option<String> {
+    let mut text = String::new();
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in content {
+            if let Some("output_text" | "text") = part.get("type").and_then(Value::as_str)
+                && let Some(part_text) = part.get("text").and_then(Value::as_str)
+            {
+                text.push_str(part_text);
+            }
+        }
+    }
+
+    (!text.is_empty()).then_some(text)
+}
+
+struct ParsedResponseReasoning {
+    summary: Option<String>,
+    items: Vec<ResponseReasoningItem>,
+}
+
+fn response_reasoning(output: &[Value]) -> ParsedResponseReasoning {
+    let mut text = String::new();
+    let mut items = Vec::new();
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        if let (Some(id), Some(encrypted_content)) = (
+            item.get("id").and_then(Value::as_str),
+            item.get("encrypted_content").and_then(Value::as_str),
+        ) && !id.is_empty()
+            && !encrypted_content.is_empty()
+        {
+            items.push(ResponseReasoningItem {
+                id: id.to_owned(),
+                encrypted_content: encrypted_content.to_owned(),
+            });
+        }
+        let Some(summary) = item.get("summary").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in summary {
+            if let Some(part_text) = part.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(part_text);
+            }
+        }
+    }
+
+    ParsedResponseReasoning {
+        summary: (!text.is_empty()).then_some(text),
+        items,
+    }
+}
+
+fn parse_response_function_call(item: &Value) -> Result<ToolCall, ModelError> {
+    let malformed = || ModelError::new(format!("unexpected function call: {item}"));
+    let id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(malformed)?
+        .to_owned();
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(malformed)?
+        .to_owned();
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or("{}")
+        .to_owned();
+
+    Ok(ToolCall {
+        id,
+        name,
+        arguments,
+    })
+}
+
+fn response_finish_reason(payload: &Value, has_tool_calls: bool) -> FinishReason {
+    if has_tool_calls {
+        return FinishReason::ToolCalls;
+    }
+
+    match payload
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+    {
+        Some("max_output_tokens" | "max_tokens") => FinishReason::Length,
+        Some(reason) => FinishReason::Other(reason.to_owned()),
+        None => FinishReason::Stop,
+    }
+}
+
 fn parse_token_usage(payload: &Value) -> Option<TokenUsage> {
+    parse_usage(
+        payload,
+        UsageKeys {
+            input: "prompt_tokens",
+            output: "completion_tokens",
+            input_details: "prompt_tokens_details",
+            output_details: "completion_tokens_details",
+        },
+    )
+}
+
+fn parse_responses_token_usage(payload: &Value) -> Option<TokenUsage> {
+    parse_usage(
+        payload,
+        UsageKeys {
+            input: "input_tokens",
+            output: "output_tokens",
+            input_details: "input_tokens_details",
+            output_details: "output_tokens_details",
+        },
+    )
+}
+
+struct UsageKeys {
+    input: &'static str,
+    output: &'static str,
+    input_details: &'static str,
+    output_details: &'static str,
+}
+
+fn parse_usage(payload: &Value, keys: UsageKeys) -> Option<TokenUsage> {
     let usage = payload.get("usage")?;
-    let input = usage_u64(usage, "prompt_tokens").unwrap_or(0);
-    let output = usage_u64(usage, "completion_tokens").unwrap_or(0);
+    let input = usage_u64(usage, keys.input).unwrap_or(0);
+    let output = usage_u64(usage, keys.output).unwrap_or(0);
     let total = usage_u64(usage, "total_tokens");
-    let reasoning = usage
-        .get("completion_tokens_details")
-        .and_then(|details| usage_u64(details, "reasoning_tokens"))
-        .unwrap_or(0);
-    let cache_read = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| usage_u64(details, "cached_tokens"))
-        .unwrap_or(0);
-    let cache_write = usage
-        .get("prompt_tokens_details")
-        .and_then(|details| usage_u64(details, "cache_write_tokens"))
-        .or_else(|| {
-            usage
-                .get("prompt_tokens_details")
-                .and_then(|details| usage_u64(details, "cache_creation_tokens"))
-        })
+    let reasoning = usage_details_u64(usage, keys.output_details, "reasoning_tokens").unwrap_or(0);
+    let cache_read = usage_details_u64(usage, keys.input_details, "cached_tokens").unwrap_or(0);
+    let cache_write = usage_details_u64(usage, keys.input_details, "cache_write_tokens")
+        .or_else(|| usage_details_u64(usage, keys.input_details, "cache_creation_tokens"))
         .unwrap_or(0);
 
-    let saw_usage = input > 0
-        || output > 0
-        || reasoning > 0
-        || cache_read > 0
-        || cache_write > 0
-        || total.is_some();
-    saw_usage.then(|| {
+    has_reported_usage(input, output, reasoning, cache_read, cache_write, total).then(|| {
         TokenUsage::provider_reported(input, output, reasoning, cache_read, cache_write, total)
     })
+}
+
+fn usage_details_u64(usage: &Value, details_key: &str, value_key: &str) -> Option<u64> {
+    usage
+        .get(details_key)
+        .and_then(|details| usage_u64(details, value_key))
+}
+
+fn has_reported_usage(
+    input: u64,
+    output: u64,
+    reasoning: u64,
+    cache_read: u64,
+    cache_write: u64,
+    total: Option<u64>,
+) -> bool {
+    input > 0 || output > 0 || reasoning > 0 || cache_read > 0 || cache_write > 0 || total.is_some()
 }
 
 fn usage_u64(value: &Value, key: &str) -> Option<u64> {

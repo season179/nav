@@ -6,15 +6,38 @@ use std::net::TcpListener;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-use nav::{ChatMessage, ChatModel, ModelContext, OpenAiConfig, OpenAiModel, ToolCall};
+use nav::{
+    ChatMessage, ChatModel, ModelContext, OpenAiConfig, OpenAiModel, OpenAiResponsesModel,
+    ResponseReasoningItem, ToolCall,
+};
 use serde_json::json;
 
 const TEST_API_KEY: &str = "sk-secret-must-not-leak";
+
+#[derive(Debug)]
+struct CapturedRequest {
+    headers: Vec<(String, String)>,
+    body: String,
+}
 
 /// Spawn a one-shot fake provider. It captures the single request body it
 /// receives (sent over the returned channel) and replies with `status_line`
 /// and `body`. Returns the base URL to point an [`OpenAiModel`] at.
 fn fake_provider(status_line: &'static str, body: &'static str) -> (String, Receiver<String>) {
+    let (base_url, requests) = fake_provider_with_request(status_line, body);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        if let Ok(request) = requests.recv() {
+            let _ = tx.send(request.body);
+        }
+    });
+    (base_url, rx)
+}
+
+fn fake_provider_with_request(
+    status_line: &'static str,
+    body: &'static str,
+) -> (String, Receiver<CapturedRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
     let base_url = format!("http://{}", listener.local_addr().expect("provider addr"));
     let (tx, rx) = mpsc::channel();
@@ -24,6 +47,7 @@ fn fake_provider(status_line: &'static str, body: &'static str) -> (String, Rece
         let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
 
         let mut content_length = 0usize;
+        let mut headers = Vec::new();
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -37,13 +61,19 @@ fn fake_provider(status_line: &'static str, body: &'static str) -> (String, Rece
             {
                 content_length = value.trim().parse().unwrap_or(0);
             }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.push((name.trim().to_owned(), value.trim().to_owned()));
+            }
         }
 
         let mut request_body = vec![0u8; content_length];
         if content_length > 0 {
             reader.read_exact(&mut request_body).ok();
         }
-        let _ = tx.send(String::from_utf8_lossy(&request_body).into_owned());
+        let _ = tx.send(CapturedRequest {
+            headers,
+            body: String::from_utf8_lossy(&request_body).into_owned(),
+        });
 
         let response = format!(
             "HTTP/1.1 {status_line}\r\n\
@@ -71,6 +101,7 @@ fn model_with_compat(base_url: String, compat: Option<serde_json::Value>) -> Ope
 
 fn config_with_compat(base_url: String, compat: Option<serde_json::Value>) -> OpenAiConfig {
     OpenAiConfig {
+        api: "openai-completions".to_owned(),
         api_key: TEST_API_KEY.to_owned(),
         provider: None,
         model: "test-model".to_owned(),
@@ -81,6 +112,10 @@ fn config_with_compat(base_url: String, compat: Option<serde_json::Value>) -> Op
         context_window: None,
         compat,
         thinking_level_map: None,
+        chatgpt_account_id: None,
+        chatgpt_plan_type: None,
+        chatgpt_fedramp: false,
+        service_tier: None,
     }
 }
 
@@ -214,6 +249,200 @@ fn omits_reasoning_effort_for_non_reasoning_models() {
         body.get("reasoning_effort").is_none(),
         "non-reasoning models should not send reasoning_effort: {body}"
     );
+}
+
+#[test]
+fn responses_adapter_sends_reasoning_service_tier_and_codex_headers() {
+    let (base_url, requests) = fake_provider_with_request(
+        "200 OK",
+        r#"{"id":"resp_1","model":"test-model",
+           "output":[{"type":"message","role":"assistant",
+             "content":[{"type":"output_text","text":"ok"}]}],
+           "usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13,
+             "input_tokens_details":{"cached_tokens":2},
+             "output_tokens_details":{"reasoning_tokens":1}}}"#,
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.api = "codex-responses".to_owned();
+    config.api_key = "chatgpt-access-token".to_owned();
+    config.reasoning = true;
+    config.thinking_level = "high".to_owned();
+    config.chatgpt_account_id = Some("workspace-123".to_owned());
+    config.chatgpt_fedramp = true;
+    config.service_tier = Some("priority".to_owned());
+    let model = OpenAiResponsesModel::new(config);
+
+    let context = context(vec![ChatMessage::user("hi")])
+        .with_system_prompt("You are an expert coding assistant operating inside nav.");
+    let reply = model
+        .respond(&context, &[])
+        .expect("provider returns a reply");
+
+    assert_eq!(reply.content.as_deref(), Some("ok"));
+    let usage = reply.token_usage.expect("responses usage should parse");
+    assert_eq!(usage.input, 9);
+    assert_eq!(usage.output, 4);
+    assert_eq!(usage.total, Some(13));
+    assert_eq!(usage.cache_read, 2);
+    assert_eq!(usage.reasoning, 1);
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body is JSON");
+    assert_eq!(
+        body["instructions"],
+        "You are an expert coding assistant operating inside nav."
+    );
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["service_tier"], "priority");
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(body["input"][0]["role"], "user");
+
+    assert!(request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("authorization") && value == "Bearer chatgpt-access-token"
+    }));
+    assert!(request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("chatgpt-account-id") && value == "workspace-123"
+    }));
+    assert!(
+        request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-openai-fedramp") && value == "true"
+        })
+    );
+}
+
+#[test]
+fn responses_adapter_maps_thinking_off_to_reasoning_none() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"id":"resp_1","output":[{"type":"message","role":"assistant",
+             "content":[{"type":"output_text","text":"ok"}]}]}"#,
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.api = "openai-responses".to_owned();
+    config.reasoning = true;
+    config.thinking_level = "off".to_owned();
+    let model = OpenAiResponsesModel::new(config);
+
+    let reply = model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect("provider returns a reply");
+
+    assert_eq!(reply.content.as_deref(), Some("ok"));
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    assert_eq!(body["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn responses_adapter_round_trips_function_calls_and_outputs() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"id":"resp_1","output":[
+          {"type":"reasoning","id":"rs_1","encrypted_content":"opaque-new",
+           "summary":[{"type":"summary_text","text":"Need a listing."}]},
+          {"type":"function_call","id":"fc_1","call_id":"call_1","name":"ls","arguments":"{}"}
+        ]}"#,
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.api = "openai-responses".to_owned();
+    let model = OpenAiResponsesModel::new(config);
+
+    let tool = nav::ToolDef {
+        name: "ls".to_owned(),
+        description: "List files".to_owned(),
+        parameters: json!({"type":"object","properties":{}}),
+    };
+    let mut previous_tool_call = ChatMessage::assistant_tool_calls(
+        "",
+        vec![ToolCall {
+            id: "call_prev".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+        }],
+    );
+    previous_tool_call.response_reasoning_items = vec![ResponseReasoningItem {
+        id: "rs_prev".to_owned(),
+        encrypted_content: "opaque-prev".to_owned(),
+    }];
+    let history = vec![
+        ChatMessage::user("list files"),
+        previous_tool_call,
+        ChatMessage::tool_result("call_prev", "Cargo.toml", false),
+    ];
+    let reply = model
+        .respond(&context(history), &[tool])
+        .expect("a tool-call response parses");
+
+    assert_eq!(reply.tool_calls.len(), 1);
+    assert_eq!(reply.tool_calls[0].id, "call_1");
+    assert_eq!(reply.tool_calls[0].name, "ls");
+    assert_eq!(reply.reasoning_content.as_deref(), Some("Need a listing."));
+    assert_eq!(
+        reply.response_reasoning_items,
+        vec![ResponseReasoningItem {
+            id: "rs_1".to_owned(),
+            encrypted_content: "opaque-new".to_owned(),
+        }]
+    );
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    assert_eq!(body["tools"][0]["type"], "function");
+    let input = body["input"].as_array().expect("input array");
+    let reasoning_index = input
+        .iter()
+        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_prev")
+        .expect("replayed previous reasoning item");
+    let function_call_index = input
+        .iter()
+        .position(|item| item["type"] == "function_call" && item["call_id"] == "call_prev")
+        .expect("replayed previous function call");
+    assert!(reasoning_index < function_call_index);
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call_prev")
+    );
+}
+
+#[test]
+fn responses_adapter_replays_reasoning_items_for_assistant_text() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"id":"resp_1","output":[{"type":"message","role":"assistant",
+             "content":[{"type":"output_text","text":"ok"}]}]}"#,
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.api = "openai-responses".to_owned();
+    let model = OpenAiResponsesModel::new(config);
+
+    let mut previous_reply = ChatMessage::assistant("prior answer");
+    previous_reply.response_reasoning_items = vec![ResponseReasoningItem {
+        id: "rs_text".to_owned(),
+        encrypted_content: "opaque-text".to_owned(),
+    }];
+
+    let reply = model
+        .respond(
+            &context(vec![ChatMessage::user("first"), previous_reply]),
+            &[],
+        )
+        .expect("provider returns a reply");
+
+    assert_eq!(reply.content.as_deref(), Some("ok"));
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    let input = body["input"].as_array().expect("input array");
+    let reasoning_index = input
+        .iter()
+        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_text")
+        .expect("replayed previous reasoning item");
+    let message_index = input
+        .iter()
+        .position(|item| item["type"] == "message" && item["role"] == "assistant")
+        .expect("replayed previous assistant message");
+    assert!(reasoning_index < message_index);
 }
 
 #[test]

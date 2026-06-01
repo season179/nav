@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::context::ModelContext;
 use crate::model::{
-    ChatMessage, ChatModel, ModelError, ModelResponse, ProviderCallTrace, ToolCall, ToolDef,
+    ChatMessage, ChatModel, ModelError, ModelResponse, ProviderCallTrace, ResponseReasoningItem,
+    ToolCall, ToolDef,
 };
 use crate::stacks::{
     ModelCallStack, ModelCallStackInput, SystemPromptTrace, build_model_call_stack,
@@ -210,17 +211,20 @@ impl Agent {
             }
 
             let reasoning_content = response.reasoning_content.clone();
+            let response_reasoning_items = response.response_reasoning_items.clone();
 
             if response.tool_calls.is_empty() {
                 let reply = response.content.unwrap_or_default();
                 sink.assistant_text(
                     &reply,
                     reasoning_content.as_deref(),
+                    &response_reasoning_items,
                     active_model.model_id.as_deref(),
                 )
                 .map_err(AgentRunError::Sink)?;
                 let mut assistant_turn = ChatMessage::assistant(&reply);
                 assistant_turn.reasoning_content = reasoning_content.clone();
+                assistant_turn.response_reasoning_items = response_reasoning_items.clone();
                 context.push(assistant_turn);
                 // The reply ends the run unless a message arrived while it was
                 // produced, in which case the run continues with that message
@@ -266,10 +270,12 @@ impl Agent {
             let calls = response.tool_calls;
             let mut assistant_turn = ChatMessage::assistant_tool_calls(&content, calls.clone());
             assistant_turn.reasoning_content = reasoning_content.clone();
+            assistant_turn.response_reasoning_items = response_reasoning_items.clone();
             context.push(assistant_turn);
             sink.assistant_tool_calls(
                 &content,
                 reasoning_content.as_deref(),
+                &response_reasoning_items,
                 &calls,
                 active_model.model_id.as_deref(),
             )
@@ -437,6 +443,7 @@ pub(crate) trait AgentRunSink {
         &mut self,
         content: &str,
         reasoning_content: Option<&str>,
+        response_reasoning_items: &[ResponseReasoningItem],
         model_id: Option<&str>,
     ) -> Result<(), Self::Error>;
 
@@ -444,6 +451,7 @@ pub(crate) trait AgentRunSink {
         &mut self,
         content: &str,
         reasoning_content: Option<&str>,
+        response_reasoning_items: &[ResponseReasoningItem],
         calls: &[ToolCall],
         model_id: Option<&str>,
     ) -> Result<(), Self::Error>;
