@@ -1,6 +1,7 @@
 //! Tool behavior tests, exercised through the `Registry` against a temp dir.
 
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,15 +70,23 @@ fn has_rg() -> bool {
 
 /// Execute a tool call through the registry and require success.
 fn run(workspace: &Workspace, tool: &str, args: serde_json::Value) -> ToolResult {
+    run_at(&workspace.path, tool, args)
+}
+
+fn run_at(cwd: &Path, tool: &str, args: serde_json::Value) -> ToolResult {
     let registry = Registry::coding();
-    let result = registry.execute_call(&tool_call(tool, args), &workspace.path, &no_cancel());
+    let result = registry.execute_call(&tool_call(tool, args), cwd, &no_cancel());
     assert!(!result.is_error, "{tool} failed: {}", result.content);
     result
 }
 
 fn run_error(workspace: &Workspace, tool: &str, args: serde_json::Value) -> ToolResult {
+    run_error_at(&workspace.path, tool, args)
+}
+
+fn run_error_at(cwd: &Path, tool: &str, args: serde_json::Value) -> ToolResult {
     let registry = Registry::coding();
-    let result = registry.execute_call(&tool_call(tool, args), &workspace.path, &no_cancel());
+    let result = registry.execute_call(&tool_call(tool, args), cwd, &no_cancel());
     assert!(result.is_error, "{tool} should have failed");
     result
 }
@@ -497,6 +506,71 @@ fn bash_cancel_kills_background_descendants() {
 }
 
 #[test]
+fn path_tools_redirect_main_checkout_paths_into_active_git_worktree() {
+    let fixture = GitWorktrees::new();
+    fs::write(fixture.worktree.join("shared.txt"), "worktree copy").unwrap();
+
+    let output = run_at(
+        &fixture.worktree,
+        "read",
+        json!({ "path": fixture.main.join("shared.txt").to_string_lossy().to_string() }),
+    );
+
+    assert_eq!(output.content, "worktree copy");
+}
+
+#[test]
+fn bash_redirects_main_checkout_paths_into_active_git_worktree() {
+    let fixture = GitWorktrees::new();
+    let main_target = fixture.main.join("created.txt");
+    let worktree_target = fixture.worktree.join("created.txt");
+
+    run_at(
+        &fixture.worktree,
+        "bash",
+        json!({
+            "command": format!("printf worktree > {}", shell_quote(&main_target))
+        }),
+    );
+
+    assert!(
+        !main_target.exists(),
+        "bash must not write through the main checkout path"
+    );
+    assert_eq!(fs::read_to_string(worktree_target).unwrap(), "worktree");
+}
+
+#[test]
+fn bash_blocks_sibling_worktree_paths_and_parent_traversal() {
+    let fixture = GitWorktrees::new();
+    let sibling_target = fixture.other_worktree.join("leak.txt");
+
+    let sibling = run_error_at(
+        &fixture.worktree,
+        "bash",
+        json!({ "command": format!("touch {}", shell_quote(&sibling_target)) }),
+    );
+    assert!(
+        sibling.content.contains("another git worktree"),
+        "{}",
+        sibling.content
+    );
+    assert!(!sibling_target.exists());
+
+    let parent = run_error_at(
+        &fixture.worktree,
+        "bash",
+        json!({ "command": "touch ../leak.txt" }),
+    );
+    assert!(
+        parent.content.contains("parent-directory traversal"),
+        "{}",
+        parent.content
+    );
+    assert!(!fixture.worktree.parent().unwrap().join("leak.txt").exists());
+}
+
+#[test]
 fn path_tools_refuse_to_escape_the_workspace() {
     let workspace = Workspace::new();
     let error = run_error(&workspace, "read", json!({ "path": "../../etc/passwd" }));
@@ -505,6 +579,90 @@ fn path_tools_refuse_to_escape_the_workspace() {
         "{}",
         error.content
     );
+}
+
+struct GitWorktrees {
+    _root: Workspace,
+    main: PathBuf,
+    worktree: PathBuf,
+    other_worktree: PathBuf,
+}
+
+impl GitWorktrees {
+    fn new() -> Self {
+        let root = Workspace::new();
+        let main = root.path.join("repo");
+        let worktree = root.path.join("repo-worktree");
+        let other_worktree = root.path.join("repo-other-worktree");
+        fs::create_dir_all(&main).unwrap();
+
+        git(&main, &["init"]);
+        git(&main, &["checkout", "-b", "main"]);
+        fs::write(main.join("shared.txt"), "main copy").unwrap();
+        git(&main, &["add", "shared.txt"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=Nav Test",
+                "-c",
+                "user.email=nav@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "nav-test-worktree",
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "nav-test-other-worktree",
+                other_worktree.to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        Self {
+            _root: root,
+            main: fs::canonicalize(main).unwrap(),
+            worktree: fs::canonicalize(worktree).unwrap(),
+            other_worktree: fs::canonicalize(other_worktree).unwrap(),
+        }
+    }
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git -C {} {} failed\nstdout:\n{}\nstderr:\n{}",
+        cwd.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 #[test]

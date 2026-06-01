@@ -126,6 +126,47 @@ fn created_sessions_can_record_their_workspace_root() {
 }
 
 #[test]
+fn most_recent_session_can_be_scoped_to_a_workspace_root() {
+    let path = temp_db();
+    let _cleanup = TempDb(path.clone());
+    let storage = Storage::open(&path).expect("open database");
+
+    storage
+        .create_session_with_workspace("main-old", "nav", Some(Path::new("/projects/nav")))
+        .unwrap();
+    storage
+        .create_session_with_workspace("worktree-new", "nav", Some(Path::new("/worktrees/nav-a")))
+        .unwrap();
+    {
+        let conn = Connection::open(&path).expect("reopen to set updated_at");
+        conn.execute(
+            "UPDATE sessions SET updated_at = 100 WHERE id = 'main-old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET updated_at = 200 WHERE id = 'worktree-new'",
+            [],
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        storage.most_recent_session("nav").unwrap().as_deref(),
+        Some("worktree-new"),
+        "global latest remains most recent across all projects"
+    );
+    assert_eq!(
+        storage
+            .most_recent_session_in_workspace("nav", Path::new("/projects/nav"))
+            .unwrap()
+            .as_deref(),
+        Some("main-old"),
+        "workspace latest must not cross into another worktree"
+    );
+}
+
+#[test]
 fn load_history_replays_a_session_in_order_for_resume() {
     let path = temp_db();
     let _cleanup = TempDb(path.clone());

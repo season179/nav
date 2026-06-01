@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -168,6 +169,57 @@ fn kinds(events: &[SseEvent]) -> Vec<&str> {
     events.iter().map(|event| event.kind.as_str()).collect()
 }
 
+struct GitRepo {
+    _root: TempDir,
+    path: PathBuf,
+}
+
+impl GitRepo {
+    fn new() -> Self {
+        let root = TempDir::new("git_repo");
+        let path = root.path.join("repo");
+        fs::create_dir_all(&path).unwrap();
+        git(&path, &["init"]);
+        git(&path, &["checkout", "-b", "main"]);
+        fs::write(path.join("shared.txt"), "main copy").unwrap();
+        git(&path, &["add", "shared.txt"]);
+        git(
+            &path,
+            &[
+                "-c",
+                "user.name=Nav Test",
+                "-c",
+                "user.email=nav@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        Self {
+            _root: root,
+            path: fs::canonicalize(path).unwrap(),
+        }
+    }
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git -C {} {} failed\nstdout:\n{}\nstderr:\n{}",
+        cwd.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[test]
 fn create_session_returns_a_session_id() {
     let backend = TestBackend::start();
@@ -214,6 +266,100 @@ fn create_session_accepts_cwd_and_lists_the_project_root() {
     assert_eq!(
         listed["result"]["sessions"][0]["workspaceRoot"], expected,
         "session.list should expose the selected cwd as project root: {listed}"
+    );
+}
+
+#[test]
+fn latest_session_can_be_scoped_to_a_project_cwd() {
+    let main_workspace = TempDir::new("rpc_main_ws");
+    let worktree_workspace = TempDir::new("rpc_worktree_ws");
+    let db = TempDir::new("rpc_latest_db");
+    let db_path = db.path.join("nav.db");
+    let storage = Arc::new(Storage::open(&db_path).expect("open storage"));
+    let backend = TestBackend::start_with(
+        SessionStore::new(Arc::new(MockModel::new())).with_storage(storage),
+    );
+
+    let main_created = backend.rpc(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "main",
+            "method": "session.create",
+            "params": { "cwd": main_workspace.path },
+        })
+        .to_string(),
+    );
+    let main_session = main_created["result"]["sessionId"].as_str().unwrap();
+    backend.rpc(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "worktree",
+            "method": "session.create",
+            "params": { "cwd": worktree_workspace.path },
+        })
+        .to_string(),
+    );
+
+    let latest = backend.rpc(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "latest",
+            "method": "session.latest",
+            "params": { "cwd": main_workspace.path },
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        latest["result"]["sessionId"], main_session,
+        "cwd-scoped latest should not resume a different workspace: {latest}"
+    );
+}
+
+#[test]
+fn create_session_worktree_mode_creates_a_linked_worktree_workspace() {
+    let repo = GitRepo::new();
+    let db = TempDir::new("rpc_worktree_db");
+    let db_path = db.path.join("nav.db");
+    let storage = Arc::new(Storage::open(&db_path).expect("open storage"));
+    let backend = TestBackend::start_with(
+        SessionStore::new(Arc::new(MockModel::new())).with_storage(storage),
+    );
+
+    let created = backend.rpc(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "create",
+            "method": "session.create",
+            "params": { "cwd": repo.path, "mode": "worktree" },
+        })
+        .to_string(),
+    );
+    let session_id = created["result"]["sessionId"]
+        .as_str()
+        .expect("worktree session id");
+
+    let listed = backend.rpc(r#"{"jsonrpc":"2.0","id":"list","method":"session.list"}"#);
+    let session = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["sessionId"] == session_id)
+        .expect("created session is listed");
+    let workspace_root = session["workspaceRoot"].as_str().unwrap();
+    let expected_prefix = repo
+        .path
+        .join(".nav")
+        .join("worktrees")
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        workspace_root.starts_with(&expected_prefix),
+        "worktree sessions should be rooted under .nav/worktrees: {workspace_root}"
+    );
+    assert!(
+        Path::new(workspace_root).join("shared.txt").exists(),
+        "created workspace should be a checked-out git worktree"
     );
 }
 

@@ -16,6 +16,16 @@ function normalizeOptionalWorkspaceRoot(value) {
   return normalizeRequiredString(value, "workspace root");
 }
 
+function normalizeOptionalSessionMode(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (value !== "local" && value !== "worktree") {
+    throw new Error("session mode must be local or worktree");
+  }
+  return value;
+}
+
 function normalizeRequiredString(value, label) {
   if (typeof value !== "string") {
     throw new TypeError(`${label} must be a string`);
@@ -29,6 +39,7 @@ function normalizeRequiredString(value, label) {
 
 module.exports = {
   normalizeMessageText,
+  normalizeOptionalSessionMode,
   normalizeOptionalWorkspaceRoot,
   normalizeSessionId,
 };

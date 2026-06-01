@@ -63,7 +63,7 @@ loadable, nav uses a conservative heuristic.
 
 ## Command Channel: `POST /rpc`
 
-JSON-RPC 2.0 over HTTP. Two methods back the chat loop.
+JSON-RPC 2.0 over HTTP. These methods back the chat loop.
 
 Create a session:
 
@@ -72,6 +72,26 @@ curl -s -X POST http://127.0.0.1:54321/rpc \
   -d '{"jsonrpc":"2.0","id":"1","method":"session.create"}'
 # => {"jsonrpc":"2.0","id":"1","result":{"sessionId":"019..."}}
 ```
+
+`session.create` accepts optional `params.cwd` and `params.mode`:
+
+- `mode: "local"` binds the session to `cwd` directly. This is the default.
+- `mode: "worktree"` creates a new git worktree and binds the session to that
+  worktree. The branch is named `nav-wt/<uuid-v7>` and the checkout is placed
+  under the main checkout's `.nav/worktrees/` directory.
+
+The selected workspace is fixed for the lifetime of the session. To move from
+local to worktree, or from one worktree to another, start a new session.
+
+```sh
+curl -s -X POST http://127.0.0.1:54321/rpc \
+  -d '{"jsonrpc":"2.0","id":"1","method":"session.create",
+       "params":{"cwd":"/path/to/repo","mode":"worktree"}}'
+```
+
+`session.latest` accepts the same `params.cwd` shape to reopen the most recent
+session for that workspace only. This keeps app instances launched from
+different worktrees from auto-resuming each other's conversations.
 
 Send a message (the model call runs in the background; progress arrives over the
 event stream):

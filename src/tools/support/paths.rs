@@ -3,6 +3,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::ToolError;
+use super::worktree::{PathRewrite, rewrite_absolute_path};
 
 /// Resolve `path` (relative to `cwd`, or absolute) and reject anything that
 /// escapes the workspace rooted at `cwd`.
@@ -14,7 +15,10 @@ use super::ToolError;
 pub fn resolve_in_cwd(cwd: &Path, path: &str) -> Result<PathBuf, ToolError> {
     let root = normalize(cwd);
     let candidate = if Path::new(path).is_absolute() {
-        normalize(Path::new(path))
+        match rewrite_absolute_path(&root, Path::new(path)) {
+            PathRewrite::Path(path) => normalize(&path),
+            PathRewrite::Block(message) => return Err(ToolError::new(message)),
+        }
     } else {
         normalize(&root.join(path))
     };

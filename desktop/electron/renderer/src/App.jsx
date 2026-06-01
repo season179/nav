@@ -344,9 +344,12 @@ export default function App() {
       if (runningRef.current || !connectedRef.current || !window.nav) {
         return;
       }
-      clearTranscript();
       try {
         const sessionId = await window.nav.newSession(projectPath || null);
+        if (!sessionId) {
+          return;
+        }
+        clearTranscript();
         await activateCreatedSession(sessionId);
       } catch (error) {
         appendMessage("error", `Could not start a new chat: ${error.message}`);

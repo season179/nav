@@ -123,15 +123,23 @@ ipcMain.handle("nav:create-project", async () => {
   }
   const workspaceRoot = normalizeWorkspaceRoot(await fs.realpath(cwd));
   const projectSessionId = await openOrCreateProjectSession(workspaceRoot);
+  if (!projectSessionId) {
+    return null;
+  }
   activateSession(mainWindow, projectSessionId);
   return projectSessionId;
 });
 
-ipcMain.handle("nav:new-session", async (_event, cwd) => {
+ipcMain.handle("nav:new-session", async (_event, request) => {
   if (!backendUrl) {
     throw new Error("chat session is not ready");
   }
-  const createdSessionId = await createBackendSession(cwd);
+  const { cwd, mode: requestedMode } = normalizeNewSessionRequest(request);
+  const mode = requestedMode ?? (await chooseSessionMode(cwd ?? PROJECT_ROOT));
+  if (!mode) {
+    return null;
+  }
+  const createdSessionId = await createBackendSession(cwd, mode);
   activateSession(mainWindow, createdSessionId);
   return createdSessionId;
 });
@@ -247,7 +255,7 @@ function activateSession(window, id, { startup = false } = {}) {
 async function openSession() {
   trace.mark("electron.session.open.start");
   if (!smokeMode) {
-    const latest = await tracedRpc("session.latest");
+    const latest = await tracedRpc("session.latest", { cwd: PROJECT_ROOT });
     if (latest.result?.sessionId) {
       // If resumption fails (pruned session, corrupt DB, schema mismatch), fall
       // back to a fresh session rather than leaving the app stuck on launch.
@@ -267,13 +275,16 @@ async function openSession() {
       }
     }
   }
-  const created = await tracedRpc("session.create");
+  const created = await tracedRpc("session.create", {
+    cwd: PROJECT_ROOT,
+    mode: "local",
+  });
   trace.mark("electron.session.open.end", { mode: "created" });
   return created.result.sessionId;
 }
 
-async function createBackendSession(cwd) {
-  const params = cwd ? { cwd } : undefined;
+async function createBackendSession(cwd, mode) {
+  const params = cwd ? { cwd, mode } : { mode };
   const created = await sendRpc({
     backendUrl,
     method: "session.create",
@@ -289,8 +300,8 @@ async function openOrCreateProjectSession(workspaceRoot) {
   }
 
   const lookup = findExistingProjectSession(workspaceRoot).then(
-    (existingSessionId) =>
-      existingSessionId ?? createBackendSession(workspaceRoot),
+    async (existingSessionId) =>
+      existingSessionId ?? createProjectSession(workspaceRoot),
   );
   pendingProjectSessions.set(workspaceRoot, lookup);
 
@@ -307,6 +318,60 @@ async function findExistingProjectSession(workspaceRoot) {
     method: "session.list",
   });
   return existingProjectSessionId(response.result.sessions, workspaceRoot);
+}
+
+async function createProjectSession(workspaceRoot) {
+  const mode = await chooseSessionMode(workspaceRoot);
+  if (!mode) {
+    return null;
+  }
+  return createBackendSession(workspaceRoot, mode);
+}
+
+async function chooseSessionMode(cwd) {
+  if (!mainWindow) {
+    return "local";
+  }
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: "question",
+    message: "Start new session",
+    detail: `Workspace: ${cwd}\nChoose whether this session works in that checkout directly or in a new git worktree.`,
+    buttons: ["Local", "Worktree", "Cancel"],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  });
+
+  switch (response) {
+    case 0:
+      return "local";
+    case 1:
+      return "worktree";
+    default:
+      return null;
+  }
+}
+
+function normalizeNewSessionRequest(request) {
+  if (!request || typeof request !== "object") {
+    return { cwd: null, mode: null };
+  }
+  return {
+    cwd: normalizeOptionalCwd(request.cwd),
+    mode: normalizeOptionalMode(request.mode),
+  };
+}
+
+function normalizeOptionalCwd(cwd) {
+  if (typeof cwd !== "string") {
+    return null;
+  }
+  const trimmed = cwd.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeOptionalMode(mode) {
+  return mode === "local" || mode === "worktree" ? mode : null;
 }
 
 function forwardEvent(window, event) {

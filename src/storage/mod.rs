@@ -402,6 +402,28 @@ impl Storage {
             .optional()?)
     }
 
+    /// The most recently active session from `source` in `workspace_root`, if
+    /// any. Empty legacy workspace roots are treated as the caller's workspace
+    /// for compatibility with sessions created before nav persisted cwd.
+    pub fn most_recent_session_in_workspace(
+        &self,
+        source: &str,
+        workspace_root: &Path,
+    ) -> Result<Option<String>, StorageError> {
+        let workspace_root = workspace_root_string(Some(workspace_root)).unwrap_or_default();
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT id FROM sessions
+                 WHERE source = ?1
+                   AND COALESCE(NULLIF(TRIM(workspace_root), ''), ?2) = ?2
+                 ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
+                params![source, workspace_root],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     /// Whether a session with this id is already persisted.
     pub fn session_exists(&self, session_id: &str) -> Result<bool, StorageError> {
         let conn = self.conn.lock().unwrap();
