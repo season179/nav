@@ -13,12 +13,12 @@
           key,
           path,
           name: path ? projectName(path) : "No project",
-          sessions: [],
+          sessionEntries: [],
           firstSeenIndex: index,
         };
         projects.set(key, project);
       }
-      project.sessions.push(session);
+      project.sessionEntries.push({ originalIndex: index, session });
     }
 
     const orderIndex = new Map();
@@ -46,8 +46,27 @@
       key: project.key,
       path: project.path,
       name: project.name,
-      sessions: project.sessions,
+      sessions: sortSessionsByActivity(project.sessionEntries),
     }));
+  }
+
+  function sortSessionsByActivity(sessions) {
+    return sessions
+      .slice()
+      .sort((left, right) => {
+        const activityDelta =
+          sessionActivity(right.session) - sessionActivity(left.session);
+        if (activityDelta !== 0) {
+          return activityDelta;
+        }
+        return left.originalIndex - right.originalIndex;
+      })
+      .map((entry) => entry.session);
+  }
+
+  function sessionActivity(session) {
+    const updatedAt = Number(session.updatedAt);
+    return Number.isFinite(updatedAt) ? updatedAt : 0;
   }
 
   function normalizeProjectPath(path) {
