@@ -288,15 +288,24 @@ test("backend startup timeout reports duration and captured output", () => {
 });
 
 async function startMockBackend() {
-  // Persist to a throwaway database so the test never touches ~/.nav/nav.db.
+  // Persist to throwaway files so the test never touches ~/.nav/nav.db or
+  // ~/.nav/stacks.jsonl.
   const dbPath = path.join(
     os.tmpdir(),
     `nav-electron-test-${crypto.randomUUID()}.db`,
   );
+  const stacksPath = path.join(
+    os.tmpdir(),
+    `nav-electron-test-stacks-${crypto.randomUUID()}.jsonl`,
+  );
   const backend = await startLocalBackend({
     projectRoot: process.cwd(),
     startupAttempts: 80,
-    env: { NAV_MOCK_MODEL: "1", NAV_DB_PATH: dbPath },
+    env: {
+      NAV_MOCK_MODEL: "1",
+      NAV_DB_PATH: dbPath,
+      NAV_STACKS_PATH: stacksPath,
+    },
   });
 
   return {
@@ -306,6 +315,7 @@ async function startMockBackend() {
       for (const suffix of ["", "-wal", "-shm"]) {
         fs.rmSync(`${dbPath}${suffix}`, { force: true });
       }
+      fs.rmSync(stacksPath, { force: true });
     },
   };
 }

@@ -3,6 +3,10 @@ import Composer from "./components/Composer.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import StacksPage from "./components/StacksPage.jsx";
 import Transcript from "./components/Transcript.jsx";
+import {
+  STACK_AVAILABILITY_RECHECK_DELAY_MS,
+  shouldRefreshStackAvailabilityForEvent,
+} from "./lib/stack-availability.mjs";
 
 export default function App() {
   const [connected, setConnected] = useState(false);
@@ -201,6 +205,21 @@ export default function App() {
     [],
   );
 
+  const refreshStackAvailabilityForEvent = useCallback(
+    (eventType) => {
+      if (!shouldRefreshStackAvailabilityForEvent(eventType)) {
+        return;
+      }
+      refreshStackAvailability();
+      // The terminal SSE event can beat the backend's JSONL stack append.
+      window.setTimeout(
+        refreshStackAvailability,
+        STACK_AVAILABILITY_RECHECK_DELAY_MS,
+      );
+    },
+    [refreshStackAvailability],
+  );
+
   const renderBackendStatus = useCallback(
     (status) => {
       switch (status.state) {
@@ -336,7 +355,7 @@ export default function App() {
           setStopRequested(false);
           refreshSessions();
           refreshModelInfo();
-          refreshStackAvailability();
+          refreshStackAvailabilityForEvent(event.type);
           refreshStacksAfterTerminalEvent();
           break;
         case "run.failed":
@@ -346,7 +365,7 @@ export default function App() {
           setStopRequested(false);
           refreshSessions();
           refreshModelInfo();
-          refreshStackAvailability();
+          refreshStackAvailabilityForEvent(event.type);
           refreshStacksAfterTerminalEvent();
           break;
         default:
@@ -357,7 +376,7 @@ export default function App() {
       appendMessage,
       refreshModelInfo,
       refreshSessions,
-      refreshStackAvailability,
+      refreshStackAvailabilityForEvent,
       refreshStacks,
       refreshStacksAfterTerminalEvent,
       setRunningState,
