@@ -9,6 +9,9 @@
     transparent
   );
   --sidebar-glass-border: color-mix(in oklab, var(--ink) 18%, transparent);
+  --sidebar-glass-highlight-start: rgb(255 255 255 / 0.052);
+  --sidebar-glass-highlight-mid: rgb(255 255 255 / 0.012);
+  --sidebar-glass-shadow: rgb(0 0 0 / 0.075);
   --sidebar-backdrop-filter: blur(18px) saturate(1.08);
   --surface: oklch(0.29 0.016 264);
   --surface-raised: oklch(0.39 0.012 261);
@@ -100,9 +103,9 @@ body {
   background:
     linear-gradient(
       180deg,
-      rgb(255 255 255 / 0.052),
-      rgb(255 255 255 / 0.012) 38%,
-      rgb(0 0 0 / 0.075)
+      var(--sidebar-glass-highlight-start),
+      var(--sidebar-glass-highlight-mid) 38%,
+      var(--sidebar-glass-shadow)
     ),
     var(--sidebar-bg);
   box-shadow:

@@ -20,11 +20,17 @@ test("sidebar keeps an opaque base with a glass treatment", () => {
 
   assert.match(rootRule, /--sidebar-bg:\s*oklch\(0\.28 0 195\);/);
   assert.match(rootRule, /--sidebar-glass:/);
+  assert.match(rootRule, /--sidebar-glass-highlight-start:/);
+  assert.match(rootRule, /--sidebar-glass-highlight-mid:/);
+  assert.match(rootRule, /--sidebar-glass-shadow:/);
   assert.match(
     rootRule,
     /--sidebar-backdrop-filter:\s*blur\(18px\) saturate\(1\.08\);/,
   );
   assert.match(sidebarRule, /linear-gradient\(/);
+  assert.match(sidebarRule, /var\(--sidebar-glass-highlight-start\)/);
+  assert.match(sidebarRule, /var\(--sidebar-glass-highlight-mid\) 38%/);
+  assert.match(sidebarRule, /var\(--sidebar-glass-shadow\)/);
   assert.match(sidebarRule, /var\(--sidebar-bg\);/);
   assert.match(
     sidebarRule,

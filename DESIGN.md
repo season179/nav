@@ -19,6 +19,9 @@ Base profile values are OKLCH. Derived states use `color-mix()` so hover, border
 | `--sidebar-glass` | derived neutral alpha mix | Sidebar glass sheen and hover fills |
 | `--sidebar-glass-strong` | derived neutral alpha mix | Raised sidebar control fill |
 | `--sidebar-glass-border` | derived neutral alpha mix | Glass control border |
+| `--sidebar-glass-highlight-start` | `rgb(255 255 255 / 0.052)` | Sidebar top highlight |
+| `--sidebar-glass-highlight-mid` | `rgb(255 255 255 / 0.012)` | Sidebar mid highlight |
+| `--sidebar-glass-shadow` | `rgb(0 0 0 / 0.075)` | Sidebar lower shade |
 | `--sidebar-backdrop-filter` | `blur(18px) saturate(1.08)` | Sidebar glass blur |
 | `--surface` | `oklch(0.29 0.016 264)` | Chat and composer surface |
 | `--surface-raised` | `oklch(0.39 0.012 261)` | Inputs, menus, and cards |
