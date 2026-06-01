@@ -7,6 +7,7 @@
 //! talks to a configured provider.
 
 use std::fmt;
+use std::io::BufRead;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -892,11 +893,16 @@ impl ChatModel for OpenAiResponsesModel {
             .iter()
             .flat_map(response_input_json)
             .collect::<Vec<_>>();
+        // The Codex ChatGPT backend only accepts streaming requests and rejects
+        // `stream: false` with HTTP 400 ("Stream must be set to true"). nav has
+        // no incremental UI, so we still consume the whole turn before returning;
+        // we just read the SSE stream to its terminal `response.completed` event.
+        let streaming = self.config.api == CODEX_RESPONSES_API;
         let mut body = json!({
             "model": self.config.model,
             "input": input,
             "store": false,
-            "stream": false,
+            "stream": streaming,
         });
         if let Some(system_prompt) = context.system_prompt() {
             body["instructions"] = Value::String(system_prompt.to_owned());
@@ -924,6 +930,9 @@ impl ChatModel for OpenAiResponsesModel {
 
         let mut request =
             ureq::post(&url).header("Authorization", format!("Bearer {}", self.config.api_key));
+        if streaming {
+            request = request.header("Accept", "text/event-stream");
+        }
         if let Some(account_id) = &self.config.chatgpt_account_id {
             request = request.header("ChatGPT-Account-ID", account_id);
         }
@@ -943,8 +952,18 @@ impl ChatModel for OpenAiResponsesModel {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
 
-        let payload: Value = response.body_mut().read_json().map_err(|error| {
-            let message = format!("could not read model response: {error}");
+        // Codex auth streams the response as SSE; every other Responses provider
+        // returns one JSON body. Both reduce to a single payload value or an
+        // error message, so the error is wrapped with the trace just once.
+        let payload: Value = if streaming {
+            read_responses_stream(response.body_mut().as_reader())
+        } else {
+            response
+                .body_mut()
+                .read_json()
+                .map_err(|error| format!("could not read model response: {error}"))
+        }
+        .map_err(|message| {
             ModelError::new(message.clone()).with_provider_trace(trace.clone().with_error(&message))
         })?;
         trace.provider_model_id = payload
@@ -1059,9 +1078,12 @@ fn responses_message_json(role: &str, content_type: &str, text: &str) -> Value {
 }
 
 fn responses_function_call_json(call: &ToolCall) -> Value {
+    // Only `call_id` is echoed back to pair the call with its output. We do not
+    // retain the server-assigned output-item id (`fc_...`), and supplying the
+    // `call_...` id in the `id` field makes the Codex backend reject the request
+    // ("Invalid 'input[..].id': Expected an ID that begins with 'fc'").
     json!({
         "type": "function_call",
-        "id": call.id,
         "call_id": call.id,
         "name": call.name,
         "arguments": call.arguments,
@@ -1187,6 +1209,86 @@ fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
         finish_reason,
         token_usage: parse_token_usage(payload),
     })
+}
+
+/// Drain a Responses Server-Sent Events stream and return the final response
+/// object in the same shape as a non-streaming body, so [`parse_responses_payload`]
+/// can consume it unchanged. Codex-backed ChatGPT auth only streams, and its
+/// terminal `response.completed` event omits the `output` array: each output
+/// item (messages, reasoning, function calls) arrives on its own
+/// `response.output_item.done` event instead, so we assemble the array here.
+/// `response.failed` / `error` events surface as the call error.
+fn read_responses_stream(reader: impl std::io::Read) -> Result<Value, String> {
+    let reader = std::io::BufReader::new(reader);
+    let mut completed: Option<Value> = None;
+    let mut output_items: Vec<Value> = Vec::new();
+    let mut stream_error: Option<String> = None;
+
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("could not read model response: {error}"))?;
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    output_items.push(item.clone());
+                }
+            }
+            Some("response.completed") => {
+                if let Some(response) = event.get("response") {
+                    completed = Some(response.clone());
+                }
+            }
+            Some("response.failed") => {
+                stream_error = Some(stream_error_message(
+                    event
+                        .get("response")
+                        .and_then(|response| response.get("error")),
+                    "model stream reported a failure",
+                ));
+            }
+            Some("error") => {
+                stream_error = Some(stream_error_message(
+                    event.get("error").or(Some(&event)),
+                    "model stream returned an error",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(mut response) = completed {
+        // The terminal event usually omits `output`; fall back to the items we
+        // assembled from the per-item events so downstream parsing sees a body
+        // identical to the non-streaming response shape.
+        let has_output = response
+            .get("output")
+            .and_then(Value::as_array)
+            .is_some_and(|output| !output.is_empty());
+        if !has_output && !output_items.is_empty() {
+            response["output"] = Value::Array(output_items);
+        }
+        return Ok(response);
+    }
+    Err(stream_error
+        .unwrap_or_else(|| "model stream ended without a completed response".to_owned()))
+}
+
+fn stream_error_message(error: Option<&Value>, fallback: &str) -> String {
+    error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 fn parse_responses_payload(payload: &Value) -> Result<ModelResponse, ModelError> {
