@@ -312,6 +312,124 @@ fn write_creates_files_and_parent_directories() {
 }
 
 #[test]
+fn write_overwrites_files_and_reports_a_patch() {
+    let workspace = Workspace::new();
+    workspace.write("notes.txt", "one\ntwo\n");
+
+    let output = run(
+        &workspace,
+        "write",
+        json!({ "path": "notes.txt", "content": "one\nTWO\n" }),
+    );
+
+    assert_eq!(workspace.read("notes.txt"), "one\nTWO\n");
+    assert!(output.content.contains("Overwrote notes.txt"));
+    assert!(
+        output
+            .content
+            .contains("Patch:\n--- notes.txt\n+++ notes.txt")
+    );
+    assert!(output.content.contains("-two"));
+    assert!(output.content.contains("+TWO"));
+}
+
+#[test]
+fn write_patch_uses_zero_range_when_overwriting_empty_file() {
+    let workspace = Workspace::new();
+    workspace.write("empty.txt", "");
+
+    let output = run(
+        &workspace,
+        "write",
+        json!({ "path": "empty.txt", "content": "hello\n" }),
+    );
+
+    assert!(
+        output.content.contains("@@ -0,0 +1 @@"),
+        "{}",
+        output.content
+    );
+}
+
+#[test]
+fn write_patch_uses_zero_range_when_rewriting_to_empty_file() {
+    let workspace = Workspace::new();
+    workspace.write("gone.txt", "hello\n");
+
+    let output = run(
+        &workspace,
+        "write",
+        json!({ "path": "gone.txt", "content": "" }),
+    );
+
+    assert!(
+        output.content.contains("@@ -1 +0,0 @@"),
+        "{}",
+        output.content
+    );
+}
+
+#[test]
+fn write_preserves_bom_and_crlf_line_endings_when_overwriting() {
+    let workspace = Workspace::new();
+    workspace.write_bytes("win.txt", b"\xEF\xBB\xBFone\r\ntwo\r\n");
+
+    let output = run(
+        &workspace,
+        "write",
+        json!({ "path": "win.txt", "content": "uno\ndos\n" }),
+    );
+
+    assert_eq!(
+        workspace.read_bytes("win.txt"),
+        b"\xEF\xBB\xBFuno\r\ndos\r\n"
+    );
+    assert!(
+        output
+            .content
+            .contains("Preserved UTF-8 BOM and CRLF line endings"),
+        "{}",
+        output.content
+    );
+}
+
+#[test]
+fn write_refuses_to_replace_a_directory() {
+    let workspace = Workspace::new();
+    fs::create_dir_all(workspace.path.join("dir")).unwrap();
+
+    let error = run_error(
+        &workspace,
+        "write",
+        json!({ "path": "dir", "content": "nope" }),
+    );
+
+    assert!(
+        error.content.contains("it is a directory"),
+        "{}",
+        error.content
+    );
+}
+
+#[test]
+fn write_honors_cancellation_before_mutating_disk() {
+    let workspace = Workspace::new();
+    let cancel = Arc::new(AtomicBool::new(true));
+    let result = Registry::coding().execute_call(
+        &tool_call(
+            "write",
+            json!({ "path": "cancelled.txt", "content": "nope" }),
+        ),
+        &workspace.path,
+        &cancel,
+    );
+
+    assert!(result.is_error, "write should have been cancelled");
+    assert!(result.content.contains("cancelled"), "{}", result.content);
+    assert!(!workspace.path.join("cancelled.txt").exists());
+}
+
+#[test]
 fn edit_replaces_unique_text() {
     let workspace = Workspace::new();
     workspace.write("code.rs", "let a = 1;\nlet b = 2;\n");
