@@ -46,11 +46,12 @@ ipcMain.handle("nav:stop", async () => {
   if (!backendUrl || !sessionId) {
     throw new Error("chat session is not ready");
   }
-  await sendRpc({
+  const response = await sendRpc({
     backendUrl,
     method: "session.stop",
     params: { sessionId },
   });
+  return response.result.stopped === true;
 });
 
 ipcMain.handle("nav:list-sessions", async () => {

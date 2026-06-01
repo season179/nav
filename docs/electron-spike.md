@@ -3,8 +3,8 @@
 This is the smallest Electron frontend for nav: a minimal multi-turn chat
 window backed by the local HTTP/SSE backend. Electron Main starts the backend,
 creates a session, subscribes to its event stream, and relays the user's
-messages; the React renderer only renders the transcript and submits requests
-through a narrow preload API.
+messages; the React renderer renders the sidebar/transcript/composer UI and
+submits requests through a narrow preload API.
 
 ## Run
 

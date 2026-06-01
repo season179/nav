@@ -28,6 +28,9 @@ export default function Sidebar({
 
   useEffect(() => {
     const nextOrder = projects.map((project) => project.key);
+    if (nextOrder.length === 0) {
+      return;
+    }
     if (sameOrder(projectOrder, nextOrder)) {
       return;
     }

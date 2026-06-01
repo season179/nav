@@ -15,6 +15,9 @@ export default function App() {
   const connectedRef = useRef(false);
   const runningRef = useRef(false);
   const activeSessionIdRef = useRef(null);
+  const activeRunStartedRef = useRef(false);
+  const stopRpcInFlightRef = useRef(false);
+  const stopSentForActiveRunRef = useRef(false);
   const stopRequestedRef = useRef(false);
   const nextMessageIdRef = useRef(0);
 
@@ -33,12 +36,20 @@ export default function App() {
     setActiveSessionId(sessionId);
   }, []);
 
-  const setStopRequested = useCallback((isRequested) => {
-    stopRequestedRef.current = isRequested;
-    if (!isRequested) {
-      setStopPending(false);
-    }
+  const setStopPendingState = useCallback((isPending) => {
+    setStopPending(isPending);
   }, []);
+
+  const setStopRequested = useCallback(
+    (isRequested) => {
+      stopRequestedRef.current = isRequested;
+      if (!isRequested) {
+        stopSentForActiveRunRef.current = false;
+        setStopPendingState(false);
+      }
+    },
+    [setStopPendingState],
+  );
 
   const nextMessageId = useCallback(() => {
     nextMessageIdRef.current += 1;
@@ -143,18 +154,39 @@ export default function App() {
   );
 
   const stopRun = useCallback(async () => {
-    if (!window.nav) {
+    if (
+      !window.nav ||
+      stopRpcInFlightRef.current ||
+      stopSentForActiveRunRef.current
+    ) {
       return;
     }
     stopRequestedRef.current = true;
-    setStopPending(true);
+    setStopPendingState(true);
+    stopRpcInFlightRef.current = true;
     try {
-      await window.nav.sessionStop();
+      // A pre-registration stop can race with run.started; retry once if the
+      // backend reported no active run before that event arrived.
+      let shouldRetry = true;
+      while (
+        shouldRetry &&
+        stopRequestedRef.current &&
+        !stopSentForActiveRunRef.current
+      ) {
+        const runHadStarted = activeRunStartedRef.current;
+        const stopped = await window.nav.sessionStop();
+        if (stopped) {
+          stopSentForActiveRunRef.current = true;
+        }
+        shouldRetry = !stopped && !runHadStarted && activeRunStartedRef.current;
+      }
     } catch (error) {
       appendMessage("error", `Could not stop: ${error.message}`);
-      setStopPending(false);
+      setStopPendingState(false);
+    } finally {
+      stopRpcInFlightRef.current = false;
     }
-  }, [appendMessage]);
+  }, [appendMessage, setStopPendingState]);
 
   const handleBackendStatus = useCallback(
     (status) => {
@@ -188,6 +220,7 @@ export default function App() {
           appendMessage("user", event.text);
           break;
         case "run.started":
+          activeRunStartedRef.current = true;
           setRunningState(true);
           if (stopRequestedRef.current) {
             stopRun();
@@ -222,6 +255,7 @@ export default function App() {
           break;
         case "run.completed":
         case "run.cancelled":
+          activeRunStartedRef.current = false;
           setRunningState(false);
           setStopRequested(false);
           refreshSessions();
@@ -229,6 +263,7 @@ export default function App() {
           break;
         case "run.failed":
           appendMessage("error", event.error ?? "the run failed");
+          activeRunStartedRef.current = false;
           setRunningState(false);
           setStopRequested(false);
           refreshSessions();
@@ -324,6 +359,7 @@ export default function App() {
 
       const wasRunning = runningRef.current;
       if (!wasRunning) {
+        activeRunStartedRef.current = false;
         setStopRequested(false);
         setRunningState(true);
       }
