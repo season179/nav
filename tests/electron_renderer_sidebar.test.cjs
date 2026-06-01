@@ -64,6 +64,26 @@ test("project sidebar omits session toggle for five sessions", () => {
   assert.equal(findByClass(list, "project-session-toggle"), null);
 });
 
+test("expanded project sidebar renders at most twenty sessions", () => {
+  const renderer = loadRenderer();
+  const project = projectWithSessions(25);
+
+  const collapsed = renderer.renderProjectSessions(project);
+  const showMore = findByClass(collapsed, "project-session-toggle");
+  assert.equal(
+    showMore.getAttribute("aria-label"),
+    "Show 15 more sessions in nav",
+  );
+
+  showMore.click();
+  const expanded = renderer.renderProjectSessions(project);
+  assert.deepEqual(
+    sessionButtonLabels(expanded),
+    sessionRange(20).map((session) => session.title),
+  );
+  assert.equal(project.sessions.length, 25, "older sessions remain available");
+});
+
 test("clicking a project heading collapses and expands its sessions", async () => {
   const sessions = sessionRange(3).map((session) => ({
     ...session,

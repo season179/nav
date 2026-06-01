@@ -12,6 +12,7 @@ const tokenUsageNode = document.querySelector("#composer-token-usage");
 const projectList = window.navProjectList;
 const tokenFormatter = new Intl.NumberFormat("en-US");
 const PROJECT_SESSION_PREVIEW_LIMIT = 5;
+const PROJECT_SESSION_DISPLAY_LIMIT = 20;
 const projectOrderStorageKey = "nav.projectOrder.v1";
 
 let connected = false;
@@ -388,9 +389,13 @@ function renderProjectSessions(project) {
   const projectSessions = document.createElement("ul");
   projectSessions.className = "project-session-list";
   const expanded = expandedProjectSessionKeys.has(project.key);
+  const displaySessions = project.sessions.slice(
+    0,
+    PROJECT_SESSION_DISPLAY_LIMIT,
+  );
   const visibleSessions = expanded
-    ? project.sessions
-    : project.sessions.slice(0, PROJECT_SESSION_PREVIEW_LIMIT);
+    ? displaySessions
+    : displaySessions.slice(0, PROJECT_SESSION_PREVIEW_LIMIT);
 
   for (const session of visibleSessions) {
     projectSessions.append(renderProjectSession(session));
@@ -411,7 +416,9 @@ function renderProjectSessionToggle(project, expanded) {
     button.textContent = "Show less";
     button.setAttribute("aria-label", `Show fewer sessions in ${project.name}`);
   } else {
-    const hiddenCount = project.sessions.length - PROJECT_SESSION_PREVIEW_LIMIT;
+    const hiddenCount =
+      Math.min(project.sessions.length, PROJECT_SESSION_DISPLAY_LIMIT) -
+      PROJECT_SESSION_PREVIEW_LIMIT;
     const sessionLabel = hiddenCount === 1 ? "session" : "sessions";
     button.textContent = "Show more";
     button.setAttribute(
