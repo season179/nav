@@ -88,6 +88,12 @@ test("clicking a project heading collapses and expands its sessions", async () =
     "Collapse project nav",
   );
 
+  const projectChatAdd = findByClass(sessionList, "project-chat-add");
+  assert.ok(projectChatAdd, "project heading keeps a separate new-chat button");
+  assert.notStrictEqual(projectChatAdd, projectToggle);
+  assert.equal(projectChatAdd.type, "button");
+  assert.equal(projectChatAdd.getAttribute("aria-label"), "New chat in nav");
+
   projectToggle.click();
 
   assert.deepEqual(sessionButtonLabels(sessionList), []);
