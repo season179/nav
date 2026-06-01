@@ -11,6 +11,7 @@ const {
   sendRpc,
 } = require("../desktop/electron/backend-client.cjs");
 const {
+  buildStartupTimeoutMessage,
   collectStderrLines,
   startLocalBackend,
 } = require("../desktop/electron/backend-process.cjs");
@@ -177,6 +178,23 @@ test("backend stderr collector preserves split trace lines", () => {
     "nav-local-backend: using mock",
   ]);
   assert.equal(finalRemainder, "partial");
+});
+
+test("backend startup timeout reports duration and captured output", () => {
+  const message = buildStartupTimeoutMessage({
+    startupAttempts: 3,
+    stderr: Array.from(
+      { length: 14 },
+      (_value, index) => `stderr ${index + 1}`,
+    ).join("\n"),
+    stdout: "cargo build still running",
+  });
+
+  assert.match(message, /backend did not print a local URL within 0.2s/);
+  assert.match(message, /backend stderr:\nstderr 3/);
+  assert.doesNotMatch(message, /^stderr 1$/m);
+  assert.match(message, /stderr 14/);
+  assert.match(message, /backend stdout:\ncargo build still running/);
 });
 
 async function startMockBackend() {

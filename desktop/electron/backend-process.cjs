@@ -3,10 +3,13 @@ const { setTimeout: delay } = require("node:timers/promises");
 
 const STARTUP_PREFIX = "nav local backend listening on ";
 const STARTUP_TRACE_PREFIX = "nav startup trace ";
+const DEFAULT_STARTUP_ATTEMPTS = 1200;
+const STARTUP_POLL_MS = 50;
+const MAX_OUTPUT_LINES = 12;
 
 async function startLocalBackend({
   projectRoot,
-  startupAttempts = 80,
+  startupAttempts = DEFAULT_STARTUP_ATTEMPTS,
   env = {},
   trace,
 }) {
@@ -80,12 +83,18 @@ async function startLocalBackend({
       throw new Error(`backend exited before startup: ${stderr.trim()}`);
     }
 
-    await delay(50);
+    await delay(STARTUP_POLL_MS);
   }
 
   child.kill();
   trace?.mark("electron.backend.startup.timeout");
-  throw new Error("backend did not print a local URL");
+  throw new Error(
+    buildStartupTimeoutMessage({
+      startupAttempts,
+      stdout,
+      stderr,
+    }),
+  );
 }
 
 function findBackendUrl(stdout) {
@@ -105,7 +114,42 @@ function collectStderrLines({ chunk, previousRemainder = "", onLine }) {
   return remainder;
 }
 
+function buildStartupTimeoutMessage({
+  startupAttempts,
+  stdout = "",
+  stderr = "",
+}) {
+  const seconds = formatTimeoutSeconds(startupAttempts * STARTUP_POLL_MS);
+  const details = [];
+  const stderrSummary = summarizeOutput(stderr);
+  const stdoutSummary = summarizeOutput(stdout);
+
+  if (stderrSummary) {
+    details.push(`backend stderr:\n${stderrSummary}`);
+  }
+  if (stdoutSummary) {
+    details.push(`backend stdout:\n${stdoutSummary}`);
+  }
+
+  const message = `backend did not print a local URL within ${seconds}s`;
+  return details.length > 0 ? `${message}\n${details.join("\n")}` : message;
+}
+
+function summarizeOutput(output) {
+  return output
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-MAX_OUTPUT_LINES)
+    .join("\n");
+}
+
+function formatTimeoutSeconds(timeoutMs) {
+  return (Math.ceil(timeoutMs / 100) / 10).toFixed(1);
+}
+
 module.exports = {
+  buildStartupTimeoutMessage,
   collectStderrLines,
   findBackendUrl,
   startLocalBackend,
