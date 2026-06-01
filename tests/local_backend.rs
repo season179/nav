@@ -3,7 +3,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use nav::{MockModel, ModelInfo, SessionStore, Storage};
@@ -301,6 +301,76 @@ fn model_info_returns_latest_session_token_usage() {
         "used tokens should update after a run: {response}"
     );
     assert_eq!(response["result"]["tokenUsage"]["contextWindow"], 128_000);
+}
+
+#[test]
+fn session_stacks_rpc_returns_captured_model_calls() {
+    let backend = TestBackend::start();
+    let session_id = backend.create_session();
+    let stream = backend.open_events(&session_id);
+
+    backend.send_message(&session_id, "capture the stack");
+    let events = read_until_completions(stream, 1);
+    assert_eq!(
+        events.last().map(|event| event.kind.as_str()),
+        Some("run.completed")
+    );
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "stacks",
+        "method": "session.stacks",
+        "params": { "sessionId": session_id },
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (response, stacks) = loop {
+        let response = backend.rpc(&request.to_string());
+        let stacks = response["result"]["stacks"]
+            .as_array()
+            .expect("session.stacks returns an array")
+            .clone();
+        if stacks.len() == 1 || Instant::now() >= deadline {
+            break (response, stacks);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(
+        stacks.len(),
+        1,
+        "one model call should be captured: {response}"
+    );
+    assert_eq!(stacks[0]["sequence"], 0);
+    assert_eq!(stacks[0]["status"], "completed");
+
+    let layers = stacks[0]["layers"]
+        .as_array()
+        .expect("stack includes layers");
+    assert!(
+        layers.iter().any(|layer| layer["kind"] == "system_prompt"),
+        "system prompt layer should be present: {response}"
+    );
+    assert!(
+        layers
+            .iter()
+            .any(|layer| layer["kind"] == "normalized_response"),
+        "normalized response layer should be present: {response}"
+    );
+}
+
+#[test]
+fn session_stacks_rpc_rejects_missing_session_id() {
+    let backend = TestBackend::start();
+
+    let response =
+        backend.rpc(r#"{"jsonrpc":"2.0","id":"stacks","method":"session.stacks","params":{}}"#);
+
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing parameter: sessionId"),
+        "missing session id should be a parameter error: {response}"
+    );
 }
 
 #[test]

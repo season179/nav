@@ -18,12 +18,14 @@ use uuid::Uuid;
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
+use crate::stacks::ModelCallStack;
 use crate::storage::{SessionSummary, Storage, StorageError};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
 
 /// How a session originates, recorded on the persisted `sessions` row.
 const SESSION_SOURCE: &str = "nav";
+const MAX_STACKS_PER_SESSION: usize = 256;
 
 /// One ordered, renderable session event. The flat shape matches what the
 /// Electron renderer already consumes over SSE.
@@ -79,6 +81,7 @@ struct Session {
     turns: TurnHistory,
     events: Vec<Event>,
     subscribers: Vec<Sender<Event>>,
+    stacks: Vec<ModelCallStack>,
     /// The in-flight run, set while a run is executing. `None` when idle.
     active_run: Option<ActiveRun>,
     /// Latest model-call context usage for this session.
@@ -105,6 +108,7 @@ impl Session {
             turns: TurnHistory::new(),
             events: Vec::new(),
             subscribers: Vec::new(),
+            stacks: Vec::new(),
             active_run: None,
             token_usage: None,
         }
@@ -478,7 +482,9 @@ impl SessionStore {
             run_id: &run_id,
             seq,
         };
-        let outcome = self.agent.run_turn(context, &workspace, &cancel, &mut sink);
+        let outcome = self
+            .agent
+            .run_turn(&run_id, context, &workspace, &cancel, &mut sink);
         match outcome {
             // A completed run already finalized itself inside the loop
             // (`next_input_or_finish` cleared the run and emitted `run.completed`
@@ -591,6 +597,15 @@ impl SessionStore {
             .unwrap()
             .get(session_id)
             .map(|session| session.events.clone())
+    }
+
+    /// Snapshot of the model-call stacks captured for a live session.
+    pub fn stacks(&self, session_id: &str) -> Option<Vec<ModelCallStack>> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|session| recent_model_call_stacks(&session.stacks))
     }
 
     fn with_default_workspace(&self, sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
@@ -816,6 +831,21 @@ impl AgentRunSink for SessionRunSink<'_> {
         }
         Ok(())
     }
+
+    fn model_call_stack(&mut self, mut stack: ModelCallStack) -> Result<(), Self::Error> {
+        self.store.with_session(self.session_id, |session| {
+            let next_sequence = session
+                .stacks
+                .last()
+                .map_or(0, |last| last.sequence.saturating_add(1));
+            if session.stacks.len() >= MAX_STACKS_PER_SESSION {
+                let remove_count = session.stacks.len() + 1 - MAX_STACKS_PER_SESSION;
+                session.stacks.drain(0..remove_count);
+            }
+            stack.sequence = next_sequence;
+            session.stacks.push(stack);
+        })
+    }
 }
 
 impl SessionRunSink<'_> {
@@ -856,6 +886,11 @@ fn drain_steer_locked(session: &mut Session, run_id: &str) -> Vec<String> {
     texts
 }
 
+fn recent_model_call_stacks(stacks: &[ModelCallStack]) -> Vec<ModelCallStack> {
+    let start = stacks.len().saturating_sub(MAX_STACKS_PER_SESSION);
+    stacks[start..].to_vec()
+}
+
 fn new_id() -> String {
     Uuid::now_v7().to_string()
 }
@@ -865,5 +900,37 @@ fn new_id() -> String {
 fn log_storage(operation: &str, result: Result<(), crate::storage::StorageError>) {
     if let Err(error) = result {
         tracing::error!(%operation, %error, "failed to persist");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stacks::StackLayer;
+
+    fn stack(sequence: u64) -> ModelCallStack {
+        ModelCallStack {
+            id: format!("call-{sequence}"),
+            run_id: "run".to_owned(),
+            sequence,
+            status: "completed".to_owned(),
+            started_at_ms: sequence,
+            duration_ms: 1.0,
+            layers: Vec::<StackLayer>::new(),
+        }
+    }
+
+    #[test]
+    fn recent_model_call_stacks_returns_only_the_retained_tail() {
+        let stacks: Vec<_> = (0..MAX_STACKS_PER_SESSION as u64 + 3).map(stack).collect();
+
+        let recent = recent_model_call_stacks(&stacks);
+
+        assert_eq!(recent.len(), MAX_STACKS_PER_SESSION);
+        assert_eq!(recent.first().map(|stack| stack.sequence), Some(3));
+        assert_eq!(
+            recent.last().map(|stack| stack.sequence),
+            Some(MAX_STACKS_PER_SESSION as u64 + 2)
+        );
     }
 }

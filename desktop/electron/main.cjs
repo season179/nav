@@ -80,6 +80,22 @@ ipcMain.handle("nav:model-info", async (_event, requestedSessionId) => {
   return response.result;
 });
 
+ipcMain.handle("nav:session-stacks", async (_event, requestedSessionId) => {
+  if (!backendUrl) {
+    throw new Error("chat session is not ready");
+  }
+  const targetSessionId = requestedSessionId || sessionId;
+  if (!targetSessionId) {
+    throw new Error("chat session is not ready");
+  }
+  const response = await sendRpc({
+    backendUrl,
+    method: "session.stacks",
+    params: { sessionId: targetSessionId },
+  });
+  return response.result.stacks;
+});
+
 ipcMain.handle("nav:switch-session", async (_event, id) => {
   if (!backendUrl) {
     throw new Error("chat session is not ready");

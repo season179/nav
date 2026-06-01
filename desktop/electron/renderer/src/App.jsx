@@ -1,6 +1,7 @@
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import Composer from "./components/Composer.jsx";
 import Sidebar from "./components/Sidebar.jsx";
+import StacksPage from "./components/StacksPage.jsx";
 import Transcript from "./components/Transcript.jsx";
 
 export default function App() {
@@ -11,6 +12,8 @@ export default function App() {
   const [messages, setMessages] = useState([]);
   const [modelInfo, setModelInfo] = useState(null);
   const [stopPending, setStopPending] = useState(false);
+  const [activeView, setActiveView] = useState("chat");
+  const [stackRefreshKey, setStackRefreshKey] = useState(0);
 
   const connectedRef = useRef(false);
   const runningRef = useRef(false);
@@ -55,6 +58,15 @@ export default function App() {
     nextMessageIdRef.current += 1;
     return `message-${nextMessageIdRef.current}`;
   }, []);
+
+  const refreshStacks = useCallback(() => {
+    setStackRefreshKey((key) => key + 1);
+  }, []);
+
+  const refreshStacksAfterTerminalEvent = useCallback(() => {
+    refreshStacks();
+    window.setTimeout(refreshStacks, 120);
+  }, [refreshStacks]);
 
   const appendMessage = useCallback(
     (role, text) => {
@@ -230,6 +242,7 @@ export default function App() {
           if (event.text) {
             appendMessage("assistant", event.text);
           }
+          refreshStacks();
           break;
         case "tool.started":
           upsertToolLine(event.tool_call_id, "running", event.tool_name);
@@ -241,6 +254,7 @@ export default function App() {
             event.tool_name,
             event.text,
           );
+          refreshStacks();
           break;
         case "tool.failed":
           upsertToolLine(
@@ -249,9 +263,11 @@ export default function App() {
             event.tool_name,
             event.error,
           );
+          refreshStacks();
           break;
         case "message.completed":
           appendMessage("assistant", event.text);
+          refreshStacks();
           break;
         case "run.completed":
         case "run.cancelled":
@@ -260,6 +276,7 @@ export default function App() {
           setStopRequested(false);
           refreshSessions();
           refreshModelInfo();
+          refreshStacksAfterTerminalEvent();
           break;
         case "run.failed":
           appendMessage("error", event.error ?? "the run failed");
@@ -268,6 +285,7 @@ export default function App() {
           setStopRequested(false);
           refreshSessions();
           refreshModelInfo();
+          refreshStacksAfterTerminalEvent();
           break;
         default:
           break;
@@ -277,6 +295,8 @@ export default function App() {
       appendMessage,
       refreshModelInfo,
       refreshSessions,
+      refreshStacks,
+      refreshStacksAfterTerminalEvent,
       setRunningState,
       setStopRequested,
       stopRun,
@@ -396,18 +416,69 @@ export default function App() {
         onSelectSession={selectSession}
       />
       <main className="shell">
-        <Transcript messages={messages} />
-        <Composer
+        <SessionToolbar
+          activeView={activeView}
           connected={connected}
-          modelInfo={modelInfo}
-          running={running}
-          stopPending={stopPending}
-          onSend={sendMessage}
-          onStop={stopRun}
+          sessionId={activeSessionId}
+          onSelectView={setActiveView}
         />
+        {activeView === "stacks" ? (
+          <StacksPage
+            key={`${activeSessionId ?? "none"}-${stackRefreshKey}`}
+            sessionId={activeSessionId}
+          />
+        ) : (
+          <>
+            <Transcript messages={messages} />
+            <Composer
+              connected={connected}
+              modelInfo={modelInfo}
+              running={running}
+              stopPending={stopPending}
+              onSend={sendMessage}
+              onStop={stopRun}
+            />
+          </>
+        )}
       </main>
     </div>
   );
+}
+
+function SessionToolbar({ activeView, connected, sessionId, onSelectView }) {
+  return (
+    <header className="session-toolbar">
+      <div className="session-toolbar-title">
+        <span className="session-toolbar-label">Session</span>
+        <span className="session-toolbar-id">
+          {sessionId ? shortId(sessionId) : "none"}
+        </span>
+      </div>
+      <nav className="session-view-tabs" aria-label="Session views">
+        <button
+          type="button"
+          className="session-view-tab"
+          aria-current={activeView === "chat" ? "page" : undefined}
+          onClick={() => onSelectView("chat")}
+        >
+          Chat
+        </button>
+        <button
+          type="button"
+          className="session-view-tab"
+          aria-current={activeView === "stacks" ? "page" : undefined}
+          disabled={!connected || !sessionId}
+          onClick={() => onSelectView("stacks")}
+        >
+          Stacks
+        </button>
+      </nav>
+    </header>
+  );
+}
+
+function shortId(id) {
+  return id.length > 8 ? id.slice(0, 8) : id;
 }
 
 function useNavSubscriptions(handleBackendStatus, handleSessionEvent, onError) {

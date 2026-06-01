@@ -21,6 +21,7 @@ use crate::tokens::{
 
 const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const OPENAI_COMPLETIONS_API_KIND: &str = "openai-completions";
 
 /// Message shown when no model can be resolved from settings or the environment.
 const NOT_CONFIGURED_MESSAGE: &str = "model not configured: add a default model to \
@@ -183,6 +184,67 @@ pub struct ModelResponse {
     pub token_usage: Option<TokenUsage>,
 }
 
+/// A normalized response paired with provider transport details, when the model
+/// adapter can expose them.
+#[derive(Clone, Debug)]
+pub struct TracedModelResponse {
+    pub response: ModelResponse,
+    pub provider_trace: Option<ProviderCallTrace>,
+}
+
+impl From<ModelResponse> for TracedModelResponse {
+    fn from(response: ModelResponse) -> Self {
+        Self {
+            response,
+            provider_trace: None,
+        }
+    }
+}
+
+/// Provider request/response details captured around one model call.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCallTrace {
+    pub api_kind: String,
+    pub url: String,
+    pub model_id: String,
+    pub request_payload: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_payload: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ProviderCallTrace {
+    fn new(api_kind: &str, url: String, model_id: String, request_payload: Value) -> Self {
+        Self {
+            api_kind: api_kind.to_owned(),
+            url,
+            model_id,
+            request_payload,
+            response_payload: None,
+            provider_model_id: None,
+            response_id: None,
+            request_id: None,
+            status_code: None,
+            error: None,
+        }
+    }
+
+    fn with_error(mut self, error: &str) -> Self {
+        self.error = Some(error.to_owned());
+        self
+    }
+}
+
 impl ModelResponse {
     /// A plain text reply that requests no tools.
     pub fn text(content: impl Into<String>) -> Self {
@@ -197,16 +259,23 @@ impl ModelResponse {
 }
 
 /// Why a model call failed. Surfaced to the renderer as a `run.failed` event.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ModelError {
     pub message: String,
+    pub provider_trace: Option<Box<ProviderCallTrace>>,
 }
 
 impl ModelError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            provider_trace: None,
         }
+    }
+
+    fn with_provider_trace(mut self, provider_trace: ProviderCallTrace) -> Self {
+        self.provider_trace = Some(Box::new(provider_trace));
+        self
     }
 }
 
@@ -227,6 +296,14 @@ pub trait ChatModel: Send + Sync {
         context: &ModelContext,
         tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError>;
+
+    fn respond_with_trace(
+        &self,
+        context: &ModelContext,
+        tools: &[ToolDef],
+    ) -> Result<TracedModelResponse, ModelError> {
+        self.respond(context, tools).map(TracedModelResponse::from)
+    }
 
     /// Estimate the tokens the next request will send. Future compaction can
     /// use this before a model call, independent of whether the provider later
@@ -599,6 +676,15 @@ impl ChatModel for OpenAiModel {
         context: &ModelContext,
         tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
+        self.respond_with_trace(context, tools)
+            .map(|traced| traced.response)
+    }
+
+    fn respond_with_trace(
+        &self,
+        context: &ModelContext,
+        tools: &[ToolDef],
+    ) -> Result<TracedModelResponse, ModelError> {
         let mut messages: Vec<Value> = Vec::with_capacity(context.messages().len() + 1);
         // Mirror pi: the system prompt rides ahead of the conversation as a
         // leading `system` message.
@@ -623,18 +709,49 @@ impl ChatModel for OpenAiModel {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
+        let mut trace = ProviderCallTrace::new(
+            OPENAI_COMPLETIONS_API_KIND,
+            url.clone(),
+            self.config.model.clone(),
+            body.clone(),
+        );
 
         let mut response = ureq::post(&url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .send_json(&body)
-            .map_err(|error| ModelError::new(format!("model request failed: {error}")))?;
+            .map_err(|error| {
+                let message = format!("model request failed: {error}");
+                ModelError::new(message.clone())
+                    .with_provider_trace(trace.clone().with_error(&message))
+            })?;
+        trace.status_code = Some(response.status().as_u16());
+        trace.request_id = response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("request-id"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
 
-        let payload: Value = response
-            .body_mut()
-            .read_json()
-            .map_err(|error| ModelError::new(format!("could not read model response: {error}")))?;
+        let payload: Value = response.body_mut().read_json().map_err(|error| {
+            let message = format!("could not read model response: {error}");
+            ModelError::new(message.clone()).with_provider_trace(trace.clone().with_error(&message))
+        })?;
+        trace.provider_model_id = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        trace.response_id = payload.get("id").and_then(Value::as_str).map(str::to_owned);
+        trace.response_payload = Some(payload.clone());
 
         parse_chat_completion(&payload)
+            .map(|response| TracedModelResponse {
+                response,
+                provider_trace: Some(trace.clone()),
+            })
+            .map_err(|error| {
+                let message = error.message.clone();
+                error.with_provider_trace(trace.with_error(&message))
+            })
     }
 
     fn estimate_context_tokens(&self, context: &ModelContext, tools: &[ToolDef]) -> TokenEstimate {
