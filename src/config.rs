@@ -556,7 +556,21 @@ fn default_settings_path() -> Result<PathBuf, ConfigError> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| ConfigError::HomeDirUnavailable)?;
-    Ok(PathBuf::from(home).join(".nav").join("settings.json"))
+    settings_path_from_home(&home)
+}
+
+fn settings_path_from_home(home: &str) -> Result<PathBuf, ConfigError> {
+    let home = home.trim();
+    if home.is_empty() {
+        return Err(ConfigError::HomeDirUnavailable);
+    }
+
+    let home_path = PathBuf::from(home);
+    if !home_path.is_absolute() {
+        return Err(ConfigError::HomeDirUnavailable);
+    }
+
+    Ok(home_path.join(".nav").join("settings.json"))
 }
 
 /// Resolve a specific provider/model pair from the default settings path.
@@ -578,4 +592,37 @@ pub fn list_default_configured_models() -> Result<Vec<ConfiguredModel>, ConfigEr
 pub fn resolve_default_config() -> Result<ResolvedModelConfig, ConfigError> {
     let path = default_settings_path()?;
     resolve_config(&path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_path_from_home_rejects_empty_values() {
+        assert!(matches!(
+            settings_path_from_home("  "),
+            Err(ConfigError::HomeDirUnavailable)
+        ));
+    }
+
+    #[test]
+    fn settings_path_from_home_rejects_relative_values() {
+        assert!(matches!(
+            settings_path_from_home("relative/home"),
+            Err(ConfigError::HomeDirUnavailable)
+        ));
+    }
+
+    #[test]
+    fn settings_path_from_home_accepts_absolute_values() {
+        let home = std::env::temp_dir();
+        let path = settings_path_from_home(
+            home.to_str()
+                .expect("temp dir should be representable for this test"),
+        )
+        .expect("absolute home path should resolve");
+
+        assert_eq!(path, home.join(".nav").join("settings.json"));
+    }
 }
