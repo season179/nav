@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use nav::{
     ChatMessage, ChatModel, Event, MockModel, ModelContext, ModelError, ModelResponse,
-    SessionStore, Storage, TokenUsage, ToolDef,
+    SessionStore, StackStore, Storage, TokenUsage, ToolDef,
 };
 
 #[test]
@@ -140,12 +140,23 @@ fn provider_token_usage_is_recorded_for_the_session() {
 
 #[test]
 fn model_call_stacks_capture_context_response_and_carried_state() {
-    let store = SessionStore::new(Arc::new(RecordingModel::new()));
+    let path =
+        std::env::temp_dir().join(format!("nav_session_stacks_{}.jsonl", uuid::Uuid::now_v7()));
+    let stack_store = Arc::new(StackStore::open(&path, 1024 * 1024).expect("open stack store"));
+    let store = SessionStore::new(Arc::new(RecordingModel::new())).with_stack_store(stack_store);
     let session_id = store.create_session();
 
     store.send_message(&session_id, "show the stack").unwrap();
 
-    let stacks = store.stacks(&session_id).expect("the session exists");
+    assert!(
+        store
+            .stack_availability(&session_id)
+            .expect("the session exists")
+            .available
+    );
+    let result = store.stacks(&session_id).expect("the session exists");
+    assert_eq!(result.unavailable_reason, None);
+    let stacks = result.stacks;
     assert_eq!(stacks.len(), 1);
     let stack = &stacks[0];
     assert_eq!(stack.sequence, 0);
@@ -176,6 +187,8 @@ fn model_call_stacks_capture_context_response_and_carried_state() {
         "carried-forward layer should include user plus assistant state: {:?}",
         layer("carried_forward")
     );
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

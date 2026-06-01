@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
+use crate::stack_store::{StackAvailability, StackQueryResult, StackStore, StackStoreError};
 use crate::stacks::ModelCallStack;
 use crate::storage::{
     SessionSummary, Storage, StorageError, project_root_to_string, workspace_root_to_string,
@@ -83,7 +84,7 @@ struct Session {
     turns: TurnHistory,
     events: Vec<Event>,
     subscribers: Vec<Sender<Event>>,
-    stacks: Vec<ModelCallStack>,
+    next_stack_sequence: u64,
     /// The in-flight run, set while a run is executing. `None` when idle.
     active_run: Option<ActiveRun>,
     /// Latest model-call context usage for this session.
@@ -110,7 +111,7 @@ impl Session {
             turns: TurnHistory::new(),
             events: Vec::new(),
             subscribers: Vec::new(),
-            stacks: Vec::new(),
+            next_stack_sequence: 0,
             active_run: None,
             token_usage: None,
         }
@@ -172,6 +173,7 @@ pub struct SessionStore {
     agent: Agent,
     context_assembler: ContextAssembler,
     storage: Option<Arc<Storage>>,
+    stack_store: Option<Arc<StackStore>>,
     /// Identifier of the active model, tagged onto persisted assistant turns.
     model_id: Option<String>,
     /// Renderer-facing model metadata shown in the app's composer.
@@ -185,6 +187,7 @@ impl SessionStore {
             agent: Agent::new(model),
             context_assembler: ContextAssembler::new(),
             storage: None,
+            stack_store: None,
             model_id: None,
             model_info: ModelInfo {
                 label: "unknown model".to_owned(),
@@ -198,6 +201,12 @@ impl SessionStore {
     /// Attach durable storage so sessions and exchanges survive restarts.
     pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Attach bounded JSONL storage for debug model-call stack snapshots.
+    pub fn with_stack_store(mut self, stack_store: Arc<StackStore>) -> Self {
+        self.stack_store = Some(stack_store);
         self
     }
 
@@ -620,13 +629,47 @@ impl SessionStore {
             .map(|session| session.events.clone())
     }
 
-    /// Snapshot of the model-call stacks captured for a live session.
-    pub fn stacks(&self, session_id: &str) -> Option<Vec<ModelCallStack>> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .map(|session| recent_model_call_stacks(&session.stacks))
+    /// Whether the stack log currently contains any record for this session.
+    ///
+    /// This is advisory. Records can still be trimmed between this check and the
+    /// later `stacks` call; callers should handle an empty stack result.
+    pub fn stack_availability(&self, session_id: &str) -> Option<StackAvailability> {
+        if !self.sessions.lock().unwrap().contains_key(session_id) {
+            return None;
+        }
+        match &self.stack_store {
+            Some(stack_store) => match stack_store.availability(session_id) {
+                Ok(availability) => Some(availability),
+                Err(error) => {
+                    tracing::error!(%session_id, %error, "failed to scan stack availability");
+                    Some(StackAvailability { available: false })
+                }
+            },
+            None => Some(StackAvailability { available: false }),
+        }
+    }
+
+    /// Snapshot of the model-call stacks currently retained for a session.
+    pub fn stacks(&self, session_id: &str) -> Option<StackQueryResult> {
+        if !self.sessions.lock().unwrap().contains_key(session_id) {
+            return None;
+        }
+        match &self.stack_store {
+            Some(stack_store) => match stack_store.stacks(session_id, MAX_STACKS_PER_SESSION) {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    tracing::error!(%session_id, %error, "failed to load stacks");
+                    Some(StackQueryResult {
+                        stacks: Vec::new(),
+                        unavailable_reason: Some("stack_store_error".to_owned()),
+                    })
+                }
+            },
+            None => Some(StackQueryResult {
+                stacks: Vec::new(),
+                unavailable_reason: Some("stack_store_unavailable".to_owned()),
+            }),
+        }
     }
 
     fn with_default_workspace(&self, sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
@@ -856,18 +899,17 @@ impl AgentRunSink for SessionRunSink<'_> {
     }
 
     fn model_call_stack(&mut self, mut stack: ModelCallStack) -> Result<(), Self::Error> {
-        self.store.with_session(self.session_id, |session| {
-            let next_sequence = session
-                .stacks
-                .last()
-                .map_or(0, |last| last.sequence.saturating_add(1));
-            if session.stacks.len() >= MAX_STACKS_PER_SESSION {
-                let remove_count = session.stacks.len() + 1 - MAX_STACKS_PER_SESSION;
-                session.stacks.drain(0..remove_count);
-            }
-            stack.sequence = next_sequence;
-            session.stacks.push(stack);
-        })
+        let sequence = self.store.with_session(self.session_id, |session| {
+            let sequence = session.next_stack_sequence;
+            session.next_stack_sequence = session.next_stack_sequence.saturating_add(1);
+            sequence
+        })?;
+        stack.sequence = sequence;
+
+        if let Some(stack_store) = &self.store.stack_store {
+            log_stack_store("append_stack", stack_store.append(self.session_id, &stack));
+        }
+        Ok(())
     }
 }
 
@@ -909,11 +951,6 @@ fn drain_steer_locked(session: &mut Session, run_id: &str) -> Vec<String> {
     texts
 }
 
-fn recent_model_call_stacks(stacks: &[ModelCallStack]) -> Vec<ModelCallStack> {
-    let start = stacks.len().saturating_sub(MAX_STACKS_PER_SESSION);
-    stacks[start..].to_vec()
-}
-
 fn new_id() -> String {
     Uuid::now_v7().to_string()
 }
@@ -926,34 +963,8 @@ fn log_storage(operation: &str, result: Result<(), crate::storage::StorageError>
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::stacks::StackLayer;
-
-    fn stack(sequence: u64) -> ModelCallStack {
-        ModelCallStack {
-            id: format!("call-{sequence}"),
-            run_id: "run".to_owned(),
-            sequence,
-            status: "completed".to_owned(),
-            started_at_ms: sequence,
-            duration_ms: 1.0,
-            layers: Vec::<StackLayer>::new(),
-        }
-    }
-
-    #[test]
-    fn recent_model_call_stacks_returns_only_the_retained_tail() {
-        let stacks: Vec<_> = (0..MAX_STACKS_PER_SESSION as u64 + 3).map(stack).collect();
-
-        let recent = recent_model_call_stacks(&stacks);
-
-        assert_eq!(recent.len(), MAX_STACKS_PER_SESSION);
-        assert_eq!(recent.first().map(|stack| stack.sequence), Some(3));
-        assert_eq!(
-            recent.last().map(|stack| stack.sequence),
-            Some(MAX_STACKS_PER_SESSION as u64 + 2)
-        );
+fn log_stack_store(operation: &str, result: Result<(), StackStoreError>) {
+    if let Err(error) = result {
+        tracing::error!(%operation, %error, "failed to persist stack");
     }
 }
