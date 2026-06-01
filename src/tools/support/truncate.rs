@@ -10,18 +10,28 @@ pub const MAX_BYTES: usize = 50 * 1024;
 /// Marker appended when output was clipped.
 pub const TRUNCATION_MARKER: &str = "\n… [output truncated]";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CappedOutput {
+    pub content: String,
+    pub truncated: bool,
+}
+
 /// Cap output to the head (first lines/bytes) — for file reads and listings.
 pub fn cap_head(text: &str) -> String {
-    cap(text, false)
+    cap_with_meta(text, false).content
 }
 
 /// Cap output to the tail (last lines/bytes) — for command output where the
 /// end is usually the interesting part.
 pub fn cap_tail(text: &str) -> String {
-    cap(text, true)
+    cap_with_meta(text, true).content
 }
 
-fn cap(text: &str, keep_tail: bool) -> String {
+pub fn cap_tail_with_meta(text: &str) -> CappedOutput {
+    cap_with_meta(text, true)
+}
+
+fn cap_with_meta(text: &str, keep_tail: bool) -> CappedOutput {
     let lines: Vec<&str> = text.lines().collect();
     let mut truncated = false;
 
@@ -62,7 +72,10 @@ fn cap(text: &str, keep_tail: bool) -> String {
     if truncated {
         out.push_str(TRUNCATION_MARKER);
     }
-    out
+    CappedOutput {
+        content: out,
+        truncated,
+    }
 }
 
 /// Largest char boundary `<= index` (std's `floor_char_boundary` is unstable).

@@ -3,7 +3,9 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -67,6 +69,14 @@ fn run_error(workspace: &Workspace, tool: &str, args: serde_json::Value) -> Tool
     let result = registry.execute_call(&tool_call(tool, args), &workspace.path, &no_cancel());
     assert!(result.is_error, "{tool} should have failed");
     result
+}
+
+fn full_output_path(content: &str) -> &str {
+    content
+        .split("Full output: ")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("full output path")
 }
 
 #[test]
@@ -198,6 +208,147 @@ fn bash_reports_a_nonzero_exit_status() {
     let workspace = Workspace::new();
     let output = run(&workspace, "bash", json!({ "command": "exit 3" }));
     assert!(output.content.contains("status 3"), "{}", output.content);
+}
+
+#[test]
+fn bash_interleaves_stdout_and_stderr_in_arrival_order() {
+    let workspace = Workspace::new();
+    let output = run(
+        &workspace,
+        "bash",
+        json!({
+            "command": "printf 'out1\\n'; sleep 0.1; printf 'err1\\n' >&2; sleep 0.1; printf 'out2\\n'"
+        }),
+    );
+
+    let out1 = output.content.find("out1").expect("stdout chunk");
+    let err1 = output.content.find("err1").expect("stderr chunk");
+    let out2 = output.content.find("out2").expect("second stdout chunk");
+    assert!(
+        out1 < err1 && err1 < out2,
+        "output should preserve chunk order: {}",
+        output.content
+    );
+}
+
+#[test]
+fn bash_uses_bash_when_available() {
+    if !std::path::Path::new("/bin/bash").exists() {
+        return;
+    }
+
+    let workspace = Workspace::new();
+    let output = run(
+        &workspace,
+        "bash",
+        json!({ "command": "echo ${BASH_VERSION}" }),
+    );
+
+    assert!(
+        !output.content.trim().is_empty(),
+        "bash-specific variable should be set: {}",
+        output.content
+    );
+}
+
+#[test]
+fn bash_sanitizes_ansi_and_binary_output() {
+    let workspace = Workspace::new();
+    let output = run(
+        &workspace,
+        "bash",
+        json!({ "command": "printf '\\033[31mred\\033[0m\\000blue\\001\\n'" }),
+    );
+
+    assert!(output.content.contains("redblue"), "{}", output.content);
+    assert!(
+        !output.content.contains('\u{1b}') && !output.content.contains('\0'),
+        "control characters should be stripped: {:?}",
+        output.content
+    );
+}
+
+#[test]
+fn bash_saves_full_output_when_truncated() {
+    let workspace = Workspace::new();
+    let output = run(
+        &workspace,
+        "bash",
+        json!({
+            "command": "i=0; while [ $i -le 2050 ]; do echo line-$i; i=$((i + 1)); done"
+        }),
+    );
+
+    assert!(
+        output.content.contains("Full output:"),
+        "truncated output should point to the full log: {}",
+        output.content
+    );
+    assert!(output.content.contains("line-2050"), "{}", output.content);
+    assert!(!output.content.contains("line-0\n"), "{}", output.content);
+
+    let path = full_output_path(&output.content);
+    let full = fs::read_to_string(path).expect("read full output");
+    let _ = fs::remove_file(path);
+    assert!(full.contains("line-0\n"), "{}", full);
+    assert!(full.contains("line-2050"), "{}", full);
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_timeout_kills_background_descendants() {
+    let workspace = Workspace::new();
+    let marker = workspace.path.join("timeout_descendant_survived");
+    let output = run(
+        &workspace,
+        "bash",
+        json!({
+            "command": "(sleep 2; touch timeout_descendant_survived) & wait",
+            "timeout": 1
+        }),
+    );
+
+    assert!(output.content.contains("timed out"), "{}", output.content);
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        !marker.exists(),
+        "timeout should kill the whole process group, not just the shell"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_cancel_kills_background_descendants() {
+    let workspace = Workspace::new();
+    let marker = workspace.path.join("cancel_descendant_survived");
+    let cancel = no_cancel();
+    let cancel_for_thread = Arc::clone(&cancel);
+
+    let runner = {
+        let path = workspace.path.clone();
+        thread::spawn(move || {
+            let registry = Registry::coding();
+            registry.execute_call(
+                &tool_call(
+                    "bash",
+                    json!({ "command": "(sleep 2; touch cancel_descendant_survived) & wait" }),
+                ),
+                &path,
+                &cancel_for_thread,
+            )
+        })
+    };
+
+    thread::sleep(Duration::from_millis(150));
+    cancel.store(true, Ordering::Relaxed);
+    let output = runner.join().expect("bash runner");
+
+    assert!(output.content.contains("cancelled"), "{}", output.content);
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        !marker.exists(),
+        "cancel should kill the whole process group, not just the shell"
+    );
 }
 
 #[test]
