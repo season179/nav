@@ -1,15 +1,22 @@
 //! Configuration resolver for loading and resolving Pi-style settings from ~/.nav/settings.json.
 
+use base64::Engine;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_THINKING_LEVEL: &str = "medium";
 const THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+pub const OPENAI_COMPLETIONS_API: &str = "openai-completions";
+pub const OPENAI_RESPONSES_API: &str = "openai-responses";
+pub const CODEX_RESPONSES_API: &str = "codex-responses";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_CODEX_RESPONSES_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
-/// Resolved configuration consumed by chat completions.
+/// Resolved configuration consumed by model transports.
 #[derive(Clone)]
 pub struct ResolvedModelConfig {
+    pub api: String,
     pub api_key: String,
     pub provider: String,
     pub model: String,
@@ -22,11 +29,16 @@ pub struct ResolvedModelConfig {
     pub max_tokens: Option<u64>,
     pub compat: Option<serde_json::Value>,
     pub thinking_level_map: Option<serde_json::Value>,
+    pub chatgpt_account_id: Option<String>,
+    pub chatgpt_plan_type: Option<String>,
+    pub chatgpt_fedramp: bool,
+    pub service_tier: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedModelConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedModelConfig")
+            .field("api", &self.api)
             .field("api_key", &"<redacted>")
             .field("provider", &self.provider)
             .field("model", &self.model)
@@ -39,6 +51,10 @@ impl std::fmt::Debug for ResolvedModelConfig {
             .field("max_tokens", &self.max_tokens)
             .field("compat", &self.compat)
             .field("thinking_level_map", &self.thinking_level_map)
+            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .field("chatgpt_plan_type", &self.chatgpt_plan_type)
+            .field("chatgpt_fedramp", &self.chatgpt_fedramp)
+            .field("service_tier", &self.service_tier)
             .finish()
     }
 }
@@ -63,6 +79,8 @@ pub enum ConfigError {
     MissingModel { provider: String, model: String },
     MissingBaseUrl(String),
     MissingApiKey(String),
+    MissingCodexAuth(PathBuf),
+    InvalidCodexAuth(String),
     MissingApi { provider: String },
     UnsupportedApi { provider: String, api: String },
     ResolutionError(String),
@@ -106,6 +124,16 @@ impl std::fmt::Display for ConfigError {
             ConfigError::MissingApiKey(provider) => {
                 write!(f, "Provider '{}' is missing 'apiKey'", provider)
             }
+            ConfigError::MissingCodexAuth(path) => {
+                write!(
+                    f,
+                    "Codex ChatGPT auth not found at {}. Run `codex login` and sign in with ChatGPT.",
+                    path.display()
+                )
+            }
+            ConfigError::InvalidCodexAuth(reason) => {
+                write!(f, "Codex ChatGPT auth is not usable: {reason}")
+            }
             ConfigError::MissingApi { provider } => {
                 write!(
                     f,
@@ -116,7 +144,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::UnsupportedApi { provider, api } => {
                 write!(
                     f,
-                    "Provider '{}' specifies unsupported API type '{}'. Only 'openai-completions' is supported.",
+                    "Provider '{}' specifies unsupported API type '{}'. Supported API types are 'openai-completions', 'openai-responses', and 'codex-responses'.",
                     provider, api
                 )
             }
@@ -159,6 +187,8 @@ struct ProviderConfig {
     base_url: Option<String>,
     api_key: Option<String>,
     api: Option<String>,
+    service_tier: Option<String>,
+    fast_mode: Option<bool>,
     compat: Option<serde_json::Value>,
     models: Option<Vec<ModelConfig>>,
 }
@@ -176,6 +206,28 @@ struct ModelConfig {
     max_tokens: Option<u64>,
     compat: Option<serde_json::Value>,
     thinking_level_map: Option<serde_json::Value>,
+    service_tier: Option<String>,
+    fast_mode: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CodexAuthFile {
+    auth_mode: Option<String>,
+    tokens: Option<CodexAuthTokens>,
+}
+
+#[derive(Deserialize)]
+struct CodexAuthTokens {
+    access_token: String,
+    id_token: Option<String>,
+    account_id: Option<String>,
+}
+
+struct ResolvedAuth {
+    access_token: String,
+    account_id: Option<String>,
+    plan_type: Option<String>,
+    is_fedramp_account: bool,
 }
 
 /// Resolve templates and shell commands for configuration values.
@@ -381,6 +433,192 @@ fn is_supported_thinking_level(
     }
 }
 
+fn is_supported_api(api: &str) -> bool {
+    matches!(
+        api,
+        OPENAI_COMPLETIONS_API | OPENAI_RESPONSES_API | CODEX_RESPONSES_API
+    )
+}
+
+fn default_base_url_for_api(api: &str) -> Option<&'static str> {
+    match api {
+        OPENAI_RESPONSES_API => Some(DEFAULT_OPENAI_BASE_URL),
+        CODEX_RESPONSES_API => Some(DEFAULT_CODEX_RESPONSES_BASE_URL),
+        _ => None,
+    }
+}
+
+fn resolve_base_url(
+    api: &str,
+    provider_config: &ProviderConfig,
+    model_config: &ModelConfig,
+    provider: &str,
+) -> Result<String, ConfigError> {
+    let base_url = model_config
+        .base_url
+        .as_ref()
+        .or(provider_config.base_url.as_ref())
+        .cloned()
+        .or_else(|| default_base_url_for_api(api).map(str::to_owned))
+        .ok_or_else(|| ConfigError::MissingBaseUrl(provider.to_owned()))?;
+
+    if base_url.trim().is_empty() {
+        return Err(ConfigError::MissingBaseUrl(provider.to_owned()));
+    }
+
+    Ok(base_url)
+}
+
+fn resolve_service_tier(
+    api: &str,
+    provider_config: &ProviderConfig,
+    model_config: &ModelConfig,
+) -> Option<String> {
+    match model_config.fast_mode.or(provider_config.fast_mode) {
+        Some(true) => return Some(service_tier_for_request(api, "fast")),
+        Some(false) => return None,
+        None => {}
+    }
+
+    model_config
+        .service_tier
+        .as_deref()
+        .or(provider_config.service_tier.as_deref())
+        .map(|tier| service_tier_for_request(api, tier))
+}
+
+fn service_tier_for_request(api: &str, tier: &str) -> String {
+    if matches!(api, OPENAI_RESPONSES_API | CODEX_RESPONSES_API) && tier == "fast" {
+        "priority".to_owned()
+    } else {
+        tier.to_owned()
+    }
+}
+
+fn resolve_auth(
+    api: &str,
+    provider_config: &ProviderConfig,
+    provider: &str,
+) -> Result<ResolvedAuth, ConfigError> {
+    if api == CODEX_RESPONSES_API {
+        return resolve_codex_chatgpt_auth();
+    }
+
+    let api_key_raw = provider_config
+        .api_key
+        .as_ref()
+        .ok_or_else(|| ConfigError::MissingApiKey(provider.to_owned()))?;
+
+    let api_key = resolve_config_value(api_key_raw)?;
+    if api_key.trim().is_empty() {
+        return Err(ConfigError::MissingApiKey(provider.to_owned()));
+    }
+
+    Ok(ResolvedAuth {
+        access_token: api_key,
+        account_id: None,
+        plan_type: None,
+        is_fedramp_account: false,
+    })
+}
+
+fn resolve_codex_chatgpt_auth() -> Result<ResolvedAuth, ConfigError> {
+    let auth_path = codex_auth_path()?;
+    let file = std::fs::File::open(&auth_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ConfigError::MissingCodexAuth(auth_path.clone())
+        } else {
+            ConfigError::Io(error.to_string())
+        }
+    })?;
+    let auth: CodexAuthFile = serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|error| ConfigError::Json(error.to_string()))?;
+
+    if !auth
+        .auth_mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("chatgpt"))
+    {
+        return Err(ConfigError::InvalidCodexAuth(
+            "cached Codex auth is not a ChatGPT login".to_owned(),
+        ));
+    }
+
+    let tokens = auth
+        .tokens
+        .ok_or_else(|| ConfigError::InvalidCodexAuth("missing token data".to_owned()))?;
+    if tokens.access_token.trim().is_empty() {
+        return Err(ConfigError::InvalidCodexAuth(
+            "missing access token".to_owned(),
+        ));
+    }
+
+    let claims = tokens
+        .id_token
+        .as_deref()
+        .and_then(decode_chatgpt_auth_claims);
+    let account_id = tokens
+        .account_id
+        .or_else(|| claims.as_ref().and_then(|claims| claims.account_id.clone()));
+    let plan_type = claims.as_ref().and_then(|claims| claims.plan_type.clone());
+    let is_fedramp_account = claims.is_some_and(|claims| claims.is_fedramp_account);
+
+    Ok(ResolvedAuth {
+        access_token: tokens.access_token,
+        account_id,
+        plan_type,
+        is_fedramp_account,
+    })
+}
+
+fn codex_auth_path() -> Result<PathBuf, ConfigError> {
+    let codex_home = match std::env::var("CODEX_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .map_err(|_| ConfigError::HomeDirUnavailable)?;
+            PathBuf::from(home).join(".codex")
+        }
+    };
+
+    Ok(codex_home.join("auth.json"))
+}
+
+struct ChatGptAuthClaims {
+    account_id: Option<String>,
+    plan_type: Option<String>,
+    is_fedramp_account: bool,
+}
+
+fn decode_chatgpt_auth_claims(jwt: &str) -> Option<ChatGptAuthClaims> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let auth = claims.get("https://api.openai.com/auth")?;
+
+    Some(ChatGptAuthClaims {
+        account_id: auth
+            .get("chatgpt_account_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        plan_type: auth
+            .get("chatgpt_plan_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        is_fedramp_account: auth
+            .get("chatgpt_account_is_fedramp")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
 fn read_settings(path: &Path) -> Result<SettingsFile, ConfigError> {
     let file = std::fs::File::open(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -458,33 +696,16 @@ fn resolve_settings_model(
             provider: model_ref.provider.clone(),
         })?;
 
-    if api != "openai-completions" {
+    if !is_supported_api(api) {
         return Err(ConfigError::UnsupportedApi {
             provider: model_ref.provider.clone(),
             api: api.clone(),
         });
     }
 
-    let base_url = model_config
-        .base_url
-        .as_ref()
-        .or(provider_config.base_url.as_ref())
-        .ok_or_else(|| ConfigError::MissingBaseUrl(model_ref.provider.clone()))?
-        .clone();
-
-    if base_url.trim().is_empty() {
-        return Err(ConfigError::MissingBaseUrl(model_ref.provider.clone()));
-    }
-
-    let api_key_raw = provider_config
-        .api_key
-        .as_ref()
-        .ok_or_else(|| ConfigError::MissingApiKey(model_ref.provider.clone()))?;
-
-    let api_key = resolve_config_value(api_key_raw)?;
-    if api_key.trim().is_empty() {
-        return Err(ConfigError::MissingApiKey(model_ref.provider.clone()));
-    }
+    let base_url = resolve_base_url(api, provider_config, model_config, &model_ref.provider)?;
+    let auth = resolve_auth(api, provider_config, &model_ref.provider)?;
+    let service_tier = resolve_service_tier(api, provider_config, model_config);
 
     let compat = merge_json_objects(provider_config.compat.clone(), model_config.compat.clone());
     let name = model_config
@@ -509,7 +730,8 @@ fn resolve_settings_model(
     );
 
     Ok(ResolvedModelConfig {
-        api_key,
+        api: api.clone(),
+        api_key: auth.access_token,
         provider: model_ref.provider.clone(),
         model: model_ref.model.clone(),
         base_url,
@@ -521,6 +743,10 @@ fn resolve_settings_model(
         max_tokens,
         compat,
         thinking_level_map,
+        chatgpt_account_id: auth.account_id,
+        chatgpt_plan_type: auth.plan_type,
+        chatgpt_fedramp: auth.is_fedramp_account,
+        service_tier,
     })
 }
 

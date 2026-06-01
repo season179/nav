@@ -8,6 +8,7 @@ name = "nav-local-backend"
 path = "src/bin/nav-local-backend.rs"
 
 [dependencies]
+base64 = "0.22.1"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 file-rotate = "0.8.0"
 regex = "1.12.3"

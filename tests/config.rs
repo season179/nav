@@ -1,3 +1,4 @@
+use base64::Engine;
 use nav::{ConfigError, list_configured_models, resolve_config, resolve_model_config};
 use serde_json::json;
 use std::path::Path;
@@ -18,6 +19,12 @@ where
     if let Err(err) = res {
         std::panic::resume_unwind(err);
     }
+}
+
+fn fake_jwt(payload: serde_json::Value) -> String {
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+    format!("{header}.{payload}.signature")
 }
 
 #[test]
@@ -121,6 +128,157 @@ fn test_specific_configured_model_can_be_resolved() {
         assert_eq!(config.base_url, "http://localhost:11434/v1");
         assert_eq!(config.api_key, "local-key");
     });
+}
+
+#[test]
+fn test_openai_responses_settings_resolution() {
+    let settings = json!({
+        "defaultModel": {
+            "provider": "openai",
+            "model": "gpt-5.5"
+        },
+        "defaultThinkingLevel": "high",
+        "providers": {
+            "openai": {
+                "apiKey": "openai-key",
+                "api": "openai-responses",
+                "serviceTier": "flex",
+                "models": [
+                    {
+                        "id": "gpt-5.5",
+                        "name": "GPT 5.5",
+                        "reasoning": true,
+                        "thinkingLevelMap": {
+                            "off": "none",
+                            "high": "high",
+                            "xhigh": "xhigh"
+                        }
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let config = resolve_config(path).expect("responses config resolves");
+
+        assert_eq!(config.api, "openai-responses");
+        assert_eq!(config.api_key, "openai-key");
+        assert_eq!(config.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.thinking_level, "high");
+        assert_eq!(config.service_tier.as_deref(), Some("flex"));
+    });
+}
+
+#[test]
+fn test_responses_fast_mode_maps_to_priority_service_tier() {
+    let settings = json!({
+        "defaultModel": {
+            "provider": "openai",
+            "model": "gpt-5.5"
+        },
+        "providers": {
+            "openai": {
+                "apiKey": "openai-key",
+                "api": "openai-responses",
+                "fastMode": true,
+                "models": [
+                    {
+                        "id": "gpt-5.5",
+                        "name": "GPT 5.5"
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let config = resolve_config(path).expect("responses config resolves");
+
+        assert_eq!(config.service_tier.as_deref(), Some("priority"));
+    });
+}
+
+#[test]
+fn test_codex_responses_resolves_chatgpt_auth_from_codex_home() {
+    let codex_home = std::env::temp_dir().join(format!("codex_home_{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&codex_home).expect("create temp codex home");
+    let previous_codex_home = std::env::var("CODEX_HOME").ok();
+    unsafe {
+        std::env::set_var("CODEX_HOME", &codex_home);
+    }
+
+    let id_token = fake_jwt(json!({
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_account_id": "acct_from_claim",
+            "chatgpt_account_is_fedramp": true
+        }
+    }));
+    std::fs::write(
+        codex_home.join("auth.json"),
+        json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "access_token": "chatgpt-access-token",
+                "id_token": id_token,
+                "refresh_token": "refresh-token",
+                "account_id": "acct_from_file"
+            },
+            "last_refresh": "2026-06-01T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .expect("write auth");
+
+    let settings = json!({
+        "defaultModel": {
+            "provider": "codex",
+            "model": "gpt-5.5"
+        },
+        "providers": {
+            "codex": {
+                "api": "codex-responses",
+                "fastMode": true,
+                "models": [
+                    {
+                        "id": "gpt-5.5",
+                        "name": "GPT 5.5",
+                        "reasoning": true
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    let res = std::panic::catch_unwind(|| {
+        with_temp_settings(&settings, |path| {
+            let config = resolve_config(path).expect("codex responses config resolves");
+
+            assert_eq!(config.api, "codex-responses");
+            assert_eq!(config.api_key, "chatgpt-access-token");
+            assert_eq!(config.base_url, "https://chatgpt.com/backend-api/codex");
+            assert_eq!(config.chatgpt_account_id.as_deref(), Some("acct_from_file"));
+            assert_eq!(config.chatgpt_plan_type.as_deref(), Some("pro"));
+            assert!(config.chatgpt_fedramp);
+            assert_eq!(config.service_tier.as_deref(), Some("priority"));
+        });
+    });
+
+    unsafe {
+        match previous_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&codex_home);
+    if let Err(error) = res {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[test]
