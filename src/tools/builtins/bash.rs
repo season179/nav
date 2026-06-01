@@ -1,8 +1,11 @@
 //! `bash` — run a shell command in the workspace, time-bounded and cancelable.
 //!
-//! Unlike the path tools, `bash` is not confined to the workspace: it runs with
-//! the backend user's shell privileges (the trusted-local posture). It is
-//! bounded by a timeout and the cancel flag, and its output is capped.
+//! In an ordinary checkout, `bash` keeps the trusted-local posture: it runs with
+//! the backend user's shell privileges. In a linked git worktree, it adds the
+//! same practical guardrails as the path tools: main-checkout paths are
+//! redirected to the active worktree, sibling worktree paths and `..` traversal
+//! are blocked. It is bounded by a timeout and the cancel flag, and its output
+//! is capped.
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -17,6 +20,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::support::truncate::{cap_tail, cap_tail_with_meta};
+use super::support::worktree::rewrite_bash_command;
 use super::{CancelFlag, Tool, ToolError, ToolOutput, arg_opt_u64, arg_str};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -58,12 +62,13 @@ impl Tool for BashTool {
         cwd: &Path,
         cancel: &CancelFlag,
     ) -> Result<ToolOutput, ToolError> {
-        let command = arg_str(args, "command")?;
+        let command =
+            rewrite_bash_command(cwd, arg_str(args, "command")?).map_err(ToolError::new)?;
         let timeout =
             Duration::from_secs(arg_opt_u64(args, "timeout").unwrap_or(DEFAULT_TIMEOUT_SECS));
 
         let runner = LocalBashRunner::from_env()?;
-        let run = runner.run(command, cwd, timeout, cancel)?;
+        let run = runner.run(&command, cwd, timeout, cancel)?;
 
         Ok(ToolOutput::new(format_tool_output(run)))
     }

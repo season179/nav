@@ -20,6 +20,16 @@ function normalizeOptionalWorkspaceRoot(value) {
   return normalizeRequiredString(value, "workspace root");
 }
 
+function normalizeOptionalSessionMode(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (value !== "local" && value !== "worktree") {
+    throw new Error("session mode must be local or worktree");
+  }
+  return value;
+}
+
 function normalizeRequiredString(value, label) {
   if (typeof value !== "string") {
     throw new TypeError(`${label} must be a string`);
@@ -77,11 +87,11 @@ contextBridge.exposeInMainWorld("nav", {
     );
   },
   // Start a fresh conversation and make it active.
-  newSession(workspaceRoot) {
-    return ipcRenderer.invoke(
-      "nav:new-session",
-      normalizeOptionalWorkspaceRoot(workspaceRoot),
-    );
+  newSession(workspaceRoot, mode) {
+    return ipcRenderer.invoke("nav:new-session", {
+      cwd: normalizeOptionalWorkspaceRoot(workspaceRoot),
+      mode: normalizeOptionalSessionMode(mode),
+    });
   },
 });
 

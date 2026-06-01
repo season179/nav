@@ -7,7 +7,7 @@
 //! prior session can be reopened with [`SessionStore::resume_session`].
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -237,6 +237,11 @@ impl SessionStore {
         self
     }
 
+    /// The workspace used when creating a local session without an explicit cwd.
+    pub fn default_workspace(&self) -> &Path {
+        self.agent.workspace()
+    }
+
     /// Create a new session and emit its `session.created` event.
     pub fn create_session(&self) -> String {
         self.create_session_in_workspace(self.agent.workspace().to_path_buf())
@@ -401,6 +406,20 @@ impl SessionStore {
             Ok(id) => id,
             Err(error) => {
                 tracing::error!(%error, "failed to look up latest session");
+                None
+            }
+        }
+    }
+
+    /// The most recent persisted nav session for one workspace. Used when an
+    /// app instance is launched from a git worktree so startup never resumes a
+    /// conversation bound to another checkout.
+    pub fn latest_session_id_in_workspace(&self, workspace: &Path) -> Option<String> {
+        let storage = self.storage.as_ref()?;
+        match storage.most_recent_session_in_workspace(SESSION_SOURCE, workspace) {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::error!(%error, "failed to look up latest session in workspace");
                 None
             }
         }

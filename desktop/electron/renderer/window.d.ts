@@ -63,7 +63,10 @@ declare global {
         }>
       >;
       switchSession(sessionId: string): Promise<void>;
-      newSession(workspaceRoot?: string | null): Promise<string>;
+      newSession(
+        workspaceRoot?: string | null,
+        mode?: "local" | "worktree" | null,
+      ): Promise<string | null>;
     };
   }
 }

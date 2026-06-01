@@ -32,6 +32,7 @@ mod storage;
 mod system_prompt;
 mod tokens;
 mod tools;
+mod worktree;
 
 pub use config::{ConfigError, ResolvedModelConfig, resolve_config, resolve_default_config};
 pub use context::{ContextAssembler, ModelContext, TurnHistory};
@@ -138,18 +139,25 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
 
     match request.get("method").and_then(Value::as_str) {
         Some("session.create") => {
-            let workspace = match requested_session_workspace(&request) {
-                Ok(workspace) => workspace,
+            let options = match requested_session_options(&request) {
+                Ok(options) => options,
                 Err(message) => return write_rpc_error(stream, &id, &message),
             };
-            let session_id = match workspace {
-                Some(workspace) => store.create_session_in_workspace(workspace),
-                None => store.create_session(),
+            let session_id = match create_session_with_options(store, options) {
+                Ok(session_id) => session_id,
+                Err(message) => return write_rpc_error(stream, &id, &message),
             };
             write_rpc_result(stream, &id, json!({ "sessionId": session_id }))
         }
         Some("session.latest") => {
-            let latest = store.latest_session_id();
+            let workspace = match requested_workspace(&request, "session.latest") {
+                Ok(workspace) => workspace,
+                Err(message) => return write_rpc_error(stream, &id, &message),
+            };
+            let latest = match workspace {
+                Some(workspace) => store.latest_session_id_in_workspace(&workspace),
+                None => store.latest_session_id(),
+            };
             write_rpc_result(stream, &id, json!({ "sessionId": latest }))
         }
         Some("session.modelInfo") => {
@@ -246,22 +254,81 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
     }
 }
 
-fn requested_session_workspace(request: &Value) -> Result<Option<PathBuf>, String> {
+struct SessionCreateOptions {
+    cwd: Option<PathBuf>,
+    mode: SessionMode,
+}
+
+enum SessionMode {
+    Local,
+    Worktree,
+}
+
+fn create_session_with_options(
+    store: &SessionStore,
+    options: SessionCreateOptions,
+) -> Result<String, String> {
+    match options.mode {
+        SessionMode::Local => Ok(create_local_session(store, options.cwd)),
+        SessionMode::Worktree => create_worktree_session(store, options.cwd),
+    }
+}
+
+fn create_local_session(store: &SessionStore, cwd: Option<PathBuf>) -> String {
+    match cwd {
+        Some(workspace) => store.create_session_in_workspace(workspace),
+        None => store.create_session(),
+    }
+}
+
+fn create_worktree_session(store: &SessionStore, cwd: Option<PathBuf>) -> Result<String, String> {
+    let base = cwd.unwrap_or_else(|| store.default_workspace().to_path_buf());
+    let created = worktree::create_session_worktree(&base)?;
+    tracing::info!(
+        branch = %created.branch,
+        path = %created.path.display(),
+        "created session worktree"
+    );
+    Ok(store.create_session_in_workspace(created.path))
+}
+
+fn requested_session_options(request: &Value) -> Result<SessionCreateOptions, String> {
+    Ok(SessionCreateOptions {
+        cwd: requested_workspace(request, "session.create")?,
+        mode: requested_session_mode(request)?,
+    })
+}
+
+fn requested_session_mode(request: &Value) -> Result<SessionMode, String> {
+    let Some(mode_value) = request.get("params").and_then(|params| params.get("mode")) else {
+        return Ok(SessionMode::Local);
+    };
+    let Some(mode) = mode_value.as_str() else {
+        return Err("session.create mode must be a string".to_owned());
+    };
+    match mode {
+        "local" => Ok(SessionMode::Local),
+        "worktree" => Ok(SessionMode::Worktree),
+        _ => Err("session.create mode must be local or worktree".to_owned()),
+    }
+}
+
+fn requested_workspace(request: &Value, method: &str) -> Result<Option<PathBuf>, String> {
     let Some(cwd_value) = request.get("params").and_then(|params| params.get("cwd")) else {
         return Ok(None);
     };
     let Some(cwd) = cwd_value.as_str() else {
-        return Err("session.create cwd must be a string".to_owned());
+        return Err(format!("{method} cwd must be a string"));
     };
     let cwd = cwd.trim();
     if cwd.is_empty() {
-        return Err("session.create cwd must not be empty".to_owned());
+        return Err(format!("{method} cwd must not be empty"));
     }
 
     let canonical = std::fs::canonicalize(cwd)
-        .map_err(|error| format!("session.create cwd is not accessible: {error}"))?;
+        .map_err(|error| format!("{method} cwd is not accessible: {error}"))?;
     if !canonical.is_dir() {
-        return Err("session.create cwd must be a directory".to_owned());
+        return Err(format!("{method} cwd must be a directory"));
     }
     Ok(Some(canonical))
 }
