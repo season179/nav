@@ -126,6 +126,51 @@ fn created_sessions_can_record_their_workspace_root() {
 }
 
 #[test]
+fn project_root_normalizes_unresolved_commondir_paths() {
+    let path = temp_db();
+    let _cleanup = TempDb(path.clone());
+    let storage = Storage::open(&path).expect("open database");
+    let fixture_root =
+        std::env::temp_dir().join(format!("nav_storage_worktree_{}", uuid::Uuid::now_v7()));
+    let workspace = fixture_root.join("worktrees").join("copy");
+    let git_dir = fixture_root
+        .join("main")
+        .join(".git")
+        .join("worktrees")
+        .join("copy");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    std::fs::create_dir_all(&git_dir).expect("create git metadata");
+    std::fs::write(
+        workspace.join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .expect("write gitfile");
+    std::fs::write(
+        git_dir.join("commondir"),
+        "../../../missing/./repo/../repo/.git",
+    )
+    .expect("write unresolved commondir");
+
+    storage
+        .create_session_with_workspace("s", "nav", Some(&workspace))
+        .expect("create worktree session");
+
+    let sessions = storage.list_sessions("nav").unwrap();
+    let expected_project_root = fixture_root
+        .join("main")
+        .join("missing")
+        .join("repo")
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert_eq!(
+        sessions[0].project_root.as_deref(),
+        Some(expected_project_root.as_str())
+    );
+
+    let _ = std::fs::remove_dir_all(fixture_root);
+}
+
+#[test]
 fn most_recent_session_can_be_scoped_to_a_workspace_root() {
     let path = temp_db();
     let _cleanup = TempDb(path.clone());
