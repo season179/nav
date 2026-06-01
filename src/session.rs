@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
 use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
+use crate::stacks::ModelCallStack;
 use crate::storage::{SessionSummary, Storage, StorageError};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
@@ -79,6 +80,7 @@ struct Session {
     turns: TurnHistory,
     events: Vec<Event>,
     subscribers: Vec<Sender<Event>>,
+    stacks: Vec<ModelCallStack>,
     /// The in-flight run, set while a run is executing. `None` when idle.
     active_run: Option<ActiveRun>,
     /// Latest model-call context usage for this session.
@@ -105,6 +107,7 @@ impl Session {
             turns: TurnHistory::new(),
             events: Vec::new(),
             subscribers: Vec::new(),
+            stacks: Vec::new(),
             active_run: None,
             token_usage: None,
         }
@@ -478,7 +481,9 @@ impl SessionStore {
             run_id: &run_id,
             seq,
         };
-        let outcome = self.agent.run_turn(context, &workspace, &cancel, &mut sink);
+        let outcome = self
+            .agent
+            .run_turn(&run_id, context, &workspace, &cancel, &mut sink);
         match outcome {
             // A completed run already finalized itself inside the loop
             // (`next_input_or_finish` cleared the run and emitted `run.completed`
@@ -591,6 +596,15 @@ impl SessionStore {
             .unwrap()
             .get(session_id)
             .map(|session| session.events.clone())
+    }
+
+    /// Snapshot of the model-call stacks captured for a live session.
+    pub fn stacks(&self, session_id: &str) -> Option<Vec<ModelCallStack>> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .map(|session| session.stacks.clone())
     }
 
     fn with_default_workspace(&self, sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
@@ -815,6 +829,13 @@ impl AgentRunSink for SessionRunSink<'_> {
             );
         }
         Ok(())
+    }
+
+    fn model_call_stack(&mut self, mut stack: ModelCallStack) -> Result<(), Self::Error> {
+        self.store.with_session(self.session_id, |session| {
+            stack.sequence = session.stacks.len() as u64;
+            session.stacks.push(stack);
+        })
     }
 }
 

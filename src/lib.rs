@@ -27,6 +27,7 @@ mod context;
 pub mod logging;
 mod model;
 mod session;
+mod stacks;
 mod storage;
 mod system_prompt;
 mod tokens;
@@ -39,6 +40,7 @@ pub use model::{
     ModelResponse, OpenAiConfig, OpenAiModel, Role, TokenBudgetInfo, ToolCall, ToolDef,
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
+pub use stacks::{ModelCallStack, StackEntry, StackLayer};
 pub use storage::{SessionSummary, Storage, StorageError};
 pub use system_prompt::{
     BuildSystemPromptOptions, ContextFile, build_system_prompt, load_project_context_files,
@@ -171,6 +173,16 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                 })
                 .collect();
             write_rpc_result(stream, &id, json!({ "sessions": sessions }))
+        }
+        Some("session.stacks") => {
+            let session_id = request
+                .get("params")
+                .and_then(|p| p.get("sessionId"))
+                .and_then(Value::as_str);
+            match session_id.and_then(|session_id| store.stacks(session_id)) {
+                Some(stacks) => write_rpc_result(stream, &id, json!({ "stacks": stacks })),
+                None => write_rpc_error(stream, &id, "unknown session"),
+            }
         }
         Some("session.resume") => {
             let session_id = request

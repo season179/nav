@@ -138,6 +138,46 @@ fn provider_token_usage_is_recorded_for_the_session() {
 }
 
 #[test]
+fn model_call_stacks_capture_context_response_and_carried_state() {
+    let store = SessionStore::new(Arc::new(RecordingModel::new()));
+    let session_id = store.create_session();
+
+    store.send_message(&session_id, "show the stack").unwrap();
+
+    let stacks = store.stacks(&session_id).expect("the session exists");
+    assert_eq!(stacks.len(), 1);
+    let stack = &stacks[0];
+    assert_eq!(stack.sequence, 0);
+    assert_eq!(stack.status, "completed");
+    assert_eq!(stack.run_id.len(), 36);
+
+    let layer = |kind: &str| {
+        stack
+            .layers
+            .iter()
+            .find(|layer| layer.kind == kind)
+            .unwrap_or_else(|| panic!("missing stack layer {kind}"))
+    };
+    assert_eq!(layer("system_prompt").status, "available");
+    assert!(
+        layer("session_history").summary.contains("1 message(s)"),
+        "history layer should describe the request context: {:?}",
+        layer("session_history")
+    );
+    assert_eq!(layer("provider_payload").status, "unavailable");
+    assert!(
+        layer("normalized_response").summary.contains("stop finish"),
+        "normalized layer should include finish reason: {:?}",
+        layer("normalized_response")
+    );
+    assert!(
+        layer("carried_forward").summary.contains("2 message(s)"),
+        "carried-forward layer should include user plus assistant state: {:?}",
+        layer("carried_forward")
+    );
+}
+
+#[test]
 fn persisted_session_summaries_include_a_workspace_root() {
     let path =
         std::env::temp_dir().join(format!("nav_session_workspace_{}.db", uuid::Uuid::now_v7()));

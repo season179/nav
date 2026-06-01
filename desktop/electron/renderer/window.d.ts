@@ -43,6 +43,25 @@ declare global {
         thinking?: string | null;
         tokenUsage?: { used: number; contextWindow: number } | null;
       }>;
+      sessionStacks(sessionId?: string): Promise<
+        Array<{
+          id: string;
+          runId: string;
+          sequence: number;
+          status: string;
+          startedAtMs: number;
+          durationMs: number;
+          layers: Array<{
+            kind: string;
+            title: string;
+            status: string;
+            summary: string;
+            entries: Array<{ label: string; value: string }>;
+            text?: string;
+            json?: unknown;
+          }>;
+        }>
+      >;
       switchSession(sessionId: string): Promise<void>;
       newSession(workspaceRoot?: string | null): Promise<string>;
     };

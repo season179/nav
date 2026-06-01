@@ -9,10 +9,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 use crate::context::ModelContext;
-use crate::model::{ChatMessage, ChatModel, ModelError, ToolCall};
+use crate::model::{
+    ChatMessage, ChatModel, ModelError, ModelResponse, ProviderCallTrace, ToolCall, ToolDef,
+};
+use crate::stacks::{
+    ModelCallStack, ModelCallStackInput, SystemPromptTrace, build_model_call_stack,
+};
 use crate::system_prompt::{self, BuildSystemPromptOptions};
+use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
 
 /// Runs one coding-agent turn with a configured model, toolset, and workspace.
@@ -48,7 +56,7 @@ impl Agent {
     /// Build the system prompt for this run from the toolset, workspace, and any
     /// project context files. Rebuilt per run so the date and project context
     /// stay current.
-    fn system_prompt(&self, workspace: &Path) -> String {
+    fn system_prompt(&self, workspace: &Path) -> SystemPromptTrace {
         let tool_snippets = self.registry.prompt_snippets();
         let prompt_guidelines = self.registry.prompt_guidelines();
         let selected_tools = self.registry.tool_names();
@@ -57,14 +65,21 @@ impl Agent {
             system_prompt::nav_agent_dir().as_deref(),
         );
         let date = system_prompt::current_date();
-        system_prompt::build_system_prompt(&BuildSystemPromptOptions {
+        let prompt = system_prompt::build_system_prompt(&BuildSystemPromptOptions {
             selected_tools: &selected_tools,
             tool_snippets: &tool_snippets,
             prompt_guidelines: &prompt_guidelines,
             cwd: workspace,
             context_files: &context_files,
             date: &date,
-        })
+        });
+        SystemPromptTrace {
+            prompt,
+            selected_tools,
+            context_files,
+            cwd: workspace.to_string_lossy().replace('\\', "/"),
+            date,
+        }
     }
 
     /// Run the model/tool loop from the assembled context for one Run.
@@ -81,6 +96,7 @@ impl Agent {
     /// Returns how the run ended so the caller can emit the right terminal event.
     pub(crate) fn run_turn<S>(
         &self,
+        run_id: &str,
         mut context: ModelContext,
         workspace: &Path,
         cancel: &CancelFlag,
@@ -91,17 +107,56 @@ impl Agent {
     {
         let tool_defs = self.registry.defs();
         // Attach the system prompt once; it leads every model call this run.
-        context = context.with_system_prompt(self.system_prompt(workspace));
+        let system_prompt = self.system_prompt(workspace);
+        context = context.with_system_prompt(system_prompt.prompt.clone());
 
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(RunStop::Cancelled);
             }
 
-            let response = self
-                .model
-                .respond(&context, &tool_defs)
-                .map_err(AgentRunError::Model)?;
+            let context_before = context.messages().to_vec();
+            let started_at_ms = now_ms();
+            let started = Instant::now();
+            let traced = match self.model.respond_with_trace(&context, &tool_defs) {
+                Ok(traced) => traced,
+                Err(error) => {
+                    let duration_ms = elapsed_ms(started);
+                    ModelCallCapture {
+                        run_id,
+                        started_at_ms,
+                        duration_ms,
+                        system_prompt: &system_prompt,
+                        context_before: &context_before,
+                        tools: &tool_defs,
+                    }
+                    .record(
+                        sink,
+                        ModelCallStackOutcome {
+                            status: "failed",
+                            provider_trace: error.provider_trace.as_deref().cloned(),
+                            response: None,
+                            token_usage: None,
+                            context_after: context.messages(),
+                            steering_messages: Vec::new(),
+                            error: Some(error.message.clone()),
+                        },
+                    )?;
+                    return Err(AgentRunError::Model(error));
+                }
+            };
+            let duration_ms = elapsed_ms(started);
+            let stack_capture = ModelCallCapture {
+                run_id,
+                started_at_ms,
+                duration_ms,
+                system_prompt: &system_prompt,
+                context_before: &context_before,
+                tools: &tool_defs,
+            };
+            let response = traced.response;
+            let response_for_stack = response.clone();
+            let provider_trace = traced.provider_trace;
             let usage = response.token_usage.clone().unwrap_or_else(|| {
                 let input_estimate = self.model.estimate_context_tokens(&context, &tool_defs);
                 let output_estimate = self.model.estimate_output_tokens(&response);
@@ -113,6 +168,20 @@ impl Agent {
             // before the reply is emitted, so a cancelled run produces no final
             // assistant turn.
             if cancel.load(Ordering::Relaxed) {
+                stack_capture.record(
+                    sink,
+                    ModelCallStackOutcome {
+                        status: "cancelled",
+                        provider_trace,
+                        response: Some(response_for_stack),
+                        token_usage: Some(usage),
+                        context_after: context.messages(),
+                        steering_messages: Vec::new(),
+                        error: Some(
+                            "cancelled after model response before reply emission".to_owned(),
+                        ),
+                    },
+                )?;
                 return Ok(RunStop::Cancelled);
             }
 
@@ -130,12 +199,38 @@ impl Agent {
                 // folded into the context (mid-run steering).
                 match sink.next_input_or_finish().map_err(AgentRunError::Sink)? {
                     TurnContinuation::Continue(messages) => {
-                        for message in messages {
-                            context.push(ChatMessage::user(&message));
+                        for message in &messages {
+                            context.push(ChatMessage::user(message.as_str()));
                         }
+                        stack_capture.record(
+                            sink,
+                            ModelCallStackOutcome {
+                                status: "completed",
+                                provider_trace,
+                                response: Some(response_for_stack),
+                                token_usage: Some(usage),
+                                context_after: context.messages(),
+                                steering_messages: messages,
+                                error: None,
+                            },
+                        )?;
                         continue;
                     }
-                    TurnContinuation::Done => return Ok(RunStop::Completed),
+                    TurnContinuation::Done => {
+                        stack_capture.record(
+                            sink,
+                            ModelCallStackOutcome {
+                                status: "completed",
+                                provider_trace,
+                                response: Some(response_for_stack),
+                                token_usage: Some(usage),
+                                context_after: context.messages(),
+                                steering_messages: Vec::new(),
+                                error: None,
+                            },
+                        )?;
+                        return Ok(RunStop::Completed);
+                    }
                 }
             }
 
@@ -187,13 +282,100 @@ impl Agent {
             // the next model call sees it. A stop takes precedence: a cancelled
             // run drops its still-queued steering rather than acting on it.
             if cancel.load(Ordering::Relaxed) {
+                stack_capture.record(
+                    sink,
+                    ModelCallStackOutcome {
+                        status: "cancelled",
+                        provider_trace,
+                        response: Some(response_for_stack),
+                        token_usage: Some(usage),
+                        context_after: context.messages(),
+                        steering_messages: Vec::new(),
+                        error: Some("cancelled after tool batch".to_owned()),
+                    },
+                )?;
                 return Ok(RunStop::Cancelled);
             }
-            for message in sink.take_steer().map_err(AgentRunError::Sink)? {
-                context.push(ChatMessage::user(&message));
+            let steering_messages = sink.take_steer().map_err(AgentRunError::Sink)?;
+            for message in &steering_messages {
+                context.push(ChatMessage::user(message.as_str()));
             }
+            stack_capture.record(
+                sink,
+                ModelCallStackOutcome {
+                    status: "completed",
+                    provider_trace,
+                    response: Some(response_for_stack),
+                    token_usage: Some(usage),
+                    context_after: context.messages(),
+                    steering_messages,
+                    error: None,
+                },
+            )?;
         }
     }
+}
+
+struct ModelCallCapture<'a> {
+    run_id: &'a str,
+    started_at_ms: u64,
+    duration_ms: f64,
+    system_prompt: &'a SystemPromptTrace,
+    context_before: &'a [ChatMessage],
+    tools: &'a [ToolDef],
+}
+
+struct ModelCallStackOutcome<'a> {
+    status: &'a str,
+    provider_trace: Option<ProviderCallTrace>,
+    response: Option<ModelResponse>,
+    token_usage: Option<TokenUsage>,
+    context_after: &'a [ChatMessage],
+    steering_messages: Vec<String>,
+    error: Option<String>,
+}
+
+impl ModelCallCapture<'_> {
+    fn record<S>(
+        &self,
+        sink: &mut S,
+        outcome: ModelCallStackOutcome,
+    ) -> Result<(), AgentRunError<S::Error>>
+    where
+        S: AgentRunSink,
+    {
+        let stack = build_model_call_stack(ModelCallStackInput {
+            id: Uuid::now_v7().to_string(),
+            run_id: self.run_id.to_owned(),
+            status: outcome.status.to_owned(),
+            started_at_ms: self.started_at_ms,
+            duration_ms: self.duration_ms,
+            system_prompt: self.system_prompt.clone(),
+            context_before: self.context_before.to_vec(),
+            tools: self.tools.to_vec(),
+            provider_trace: outcome.provider_trace,
+            response: outcome.response,
+            token_usage: outcome.token_usage,
+            context_after: outcome.context_after.to_vec(),
+            steering_messages: outcome.steering_messages,
+            error: outcome.error,
+        });
+        sink.model_call_stack(stack).map_err(AgentRunError::Sink)
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn elapsed_ms(started_at: Instant) -> f64 {
+    let millis = started_at.elapsed().as_secs_f64() * 1000.0;
+    (millis * 100.0).round() / 100.0
 }
 
 /// How an agent run ended once `run_turn` returned without error.
@@ -251,6 +433,10 @@ pub(crate) trait AgentRunSink {
     fn next_input_or_finish(&mut self) -> Result<TurnContinuation, Self::Error>;
 
     fn token_usage(&mut self, _usage: &crate::tokens::TokenUsage) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn model_call_stack(&mut self, _stack: ModelCallStack) -> Result<(), Self::Error> {
         Ok(())
     }
 }

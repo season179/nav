@@ -62,6 +62,13 @@ contextBridge.exposeInMainWorld("nav", {
       sessionId == null ? undefined : normalizeSessionId(sessionId),
     );
   },
+  // Debug context stacks captured for a session's model calls.
+  sessionStacks(sessionId) {
+    return ipcRenderer.invoke(
+      "nav:session-stacks",
+      sessionId == null ? undefined : normalizeSessionId(sessionId),
+    );
+  },
   // Switch the active conversation to an existing session.
   switchSession(sessionId) {
     return ipcRenderer.invoke(

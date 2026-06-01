@@ -12,8 +12,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use chrono::Local;
+use serde::Serialize;
 
 /// One loaded project context file (AGENTS.md / CLAUDE.md): its path and content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ContextFile {
     pub path: String,
     pub content: String,
