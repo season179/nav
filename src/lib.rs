@@ -27,6 +27,7 @@ mod context;
 pub mod logging;
 mod model;
 mod session;
+mod stack_store;
 mod stacks;
 mod storage;
 mod system_prompt;
@@ -41,6 +42,9 @@ pub use model::{
     ModelResponse, OpenAiConfig, OpenAiModel, Role, TokenBudgetInfo, ToolCall, ToolDef,
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
+pub use stack_store::{
+    DEFAULT_STACKS_MAX_BYTES, StackAvailability, StackQueryResult, StackStore, StackStoreError,
+};
 pub use stacks::{ModelCallStack, StackEntry, StackLayer};
 pub use storage::{SessionSummary, Storage, StorageError};
 pub use system_prompt::{
@@ -190,7 +194,20 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                 .and_then(Value::as_str);
             match session_id {
                 Some(session_id) => match store.stacks(session_id) {
-                    Some(stacks) => write_rpc_result(stream, &id, json!({ "stacks": stacks })),
+                    Some(result) => write_rpc_result(stream, &id, json!(result)),
+                    None => write_rpc_error(stream, &id, "unknown session"),
+                },
+                None => write_rpc_error(stream, &id, "missing parameter: sessionId"),
+            }
+        }
+        Some("session.stackAvailability") => {
+            let session_id = request
+                .get("params")
+                .and_then(|p| p.get("sessionId"))
+                .and_then(Value::as_str);
+            match session_id {
+                Some(session_id) => match store.stack_availability(session_id) {
+                    Some(availability) => write_rpc_result(stream, &id, json!(availability)),
                     None => write_rpc_error(stream, &id, "unknown session"),
                 },
                 None => write_rpc_error(stream, &id, "missing parameter: sessionId"),

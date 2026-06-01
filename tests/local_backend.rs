@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-use nav::{MockModel, ModelInfo, SessionStore, Storage};
+use nav::{MockModel, ModelInfo, SessionStore, StackStore, Storage};
 use serde_json::{Value, json};
 
 /// An in-process backend bound to an ephemeral loopback port, driven over raw
@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 /// mock model.
 struct TestBackend {
     address: String,
+    _stack_dir: TempDir,
 }
 
 struct TempDir {
@@ -37,10 +38,22 @@ impl Drop for TempDir {
 
 impl TestBackend {
     fn start() -> Self {
-        Self::start_with(SessionStore::new(Arc::new(MockModel::new())))
+        let stack_dir = TempDir::new("stack_store");
+        let stack_store = Arc::new(
+            StackStore::open(&stack_dir.path.join("stacks.jsonl"), 1024 * 1024)
+                .expect("open stack store"),
+        );
+        Self::start_with_temp(
+            SessionStore::new(Arc::new(MockModel::new())).with_stack_store(stack_store),
+            stack_dir,
+        )
     }
 
     fn start_with(store: SessionStore) -> Self {
+        Self::start_with_temp(store, TempDir::new("backend"))
+    }
+
+    fn start_with_temp(store: SessionStore, stack_dir: TempDir) -> Self {
         let store = Arc::new(store);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let address = listener.local_addr().expect("read local addr").to_string();
@@ -49,7 +62,10 @@ impl TestBackend {
             let _ = nav::serve(listener, store);
         });
 
-        Self { address }
+        Self {
+            address,
+            _stack_dir: stack_dir,
+        }
     }
 
     fn connect(&self) -> TcpStream {
@@ -513,6 +529,41 @@ fn session_stacks_rpc_returns_captured_model_calls() {
             .iter()
             .any(|layer| layer["kind"] == "normalized_response"),
         "normalized response layer should be present: {response}"
+    );
+
+    let availability = json!({
+        "jsonrpc": "2.0",
+        "id": "stack-availability",
+        "method": "session.stackAvailability",
+        "params": { "sessionId": session_id },
+    });
+    let response = backend.rpc(&availability.to_string());
+    assert_eq!(
+        response["result"]["available"], true,
+        "stack availability should reflect the retained JSONL record: {response}"
+    );
+}
+
+#[test]
+fn session_stacks_rpc_reports_when_stack_records_are_unavailable() {
+    let backend = TestBackend::start_with(SessionStore::new(Arc::new(MockModel::new())));
+    let session_id = backend.create_session();
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "stacks",
+        "method": "session.stacks",
+        "params": { "sessionId": session_id },
+    });
+    let response = backend.rpc(&request.to_string());
+
+    assert_eq!(
+        response["result"]["stacks"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        response["result"]["unavailableReason"],
+        "stack_store_unavailable"
     );
 }
 

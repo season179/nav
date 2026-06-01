@@ -4,7 +4,7 @@
 //! layered instead of being only a raw JSON blob: each layer names what was
 //! available, how it was assembled, and what state moved forward.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::model::{
@@ -13,7 +13,7 @@ use crate::model::{
 use crate::system_prompt::ContextFile;
 use crate::tokens::{TokenCountConfidence, TokenCountSource, TokenUsage};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCallStack {
     pub id: String,
@@ -25,7 +25,7 @@ pub struct ModelCallStack {
     pub layers: Vec<StackLayer>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StackLayer {
     pub kind: String,
@@ -39,7 +39,7 @@ pub struct StackLayer {
     pub json: Option<Value>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StackEntry {
     pub label: String,

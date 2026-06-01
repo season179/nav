@@ -13,6 +13,7 @@ export default function App() {
   const [modelInfo, setModelInfo] = useState(null);
   const [stopPending, setStopPending] = useState(false);
   const [activeView, setActiveView] = useState("chat");
+  const [stackAvailable, setStackAvailable] = useState(false);
   const [stackRefreshKey, setStackRefreshKey] = useState(0);
   const [newSessionMode, setNewSessionMode] = useState("local");
 
@@ -24,6 +25,7 @@ export default function App() {
   const stopSentForActiveRunRef = useRef(false);
   const stopRequestedRef = useRef(false);
   const nextMessageIdRef = useRef(0);
+  const stackAvailabilityRequestRef = useRef(0);
 
   const setConnectedState = useCallback((isConnected) => {
     connectedRef.current = isConnected;
@@ -68,6 +70,10 @@ export default function App() {
     refreshStacks();
     window.setTimeout(refreshStacks, 120);
   }, [refreshStacks]);
+
+  const markStacksUnavailable = useCallback(() => {
+    setStackAvailable(false);
+  }, []);
 
   const appendMessage = useCallback(
     (role, text) => {
@@ -146,6 +152,42 @@ export default function App() {
     }
   }, []);
 
+  const refreshStackAvailability = useCallback(
+    async (sessionId, options = {}) => {
+      if (!window.nav) {
+        return;
+      }
+      const targetSessionId = sessionId ?? activeSessionIdRef.current;
+      if (!targetSessionId) {
+        setStackAvailable(false);
+        return;
+      }
+      const requestId = stackAvailabilityRequestRef.current + 1;
+      stackAvailabilityRequestRef.current = requestId;
+      if (options.reset) {
+        setStackAvailable(false);
+      }
+      try {
+        const availability =
+          await window.nav.sessionStackAvailability(targetSessionId);
+        if (
+          requestId === stackAvailabilityRequestRef.current &&
+          targetSessionId === activeSessionIdRef.current
+        ) {
+          setStackAvailable(availability?.available === true);
+        }
+      } catch {
+        if (
+          requestId === stackAvailabilityRequestRef.current &&
+          targetSessionId === activeSessionIdRef.current
+        ) {
+          setStackAvailable(false);
+        }
+      }
+    },
+    [],
+  );
+
   const renderBackendStatus = useCallback(
     (status) => {
       switch (status.state) {
@@ -215,10 +257,12 @@ export default function App() {
       setRunningState(false);
       refreshSessions();
       refreshModelInfo(status.sessionId);
+      refreshStackAvailability(status.sessionId, { reset: true });
     },
     [
       refreshModelInfo,
       refreshSessions,
+      refreshStackAvailability,
       renderBackendStatus,
       setActiveSession,
       setConnectedState,
@@ -277,6 +321,7 @@ export default function App() {
           setStopRequested(false);
           refreshSessions();
           refreshModelInfo();
+          refreshStackAvailability();
           refreshStacksAfterTerminalEvent();
           break;
         case "run.failed":
@@ -286,6 +331,7 @@ export default function App() {
           setStopRequested(false);
           refreshSessions();
           refreshModelInfo();
+          refreshStackAvailability();
           refreshStacksAfterTerminalEvent();
           break;
         default:
@@ -296,6 +342,7 @@ export default function App() {
       appendMessage,
       refreshModelInfo,
       refreshSessions,
+      refreshStackAvailability,
       refreshStacks,
       refreshStacksAfterTerminalEvent,
       setRunningState,
@@ -310,10 +357,17 @@ export default function App() {
   const activateCreatedSession = useCallback(
     async (sessionId) => {
       setActiveSession(sessionId);
+      setStackAvailable(false);
       await refreshSessions();
       refreshModelInfo(sessionId);
+      refreshStackAvailability(sessionId, { reset: true });
     },
-    [refreshModelInfo, refreshSessions, setActiveSession],
+    [
+      refreshModelInfo,
+      refreshSessions,
+      refreshStackAvailability,
+      setActiveSession,
+    ],
   );
 
   const selectSession = useCallback(
@@ -328,16 +382,26 @@ export default function App() {
 
       const previousSessionId = activeSessionIdRef.current;
       clearTranscript();
+      setActiveView("chat");
+      setStackAvailable(false);
       setActiveSession(sessionId);
       try {
         await window.nav.switchSession(sessionId);
         refreshModelInfo(sessionId);
+        refreshStackAvailability(sessionId, { reset: true });
       } catch (error) {
         setActiveSession(previousSessionId);
+        refreshStackAvailability(previousSessionId, { reset: true });
         appendMessage("error", `Could not open session: ${error.message}`);
       }
     },
-    [appendMessage, clearTranscript, refreshModelInfo, setActiveSession],
+    [
+      appendMessage,
+      clearTranscript,
+      refreshModelInfo,
+      refreshStackAvailability,
+      setActiveSession,
+    ],
   );
 
   const startNewChatInProject = useCallback(
@@ -427,11 +491,13 @@ export default function App() {
           activeView={activeView}
           connected={connected}
           sessionId={activeSessionId}
+          showStacks={stackAvailable}
           onSelectView={setActiveView}
         />
         {activeView === "stacks" ? (
           <StacksPage
             key={`${activeSessionId ?? "none"}-${stackRefreshKey}`}
+            onUnavailable={markStacksUnavailable}
             sessionId={activeSessionId}
           />
         ) : (
@@ -454,7 +520,13 @@ export default function App() {
   );
 }
 
-function SessionToolbar({ activeView, connected, sessionId, onSelectView }) {
+function SessionToolbar({
+  activeView,
+  connected,
+  sessionId,
+  showStacks,
+  onSelectView,
+}) {
   return (
     <header className="session-toolbar">
       <div className="session-toolbar-title">
@@ -472,15 +544,17 @@ function SessionToolbar({ activeView, connected, sessionId, onSelectView }) {
         >
           Chat
         </button>
-        <button
-          type="button"
-          className="session-view-tab"
-          aria-current={activeView === "stacks" ? "page" : undefined}
-          disabled={!connected || !sessionId}
-          onClick={() => onSelectView("stacks")}
-        >
-          Stacks
-        </button>
+        {showStacks ? (
+          <button
+            type="button"
+            className="session-view-tab"
+            aria-current={activeView === "stacks" ? "page" : undefined}
+            disabled={!connected || !sessionId}
+            onClick={() => onSelectView("stacks")}
+          >
+            Stacks
+          </button>
+        ) : null}
       </nav>
     </header>
   );

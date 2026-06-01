@@ -1,24 +1,32 @@
 import { useEffect, useMemo, useState } from "react";
 
-export default function StacksPage({ sessionId }) {
+export default function StacksPage({ onUnavailable, sessionId }) {
   const [stacks, setStacks] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [unavailableReason, setUnavailableReason] = useState(null);
 
   useEffect(() => {
     let alive = true;
     if (!sessionId || !window.nav) {
       setStacks([]);
+      setUnavailableReason(null);
       return undefined;
     }
 
     setLoading(true);
     setError(null);
+    setUnavailableReason(null);
     window.nav
       .sessionStacks(sessionId)
-      .then((nextStacks) => {
+      .then((result) => {
         if (alive) {
-          setStacks(Array.isArray(nextStacks) ? nextStacks : []);
+          const nextStacks = Array.isArray(result?.stacks) ? result.stacks : [];
+          setStacks(nextStacks);
+          setUnavailableReason(result?.unavailableReason ?? null);
+          if (nextStacks.length === 0 && result?.unavailableReason) {
+            onUnavailable?.(result.unavailableReason);
+          }
         }
       })
       .catch((fetchError) => {
@@ -35,7 +43,7 @@ export default function StacksPage({ sessionId }) {
     return () => {
       alive = false;
     };
-  }, [sessionId]);
+  }, [onUnavailable, sessionId]);
 
   const orderedStacks = useMemo(
     () => [...stacks].sort((left, right) => left.sequence - right.sequence),
@@ -74,7 +82,7 @@ export default function StacksPage({ sessionId }) {
       </div>
 
       {orderedStacks.length === 0 ? (
-        <EmptyStacks text="No model calls captured for this live session yet" />
+        <EmptyStacks text={emptyStackText(unavailableReason)} />
       ) : (
         <ol className="stack-call-list">
           {orderedStacks.map((stack) => (
@@ -152,6 +160,19 @@ function EntryGrid({ entries }) {
 
 function EmptyStacks({ text }) {
   return <div className="stacks-empty">{text}</div>;
+}
+
+function emptyStackText(reason) {
+  switch (reason) {
+    case "trimmed_or_missing":
+      return "Stack records for this session were no longer available. The stack log is capped at 800MB, so older records may have been trimmed.";
+    case "stack_store_unavailable":
+      return "Stack storage is unavailable for this backend run.";
+    case "stack_store_error":
+      return "Stack records could not be read from the local stack log.";
+    default:
+      return "No model calls captured for this live session yet";
+  }
 }
 
 function defaultOpen(layer) {

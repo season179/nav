@@ -44,8 +44,8 @@ declare global {
         thinking?: string | null;
         tokenUsage?: { used: number; contextWindow: number } | null;
       }>;
-      sessionStacks(sessionId?: string): Promise<
-        Array<{
+      sessionStacks(sessionId?: string): Promise<{
+        stacks: Array<{
           id: string;
           runId: string;
           sequence: number;
@@ -61,8 +61,12 @@ declare global {
             text?: string;
             json?: unknown;
           }>;
-        }>
-      >;
+        }>;
+        unavailableReason?: string;
+      }>;
+      sessionStackAvailability(sessionId?: string): Promise<{
+        available: boolean;
+      }>;
       switchSession(sessionId: string): Promise<void>;
       newSession(
         workspaceRoot?: string | null,

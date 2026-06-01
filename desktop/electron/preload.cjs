@@ -81,6 +81,13 @@ contextBridge.exposeInMainWorld("nav", {
       sessionId == null ? undefined : normalizeSessionId(sessionId),
     );
   },
+  // Advisory scan for whether stack records are currently retained.
+  sessionStackAvailability(sessionId) {
+    return ipcRenderer.invoke(
+      "nav:session-stack-availability",
+      sessionId == null ? undefined : normalizeSessionId(sessionId),
+    );
+  },
   // Switch the active conversation to an existing session.
   switchSession(sessionId) {
     return ipcRenderer.invoke(

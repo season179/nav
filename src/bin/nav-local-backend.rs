@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use nav::{ModelChoice, SessionStore, Storage};
+use nav::{ModelChoice, SessionStore, StackStore, Storage};
 use serde_json::{Value, json};
 
 const STARTUP_TRACE_PREFIX: &str = "nav startup trace ";
@@ -112,6 +112,45 @@ fn run() -> io::Result<()> {
                 }),
             );
             tracing::error!(%error, "storage unavailable, sessions will not persist");
+        }
+    }
+
+    let stacks_override = std::env::var("NAV_STACKS_PATH")
+        .ok()
+        .filter(|path| !path.is_empty());
+    let stacks_location = stacks_override.as_deref().unwrap_or("~/.nav/stacks.jsonl");
+    let stacks_source = if stacks_override.is_some() {
+        "override"
+    } else {
+        "default"
+    };
+    let stacks_started = Instant::now();
+    let opened_stacks = match &stacks_override {
+        Some(path) => StackStore::open(Path::new(path), nav::DEFAULT_STACKS_MAX_BYTES),
+        None => StackStore::open_default(),
+    };
+    let stacks_duration_ms = elapsed_ms(stacks_started);
+    match opened_stacks {
+        Ok(stack_store) => {
+            trace.event(
+                "backend.stack_store.opened",
+                json!({
+                    "duration_ms": stacks_duration_ms,
+                    "location": stacks_source,
+                }),
+            );
+            tracing::info!(location = %stacks_location, "persisting model-call stacks");
+            store = store.with_stack_store(Arc::new(stack_store));
+        }
+        Err(error) => {
+            trace.event(
+                "backend.stack_store.failed",
+                json!({
+                    "duration_ms": stacks_duration_ms,
+                    "location": stacks_source,
+                }),
+            );
+            tracing::error!(%error, "stack store unavailable, stacks will not persist");
         }
     }
     let store = Arc::new(store);
