@@ -113,6 +113,40 @@ fn test_non_reasoning_model_resolves_thinking_level_to_off() {
 }
 
 #[test]
+fn test_non_string_thinking_level_mapping_is_unsupported() {
+    let settings = json!({
+        "defaultModel": {
+            "provider": "commandcode",
+            "model": "Qwen/Qwen3.7-Max"
+        },
+        "defaultThinkingLevel": "high",
+        "providers": {
+            "commandcode": {
+                "baseUrl": "https://api.example.com",
+                "apiKey": "test-key-literal",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "Qwen/Qwen3.7-Max",
+                        "reasoning": true,
+                        "thinkingLevelMap": {
+                            "high": true
+                        }
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let config = resolve_config(path).expect("Should resolve valid config");
+
+        assert_eq!(config.thinking_level, "medium");
+    });
+}
+
+#[test]
 fn test_missing_settings_file() {
     let path = Path::new("non_existent_settings_file_12345.json");
     let res = resolve_config(path);

@@ -368,12 +368,11 @@ fn is_supported_thinking_level(
         return level == "off";
     }
 
-    let mapped = thinking_level_map.and_then(|map| map.get(level));
-    if matches!(mapped, Some(serde_json::Value::Null)) {
-        return false;
+    match thinking_level_map.and_then(|map| map.get(level)) {
+        Some(serde_json::Value::String(_)) => true,
+        Some(_) => false,
+        None => level != "xhigh",
     }
-
-    level != "xhigh" || mapped.is_some()
 }
 
 /// Load and resolve Pi-style model settings from settings.json.
