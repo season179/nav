@@ -57,6 +57,23 @@ fn stack_store_appends_and_reads_session_records() {
 }
 
 #[test]
+fn stack_store_returns_empty_success_when_limit_is_zero() {
+    let path = std::env::temp_dir().join(format!(
+        "nav_stack_store_zero_limit_{}.jsonl",
+        uuid::Uuid::now_v7()
+    ));
+    let store = StackStore::open(&path, 1024 * 1024).expect("open stack store");
+
+    store.append("session", &stack("call-1", 0)).unwrap();
+
+    let result = store.stacks("session", 0).unwrap();
+    assert!(result.stacks.is_empty());
+    assert_eq!(result.unavailable_reason, None);
+
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn stack_store_compacts_to_newest_valid_records_under_the_cap() {
     let path = std::env::temp_dir().join(format!(
         "nav_stack_store_compact_{}.jsonl",

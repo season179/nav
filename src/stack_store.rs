@@ -151,6 +151,13 @@ impl StackStore {
         session_id: &str,
         limit: usize,
     ) -> Result<StackQueryResult, StackStoreError> {
+        if limit == 0 {
+            return Ok(StackQueryResult {
+                stacks: Vec::new(),
+                unavailable_reason: None,
+            });
+        }
+
         let mut stacks = Vec::new();
         let Ok(file) = File::open(&self.path) else {
             return Ok(StackQueryResult {
@@ -245,9 +252,7 @@ impl StackStore {
         records: Vec<Vec<u8>>,
         appended_line: Option<&[u8]>,
     ) -> Result<(), StackStoreError> {
-        let temp_path = self
-            .path
-            .with_extension(format!("jsonl.tmp-{}", Uuid::now_v7()));
+        let temp_path = temp_path_next_to(&self.path);
         {
             let mut temp = File::create(&temp_path)?;
             for chunk in records {
@@ -258,9 +263,110 @@ impl StackStore {
                 temp.write_all(line)?;
             }
             temp.flush()?;
+            temp.sync_all()?;
         }
-        fs::rename(temp_path, &self.path)?;
+        replace_file(&temp_path, &self.path)?;
         Ok(())
+    }
+}
+
+fn temp_path_next_to(path: &Path) -> PathBuf {
+    // Keep the temp file beside the target so successful renames stay on the
+    // same filesystem. Some platforms still fail when replacing an existing
+    // target, so `replace_file` has a verified copy fallback.
+    path.with_extension(format!("jsonl.tmp-{}", Uuid::now_v7()))
+}
+
+fn replace_file(temp_path: &Path, target_path: &Path) -> Result<(), StackStoreError> {
+    match fs::rename(temp_path, target_path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            tracing::warn!(
+                temp_path = %temp_path.display(),
+                target_path = %target_path.display(),
+                %rename_error,
+                "stack log rename failed; falling back to copy replacement"
+            );
+            replace_file_by_copy(temp_path, target_path, &rename_error)
+        }
+    }
+}
+
+fn replace_file_by_copy(
+    temp_path: &Path,
+    target_path: &Path,
+    rename_error: &std::io::Error,
+) -> Result<(), StackStoreError> {
+    let bytes = fs::read(temp_path).map_err(|error| {
+        StackStoreError(format!(
+            "rename failed ({rename_error}); fallback could not read {}: {error}",
+            temp_path.display()
+        ))
+    })?;
+
+    {
+        let mut target = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(target_path)
+            .map_err(|error| {
+                StackStoreError(format!(
+                    "rename failed ({rename_error}); fallback could not open {}: {error}",
+                    target_path.display()
+                ))
+            })?;
+        target.write_all(&bytes).map_err(|error| {
+            StackStoreError(format!(
+                "rename failed ({rename_error}); fallback could not write {}: {error}",
+                target_path.display()
+            ))
+        })?;
+        target.sync_all().map_err(|error| {
+            StackStoreError(format!(
+                "rename failed ({rename_error}); fallback could not sync {}: {error}",
+                target_path.display()
+            ))
+        })?;
+    }
+
+    let written_len = fs::metadata(target_path)
+        .map_err(|error| {
+            StackStoreError(format!(
+                "rename failed ({rename_error}); fallback could not stat {}: {error}",
+                target_path.display()
+            ))
+        })?
+        .len();
+    if written_len != bytes.len() as u64 {
+        return Err(StackStoreError(format!(
+            "rename failed ({rename_error}); fallback wrote {} bytes, expected {} bytes",
+            written_len,
+            bytes.len()
+        )));
+    }
+
+    sync_parent_dir(target_path, rename_error);
+    fs::remove_file(temp_path).map_err(|error| {
+        StackStoreError(format!(
+            "rename failed ({rename_error}); fallback wrote {}, but could not remove {}: {error}",
+            target_path.display(),
+            temp_path.display()
+        ))
+    })
+}
+
+fn sync_parent_dir(path: &Path, rename_error: &std::io::Error) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+        tracing::debug!(
+            parent = %parent.display(),
+            %rename_error,
+            %error,
+            "stack log fallback could not fsync parent directory"
+        );
     }
 }
 
