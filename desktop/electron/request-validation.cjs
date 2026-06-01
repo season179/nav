@@ -9,6 +9,14 @@ function normalizeSessionId(value) {
   return normalizeRequiredString(value, "session id");
 }
 
+function normalizeModelProvider(value) {
+  return normalizeRequiredString(value, "model provider");
+}
+
+function normalizeModelId(value) {
+  return normalizeRequiredString(value, "model id");
+}
+
 function normalizeOptionalWorkspaceRoot(value) {
   if (value === undefined || value === null) {
     return null;
@@ -38,7 +46,9 @@ function normalizeRequiredString(value, label) {
 }
 
 module.exports = {
+  normalizeModelId,
   normalizeMessageText,
+  normalizeModelProvider,
   normalizeOptionalSessionMode,
   normalizeOptionalWorkspaceRoot,
   normalizeSessionId,

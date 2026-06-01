@@ -132,6 +132,56 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
   assert.match(assistantReplies[1].text, /my name is Ada/);
 });
 
+test("Electron backend client lists and switches configured models", async () => {
+  const backend = await startConfiguredBackend();
+
+  try {
+    const listed = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.models",
+    });
+    assert.deepEqual(listed.result.models, [
+      {
+        provider: "local",
+        model: "qwen-coder",
+        label: "Qwen Coder",
+      },
+      {
+        provider: "openai",
+        model: "gpt-default",
+        label: "Default GPT",
+      },
+    ]);
+
+    const before = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.modelInfo",
+    });
+    assert.equal(before.result.label, "Default GPT");
+    assert.equal(before.result.provider, "openai");
+    assert.equal(before.result.model, "gpt-default");
+
+    const switched = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.switchModel",
+      params: { provider: "local", model: "qwen-coder" },
+    });
+    assert.equal(switched.result.modelInfo.label, "Qwen Coder");
+    assert.equal(switched.result.modelInfo.provider, "local");
+    assert.equal(switched.result.modelInfo.model, "qwen-coder");
+
+    const after = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.modelInfo",
+    });
+    assert.equal(after.result.label, "Qwen Coder");
+    assert.equal(after.result.provider, "local");
+    assert.equal(after.result.model, "qwen-coder");
+  } finally {
+    backend.stop();
+  }
+});
+
 test("SSE subscription reports non-200 response status before failing", async () => {
   const server = http.createServer((_request, response) => {
     response.writeHead(503);
@@ -219,6 +269,73 @@ async function startMockBackend() {
     url: backend.url,
     stop() {
       backend.child.kill();
+      for (const suffix of ["", "-wal", "-shm"]) {
+        fs.rmSync(`${dbPath}${suffix}`, { force: true });
+      }
+    },
+  };
+}
+
+async function startConfiguredBackend() {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nav-home-"));
+  const navDir = path.join(home, ".nav");
+  fs.mkdirSync(navDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(navDir, "settings.json"),
+    JSON.stringify({
+      defaultModel: {
+        provider: "openai",
+        model: "gpt-default",
+      },
+      providers: {
+        openai: {
+          baseUrl: "https://api.openai.example/v1",
+          apiKey: "test-openai-key",
+          api: "openai-completions",
+          models: [
+            {
+              id: "gpt-default",
+              name: "Default GPT",
+            },
+          ],
+        },
+        local: {
+          baseUrl: "http://localhost:11434/v1",
+          apiKey: "test-local-key",
+          api: "openai-completions",
+          models: [
+            {
+              id: "qwen-coder",
+              name: "Qwen Coder",
+            },
+          ],
+        },
+      },
+    }),
+  );
+
+  const dbPath = path.join(
+    os.tmpdir(),
+    `nav-electron-config-test-${crypto.randomUUID()}.db`,
+  );
+  const backend = await startLocalBackend({
+    projectRoot: process.cwd(),
+    startupAttempts: 80,
+    env: {
+      HOME: home,
+      CARGO_HOME: process.env.CARGO_HOME ?? path.join(os.homedir(), ".cargo"),
+      RUSTUP_HOME:
+        process.env.RUSTUP_HOME ?? path.join(os.homedir(), ".rustup"),
+      NAV_DB_PATH: dbPath,
+      NAV_MOCK_MODEL: "",
+    },
+  });
+
+  return {
+    url: backend.url,
+    stop() {
+      backend.child.kill();
+      fs.rmSync(home, { recursive: true, force: true });
       for (const suffix of ["", "-wal", "-shm"]) {
         fs.rmSync(`${dbPath}${suffix}`, { force: true });
       }

@@ -9,9 +9,12 @@ const sessionModeOptions = [
 export default function Composer({
   connected,
   modelInfo,
+  modelOptions,
+  modelSwitching,
   newSessionMode,
   running,
   stopPending,
+  onModelChange,
   onNewSessionModeChange,
   onSend,
   onStop,
@@ -100,13 +103,12 @@ export default function Composer({
             mode={newSessionMode}
             onModeChange={onNewSessionModeChange}
           />
-          <span
-            className="composer-model"
-            id="composer-model"
-            aria-live="polite"
-          >
-            {modelInfo?.label ?? ""}
-          </span>
+          <ModelMenu
+            disabled={!connected || modelSwitching}
+            modelInfo={modelInfo}
+            options={modelOptions}
+            onModelChange={onModelChange}
+          />
         </span>
         <span className="composer-meta-right">
           <span
@@ -122,6 +124,168 @@ export default function Composer({
         </span>
       </div>
     </form>
+  );
+}
+
+function ModelMenu({ disabled, modelInfo, options, onModelChange }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const menuRef = useRef(null);
+  const searchRef = useRef(null);
+  const triggerRef = useRef(null);
+  const hasOptions = options.length > 0;
+  const visibleOptions = filterModelOptions(options, query);
+
+  const closeMenu = useCallback(() => {
+    setOpen(false);
+    setQuery("");
+    window.setTimeout(() => {
+      triggerRef.current?.focus();
+    }, 0);
+  }, []);
+
+  const openMenu = useCallback(() => {
+    setOpen(true);
+    window.setTimeout(() => {
+      searchRef.current?.focus();
+    }, 0);
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+
+    function closeOnOutsidePointer(event) {
+      if (!menuRef.current?.contains(event.target)) {
+        closeMenu();
+      }
+    }
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+    };
+  }, [open, closeMenu]);
+
+  useEffect(() => {
+    if (disabled || !hasOptions) {
+      closeMenu();
+    }
+  }, [disabled, hasOptions, closeMenu]);
+
+  function selectModel(option) {
+    onModelChange(option);
+    closeMenu();
+  }
+
+  function closeOnEscape(event) {
+    if (event.key === "Escape") {
+      closeMenu();
+    }
+  }
+
+  function handleSearchKeyDown(event) {
+    event.stopPropagation();
+    if (event.key === "Enter") {
+      event.preventDefault();
+      return;
+    }
+    closeOnEscape(event);
+  }
+
+  function toggleMenu() {
+    if (open) {
+      closeMenu();
+    } else {
+      openMenu();
+    }
+  }
+
+  if (!hasOptions) {
+    return (
+      <span className="composer-model" id="composer-model" aria-live="polite">
+        {modelInfo?.label ?? ""}
+      </span>
+    );
+  }
+
+  return (
+    <span className="composer-model-menu" ref={menuRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        id="composer-model"
+        className="model-trigger"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-live="polite"
+        disabled={disabled}
+        onClick={toggleMenu}
+        onKeyDown={closeOnEscape}
+      >
+        <span>{modelInfo?.label ?? "Model"}</span>
+        <span className="model-chevron" aria-hidden="true">
+          v
+        </span>
+      </button>
+      {open ? (
+        <div className="model-menu" role="menu" onKeyDown={closeOnEscape}>
+          <input
+            ref={searchRef}
+            type="search"
+            className="model-search"
+            aria-label="Search models"
+            placeholder="Search models"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={handleSearchKeyDown}
+          />
+          {visibleOptions.map((option) => {
+            const selected = isCurrentModel(option, modelInfo);
+            return (
+              <button
+                key={`${option.provider}:${option.model}`}
+                type="button"
+                className="model-option"
+                role="menuitemradio"
+                aria-checked={selected ? "true" : "false"}
+                onClick={() => selectModel(option)}
+              >
+                <span className="model-option-label">{option.label}</span>
+                <span className="model-option-provider">{option.provider}</span>
+                <span className="model-check" aria-hidden="true">
+                  {selected ? "✓" : ""}
+                </span>
+              </button>
+            );
+          })}
+          {visibleOptions.length === 0 ? (
+            <div className="model-empty">No matching models</div>
+          ) : null}
+        </div>
+      ) : null}
+    </span>
+  );
+}
+
+function filterModelOptions(options, query) {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return options;
+  }
+  return options.filter((option) =>
+    modelSearchText(option).includes(normalizedQuery),
+  );
+}
+
+function modelSearchText(option) {
+  return `${option.label} ${option.provider} ${option.model}`.toLowerCase();
+}
+
+function isCurrentModel(option, modelInfo) {
+  return (
+    option.provider === modelInfo?.provider && option.model === modelInfo?.model
   );
 }
 

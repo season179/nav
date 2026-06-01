@@ -11,6 +11,7 @@ const THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "
 #[derive(Clone)]
 pub struct ResolvedModelConfig {
     pub api_key: String,
+    pub provider: String,
     pub model: String,
     pub base_url: String,
     pub name: String,
@@ -27,6 +28,7 @@ impl std::fmt::Debug for ResolvedModelConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedModelConfig")
             .field("api_key", &"<redacted>")
+            .field("provider", &self.provider)
             .field("model", &self.model)
             .field("base_url", &self.base_url)
             .field("name", &self.name)
@@ -39,6 +41,14 @@ impl std::fmt::Debug for ResolvedModelConfig {
             .field("thinking_level_map", &self.thinking_level_map)
             .finish()
     }
+}
+
+/// One model declared in settings.json, safe to return to frontends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfiguredModel {
+    pub provider: String,
+    pub model: String,
+    pub name: String,
 }
 
 /// Errors occurring during settings loading or resolution.
@@ -77,11 +87,7 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "Configuration is missing 'providers' setup")
             }
             ConfigError::MissingProvider(provider) => {
-                write!(
-                    f,
-                    "Default provider '{}' is not defined in configuration",
-                    provider
-                )
+                write!(f, "Provider '{}' is not defined in configuration", provider)
             }
             ConfigError::MissingModel { provider, model } => {
                 write!(
@@ -375,8 +381,7 @@ fn is_supported_thinking_level(
     }
 }
 
-/// Load and resolve Pi-style model settings from settings.json.
-pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
+fn read_settings(path: &Path) -> Result<SettingsFile, ConfigError> {
     let file = std::fs::File::open(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ConfigError::FileNotFound(path.to_path_buf())
@@ -385,32 +390,64 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
         }
     })?;
 
-    let settings: SettingsFile = serde_json::from_reader(std::io::BufReader::new(file))
-        .map_err(|e| ConfigError::Json(e.to_string()))?;
+    serde_json::from_reader(std::io::BufReader::new(file))
+        .map_err(|e| ConfigError::Json(e.to_string()))
+}
 
+/// Load and resolve Pi-style model settings from settings.json.
+pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
+    let settings = read_settings(path)?;
     let default_ref = settings
         .default_model
+        .as_ref()
         .ok_or(ConfigError::MissingDefaultModel)?;
-    let providers = settings.providers.ok_or(ConfigError::MissingProviders)?;
+
+    resolve_settings_model(&settings, default_ref)
+}
+
+/// Resolve a specific provider/model pair declared in settings.json.
+pub fn resolve_model_config(
+    path: &Path,
+    provider: &str,
+    model: &str,
+) -> Result<ResolvedModelConfig, ConfigError> {
+    let settings = read_settings(path)?;
+    let requested = DefaultModelRef {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        thinking_level: None,
+    };
+
+    resolve_settings_model(&settings, &requested)
+}
+
+fn resolve_settings_model(
+    settings: &SettingsFile,
+    model_ref: &DefaultModelRef,
+) -> Result<ResolvedModelConfig, ConfigError> {
+    let providers = settings
+        .providers
+        .as_ref()
+        .ok_or(ConfigError::MissingProviders)?;
 
     let provider_config = providers
-        .get(&default_ref.provider)
-        .ok_or_else(|| ConfigError::MissingProvider(default_ref.provider.clone()))?;
+        .get(&model_ref.provider)
+        .ok_or_else(|| ConfigError::MissingProvider(model_ref.provider.clone()))?;
 
     let models = provider_config
         .models
         .as_ref()
         .ok_or_else(|| ConfigError::MissingModel {
-            provider: default_ref.provider.clone(),
-            model: default_ref.model.clone(),
+            provider: model_ref.provider.clone(),
+            model: model_ref.model.clone(),
         })?;
 
     let model_config = models
         .iter()
-        .find(|m| m.id == default_ref.model)
+        .find(|m| m.id == model_ref.model)
         .ok_or_else(|| ConfigError::MissingModel {
-            provider: default_ref.provider.clone(),
-            model: default_ref.model.clone(),
+            provider: model_ref.provider.clone(),
+            model: model_ref.model.clone(),
         })?;
 
     let api = model_config
@@ -418,12 +455,12 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
         .as_ref()
         .or(provider_config.api.as_ref())
         .ok_or_else(|| ConfigError::MissingApi {
-            provider: default_ref.provider.clone(),
+            provider: model_ref.provider.clone(),
         })?;
 
     if api != "openai-completions" {
         return Err(ConfigError::UnsupportedApi {
-            provider: default_ref.provider.clone(),
+            provider: model_ref.provider.clone(),
             api: api.clone(),
         });
     }
@@ -432,21 +469,21 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
         .base_url
         .as_ref()
         .or(provider_config.base_url.as_ref())
-        .ok_or_else(|| ConfigError::MissingBaseUrl(default_ref.provider.clone()))?
+        .ok_or_else(|| ConfigError::MissingBaseUrl(model_ref.provider.clone()))?
         .clone();
 
     if base_url.trim().is_empty() {
-        return Err(ConfigError::MissingBaseUrl(default_ref.provider.clone()));
+        return Err(ConfigError::MissingBaseUrl(model_ref.provider.clone()));
     }
 
     let api_key_raw = provider_config
         .api_key
         .as_ref()
-        .ok_or_else(|| ConfigError::MissingApiKey(default_ref.provider.clone()))?;
+        .ok_or_else(|| ConfigError::MissingApiKey(model_ref.provider.clone()))?;
 
     let api_key = resolve_config_value(api_key_raw)?;
     if api_key.trim().is_empty() {
-        return Err(ConfigError::MissingApiKey(default_ref.provider.clone()));
+        return Err(ConfigError::MissingApiKey(model_ref.provider.clone()));
     }
 
     let compat = merge_json_objects(provider_config.compat.clone(), model_config.compat.clone());
@@ -465,7 +502,7 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
     let thinking_level = resolve_thinking_level(
         reasoning,
         thinking_level_map.as_ref(),
-        default_ref
+        model_ref
             .thinking_level
             .as_deref()
             .or(settings.default_thinking_level.as_deref()),
@@ -473,7 +510,8 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
 
     Ok(ResolvedModelConfig {
         api_key,
-        model: default_ref.model.clone(),
+        provider: model_ref.provider.clone(),
+        model: model_ref.model.clone(),
         base_url,
         name,
         reasoning,
@@ -486,11 +524,105 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
     })
 }
 
-/// Load and resolve from the default path at ~/.nav/settings.json.
-pub fn resolve_default_config() -> Result<ResolvedModelConfig, ConfigError> {
+/// List configured provider/model pairs without resolving API keys.
+pub fn list_configured_models(path: &Path) -> Result<Vec<ConfiguredModel>, ConfigError> {
+    let settings = read_settings(path)?;
+    let providers = settings.providers.ok_or(ConfigError::MissingProviders)?;
+    let mut models = Vec::new();
+
+    for (provider, provider_config) in providers {
+        let Some(provider_models) = provider_config.models else {
+            continue;
+        };
+        for model in provider_models {
+            models.push(ConfiguredModel {
+                provider: provider.clone(),
+                name: model.name.unwrap_or_else(|| model.id.clone()),
+                model: model.id,
+            });
+        }
+    }
+
+    models.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    Ok(models)
+}
+
+fn default_settings_path() -> Result<PathBuf, ConfigError> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .map_err(|_| ConfigError::HomeDirUnavailable)?;
-    let path = PathBuf::from(home).join(".nav").join("settings.json");
+    settings_path_from_home(&home)
+}
+
+fn settings_path_from_home(home: &str) -> Result<PathBuf, ConfigError> {
+    let home = home.trim();
+    if home.is_empty() {
+        return Err(ConfigError::HomeDirUnavailable);
+    }
+
+    let home_path = PathBuf::from(home);
+    if !home_path.is_absolute() {
+        return Err(ConfigError::HomeDirUnavailable);
+    }
+
+    Ok(home_path.join(".nav").join("settings.json"))
+}
+
+/// Resolve a specific provider/model pair from the default settings path.
+pub fn resolve_default_model_config(
+    provider: &str,
+    model: &str,
+) -> Result<ResolvedModelConfig, ConfigError> {
+    let path = default_settings_path()?;
+    resolve_model_config(&path, provider, model)
+}
+
+/// List configured models from the default settings path.
+pub fn list_default_configured_models() -> Result<Vec<ConfiguredModel>, ConfigError> {
+    let path = default_settings_path()?;
+    list_configured_models(&path)
+}
+
+/// Load and resolve from the default path at ~/.nav/settings.json.
+pub fn resolve_default_config() -> Result<ResolvedModelConfig, ConfigError> {
+    let path = default_settings_path()?;
     resolve_config(&path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_path_from_home_rejects_empty_values() {
+        assert!(matches!(
+            settings_path_from_home("  "),
+            Err(ConfigError::HomeDirUnavailable)
+        ));
+    }
+
+    #[test]
+    fn settings_path_from_home_rejects_relative_values() {
+        assert!(matches!(
+            settings_path_from_home("relative/home"),
+            Err(ConfigError::HomeDirUnavailable)
+        ));
+    }
+
+    #[test]
+    fn settings_path_from_home_accepts_absolute_values() {
+        let home = std::env::temp_dir();
+        let path = settings_path_from_home(
+            home.to_str()
+                .expect("temp dir should be representable for this test"),
+        )
+        .expect("absolute home path should resolve");
+
+        assert_eq!(path, home.join(".nav").join("settings.json"));
+    }
 }

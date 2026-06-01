@@ -7,8 +7,8 @@
 //! persistence.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -25,15 +25,24 @@ use crate::tools::{CancelFlag, Registry};
 
 /// Runs one coding-agent turn with a configured model, toolset, and workspace.
 pub(crate) struct Agent {
-    model: Arc<dyn ChatModel>,
+    model: Arc<RwLock<ActiveModel>>,
     registry: Arc<Registry>,
     workspace: PathBuf,
+}
+
+#[derive(Clone)]
+struct ActiveModel {
+    model: Arc<dyn ChatModel>,
+    model_id: Option<String>,
 }
 
 impl Agent {
     pub(crate) fn new(model: Arc<dyn ChatModel>) -> Self {
         Self {
-            model,
+            model: Arc::new(RwLock::new(ActiveModel {
+                model,
+                model_id: None,
+            })),
             registry: Arc::new(Registry::coding()),
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
@@ -51,6 +60,18 @@ impl Agent {
 
     pub(crate) fn workspace(&self) -> &Path {
         &self.workspace
+    }
+
+    pub(crate) fn set_model(&self, model: Arc<dyn ChatModel>, model_id: Option<String>) {
+        *self.model.write().unwrap() = ActiveModel { model, model_id };
+    }
+
+    pub(crate) fn set_model_id(&self, model_id: Option<String>) {
+        self.model.write().unwrap().model_id = model_id;
+    }
+
+    fn active_model(&self) -> ActiveModel {
+        self.model.read().unwrap().clone()
     }
 
     /// Build the system prompt for this run from the toolset, workspace, and any
@@ -115,10 +136,11 @@ impl Agent {
                 return Ok(RunStop::Cancelled);
             }
 
+            let active_model = self.active_model();
             let context_before = context.messages().to_vec();
             let started_at_ms = now_ms();
             let started = Instant::now();
-            let traced = match self.model.respond_with_trace(&context, &tool_defs) {
+            let traced = match active_model.model.respond_with_trace(&context, &tool_defs) {
                 Ok(traced) => traced,
                 Err(error) => {
                     let duration_ms = elapsed_ms(started);
@@ -158,8 +180,10 @@ impl Agent {
             let response_for_stack = response.clone();
             let provider_trace = traced.provider_trace;
             let usage = response.token_usage.clone().unwrap_or_else(|| {
-                let input_estimate = self.model.estimate_context_tokens(&context, &tool_defs);
-                let output_estimate = self.model.estimate_output_tokens(&response);
+                let input_estimate = active_model
+                    .model
+                    .estimate_context_tokens(&context, &tool_defs);
+                let output_estimate = active_model.model.estimate_output_tokens(&response);
                 crate::tokens::TokenUsage::estimated(input_estimate, output_estimate)
             });
             sink.token_usage(&usage).map_err(AgentRunError::Sink)?;
@@ -189,8 +213,12 @@ impl Agent {
 
             if response.tool_calls.is_empty() {
                 let reply = response.content.unwrap_or_default();
-                sink.assistant_text(&reply, reasoning_content.as_deref())
-                    .map_err(AgentRunError::Sink)?;
+                sink.assistant_text(
+                    &reply,
+                    reasoning_content.as_deref(),
+                    active_model.model_id.as_deref(),
+                )
+                .map_err(AgentRunError::Sink)?;
                 let mut assistant_turn = ChatMessage::assistant(&reply);
                 assistant_turn.reasoning_content = reasoning_content.clone();
                 context.push(assistant_turn);
@@ -239,8 +267,13 @@ impl Agent {
             let mut assistant_turn = ChatMessage::assistant_tool_calls(&content, calls.clone());
             assistant_turn.reasoning_content = reasoning_content.clone();
             context.push(assistant_turn);
-            sink.assistant_tool_calls(&content, reasoning_content.as_deref(), &calls)
-                .map_err(AgentRunError::Sink)?;
+            sink.assistant_tool_calls(
+                &content,
+                reasoning_content.as_deref(),
+                &calls,
+                active_model.model_id.as_deref(),
+            )
+            .map_err(AgentRunError::Sink)?;
 
             for call in &calls {
                 // A stop requested mid-batch must not let a later call in the
@@ -404,6 +437,7 @@ pub(crate) trait AgentRunSink {
         &mut self,
         content: &str,
         reasoning_content: Option<&str>,
+        model_id: Option<&str>,
     ) -> Result<(), Self::Error>;
 
     fn assistant_tool_calls(
@@ -411,6 +445,7 @@ pub(crate) trait AgentRunSink {
         content: &str,
         reasoning_content: Option<&str>,
         calls: &[ToolCall],
+        model_id: Option<&str>,
     ) -> Result<(), Self::Error>;
 
     fn tool_started(&mut self, call: &ToolCall) -> Result<(), Self::Error>;

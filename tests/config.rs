@@ -1,4 +1,4 @@
-use nav::{ConfigError, resolve_config};
+use nav::{ConfigError, list_configured_models, resolve_config, resolve_model_config};
 use serde_json::json;
 use std::path::Path;
 
@@ -59,6 +59,7 @@ fn test_valid_pi_style_settings_resolution() {
 
     with_temp_settings(&settings, |path| {
         let config = resolve_config(path).expect("Should resolve valid config");
+        assert_eq!(config.provider, "commandcode");
         assert_eq!(config.model, "Qwen/Qwen3.7-Max");
         assert_eq!(config.api_key, "test-key-literal");
         assert_eq!(config.base_url, "https://api.example.com");
@@ -77,6 +78,127 @@ fn test_valid_pi_style_settings_resolution() {
             .thinking_level_map
             .expect("Should have thinkingLevelMap");
         assert_eq!(thinking_map["high"], "xhigh");
+    });
+}
+
+#[test]
+fn test_specific_configured_model_can_be_resolved() {
+    let settings = json!({
+        "providers": {
+            "openai": {
+                "baseUrl": "https://api.openai.example/v1",
+                "apiKey": "openai-key",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "gpt-5.1",
+                        "name": "GPT 5.1"
+                    }
+                ]
+            },
+            "local": {
+                "baseUrl": "http://localhost:11434/v1",
+                "apiKey": "local-key",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "qwen-coder",
+                        "name": "Qwen Coder"
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let config =
+            resolve_model_config(path, "local", "qwen-coder").expect("specific model resolves");
+
+        assert_eq!(config.provider, "local");
+        assert_eq!(config.model, "qwen-coder");
+        assert_eq!(config.name, "Qwen Coder");
+        assert_eq!(config.base_url, "http://localhost:11434/v1");
+        assert_eq!(config.api_key, "local-key");
+    });
+}
+
+#[test]
+fn test_specific_model_resolution_requires_a_configured_provider_and_model() {
+    let settings = json!({
+        "providers": {
+            "openai": {
+                "baseUrl": "https://api.openai.example/v1",
+                "apiKey": "openai-key",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "gpt-5.1"
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let missing_provider = resolve_model_config(path, "missing", "gpt-5.1");
+        assert!(
+            matches!(missing_provider, Err(ConfigError::MissingProvider(provider)) if provider == "missing")
+        );
+
+        let missing_model = resolve_model_config(path, "openai", "not-real");
+        assert!(matches!(
+            missing_model,
+            Err(ConfigError::MissingModel { provider, model })
+                if provider == "openai" && model == "not-real"
+        ));
+    });
+}
+
+#[test]
+fn test_configured_model_list_is_safe_and_sorted() {
+    let settings = json!({
+        "providers": {
+            "zai": {
+                "baseUrl": "https://api.z.ai/v1",
+                "apiKey": "zai-secret",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "glm-5.1",
+                        "name": "GLM 5.1"
+                    }
+                ]
+            },
+            "deepseek": {
+                "baseUrl": "https://api.deepseek.com",
+                "apiKey": "deepseek-secret",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "deepseek-v4-pro",
+                        "name": "DeepSeek V4 Pro"
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let models = list_configured_models(path).expect("model list resolves");
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].provider, "deepseek");
+        assert_eq!(models[0].model, "deepseek-v4-pro");
+        assert_eq!(models[0].name, "DeepSeek V4 Pro");
+        assert_eq!(models[1].provider, "zai");
+        assert_eq!(models[1].model, "glm-5.1");
+        assert!(
+            !format!("{models:?}").contains("secret"),
+            "model list must not expose provider API keys"
+        );
     });
 }
 

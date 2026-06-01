@@ -13,17 +13,16 @@ change drastically as the architecture becomes clearer.
 ## Local Chat Backend
 
 There is a minimal local HTTP/SSE backend that runs an in-memory, multi-turn
-chat loop backed by one text model:
+chat loop backed by one active text model:
 
 ```sh
 NAV_MOCK_MODEL=1 cargo run --bin nav-local-backend -- --bind 127.0.0.1:0
 ```
 
 It exposes `session.create` and `session.sendMessage` over `POST /rpc` and a
-live session event stream at `GET /sessions/{id}/events`. See
-[docs/local-backend.md](docs/local-backend.md) for the URL contract, model
-configuration (`NAV_MOCK_MODEL`, `NAV_API_KEY`, `NAV_MODEL`, `NAV_BASE_URL`),
-SSE event shape, and a curl verification path.
+live session event stream at `GET /sessions/{id}/events`. The backend resolves
+configured provider/model pairs, exposes them through `session.models`, and lets
+callers switch the active session model with `session.switchModel`.
 
 ## Electron Chat Spike
 
@@ -34,8 +33,8 @@ bun install
 NAV_MOCK_MODEL=1 bun run electron:dev   # or set NAV_API_KEY for a real model
 ```
 
-See [docs/electron-spike.md](docs/electron-spike.md) for the security boundary
-and the manual real-model verification path.
+The Electron app starts the backend, subscribes to session events, and keeps the
+renderer isolated behind the preload API.
 
 ## License
 

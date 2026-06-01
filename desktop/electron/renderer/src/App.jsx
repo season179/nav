@@ -11,6 +11,8 @@ export default function App() {
   const [sessionSummaries, setSessionSummaries] = useState([]);
   const [messages, setMessages] = useState([]);
   const [modelInfo, setModelInfo] = useState(null);
+  const [modelOptions, setModelOptions] = useState([]);
+  const [modelSwitching, setModelSwitching] = useState(false);
   const [stopPending, setStopPending] = useState(false);
   const [activeView, setActiveView] = useState("chat");
   const [stackAvailable, setStackAvailable] = useState(false);
@@ -141,6 +143,17 @@ export default function App() {
     }
   }, []);
 
+  const refreshModelOptions = useCallback(async () => {
+    if (!window.nav) {
+      return;
+    }
+    try {
+      setModelOptions(await window.nav.modelList());
+    } catch {
+      setModelOptions([]);
+    }
+  }, []);
+
   const refreshSessions = useCallback(async () => {
     if (!window.nav) {
       return;
@@ -255,12 +268,14 @@ export default function App() {
         setActiveSession(status.sessionId);
       }
       setRunningState(false);
+      refreshModelOptions();
       refreshSessions();
       refreshModelInfo(status.sessionId);
       refreshStackAvailability(status.sessionId, { reset: true });
     },
     [
       refreshModelInfo,
+      refreshModelOptions,
       refreshSessions,
       refreshStackAvailability,
       renderBackendStatus,
@@ -442,6 +457,28 @@ export default function App() {
     }
   }, [activateCreatedSession, appendMessage, clearTranscript, newSessionMode]);
 
+  const switchModel = useCallback(
+    async (option) => {
+      if (!connectedRef.current || !window.nav || !option) {
+        return;
+      }
+      setModelSwitching(true);
+      try {
+        const info = await window.nav.switchModel(
+          option.provider,
+          option.model,
+        );
+        setModelInfo(info ?? null);
+        await refreshModelInfo();
+      } catch (error) {
+        appendMessage("error", `Could not switch model: ${error.message}`);
+      } finally {
+        setModelSwitching(false);
+      }
+    },
+    [appendMessage, refreshModelInfo],
+  );
+
   const sendMessage = useCallback(
     async (text) => {
       if (!text || !connectedRef.current || !window.nav) {
@@ -506,10 +543,13 @@ export default function App() {
             <Composer
               connected={connected}
               modelInfo={modelInfo}
+              modelOptions={modelOptions}
+              modelSwitching={modelSwitching}
               newSessionMode={newSessionMode}
               running={running}
               stopPending={stopPending}
               onNewSessionModeChange={setNewSessionMode}
+              onModelChange={switchModel}
               onSend={sendMessage}
               onStop={stopRun}
             />

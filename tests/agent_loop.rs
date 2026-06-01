@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nav::{
-    ChatMessage, ChatModel, Event, FinishReason, ModelContext, ModelError, ModelResponse, Role,
-    SessionStore, Storage, ToolCall, ToolDef,
+    ChatMessage, ChatModel, Event, FinishReason, ModelContext, ModelError, ModelInfo,
+    ModelResponse, Role, SessionStore, Storage, ToolCall, ToolDef,
 };
 
 /// A throwaway directory, removed on drop.
@@ -37,6 +37,17 @@ impl Drop for TempDir {
 
 fn kinds(events: &[Event]) -> Vec<&str> {
     events.iter().map(|event| event.kind.as_str()).collect()
+}
+
+fn model_info(label: &str) -> ModelInfo {
+    ModelInfo {
+        label: label.to_owned(),
+        provider: None,
+        model: None,
+        thinking: None,
+        context_window: None,
+        token_usage: None,
+    }
 }
 
 /// Asks for a single `ls` tool call on its first turn, then replies with text
@@ -600,6 +611,53 @@ fn a_message_sent_during_a_tool_batch_is_folded_into_the_same_run() {
             .filter(|event| event.kind == "user.message")
             .count(),
         2,
+    );
+}
+
+#[test]
+fn switching_model_during_a_run_affects_the_next_model_call() {
+    let workspace = TempDir::new("agent_ws");
+    let first_model = Arc::new(GatedModel::new(vec![GatedReply::Tool {
+        id: "call-1".to_owned(),
+        name: "ls".to_owned(),
+        args: "{}".to_owned(),
+    }]));
+    let second_model = Arc::new(GatedModel::new(vec![GatedReply::Text(
+        "second model reply".to_owned(),
+    )]));
+    let store = Arc::new(
+        SessionStore::new(first_model.clone())
+            .with_model_id(Some("first-model".to_owned()))
+            .with_model_info(model_info("First model"))
+            .with_workspace(workspace.path.clone()),
+    );
+    let session_id = store.create_session();
+
+    let runner = {
+        let store = Arc::clone(&store);
+        let session_id = session_id.clone();
+        thread::spawn(move || store.send_message(&session_id, "list files").unwrap())
+    };
+
+    first_model.wait_entered(1);
+    store.replace_model(
+        second_model.clone(),
+        Some("second-model".to_owned()),
+        model_info("Second model"),
+    );
+    first_model.release(1);
+
+    second_model.wait_entered(1);
+    second_model.release(1);
+    runner.join().expect("run thread");
+
+    assert_eq!(first_model.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(second_model.calls.load(Ordering::SeqCst), 1);
+    let events = store.events(&session_id).unwrap();
+    assert!(
+        events.iter().any(|event| event.kind == "message.completed"
+            && event.text.as_deref() == Some("second model reply")),
+        "the same run should finish with the model selected after the tool call: {events:?}"
     );
 }
 

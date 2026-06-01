@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nav::{
-    ChatMessage, ChatModel, Event, MockModel, ModelContext, ModelError, ModelResponse,
+    ChatMessage, ChatModel, Event, MockModel, ModelContext, ModelError, ModelInfo, ModelResponse,
     SessionStore, StackStore, Storage, TokenUsage, ToolDef,
 };
 
@@ -21,6 +21,17 @@ fn creating_a_session_emits_session_created() {
 
 fn kinds(events: &[Event]) -> Vec<&str> {
     events.iter().map(|event| event.kind.as_str()).collect()
+}
+
+fn model_info(label: &str) -> ModelInfo {
+    ModelInfo {
+        label: label.to_owned(),
+        provider: None,
+        model: None,
+        thinking: None,
+        context_window: None,
+        token_usage: None,
+    }
 }
 
 #[test]
@@ -81,6 +92,68 @@ fn a_follow_up_turn_includes_prior_messages_as_context() {
             ChatMessage::user("what is my name?"),
         ],
     );
+}
+
+#[test]
+fn replacing_the_model_updates_later_turns_and_metadata() {
+    let first_model = Arc::new(StaticModel("first reply"));
+    let second_model = Arc::new(StaticModel("second reply"));
+    let store = SessionStore::new(first_model)
+        .with_model_id(Some("first-model".to_owned()))
+        .with_model_info(model_info("First model"));
+    let session_id = store.create_session();
+
+    store.send_message(&session_id, "hello").unwrap();
+    store.replace_model(
+        second_model,
+        Some("second-model".to_owned()),
+        model_info("Second model"),
+    );
+    store.send_message(&session_id, "again").unwrap();
+
+    let events = store.events(&session_id).unwrap();
+    assert!(
+        events.iter().any(|event| event.kind == "message.completed"
+            && event.text.as_deref() == Some("first reply"))
+    );
+    assert!(
+        events.iter().any(|event| event.kind == "message.completed"
+            && event.text.as_deref() == Some("second reply"))
+    );
+    assert_eq!(store.model_info(None).label, "Second model");
+}
+
+#[test]
+fn replacing_the_model_updates_the_persisted_assistant_model_id() {
+    let path = std::env::temp_dir().join(format!("nav_session_model_{}.db", uuid::Uuid::now_v7()));
+    let storage = Arc::new(Storage::open(&path).expect("open storage"));
+    let store = SessionStore::new(Arc::new(StaticModel("first reply")))
+        .with_model_id(Some("first-model".to_owned()))
+        .with_model_info(model_info("First model"))
+        .with_storage(storage);
+    let session_id = store.create_session();
+
+    store.send_message(&session_id, "hello").unwrap();
+    store.replace_model(
+        Arc::new(StaticModel("second reply")),
+        Some("second-model".to_owned()),
+        model_info("Second model"),
+    );
+    store.send_message(&session_id, "again").unwrap();
+
+    let conn = rusqlite::Connection::open(&path).expect("reopen db");
+    let models: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT model_id FROM turns WHERE role = 'assistant' ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+
+    assert_eq!(models, ["first-model", "second-model"]);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -539,6 +612,18 @@ impl ChatModel for FailingModel {
         _tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
         Err(ModelError::new("model is offline"))
+    }
+}
+
+struct StaticModel(&'static str);
+
+impl ChatModel for StaticModel {
+    fn respond(
+        &self,
+        _context: &ModelContext,
+        _tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
+        Ok(ModelResponse::text(self.0))
     }
 }
 

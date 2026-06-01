@@ -13,6 +13,14 @@ function normalizeSessionId(value) {
   return normalizeRequiredString(value, "session id");
 }
 
+function normalizeModelProvider(value) {
+  return normalizeRequiredString(value, "model provider");
+}
+
+function normalizeModelId(value) {
+  return normalizeRequiredString(value, "model id");
+}
+
 function normalizeOptionalWorkspaceRoot(value) {
   if (value === undefined || value === null) {
     return null;
@@ -73,6 +81,17 @@ contextBridge.exposeInMainWorld("nav", {
       "nav:model-info",
       sessionId == null ? undefined : normalizeSessionId(sessionId),
     );
+  },
+  // Configured models safe to show in the model picker.
+  modelList() {
+    return ipcRenderer.invoke("nav:model-list");
+  },
+  // Switch the active backend model to a configured provider/model pair.
+  switchModel(provider, model) {
+    return ipcRenderer.invoke("nav:switch-model", {
+      provider: normalizeModelProvider(provider),
+      model: normalizeModelId(model),
+    });
   },
   // Debug context stacks captured for a session's model calls.
   sessionStacks(sessionId) {

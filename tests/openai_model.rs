@@ -72,6 +72,7 @@ fn model_with_compat(base_url: String, compat: Option<serde_json::Value>) -> Ope
 fn config_with_compat(base_url: String, compat: Option<serde_json::Value>) -> OpenAiConfig {
     OpenAiConfig {
         api_key: TEST_API_KEY.to_owned(),
+        provider: None,
         model: "test-model".to_owned(),
         base_url,
         name: "test-model".to_owned(),
