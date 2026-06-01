@@ -94,7 +94,16 @@ impl Tool for ReadTool {
         let offset = arg_opt_u64(args, "offset").unwrap_or(1).max(1) as usize;
         let limit = arg_opt_u64(args, "limit").map(|value| value as usize);
 
-        let all_lines: Vec<&str> = content.split('\n').collect();
+        let all_lines = split_lines_for_counting(&content);
+        if all_lines.is_empty() {
+            if offset > 1 {
+                return Err(ToolError::new(format!(
+                    "Offset {offset} is beyond end of file (0 lines total)"
+                )));
+            }
+            return Ok(ToolOutput::new(String::new()));
+        }
+
         let start = offset - 1;
         if start >= all_lines.len() {
             return Err(ToolError::new(format!(
@@ -246,7 +255,10 @@ fn format_complete_read(
 
     let remaining = total_lines - (start + user_limited_lines);
     let next_offset = start + user_limited_lines + 1;
-    format!("{content}\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]")
+    let line_label = if remaining == 1 { "line" } else { "lines" };
+    format!(
+        "{content}\n\n[{remaining} more {line_label} in file. Use offset={next_offset} to continue.]"
+    )
 }
 
 fn split_lines_for_counting(content: &str) -> Vec<&str> {

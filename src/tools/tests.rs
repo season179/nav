@@ -153,8 +153,46 @@ fn read_returns_file_contents_and_honors_offset_limit() {
     );
     assert_eq!(
         middle.content,
-        "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]"
+        "two\nthree\n\n[1 more line in file. Use offset=4 to continue.]"
     );
+}
+
+#[test]
+fn read_counts_trailing_newline_as_line_terminator() {
+    let workspace = Workspace::new();
+    workspace.write("notes.txt", "one\ntwo\n");
+
+    let first = run(
+        &workspace,
+        "read",
+        json!({ "path": "notes.txt", "limit": 1 }),
+    );
+    assert_eq!(
+        first.content,
+        "one\n\n[1 more line in file. Use offset=2 to continue.]"
+    );
+
+    let error = run_error(
+        &workspace,
+        "read",
+        json!({ "path": "notes.txt", "offset": 3 }),
+    );
+    assert!(
+        error
+            .content
+            .contains("Offset 3 is beyond end of file (2 lines total)"),
+        "{}",
+        error.content
+    );
+}
+
+#[test]
+fn read_returns_empty_file_contents() {
+    let workspace = Workspace::new();
+    workspace.write("empty.txt", "");
+
+    let output = run(&workspace, "read", json!({ "path": "empty.txt" }));
+    assert_eq!(output.content, "");
 }
 
 #[test]
