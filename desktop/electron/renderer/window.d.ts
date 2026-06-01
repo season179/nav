@@ -34,6 +34,7 @@ type ModelOption = {
   provider: string;
   model: string;
   label: string;
+  thinkingLevels?: string[];
 };
 
 type ModelInfo = {
@@ -41,6 +42,7 @@ type ModelInfo = {
   provider?: string | null;
   model?: string | null;
   thinking?: string | null;
+  thinkingLevels?: string[];
   tokenUsage?: { used: number; contextWindow: number } | null;
 };
 
@@ -55,7 +57,12 @@ declare global {
       createProject(mode?: "local" | "worktree" | null): Promise<string | null>;
       modelInfo(sessionId?: string): Promise<ModelInfo>;
       modelList(): Promise<ModelOption[]>;
-      switchModel(provider: string, model: string): Promise<ModelInfo>;
+      switchModel(
+        provider: string,
+        model: string,
+        thinkingLevel?: string | null,
+      ): Promise<ModelInfo>;
+      switchThinking(thinkingLevel: string): Promise<ModelInfo>;
       sessionStacks(sessionId?: string): Promise<{
         stacks: Array<{
           id: string;

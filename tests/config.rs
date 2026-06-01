@@ -1,5 +1,8 @@
 use base64::Engine;
-use nav::{ConfigError, list_configured_models, resolve_config, resolve_model_config};
+use nav::{
+    ConfigError, list_configured_models, resolve_config, resolve_model_config,
+    resolve_model_config_with_thinking,
+};
 use serde_json::json;
 use std::path::Path;
 use std::sync::Mutex;
@@ -377,7 +380,11 @@ fn test_configured_model_list_is_safe_and_sorted() {
                 "models": [
                     {
                         "id": "deepseek-v4-pro",
-                        "name": "DeepSeek V4 Pro"
+                        "name": "DeepSeek V4 Pro",
+                        "reasoning": true,
+                        "thinkingLevelMap": {
+                            "xhigh": "xhigh"
+                        }
                     }
                 ]
             }
@@ -392,12 +399,45 @@ fn test_configured_model_list_is_safe_and_sorted() {
         assert_eq!(models[0].provider, "deepseek");
         assert_eq!(models[0].model, "deepseek-v4-pro");
         assert_eq!(models[0].name, "DeepSeek V4 Pro");
+        assert_eq!(
+            models[0].thinking_levels,
+            ["off", "minimal", "low", "medium", "high", "xhigh"]
+        );
         assert_eq!(models[1].provider, "zai");
         assert_eq!(models[1].model, "glm-5.1");
+        assert_eq!(models[1].thinking_levels, ["off"]);
         assert!(
             !format!("{models:?}").contains("secret"),
             "model list must not expose provider API keys"
         );
+    });
+}
+
+#[test]
+fn test_specific_model_resolution_clamps_requested_thinking_level() {
+    let settings = json!({
+        "providers": {
+            "local": {
+                "baseUrl": "http://localhost:11434/v1",
+                "apiKey": "local-key",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "qwen-coder",
+                        "name": "Qwen Coder",
+                        "reasoning": true
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let config = resolve_model_config_with_thinking(path, "local", "qwen-coder", Some("xhigh"))
+            .expect("specific model resolves");
+
+        assert_eq!(config.thinking_level, "high");
     });
 }
 

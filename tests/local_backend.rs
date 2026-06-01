@@ -414,6 +414,7 @@ fn model_info_returns_the_configured_metadata() {
         provider: Some("anthropic-proxy".to_owned()),
         model: Some("claude-opus-4.8".to_owned()),
         thinking: Some("high".to_owned()),
+        thinking_levels: vec!["off".to_owned(), "medium".to_owned(), "high".to_owned()],
         context_window: Some(200_000),
         token_usage: None,
     };
@@ -440,6 +441,11 @@ fn model_info_returns_the_configured_metadata() {
         "session.modelInfo returns optional thinking level metadata: {response}"
     );
     assert_eq!(
+        response["result"]["thinkingLevels"],
+        serde_json::json!(["off", "medium", "high"]),
+        "session.modelInfo returns supported thinking levels: {response}"
+    );
+    assert_eq!(
         response["result"]["tokenUsage"]["used"], 0,
         "session.modelInfo returns initial context usage: {response}"
     );
@@ -456,6 +462,7 @@ fn model_info_returns_latest_session_token_usage() {
         provider: None,
         model: None,
         thinking: None,
+        thinking_levels: Vec::new(),
         context_window: Some(128_000),
         token_usage: None,
     };

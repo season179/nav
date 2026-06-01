@@ -1,5 +1,16 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
+const THINKING_LEVELS = new Set([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+const THINKING_LEVEL_ERROR =
+  "thinking level must be off, minimal, low, medium, high, or xhigh";
+
 // This preload runs sandboxed (`sandbox: true`), where `require` is limited to
 // `electron` and a few builtins — it cannot load relative project files. So the
 // boundary validation is inlined here rather than imported from
@@ -19,6 +30,21 @@ function normalizeModelProvider(value) {
 
 function normalizeModelId(value) {
   return normalizeRequiredString(value, "model id");
+}
+
+function normalizeThinkingLevel(value) {
+  const level = normalizeRequiredString(value, "thinking level");
+  if (!THINKING_LEVELS.has(level)) {
+    throw new Error(THINKING_LEVEL_ERROR);
+  }
+  return level;
+}
+
+function normalizeOptionalThinkingLevel(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return normalizeThinkingLevel(value);
 }
 
 function normalizeOptionalWorkspaceRoot(value) {
@@ -87,11 +113,23 @@ contextBridge.exposeInMainWorld("nav", {
     return ipcRenderer.invoke("nav:model-list");
   },
   // Switch the active backend model to a configured provider/model pair.
-  switchModel(provider, model) {
-    return ipcRenderer.invoke("nav:switch-model", {
+  switchModel(provider, model, thinkingLevel) {
+    const request = {
       provider: normalizeModelProvider(provider),
       model: normalizeModelId(model),
-    });
+    };
+    const normalizedThinking = normalizeOptionalThinkingLevel(thinkingLevel);
+    if (normalizedThinking) {
+      request.thinkingLevel = normalizedThinking;
+    }
+    return ipcRenderer.invoke("nav:switch-model", request);
+  },
+  // Switch only the active model's thinking level.
+  switchThinking(thinkingLevel) {
+    return ipcRenderer.invoke(
+      "nav:switch-thinking",
+      normalizeThinkingLevel(thinkingLevel),
+    );
   },
   // Debug context stacks captured for a session's model calls.
   sessionStacks(sessionId) {

@@ -1,6 +1,17 @@
 // Pure validation for renderer-originated requests. Keeping it separate from
 // preload (which needs Electron) lets the boundary checks be unit tested.
 
+const THINKING_LEVELS = new Set([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+const THINKING_LEVEL_ERROR =
+  "thinking level must be off, minimal, low, medium, high, or xhigh";
+
 function normalizeMessageText(value) {
   return normalizeRequiredString(value, "message text");
 }
@@ -15,6 +26,21 @@ function normalizeModelProvider(value) {
 
 function normalizeModelId(value) {
   return normalizeRequiredString(value, "model id");
+}
+
+function normalizeThinkingLevel(value) {
+  const level = normalizeRequiredString(value, "thinking level");
+  if (!THINKING_LEVELS.has(level)) {
+    throw new Error(THINKING_LEVEL_ERROR);
+  }
+  return level;
+}
+
+function normalizeOptionalThinkingLevel(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return normalizeThinkingLevel(value);
 }
 
 function normalizeOptionalWorkspaceRoot(value) {
@@ -50,6 +76,8 @@ module.exports = {
   normalizeMessageText,
   normalizeModelProvider,
   normalizeOptionalSessionMode,
+  normalizeOptionalThinkingLevel,
   normalizeOptionalWorkspaceRoot,
   normalizeSessionId,
+  normalizeThinkingLevel,
 };

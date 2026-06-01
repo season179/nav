@@ -5,6 +5,14 @@ const sessionModeOptions = [
   { value: "local", label: "Local" },
   { value: "worktree", label: "Worktree" },
 ];
+const thinkingLevelDetails = {
+  off: "No reasoning",
+  minimal: "Very brief reasoning",
+  low: "Light reasoning",
+  medium: "Balanced reasoning",
+  high: "Deeper reasoning",
+  xhigh: "Maximum reasoning",
+};
 
 export default function Composer({
   connected,
@@ -18,6 +26,7 @@ export default function Composer({
   onNewSessionModeChange,
   onSend,
   onStop,
+  onThinkingChange,
 }) {
   const [text, setText] = useState("");
   const inputRef = useRef(null);
@@ -111,19 +120,142 @@ export default function Composer({
           />
         </span>
         <span className="composer-meta-right">
-          <span
-            className="composer-thinking"
-            id="composer-thinking"
-            aria-live="polite"
-          >
-            {modelInfo?.thinking ?? ""}
-          </span>
+          <ThinkingMenu
+            disabled={!connected || modelSwitching}
+            modelInfo={modelInfo}
+            onThinkingChange={onThinkingChange}
+          />
           <span className="composer-token-usage" id="composer-token-usage">
             {formatTokenUsage(modelInfo?.tokenUsage)}
           </span>
         </span>
       </div>
     </form>
+  );
+}
+
+function ThinkingMenu({ disabled, modelInfo, onThinkingChange }) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef(null);
+  const triggerRef = useRef(null);
+  const levels = Array.isArray(modelInfo?.thinkingLevels)
+    ? modelInfo.thinkingLevels
+    : [];
+  const current = modelInfo?.thinking ?? levels[0] ?? "";
+  const hasChoices = levels.length > 1;
+
+  const closeMenu = useCallback(() => {
+    setOpen(false);
+    window.setTimeout(() => {
+      triggerRef.current?.focus();
+    }, 0);
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+
+    function closeOnOutsidePointer(event) {
+      if (!menuRef.current?.contains(event.target)) {
+        closeMenu();
+      }
+    }
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+    };
+  }, [open, closeMenu]);
+
+  useEffect(() => {
+    if (disabled || !hasChoices) {
+      closeMenu();
+    }
+  }, [disabled, hasChoices, closeMenu]);
+
+  function selectThinking(level) {
+    onThinkingChange(level);
+    closeMenu();
+  }
+
+  function closeOnEscape(event) {
+    if (event.key === "Escape") {
+      closeMenu();
+    }
+  }
+
+  if (!current && !hasChoices) {
+    return (
+      <span
+        className="composer-thinking"
+        id="composer-thinking"
+        aria-live="polite"
+      />
+    );
+  }
+
+  if (!hasChoices) {
+    return (
+      <span
+        className="composer-thinking"
+        id="composer-thinking"
+        aria-live="polite"
+      >
+        {formatThinkingLabel(current)}
+      </span>
+    );
+  }
+
+  return (
+    <span className="composer-thinking-menu" ref={menuRef}>
+      <button
+        ref={triggerRef}
+        type="button"
+        id="composer-thinking"
+        className="thinking-trigger"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-live="polite"
+        disabled={disabled}
+        onClick={() => setOpen((isOpen) => !isOpen)}
+        onKeyDown={closeOnEscape}
+      >
+        <span>{formatThinkingLabel(current)}</span>
+        <span className="thinking-chevron" aria-hidden="true">
+          v
+        </span>
+      </button>
+      {open ? (
+        <div className="thinking-menu" role="menu" onKeyDown={closeOnEscape}>
+          {levels.map((level) => {
+            const selected = level === current;
+            return (
+              <button
+                key={level}
+                type="button"
+                className="thinking-option"
+                role="menuitemradio"
+                aria-checked={selected ? "true" : "false"}
+                onClick={() => selectThinking(level)}
+              >
+                <span>
+                  <span className="thinking-option-label">
+                    {formatThinkingLabel(level)}
+                  </span>
+                  <span className="thinking-option-description">
+                    {thinkingLevelDetails[level] ?? ""}
+                  </span>
+                </span>
+                <span className="thinking-check" aria-hidden="true">
+                  {selected ? "✓" : ""}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </span>
   );
 }
 
@@ -287,6 +419,13 @@ function isCurrentModel(option, modelInfo) {
   return (
     option.provider === modelInfo?.provider && option.model === modelInfo?.model
   );
+}
+
+function formatThinkingLabel(level) {
+  if (!level) {
+    return "";
+  }
+  return level === "off" ? "thinking off" : `thinking ${level}`;
 }
 
 function SessionModeMenu({ disabled, mode, onModeChange }) {

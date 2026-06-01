@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::config::{
     CODEX_RESPONSES_API, ConfigError, OPENAI_COMPLETIONS_API, OPENAI_RESPONSES_API,
-    ResolvedModelConfig,
+    ResolvedModelConfig, supported_thinking_levels,
 };
 use crate::context::ModelContext;
 use crate::tokens::{
@@ -367,6 +367,8 @@ pub struct ModelInfo {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub thinking_levels: Vec<String>,
     #[serde(skip)]
     pub context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -486,6 +488,7 @@ impl ModelChoice {
             provider: self.provider_id(),
             model: self.configured_model_id(),
             thinking: self.thinking_level(),
+            thinking_levels: self.thinking_levels(),
             context_window: self.context_window(),
             token_usage: None,
         }
@@ -506,8 +509,17 @@ impl ModelChoice {
     /// Optional reasoning/thinking level for the app's model metadata row.
     fn thinking_level(&self) -> Option<String> {
         match self {
-            ModelChoice::OpenAi(config) => Some(config.thinking_level.clone()),
+            ModelChoice::OpenAi(config) if config.reasoning => Some(config.thinking_level.clone()),
             _ => None,
+        }
+    }
+
+    fn thinking_levels(&self) -> Vec<String> {
+        match self {
+            ModelChoice::OpenAi(config) if config.reasoning => {
+                supported_thinking_levels(config.reasoning, config.thinking_level_map.as_ref())
+            }
+            _ => Vec::new(),
         }
     }
 
