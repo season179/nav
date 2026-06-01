@@ -151,7 +151,94 @@ fn read_returns_file_contents_and_honors_offset_limit() {
         "read",
         json!({ "path": "notes.txt", "offset": 2, "limit": 2 }),
     );
-    assert_eq!(middle.content, "two\nthree");
+    assert_eq!(
+        middle.content,
+        "two\nthree\n\n[1 more lines in file. Use offset=4 to continue.]"
+    );
+}
+
+#[test]
+fn read_rejects_offset_beyond_end_of_file() {
+    let workspace = Workspace::new();
+    workspace.write("notes.txt", "one\ntwo");
+
+    let error = run_error(
+        &workspace,
+        "read",
+        json!({ "path": "notes.txt", "offset": 3 }),
+    );
+    assert!(
+        error
+            .content
+            .contains("Offset 3 is beyond end of file (2 lines total)"),
+        "{}",
+        error.content
+    );
+}
+
+#[test]
+fn read_reports_how_to_continue_when_output_is_truncated() {
+    let workspace = Workspace::new();
+    let content = (1..=2050)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    workspace.write("long.txt", &content);
+
+    let output = run(&workspace, "read", json!({ "path": "long.txt" }));
+    assert!(
+        output.content.starts_with("line 1\nline 2\n"),
+        "{}",
+        output.content
+    );
+    assert!(
+        output
+            .content
+            .ends_with("[Showing lines 1-2000 of 2050. Use offset=2001 to continue.]"),
+        "{}",
+        output.content
+    );
+}
+
+#[test]
+fn read_reports_first_line_that_exceeds_the_byte_limit() {
+    let workspace = Workspace::new();
+    workspace.write(
+        "wide.txt",
+        &"x".repeat(super::support::truncate::MAX_BYTES + 1),
+    );
+
+    let output = run(&workspace, "read", json!({ "path": "wide.txt" }));
+    assert!(
+        output
+            .content
+            .contains("[Line 1 is 50.0KB, exceeds 50.0KB limit."),
+        "{}",
+        output.content
+    );
+    assert!(
+        output
+            .content
+            .contains("Use bash: sed -n '1p' 'wide.txt' | head -c 51200"),
+        "{}",
+        output.content
+    );
+}
+
+#[test]
+fn read_recognizes_supported_images_without_dumping_binary() {
+    let workspace = Workspace::new();
+    fs::write(
+        workspace.path.join("image.png"),
+        b"\x89PNG\r\n\x1a\nminimal test payload",
+    )
+    .expect("write image");
+
+    let output = run(&workspace, "read", json!({ "path": "image.png" }));
+    assert_eq!(
+        output.content,
+        "Read image file [image/png]\n[Image omitted: nav tool results are currently text-only.]"
+    );
 }
 
 #[test]
