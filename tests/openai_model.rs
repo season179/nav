@@ -66,16 +66,21 @@ fn model(base_url: String) -> OpenAiModel {
 }
 
 fn model_with_compat(base_url: String, compat: Option<serde_json::Value>) -> OpenAiModel {
-    OpenAiModel::new(OpenAiConfig {
+    OpenAiModel::new(config_with_compat(base_url, compat))
+}
+
+fn config_with_compat(base_url: String, compat: Option<serde_json::Value>) -> OpenAiConfig {
+    OpenAiConfig {
         api_key: TEST_API_KEY.to_owned(),
         model: "test-model".to_owned(),
         base_url,
         name: "test-model".to_owned(),
         reasoning: false,
+        thinking_level: "off".to_owned(),
         context_window: None,
         compat,
         thinking_level_map: None,
-    })
+    }
 }
 
 fn context(messages: Vec<ChatMessage>) -> ModelContext {
@@ -146,6 +151,68 @@ fn prepends_the_system_prompt_as_a_leading_system_message() {
         "You are an expert coding assistant operating inside nav."
     );
     assert_eq!(messages[1]["role"], "user");
+}
+
+#[test]
+fn sends_resolved_reasoning_effort_for_reasoning_models() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.reasoning = true;
+    config.thinking_level = "high".to_owned();
+    config.thinking_level_map = Some(json!({ "high": "xhigh" }));
+    let model = OpenAiModel::new(config);
+
+    model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect("provider returns a reply");
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    assert_eq!(body["reasoning_effort"], "xhigh");
+}
+
+#[test]
+fn applies_deepseek_thinking_format_for_reasoning_models() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    );
+    let mut config = config_with_compat(base_url, Some(json!({ "thinkingFormat": "deepseek" })));
+    config.reasoning = true;
+    config.thinking_level = "medium".to_owned();
+    let model = OpenAiModel::new(config);
+
+    model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect("provider returns a reply");
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["reasoning_effort"], "medium");
+}
+
+#[test]
+fn omits_reasoning_effort_for_non_reasoning_models() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+    );
+    let model = model(base_url);
+
+    model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect("provider returns a reply");
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    assert!(
+        body.get("reasoning_effort").is_none(),
+        "non-reasoning models should not send reasoning_effort: {body}"
+    );
 }
 
 #[test]

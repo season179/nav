@@ -22,6 +22,7 @@ fn resolved(api_key: &str, model: &str, base_url: &str) -> ResolvedModelConfig {
         base_url: base_url.to_owned(),
         name: model.to_owned(),
         reasoning: false,
+        thinking_level: "off".to_owned(),
         input: vec!["text".to_owned()],
         context_window: Some(128_000),
         max_tokens: Some(16_384),
@@ -144,14 +145,12 @@ fn resolve_surfaces_reasoning_thinking_metadata() {
         "https://commandcode.example/v1",
     );
     config.reasoning = true;
+    config.thinking_level = "medium".to_owned();
     config.thinking_level_map = Some(json!({ "high": "xhigh" }));
 
     let choice = ModelChoice::resolve(env(&[]), || Ok(config));
 
-    assert_eq!(
-        choice.info().thinking.as_deref(),
-        Some("Reasoning / Thinking")
-    );
+    assert_eq!(choice.info().thinking.as_deref(), Some("medium"));
     assert_eq!(choice.info().context_window, Some(128_000));
 }
 

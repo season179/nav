@@ -236,7 +236,7 @@ fn listing_sessions_without_storage_returns_an_empty_array() {
 fn model_info_returns_the_configured_metadata() {
     let model_info = ModelInfo {
         label: "Claude Opus 4.8".to_owned(),
-        thinking: Some("Reasoning".to_owned()),
+        thinking: Some("high".to_owned()),
         context_window: Some(200_000),
         token_usage: None,
     };
@@ -251,8 +251,8 @@ fn model_info_returns_the_configured_metadata() {
         "session.modelInfo returns the configured model label: {response}"
     );
     assert_eq!(
-        response["result"]["thinking"], "Reasoning",
-        "session.modelInfo returns optional thinking metadata: {response}"
+        response["result"]["thinking"], "high",
+        "session.modelInfo returns optional thinking level metadata: {response}"
     );
     assert_eq!(
         response["result"]["tokenUsage"]["used"], 0,

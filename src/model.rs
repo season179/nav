@@ -343,6 +343,7 @@ impl ModelChoice {
                     name: model.clone(),
                     model,
                     reasoning: false,
+                    thinking_level: "off".to_owned(),
                     context_window: None,
                     compat: None,
                     thinking_level_map: None,
@@ -375,7 +376,7 @@ impl ModelChoice {
     pub fn info(&self) -> ModelInfo {
         ModelInfo {
             label: self.label(),
-            thinking: self.thinking_label(),
+            thinking: self.thinking_level(),
             context_window: self.context_window(),
             token_usage: None,
         }
@@ -393,18 +394,10 @@ impl ModelChoice {
         }
     }
 
-    /// Optional reasoning/thinking capability label for the app's model metadata
-    /// row. Providers use both terms, so preserve whichever metadata exists.
-    fn thinking_label(&self) -> Option<String> {
+    /// Optional reasoning/thinking level for the app's model metadata row.
+    fn thinking_level(&self) -> Option<String> {
         match self {
-            ModelChoice::OpenAi(config) => {
-                match (config.reasoning, config.thinking_level_map.is_some()) {
-                    (true, true) => Some("Reasoning / Thinking".to_owned()),
-                    (true, false) => Some("Reasoning".to_owned()),
-                    (false, true) => Some("Thinking".to_owned()),
-                    (false, false) => None,
-                }
-            }
+            ModelChoice::OpenAi(config) => Some(config.thinking_level.clone()),
             _ => None,
         }
     }
@@ -451,6 +444,8 @@ pub struct OpenAiConfig {
     pub name: String,
     /// Whether the model is marked as reasoning-capable in settings.json.
     pub reasoning: bool,
+    /// The resolved nav reasoning/thinking level shown in the composer.
+    pub thinking_level: String,
     /// Model context window from settings, used by future budget checks.
     pub context_window: Option<u64>,
     /// Provider/model compatibility metadata. May include an optional local
@@ -472,6 +467,7 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
             base_url: config.base_url,
             name: config.name,
             reasoning: config.reasoning,
+            thinking_level: config.thinking_level,
             context_window: config.context_window,
             compat: config.compat,
             thinking_level_map: config.thinking_level_map,
@@ -486,6 +482,98 @@ impl OpenAiConfig {
             .and_then(|compat| compat.get("requiresReasoningContentOnAssistantMessages"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
+    }
+
+    fn supports_reasoning_effort(&self) -> bool {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.get("supportsReasoningEffort"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    fn thinking_format(&self) -> &str {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.get("thinkingFormat"))
+            .and_then(Value::as_str)
+            .unwrap_or("openai")
+    }
+
+    fn provider_thinking_level(&self) -> Option<String> {
+        if !self.reasoning {
+            return None;
+        }
+
+        self.map_thinking_level(&self.thinking_level)
+    }
+
+    fn map_thinking_level(&self, level: &str) -> Option<String> {
+        match self
+            .thinking_level_map
+            .as_ref()
+            .and_then(|map| map.get(level))
+        {
+            Some(Value::String(mapped)) => Some(mapped.clone()),
+            Some(_) => None,
+            None if level == "off" => None,
+            None => Some(level.to_owned()),
+        }
+    }
+}
+
+fn apply_reasoning_settings(body: &mut Value, config: &OpenAiConfig) {
+    if !config.reasoning {
+        return;
+    }
+
+    let effort = config.provider_thinking_level();
+    let thinking_enabled = effort.is_some();
+    match config.thinking_format() {
+        "deepseek" => {
+            body["thinking"] = json!({ "type": thinking_type(thinking_enabled) });
+            set_reasoning_effort(body, effort);
+        }
+        "openrouter" => {
+            if let Some(effort) = effort.or_else(|| config.map_thinking_level("off")) {
+                body["reasoning"] = json!({ "effort": effort });
+            }
+        }
+        "together" => {
+            body["reasoning"] = json!({ "enabled": thinking_enabled });
+            if config.supports_reasoning_effort() {
+                set_reasoning_effort(body, effort);
+            }
+        }
+        "zai" | "qwen" => {
+            body["enable_thinking"] = Value::Bool(thinking_enabled);
+        }
+        "qwen-chat-template" => {
+            body["chat_template_kwargs"] = json!({
+                "enable_thinking": thinking_enabled,
+                "preserve_thinking": true,
+            });
+        }
+        "string-thinking" => {
+            if let Some(effort) = effort.or_else(|| config.map_thinking_level("off")) {
+                body["thinking"] = Value::String(effort);
+            }
+        }
+        _ => {
+            if config.supports_reasoning_effort() {
+                set_reasoning_effort(body, effort.or_else(|| config.map_thinking_level("off")));
+            }
+        }
+    }
+}
+
+fn thinking_type(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
+}
+
+fn set_reasoning_effort(body: &mut Value, effort: Option<String>) {
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = Value::String(effort);
     }
 }
 
@@ -530,6 +618,7 @@ impl ChatModel for OpenAiModel {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools.iter().map(tool_json).collect());
         }
+        apply_reasoning_settings(&mut body, &self.config);
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')

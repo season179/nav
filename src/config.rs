@@ -4,6 +4,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+const DEFAULT_THINKING_LEVEL: &str = "medium";
+const THINKING_LEVELS: [&str; 6] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
 /// Resolved configuration consumed by chat completions.
 #[derive(Clone)]
 pub struct ResolvedModelConfig {
@@ -12,6 +15,7 @@ pub struct ResolvedModelConfig {
     pub base_url: String,
     pub name: String,
     pub reasoning: bool,
+    pub thinking_level: String,
     pub input: Vec<String>,
     pub context_window: Option<u64>,
     pub max_tokens: Option<u64>,
@@ -27,6 +31,7 @@ impl std::fmt::Debug for ResolvedModelConfig {
             .field("base_url", &self.base_url)
             .field("name", &self.name)
             .field("reasoning", &self.reasoning)
+            .field("thinking_level", &self.thinking_level)
             .field("input", &self.input)
             .field("context_window", &self.context_window)
             .field("max_tokens", &self.max_tokens)
@@ -130,13 +135,16 @@ impl std::error::Error for ConfigError {}
 #[serde(rename_all = "camelCase")]
 struct SettingsFile {
     default_model: Option<DefaultModelRef>,
+    default_thinking_level: Option<String>,
     providers: Option<HashMap<String, ProviderConfig>>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 struct DefaultModelRef {
     provider: String,
     model: String,
+    thinking_level: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -314,6 +322,59 @@ fn merge_json_maps(
     }
 }
 
+fn resolve_thinking_level(
+    reasoning: bool,
+    thinking_level_map: Option<&serde_json::Value>,
+    requested: Option<&str>,
+) -> String {
+    let requested = requested.unwrap_or(DEFAULT_THINKING_LEVEL);
+    if is_supported_thinking_level(reasoning, thinking_level_map, requested) {
+        return requested.to_owned();
+    }
+
+    let Some(requested_index) = THINKING_LEVELS.iter().position(|level| *level == requested) else {
+        return first_supported_thinking_level(reasoning, thinking_level_map).to_owned();
+    };
+
+    for candidate in THINKING_LEVELS[requested_index..]
+        .iter()
+        .chain(THINKING_LEVELS[..requested_index].iter().rev())
+    {
+        if is_supported_thinking_level(reasoning, thinking_level_map, candidate) {
+            return (*candidate).to_owned();
+        }
+    }
+
+    first_supported_thinking_level(reasoning, thinking_level_map).to_owned()
+}
+
+fn first_supported_thinking_level(
+    reasoning: bool,
+    thinking_level_map: Option<&serde_json::Value>,
+) -> &'static str {
+    THINKING_LEVELS
+        .iter()
+        .copied()
+        .find(|level| is_supported_thinking_level(reasoning, thinking_level_map, level))
+        .unwrap_or("off")
+}
+
+fn is_supported_thinking_level(
+    reasoning: bool,
+    thinking_level_map: Option<&serde_json::Value>,
+    level: &str,
+) -> bool {
+    if !reasoning {
+        return level == "off";
+    }
+
+    match thinking_level_map.and_then(|map| map.get(level)) {
+        Some(serde_json::Value::String(_)) => true,
+        Some(_) => false,
+        None => level != "xhigh",
+    }
+}
+
 /// Load and resolve Pi-style model settings from settings.json.
 pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
     let file = std::fs::File::open(path).map_err(|e| {
@@ -401,6 +462,14 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
     let context_window = model_config.context_window.or(Some(128000));
     let max_tokens = model_config.max_tokens.or(Some(16384));
     let thinking_level_map = model_config.thinking_level_map.clone();
+    let thinking_level = resolve_thinking_level(
+        reasoning,
+        thinking_level_map.as_ref(),
+        default_ref
+            .thinking_level
+            .as_deref()
+            .or(settings.default_thinking_level.as_deref()),
+    );
 
     Ok(ResolvedModelConfig {
         api_key,
@@ -408,6 +477,7 @@ pub fn resolve_config(path: &Path) -> Result<ResolvedModelConfig, ConfigError> {
         base_url,
         name,
         reasoning,
+        thinking_level,
         input,
         context_window,
         max_tokens,
