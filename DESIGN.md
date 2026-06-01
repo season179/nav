@@ -16,8 +16,8 @@ Base profile values are OKLCH. Derived states use `color-mix()` so hover, border
 |---|---|---|
 | `--bg` | `oklch(0.21 0.004 95)` | App background |
 | `--sidebar-bg` | `var(--bg)` | Opaque sidebar |
-| `--surface` | `oklch(29% 4% 264deg)` | Chat and composer surface |
-| `--surface-raised` | `oklch(39% 3% 261deg)` | Inputs, menus, and cards |
+| `--surface` | `oklch(0.29 0.016 264)` | Chat and composer surface |
+| `--surface-raised` | `oklch(0.39 0.012 261)` | Inputs, menus, and cards |
 | `--surface-muted` | derived neutral mix | Hover and secondary fills |
 | `--border` | derived neutral mix | Hairline dividers, control borders |
 | `--border-strong` | derived neutral mix | Emphasized borders |

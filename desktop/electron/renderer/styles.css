@@ -2,8 +2,8 @@
   /* Three color profiles only: charcoal neutral, cyan-green state, muted red error. */
   --bg: oklch(0.21 0.004 95);
   --sidebar-bg: var(--bg);
-  --surface: oklch(29% 4% 264deg);
-  --surface-raised: oklch(39% 3% 261deg);
+  --surface: oklch(0.29 0.016 264);
+  --surface-raised: oklch(0.39 0.012 261);
   --surface-muted: color-mix(
     in oklab,
     var(--surface) 62%,
