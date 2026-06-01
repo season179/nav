@@ -30,6 +30,27 @@ test("project groups keep their existing order when a nested session becomes new
   );
 });
 
+test("sessions with invalid activity sort as zero while preserving tie order", () => {
+  const sessions = [
+    { sessionId: "a", workspaceRoot: "/work/project-a", updatedAt: undefined },
+    { sessionId: "b", workspaceRoot: "/work/project-a", updatedAt: "invalid" },
+    { sessionId: "c", workspaceRoot: "/work/project-a", updatedAt: 100 },
+    { sessionId: "d", workspaceRoot: "/work/project-b", updatedAt: null },
+    { sessionId: "e", workspaceRoot: "/work/project-b", updatedAt: 1 },
+  ];
+
+  const projects = groupSessionsByProject(sessions);
+
+  assert.deepEqual(
+    projects[0].sessions.map((session) => session.sessionId),
+    ["c", "a", "b"],
+  );
+  assert.deepEqual(
+    projects[1].sessions.map((session) => session.sessionId),
+    ["e", "d"],
+  );
+});
+
 test("new project groups append after already-known projects", () => {
   const sessions = [
     { sessionId: "c", workspaceRoot: "/work/project-c", updatedAt: 300 },
