@@ -136,7 +136,9 @@ export default function Composer({
 
 function ThinkingMenu({ disabled, modelInfo, onThinkingChange }) {
   const [open, setOpen] = useState(false);
+  const [focusedIndex, setFocusedIndex] = useState(0);
   const menuRef = useRef(null);
+  const itemRefs = useRef([]);
   const triggerRef = useRef(null);
   const levels = Array.isArray(modelInfo?.thinkingLevels)
     ? modelInfo.thinkingLevels
@@ -149,6 +151,11 @@ function ThinkingMenu({ disabled, modelInfo, onThinkingChange }) {
     window.setTimeout(() => {
       triggerRef.current?.focus();
     }, 0);
+  }, []);
+
+  const openMenu = useCallback(() => {
+    setFocusedIndex(0);
+    setOpen(true);
   }, []);
 
   useEffect(() => {
@@ -174,15 +181,58 @@ function ThinkingMenu({ disabled, modelInfo, onThinkingChange }) {
     }
   }, [disabled, hasChoices, closeMenu]);
 
+  useEffect(() => {
+    itemRefs.current = itemRefs.current.slice(0, levels.length);
+  }, [levels.length]);
+
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+    window.setTimeout(() => {
+      itemRefs.current[focusedIndex]?.focus();
+    }, 0);
+  }, [focusedIndex, open]);
+
   function selectThinking(level) {
     onThinkingChange(level);
     closeMenu();
   }
 
-  function closeOnEscape(event) {
+  function handleTriggerKeyDown(event) {
     if (event.key === "Escape") {
       closeMenu();
     }
+  }
+
+  function handleMenuKeyDown(event) {
+    if (event.key === "Escape") {
+      closeMenu();
+      return;
+    }
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      focusThinkingOption(focusedIndex + 1);
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      focusThinkingOption(focusedIndex - 1);
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      const focusedLevel = levels[focusedIndex];
+      if (focusedLevel) {
+        selectThinking(focusedLevel);
+      }
+    }
+  }
+
+  function focusThinkingOption(index) {
+    const nextIndex = wrapIndex(index, levels.length);
+    setFocusedIndex(nextIndex);
+    itemRefs.current[nextIndex]?.focus();
   }
 
   if (!current && !hasChoices) {
@@ -218,8 +268,8 @@ function ThinkingMenu({ disabled, modelInfo, onThinkingChange }) {
         aria-expanded={open}
         aria-live="polite"
         disabled={disabled}
-        onClick={() => setOpen((isOpen) => !isOpen)}
-        onKeyDown={closeOnEscape}
+        onClick={() => (open ? closeMenu() : openMenu())}
+        onKeyDown={handleTriggerKeyDown}
       >
         <span>{formatThinkingLabel(current)}</span>
         <span className="thinking-chevron" aria-hidden="true">
@@ -227,16 +277,25 @@ function ThinkingMenu({ disabled, modelInfo, onThinkingChange }) {
         </span>
       </button>
       {open ? (
-        <div className="thinking-menu" role="menu" onKeyDown={closeOnEscape}>
-          {levels.map((level) => {
+        <div
+          className="thinking-menu"
+          role="menu"
+          onKeyDown={handleMenuKeyDown}
+        >
+          {levels.map((level, index) => {
             const selected = level === current;
             return (
               <button
                 key={level}
+                ref={(node) => {
+                  itemRefs.current[index] = node;
+                }}
                 type="button"
                 className="thinking-option"
                 role="menuitemradio"
                 aria-checked={selected ? "true" : "false"}
+                tabIndex={index === focusedIndex ? 0 : -1}
+                onFocus={() => setFocusedIndex(index)}
                 onClick={() => selectThinking(level)}
               >
                 <span>
@@ -426,6 +485,10 @@ function formatThinkingLabel(level) {
     return "";
   }
   return level === "off" ? "thinking off" : `thinking ${level}`;
+}
+
+function wrapIndex(index, length) {
+  return ((index % length) + length) % length;
 }
 
 function SessionModeMenu({ disabled, mode, onModeChange }) {
