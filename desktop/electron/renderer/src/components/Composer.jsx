@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 const tokenFormatter = new Intl.NumberFormat("en-US");
 const sessionModeOptions = [
-  { value: "local", label: "Work locally" },
-  { value: "worktree", label: "New worktree" },
+  { value: "local", label: "Local" },
+  { value: "worktree", label: "Worktree" },
 ];
 
 export default function Composer({
@@ -63,7 +63,7 @@ export default function Composer({
           id="composer-input"
           className="composer-input"
           aria-label="Message"
-          placeholder="Send a message..."
+          placeholder="Tell nav what to do"
           autoComplete="off"
           rows="1"
           disabled={!connected}
@@ -75,9 +75,11 @@ export default function Composer({
           type="submit"
           id="composer-send"
           className="composer-send"
+          aria-label="Send message"
+          title="Send message"
           disabled={!connected}
         >
-          Send
+          ↑
         </button>
         {running ? (
           <button

@@ -60,7 +60,7 @@ export default function Sidebar({
           disabled={running || !connected}
           onClick={onNewChat}
         >
-          + New chat
+          + New thread
         </button>
       </div>
 
@@ -183,8 +183,8 @@ function ProjectHeading({
       <button
         type="button"
         className="project-chat-add"
-        title={`New chat in ${label}`}
-        aria-label={`New chat in ${label}`}
+        title={`New thread in ${label}`}
+        aria-label={`New thread in ${label}`}
         disabled={running || !connected}
         onClick={() => onNewChatInProject(project.path)}
       >
@@ -236,7 +236,7 @@ function ProjectSessions({
 
 function sessionTitle(session) {
   const title = (session.title ?? "").trim();
-  return title.length > 0 ? title : "New chat";
+  return title.length > 0 ? title : "New thread";
 }
 
 function toggleSetEntry(key) {

@@ -9,6 +9,7 @@
     "includes": [
       "desktop/**",
       "tests/**/*.cjs",
+      "!!.nav",
       "!desktop/electron/renderer/vendor"
     ]
   },

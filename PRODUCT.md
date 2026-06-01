@@ -24,13 +24,13 @@ Terminal-native, precise, a little bit hacker. Three words: sharp, focused, aliv
 
 ## Design Principles
 
-- **One signal.** A single phosphor-green accent carries every active/important state. Color means something; it isn't decoration.
-- **The tool disappears.** Dense, legible, fast. Personality lives in the chrome (palette, type, glow), never in re-decorating the content.
+- **One signal.** A single cyan-green accent carries active, focus, and running states. Color means something; it is not decoration.
+- **The tool disappears.** Dense, legible, fast. Personality lives in the chrome (palette, type, spacing), never in re-decorating the content.
 - **Glyph over chrome.** Status and meaning come from monospace glyphs and alignment, not bubbles, stripes, or badges.
-- **Alive, not busy.** Motion is reserved for state and focus (caret blink, focus glow, running pulse), 150–250ms, always with a reduced-motion fallback.
+- **Alive, not busy.** Motion is reserved for state and focus (caret blink, focus glow, running pulse), 150-250ms, always with a reduced-motion fallback.
 
 ## Accessibility & Inclusion
 
-- WCAG AA: body text ≥4.5:1, large/UI text ≥3:1 against its surface. Verified against the dark base.
-- Error state never relies on the green-vs-red hue alone (colorblind-safe): it also carries a distinct `✕` glyph and tinted surface.
+- WCAG AA: body text >=4.5:1, large/UI text >=3:1 against its surface. Verified against the dark base.
+- Error state never relies on the accent-vs-red hue alone (colorblind-safe): it also carries a distinct `✕` glyph and tinted surface.
 - Every animation has a `prefers-reduced-motion: reduce` alternative (instant / static).

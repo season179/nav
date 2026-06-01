@@ -530,7 +530,7 @@ function SessionToolbar({
   return (
     <header className="session-toolbar">
       <div className="session-toolbar-title">
-        <span className="session-toolbar-label">Session</span>
+        <span className="session-toolbar-label">Thread</span>
         <span className="session-toolbar-id">
           {sessionId ? shortId(sessionId) : "none"}
         </span>
