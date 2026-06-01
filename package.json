@@ -3,19 +3,24 @@
   "private": true,
   "description": "Learning project for building a coding agent.",
   "scripts": {
-    "electron:dev": "electron desktop/electron/main.cjs",
-    "electron:smoke": "electron desktop/electron/main.cjs --smoke",
-    "check:electron": "node --test tests/*.test.cjs",
+    "renderer:build": "vite build --config desktop/electron/renderer/vite.config.mjs",
+    "electron:dev": "vite build --config desktop/electron/renderer/vite.config.mjs && electron desktop/electron/main.cjs",
+    "electron:smoke": "vite build --config desktop/electron/renderer/vite.config.mjs && electron desktop/electron/main.cjs --smoke",
+    "check:electron": "vite build --config desktop/electron/renderer/vite.config.mjs && node --test tests/*.test.cjs",
     "lint": "biome check",
     "lint:fix": "biome check --write",
     "format": "biome format --write"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.15",
-    "electron": "^42.2.0"
+    "@vitejs/plugin-react": "^6.0.2",
+    "electron": "^42.2.0",
+    "vite": "^8.0.14"
   },
   "dependencies": {
     "dompurify": "^3.4.5",
-    "marked": "^18.0.4"
+    "marked": "^18.0.4",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
   }
 }

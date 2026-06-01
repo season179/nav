@@ -1,13 +1,10 @@
 const assert = require("node:assert/strict");
+const path = require("node:path");
 const { test } = require("node:test");
+const { pathToFileURL } = require("node:url");
 
-const {
-  groupSessionsByProject,
-  normalizeProjectPath,
-  projectKey,
-} = require("../desktop/electron/renderer/project-list.js");
-
-test("project groups keep their existing order when a nested session becomes newest", () => {
+test("project groups keep their existing order when a nested session becomes newest", async () => {
+  const { groupSessionsByProject } = await loadProjectList();
   const sessions = [
     { sessionId: "b-old", workspaceRoot: "/work/project-b", updatedAt: 100 },
     { sessionId: "a-old", workspaceRoot: "/work/project-a", updatedAt: 200 },
@@ -30,7 +27,8 @@ test("project groups keep their existing order when a nested session becomes new
   );
 });
 
-test("sessions with invalid activity sort as zero while preserving tie order", () => {
+test("sessions with invalid activity sort as zero while preserving tie order", async () => {
+  const { groupSessionsByProject } = await loadProjectList();
   const sessions = [
     { sessionId: "a", workspaceRoot: "/work/project-a", updatedAt: undefined },
     { sessionId: "b", workspaceRoot: "/work/project-a", updatedAt: "invalid" },
@@ -51,7 +49,8 @@ test("sessions with invalid activity sort as zero while preserving tie order", (
   );
 });
 
-test("new project groups append after already-known projects", () => {
+test("new project groups append after already-known projects", async () => {
+  const { groupSessionsByProject } = await loadProjectList();
   const sessions = [
     { sessionId: "c", workspaceRoot: "/work/project-c", updatedAt: 300 },
     { sessionId: "a", workspaceRoot: "/work/project-a", updatedAt: 200 },
@@ -69,10 +68,22 @@ test("new project groups append after already-known projects", () => {
   );
 });
 
-test("project paths normalize into stable keys", () => {
+test("project paths normalize into stable keys", async () => {
+  const { normalizeProjectPath, projectKey } = await loadProjectList();
   assert.equal(
     normalizeProjectPath("  C:\\Users\\season\\nav\\\\  "),
     "C:/Users/season/nav",
   );
   assert.equal(projectKey(normalizeProjectPath("   ")), "__no_project__");
 });
+
+function loadProjectList() {
+  return import(
+    pathToFileURL(
+      path.join(
+        __dirname,
+        "../desktop/electron/renderer/src/lib/project-list.mjs",
+      ),
+    ).href
+  );
+}

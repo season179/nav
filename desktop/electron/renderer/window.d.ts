@@ -35,6 +35,7 @@ declare global {
       onBackendStatus(callback: (status: BackendStatus) => void): () => void;
       onSessionEvent(callback: (event: SessionEvent) => void): () => void;
       sessionSendMessage(text: string): Promise<void>;
+      sessionStop(): Promise<void>;
       listSessions(): Promise<SessionSummary[]>;
       createProject(): Promise<string | null>;
       modelInfo(sessionId?: string): Promise<{

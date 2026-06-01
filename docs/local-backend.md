@@ -155,7 +155,7 @@ model (e.g. `provider: commandcode`, `model: Qwen/Qwen3.7-Max`,
    environment, so leave `NAV_MOCK_MODEL` unset to reach the real model):
 
    ```sh
-   npm run electron:dev
+   bun run electron:dev
    ```
 
 3. Send an initial message (e.g. `my name is Ada`) and confirm a **real**

@@ -132,7 +132,7 @@ function createMainWindow() {
   });
   trace.mark("electron.window.load_file.start");
   window
-    .loadFile(path.join(__dirname, "renderer", "index.html"))
+    .loadFile(path.join(__dirname, "renderer", "dist", "index.html"))
     .then(() => {
       trace.mark("electron.window.load_file.end");
     })

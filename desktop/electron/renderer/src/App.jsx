@@ -1,0 +1,391 @@
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import Composer from "./components/Composer.jsx";
+import Sidebar from "./components/Sidebar.jsx";
+import Transcript from "./components/Transcript.jsx";
+
+export default function App() {
+  const [connected, setConnected] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [sessionSummaries, setSessionSummaries] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [modelInfo, setModelInfo] = useState(null);
+  const [stopPending, setStopPending] = useState(false);
+
+  const connectedRef = useRef(false);
+  const runningRef = useRef(false);
+  const activeSessionIdRef = useRef(null);
+  const stopRequestedRef = useRef(false);
+  const nextMessageIdRef = useRef(0);
+
+  const setConnectedState = useCallback((isConnected) => {
+    connectedRef.current = isConnected;
+    setConnected(isConnected);
+  }, []);
+
+  const setRunningState = useCallback((isRunning) => {
+    runningRef.current = isRunning;
+    setRunning(isRunning);
+  }, []);
+
+  const setActiveSession = useCallback((sessionId) => {
+    activeSessionIdRef.current = sessionId;
+    setActiveSessionId(sessionId);
+  }, []);
+
+  const setStopRequested = useCallback((isRequested) => {
+    stopRequestedRef.current = isRequested;
+    if (!isRequested) {
+      setStopPending(false);
+    }
+  }, []);
+
+  const nextMessageId = useCallback(() => {
+    nextMessageIdRef.current += 1;
+    return `message-${nextMessageIdRef.current}`;
+  }, []);
+
+  const appendMessage = useCallback(
+    (role, text) => {
+      setMessages((current) => [
+        ...current,
+        {
+          id: nextMessageId(),
+          role,
+          text: text ?? "",
+          createdAt: new Date().toISOString(),
+        },
+      ]);
+    },
+    [nextMessageId],
+  );
+
+  const clearTranscript = useCallback(() => {
+    setMessages([]);
+  }, []);
+
+  const upsertToolLine = useCallback(
+    (toolCallId, state, toolName, detail) => {
+      setMessages((current) => {
+        const nextToolLine = (existingId) => ({
+          id: existingId ?? nextMessageId(),
+          role: "tool",
+          toolCallId,
+          state,
+          toolName: toolName ?? "tool",
+          detail: detail ?? "",
+        });
+
+        if (!toolCallId) {
+          return [...current, nextToolLine()];
+        }
+
+        const index = current.findIndex(
+          (message) =>
+            message.role === "tool" && message.toolCallId === toolCallId,
+        );
+        if (index === -1) {
+          return [...current, nextToolLine()];
+        }
+
+        const next = current.slice();
+        next[index] = nextToolLine(current[index].id);
+        return next;
+      });
+    },
+    [nextMessageId],
+  );
+
+  const refreshModelInfo = useCallback(async (sessionId) => {
+    if (!window.nav) {
+      return;
+    }
+    const targetSessionId = sessionId ?? activeSessionIdRef.current;
+    try {
+      const info = await window.nav.modelInfo(targetSessionId);
+      if ((targetSessionId ?? null) === (activeSessionIdRef.current ?? null)) {
+        setModelInfo(info ?? null);
+      }
+    } catch {
+      // The indicator is best-effort; never let it disrupt the chat.
+    }
+  }, []);
+
+  const refreshSessions = useCallback(async () => {
+    if (!window.nav) {
+      return;
+    }
+    try {
+      setSessionSummaries(await window.nav.listSessions());
+    } catch {
+      // Listing is best-effort; never let it disrupt the chat.
+    }
+  }, []);
+
+  const renderBackendStatus = useCallback(
+    (status) => {
+      switch (status.state) {
+        case "starting-backend":
+        case "connected":
+          break;
+        case "stream-error":
+          appendMessage("error", `Stream error: ${status.message}`);
+          break;
+        case "backend-error":
+          appendMessage("error", `Backend error: ${status.message}`);
+          break;
+        default:
+          appendMessage("error", status.message ?? status.state);
+          break;
+      }
+    },
+    [appendMessage],
+  );
+
+  const stopRun = useCallback(async () => {
+    if (!window.nav) {
+      return;
+    }
+    stopRequestedRef.current = true;
+    setStopPending(true);
+    try {
+      await window.nav.sessionStop();
+    } catch (error) {
+      appendMessage("error", `Could not stop: ${error.message}`);
+      setStopPending(false);
+    }
+  }, [appendMessage]);
+
+  const handleBackendStatus = useCallback(
+    (status) => {
+      renderBackendStatus(status);
+      if (status.state !== "connected") {
+        return;
+      }
+
+      setConnectedState(true);
+      if (status.sessionId) {
+        setActiveSession(status.sessionId);
+      }
+      setRunningState(false);
+      refreshSessions();
+      refreshModelInfo(status.sessionId);
+    },
+    [
+      refreshModelInfo,
+      refreshSessions,
+      renderBackendStatus,
+      setActiveSession,
+      setConnectedState,
+      setRunningState,
+    ],
+  );
+
+  const handleSessionEvent = useCallback(
+    (event) => {
+      switch (event.type) {
+        case "user.message":
+          appendMessage("user", event.text);
+          break;
+        case "run.started":
+          setRunningState(true);
+          if (stopRequestedRef.current) {
+            stopRun();
+          }
+          break;
+        case "assistant.tool_calls":
+          if (event.text) {
+            appendMessage("assistant", event.text);
+          }
+          break;
+        case "tool.started":
+          upsertToolLine(event.tool_call_id, "running", event.tool_name);
+          break;
+        case "tool.completed":
+          upsertToolLine(
+            event.tool_call_id,
+            "done",
+            event.tool_name,
+            event.text,
+          );
+          break;
+        case "tool.failed":
+          upsertToolLine(
+            event.tool_call_id,
+            "failed",
+            event.tool_name,
+            event.error,
+          );
+          break;
+        case "message.completed":
+          appendMessage("assistant", event.text);
+          break;
+        case "run.completed":
+        case "run.cancelled":
+          setRunningState(false);
+          setStopRequested(false);
+          refreshSessions();
+          refreshModelInfo();
+          break;
+        case "run.failed":
+          appendMessage("error", event.error ?? "the run failed");
+          setRunningState(false);
+          setStopRequested(false);
+          refreshSessions();
+          refreshModelInfo();
+          break;
+        default:
+          break;
+      }
+    },
+    [
+      appendMessage,
+      refreshModelInfo,
+      refreshSessions,
+      setRunningState,
+      setStopRequested,
+      stopRun,
+      upsertToolLine,
+    ],
+  );
+
+  useNavSubscriptions(handleBackendStatus, handleSessionEvent, appendMessage);
+
+  const activateCreatedSession = useCallback(
+    async (sessionId) => {
+      setActiveSession(sessionId);
+      await refreshSessions();
+      refreshModelInfo(sessionId);
+    },
+    [refreshModelInfo, refreshSessions, setActiveSession],
+  );
+
+  const selectSession = useCallback(
+    async (sessionId) => {
+      if (
+        sessionId === activeSessionIdRef.current ||
+        runningRef.current ||
+        !connectedRef.current
+      ) {
+        return;
+      }
+
+      const previousSessionId = activeSessionIdRef.current;
+      clearTranscript();
+      setActiveSession(sessionId);
+      try {
+        await window.nav.switchSession(sessionId);
+        refreshModelInfo(sessionId);
+      } catch (error) {
+        setActiveSession(previousSessionId);
+        appendMessage("error", `Could not open session: ${error.message}`);
+      }
+    },
+    [appendMessage, clearTranscript, refreshModelInfo, setActiveSession],
+  );
+
+  const startNewChatInProject = useCallback(
+    async (projectPath) => {
+      if (runningRef.current || !connectedRef.current || !window.nav) {
+        return;
+      }
+      clearTranscript();
+      try {
+        const sessionId = await window.nav.newSession(projectPath || null);
+        await activateCreatedSession(sessionId);
+      } catch (error) {
+        appendMessage("error", `Could not start a new chat: ${error.message}`);
+      }
+    },
+    [activateCreatedSession, appendMessage, clearTranscript],
+  );
+
+  const createProject = useCallback(async () => {
+    if (runningRef.current || !connectedRef.current || !window.nav) {
+      return;
+    }
+    try {
+      const sessionId = await window.nav.createProject();
+      if (!sessionId) {
+        return;
+      }
+      clearTranscript();
+      await activateCreatedSession(sessionId);
+    } catch (error) {
+      appendMessage("error", `Could not create project: ${error.message}`);
+    }
+  }, [activateCreatedSession, appendMessage, clearTranscript]);
+
+  const sendMessage = useCallback(
+    async (text) => {
+      if (!text || !connectedRef.current || !window.nav) {
+        return;
+      }
+
+      const wasRunning = runningRef.current;
+      if (!wasRunning) {
+        setStopRequested(false);
+        setRunningState(true);
+      }
+
+      try {
+        await window.nav.sessionSendMessage(text);
+      } catch (error) {
+        appendMessage("error", `Could not send message: ${error.message}`);
+        if (!wasRunning) {
+          setRunningState(false);
+        }
+      }
+    },
+    [appendMessage, setRunningState, setStopRequested],
+  );
+
+  const activeProjectPath = useMemo(
+    () =>
+      sessionSummaries.find((session) => session.sessionId === activeSessionId)
+        ?.workspaceRoot ?? null,
+    [activeSessionId, sessionSummaries],
+  );
+
+  return (
+    <div className="app">
+      <Sidebar
+        activeSessionId={activeSessionId}
+        connected={connected}
+        running={running}
+        sessions={sessionSummaries}
+        onCreateProject={createProject}
+        onNewChat={() => startNewChatInProject(activeProjectPath)}
+        onNewChatInProject={startNewChatInProject}
+        onSelectSession={selectSession}
+      />
+      <main className="shell">
+        <Transcript messages={messages} />
+        <Composer
+          connected={connected}
+          modelInfo={modelInfo}
+          running={running}
+          stopPending={stopPending}
+          onSend={sendMessage}
+          onStop={stopRun}
+        />
+      </main>
+    </div>
+  );
+}
+
+function useNavSubscriptions(handleBackendStatus, handleSessionEvent, onError) {
+  useLayoutEffect(() => {
+    if (window.nav) {
+      const unsubscribeStatus = window.nav.onBackendStatus(handleBackendStatus);
+      const unsubscribeEvents = window.nav.onSessionEvent(handleSessionEvent);
+      return () => {
+        unsubscribeStatus?.();
+        unsubscribeEvents?.();
+      };
+    }
+
+    onError("error", "Electron preload API unavailable");
+    return undefined;
+  }, [handleBackendStatus, handleSessionEvent, onError]);
+}
