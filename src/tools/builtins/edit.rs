@@ -9,6 +9,10 @@ use serde_json::{Value, json};
 use unicode_normalization_alignments::UnicodeNormalization;
 
 use super::support::paths::resolve_in_cwd;
+use super::support::text::{
+    LineEnding, bytes_preserving_file_style, detect_line_ending, normalize_line_endings_to_lf,
+    strip_utf8_bom,
+};
 use super::support::truncate::cap_head;
 use super::{CancelFlag, Tool, ToolError, ToolOutput};
 
@@ -105,15 +109,6 @@ impl Tool for EditTool {
             &resolved_edits,
         ))))
     }
-}
-
-const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
-
-#[derive(Clone, Copy)]
-enum LineEnding {
-    Lf,
-    Crlf,
-    Cr,
 }
 
 #[derive(Clone)]
@@ -217,51 +212,6 @@ fn bool_alias(value: &Value, aliases: &[&str]) -> Option<bool> {
         .find_map(|key| value.get(*key).and_then(Value::as_bool))
 }
 
-fn strip_utf8_bom(bytes: &[u8]) -> (bool, &[u8]) {
-    if bytes.starts_with(UTF8_BOM) {
-        (true, &bytes[UTF8_BOM.len()..])
-    } else {
-        (false, bytes)
-    }
-}
-
-fn detect_line_ending(text: &str) -> LineEnding {
-    let bytes = text.as_bytes();
-    for (index, byte) in bytes.iter().enumerate() {
-        match byte {
-            b'\r' if bytes.get(index + 1) == Some(&b'\n') => return LineEnding::Crlf,
-            b'\r' => return LineEnding::Cr,
-            b'\n' => return LineEnding::Lf,
-            _ => {}
-        }
-    }
-    LineEnding::Lf
-}
-
-fn normalize_line_endings_to_lf(text: &str) -> String {
-    let mut normalized = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-            normalized.push('\n');
-        } else {
-            normalized.push(ch);
-        }
-    }
-    normalized
-}
-
-fn restore_line_endings(text: &str, line_ending: LineEnding) -> String {
-    match line_ending {
-        LineEnding::Lf => text.to_owned(),
-        LineEnding::Crlf => text.replace('\n', "\r\n"),
-        LineEnding::Cr => text.replace('\n', "\r"),
-    }
-}
-
 fn write_preserving_file_style(
     resolved: &Path,
     path: &str,
@@ -269,13 +219,11 @@ fn write_preserving_file_style(
     had_bom: bool,
     line_ending: LineEnding,
 ) -> Result<(), ToolError> {
-    let mut output_bytes = Vec::new();
-    if had_bom {
-        output_bytes.extend_from_slice(UTF8_BOM);
-    }
-    output_bytes.extend_from_slice(restore_line_endings(text, line_ending).as_bytes());
-    fs::write(resolved, output_bytes)
-        .map_err(|error| ToolError::new(format!("could not write {path}: {error}")))
+    fs::write(
+        resolved,
+        bytes_preserving_file_style(text, had_bom, line_ending),
+    )
+    .map_err(|error| ToolError::new(format!("could not write {path}: {error}")))
 }
 
 fn resolve_edit(
