@@ -3,7 +3,7 @@
 
 use nav::{ChatMessage, Role, Storage, TokenUsage, ToolCall};
 use rusqlite::Connection;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A throwaway database path under the OS temp dir.
 fn temp_db() -> std::path::PathBuf {
@@ -17,6 +17,26 @@ impl Drop for TempDb {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
         }
+    }
+}
+
+struct TempWorktree {
+    path: PathBuf,
+}
+
+impl TempWorktree {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempWorktree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -130,10 +150,12 @@ fn project_root_normalizes_unresolved_commondir_paths() {
     let path = temp_db();
     let _cleanup = TempDb(path.clone());
     let storage = Storage::open(&path).expect("open database");
-    let fixture_root =
-        std::env::temp_dir().join(format!("nav_storage_worktree_{}", uuid::Uuid::now_v7()));
-    let workspace = fixture_root.join("worktrees").join("copy");
-    let git_dir = fixture_root
+    let temp_worktree = TempWorktree::new(
+        std::env::temp_dir().join(format!("nav_storage_worktree_{}", uuid::Uuid::now_v7())),
+    );
+    let workspace = temp_worktree.path().join("worktrees").join("copy");
+    let git_dir = temp_worktree
+        .path()
         .join("main")
         .join(".git")
         .join("worktrees")
@@ -156,7 +178,8 @@ fn project_root_normalizes_unresolved_commondir_paths() {
         .expect("create worktree session");
 
     let sessions = storage.list_sessions("nav").unwrap();
-    let expected_project_root = fixture_root
+    let expected_project_root = temp_worktree
+        .path()
         .join("main")
         .join("missing")
         .join("repo")
@@ -166,8 +189,6 @@ fn project_root_normalizes_unresolved_commondir_paths() {
         sessions[0].project_root.as_deref(),
         Some(expected_project_root.as_str())
     );
-
-    let _ = std::fs::remove_dir_all(fixture_root);
 }
 
 #[test]
