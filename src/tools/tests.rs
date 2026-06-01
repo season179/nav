@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -56,6 +57,14 @@ fn tool_call(tool: &str, args: serde_json::Value) -> ToolCall {
         name: tool.to_owned(),
         arguments: args.to_string(),
     }
+}
+
+fn has_rg() -> bool {
+    Command::new("rg")
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 /// Execute a tool call through the registry and require success.
@@ -229,6 +238,78 @@ fn grep_reports_matches_with_path_and_line_number() {
         json!({ "pattern": "beta", "ignoreCase": true }),
     );
     assert_eq!(case_insensitive.content.trim(), "a.txt:2:BETA");
+}
+
+#[test]
+fn grep_respects_gitignore_when_ripgrep_is_available() {
+    if !has_rg() {
+        return;
+    }
+
+    let workspace = Workspace::new();
+    fs::create_dir_all(workspace.path.join(".git")).expect("create git marker");
+    workspace.write(".gitignore", "ignored.txt\n");
+    workspace.write("ignored.txt", "needle ignored\n");
+    workspace.write("visible.txt", "needle visible\n");
+
+    let output = run(&workspace, "grep", json!({ "pattern": "needle" }));
+    assert!(
+        output.content.contains("visible.txt:1:needle visible"),
+        "{}",
+        output.content
+    );
+    assert!(
+        !output.content.contains("ignored.txt"),
+        "{}",
+        output.content
+    );
+}
+
+#[test]
+fn grep_supports_output_modes_and_offset() {
+    let workspace = Workspace::new();
+    workspace.write("a.txt", "needle one\nneedle two\nneedle three\n");
+    workspace.write("b.txt", "needle four\n");
+
+    let paged = run(
+        &workspace,
+        "grep",
+        json!({ "pattern": "needle", "path": "a.txt", "offset": 1, "limit": 1 }),
+    );
+    assert!(
+        paged.content.contains("a.txt:2:needle two"),
+        "{}",
+        paged.content
+    );
+    assert!(
+        !paged.content.contains("a.txt:1:needle one"),
+        "{}",
+        paged.content
+    );
+
+    let files = run(
+        &workspace,
+        "grep",
+        json!({ "pattern": "needle", "outputMode": "files_with_matches" }),
+    );
+    assert!(
+        files.content.lines().any(|line| line == "a.txt"),
+        "{}",
+        files.content
+    );
+    assert!(
+        files.content.lines().any(|line| line == "b.txt"),
+        "{}",
+        files.content
+    );
+
+    let counts = run(
+        &workspace,
+        "grep",
+        json!({ "pattern": "needle", "output_mode": "count" }),
+    );
+    assert!(counts.content.contains("a.txt:3"), "{}", counts.content);
+    assert!(counts.content.contains("b.txt:1"), "{}", counts.content);
 }
 
 #[test]
