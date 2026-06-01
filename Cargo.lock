@@ -812,6 +812,7 @@ dependencies = [
  "tokenizers",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization-alignments",
  "ureq",
  "uuid",
 ]
