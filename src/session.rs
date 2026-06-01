@@ -17,7 +17,9 @@ use uuid::Uuid;
 
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
-use crate::model::{ChatMessage, ChatModel, ModelChoice, ModelInfo, Role, ToolCall};
+use crate::model::{
+    ChatMessage, ChatModel, ModelChoice, ModelInfo, ResponseReasoningItem, Role, ToolCall,
+};
 use crate::stack_store::{StackAvailability, StackQueryResult, StackStore, StackStoreError};
 use crate::stacks::ModelCallStack;
 use crate::storage::{
@@ -757,6 +759,7 @@ impl AgentRunSink for SessionRunSink<'_> {
         &mut self,
         content: &str,
         reasoning_content: Option<&str>,
+        response_reasoning_items: &[ResponseReasoningItem],
         model_id: Option<&str>,
     ) -> Result<(), Self::Error> {
         // Record the reply only. Whether this reply ends the run or it continues
@@ -766,6 +769,7 @@ impl AgentRunSink for SessionRunSink<'_> {
         self.store.with_session(self.session_id, |session| {
             let mut message = ChatMessage::assistant(content);
             message.reasoning_content = reasoning_content.map(str::to_owned);
+            message.response_reasoning_items = response_reasoning_items.to_vec();
             session.turns.push(message);
             session.emit("message.completed", |event| {
                 event.role = Some(Role::Assistant.as_str().to_owned());
@@ -781,8 +785,7 @@ impl AgentRunSink for SessionRunSink<'_> {
                     self.session_id,
                     self.run_id,
                     self.seq,
-                    content,
-                    reasoning_content,
+                    (content, reasoning_content, response_reasoning_items),
                     model_id,
                 ),
             );
@@ -834,12 +837,14 @@ impl AgentRunSink for SessionRunSink<'_> {
         &mut self,
         content: &str,
         reasoning_content: Option<&str>,
+        response_reasoning_items: &[ResponseReasoningItem],
         calls: &[ToolCall],
         model_id: Option<&str>,
     ) -> Result<(), Self::Error> {
         self.store.with_session(self.session_id, |session| {
             let mut message = ChatMessage::assistant_tool_calls(content, calls.to_vec());
             message.reasoning_content = reasoning_content.map(str::to_owned);
+            message.response_reasoning_items = response_reasoning_items.to_vec();
             session.turns.push(message);
             session.emit("assistant.tool_calls", |event| {
                 event.role = Some(Role::Assistant.as_str().to_owned());
@@ -857,7 +862,7 @@ impl AgentRunSink for SessionRunSink<'_> {
                     self.session_id,
                     self.run_id,
                     self.seq,
-                    (text, reasoning_content),
+                    (text, reasoning_content, response_reasoning_items),
                     calls,
                     model_id,
                 ),

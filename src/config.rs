@@ -37,6 +37,8 @@ pub struct ResolvedModelConfig {
 
 impl std::fmt::Debug for ResolvedModelConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let chatgpt_account_id = self.chatgpt_account_id.as_ref().map(|_| "<redacted>");
+
         f.debug_struct("ResolvedModelConfig")
             .field("api", &self.api)
             .field("api_key", &"<redacted>")
@@ -51,7 +53,7 @@ impl std::fmt::Debug for ResolvedModelConfig {
             .field("max_tokens", &self.max_tokens)
             .field("compat", &self.compat)
             .field("thinking_level_map", &self.thinking_level_map)
-            .field("chatgpt_account_id", &self.chatgpt_account_id)
+            .field("chatgpt_account_id", &chatgpt_account_id)
             .field("chatgpt_plan_type", &self.chatgpt_plan_type)
             .field("chatgpt_fedramp", &self.chatgpt_fedramp)
             .field("service_tier", &self.service_tier)
@@ -474,10 +476,11 @@ fn resolve_service_tier(
     provider_config: &ProviderConfig,
     model_config: &ModelConfig,
 ) -> Option<String> {
-    match model_config.fast_mode.or(provider_config.fast_mode) {
-        Some(true) => return Some(service_tier_for_request(api, "fast")),
-        Some(false) => return None,
-        None => {}
+    if matches!(
+        model_config.fast_mode.or(provider_config.fast_mode),
+        Some(true)
+    ) {
+        return Some(service_tier_for_request(api, "fast"));
     }
 
     model_config

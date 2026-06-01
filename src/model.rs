@@ -9,7 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{
@@ -61,6 +61,14 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// Opaque Responses API reasoning state that must be replayed with an
+/// assistant turn in stateless follow-up requests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseReasoningItem {
+    pub id: String,
+    pub encrypted_content: String,
+}
+
 /// One message-shaped entry shared by Turn History and Model Context.
 ///
 /// Plain user and assistant turns carry only `content`. An assistant turn may
@@ -73,6 +81,9 @@ pub struct ChatMessage {
     /// Provider reasoning/thinking payload for assistant turns. Some
     /// OpenAI-compatible thinking models require this to be replayed verbatim.
     pub reasoning_content: Option<String>,
+    /// Opaque Responses API reasoning payloads for assistant turns. These are
+    /// sent back to OpenAI but are not user-visible reasoning text.
+    pub response_reasoning_items: Vec<ResponseReasoningItem>,
     /// Tool calls requested by an assistant turn (empty for every other turn).
     pub tool_calls: Vec<ToolCall>,
     /// For a [`Role::Tool`] turn, the assistant tool call this result answers.
@@ -89,6 +100,7 @@ impl ChatMessage {
             role: Role::User,
             content: content.into(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
             is_error: false,
@@ -100,6 +112,7 @@ impl ChatMessage {
             role: Role::Assistant,
             content: content.into(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
             is_error: false,
@@ -119,6 +132,7 @@ impl ChatMessage {
             role: Role::Assistant,
             content: content.into(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls,
             tool_call_id: None,
             is_error: false,
@@ -146,6 +160,7 @@ impl ChatMessage {
             role: Role::Tool,
             content: content.into(),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             is_error,
@@ -178,6 +193,8 @@ pub struct ModelResponse {
     pub content: Option<String>,
     /// Provider reasoning/thinking payload, if returned separately from text.
     pub reasoning_content: Option<String>,
+    /// Opaque Responses API reasoning payloads to replay on later model calls.
+    pub response_reasoning_items: Vec<ResponseReasoningItem>,
     /// Tool calls the model wants executed before the next turn.
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
@@ -253,6 +270,7 @@ impl ModelResponse {
         Self {
             content: Some(content.into()),
             reasoning_content: None,
+            response_reasoning_items: Vec::new(),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
             token_usage: None,
@@ -979,14 +997,16 @@ fn response_input_json(message: &ChatMessage) -> Vec<Value> {
             &message.content,
         )],
         Role::Assistant if message.tool_calls.is_empty() => {
-            vec![responses_message_json(
+            let mut items = responses_reasoning_items_json(&message.response_reasoning_items);
+            items.push(responses_message_json(
                 "assistant",
                 "output_text",
                 &message.content,
-            )]
+            ));
+            items
         }
         Role::Assistant => {
-            let mut items = Vec::new();
+            let mut items = responses_reasoning_items_json(&message.response_reasoning_items);
             if !message.content.is_empty() {
                 items.push(responses_message_json(
                     "assistant",
@@ -1003,6 +1023,19 @@ fn response_input_json(message: &ChatMessage) -> Vec<Value> {
             "output": message.content,
         })],
     }
+}
+
+fn responses_reasoning_items_json(reasoning: &[ResponseReasoningItem]) -> Vec<Value> {
+    reasoning
+        .iter()
+        .map(|item| {
+            json!({
+                "type": "reasoning",
+                "id": item.id,
+                "encrypted_content": item.encrypted_content,
+            })
+        })
+        .collect()
 }
 
 fn responses_message_json(role: &str, content_type: &str, text: &str) -> Value {
@@ -1137,6 +1170,7 @@ fn parse_chat_completion(payload: &Value) -> Result<ModelResponse, ModelError> {
     Ok(ModelResponse {
         content,
         reasoning_content,
+        response_reasoning_items: Vec::new(),
         tool_calls,
         finish_reason,
         token_usage: parse_token_usage(payload),
@@ -1151,7 +1185,7 @@ fn parse_responses_payload(payload: &Value) -> Result<ModelResponse, ModelError>
         .ok_or_else(unexpected)?;
 
     let content = response_output_text(output);
-    let reasoning_content = response_reasoning_summary(output);
+    let response_reasoning = response_reasoning(output);
     let tool_calls = output
         .iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
@@ -1166,7 +1200,8 @@ fn parse_responses_payload(payload: &Value) -> Result<ModelResponse, ModelError>
 
     Ok(ModelResponse {
         content,
-        reasoning_content,
+        reasoning_content: response_reasoning.summary,
+        response_reasoning_items: response_reasoning.items,
         tool_calls,
         finish_reason,
         token_usage: parse_responses_token_usage(payload),
@@ -1194,11 +1229,28 @@ fn response_output_text(output: &[Value]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn response_reasoning_summary(output: &[Value]) -> Option<String> {
+struct ParsedResponseReasoning {
+    summary: Option<String>,
+    items: Vec<ResponseReasoningItem>,
+}
+
+fn response_reasoning(output: &[Value]) -> ParsedResponseReasoning {
     let mut text = String::new();
+    let mut items = Vec::new();
     for item in output {
         if item.get("type").and_then(Value::as_str) != Some("reasoning") {
             continue;
+        }
+        if let (Some(id), Some(encrypted_content)) = (
+            item.get("id").and_then(Value::as_str),
+            item.get("encrypted_content").and_then(Value::as_str),
+        ) && !id.is_empty()
+            && !encrypted_content.is_empty()
+        {
+            items.push(ResponseReasoningItem {
+                id: id.to_owned(),
+                encrypted_content: encrypted_content.to_owned(),
+            });
         }
         let Some(summary) = item.get("summary").and_then(Value::as_array) else {
             continue;
@@ -1213,7 +1265,10 @@ fn response_reasoning_summary(output: &[Value]) -> Option<String> {
         }
     }
 
-    (!text.is_empty()).then_some(text)
+    ParsedResponseReasoning {
+        summary: (!text.is_empty()).then_some(text),
+        items,
+    }
 }
 
 fn parse_response_function_call(item: &Value) -> Result<ToolCall, ModelError> {

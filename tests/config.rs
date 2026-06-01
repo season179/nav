@@ -2,6 +2,9 @@ use base64::Engine;
 use nav::{ConfigError, list_configured_models, resolve_config, resolve_model_config};
 use serde_json::json;
 use std::path::Path;
+use std::sync::Mutex;
+
+static CODEX_HOME_LOCK: Mutex<()> = Mutex::new(());
 
 fn with_temp_settings<F>(content: &str, f: F)
 where
@@ -202,7 +205,41 @@ fn test_responses_fast_mode_maps_to_priority_service_tier() {
 }
 
 #[test]
+fn test_responses_fast_mode_false_preserves_service_tier() {
+    let settings = json!({
+        "defaultModel": {
+            "provider": "openai",
+            "model": "gpt-5.5"
+        },
+        "providers": {
+            "openai": {
+                "apiKey": "openai-key",
+                "api": "openai-responses",
+                "fastMode": false,
+                "serviceTier": "flex",
+                "models": [
+                    {
+                        "id": "gpt-5.5",
+                        "name": "GPT 5.5"
+                    }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    with_temp_settings(&settings, |path| {
+        let config = resolve_config(path).expect("responses config resolves");
+
+        assert_eq!(config.service_tier.as_deref(), Some("flex"));
+    });
+}
+
+#[test]
 fn test_codex_responses_resolves_chatgpt_auth_from_codex_home() {
+    let _codex_home_guard = CODEX_HOME_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let codex_home = std::env::temp_dir().join(format!("codex_home_{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&codex_home).expect("create temp codex home");
     let previous_codex_home = std::env::var("CODEX_HOME").ok();
@@ -266,6 +303,10 @@ fn test_codex_responses_resolves_chatgpt_auth_from_codex_home() {
             assert_eq!(config.chatgpt_plan_type.as_deref(), Some("pro"));
             assert!(config.chatgpt_fedramp);
             assert_eq!(config.service_tier.as_deref(), Some("priority"));
+
+            let debug_str = format!("{config:?}");
+            assert!(!debug_str.contains("acct_from_file"));
+            assert!(debug_str.contains("chatgpt_account_id: Some(\"<redacted>\")"));
         });
     });
 

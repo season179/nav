@@ -84,6 +84,7 @@ impl ChatModel for ScriptedModel {
             Ok(ModelResponse {
                 content: None,
                 reasoning_content: Some("I should inspect the workspace.".to_owned()),
+                response_reasoning_items: Vec::new(),
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_owned(),
                     name: "ls".to_owned(),
@@ -115,6 +116,7 @@ impl ChatModel for SleepThenTextModel {
             Ok(ModelResponse {
                 content: None,
                 reasoning_content: None,
+                response_reasoning_items: Vec::new(),
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_owned(),
                     name: "bash".to_owned(),
@@ -147,6 +149,7 @@ impl ChatModel for SleepThenWriteModel {
             Ok(ModelResponse {
                 content: None,
                 reasoning_content: None,
+                response_reasoning_items: Vec::new(),
                 tool_calls: vec![
                     ToolCall {
                         id: "call-bash".to_owned(),
@@ -257,6 +260,7 @@ impl ChatModel for GatedModel {
             GatedReply::Tool { id, name, args } => ModelResponse {
                 content: None,
                 reasoning_content: None,
+                response_reasoning_items: Vec::new(),
                 tool_calls: vec![ToolCall {
                     id,
                     name,
@@ -269,6 +273,7 @@ impl ChatModel for GatedModel {
             GatedReply::TextWithReasoning { text, reasoning } => ModelResponse {
                 content: Some(text),
                 reasoning_content: Some(reasoning),
+                response_reasoning_items: Vec::new(),
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
                 token_usage: None,

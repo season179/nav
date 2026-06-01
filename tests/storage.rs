@@ -1,7 +1,7 @@
 //! Durable session storage: a fresh database is created from the canonical
 //! schema, and a full exchange is persisted into the shared table shapes.
 
-use nav::{ChatMessage, Role, Storage, TokenUsage, ToolCall};
+use nav::{ChatMessage, ResponseReasoningItem, Role, Storage, TokenUsage, ToolCall};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -317,7 +317,14 @@ fn load_history_reconstructs_tool_calls_and_results_for_resume() {
             session_id,
             "run",
             1,
-            (Some("on it"), Some("I should inspect the workspace.")),
+            (
+                Some("on it"),
+                Some("I should inspect the workspace."),
+                &[ResponseReasoningItem {
+                    id: "rs_1".to_owned(),
+                    encrypted_content: "opaque-reasoning".to_owned(),
+                }],
+            ),
             &calls,
             Some("m"),
         )
@@ -334,15 +341,21 @@ fn load_history_reconstructs_tool_calls_and_results_for_resume() {
     storage.complete_run("run").unwrap();
 
     let history = storage.load_history(session_id).unwrap();
+    let mut expected_tool_call = ChatMessage::assistant_tool_calls_with_reasoning(
+        "on it",
+        calls,
+        "I should inspect the workspace.",
+    );
+    expected_tool_call.response_reasoning_items = vec![ResponseReasoningItem {
+        id: "rs_1".to_owned(),
+        encrypted_content: "opaque-reasoning".to_owned(),
+    }];
+
     assert_eq!(
         history.as_turns(),
         vec![
             ChatMessage::user("do the thing"),
-            ChatMessage::assistant_tool_calls_with_reasoning(
-                "on it",
-                calls,
-                "I should inspect the workspace.",
-            ),
+            expected_tool_call,
             ChatMessage::tool_result("call-a", "a.txt\nb.txt", false),
             ChatMessage::tool_result("call-b", "no such file", true),
             ChatMessage::assistant("all done"),

@@ -43,8 +43,8 @@ pub use config::{
 pub use context::{ContextAssembler, ModelContext, TurnHistory};
 pub use model::{
     ChatMessage, ChatModel, FinishReason, MockModel, ModelChoice, ModelError, ModelInfo,
-    ModelResponse, OpenAiConfig, OpenAiModel, OpenAiResponsesModel, Role, TokenBudgetInfo,
-    ToolCall, ToolDef,
+    ModelResponse, OpenAiConfig, OpenAiModel, OpenAiResponsesModel, ResponseReasoningItem, Role,
+    TokenBudgetInfo, ToolCall, ToolDef,
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
 pub use stack_store::{

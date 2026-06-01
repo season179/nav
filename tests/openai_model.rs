@@ -7,7 +7,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use nav::{
-    ChatMessage, ChatModel, ModelContext, OpenAiConfig, OpenAiModel, OpenAiResponsesModel, ToolCall,
+    ChatMessage, ChatModel, ModelContext, OpenAiConfig, OpenAiModel, OpenAiResponsesModel,
+    ResponseReasoningItem, ToolCall,
 };
 use serde_json::json;
 
@@ -338,7 +339,8 @@ fn responses_adapter_round_trips_function_calls_and_outputs() {
     let (base_url, requests) = fake_provider(
         "200 OK",
         r#"{"id":"resp_1","output":[
-          {"type":"reasoning","summary":[{"type":"summary_text","text":"Need a listing."}]},
+          {"type":"reasoning","id":"rs_1","encrypted_content":"opaque-new",
+           "summary":[{"type":"summary_text","text":"Need a listing."}]},
           {"type":"function_call","id":"fc_1","call_id":"call_1","name":"ls","arguments":"{}"}
         ]}"#,
     );
@@ -351,16 +353,21 @@ fn responses_adapter_round_trips_function_calls_and_outputs() {
         description: "List files".to_owned(),
         parameters: json!({"type":"object","properties":{}}),
     };
+    let mut previous_tool_call = ChatMessage::assistant_tool_calls(
+        "",
+        vec![ToolCall {
+            id: "call_prev".to_owned(),
+            name: "read".to_owned(),
+            arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
+        }],
+    );
+    previous_tool_call.response_reasoning_items = vec![ResponseReasoningItem {
+        id: "rs_prev".to_owned(),
+        encrypted_content: "opaque-prev".to_owned(),
+    }];
     let history = vec![
         ChatMessage::user("list files"),
-        ChatMessage::assistant_tool_calls(
-            "",
-            vec![ToolCall {
-                id: "call_prev".to_owned(),
-                name: "read".to_owned(),
-                arguments: r#"{"path":"Cargo.toml"}"#.to_owned(),
-            }],
-        ),
+        previous_tool_call,
         ChatMessage::tool_result("call_prev", "Cargo.toml", false),
     ];
     let reply = model
@@ -371,24 +378,71 @@ fn responses_adapter_round_trips_function_calls_and_outputs() {
     assert_eq!(reply.tool_calls[0].id, "call_1");
     assert_eq!(reply.tool_calls[0].name, "ls");
     assert_eq!(reply.reasoning_content.as_deref(), Some("Need a listing."));
+    assert_eq!(
+        reply.response_reasoning_items,
+        vec![ResponseReasoningItem {
+            id: "rs_1".to_owned(),
+            encrypted_content: "opaque-new".to_owned(),
+        }]
+    );
 
     let request = requests.recv().expect("captured provider request");
     let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
     assert_eq!(body["tools"][0]["type"], "function");
+    let input = body["input"].as_array().expect("input array");
+    let reasoning_index = input
+        .iter()
+        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_prev")
+        .expect("replayed previous reasoning item");
+    let function_call_index = input
+        .iter()
+        .position(|item| item["type"] == "function_call" && item["call_id"] == "call_prev")
+        .expect("replayed previous function call");
+    assert!(reasoning_index < function_call_index);
     assert!(
-        body["input"]
-            .as_array()
-            .expect("input array")
-            .iter()
-            .any(|item| item["type"] == "function_call" && item["call_id"] == "call_prev")
-    );
-    assert!(
-        body["input"]
-            .as_array()
-            .expect("input array")
+        input
             .iter()
             .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call_prev")
     );
+}
+
+#[test]
+fn responses_adapter_replays_reasoning_items_for_assistant_text() {
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"id":"resp_1","output":[{"type":"message","role":"assistant",
+             "content":[{"type":"output_text","text":"ok"}]}]}"#,
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.api = "openai-responses".to_owned();
+    let model = OpenAiResponsesModel::new(config);
+
+    let mut previous_reply = ChatMessage::assistant("prior answer");
+    previous_reply.response_reasoning_items = vec![ResponseReasoningItem {
+        id: "rs_text".to_owned(),
+        encrypted_content: "opaque-text".to_owned(),
+    }];
+
+    let reply = model
+        .respond(
+            &context(vec![ChatMessage::user("first"), previous_reply]),
+            &[],
+        )
+        .expect("provider returns a reply");
+
+    assert_eq!(reply.content.as_deref(), Some("ok"));
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    let input = body["input"].as_array().expect("input array");
+    let reasoning_index = input
+        .iter()
+        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_text")
+        .expect("replayed previous reasoning item");
+    let message_index = input
+        .iter()
+        .position(|item| item["type"] == "message" && item["role"] == "assistant")
+        .expect("replayed previous assistant message");
+    assert!(reasoning_index < message_index);
 }
 
 #[test]
