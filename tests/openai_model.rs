@@ -253,14 +253,23 @@ fn omits_reasoning_effort_for_non_reasoning_models() {
 
 #[test]
 fn responses_adapter_sends_reasoning_service_tier_and_codex_headers() {
+    // Mirror the real Codex backend: output items stream on their own
+    // response.output_item.done events and the terminal response.completed
+    // omits `output`, so the reader must assemble the array itself.
     let (base_url, requests) = fake_provider_with_request(
         "200 OK",
-        r#"{"id":"resp_1","model":"test-model",
-           "output":[{"type":"message","role":"assistant",
-             "content":[{"type":"output_text","text":"ok"}]}],
-           "usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13,
-             "input_tokens_details":{"cached_tokens":2},
-             "output_tokens_details":{"reasoning_tokens":1}}}"#,
+        "event: response.created\n\
+         data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\
+         \n\
+         event: response.output_text.delta\n\
+         data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\
+         \n\
+         event: response.output_item.done\n\
+         data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\
+         \n\
+         event: response.completed\n\
+         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"test-model\",\"usage\":{\"input_tokens\":9,\"output_tokens\":4,\"total_tokens\":13,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\
+         \n",
     );
     let mut config = config_with_compat(base_url, None);
     config.api = "codex-responses".to_owned();
@@ -297,6 +306,8 @@ fn responses_adapter_sends_reasoning_service_tier_and_codex_headers() {
     assert_eq!(body["service_tier"], "priority");
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(body["input"][0]["role"], "user");
+    // The Codex backend rejects non-streaming requests with HTTP 400.
+    assert_eq!(body["stream"], true);
 
     assert!(request.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("authorization") && value == "Bearer chatgpt-access-token"
@@ -308,6 +319,61 @@ fn responses_adapter_sends_reasoning_service_tier_and_codex_headers() {
         request.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("x-openai-fedramp") && value == "true"
         })
+    );
+    assert!(request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("accept") && value == "text/event-stream"
+    }));
+}
+
+#[test]
+fn responses_adapter_surfaces_stream_failure() {
+    let (base_url, _requests) = fake_provider_with_request(
+        "200 OK",
+        "event: response.failed\n\
+         data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"model is overloaded\"}}}\n\
+         \n",
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.api = "codex-responses".to_owned();
+    let model = OpenAiResponsesModel::new(config);
+
+    let error = model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect_err("a response.failed event should become a call error");
+    assert!(
+        error.message.contains("model is overloaded"),
+        "stream failure message should surface to the caller: {}",
+        error.message
+    );
+}
+
+#[test]
+fn openai_responses_adapter_stays_non_streaming() {
+    // Direct OpenAI Responses (api-key) auth still uses a single JSON body.
+    let (base_url, requests) = fake_provider_with_request(
+        "200 OK",
+        r#"{"id":"resp_1","model":"test-model",
+           "output":[{"type":"message","role":"assistant",
+             "content":[{"type":"output_text","text":"ok"}]}]}"#,
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.api = "openai-responses".to_owned();
+    let model = OpenAiResponsesModel::new(config);
+
+    let reply = model
+        .respond(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect("provider returns a reply");
+    assert_eq!(reply.content.as_deref(), Some("ok"));
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body is JSON");
+    assert_eq!(body["stream"], false);
+    assert!(
+        !request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("accept") && value == "text/event-stream"
+        }),
+        "openai-responses should not request an event stream"
     );
 }
 
@@ -399,6 +465,13 @@ fn responses_adapter_round_trips_function_calls_and_outputs() {
         .position(|item| item["type"] == "function_call" && item["call_id"] == "call_prev")
         .expect("replayed previous function call");
     assert!(reasoning_index < function_call_index);
+    // The Codex backend rejects a `call_...` value in `id`; we retain only the
+    // call_id, so the replayed function call must not carry an `id` field.
+    assert!(
+        input[function_call_index].get("id").is_none(),
+        "input function_call must omit the server-assigned id: {}",
+        input[function_call_index]
+    );
     assert!(
         input
             .iter()
