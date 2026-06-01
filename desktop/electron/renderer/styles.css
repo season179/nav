@@ -227,6 +227,40 @@ body {
   min-width: 0;
 }
 
+.project-toggle {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  min-width: 0;
+  padding: 3px 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-toggle:hover {
+  color: var(--ink);
+}
+
+.project-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--primary-tint);
+}
+
+.project-disclosure {
+  flex: 0 0 9px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1;
+  text-align: center;
+}
+
 .project-icon {
   position: relative;
   flex: 0 0 auto;

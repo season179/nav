@@ -18,7 +18,8 @@ let connected = false;
 let running = false;
 let activeSessionId = null;
 let sessionSummaries = [];
-const expandedProjectKeys = new Set();
+const collapsedProjectKeys = new Set();
+const expandedProjectSessionKeys = new Set();
 let projectOrder = readProjectOrder();
 // Set when Stop is pressed; re-applied on `run.started` in case the press landed
 // before the backend had registered the run (when a stop is a no-op).
@@ -317,18 +318,23 @@ function sessionTitle(session) {
 
 function renderProject(project) {
   const projectRow = document.createElement("li");
+  const collapsed = collapsedProjectKeys.has(project.key);
   projectRow.className = "project-group";
-  projectRow.append(
-    renderProjectHeading(project),
-    renderProjectSessions(project),
-  );
+  projectRow.append(renderProjectHeading(project, collapsed));
+  if (!collapsed) {
+    projectRow.append(renderProjectSessions(project));
+  }
   return projectRow;
 }
 
-function renderProjectHeading(project) {
+function renderProjectHeading(project, collapsed) {
   const heading = document.createElement("div");
   heading.className = "project-heading";
-  heading.title = project.path || project.name;
+
+  const disclosure = document.createElement("span");
+  disclosure.className = "project-disclosure";
+  disclosure.setAttribute("aria-hidden", "true");
+  disclosure.textContent = collapsed ? "▸" : "▾";
 
   const icon = document.createElement("span");
   icon.className = "project-icon";
@@ -340,7 +346,19 @@ function renderProjectHeading(project) {
 
   const label = document.createElement("span");
   label.className = "project-label";
-  label.append(icon, name);
+  label.append(disclosure, icon, name);
+
+  const projectToggle = document.createElement("button");
+  projectToggle.type = "button";
+  projectToggle.className = "project-toggle";
+  projectToggle.title = project.path || project.name;
+  projectToggle.setAttribute(
+    "aria-label",
+    `${collapsed ? "Expand" : "Collapse"} project ${project.name}`,
+  );
+  projectToggle.setAttribute("aria-expanded", String(!collapsed));
+  projectToggle.append(label);
+  projectToggle.addEventListener("click", () => toggleProject(project.key));
 
   const addChatButton = document.createElement("button");
   addChatButton.type = "button";
@@ -353,14 +371,23 @@ function renderProjectHeading(project) {
     startNewChatInProject(project.path),
   );
 
-  heading.append(label, addChatButton);
+  heading.append(projectToggle, addChatButton);
   return heading;
+}
+
+function toggleProject(projectKey) {
+  if (collapsedProjectKeys.has(projectKey)) {
+    collapsedProjectKeys.delete(projectKey);
+  } else {
+    collapsedProjectKeys.add(projectKey);
+  }
+  renderSessionList(sessionSummaries);
 }
 
 function renderProjectSessions(project) {
   const projectSessions = document.createElement("ul");
   projectSessions.className = "project-session-list";
-  const expanded = expandedProjectKeys.has(project.key);
+  const expanded = expandedProjectSessionKeys.has(project.key);
   const visibleSessions = expanded
     ? project.sessions
     : project.sessions.slice(0, PROJECT_SESSION_PREVIEW_LIMIT);
@@ -394,9 +421,9 @@ function renderProjectSessionToggle(project, expanded) {
   }
   button.addEventListener("click", () => {
     if (expanded) {
-      expandedProjectKeys.delete(project.key);
+      expandedProjectSessionKeys.delete(project.key);
     } else {
-      expandedProjectKeys.add(project.key);
+      expandedProjectSessionKeys.add(project.key);
     }
     renderSessionList(sessionSummaries);
   });
