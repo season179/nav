@@ -10,6 +10,8 @@ const {
 test("Electron window keeps the renderer isolated from Node and Electron internals", () => {
   const options = createWindowOptions({ preloadPath: "/tmp/nav-preload.cjs" });
 
+  assert.equal(options.titleBarStyle, "hidden");
+  assert.deepEqual(options.trafficLightPosition, { x: 16, y: 18 });
   assert.equal(options.webPreferences.preload, "/tmp/nav-preload.cjs");
   assert.equal(options.webPreferences.contextIsolation, true);
   assert.equal(options.webPreferences.nodeIntegration, false);
