@@ -30,6 +30,20 @@ type SessionSummary = {
   updatedAt: number;
 };
 
+type ModelOption = {
+  provider: string;
+  model: string;
+  label: string;
+};
+
+type ModelInfo = {
+  label: string;
+  provider?: string | null;
+  model?: string | null;
+  thinking?: string | null;
+  tokenUsage?: { used: number; contextWindow: number } | null;
+};
+
 declare global {
   interface Window {
     nav: {
@@ -39,11 +53,9 @@ declare global {
       sessionStop(): Promise<boolean>;
       listSessions(): Promise<SessionSummary[]>;
       createProject(mode?: "local" | "worktree" | null): Promise<string | null>;
-      modelInfo(sessionId?: string): Promise<{
-        label: string;
-        thinking?: string | null;
-        tokenUsage?: { used: number; contextWindow: number } | null;
-      }>;
+      modelInfo(sessionId?: string): Promise<ModelInfo>;
+      modelList(): Promise<ModelOption[]>;
+      switchModel(provider: string, model: string): Promise<ModelInfo>;
       sessionStacks(sessionId?: string): Promise<{
         stacks: Array<{
           id: string;

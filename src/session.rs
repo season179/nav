@@ -10,14 +10,14 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
 use crate::context::{ContextAssembler, TurnHistory};
-use crate::model::{ChatMessage, ChatModel, ModelInfo, Role, ToolCall};
+use crate::model::{ChatMessage, ChatModel, ModelChoice, ModelInfo, Role, ToolCall};
 use crate::stack_store::{StackAvailability, StackQueryResult, StackStore, StackStoreError};
 use crate::stacks::ModelCallStack;
 use crate::storage::{
@@ -174,10 +174,8 @@ pub struct SessionStore {
     context_assembler: ContextAssembler,
     storage: Option<Arc<Storage>>,
     stack_store: Option<Arc<StackStore>>,
-    /// Identifier of the active model, tagged onto persisted assistant turns.
-    model_id: Option<String>,
     /// Renderer-facing model metadata shown in the app's composer.
-    model_info: ModelInfo,
+    model_info: RwLock<ModelInfo>,
 }
 
 impl SessionStore {
@@ -188,13 +186,14 @@ impl SessionStore {
             context_assembler: ContextAssembler::new(),
             storage: None,
             stack_store: None,
-            model_id: None,
-            model_info: ModelInfo {
+            model_info: RwLock::new(ModelInfo {
                 label: "unknown model".to_owned(),
+                provider: None,
+                model: None,
                 thinking: None,
                 context_window: None,
                 token_usage: None,
-            },
+            }),
         }
     }
 
@@ -211,21 +210,50 @@ impl SessionStore {
     }
 
     /// Record which model produced assistant replies (persisted on each turn).
-    pub fn with_model_id(mut self, model_id: Option<String>) -> Self {
-        self.model_id = model_id;
+    pub fn with_model_id(self, model_id: Option<String>) -> Self {
+        self.agent.set_model_id(model_id);
         self
     }
 
     /// Set renderer-facing model metadata surfaced to the UI.
     pub fn with_model_info(mut self, model_info: ModelInfo) -> Self {
-        self.model_info = model_info;
+        *self.model_info.get_mut().unwrap() = model_info;
         self
     }
 
     /// Renderer-facing model metadata for the app's composer.
     pub fn model_info(&self, session_id: Option<&str>) -> ModelInfo {
         let used_tokens = session_id.and_then(|session_id| self.token_usage(session_id));
-        self.model_info.with_used_tokens(used_tokens)
+        self.model_info
+            .read()
+            .unwrap()
+            .with_used_tokens(used_tokens)
+    }
+
+    /// Replace the active model used for future model calls.
+    ///
+    /// A call already in flight keeps the model it started with. Multi-call runs
+    /// (for example, after tool results) read this active handle before each
+    /// next provider request, so a switch can affect the same run's next model
+    /// call.
+    pub fn replace_model(
+        &self,
+        model: Arc<dyn ChatModel>,
+        model_id: Option<String>,
+        model_info: ModelInfo,
+    ) {
+        self.agent.set_model(model, model_id);
+        *self.model_info.write().unwrap() = model_info;
+        self.clear_token_usage();
+    }
+
+    /// Replace the active model from a resolved choice and return the metadata
+    /// now shown to the renderer.
+    pub fn switch_model(&self, choice: ModelChoice) -> ModelInfo {
+        let model_id = choice.model_id();
+        let model_info = choice.info();
+        self.replace_model(choice.into_model(), model_id, model_info.clone());
+        model_info
     }
 
     fn token_usage(&self, session_id: &str) -> Option<u64> {
@@ -234,6 +262,12 @@ impl SessionStore {
             .unwrap()
             .get(session_id)
             .and_then(|session| session.token_usage)
+    }
+
+    fn clear_token_usage(&self) {
+        for session in self.sessions.lock().unwrap().values_mut() {
+            session.token_usage = None;
+        }
     }
 
     /// Override the toolset offered to the model (defaults to the coding tools).
@@ -723,6 +757,7 @@ impl AgentRunSink for SessionRunSink<'_> {
         &mut self,
         content: &str,
         reasoning_content: Option<&str>,
+        model_id: Option<&str>,
     ) -> Result<(), Self::Error> {
         // Record the reply only. Whether this reply ends the run or it continues
         // with steering that arrived mid-run is decided by the agent loop's
@@ -748,7 +783,7 @@ impl AgentRunSink for SessionRunSink<'_> {
                     self.seq,
                     content,
                     reasoning_content,
-                    self.store.model_id.as_deref(),
+                    model_id,
                 ),
             );
         }
@@ -800,6 +835,7 @@ impl AgentRunSink for SessionRunSink<'_> {
         content: &str,
         reasoning_content: Option<&str>,
         calls: &[ToolCall],
+        model_id: Option<&str>,
     ) -> Result<(), Self::Error> {
         self.store.with_session(self.session_id, |session| {
             let mut message = ChatMessage::assistant_tool_calls(content, calls.to_vec());
@@ -823,7 +859,7 @@ impl AgentRunSink for SessionRunSink<'_> {
                     self.seq,
                     (text, reasoning_content),
                     calls,
-                    self.store.model_id.as_deref(),
+                    model_id,
                 ),
             );
         }

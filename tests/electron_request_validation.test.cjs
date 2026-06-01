@@ -2,7 +2,9 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
 const {
+  normalizeModelId,
   normalizeMessageText,
+  normalizeModelProvider,
   normalizeOptionalSessionMode,
   normalizeOptionalWorkspaceRoot,
   normalizeSessionId,
@@ -31,6 +33,18 @@ test("preload session id validation rejects non-strings and blanks", () => {
   assert.throws(() => normalizeSessionId(42), TypeError);
   assert.throws(() => normalizeSessionId(undefined), TypeError);
   assert.throws(() => normalizeSessionId("   "));
+});
+
+test("preload model switch validation trims provider and model ids", () => {
+  assert.equal(normalizeModelProvider("  openai  "), "openai");
+  assert.equal(normalizeModelId("  gpt-5.1  "), "gpt-5.1");
+});
+
+test("preload model switch validation rejects non-strings and blanks", () => {
+  assert.throws(() => normalizeModelProvider(42), TypeError);
+  assert.throws(() => normalizeModelProvider("   "));
+  assert.throws(() => normalizeModelId(undefined), TypeError);
+  assert.throws(() => normalizeModelId(""));
 });
 
 test("preload workspace root validation trims valid paths", () => {

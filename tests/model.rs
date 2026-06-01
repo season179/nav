@@ -18,6 +18,7 @@ fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 fn resolved(api_key: &str, model: &str, base_url: &str) -> ResolvedModelConfig {
     ResolvedModelConfig {
         api_key: api_key.to_owned(),
+        provider: "commandcode".to_owned(),
         model: model.to_owned(),
         base_url: base_url.to_owned(),
         name: model.to_owned(),
@@ -130,6 +131,7 @@ fn resolve_uses_the_settings_default_model() {
     match choice {
         ModelChoice::OpenAi(config) => {
             assert_eq!(config.api_key, "sk-settings");
+            assert_eq!(config.provider.as_deref(), Some("commandcode"));
             assert_eq!(config.model, "Qwen/Qwen3.7-Max");
             assert_eq!(config.base_url, "https://commandcode.example/v1");
         }
@@ -151,6 +153,8 @@ fn resolve_surfaces_reasoning_thinking_metadata() {
     let choice = ModelChoice::resolve(env(&[]), || Ok(config));
 
     assert_eq!(choice.info().thinking.as_deref(), Some("medium"));
+    assert_eq!(choice.info().provider.as_deref(), Some("commandcode"));
+    assert_eq!(choice.info().model.as_deref(), Some("Qwen/Qwen3.7-Max"));
     assert_eq!(choice.info().context_window, Some(128_000));
 }
 

@@ -3,8 +3,8 @@
 //! Two routes back the chat loop:
 //!
 //! - `POST /rpc` — JSON-RPC `session.create`, `session.resume`,
-//!   `session.latest`, `session.list`, `session.sendMessage`, and
-//!   `session.stop`.
+//!   `session.latest`, `session.list`, `session.models`,
+//!   `session.switchModel`, `session.sendMessage`, and `session.stop`.
 //! - `GET /sessions/{id}/events` — a live Server-Sent Events feed of one
 //!   session's ordered events.
 //!
@@ -35,7 +35,11 @@ mod tokens;
 mod tools;
 mod worktree;
 
-pub use config::{ConfigError, ResolvedModelConfig, resolve_config, resolve_default_config};
+pub use config::{
+    ConfigError, ConfiguredModel, ResolvedModelConfig, list_configured_models,
+    list_default_configured_models, resolve_config, resolve_default_config,
+    resolve_default_model_config, resolve_model_config,
+};
 pub use context::{ContextAssembler, ModelContext, TurnHistory};
 pub use model::{
     ChatMessage, ChatModel, FinishReason, MockModel, ModelChoice, ModelError, ModelInfo,
@@ -170,6 +174,49 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                 .and_then(|p| p.get("sessionId"))
                 .and_then(Value::as_str);
             write_rpc_result(stream, &id, json!(store.model_info(session_id)))
+        }
+        Some("session.models") if mock_model_forced() => {
+            write_rpc_result(stream, &id, json!({ "models": [] }))
+        }
+        Some("session.models") => match list_default_configured_models() {
+            Ok(models) => {
+                let models: Vec<Value> = models
+                    .into_iter()
+                    .map(|model| {
+                        json!({
+                            "provider": model.provider,
+                            "model": model.model,
+                            "label": model.name,
+                        })
+                    })
+                    .collect();
+                write_rpc_result(stream, &id, json!({ "models": models }))
+            }
+            Err(ConfigError::FileNotFound(_) | ConfigError::HomeDirUnavailable) => {
+                write_rpc_result(stream, &id, json!({ "models": [] }))
+            }
+            Err(error) => write_rpc_error(stream, &id, &error.to_string()),
+        },
+        Some("session.switchModel") => {
+            if mock_model_forced() {
+                return write_rpc_error(
+                    stream,
+                    &id,
+                    "cannot switch model while NAV_MOCK_MODEL is set",
+                );
+            }
+            let (provider, model) = match requested_model(&request, "session.switchModel") {
+                Ok(model) => model,
+                Err(message) => return write_rpc_error(stream, &id, &message),
+            };
+            match resolve_default_model_config(&provider, &model) {
+                Ok(config) => {
+                    let info = store
+                        .switch_model(ModelChoice::OpenAi(Box::new(OpenAiConfig::from(config))));
+                    write_rpc_result(stream, &id, json!({ "modelInfo": info }))
+                }
+                Err(error) => write_rpc_error(stream, &id, &error.to_string()),
+            }
         }
         Some("session.list") => {
             let sessions: Vec<Value> = store
@@ -349,6 +396,35 @@ fn requested_workspace(request: &Value, method: &str) -> Result<Option<PathBuf>,
         return Err(format!("{method} cwd must be a directory"));
     }
     Ok(Some(canonical))
+}
+
+fn requested_model(request: &Value, method: &str) -> Result<(String, String), String> {
+    let params = request
+        .get("params")
+        .ok_or_else(|| format!("{method} requires provider and model"))?;
+    let provider = params
+        .get("provider")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{method} provider must be a string"))?;
+    let model = params
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{method} model must be a string"))?;
+
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() {
+        return Err(format!("{method} provider must not be empty"));
+    }
+    if model.is_empty() {
+        return Err(format!("{method} model must not be empty"));
+    }
+
+    Ok((provider.to_owned(), model.to_owned()))
+}
+
+fn mock_model_forced() -> bool {
+    std::env::var("NAV_MOCK_MODEL").is_ok_and(|value| !value.is_empty())
 }
 
 fn stream_session_events(

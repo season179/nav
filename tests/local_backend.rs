@@ -411,6 +411,8 @@ fn listing_sessions_without_storage_returns_an_empty_array() {
 fn model_info_returns_the_configured_metadata() {
     let model_info = ModelInfo {
         label: "Claude Opus 4.8".to_owned(),
+        provider: Some("anthropic-proxy".to_owned()),
+        model: Some("claude-opus-4.8".to_owned()),
         thinking: Some("high".to_owned()),
         context_window: Some(200_000),
         token_usage: None,
@@ -424,6 +426,14 @@ fn model_info_returns_the_configured_metadata() {
     assert_eq!(
         response["result"]["label"], "Claude Opus 4.8",
         "session.modelInfo returns the configured model label: {response}"
+    );
+    assert_eq!(
+        response["result"]["provider"], "anthropic-proxy",
+        "session.modelInfo returns the configured provider id: {response}"
+    );
+    assert_eq!(
+        response["result"]["model"], "claude-opus-4.8",
+        "session.modelInfo returns the configured model id: {response}"
     );
     assert_eq!(
         response["result"]["thinking"], "high",
@@ -443,6 +453,8 @@ fn model_info_returns_the_configured_metadata() {
 fn model_info_returns_latest_session_token_usage() {
     let model_info = ModelInfo {
         label: "Mock model".to_owned(),
+        provider: None,
+        model: None,
         thinking: None,
         context_window: Some(128_000),
         token_usage: None,

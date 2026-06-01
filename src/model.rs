@@ -328,7 +328,7 @@ pub enum ModelChoice {
     /// Deterministic mock, requested explicitly for tests and offline smoke.
     Mock,
     /// A configured OpenAI-compatible provider.
-    OpenAi(OpenAiConfig),
+    OpenAi(Box<OpenAiConfig>),
     /// No model configured; sending a message yields a clear failure.
     NotConfigured,
     /// Settings resolved to a config the backend cannot use (e.g. unsupported
@@ -341,6 +341,10 @@ pub enum ModelChoice {
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
     pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
     #[serde(skip)]
@@ -392,7 +396,7 @@ impl ModelChoice {
         }
 
         match load_config() {
-            Ok(config) => ModelChoice::OpenAi(OpenAiConfig::from(config)),
+            Ok(config) => ModelChoice::OpenAi(Box::new(OpenAiConfig::from(config))),
             Err(ConfigError::FileNotFound(_) | ConfigError::HomeDirUnavailable) => {
                 ModelChoice::from_env(get)
             }
@@ -413,8 +417,9 @@ impl ModelChoice {
         match get("NAV_API_KEY") {
             Some(api_key) if !api_key.is_empty() => {
                 let model = non_empty(get("NAV_MODEL"), DEFAULT_OPENAI_MODEL);
-                ModelChoice::OpenAi(OpenAiConfig {
+                ModelChoice::OpenAi(Box::new(OpenAiConfig {
                     api_key,
+                    provider: None,
                     base_url: non_empty(get("NAV_BASE_URL"), DEFAULT_OPENAI_BASE_URL),
                     // No display name over env config, so the id is the label.
                     name: model.clone(),
@@ -424,7 +429,7 @@ impl ModelChoice {
                     context_window: None,
                     compat: None,
                     thinking_level_map: None,
-                })
+                }))
             }
             _ => ModelChoice::NotConfigured,
         }
@@ -453,6 +458,8 @@ impl ModelChoice {
     pub fn info(&self) -> ModelInfo {
         ModelInfo {
             label: self.label(),
+            provider: self.provider_id(),
+            model: self.configured_model_id(),
             thinking: self.thinking_level(),
             context_window: self.context_window(),
             token_usage: None,
@@ -479,6 +486,20 @@ impl ModelChoice {
         }
     }
 
+    fn provider_id(&self) -> Option<String> {
+        match self {
+            ModelChoice::OpenAi(config) => config.provider.clone(),
+            _ => None,
+        }
+    }
+
+    fn configured_model_id(&self) -> Option<String> {
+        match self {
+            ModelChoice::OpenAi(config) => Some(config.model.clone()),
+            _ => None,
+        }
+    }
+
     fn context_window(&self) -> Option<u64> {
         match self {
             ModelChoice::OpenAi(config) => config.context_window,
@@ -490,7 +511,7 @@ impl ModelChoice {
     pub fn into_model(self) -> Arc<dyn ChatModel> {
         match self {
             ModelChoice::Mock => Arc::new(MockModel::new()),
-            ModelChoice::OpenAi(config) => Arc::new(OpenAiModel::new(config)),
+            ModelChoice::OpenAi(config) => Arc::new(OpenAiModel::new(*config)),
             ModelChoice::NotConfigured => Arc::new(FailingModel::new(NOT_CONFIGURED_MESSAGE)),
             ModelChoice::Unavailable(reason) => Arc::new(FailingModel::new(reason)),
         }
@@ -514,6 +535,9 @@ fn non_empty(value: Option<String>, fallback: &str) -> String {
 /// Connection settings for an OpenAI-compatible chat-completions provider.
 pub struct OpenAiConfig {
     pub api_key: String,
+    /// Provider id from settings.json when this model came from configured
+    /// provider/model selection. Environment-only fallback models have none.
+    pub provider: Option<String>,
     pub model: String,
     pub base_url: String,
     /// Human-friendly display name for the model (from settings.json `name`,
@@ -540,6 +564,7 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
     fn from(config: ResolvedModelConfig) -> Self {
         Self {
             api_key: config.api_key,
+            provider: Some(config.provider),
             model: config.model,
             base_url: config.base_url,
             name: config.name,
