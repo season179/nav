@@ -47,7 +47,7 @@ pub use context::{ContextAssembler, ModelContext, TurnHistory};
 pub use model::{
     ChatMessage, ChatModel, FinishReason, MockModel, ModelChoice, ModelError, ModelInfo,
     ModelResponse, OpenAiConfig, OpenAiModel, OpenAiResponsesModel, ResponseReasoningItem, Role,
-    TokenBudgetInfo, ToolCall, ToolDef,
+    TokenBudgetInfo, ToolCall, ToolDef, TracedModelResponse,
 };
 pub use session::{Event, SendError, SessionStore, Subscription};
 pub use stack_store::{

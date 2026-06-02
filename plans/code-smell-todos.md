@@ -51,15 +51,25 @@
     and the updated `electron_backend_client` e2e prove a switch is isolated to
     one session and leaves the default untouched.
 
+- [x] Split the largest module (`src/model.rs`, 1721 lines) into a `model/`
+  module of focused units.
+  - `model/mod.rs` is a thin facade: submodule declarations plus `pub use`
+    re-exports, so every existing `crate::model::*` path is unchanged.
+  - `model/chat.rs` holds the request/response domain types and the `ChatModel`
+    trait; `model/choice.rs` holds `ModelChoice` resolution and the
+    renderer-facing `ModelInfo`; `model/openai.rs` holds the two OpenAI-compatible
+    adapters and their wire (de)serialization; `model/mock.rs` holds `MockModel`
+    and `FailingModel`.
+  - Cross-module internals were narrowed to `pub(crate)` (`ProviderCallTrace::new`
+    / `with_error`, `ModelError::with_provider_trace`, `OpenAiConfig::is_responses_api`,
+    `message_json`, `FailingModel`) rather than left fully public. Surfaced
+    `TracedModelResponse` at the crate root for parity with the other
+    `ChatModel::respond_with_trace` signature types.
+
 ## Open (need a product/scope decision — investigated, not yet changed)
 
-- [ ] Split large modules/components into smaller focused units.
-  - Largest first: `src/model.rs` (1721 lines) → a `model/` module:
-    `model/mod.rs` (domain types + `ChatModel` trait + `ModelChoice`/`ModelInfo`
-    + `OpenAiConfig`), `model/openai.rs` (`OpenAiModel`/`OpenAiResponsesModel` and
-    the request/response JSON helpers, ~lines 577–1615), `model/mock.rs`
-    (`FailingModel`, `MockModel`).
-  - Also candidates: `App.tsx` (873) extract hooks/subscriptions from rendering;
+- [ ] Split the remaining large components into smaller focused units.
+  - Candidates: `App.tsx` (873) extract hooks/subscriptions from rendering;
     `main.cts` (now smaller after the guard extraction) move IPC registration to
     its own module; `lib.rs` (620) separate HTTP/RPC routing from backend helpers.
   - Deferred deliberately: these are large, churny diffs better landed on their
