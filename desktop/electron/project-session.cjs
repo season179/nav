@@ -1,5 +1,6 @@
-function existingProjectSessionId(sessions, workspaceRoot) {
+function existingProjectSessionId(sessions, workspaceRoot, mode = "local") {
   const targetRoot = normalizeWorkspaceRoot(workspaceRoot);
+  const isWorktree = mode === "worktree";
   if (!targetRoot || !Array.isArray(sessions)) {
     return null;
   }
@@ -9,10 +10,17 @@ function existingProjectSessionId(sessions, workspaceRoot) {
 
   for (const session of sessions) {
     const sessionId = session?.sessionId;
-    if (
-      typeof sessionId !== "string" ||
-      normalizeWorkspaceRoot(session?.workspaceRoot) !== targetRoot
-    ) {
+    if (typeof sessionId !== "string") {
+      continue;
+    }
+
+    const workspace = normalizeWorkspaceRoot(session?.workspaceRoot);
+    const matches = isWorktree
+      ? workspace !== "" &&
+        workspace !== targetRoot &&
+        normalizeWorkspaceRoot(session?.projectRoot) === targetRoot
+      : workspace === targetRoot;
+    if (!matches) {
       continue;
     }
 

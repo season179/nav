@@ -7,7 +7,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
-use nav::{MockModel, ModelInfo, SessionStore, StackStore, Storage};
+use nav::{
+    ChatModel, FinishReason, MockModel, ModelContext, ModelError, ModelInfo, ModelResponse, Role,
+    SessionStore, StackStore, Storage, ToolCall, ToolDef,
+};
 use serde_json::{Value, json};
 
 /// An in-process backend bound to an ephemeral loopback port, driven over raw
@@ -219,7 +222,41 @@ impl GitRepo {
     }
 }
 
-fn git(cwd: &Path, args: &[&str]) {
+struct WorktreeProbeModel;
+
+impl ChatModel for WorktreeProbeModel {
+    fn respond(
+        &self,
+        context: &ModelContext,
+        _tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
+        let saw_tool_result = context
+            .messages()
+            .iter()
+            .any(|message| message.role == Role::Tool);
+        if saw_tool_result {
+            return Ok(ModelResponse::text("worktree probe complete"));
+        }
+
+        Ok(ModelResponse {
+            content: None,
+            reasoning_content: None,
+            response_reasoning_items: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: "worktree-probe".to_owned(),
+                name: "bash".to_owned(),
+                arguments: json!({
+                    "command": "printf worktree > tool-worktree-marker.txt && git rev-parse --show-toplevel > git-root.txt"
+                })
+                .to_string(),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            token_usage: None,
+        })
+    }
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
         .arg(cwd)
@@ -234,6 +271,11 @@ fn git(cwd: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let _ = git_stdout(cwd, args);
 }
 
 #[test]
@@ -389,6 +431,71 @@ fn create_session_worktree_mode_creates_a_linked_worktree_workspace() {
     assert!(
         Path::new(workspace_root).join("shared.txt").exists(),
         "created workspace should be a checked-out git worktree"
+    );
+}
+
+#[test]
+fn worktree_mode_runs_tools_inside_the_created_worktree() {
+    let repo = GitRepo::new();
+    let db = TempDir::new("rpc_worktree_tool_db");
+    let db_path = db.path.join("nav.db");
+    let storage = Arc::new(Storage::open(&db_path).expect("open storage"));
+    let backend = TestBackend::start_with(
+        SessionStore::new(Arc::new(WorktreeProbeModel)).with_storage(storage),
+    );
+
+    let created = backend.rpc(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "create",
+            "method": "session.create",
+            "params": { "cwd": repo.path, "mode": "worktree" },
+        })
+        .to_string(),
+    );
+    let session_id = created["result"]["sessionId"]
+        .as_str()
+        .expect("worktree session id");
+
+    let listed = backend.rpc(r#"{"jsonrpc":"2.0","id":"list","method":"session.list"}"#);
+    let session = listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["sessionId"] == session_id)
+        .expect("created session is listed");
+    let workspace_root = PathBuf::from(session["workspaceRoot"].as_str().unwrap());
+
+    let worktrees = git_stdout(&repo.path, &["worktree", "list", "--porcelain"]);
+    assert!(
+        worktrees.contains(&format!("worktree {}", workspace_root.display())),
+        "created workspace should be registered in git worktree list: {worktrees}"
+    );
+
+    let stream = backend.open_events(session_id);
+    backend.send_message(session_id, "probe cwd");
+    let events = read_until_completions(stream, 1);
+    assert!(
+        events.iter().any(|event| event.kind == "tool.completed"),
+        "probe should run a bash tool: {:?}",
+        kinds(&events)
+    );
+
+    assert_eq!(
+        fs::read_to_string(workspace_root.join("tool-worktree-marker.txt")).unwrap(),
+        "worktree",
+        "tool output should be written in the linked worktree"
+    );
+    assert!(
+        !repo.path.join("tool-worktree-marker.txt").exists(),
+        "tool output must not be written in the main checkout"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace_root.join("git-root.txt"))
+            .unwrap()
+            .trim(),
+        workspace_root.to_string_lossy(),
+        "bash should execute with the created worktree as git's top-level cwd"
     );
 }
 

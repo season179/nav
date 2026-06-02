@@ -321,6 +321,7 @@ export default function App() {
           if (event.text) {
             appendMessage("assistant", event.text);
           }
+          refreshModelInfo();
           refreshStacks();
           break;
         case "tool.started":
@@ -346,6 +347,7 @@ export default function App() {
           break;
         case "message.completed":
           appendMessage("assistant", event.text);
+          refreshModelInfo();
           refreshStacks();
           break;
         case "run.completed":
