@@ -744,7 +744,7 @@ fn resolve_settings_model(
         .input
         .clone()
         .unwrap_or_else(|| vec!["text".to_string()]);
-    let context_window = model_config.context_window.or(Some(128000));
+    let context_window = model_config.context_window.or(Some(200000));
     let max_tokens = model_config.max_tokens.or(Some(16384));
     let thinking_level_map = model_config.thinking_level_map.clone();
     let thinking_level = resolve_thinking_level(
