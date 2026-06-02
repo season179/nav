@@ -6,7 +6,6 @@ import type {
   TokenUsage,
 } from "../types.ts";
 
-const tokenFormatter = new Intl.NumberFormat("en-US");
 const sessionModeOptions: { value: SessionMode; label: string }[] = [
   { value: "local", label: "Local" },
   { value: "worktree", label: "Worktree" },
@@ -641,8 +640,19 @@ function formatTokenUsage(tokenUsage: TokenUsage | null | undefined): string {
   if (!tokenUsage?.contextWindow) {
     return "";
   }
-  const used = Number.isFinite(tokenUsage.used) ? tokenUsage.used : 0;
-  return `${tokenFormatter.format(used)}/${tokenFormatter.format(
+  return `${formatTokenCount(tokenUsage.used)}/${formatTokenCount(
     tokenUsage.contextWindow,
   )}`;
+}
+
+function formatTokenCount(value: number): string {
+  if (!Number.isFinite(value) || value < 1000) {
+    return "0";
+  }
+
+  if (value >= 1_000_000) {
+    return `${Math.floor(value / 1_000_000)}M`;
+  }
+
+  return `${Math.floor(value / 1000)}k`;
 }
