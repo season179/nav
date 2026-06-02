@@ -2,20 +2,29 @@
   "name": "nav",
   "private": true,
   "description": "Learning project for building a coding agent.",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "scripts": {
     "reset-data": "bun scripts/reset-data.mjs",
-    "renderer:build": "vite build --config desktop/electron/renderer/vite.config.mjs",
-    "electron:dev": "vite build --config desktop/electron/renderer/vite.config.mjs && electron desktop/electron/main.cjs",
-    "electron:smoke": "vite build --config desktop/electron/renderer/vite.config.mjs && electron desktop/electron/main.cjs --smoke",
-    "check:electron": "vite build --config desktop/electron/renderer/vite.config.mjs && node --test tests/*.test.cjs",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.main.json --noEmit",
+    "main:build": "tsc -p tsconfig.main.json",
+    "renderer:build": "vite build --config desktop/electron/renderer/vite.config.ts",
+    "electron:dev": "bun run main:build && bun run renderer:build && electron desktop/electron/out/main.cjs",
+    "electron:smoke": "bun run main:build && bun run renderer:build && electron desktop/electron/out/main.cjs --smoke",
+    "check:electron": "bun run typecheck && bun run main:build && bun run renderer:build && node --test tests/*.test.cts",
     "lint": "biome check",
     "lint:fix": "biome check --write",
     "format": "biome format --write"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.15",
+    "@types/node": "^25.9.1",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
     "electron": "^42.2.0",
+    "typescript": "^6.0.3",
     "vite": "^8.0.14"
   },
   "dependencies": {
