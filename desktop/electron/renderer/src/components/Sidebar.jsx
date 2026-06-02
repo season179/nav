@@ -11,7 +11,7 @@ const projectOrderStorageKey = "nav.projectOrder.v1";
 export default function Sidebar({
   activeSessionId,
   connected,
-  running,
+  runningSessionIds,
   sessions,
   onCreateProject,
   onNewChat,
@@ -57,7 +57,7 @@ export default function Sidebar({
           type="button"
           id="new-chat"
           className="new-chat"
-          disabled={running || !connected}
+          disabled={!connected}
           onClick={onNewChat}
         >
           + New thread
@@ -73,7 +73,7 @@ export default function Sidebar({
             className="project-add"
             aria-label="Add project"
             title="Add project"
-            disabled={running || !connected}
+            disabled={!connected}
             onClick={onCreateProject}
           >
             +
@@ -91,7 +91,7 @@ export default function Sidebar({
                 connected={connected}
                 expanded={expandedProjectSessionKeys.has(project.key)}
                 project={project}
-                running={running}
+                runningSessionIds={runningSessionIds}
                 onNewChatInProject={onNewChatInProject}
                 onSelectSession={onSelectSession}
                 onToggleProject={() => toggleProject(project.key)}
@@ -115,7 +115,7 @@ function ProjectGroup({
   connected,
   expanded,
   project,
-  running,
+  runningSessionIds,
   onNewChatInProject,
   onSelectSession,
   onToggleProject,
@@ -123,13 +123,18 @@ function ProjectGroup({
 }) {
   const { visibleSessions, toggle } = projectSessionView(project, expanded);
   const toggleView = projectToggleView(project, collapsed);
+  // Surface a run hidden inside a collapsed project so the user can tell a
+  // background session is still working without expanding it.
+  const projectRunning = project.sessions.some((session) =>
+    runningSessionIds.has(session.sessionId),
+  );
 
   return (
     <li className="project-group">
       <ProjectHeading
         connected={connected}
         project={project}
-        running={running}
+        running={projectRunning}
         toggleView={toggleView}
         onNewChatInProject={onNewChatInProject}
         onToggleProject={onToggleProject}
@@ -137,6 +142,7 @@ function ProjectGroup({
       {collapsed ? null : (
         <ProjectSessions
           activeSessionId={activeSessionId}
+          runningSessionIds={runningSessionIds}
           sessions={visibleSessions}
           toggle={toggle}
           onSelectSession={onSelectSession}
@@ -178,6 +184,14 @@ function ProjectHeading({
               <span className="project-path-hint">{project.pathHint}</span>
             ) : null}
           </span>
+          {running ? (
+            <span
+              className="project-running"
+              role="img"
+              aria-label="Running"
+              title="Running"
+            />
+          ) : null}
         </span>
       </button>
       <button
@@ -185,7 +199,7 @@ function ProjectHeading({
         className="project-chat-add"
         title={`New thread in ${label}`}
         aria-label={`New thread in ${label}`}
-        disabled={running || !connected}
+        disabled={!connected}
         onClick={() => onNewChatInProject(project.path)}
       >
         +
@@ -196,6 +210,7 @@ function ProjectHeading({
 
 function ProjectSessions({
   activeSessionId,
+  runningSessionIds,
   sessions,
   toggle,
   onSelectSession,
@@ -214,7 +229,15 @@ function ProjectSessions({
             }
             onClick={() => onSelectSession(session.sessionId)}
           >
-            {sessionTitle(session)}
+            <span className="session-item-title">{sessionTitle(session)}</span>
+            {runningSessionIds.has(session.sessionId) ? (
+              <span
+                className="session-running"
+                role="img"
+                aria-label="Running"
+                title="Running"
+              />
+            ) : null}
           </button>
         </li>
       ))}

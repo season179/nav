@@ -51,8 +51,8 @@ declare global {
     nav: {
       onBackendStatus(callback: (status: BackendStatus) => void): () => void;
       onSessionEvent(callback: (event: SessionEvent) => void): () => void;
-      sessionSendMessage(text: string): Promise<void>;
-      sessionStop(): Promise<boolean>;
+      sessionSendMessage(sessionId: string, text: string): Promise<void>;
+      sessionStop(sessionId: string): Promise<boolean>;
       listSessions(): Promise<SessionSummary[]>;
       createProject(mode?: "local" | "worktree" | null): Promise<string | null>;
       modelInfo(sessionId?: string): Promise<ModelInfo>;
@@ -94,6 +94,8 @@ declare global {
         workspaceRoot?: string | null,
         mode?: "local" | "worktree" | null,
       ): Promise<string | null>;
+      getSessionMode(): Promise<"local" | "worktree" | null>;
+      setSessionMode(mode: "local" | "worktree"): Promise<void>;
     };
   }
 }

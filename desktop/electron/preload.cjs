@@ -87,14 +87,18 @@ contextBridge.exposeInMainWorld("nav", {
   onSessionEvent(callback) {
     return subscribe("nav:session-event", callback);
   },
-  // Send one chat message. The text is validated here so the renderer can only
-  // ever hand Main a clean string — never an arbitrary IPC payload.
-  sessionSendMessage(text) {
-    return ipcRenderer.invoke("nav:send-message", normalizeMessageText(text));
+  // Send one chat message to a specific session. Both the target session and
+  // the text are validated here so the renderer can only ever hand Main a clean
+  // payload — never an arbitrary IPC value.
+  sessionSendMessage(sessionId, text) {
+    return ipcRenderer.invoke("nav:send-message", {
+      sessionId: normalizeSessionId(sessionId),
+      text: normalizeMessageText(text),
+    });
   },
-  // Stop the active session's in-flight run.
-  sessionStop() {
-    return ipcRenderer.invoke("nav:stop");
+  // Stop a specific session's in-flight run.
+  sessionStop(sessionId) {
+    return ipcRenderer.invoke("nav:stop", normalizeSessionId(sessionId));
   },
   // List persisted sessions for the sidebar.
   listSessions() {

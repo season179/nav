@@ -20,12 +20,15 @@ const trace = createStartupTrace();
 trace.mark("electron.main.loaded", { smoke: smokeMode });
 
 let backendProcess = null;
-let eventSubscription = null;
 let backendUrl = null;
 let sessionId = null;
 let mainWindow = null;
 let firstSessionEventSeen = false;
 const pendingProjectSessions = new Map();
+// Every session the app has opened keeps its own live SSE subscription so a
+// background run keeps streaming while the user works in another session. Keyed
+// by session id; closed only on quit.
+const subscriptions = new Map();
 
 app.whenReady().then(async () => {
   trace.mark("electron.app.ready");
@@ -40,26 +43,28 @@ app.on("window-all-closed", () => {
 });
 
 // The renderer can only ask Main to send a chat message; Main owns all backend
-// transport.
-ipcMain.handle("nav:send-message", async (_event, text) => {
-  if (!backendUrl || !sessionId) {
+// transport. The renderer names the target session so a message always lands in
+// the conversation it was typed into, even if several are running at once.
+ipcMain.handle("nav:send-message", async (_event, request) => {
+  const { sessionId: targetSessionId, text } = request ?? {};
+  if (!backendUrl || !targetSessionId || !text) {
     throw new Error("chat session is not ready");
   }
   await sendRpc({
     backendUrl,
     method: "session.sendMessage",
-    params: { sessionId, text },
+    params: { sessionId: targetSessionId, text },
   });
 });
 
-ipcMain.handle("nav:stop", async () => {
-  if (!backendUrl || !sessionId) {
+ipcMain.handle("nav:stop", async (_event, requestedSessionId) => {
+  if (!backendUrl || !requestedSessionId) {
     throw new Error("chat session is not ready");
   }
   const response = await sendRpc({
     backendUrl,
     method: "session.stop",
-    params: { sessionId },
+    params: { sessionId: requestedSessionId },
   });
   return response.result.stopped === true;
 });
@@ -276,14 +281,34 @@ async function startChatSession(window) {
   }
 }
 
-// Make `id` the active conversation: point the event stream at it (replacing any
-// prior subscription) and tell the renderer it's connected. The session's
-// backlog replays over the stream, so switching redraws the transcript.
+// Bring `id` to the foreground: make sure Main is streaming its events and note
+// it as the primary session (used by smoke mode and as an RPC default). Prior
+// sessions keep their own subscriptions open, so their runs keep streaming in
+// the background. The renderer routes every event by its session id.
 function activateSession(window, id, { startup = false } = {}) {
   sessionId = id;
-  eventSubscription?.close();
+  ensureSubscription(window, id, { startup, announce: startup });
+}
+
+// Subscribe to a session's event feed once and keep it open. Re-activating an
+// already-subscribed session is a no-op (its backlog already streamed and lives
+// in the renderer), so switching back never replays or duplicates a transcript.
+// `announce` sends the renderer the single startup `connected` status; later
+// sessions are activated by the renderer itself, which must not be told to jump
+// its active conversation.
+function ensureSubscription(
+  window,
+  id,
+  { startup = false, announce = false } = {},
+) {
+  if (subscriptions.has(id)) {
+    if (announce) {
+      sendConnected(window, id);
+    }
+    return;
+  }
   markStartup(startup, "electron.sse.subscribe.start", { session_id: id });
-  eventSubscription = subscribeToSessionEvents({
+  const subscription = subscribeToSessionEvents({
     backendUrl,
     sessionId: id,
     onOpen({ statusCode } = {}) {
@@ -294,11 +319,8 @@ function activateSession(window, id, { startup = false } = {}) {
       if (statusCode !== 200) {
         return;
       }
-      // Smoke mode drives the turn from Main and quits on `run.completed`;
-      // telling the renderer it is connected can start sidebar/model refreshes
-      // that race the intentional shutdown.
-      if (!smokeMode) {
-        sendStatus(window, { state: "connected", backendUrl, sessionId: id });
+      if (announce) {
+        sendConnected(window, id);
       }
       markStartup(startup, "electron.connected", { session_id: id });
     },
@@ -310,7 +332,20 @@ function activateSession(window, id, { startup = false } = {}) {
     },
     onError(error) {
       markStartup(startup, "electron.sse.error", { error: error.message });
-      sendStatus(window, { state: "stream-error", message: error.message });
+      // A stream can fire onError more than once (request and response paths),
+      // possibly after the session was re-subscribed. Only tear down the entry
+      // if it is still this exact subscription, never a newer replacement.
+      if (subscriptions.get(id) !== subscription) {
+        return;
+      }
+      subscriptions.delete(id);
+      // Name the session whose stream died so the renderer reports the error in
+      // that conversation, not whichever one happens to be on screen.
+      sendStatus(window, {
+        state: "stream-error",
+        message: error.message,
+        sessionId: id,
+      });
       if (smokeMode) {
         console.error(error);
         printStartupSummary();
@@ -318,6 +353,17 @@ function activateSession(window, id, { startup = false } = {}) {
       }
     },
   });
+  subscriptions.set(id, subscription);
+}
+
+// Smoke mode drives the turn from Main and quits on `run.completed`; telling the
+// renderer it is connected can start sidebar/model refreshes that race the
+// intentional shutdown, so it is suppressed there.
+function sendConnected(window, id) {
+  if (smokeMode) {
+    return;
+  }
+  sendStatus(window, { state: "connected", backendUrl, sessionId: id });
 }
 
 // Reopen the most recent conversation so sessions persist across launches,
@@ -496,8 +542,10 @@ function sendStatus(window, status) {
 }
 
 function stopBackend() {
-  eventSubscription?.close();
-  eventSubscription = null;
+  for (const subscription of subscriptions.values()) {
+    subscription.close();
+  }
+  subscriptions.clear();
   backendProcess?.kill();
   backendProcess = null;
 }
