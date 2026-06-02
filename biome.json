@@ -9,8 +9,10 @@
     "includes": [
       "desktop/**",
       "scripts/**",
-      "tests/**/*.cjs",
+      "tests/**/*.cts",
       "!!.nav",
+      "!desktop/electron/out",
+      "!desktop/electron/renderer/dist",
       "!desktop/electron/renderer/vendor"
     ]
   },

@@ -165,5 +165,8 @@ rustc-ice-*.txt
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Compiled Electron main process (tsc output from tsconfig.main.json)
+desktop/electron/out/
+
 # Claude
 .claude/*
