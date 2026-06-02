@@ -536,18 +536,27 @@ fn session_stacks_rpc_returns_captured_model_calls() {
     assert_eq!(stacks[0]["sequence"], 0);
     assert_eq!(stacks[0]["status"], "completed");
 
-    let layers = stacks[0]["layers"]
+    // The faithful record exposes what was sent and what came back.
+    let messages = stacks[0]["request"]["body"]["messages"]
         .as_array()
-        .expect("stack includes layers");
-    assert!(
-        layers.iter().any(|layer| layer["kind"] == "system_prompt"),
-        "system prompt layer should be present: {response}"
+        .expect("request body carries the sent messages");
+    assert_eq!(
+        messages[0]["role"], "system",
+        "request should lead with the system prompt: {response}"
     );
     assert!(
-        layers
+        messages
             .iter()
-            .any(|layer| layer["kind"] == "normalized_response"),
-        "normalized response layer should be present: {response}"
+            .any(|message| message["content"] == "capture the stack"),
+        "request should carry the user message verbatim: {response}"
+    );
+    assert_eq!(
+        stacks[0]["response"]["statusCode"], 200,
+        "response status should be captured: {response}"
+    );
+    assert!(
+        !stacks[0]["response"]["body"].is_null(),
+        "a successful call should capture a response body: {response}"
     );
 
     let availability = json!({
