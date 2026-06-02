@@ -54,3 +54,55 @@ test("project creation allows a workspace that has not been added yet", () => {
     null,
   );
 });
+
+test("worktree project creation does not reuse a local session for the same checkout", () => {
+  const sessions = [
+    {
+      sessionId: "local",
+      workspaceRoot: "/Users/season/Personal/nav",
+      projectRoot: "/Users/season/Personal/nav",
+      updatedAt: 500,
+    },
+  ];
+
+  assert.equal(
+    existingProjectSessionId(
+      sessions,
+      "/Users/season/Personal/nav",
+      "worktree",
+    ),
+    null,
+  );
+});
+
+test("worktree project creation reuses the newest worktree for the checkout", () => {
+  const sessions = [
+    {
+      sessionId: "local",
+      workspaceRoot: "/Users/season/Personal/nav",
+      projectRoot: "/Users/season/Personal/nav",
+      updatedAt: 500,
+    },
+    {
+      sessionId: "older-worktree",
+      workspaceRoot: "/Users/season/Personal/nav/.nav/worktrees/nav-wt-old",
+      projectRoot: "/Users/season/Personal/nav",
+      updatedAt: 300,
+    },
+    {
+      sessionId: "newer-worktree",
+      workspaceRoot: "/Users/season/Personal/nav/.nav/worktrees/nav-wt-new",
+      projectRoot: "/Users/season/Personal/nav",
+      updatedAt: 700,
+    },
+  ];
+
+  assert.equal(
+    existingProjectSessionId(
+      sessions,
+      "/Users/season/Personal/nav",
+      "worktree",
+    ),
+    "newer-worktree",
+  );
+});

@@ -349,30 +349,39 @@ async function createBackendSession(cwd, mode) {
 }
 
 async function openOrCreateProjectSession(workspaceRoot, mode = "local") {
-  const pending = pendingProjectSessions.get(workspaceRoot);
+  // The resolved session depends on both the root and the mode, so dedupe
+  // in-flight lookups per (mode, root) — keying on the root alone would let a
+  // concurrent local and worktree open of the same path share one promise and
+  // return a session of the wrong mode.
+  const pendingKey = `${mode} ${workspaceRoot}`;
+  const pending = pendingProjectSessions.get(pendingKey);
   if (pending) {
     return pending;
   }
 
-  const lookup = findExistingProjectSession(workspaceRoot).then(
+  const lookup = findExistingProjectSession(workspaceRoot, mode).then(
     async (existingSessionId) =>
       existingSessionId ?? createProjectSession(workspaceRoot, mode),
   );
-  pendingProjectSessions.set(workspaceRoot, lookup);
+  pendingProjectSessions.set(pendingKey, lookup);
 
   try {
     return await lookup;
   } finally {
-    pendingProjectSessions.delete(workspaceRoot);
+    pendingProjectSessions.delete(pendingKey);
   }
 }
 
-async function findExistingProjectSession(workspaceRoot) {
+async function findExistingProjectSession(workspaceRoot, mode) {
   const response = await sendRpc({
     backendUrl,
     method: "session.list",
   });
-  return existingProjectSessionId(response.result.sessions, workspaceRoot);
+  return existingProjectSessionId(
+    response.result.sessions,
+    workspaceRoot,
+    mode,
+  );
 }
 
 async function createProjectSession(workspaceRoot, mode) {
