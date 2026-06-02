@@ -256,6 +256,11 @@ function createMainWindow(): BrowserWindow {
       event.preventDefault();
     }
   });
+  window.webContents.on("will-redirect", (event, url) => {
+    if (openInExternalBrowser(url)) {
+      event.preventDefault();
+    }
+  });
   trace.mark("electron.window.load_file.start");
   window
     .loadFile(path.join(__dirname, "..", "renderer", "dist", "index.html"))
