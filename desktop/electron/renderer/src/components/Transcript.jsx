@@ -8,9 +8,15 @@ export default function Transcript({ messages }) {
     [messages],
   );
 
+  // Only follow this transcript's own new messages. Without the dependency the
+  // effect runs on every App re-render — including a background session's
+  // events — and would yank the viewport down while the user reads history.
   useEffect(() => {
+    if (messages.length === 0) {
+      return;
+    }
     listRef.current?.lastElementChild?.scrollIntoView({ block: "end" });
-  });
+  }, [messages]);
 
   return (
     <section className="chat" aria-label="Chat transcript">

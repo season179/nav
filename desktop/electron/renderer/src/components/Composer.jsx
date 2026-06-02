@@ -108,7 +108,7 @@ export default function Composer({
       <div className="composer-meta">
         <span className="composer-meta-left">
           <SessionModeMenu
-            disabled={!connected || running}
+            disabled={!connected}
             mode={newSessionMode}
             onModeChange={onNewSessionModeChange}
           />

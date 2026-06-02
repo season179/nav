@@ -11,34 +11,39 @@ import Sidebar from "./components/Sidebar.jsx";
 import StacksPage from "./components/StacksPage.jsx";
 import Transcript from "./components/Transcript.jsx";
 import {
+  appendMessage,
+  createSessionState,
+  reduceSessions,
+} from "./lib/session-runtime.mjs";
+import {
   STACK_AVAILABILITY_RECHECK_DELAY_MS,
   shouldRefreshStackAvailabilityForEvent,
 } from "./lib/stack-availability.mjs";
 
+// Shown when a session has no state yet (e.g. before its first event arrives),
+// so the composer and transcript always have a stable object to read.
+const EMPTY_SESSION_STATE = createSessionState();
+// Where startup/connection errors land before any real session exists.
+const SYSTEM_SESSION_ID = "system";
+
 export default function App() {
   const [connected, setConnected] = useState(false);
-  const [running, setRunning] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [sessionSummaries, setSessionSummaries] = useState([]);
-  const [messages, setMessages] = useState([]);
-  const [modelInfo, setModelInfo] = useState(null);
+  // Every live session's transcript and run state, keyed by id. Routing events
+  // here by session id is what keeps concurrent sessions from interfering.
+  const [sessionStates, setSessionStates] = useState({});
   const [modelOptions, setModelOptions] = useState([]);
   const [modelSwitching, setModelSwitching] = useState(false);
-  const [stopPending, setStopPending] = useState(false);
   const [activeView, setActiveView] = useState("chat");
-  const [stackAvailable, setStackAvailable] = useState(false);
-  const [stackRefreshKey, setStackRefreshKey] = useState(0);
   const [newSessionMode, setNewSessionMode] = useState("local");
 
   const connectedRef = useRef(false);
-  const runningRef = useRef(false);
   const activeSessionIdRef = useRef(null);
-  const activeRunStartedRef = useRef(false);
-  const stopRpcInFlightRef = useRef(false);
-  const stopSentForActiveRunRef = useRef(false);
-  const stopRequestedRef = useRef(false);
-  const nextMessageIdRef = useRef(0);
-  const stackAvailabilityRequestRef = useRef(0);
+  // Imperative per-session run bookkeeping read synchronously by the stop/send
+  // paths (React state would be stale inside the async stop loop). `running`
+  // mirrors the view state's flag; the rest track one in-flight run.
+  const runtimesRef = useRef(new Map());
   const sessionModeTouchedRef = useRef(false);
 
   const setConnectedState = useCallback((isConnected) => {
@@ -46,114 +51,150 @@ export default function App() {
     setConnected(isConnected);
   }, []);
 
-  const setRunningState = useCallback((isRunning) => {
-    runningRef.current = isRunning;
-    setRunning(isRunning);
-  }, []);
-
   const setActiveSession = useCallback((sessionId) => {
     activeSessionIdRef.current = sessionId;
     setActiveSessionId(sessionId);
   }, []);
 
-  const setStopPendingState = useCallback((isPending) => {
-    setStopPending(isPending);
+  const runtimeFor = useCallback((sessionId) => {
+    let runtime = runtimesRef.current.get(sessionId);
+    if (!runtime) {
+      runtime = {
+        running: false,
+        runStarted: false,
+        stopRequested: false,
+        stopRpcInFlight: false,
+        stopSentForActiveRun: false,
+        stackRequest: 0,
+        modelInfoRequest: 0,
+        // Event ids already applied, so a backlog replay (e.g. after a
+        // stream-error re-subscribes) is ignored instead of duplicating the
+        // transcript.
+        seenEventIds: new Set(),
+      };
+      runtimesRef.current.set(sessionId, runtime);
+    }
+    return runtime;
   }, []);
 
-  const setStopRequested = useCallback(
-    (isRequested) => {
-      stopRequestedRef.current = isRequested;
-      if (!isRequested) {
-        stopSentForActiveRunRef.current = false;
-        setStopPendingState(false);
-      }
-    },
-    [setStopPendingState],
-  );
-
-  const nextMessageId = useCallback(() => {
-    nextMessageIdRef.current += 1;
-    return `message-${nextMessageIdRef.current}`;
-  }, []);
-
-  const refreshStacks = useCallback(() => {
-    setStackRefreshKey((key) => key + 1);
-  }, []);
-
-  const refreshStacksAfterTerminalEvent = useCallback(() => {
-    refreshStacks();
-    window.setTimeout(refreshStacks, 120);
-  }, [refreshStacks]);
-
-  const markStacksUnavailable = useCallback(() => {
-    setStackAvailable(false);
-  }, []);
-
-  const appendMessage = useCallback(
-    (role, text) => {
-      setMessages((current) => [
-        ...current,
-        {
-          id: nextMessageId(),
-          role,
-          text: text ?? "",
-          createdAt: new Date().toISOString(),
-        },
-      ]);
-    },
-    [nextMessageId],
-  );
-
-  const clearTranscript = useCallback(() => {
-    setMessages([]);
-  }, []);
-
-  const upsertToolLine = useCallback(
-    (toolCallId, state, toolName, detail) => {
-      setMessages((current) => {
-        const nextToolLine = (existingId) => ({
-          id: existingId ?? nextMessageId(),
-          role: "tool",
-          toolCallId,
-          state,
-          toolName: toolName ?? "tool",
-          detail: detail ?? "",
-        });
-
-        if (!toolCallId) {
-          return [...current, nextToolLine()];
-        }
-
-        const index = current.findIndex(
-          (message) =>
-            message.role === "tool" && message.toolCallId === toolCallId,
-        );
-        if (index === -1) {
-          return [...current, nextToolLine()];
-        }
-
-        const next = current.slice();
-        next[index] = nextToolLine(current[index].id);
-        return next;
-      });
-    },
-    [nextMessageId],
-  );
-
-  const refreshModelInfo = useCallback(async (sessionId) => {
-    if (!window.nav) {
+  // Update one session's view state, creating it on first touch so events for a
+  // brand-new (or backgrounded) session never need pre-registration.
+  const updateSessionState = useCallback((sessionId, updater) => {
+    if (!sessionId) {
       return;
     }
-    const targetSessionId = sessionId ?? activeSessionIdRef.current;
-    try {
-      const info = await window.nav.modelInfo(targetSessionId);
-      if ((targetSessionId ?? null) === (activeSessionIdRef.current ?? null)) {
-        setModelInfo(info ?? null);
+    setSessionStates((current) => {
+      const previous = current[sessionId] ?? createSessionState();
+      const next = updater(previous);
+      if (next === previous) {
+        return current;
       }
-    } catch {
-      // The indicator is best-effort; never let it disrupt the chat.
-    }
+      return { ...current, [sessionId]: next };
+    });
   }, []);
+
+  const appendSessionMessage = useCallback(
+    (sessionId, role, text) => {
+      updateSessionState(sessionId, (state) =>
+        appendMessage(state, role, text),
+      );
+    },
+    [updateSessionState],
+  );
+
+  const setSessionRunning = useCallback(
+    (sessionId, isRunning) => {
+      runtimeFor(sessionId).running = isRunning;
+      updateSessionState(sessionId, (state) =>
+        state.running === isRunning ? state : { ...state, running: isRunning },
+      );
+    },
+    [runtimeFor, updateSessionState],
+  );
+
+  const setSessionStopPending = useCallback(
+    (sessionId, isPending) => {
+      updateSessionState(sessionId, (state) =>
+        state.stopPending === isPending
+          ? state
+          : { ...state, stopPending: isPending },
+      );
+    },
+    [updateSessionState],
+  );
+
+  // Forget a session's stop request and clear its pending indicator. Used both
+  // when a run ends and before a fresh run starts.
+  const resetSessionStop = useCallback(
+    (sessionId) => {
+      const runtime = runtimeFor(sessionId);
+      runtime.stopRequested = false;
+      runtime.stopSentForActiveRun = false;
+      setSessionStopPending(sessionId, false);
+    },
+    [runtimeFor, setSessionStopPending],
+  );
+
+  const setSessionModelInfo = useCallback(
+    (sessionId, modelInfo) => {
+      updateSessionState(sessionId, (state) => ({
+        ...state,
+        modelInfo: modelInfo ?? null,
+      }));
+    },
+    [updateSessionState],
+  );
+
+  const setSessionStackAvailable = useCallback(
+    (sessionId, available) => {
+      updateSessionState(sessionId, (state) =>
+        state.stackAvailable === available
+          ? state
+          : { ...state, stackAvailable: available },
+      );
+    },
+    [updateSessionState],
+  );
+
+  const refreshStacks = useCallback(
+    (sessionId) => {
+      updateSessionState(sessionId, (state) => ({
+        ...state,
+        stackRefreshKey: state.stackRefreshKey + 1,
+      }));
+    },
+    [updateSessionState],
+  );
+
+  const refreshStacksAfterTerminalEvent = useCallback(
+    (sessionId) => {
+      refreshStacks(sessionId);
+      window.setTimeout(() => refreshStacks(sessionId), 120);
+    },
+    [refreshStacks],
+  );
+
+  const refreshModelInfo = useCallback(
+    async (sessionId) => {
+      if (!window.nav || !sessionId) {
+        return;
+      }
+      // Guard against out-of-order resolution: a slow, stale fetch must not
+      // overwrite the model a newer call (or an explicit switch) already showed.
+      const runtime = runtimeFor(sessionId);
+      const requestId = runtime.modelInfoRequest + 1;
+      runtime.modelInfoRequest = requestId;
+      try {
+        const info = await window.nav.modelInfo(sessionId);
+        if (requestId === runtime.modelInfoRequest) {
+          setSessionModelInfo(sessionId, info ?? null);
+        }
+      } catch {
+        // The indicator is best-effort; never let it disrupt the chat.
+      }
+    },
+    [runtimeFor, setSessionModelInfo],
+  );
 
   const refreshModelOptions = useCallback(async () => {
     if (!window.nav) {
@@ -179,53 +220,62 @@ export default function App() {
 
   const refreshStackAvailability = useCallback(
     async (sessionId, options = {}) => {
-      if (!window.nav) {
+      if (!window.nav || !sessionId) {
         return;
       }
-      const targetSessionId = sessionId ?? activeSessionIdRef.current;
-      if (!targetSessionId) {
-        setStackAvailable(false);
-        return;
-      }
-      const requestId = stackAvailabilityRequestRef.current + 1;
-      stackAvailabilityRequestRef.current = requestId;
+      const runtime = runtimeFor(sessionId);
+      const requestId = runtime.stackRequest + 1;
+      runtime.stackRequest = requestId;
       if (options.reset) {
-        setStackAvailable(false);
+        setSessionStackAvailable(sessionId, false);
       }
       try {
         const availability =
-          await window.nav.sessionStackAvailability(targetSessionId);
-        if (
-          requestId === stackAvailabilityRequestRef.current &&
-          targetSessionId === activeSessionIdRef.current
-        ) {
-          setStackAvailable(availability?.available === true);
+          await window.nav.sessionStackAvailability(sessionId);
+        if (requestId === runtime.stackRequest) {
+          setSessionStackAvailable(sessionId, availability?.available === true);
         }
       } catch {
-        if (
-          requestId === stackAvailabilityRequestRef.current &&
-          targetSessionId === activeSessionIdRef.current
-        ) {
-          setStackAvailable(false);
+        if (requestId === runtime.stackRequest) {
+          setSessionStackAvailable(sessionId, false);
         }
       }
     },
-    [],
+    [runtimeFor, setSessionStackAvailable],
   );
 
   const refreshStackAvailabilityForEvent = useCallback(
-    (eventType) => {
+    (sessionId, eventType) => {
       if (!shouldRefreshStackAvailabilityForEvent(eventType)) {
         return;
       }
-      refreshStackAvailability();
+      refreshStackAvailability(sessionId);
       // The terminal SSE event can beat the backend's JSONL stack append.
       window.setTimeout(
-        refreshStackAvailability,
+        () => refreshStackAvailability(sessionId),
         STACK_AVAILABILITY_RECHECK_DELAY_MS,
       );
     },
     [refreshStackAvailability],
+  );
+
+  // Surface a connection/backend error in a transcript the user can see. When
+  // the failure names a session (e.g. one session's stream dropped), report it
+  // there without yanking the user's active view; otherwise fall back to the
+  // active session, or a synthetic one if the failure beat any real session.
+  const reportStatusError = useCallback(
+    (message, sessionId) => {
+      if (sessionId) {
+        appendSessionMessage(sessionId, "error", message);
+        return;
+      }
+      const activeId = activeSessionIdRef.current;
+      if (!activeId) {
+        setActiveSession(SYSTEM_SESSION_ID);
+      }
+      appendSessionMessage(activeId ?? SYSTEM_SESSION_ID, "error", message);
+    },
+    [appendSessionMessage, setActiveSession],
   );
 
   const renderBackendStatus = useCallback(
@@ -235,53 +285,64 @@ export default function App() {
         case "connected":
           break;
         case "stream-error":
-          appendMessage("error", `Stream error: ${status.message}`);
+          reportStatusError(
+            `Stream error: ${status.message}`,
+            status.sessionId,
+          );
           break;
         case "backend-error":
-          appendMessage("error", `Backend error: ${status.message}`);
+          reportStatusError(`Backend error: ${status.message}`);
           break;
         default:
-          appendMessage("error", status.message ?? status.state);
+          reportStatusError(status.message ?? status.state);
           break;
       }
     },
-    [appendMessage],
+    [reportStatusError],
   );
 
-  const stopRun = useCallback(async () => {
-    if (
-      !window.nav ||
-      stopRpcInFlightRef.current ||
-      stopSentForActiveRunRef.current
-    ) {
-      return;
-    }
-    stopRequestedRef.current = true;
-    setStopPendingState(true);
-    stopRpcInFlightRef.current = true;
-    try {
-      // A pre-registration stop can race with run.started; retry once if the
-      // backend reported no active run before that event arrived.
-      let shouldRetry = true;
-      while (
-        shouldRetry &&
-        stopRequestedRef.current &&
-        !stopSentForActiveRunRef.current
-      ) {
-        const runHadStarted = activeRunStartedRef.current;
-        const stopped = await window.nav.sessionStop();
-        if (stopped) {
-          stopSentForActiveRunRef.current = true;
-        }
-        shouldRetry = !stopped && !runHadStarted && activeRunStartedRef.current;
+  // Ask the backend to stop one session's in-flight run. Each session has its
+  // own stop bookkeeping, so stopping one never touches another. A stop
+  // requested before `run.started` arrives retries once when the run shows up.
+  const stopRun = useCallback(
+    async (sessionId) => {
+      if (!window.nav || !sessionId) {
+        return;
       }
-    } catch (error) {
-      appendMessage("error", `Could not stop: ${error.message}`);
-      setStopPendingState(false);
-    } finally {
-      stopRpcInFlightRef.current = false;
-    }
-  }, [appendMessage, setStopPendingState]);
+      const runtime = runtimeFor(sessionId);
+      if (runtime.stopRpcInFlight || runtime.stopSentForActiveRun) {
+        return;
+      }
+      runtime.stopRequested = true;
+      setSessionStopPending(sessionId, true);
+      runtime.stopRpcInFlight = true;
+      try {
+        let shouldRetry = true;
+        while (
+          shouldRetry &&
+          runtime.stopRequested &&
+          !runtime.stopSentForActiveRun
+        ) {
+          const runHadStarted = runtime.runStarted;
+          const stopped = await window.nav.sessionStop(sessionId);
+          if (stopped) {
+            runtime.stopSentForActiveRun = true;
+          }
+          shouldRetry = !stopped && !runHadStarted && runtime.runStarted;
+        }
+      } catch (error) {
+        appendSessionMessage(
+          sessionId,
+          "error",
+          `Could not stop: ${error.message}`,
+        );
+        setSessionStopPending(sessionId, false);
+      } finally {
+        runtime.stopRpcInFlight = false;
+      }
+    },
+    [appendSessionMessage, runtimeFor, setSessionStopPending],
+  );
 
   const handleBackendStatus = useCallback(
     (status) => {
@@ -293,12 +354,11 @@ export default function App() {
       setConnectedState(true);
       if (status.sessionId) {
         setActiveSession(status.sessionId);
+        refreshModelInfo(status.sessionId);
+        refreshStackAvailability(status.sessionId, { reset: true });
       }
-      setRunningState(false);
       refreshModelOptions();
       refreshSessions();
-      refreshModelInfo(status.sessionId);
-      refreshStackAvailability(status.sessionId, { reset: true });
     },
     [
       refreshModelInfo,
@@ -308,95 +368,82 @@ export default function App() {
       renderBackendStatus,
       setActiveSession,
       setConnectedState,
-      setRunningState,
     ],
   );
 
   const handleSessionEvent = useCallback(
     (event) => {
+      const sessionId = event.session_id;
+      if (!sessionId) {
+        return;
+      }
+
+      const runtime = runtimeFor(sessionId);
+      // Skip events already applied so a backlog replay (the SSE feed resends a
+      // session's full history when it re-subscribes after a stream error)
+      // never re-appends the transcript or re-fires its side effects.
+      if (event.event_id) {
+        if (runtime.seenEventIds.has(event.event_id)) {
+          return;
+        }
+        runtime.seenEventIds.add(event.event_id);
+      }
+
+      // Transcript + running/stopPending for the named session only.
+      setSessionStates((current) => reduceSessions(current, event));
+
       switch (event.type) {
-        case "user.message":
-          appendMessage("user", event.text);
-          break;
         case "run.started":
-          activeRunStartedRef.current = true;
-          setRunningState(true);
-          if (stopRequestedRef.current) {
-            stopRun();
+          runtime.runStarted = true;
+          runtime.running = true;
+          if (runtime.stopRequested) {
+            stopRun(sessionId);
           }
           break;
         case "assistant.tool_calls":
-          if (event.text) {
-            appendMessage("assistant", event.text);
-          }
-          refreshModelInfo();
-          refreshStacks();
-          break;
-        case "tool.started":
-          upsertToolLine(event.tool_call_id, "running", event.tool_name);
+          refreshModelInfo(sessionId);
+          refreshStacks(sessionId);
           break;
         case "tool.completed":
-          upsertToolLine(
-            event.tool_call_id,
-            "done",
-            event.tool_name,
-            event.text,
-          );
-          refreshStacks();
-          break;
         case "tool.failed":
-          upsertToolLine(
-            event.tool_call_id,
-            "failed",
-            event.tool_name,
-            event.error,
-          );
-          refreshStacks();
+          refreshStacks(sessionId);
           break;
         case "message.completed":
-          appendMessage("assistant", event.text);
-          refreshModelInfo();
-          refreshStacks();
+          refreshModelInfo(sessionId);
+          refreshStacks(sessionId);
           break;
         case "run.completed":
         case "run.cancelled":
-          activeRunStartedRef.current = false;
-          setRunningState(false);
-          setStopRequested(false);
-          refreshSessions();
-          refreshModelInfo();
-          refreshStackAvailabilityForEvent(event.type);
-          refreshStacksAfterTerminalEvent();
-          break;
         case "run.failed":
-          appendMessage("error", event.error ?? "the run failed");
-          activeRunStartedRef.current = false;
-          setRunningState(false);
-          setStopRequested(false);
+          runtime.runStarted = false;
+          runtime.running = false;
+          runtime.stopRequested = false;
+          runtime.stopSentForActiveRun = false;
           refreshSessions();
-          refreshModelInfo();
-          refreshStackAvailabilityForEvent(event.type);
-          refreshStacksAfterTerminalEvent();
+          refreshModelInfo(sessionId);
+          refreshStackAvailabilityForEvent(sessionId, event.type);
+          refreshStacksAfterTerminalEvent(sessionId);
           break;
         default:
           break;
       }
     },
     [
-      appendMessage,
       refreshModelInfo,
       refreshSessions,
       refreshStackAvailabilityForEvent,
       refreshStacks,
       refreshStacksAfterTerminalEvent,
-      setRunningState,
-      setStopRequested,
+      runtimeFor,
       stopRun,
-      upsertToolLine,
     ],
   );
 
-  useNavSubscriptions(handleBackendStatus, handleSessionEvent, appendMessage);
+  useNavSubscriptions(
+    handleBackendStatus,
+    handleSessionEvent,
+    reportStatusError,
+  );
 
   // Load the persisted "Start in" preference so the menu reflects the mode the
   // next launch will actually use (it is owned by Main, which reads it before
@@ -436,11 +483,11 @@ export default function App() {
 
   const activateCreatedSession = useCallback(
     async (sessionId) => {
+      setActiveView("chat");
       setActiveSession(sessionId);
-      setStackAvailable(false);
-      await refreshSessions();
       refreshModelInfo(sessionId);
       refreshStackAvailability(sessionId, { reset: true });
+      await refreshSessions();
     },
     [
       refreshModelInfo,
@@ -450,20 +497,17 @@ export default function App() {
     ],
   );
 
+  // Bring an existing session to the foreground. Switching is always allowed —
+  // even while this or another session is running — because each session keeps
+  // its own transcript and the backend streams them independently.
   const selectSession = useCallback(
     async (sessionId) => {
-      if (
-        sessionId === activeSessionIdRef.current ||
-        runningRef.current ||
-        !connectedRef.current
-      ) {
+      if (sessionId === activeSessionIdRef.current || !connectedRef.current) {
         return;
       }
 
       const previousSessionId = activeSessionIdRef.current;
-      clearTranscript();
       setActiveView("chat");
-      setStackAvailable(false);
       setActiveSession(sessionId);
       try {
         await window.nav.switchSession(sessionId);
@@ -471,13 +515,15 @@ export default function App() {
         refreshStackAvailability(sessionId, { reset: true });
       } catch (error) {
         setActiveSession(previousSessionId);
-        refreshStackAvailability(previousSessionId, { reset: true });
-        appendMessage("error", `Could not open session: ${error.message}`);
+        appendSessionMessage(
+          previousSessionId ?? SYSTEM_SESSION_ID,
+          "error",
+          `Could not open session: ${error.message}`,
+        );
       }
     },
     [
-      appendMessage,
-      clearTranscript,
+      appendSessionMessage,
       refreshModelInfo,
       refreshStackAvailability,
       setActiveSession,
@@ -486,7 +532,7 @@ export default function App() {
 
   const startNewChatInProject = useCallback(
     async (projectPath) => {
-      if (runningRef.current || !connectedRef.current || !window.nav) {
+      if (!connectedRef.current || !window.nav) {
         return;
       }
       try {
@@ -497,17 +543,16 @@ export default function App() {
         if (!sessionId) {
           return;
         }
-        clearTranscript();
         await activateCreatedSession(sessionId);
       } catch (error) {
-        appendMessage("error", `Could not start a new chat: ${error.message}`);
+        reportStatusError(`Could not start a new chat: ${error.message}`);
       }
     },
-    [activateCreatedSession, appendMessage, clearTranscript, newSessionMode],
+    [activateCreatedSession, newSessionMode, reportStatusError],
   );
 
   const createProject = useCallback(async () => {
-    if (runningRef.current || !connectedRef.current || !window.nav) {
+    if (!connectedRef.current || !window.nav) {
       return;
     }
     try {
@@ -515,15 +560,15 @@ export default function App() {
       if (!sessionId) {
         return;
       }
-      clearTranscript();
       await activateCreatedSession(sessionId);
     } catch (error) {
-      appendMessage("error", `Could not create project: ${error.message}`);
+      reportStatusError(`Could not create project: ${error.message}`);
     }
-  }, [activateCreatedSession, appendMessage, clearTranscript, newSessionMode]);
+  }, [activateCreatedSession, newSessionMode, reportStatusError]);
 
   const switchModel = useCallback(
     async (option) => {
+      const sessionId = activeSessionIdRef.current;
       if (!connectedRef.current || !window.nav || !option) {
         return;
       }
@@ -533,60 +578,79 @@ export default function App() {
           option.provider,
           option.model,
         );
-        setModelInfo(info ?? null);
-        await refreshModelInfo();
+        setSessionModelInfo(sessionId, info ?? null);
+        await refreshModelInfo(sessionId);
       } catch (error) {
-        appendMessage("error", `Could not switch model: ${error.message}`);
+        reportStatusError(`Could not switch model: ${error.message}`);
       } finally {
         setModelSwitching(false);
       }
     },
-    [appendMessage, refreshModelInfo],
+    [refreshModelInfo, reportStatusError, setSessionModelInfo],
   );
 
   const switchThinking = useCallback(
     async (level) => {
+      const sessionId = activeSessionIdRef.current;
       if (!connectedRef.current || !window.nav || !level) {
         return;
       }
       setModelSwitching(true);
       try {
         const info = await window.nav.switchThinking(level);
-        setModelInfo(info ?? null);
-        await refreshModelInfo();
+        setSessionModelInfo(sessionId, info ?? null);
+        await refreshModelInfo(sessionId);
       } catch (error) {
-        appendMessage("error", `Could not switch thinking: ${error.message}`);
+        reportStatusError(`Could not switch thinking: ${error.message}`);
       } finally {
         setModelSwitching(false);
       }
     },
-    [appendMessage, refreshModelInfo],
+    [refreshModelInfo, reportStatusError, setSessionModelInfo],
   );
 
   const sendMessage = useCallback(
     async (text) => {
-      if (!text || !connectedRef.current || !window.nav) {
+      const sessionId = activeSessionIdRef.current;
+      if (!text || !connectedRef.current || !window.nav || !sessionId) {
         return;
       }
 
-      const wasRunning = runningRef.current;
+      const runtime = runtimeFor(sessionId);
+      const wasRunning = runtime.running;
       if (!wasRunning) {
-        activeRunStartedRef.current = false;
-        setStopRequested(false);
-        setRunningState(true);
+        runtime.runStarted = false;
+        resetSessionStop(sessionId);
+        setSessionRunning(sessionId, true);
       }
 
       try {
-        await window.nav.sessionSendMessage(text);
+        await window.nav.sessionSendMessage(sessionId, text);
       } catch (error) {
-        appendMessage("error", `Could not send message: ${error.message}`);
+        appendSessionMessage(
+          sessionId,
+          "error",
+          `Could not send message: ${error.message}`,
+        );
         if (!wasRunning) {
-          setRunningState(false);
+          setSessionRunning(sessionId, false);
         }
       }
     },
-    [appendMessage, setRunningState, setStopRequested],
+    [appendSessionMessage, resetSessionStop, runtimeFor, setSessionRunning],
   );
+
+  const activeState = sessionStates[activeSessionId] ?? EMPTY_SESSION_STATE;
+
+  const runningSessionIds = useMemo(() => {
+    const ids = new Set();
+    for (const [id, state] of Object.entries(sessionStates)) {
+      if (state.running) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }, [sessionStates]);
 
   const activeProjectPath = useMemo(
     () =>
@@ -595,12 +659,16 @@ export default function App() {
     [activeSessionId, sessionSummaries],
   );
 
+  const markStacksUnavailable = useCallback(() => {
+    setSessionStackAvailable(activeSessionIdRef.current, false);
+  }, [setSessionStackAvailable]);
+
   return (
     <div className="app">
       <Sidebar
         activeSessionId={activeSessionId}
         connected={connected}
-        running={running}
+        runningSessionIds={runningSessionIds}
         sessions={sessionSummaries}
         onCreateProject={createProject}
         onNewChat={() => startNewChatInProject(activeProjectPath)}
@@ -611,32 +679,36 @@ export default function App() {
         <SessionToolbar
           activeView={activeView}
           connected={connected}
+          running={activeState.running}
           sessionId={activeSessionId}
-          showStacks={stackAvailable}
+          showStacks={activeState.stackAvailable}
           onSelectView={setActiveView}
         />
         {activeView === "stacks" ? (
           <StacksPage
-            key={`${activeSessionId ?? "none"}-${stackRefreshKey}`}
+            key={`${activeSessionId ?? "none"}-${activeState.stackRefreshKey}`}
             onUnavailable={markStacksUnavailable}
             sessionId={activeSessionId}
           />
         ) : (
           <>
-            <Transcript messages={messages} />
+            <Transcript
+              key={activeSessionId ?? "none"}
+              messages={activeState.messages}
+            />
             <Composer
               connected={connected}
-              modelInfo={modelInfo}
+              modelInfo={activeState.modelInfo}
               modelOptions={modelOptions}
               modelSwitching={modelSwitching}
               newSessionMode={newSessionMode}
-              running={running}
-              stopPending={stopPending}
+              running={activeState.running}
+              stopPending={activeState.stopPending}
               onNewSessionModeChange={changeNewSessionMode}
               onModelChange={switchModel}
               onThinkingChange={switchThinking}
               onSend={sendMessage}
-              onStop={stopRun}
+              onStop={() => stopRun(activeSessionIdRef.current)}
             />
           </>
         )}
@@ -648,6 +720,7 @@ export default function App() {
 function SessionToolbar({
   activeView,
   connected,
+  running,
   sessionId,
   showStacks,
   onSelectView,
@@ -659,6 +732,14 @@ function SessionToolbar({
         <span className="session-toolbar-id">
           {sessionId ? shortId(sessionId) : "none"}
         </span>
+        {running ? (
+          <span
+            className="session-toolbar-running"
+            role="img"
+            aria-label="Running"
+            title="Running"
+          />
+        ) : null}
       </div>
       <nav className="session-view-tabs" aria-label="Thread views">
         <button
@@ -700,7 +781,7 @@ function useNavSubscriptions(handleBackendStatus, handleSessionEvent, onError) {
       };
     }
 
-    onError("error", "Electron preload API unavailable");
+    onError("Electron preload API unavailable");
     return undefined;
   }, [handleBackendStatus, handleSessionEvent, onError]);
 }

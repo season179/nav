@@ -354,7 +354,9 @@ body {
 }
 
 .session-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   max-width: 100%;
   min-width: 0;
@@ -368,12 +370,35 @@ body {
   line-height: 1.35;
   text-align: left;
   cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
   transition:
     background 150ms ease-out,
     color 150ms ease-out;
+}
+
+.session-item-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A small pulsing dot marks a session whose run is still in flight, including
+   sessions working in the background while another is on screen. */
+.session-running,
+.project-running,
+.session-toolbar-running {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--active);
+  animation: tool-pulse 1.4s ease-in-out infinite;
+}
+
+.session-toolbar-running {
+  display: inline-block;
+  margin-left: 8px;
 }
 
 .session-item:hover {
@@ -1427,7 +1452,10 @@ h1 {
 
 @media (prefers-reduced-motion: reduce) {
   .message,
-  .message-tool-running .message-role {
+  .message-tool-running .message-role,
+  .session-running,
+  .project-running,
+  .session-toolbar-running {
     animation: none;
   }
 
