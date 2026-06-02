@@ -16,8 +16,9 @@ function existingProjectSessionId(sessions, workspaceRoot, mode = "local") {
 
     const workspace = normalizeWorkspaceRoot(session?.workspaceRoot);
     const matches = isWorktree
-      ? normalizeWorkspaceRoot(session?.projectRoot) === targetRoot &&
-        workspace !== targetRoot
+      ? workspace !== "" &&
+        workspace !== targetRoot &&
+        normalizeWorkspaceRoot(session?.projectRoot) === targetRoot
       : workspace === targetRoot;
     if (!matches) {
       continue;
