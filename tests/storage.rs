@@ -476,7 +476,7 @@ fn opening_a_foreign_non_nav_database_is_refused() {
     let path = temp_db();
     let _cleanup = TempDb(path.clone());
 
-    // A populated database that is not a nav/pi database.
+    // A populated database that does not use nav's schema.
     {
         let conn = Connection::open(&path).expect("create foreign database");
         conn.execute_batch("CREATE TABLE widgets (id INTEGER PRIMARY KEY);")

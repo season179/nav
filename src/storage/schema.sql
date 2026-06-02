@@ -1,8 +1,9 @@
 -- Canonical nav session-storage schema (migration version 1).
--- Captured verbatim from the existing ~/.nav/nav.db; do NOT modify the
--- structure — it is shared with the pi CLI and stores raw provider
--- payloads (OpenAI Responses / Anthropic) alongside conversation turns.
--- Applied by nav only when opening a database that has no tables yet.
+-- Captured verbatim from a pre-existing ~/.nav/nav.db; do NOT modify the
+-- structure — nav treats it as a fixed contract, and the file may already
+-- hold rows written by the tool that originally created it. It stores raw
+-- provider payloads (OpenAI Responses / Anthropic) alongside conversation
+-- turns. Applied by nav only when opening a database that has no tables yet.
 
 CREATE TABLE schema_migrations (
     version     INTEGER PRIMARY KEY NOT NULL,

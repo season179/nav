@@ -1,12 +1,13 @@
-//! Durable session storage backed by the shared `~/.nav/nav.db` SQLite database.
+//! Durable session storage backed by the `~/.nav/nav.db` SQLite database.
 //!
 //! Every chat exchange — the session, each run, and the user/assistant turns
-//! with their text parts — is persisted into the existing schema (also written
-//! by the pi CLI, which additionally stores raw provider payloads). nav treats
-//! that structure as a fixed contract: it only inserts and updates rows, never
-//! alters tables. On a database that has no tables yet, nav applies the
-//! captured schema once (migration version 1); an existing database is used
-//! as-is.
+//! with their text parts — is persisted into this schema, which nav adopted
+//! verbatim from a pre-existing `~/.nav/nav.db` and also carries raw provider
+//! payloads. nav treats that structure as a fixed contract: it only inserts
+//! and updates rows, never alters tables. On a database that has no tables
+//! yet, nav applies the captured schema once (migration version 1); an
+//! existing database (which may hold rows from the tool that created it) is
+//! used as-is.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -44,7 +45,7 @@ impl From<rusqlite::Error> for StorageError {
     }
 }
 
-/// A persistent store of chat sessions over the shared SQLite database.
+/// A persistent store of chat sessions over the `~/.nav/nav.db` SQLite database.
 pub struct Storage {
     conn: Mutex<Connection>,
 }
@@ -70,7 +71,7 @@ impl Storage {
 
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        // WAL lets nav and the pi CLI read/write the shared database concurrently.
+        // WAL allows concurrent readers/writers (e.g. several nav processes) without lock contention.
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         ensure_schema(&conn)?;
 
@@ -329,7 +330,7 @@ impl Storage {
 
     /// Add observed or estimated token counts to the session aggregate.
     ///
-    /// The shared schema stores these on `sessions` rather than per run. nav
+    /// The schema stores these on `sessions` rather than per run. nav
     /// records them as operational telemetry for future context management, not
     /// as billing data.
     pub fn record_token_usage(
@@ -700,7 +701,7 @@ fn response_reasoning_items_from_part(data: &serde_json::Value) -> Vec<ResponseR
         .collect()
 }
 
-/// A provider reasoning/thinking part. The shared schema mirrors `text` into
+/// A provider reasoning/thinking part. The schema mirrors `text` into
 /// FTS, while `response_reasoning` stays opaque and is only used for replay.
 fn thinking_part(
     text: Option<&str>,
@@ -744,7 +745,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
         return Ok(());
     }
 
-    // A non-empty database must already be a nav/pi database. If the expected
+    // A non-empty database must already use nav's schema. If the expected
     // tables are missing, it belongs to something else — refuse to modify it.
     for table in ["sessions", "schema_migrations"] {
         let present = conn
@@ -757,7 +758,7 @@ fn ensure_schema(conn: &Connection) -> Result<(), StorageError> {
             .is_some();
         if !present {
             return Err(StorageError(format!(
-                "database is not a nav/pi database (missing table '{table}'); refusing to modify it"
+                "database does not use nav's schema (missing table '{table}'); refusing to modify it"
             )));
         }
     }
