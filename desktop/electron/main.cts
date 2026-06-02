@@ -1,10 +1,11 @@
 import type { ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import type { Subscription } from "./backend-client.cjs";
 import { sendRpc, subscribeToSessionEvents } from "./backend-client.cjs";
 import { startLocalBackend } from "./backend-process.cjs";
+import { isExternalBrowserUrl } from "./external-links.cjs";
 import {
   existingProjectSessionId,
   normalizeWorkspaceRoot,
@@ -13,6 +14,7 @@ import type { SessionMode } from "./request-validation.cjs";
 import { readSessionMode, writeSessionMode } from "./session-mode-store.cjs";
 import { createStartupTrace } from "./startup-trace.cjs";
 import type { SessionEvent } from "./types.cjs";
+
 import { createWindowOptions } from "./window-options.cjs";
 
 type BackendStatus = {
@@ -245,6 +247,15 @@ function createMainWindow(): BrowserWindow {
       error: description,
     });
   });
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    openInExternalBrowser(url);
+    return { action: "deny" };
+  });
+  window.webContents.on("will-navigate", (event, url) => {
+    if (openInExternalBrowser(url)) {
+      event.preventDefault();
+    }
+  });
   trace.mark("electron.window.load_file.start");
   window
     .loadFile(path.join(__dirname, "..", "renderer", "dist", "index.html"))
@@ -255,6 +266,19 @@ function createMainWindow(): BrowserWindow {
       trace.mark("electron.window.load_file.failed", { error: error.message });
     });
   return window;
+}
+
+function openInExternalBrowser(url: string): boolean {
+  if (!isExternalBrowserUrl(url)) {
+    return false;
+  }
+  shell.openExternal(url).catch((error: Error) => {
+    trace.mark("electron.external_link.failed", {
+      url,
+      error: error.message,
+    });
+  });
+  return true;
 }
 
 async function startChatSession(window: BrowserWindow | null): Promise<void> {
