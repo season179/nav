@@ -458,7 +458,7 @@ fn responses_adapter_round_trips_function_calls_and_outputs() {
     let input = body["input"].as_array().expect("input array");
     let reasoning_index = input
         .iter()
-        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_prev")
+        .position(|item| item["type"] == "reasoning" && item["encrypted_content"] == "opaque-prev")
         .expect("replayed previous reasoning item");
     let function_call_index = input
         .iter()
@@ -476,6 +476,61 @@ fn responses_adapter_round_trips_function_calls_and_outputs() {
         input
             .iter()
             .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call_prev")
+    );
+}
+
+#[test]
+fn responses_adapter_replays_reasoning_items_in_codex_accepted_shape() {
+    // The Codex ChatGPT backend rejects a tool turn whose replayed reasoning
+    // item omits `summary` or carries the server-assigned `id` (store: false).
+    // Mirror codex-rs, which always sends `summary` (empty array when there is
+    // no summary text) and never echoes the reasoning `id`.
+    let (base_url, requests) = fake_provider(
+        "200 OK",
+        r#"{"id":"resp_1","output":[{"type":"message","role":"assistant",
+             "content":[{"type":"output_text","text":"ok"}]}]}"#,
+    );
+    let mut config = config_with_compat(base_url, None);
+    config.api = "openai-responses".to_owned();
+    let model = OpenAiResponsesModel::new(config);
+
+    let mut previous_tool_call = ChatMessage::assistant_tool_calls(
+        "",
+        vec![ToolCall {
+            id: "call_prev".to_owned(),
+            name: "ls".to_owned(),
+            arguments: "{}".to_owned(),
+        }],
+    );
+    previous_tool_call.response_reasoning_items = vec![ResponseReasoningItem {
+        id: "rs_prev".to_owned(),
+        encrypted_content: "opaque-prev".to_owned(),
+    }];
+    let history = vec![
+        ChatMessage::user("list files"),
+        previous_tool_call,
+        ChatMessage::tool_result("call_prev", "Cargo.toml", false),
+    ];
+    model
+        .respond(&context(history), &[])
+        .expect("provider returns a reply");
+
+    let request = requests.recv().expect("captured provider request");
+    let body: serde_json::Value = serde_json::from_str(&request).expect("request body is JSON");
+    let input = body["input"].as_array().expect("input array");
+    let reasoning = input
+        .iter()
+        .find(|item| item["type"] == "reasoning")
+        .expect("replayed reasoning item");
+
+    assert_eq!(reasoning["encrypted_content"], "opaque-prev");
+    assert!(
+        reasoning["summary"].is_array(),
+        "reasoning item must carry a `summary` array the Codex backend requires: {reasoning}"
+    );
+    assert!(
+        reasoning.get("id").is_none(),
+        "reasoning item must omit the server-assigned id under store: false: {reasoning}"
     );
 }
 
@@ -509,7 +564,7 @@ fn responses_adapter_replays_reasoning_items_for_assistant_text() {
     let input = body["input"].as_array().expect("input array");
     let reasoning_index = input
         .iter()
-        .position(|item| item["type"] == "reasoning" && item["id"] == "rs_text")
+        .position(|item| item["type"] == "reasoning" && item["encrypted_content"] == "opaque-text")
         .expect("replayed previous reasoning item");
     let message_index = input
         .iter()

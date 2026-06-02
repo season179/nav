@@ -1057,12 +1057,18 @@ fn response_input_json(message: &ChatMessage) -> Vec<Value> {
 }
 
 fn responses_reasoning_items_json(reasoning: &[ResponseReasoningItem]) -> Vec<Value> {
+    // The Responses API requires a `summary` array on replayed reasoning items
+    // and rejects the server-assigned `id` under `store: false` (the same class
+    // of error the function-call `id` hit). nav does not retain per-item summary
+    // text, so send an empty `summary` — the `encrypted_content` carries the
+    // full reasoning. This mirrors codex-rs, which skips the id and always emits
+    // `summary`.
     reasoning
         .iter()
         .map(|item| {
             json!({
                 "type": "reasoning",
-                "id": item.id,
+                "summary": [],
                 "encrypted_content": item.encrypted_content,
             })
         })
