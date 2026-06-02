@@ -1,0 +1,393 @@
+/* The model metadata currently in use: small, dim, just under the input. */
+.composer-model,
+.composer-thinking,
+.composer-token-usage {
+  color: var(--ink-faint);
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.composer-model {
+  padding-left: 2px;
+}
+
+.composer-session-mode,
+.composer-model-menu,
+.composer-thinking-menu {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.session-mode-trigger,
+.model-trigger,
+.thinking-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.15;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.session-mode-trigger {
+  justify-content: space-between;
+  width: 96px;
+}
+
+.model-trigger {
+  justify-content: space-between;
+  max-width: min(280px, 36vw);
+  min-width: 0;
+}
+
+.thinking-trigger {
+  justify-content: space-between;
+  width: 116px;
+}
+
+.model-trigger span:first-child,
+.thinking-trigger span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-mode-trigger:hover:not(:disabled),
+.model-trigger:hover:not(:disabled),
+.thinking-trigger:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--ink);
+}
+
+.session-mode-trigger:focus-visible,
+.model-trigger:focus-visible,
+.thinking-trigger:focus-visible {
+  outline: none;
+  border-color: var(--active);
+  box-shadow: 0 0 0 2px var(--active-tint);
+}
+
+.session-mode-trigger:disabled,
+.model-trigger:disabled,
+.thinking-trigger:disabled {
+  color: var(--ink-faint);
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.session-mode-chevron,
+.model-chevron,
+.thinking-chevron {
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1;
+}
+
+.session-mode-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: var(--z-overlay);
+  width: 184px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-raised);
+  box-shadow: 0 18px 40px rgb(0 0 0 / 0.14);
+}
+
+.model-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: var(--z-overlay);
+  width: min(340px, calc(100vw - 32px));
+  max-height: 280px;
+  padding: 8px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-raised);
+  box-shadow: 0 18px 40px rgb(0 0 0 / 0.14);
+}
+
+.thinking-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: var(--z-overlay);
+  width: 220px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-raised);
+  box-shadow: 0 18px 40px rgb(0 0 0 / 0.14);
+}
+
+.model-search {
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.model-search::placeholder {
+  color: var(--ink-faint);
+}
+
+.model-search:focus {
+  outline: none;
+  border-color: var(--active);
+  box-shadow: 0 0 0 2px var(--active-tint);
+}
+
+.session-mode-menu-title {
+  padding: 2px 8px 8px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.session-mode-option,
+.model-option,
+.thinking-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 8px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-mode-option {
+  justify-content: space-between;
+}
+
+.model-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 14px;
+}
+
+.thinking-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 14px;
+}
+
+.session-mode-option:hover,
+.session-mode-option:focus-visible,
+.model-option:hover,
+.model-option:focus-visible,
+.thinking-option:hover,
+.thinking-option:focus-visible {
+  outline: none;
+  background: var(--active-tint);
+  color: var(--ink);
+}
+
+.session-mode-option[aria-checked="true"],
+.model-option[aria-checked="true"],
+.thinking-option[aria-checked="true"] {
+  color: var(--ink);
+}
+
+.model-option-label,
+.thinking-option-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thinking-option-label,
+.thinking-option-description {
+  display: block;
+}
+
+.thinking-option-description {
+  margin-top: 2px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.model-option-provider {
+  color: var(--ink-faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.model-empty {
+  padding: 8px;
+  color: var(--ink-faint);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.session-mode-check,
+.model-check,
+.thinking-check {
+  width: 14px;
+  color: var(--active);
+  text-align: center;
+}
+
+.composer-token-usage {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.composer-model:empty,
+.composer-thinking:empty,
+.composer-token-usage:empty {
+  display: none;
+}
+
+.composer-input {
+  flex: 1;
+  min-height: 48px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 16px;
+  background: transparent;
+  color: var(--ink);
+  caret-color: var(--active);
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1.4;
+  /* Grows with content (height set in JS); caps out before scrolling. */
+  resize: none;
+  overflow-y: auto;
+  max-height: 200px;
+}
+
+.composer-input::placeholder {
+  color: var(--ink-faint);
+}
+
+.composer-input:focus {
+  outline: none;
+}
+
+.composer-send {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--border);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 23px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    transform 150ms ease-out,
+    box-shadow 150ms ease-out,
+    background 150ms ease-out;
+}
+
+.composer-send:hover:not(:disabled) {
+  background: var(--border-strong);
+  box-shadow: 0 8px 18px rgb(0 0 0 / 0.22);
+  transform: translateY(-1px);
+}
+
+.composer-send:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--surface-raised),
+    0 0 0 4px var(--active);
+}
+
+/* Shown alongside Send only while a run is in flight, so the user can keep
+   sending (steering) the live run yet still interrupt it. */
+.composer-stop {
+  padding: 12px 16px;
+  border: 1px solid var(--danger);
+  border-radius: 999px;
+  background: var(--danger-tint);
+  color: var(--danger);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+  transition:
+    box-shadow 150ms ease-out,
+    background 150ms ease-out;
+}
+
+.composer-stop:hover:not(:disabled) {
+  background: var(--danger-tint);
+  box-shadow: 0 8px 18px rgb(0 0 0 / 0.2);
+}
+
+.composer-stop:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--surface-raised),
+    0 0 0 4px var(--danger);
+}
+
+.composer-input:disabled,
+.composer-send:disabled,
+.composer-stop:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message,
+  .message-tool-running .message-role,
+  .session-running,
+  .project-running,
+  .session-toolbar-running {
+    animation: none;
+  }
+
+  .session-attention,
+  .project-attention {
+    box-shadow:
+      0 0 0 2px var(--active-dim),
+      0 0 0 4px color-mix(in oklab, var(--active) 32%, transparent);
+  }
+
+  .new-chat,
+  .project-add,
+  .project-chat-add,
+  .session-item,
+  .project-session-toggle,
+  .session-view-tab,
+  .composer-input,
+  .composer-send,
+  .composer-stop,
+  .message-time {
+    transition: none;
+  }
+}

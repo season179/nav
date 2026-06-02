@@ -1,0 +1,107 @@
+.shell {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-width: 0;
+  height: 100vh;
+  background: var(--surface);
+}
+
+.session-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: var(--window-chrome-height);
+  min-width: 0;
+  padding: 12px 32px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  -webkit-app-region: drag;
+}
+
+.session-toolbar-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.session-toolbar-label {
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.session-toolbar-id {
+  max-width: 110px;
+  overflow: hidden;
+  color: var(--ink-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-view-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  -webkit-app-region: no-drag;
+}
+
+.session-view-tab {
+  min-width: 66px;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.session-view-tab:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+.session-view-tab[aria-current="page"] {
+  border-color: var(--active-border);
+  background: var(--active-tint);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.18);
+}
+
+.session-view-tab:focus-visible {
+  outline: none;
+  border-color: var(--active);
+  box-shadow: 0 0 0 2px var(--active-tint);
+}
+
+.session-view-tab:disabled {
+  color: var(--ink-faint);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+h1 {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.chat {
+  min-height: 0;
+  padding: 26px 32px 18px;
+  overflow: auto;
+}

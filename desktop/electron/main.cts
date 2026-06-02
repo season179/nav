@@ -24,6 +24,8 @@ type BackendStatus = {
   backendUrl?: string | null;
 };
 
+const NOT_READY_ERROR = "chat session is not ready";
+
 const PROJECT_ROOT = path.resolve(__dirname, "../../..");
 const smokeMode = process.argv.includes("--smoke");
 const trace = createStartupTrace();
@@ -39,6 +41,35 @@ const pendingProjectSessions = new Map<string, Promise<string | null>>();
 // background run keeps streaming while the user works in another session. Keyed
 // by session id; closed only on quit.
 const subscriptions = new Map<string, Subscription>();
+
+// Backend-touching handlers all need the same readiness checks. These guards
+// state that intent once and narrow the nullable module state to a non-null
+// local, so each handler reads as what it does rather than boilerplate. The
+// locals deliberately shadow the module-level `backendUrl`/`mainWindow` so the
+// existing object-shorthand call sites keep working unchanged.
+function requireBackendUrl(): string {
+  if (!backendUrl) {
+    throw new Error(NOT_READY_ERROR);
+  }
+  return backendUrl;
+}
+
+function requireMainWindow(): BrowserWindow {
+  if (!mainWindow) {
+    throw new Error(NOT_READY_ERROR);
+  }
+  return mainWindow;
+}
+
+// Handlers that act on a session accept an explicit id but fall back to the
+// active one; either way there must be a session, or the request is not ready.
+function requireActiveSessionId(requestedSessionId?: string | null): string {
+  const targetSessionId = requestedSessionId || sessionId;
+  if (!targetSessionId) {
+    throw new Error(NOT_READY_ERROR);
+  }
+  return targetSessionId;
+}
 
 app.whenReady().then(async () => {
   trace.mark("electron.app.ready");
@@ -56,9 +87,10 @@ app.on("window-all-closed", () => {
 // transport. The renderer names the target session so a message always lands in
 // the conversation it was typed into, even if several are running at once.
 ipcMain.handle("nav:send-message", async (_event, request) => {
+  const backendUrl = requireBackendUrl();
   const { sessionId: targetSessionId, text } = request ?? {};
-  if (!backendUrl || !targetSessionId || !text) {
-    throw new Error("chat session is not ready");
+  if (!targetSessionId || !text) {
+    throw new Error(NOT_READY_ERROR);
   }
   await sendRpc({
     backendUrl,
@@ -68,8 +100,9 @@ ipcMain.handle("nav:send-message", async (_event, request) => {
 });
 
 ipcMain.handle("nav:stop", async (_event, requestedSessionId) => {
-  if (!backendUrl || !requestedSessionId) {
-    throw new Error("chat session is not ready");
+  const backendUrl = requireBackendUrl();
+  if (!requestedSessionId) {
+    throw new Error(NOT_READY_ERROR);
   }
   const response = await sendRpc({
     backendUrl,
@@ -80,17 +113,13 @@ ipcMain.handle("nav:stop", async (_event, requestedSessionId) => {
 });
 
 ipcMain.handle("nav:list-sessions", async () => {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
   const response = await sendRpc({ backendUrl, method: "session.list" });
   return response.result.sessions;
 });
 
 ipcMain.handle("nav:model-info", async (_event, requestedSessionId) => {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
   const response = await sendRpc({
     backendUrl,
     method: "session.modelInfo",
@@ -100,9 +129,7 @@ ipcMain.handle("nav:model-info", async (_event, requestedSessionId) => {
 });
 
 ipcMain.handle("nav:model-list", async () => {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
   const response = await sendRpc({
     backendUrl,
     method: "session.models",
@@ -111,9 +138,7 @@ ipcMain.handle("nav:model-list", async () => {
 });
 
 ipcMain.handle("nav:switch-model", async (_event, request) => {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
   const response = await sendRpc({
     backendUrl,
     method: "session.switchModel",
@@ -122,26 +147,19 @@ ipcMain.handle("nav:switch-model", async (_event, request) => {
   return response.result.modelInfo;
 });
 
-ipcMain.handle("nav:switch-thinking", async (_event, thinkingLevel) => {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+ipcMain.handle("nav:switch-thinking", async (_event, request) => {
+  const backendUrl = requireBackendUrl();
   const response = await sendRpc({
     backendUrl,
     method: "session.switchThinking",
-    params: { thinkingLevel },
+    params: request,
   });
   return response.result.modelInfo;
 });
 
 ipcMain.handle("nav:session-stacks", async (_event, requestedSessionId) => {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
-  const targetSessionId = requestedSessionId || sessionId;
-  if (!targetSessionId) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
+  const targetSessionId = requireActiveSessionId(requestedSessionId);
   const response = await sendRpc({
     backendUrl,
     method: "session.stacks",
@@ -153,13 +171,8 @@ ipcMain.handle("nav:session-stacks", async (_event, requestedSessionId) => {
 ipcMain.handle(
   "nav:session-stack-availability",
   async (_event, requestedSessionId) => {
-    if (!backendUrl) {
-      throw new Error("chat session is not ready");
-    }
-    const targetSessionId = requestedSessionId || sessionId;
-    if (!targetSessionId) {
-      throw new Error("chat session is not ready");
-    }
+    const backendUrl = requireBackendUrl();
+    const targetSessionId = requireActiveSessionId(requestedSessionId);
     const response = await sendRpc({
       backendUrl,
       method: "session.stackAvailability",
@@ -170,9 +183,7 @@ ipcMain.handle(
 );
 
 ipcMain.handle("nav:switch-session", async (_event, id) => {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
   await sendRpc({
     backendUrl,
     method: "session.resume",
@@ -182,9 +193,8 @@ ipcMain.handle("nav:switch-session", async (_event, id) => {
 });
 
 ipcMain.handle("nav:create-project", async (_event, request) => {
-  if (!backendUrl || !mainWindow) {
-    throw new Error("chat session is not ready");
-  }
+  requireBackendUrl();
+  const mainWindow = requireMainWindow();
   const { mode: requestedMode } = normalizeNewSessionRequest(request);
   const selection = await dialog.showOpenDialog(mainWindow, {
     title: "Add Project",
@@ -208,9 +218,7 @@ ipcMain.handle("nav:create-project", async (_event, request) => {
 });
 
 ipcMain.handle("nav:new-session", async (_event, request) => {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  requireBackendUrl();
   const { cwd, mode: requestedMode } = normalizeNewSessionRequest(request);
   const mode = requestedMode ?? "local";
   const createdSessionId = await createBackendSession(cwd, mode);
@@ -493,9 +501,7 @@ async function createBackendSession(
   cwd: string | null,
   mode: SessionMode,
 ): Promise<string> {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
   const params = cwd ? { cwd, mode } : { mode };
   const created = await sendRpc({
     backendUrl,
@@ -536,9 +542,7 @@ async function findExistingProjectSession(
   workspaceRoot: string,
   mode: SessionMode,
 ): Promise<string | null> {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
   const response = await sendRpc({
     backendUrl,
     method: "session.list",
@@ -628,9 +632,7 @@ function stopBackend(): void {
 }
 
 async function tracedRpc(method: string, params?: unknown) {
-  if (!backendUrl) {
-    throw new Error("chat session is not ready");
-  }
+  const backendUrl = requireBackendUrl();
   trace.mark(`electron.rpc.${method}.start`);
   try {
     const response = await sendRpc({ backendUrl, method, params });

@@ -132,11 +132,12 @@ export type NavApi = {
   modelInfo(sessionId?: string): Promise<ModelInfo>;
   modelList(): Promise<ModelOption[]>;
   switchModel(
+    sessionId: string,
     provider: string,
     model: string,
     thinkingLevel?: string | null,
   ): Promise<ModelInfo>;
-  switchThinking(thinkingLevel: string): Promise<ModelInfo>;
+  switchThinking(sessionId: string, thinkingLevel: string): Promise<ModelInfo>;
   sessionStacks(sessionId?: string): Promise<SessionStacksResult>;
   sessionStackAvailability(
     sessionId?: string,

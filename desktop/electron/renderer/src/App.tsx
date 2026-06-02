@@ -637,12 +637,13 @@ export default function App() {
   const switchModel = useCallback(
     async (option: ModelOption) => {
       const sessionId = activeSessionIdRef.current;
-      if (!connectedRef.current || !window.nav || !option) {
+      if (!connectedRef.current || !window.nav || !option || !sessionId) {
         return;
       }
       setModelSwitching(true);
       try {
         const info = await window.nav.switchModel(
+          sessionId,
           option.provider,
           option.model,
         );
@@ -660,12 +661,12 @@ export default function App() {
   const switchThinking = useCallback(
     async (level: string) => {
       const sessionId = activeSessionIdRef.current;
-      if (!connectedRef.current || !window.nav || !level) {
+      if (!connectedRef.current || !window.nav || !level || !sessionId) {
         return;
       }
       setModelSwitching(true);
       try {
-        const info = await window.nav.switchThinking(level);
+        const info = await window.nav.switchThinking(sessionId, level);
         setSessionModelInfo(sessionId, info ?? null);
         await refreshModelInfo(sessionId);
       } catch (error) {

@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::lock::LockExt;
 use crate::stacks::ModelCallStack;
 
 pub const DEFAULT_STACKS_MAX_BYTES: u64 = 800 * 1024 * 1024;
@@ -124,7 +125,7 @@ impl StackStore {
             )));
         }
 
-        let _guard = self.writer.lock().unwrap();
+        let _guard = self.writer.lock_recover();
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }

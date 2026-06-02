@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 mod agent;
 mod config;
 mod context;
+mod lock;
 pub mod logging;
 mod model;
 mod session;
@@ -209,6 +210,10 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                     "cannot switch model while NAV_MOCK_MODEL is set",
                 );
             }
+            let session_id = match requested_session_id(&request, "session.switchModel") {
+                Ok(session_id) => session_id,
+                Err(message) => return write_rpc_error(stream, &id, &message),
+            };
             let (provider, model) = match requested_model(&request, "session.switchModel") {
                 Ok(model) => model,
                 Err(message) => return write_rpc_error(stream, &id, &message),
@@ -216,12 +221,18 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
             let requested_thinking =
                 match requested_optional_thinking_level(&request, "session.switchModel") {
                     Ok(Some(level)) => Some(level),
-                    Ok(None) => store.active_thinking_level(),
+                    Ok(None) => store.active_thinking_level(&session_id),
                     Err(message) => return write_rpc_error(stream, &id, &message),
                 };
-            match switch_configured_model(store, &provider, &model, requested_thinking.as_deref()) {
+            match switch_configured_model(
+                store,
+                &session_id,
+                &provider,
+                &model,
+                requested_thinking.as_deref(),
+            ) {
                 Ok(info) => write_rpc_result(stream, &id, json!({ "modelInfo": info })),
-                Err(error) => write_rpc_error(stream, &id, &error.to_string()),
+                Err(message) => write_rpc_error(stream, &id, &message),
             }
         }
         Some("session.switchThinking") => {
@@ -232,17 +243,27 @@ fn handle_rpc(stream: &mut TcpStream, store: &Arc<SessionStore>, body: &str) -> 
                     "cannot switch thinking while NAV_MOCK_MODEL is set",
                 );
             }
+            let session_id = match requested_session_id(&request, "session.switchThinking") {
+                Ok(session_id) => session_id,
+                Err(message) => return write_rpc_error(stream, &id, &message),
+            };
             let thinking_level =
                 match requested_required_thinking_level(&request, "session.switchThinking") {
                     Ok(level) => level,
                     Err(message) => return write_rpc_error(stream, &id, &message),
                 };
-            let Some((provider, model)) = store.active_model_ref() else {
+            let Some((provider, model)) = store.active_model_ref(&session_id) else {
                 return write_rpc_error(stream, &id, "no configured model is active");
             };
-            match switch_configured_model(store, &provider, &model, Some(&thinking_level)) {
+            match switch_configured_model(
+                store,
+                &session_id,
+                &provider,
+                &model,
+                Some(&thinking_level),
+            ) {
                 Ok(info) => write_rpc_result(stream, &id, json!({ "modelInfo": info })),
-                Err(error) => write_rpc_error(stream, &id, &error.to_string()),
+                Err(message) => write_rpc_error(stream, &id, &message),
             }
         }
         Some("session.list") => {
@@ -358,13 +379,17 @@ enum SessionMode {
 
 fn switch_configured_model(
     store: &SessionStore,
+    session_id: &str,
     provider: &str,
     model: &str,
     thinking_level: Option<&str>,
-) -> Result<ModelInfo, ConfigError> {
-    let config = resolve_default_model_config_with_thinking(provider, model, thinking_level)?;
+) -> Result<ModelInfo, String> {
+    let config = resolve_default_model_config_with_thinking(provider, model, thinking_level)
+        .map_err(|error| error.to_string())?;
     let choice = ModelChoice::OpenAi(Box::new(OpenAiConfig::from(config)));
-    Ok(store.switch_model(choice))
+    store
+        .switch_model(session_id, choice)
+        .ok_or_else(|| "unknown session".to_owned())
 }
 
 fn create_session_with_options(
@@ -434,6 +459,19 @@ fn requested_workspace(request: &Value, method: &str) -> Result<Option<PathBuf>,
         return Err(format!("{method} cwd must be a directory"));
     }
     Ok(Some(canonical))
+}
+
+fn requested_session_id(request: &Value, method: &str) -> Result<String, String> {
+    let session_id = request
+        .get("params")
+        .and_then(|params| params.get("sessionId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{method} requires sessionId"))?;
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err(format!("{method} sessionId must not be empty"));
+    }
+    Ok(session_id.to_owned())
 }
 
 fn requested_model(request: &Value, method: &str) -> Result<(String, String), String> {

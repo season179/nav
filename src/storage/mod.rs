@@ -17,6 +17,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::context::TurnHistory;
+use crate::lock::LockExt;
 use crate::model::{ChatMessage, ResponseReasoningItem, ToolCall};
 use crate::tokens::TokenUsage;
 
@@ -102,7 +103,7 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let now = now_ms();
         let workspace_root = workspace_root_string(workspace_root);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         conn.execute(
             "INSERT INTO sessions (id, source, workspace_root, settings_json, version, created_at, updated_at)
              VALUES (?1, ?2, ?3, '{}', ?4, ?5, ?5)",
@@ -119,7 +120,7 @@ impl Storage {
 
     /// Open a run for one chat turn (status `running`).
     pub fn start_run(&self, run_id: &str, session_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         conn.execute(
             "INSERT INTO runs (id, session_id, status, trigger, started_at)
              VALUES (?1, ?2, 'running', 'session.sendMessage', ?3)",
@@ -299,7 +300,7 @@ impl Storage {
 
     /// Mark a run completed.
     pub fn complete_run(&self, run_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         conn.execute(
             "UPDATE runs SET status = 'completed', finished_at = ?2 WHERE id = ?1",
             params![run_id, now_ms()],
@@ -310,7 +311,7 @@ impl Storage {
     /// Mark a run failed, recording the error message.
     pub fn fail_run(&self, run_id: &str, error: &str) -> Result<(), StorageError> {
         let error_json = serde_json::json!({ "message": error }).to_string();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         conn.execute(
             "UPDATE runs SET status = 'failed', finished_at = ?2, error_json = ?3 WHERE id = ?1",
             params![run_id, now_ms(), error_json],
@@ -320,7 +321,7 @@ impl Storage {
 
     /// Mark a run cancelled after a user-requested stop.
     pub fn cancel_run(&self, run_id: &str) -> Result<(), StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         conn.execute(
             "UPDATE runs SET status = 'cancelled', finished_at = ?2 WHERE id = ?1",
             params![run_id, now_ms()],
@@ -338,7 +339,7 @@ impl Storage {
         session_id: &str,
         usage: &TokenUsage,
     ) -> Result<(), StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         conn.execute(
             "UPDATE sessions
              SET tokens_input = tokens_input + ?2,
@@ -363,7 +364,7 @@ impl Storage {
     /// the sidebar. `title` is the session's first user message (callers
     /// truncate and supply a fallback for empty sessions).
     pub fn list_sessions(&self, source: &str) -> Result<Vec<SessionSummary>, StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         // The title reads from the derived `turn_parts_text` table (kept in sync
         // by triggers) rather than scanning `turn_parts` and json_extract-ing
         // each row: its `idx_turn_parts_text_turn_id` index turns the per-session
@@ -407,7 +408,7 @@ impl Storage {
     /// The id of the most recently active session from `source`, if any. Used
     /// to reopen the last conversation when the app restarts.
     pub fn most_recent_session(&self, source: &str) -> Result<Option<String>, StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         Ok(conn
             .query_row(
                 "SELECT id FROM sessions WHERE source = ?1
@@ -426,7 +427,7 @@ impl Storage {
         workspace_root: &Path,
     ) -> Result<Option<String>, StorageError> {
         let workspace_root = workspace_root_string(Some(workspace_root)).unwrap_or_default();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         Ok(conn
             .query_row(
                 "SELECT id FROM sessions
@@ -444,7 +445,7 @@ impl Storage {
 
     /// Whether a session with this id is already persisted.
     pub fn session_exists(&self, session_id: &str) -> Result<bool, StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         Ok(conn
             .query_row(
                 "SELECT 1 FROM sessions WHERE id = ?1",
@@ -457,7 +458,7 @@ impl Storage {
 
     /// The workspace root recorded for a persisted session, if any.
     pub fn session_workspace_root(&self, session_id: &str) -> Result<Option<String>, StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         Ok(conn
             .query_row(
                 "SELECT workspace_root FROM sessions WHERE id = ?1",
@@ -480,7 +481,7 @@ impl Storage {
     /// by run start then sequence (run id as a stable tiebreaker), and a turn's
     /// parts by creation, so the rebuilt Turn History matches what was recorded.
     pub fn load_history(&self, session_id: &str) -> Result<TurnHistory, StorageError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         let mut stmt = conn.prepare(
             "SELECT t.id, t.role, tp.type, tp.data_json
              FROM turns t
@@ -527,7 +528,7 @@ impl Storage {
         let turn_id = new_id();
         let now = now_ms();
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock_recover();
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO turns (id, run_id, seq, role, meta_json, created_at, model_id)

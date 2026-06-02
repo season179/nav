@@ -647,6 +647,7 @@ fn switching_model_during_a_run_affects_the_next_model_call() {
 
     first_model.wait_entered(1);
     store.replace_model(
+        &session_id,
         second_model.clone(),
         Some("second-model".to_owned()),
         model_info("Second model"),

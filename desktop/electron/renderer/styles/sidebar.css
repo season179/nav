@@ -1,0 +1,374 @@
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: var(--sidebar-bg);
+  box-shadow:
+    inset -1px 0 rgb(255 255 255 / 0.035),
+    12px 0 28px rgb(0 0 0 / 0.14);
+  -webkit-backdrop-filter: var(--sidebar-backdrop-filter);
+  backdrop-filter: var(--sidebar-backdrop-filter);
+}
+
+.sidebar-header {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: var(--window-chrome-height) 16px 16px;
+  -webkit-app-region: drag;
+}
+
+.new-chat {
+  padding: 10px 12px;
+  border: 1px solid var(--sidebar-glass-border);
+  border-radius: 12px;
+  background: var(--sidebar-glass-strong);
+  box-shadow: inset 0 1px rgb(255 255 255 / 0.05);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background 150ms ease-out,
+    border-color 150ms ease-out,
+    box-shadow 150ms ease-out;
+  -webkit-app-region: no-drag;
+}
+
+.new-chat:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: color-mix(in oklab, var(--surface-raised) 68%, transparent);
+  box-shadow: 0 8px 18px rgb(0 0 0 / 0.16);
+}
+
+.new-chat:focus-visible {
+  outline: none;
+  border-color: var(--active);
+  box-shadow: 0 0 0 2px var(--active-tint);
+}
+
+.new-chat:disabled {
+  border-color: var(--border);
+  color: var(--ink-faint);
+  cursor: not-allowed;
+}
+
+.sidebar-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.sidebar-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px 8px 16px;
+}
+
+.sidebar-section-title {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.project-add,
+.project-chat-add {
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-dim);
+  font-family: inherit;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 150ms ease-out,
+    border-color 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.project-add {
+  width: 26px;
+  height: 26px;
+  font-size: 16px;
+}
+
+.project-add:hover:not(:disabled),
+.project-chat-add:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--sidebar-glass);
+  color: var(--ink);
+}
+
+.project-add:focus-visible,
+.project-chat-add:focus-visible {
+  outline: none;
+  border-color: var(--active);
+  box-shadow: 0 0 0 2px var(--active-tint);
+}
+
+.project-add:disabled,
+.project-chat-add:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.project-add:disabled {
+  color: var(--ink-faint);
+}
+
+.session-list {
+  margin: 0;
+  padding: 0 10px 10px;
+  list-style: none;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.project-group {
+  margin: 0 0 8px;
+}
+
+.project-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 8px;
+  color: var(--ink-dim);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.project-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-toggle {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  min-width: 0;
+  padding: 3px 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-toggle:hover {
+  color: var(--ink);
+}
+
+.project-toggle:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--active-tint);
+}
+
+.project-disclosure {
+  flex: 0 0 9px;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  text-align: center;
+}
+
+.project-icon {
+  position: relative;
+  flex: 0 0 auto;
+  width: 14px;
+  height: 11px;
+  border: 1px solid currentcolor;
+  border-radius: 2px;
+  opacity: 0.85;
+}
+
+.project-icon::before {
+  position: absolute;
+  top: -4px;
+  left: 1px;
+  width: 7px;
+  height: 4px;
+  border: 1px solid currentcolor;
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+  content: "";
+}
+
+.project-title {
+  display: grid;
+  min-width: 0;
+}
+
+.project-name,
+.project-path-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-path-hint {
+  color: var(--ink-faint);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.project-chat-add {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border-color: transparent;
+  color: var(--ink-faint);
+  font-size: 14px;
+}
+
+.project-session-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+  min-width: 0;
+  margin: 0 0 0 20px;
+  padding: 0;
+  list-style: none;
+}
+
+.project-session-list > li {
+  min-width: 0;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.session-item-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A small pulsing dot marks a session whose run is still in flight, including
+   sessions working in the background while another is on screen. A steady
+   green dot marks a background session that completed and needs attention. */
+.session-running,
+.project-running,
+.session-toolbar-running,
+.session-attention,
+.project-attention {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--active);
+}
+
+.session-running,
+.project-running,
+.session-toolbar-running {
+  animation: tool-pulse 1.4s ease-in-out infinite;
+}
+
+.session-attention,
+.project-attention {
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--active) 48%, transparent);
+}
+
+.session-toolbar-running {
+  display: inline-block;
+  margin-left: 8px;
+}
+
+.session-item:hover {
+  background: var(--sidebar-glass);
+  color: var(--ink);
+}
+
+.session-item[aria-current="true"] {
+  border-color: var(--active-border);
+  background: var(--active-tint);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.project-session-toggle {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-faint);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 150ms ease-out,
+    color 150ms ease-out;
+}
+
+.project-session-toggle:hover {
+  background: var(--sidebar-glass);
+  color: var(--ink-dim);
+}
+
+.project-session-toggle:focus-visible {
+  outline: none;
+  border-color: var(--active);
+  box-shadow: 0 0 0 2px var(--active-tint);
+}
+
+.sidebar-empty {
+  padding: 4px 16px;
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.sidebar-footer {
+  border-top: 1px solid var(--border);
+  background: linear-gradient(0deg, var(--sidebar-glass), transparent);
+  -webkit-backdrop-filter: var(--sidebar-backdrop-filter);
+  backdrop-filter: var(--sidebar-backdrop-filter);
+}

@@ -106,6 +106,7 @@ fn replacing_the_model_updates_later_turns_and_metadata() {
 
     store.send_message(&session_id, "hello").unwrap();
     store.replace_model(
+        &session_id,
         second_model,
         Some("second-model".to_owned()),
         model_info("Second model"),
@@ -121,7 +122,40 @@ fn replacing_the_model_updates_later_turns_and_metadata() {
         events.iter().any(|event| event.kind == "message.completed"
             && event.text.as_deref() == Some("second reply"))
     );
-    assert_eq!(store.model_info(None).label, "Second model");
+    assert_eq!(store.model_info(Some(&session_id)).label, "Second model");
+}
+
+#[test]
+fn switching_one_session_model_leaves_other_sessions_untouched() {
+    let store = SessionStore::new(Arc::new(StaticModel("default reply")))
+        .with_model_info(model_info("Default model"));
+    let first = store.create_session();
+    let second = store.create_session();
+
+    store.replace_model(
+        &first,
+        Arc::new(StaticModel("switched reply")),
+        Some("switched-model".to_owned()),
+        model_info("Switched model"),
+    );
+
+    // Only the switched session reports the new model; the other session and the
+    // store-wide default new sessions start from are untouched.
+    assert_eq!(store.model_info(Some(&first)).label, "Switched model");
+    assert_eq!(store.model_info(Some(&second)).label, "Default model");
+    assert_eq!(store.model_info(None).label, "Default model");
+
+    // Each session also calls its own model on its next run.
+    store.send_message(&first, "hi").unwrap();
+    store.send_message(&second, "hi").unwrap();
+    let replied =
+        |session_id: &str, reply: &str| {
+            store.events(session_id).unwrap().iter().any(|event| {
+                event.kind == "message.completed" && event.text.as_deref() == Some(reply)
+            })
+        };
+    assert!(replied(&first, "switched reply"));
+    assert!(replied(&second, "default reply"));
 }
 
 #[test]
@@ -136,6 +170,7 @@ fn replacing_the_model_updates_the_persisted_assistant_model_id() {
 
     store.send_message(&session_id, "hello").unwrap();
     store.replace_model(
+        &session_id,
         Arc::new(StaticModel("second reply")),
         Some("second-model".to_owned()),
         model_info("Second model"),

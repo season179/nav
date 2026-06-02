@@ -121,13 +121,21 @@ contextBridge.exposeInMainWorld("nav", {
   modelList() {
     return ipcRenderer.invoke("nav:model-list");
   },
-  // Switch the active backend model to a configured provider/model pair.
-  switchModel(provider: unknown, model: unknown, thinkingLevel: unknown) {
+  // Switch one session's model to a configured provider/model pair. The target
+  // session is validated here so Main only ever sees a clean payload.
+  switchModel(
+    sessionId: unknown,
+    provider: unknown,
+    model: unknown,
+    thinkingLevel: unknown,
+  ) {
     const request: {
+      sessionId: string;
       provider: string;
       model: string;
       thinkingLevel?: string;
     } = {
+      sessionId: normalizeSessionId(sessionId),
       provider: normalizeModelProvider(provider),
       model: normalizeModelId(model),
     };
@@ -137,12 +145,12 @@ contextBridge.exposeInMainWorld("nav", {
     }
     return ipcRenderer.invoke("nav:switch-model", request);
   },
-  // Switch only the active model's thinking level.
-  switchThinking(thinkingLevel: unknown) {
-    return ipcRenderer.invoke(
-      "nav:switch-thinking",
-      normalizeThinkingLevel(thinkingLevel),
-    );
+  // Switch only one session's thinking level.
+  switchThinking(sessionId: unknown, thinkingLevel: unknown) {
+    return ipcRenderer.invoke("nav:switch-thinking", {
+      sessionId: normalizeSessionId(sessionId),
+      thinkingLevel: normalizeThinkingLevel(thinkingLevel),
+    });
   },
   // Debug context stacks captured for a session's model calls.
   sessionStacks(sessionId: unknown) {

@@ -15,8 +15,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::agent::{Agent, AgentRunError, AgentRunSink, RunStop, TurnContinuation};
+use crate::agent::{
+    ActiveModel, Agent, AgentRunError, AgentRunSink, RunStop, SharedModel, TurnContinuation,
+};
 use crate::context::{ContextAssembler, TurnHistory};
+use crate::lock::{LockExt, RwLockExt};
 use crate::model::{
     ChatMessage, ChatModel, ModelChoice, ModelInfo, ResponseReasoningItem, Role, ToolCall,
 };
@@ -91,6 +94,11 @@ struct Session {
     active_run: Option<ActiveRun>,
     /// Latest model-call context usage for this session.
     token_usage: Option<u64>,
+    /// The model this session calls. Shared with its in-flight run so a switch
+    /// can land mid-run, and independent of every other session's model.
+    model: SharedModel,
+    /// Renderer-facing metadata for this session's model (shown in the composer).
+    model_info: ModelInfo,
 }
 
 /// The run currently executing in a session.
@@ -106,7 +114,7 @@ struct ActiveRun {
 }
 
 impl Session {
-    fn new(id: String, workspace: PathBuf) -> Self {
+    fn new(id: String, workspace: PathBuf, model: ActiveModel, model_info: ModelInfo) -> Self {
         Self {
             id,
             workspace,
@@ -116,6 +124,8 @@ impl Session {
             next_stack_sequence: 0,
             active_run: None,
             token_usage: None,
+            model: Arc::new(RwLock::new(model)),
+            model_info,
         }
     }
 
@@ -176,19 +186,23 @@ pub struct SessionStore {
     context_assembler: ContextAssembler,
     storage: Option<Arc<Storage>>,
     stack_store: Option<Arc<StackStore>>,
-    /// Renderer-facing model metadata shown in the app's composer.
-    model_info: RwLock<ModelInfo>,
+    /// The model new (and resumed) sessions start with; each session then owns
+    /// and switches its own copy. Fixed once construction finishes.
+    default_model: ActiveModel,
+    /// Renderer-facing metadata matching `default_model`.
+    default_model_info: ModelInfo,
 }
 
 impl SessionStore {
     pub fn new(model: Arc<dyn ChatModel>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            agent: Agent::new(model),
+            agent: Agent::new(),
             context_assembler: ContextAssembler::new(),
             storage: None,
             stack_store: None,
-            model_info: RwLock::new(ModelInfo {
+            default_model: ActiveModel::new(model, None),
+            default_model_info: ModelInfo {
                 label: "unknown model".to_owned(),
                 provider: None,
                 model: None,
@@ -196,7 +210,7 @@ impl SessionStore {
                 thinking_levels: Vec::new(),
                 context_window: None,
                 token_usage: None,
-            }),
+            },
         }
     }
 
@@ -213,77 +227,87 @@ impl SessionStore {
     }
 
     /// Record which model produced assistant replies (persisted on each turn).
-    pub fn with_model_id(self, model_id: Option<String>) -> Self {
-        self.agent.set_model_id(model_id);
+    pub fn with_model_id(mut self, model_id: Option<String>) -> Self {
+        self.default_model.model_id = model_id;
         self
     }
 
     /// Set renderer-facing model metadata surfaced to the UI.
     pub fn with_model_info(mut self, model_info: ModelInfo) -> Self {
-        *self.model_info.get_mut().unwrap() = model_info;
+        self.default_model_info = model_info;
         self
     }
 
-    /// Renderer-facing model metadata for the app's composer.
+    /// Renderer-facing model metadata for the app's composer. With a session id,
+    /// reports that session's model plus its latest token usage; without one,
+    /// reports the default that new sessions start from.
     pub fn model_info(&self, session_id: Option<&str>) -> ModelInfo {
-        let used_tokens = session_id.and_then(|session_id| self.token_usage(session_id));
-        self.model_info
-            .read()
-            .unwrap()
-            .with_used_tokens(used_tokens)
+        match session_id {
+            Some(session_id) => self
+                .with_session(session_id, |session| {
+                    session
+                        .model_info
+                        .clone()
+                        .with_used_tokens(session.token_usage)
+                })
+                .unwrap_or_else(|_| self.default_model_info.with_used_tokens(None)),
+            None => self.default_model_info.with_used_tokens(None),
+        }
     }
 
-    /// Active configured provider/model ids, when the current model came from
+    /// A session's configured provider/model ids, when its model came from
     /// settings rather than the mock or environment-only fallback.
-    pub fn active_model_ref(&self) -> Option<(String, String)> {
-        let info = self.model_info.read().unwrap();
-        Some((info.provider.clone()?, info.model.clone()?))
+    pub fn active_model_ref(&self, session_id: &str) -> Option<(String, String)> {
+        self.with_session(session_id, |session| {
+            Some((
+                session.model_info.provider.clone()?,
+                session.model_info.model.clone()?,
+            ))
+        })
+        .ok()
+        .flatten()
     }
 
-    /// Current visible thinking level for preserving the user's choice across
-    /// model switches.
-    pub fn active_thinking_level(&self) -> Option<String> {
-        self.model_info.read().unwrap().thinking.clone()
+    /// A session's visible thinking level, for preserving the user's choice
+    /// across model switches.
+    pub fn active_thinking_level(&self, session_id: &str) -> Option<String> {
+        self.with_session(session_id, |session| session.model_info.thinking.clone())
+            .ok()
+            .flatten()
     }
 
-    /// Replace the active model used for future model calls.
+    /// Replace one session's active model, returning whether the session existed.
     ///
-    /// A call already in flight keeps the model it started with. Multi-call runs
-    /// (for example, after tool results) read this active handle before each
-    /// next provider request, so a switch can affect the same run's next model
-    /// call.
+    /// A call already in flight keeps the model it started with for that call,
+    /// but a multi-call run reads the session's model before each next provider
+    /// request, so a switch can affect the same run's next model call.
     pub fn replace_model(
         &self,
+        session_id: &str,
         model: Arc<dyn ChatModel>,
         model_id: Option<String>,
         model_info: ModelInfo,
-    ) {
-        self.agent.set_model(model, model_id);
-        *self.model_info.write().unwrap() = model_info;
-        self.clear_token_usage();
+    ) -> bool {
+        self.with_session(session_id, |session| {
+            *session.model.write_recover() = ActiveModel::new(model, model_id);
+            session.model_info = model_info;
+            session.token_usage = None;
+        })
+        .is_ok()
     }
 
-    /// Replace the active model from a resolved choice and return the metadata
-    /// now shown to the renderer.
-    pub fn switch_model(&self, choice: ModelChoice) -> ModelInfo {
+    /// Switch one session's model from a resolved choice, returning the metadata
+    /// now shown to the renderer, or `None` if the session is unknown.
+    pub fn switch_model(&self, session_id: &str, choice: ModelChoice) -> Option<ModelInfo> {
         let model_id = choice.model_id();
         let model_info = choice.info();
-        self.replace_model(choice.into_model(), model_id, model_info.clone());
-        model_info
-    }
-
-    fn token_usage(&self, session_id: &str) -> Option<u64> {
-        self.sessions
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .and_then(|session| session.token_usage)
-    }
-
-    fn clear_token_usage(&self) {
-        for session in self.sessions.lock().unwrap().values_mut() {
-            session.token_usage = None;
-        }
+        self.replace_model(
+            session_id,
+            choice.into_model(),
+            model_id,
+            model_info.clone(),
+        )
+        .then_some(model_info)
     }
 
     /// Override the toolset offered to the model (defaults to the coding tools).
@@ -312,7 +336,12 @@ impl SessionStore {
     /// event.
     pub fn create_session_in_workspace(&self, workspace: PathBuf) -> String {
         let session_id = new_id();
-        let mut session = Session::new(session_id.clone(), workspace);
+        let mut session = Session::new(
+            session_id.clone(),
+            workspace,
+            self.default_model.clone(),
+            self.default_model_info.clone(),
+        );
         session.emit("session.created", |_| {});
 
         if let Some(storage) = &self.storage {
@@ -327,8 +356,7 @@ impl SessionStore {
         }
 
         self.sessions
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(session_id.clone(), session);
         session_id
     }
@@ -345,7 +373,7 @@ impl SessionStore {
     /// success. Returns `false` when the session cannot be found in storage (or
     /// no storage is attached).
     pub fn resume_session(&self, session_id: &str) -> bool {
-        if self.sessions.lock().unwrap().contains_key(session_id) {
+        if self.sessions.lock_recover().contains_key(session_id) {
             return true;
         }
 
@@ -375,7 +403,12 @@ impl SessionStore {
                 return false;
             }
         };
-        let mut session = Session::new(session_id.to_owned(), workspace);
+        let mut session = Session::new(
+            session_id.to_owned(),
+            workspace,
+            self.default_model.clone(),
+            self.default_model_info.clone(),
+        );
         session.emit("session.created", |_| {});
         // A tool line is rendered by its name, but a stored tool result carries
         // only the id it answers — remember each call's name from the requesting
@@ -438,8 +471,7 @@ impl SessionStore {
         session.turns = history;
 
         self.sessions
-            .lock()
-            .unwrap()
+            .lock_recover()
             .insert(session_id.to_owned(), session);
         true
     }
@@ -512,11 +544,14 @@ impl SessionStore {
         // drain-or-finish decision both run under the store lock, so a message
         // either joins this run or (if it lands after the run finalizes) starts
         // a fresh one — it is never lost.
-        let (queued_onto, workspace) = self.with_session(session_id, |session| {
+        let (queued_onto, workspace, model) = self.with_session(session_id, |session| {
             let workspace = session.workspace.clone();
+            // Hand the run the session's own model handle so a switch lands on
+            // this session alone, and can take effect mid-run.
+            let model = Arc::clone(&session.model);
             if let Some(active) = session.active_run.as_mut() {
                 active.steer.push_back(text.to_owned());
-                return (Some(active.id.clone()), workspace);
+                return (Some(active.id.clone()), workspace, model);
             }
             session.turns.push(ChatMessage::user(text));
             // Register the run so `stop_run` can find its cancel flag and senders
@@ -533,7 +568,7 @@ impl SessionStore {
             session.emit("run.started", |event| {
                 event.run_id = Some(run_id.clone());
             });
-            (None, workspace)
+            (None, workspace, model)
         })?;
         if let Some(active_run_id) = queued_onto {
             // Folded into the in-flight run; nothing more to do on this thread.
@@ -564,7 +599,7 @@ impl SessionStore {
         };
         let outcome = self
             .agent
-            .run_turn(&run_id, context, &workspace, &cancel, &mut sink);
+            .run_turn(&run_id, context, &workspace, &model, &cancel, &mut sink);
         match outcome {
             // A completed run already finalized itself inside the loop
             // (`next_input_or_finish` cleared the run and emitted `run.completed`
@@ -649,7 +684,7 @@ impl SessionStore {
         session_id: &str,
         body: impl FnOnce(&mut Session) -> T,
     ) -> Result<T, SendError> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock_recover();
         let session = sessions
             .get_mut(session_id)
             .ok_or(SendError::UnknownSession)?;
@@ -660,7 +695,7 @@ impl SessionStore {
     /// events. Registering happens under the lock so no event slips between the
     /// backlog snapshot and the live subscription.
     pub fn subscribe(&self, session_id: &str) -> Option<Subscription> {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock_recover();
         let session = sessions.get_mut(session_id)?;
 
         let (sender, receiver) = mpsc::channel();
@@ -673,8 +708,7 @@ impl SessionStore {
     /// Snapshot of a session's event log, or `None` if it does not exist.
     pub fn events(&self, session_id: &str) -> Option<Vec<Event>> {
         self.sessions
-            .lock()
-            .unwrap()
+            .lock_recover()
             .get(session_id)
             .map(|session| session.events.clone())
     }
@@ -684,7 +718,7 @@ impl SessionStore {
     /// This is advisory. Records can still be trimmed between this check and the
     /// later `stacks` call; callers should handle an empty stack result.
     pub fn stack_availability(&self, session_id: &str) -> Option<StackAvailability> {
-        if !self.sessions.lock().unwrap().contains_key(session_id) {
+        if !self.sessions.lock_recover().contains_key(session_id) {
             return None;
         }
         match &self.stack_store {
@@ -701,7 +735,7 @@ impl SessionStore {
 
     /// Snapshot of the model-call stacks currently retained for a session.
     pub fn stacks(&self, session_id: &str) -> Option<StackQueryResult> {
-        if !self.sessions.lock().unwrap().contains_key(session_id) {
+        if !self.sessions.lock_recover().contains_key(session_id) {
             return None;
         }
         match &self.stack_store {

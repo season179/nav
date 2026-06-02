@@ -158,9 +158,17 @@ test("Electron backend client lists and switches configured models", async () =>
       },
     ]);
 
+    const created = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.create",
+    });
+    const sessionId = created.result.sessionId;
+    assert.ok(sessionId, "session.create returns a sessionId");
+
     const before = await sendRpc({
       backendUrl: backend.url,
       method: "session.modelInfo",
+      params: { sessionId },
     });
     assert.equal(before.result.label, "Default GPT");
     assert.equal(before.result.provider, "openai");
@@ -178,7 +186,7 @@ test("Electron backend client lists and switches configured models", async () =>
     const switched = await sendRpc({
       backendUrl: backend.url,
       method: "session.switchModel",
-      params: { provider: "local", model: "qwen-coder" },
+      params: { sessionId, provider: "local", model: "qwen-coder" },
     });
     assert.equal(switched.result.modelInfo.label, "Qwen Coder");
     assert.equal(switched.result.modelInfo.provider, "local");
@@ -193,7 +201,7 @@ test("Electron backend client lists and switches configured models", async () =>
     const thinkingOff = await sendRpc({
       backendUrl: backend.url,
       method: "session.switchThinking",
-      params: { thinkingLevel: "off" },
+      params: { sessionId, thinkingLevel: "off" },
     });
     assert.equal(thinkingOff.result.modelInfo.label, "Qwen Coder");
     assert.equal(thinkingOff.result.modelInfo.thinking, "off");
@@ -201,7 +209,7 @@ test("Electron backend client lists and switches configured models", async () =>
     const thinkingClamped = await sendRpc({
       backendUrl: backend.url,
       method: "session.switchThinking",
-      params: { thinkingLevel: "xhigh" },
+      params: { sessionId, thinkingLevel: "xhigh" },
     });
     assert.equal(thinkingClamped.result.modelInfo.label, "Qwen Coder");
     assert.equal(thinkingClamped.result.modelInfo.thinking, "medium");
@@ -209,11 +217,21 @@ test("Electron backend client lists and switches configured models", async () =>
     const after = await sendRpc({
       backendUrl: backend.url,
       method: "session.modelInfo",
+      params: { sessionId },
     });
     assert.equal(after.result.label, "Qwen Coder");
     assert.equal(after.result.provider, "local");
     assert.equal(after.result.model, "qwen-coder");
     assert.equal(after.result.thinking, "medium");
+
+    // The switch is scoped to this session: the default new sessions start
+    // from is untouched.
+    const untouchedDefault = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.modelInfo",
+    });
+    assert.equal(untouchedDefault.result.label, "Default GPT");
+    assert.equal(untouchedDefault.result.model, "gpt-default");
   } finally {
     backend.stop();
   }

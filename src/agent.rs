@@ -13,6 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::context::ModelContext;
+use crate::lock::RwLockExt;
 use crate::model::{
     ChatMessage, ChatModel, ModelError, ProviderCallTrace, ResponseReasoningItem, ToolCall,
 };
@@ -21,26 +22,34 @@ use crate::system_prompt::{self, BuildSystemPromptOptions};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
 
-/// Runs one coding-agent turn with a configured model, toolset, and workspace.
+/// Runs one coding-agent turn with a configured toolset and workspace. The model
+/// is owned per session and supplied to each run, not held here, so a switch in
+/// one session never affects another.
 pub(crate) struct Agent {
-    model: Arc<RwLock<ActiveModel>>,
     registry: Arc<Registry>,
     workspace: PathBuf,
 }
 
+/// The model a session calls, plus the id recorded on the turns it produces.
 #[derive(Clone)]
-struct ActiveModel {
-    model: Arc<dyn ChatModel>,
-    model_id: Option<String>,
+pub(crate) struct ActiveModel {
+    pub(crate) model: Arc<dyn ChatModel>,
+    pub(crate) model_id: Option<String>,
 }
 
+impl ActiveModel {
+    pub(crate) fn new(model: Arc<dyn ChatModel>, model_id: Option<String>) -> Self {
+        Self { model, model_id }
+    }
+}
+
+/// A session's active model, shared with its in-flight run so a switch can take
+/// effect before the run's next model call (the loop re-reads it each iteration).
+pub(crate) type SharedModel = Arc<RwLock<ActiveModel>>;
+
 impl Agent {
-    pub(crate) fn new(model: Arc<dyn ChatModel>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            model: Arc::new(RwLock::new(ActiveModel {
-                model,
-                model_id: None,
-            })),
             registry: Arc::new(Registry::coding()),
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
@@ -58,18 +67,6 @@ impl Agent {
 
     pub(crate) fn workspace(&self) -> &Path {
         &self.workspace
-    }
-
-    pub(crate) fn set_model(&self, model: Arc<dyn ChatModel>, model_id: Option<String>) {
-        *self.model.write().unwrap() = ActiveModel { model, model_id };
-    }
-
-    pub(crate) fn set_model_id(&self, model_id: Option<String>) {
-        self.model.write().unwrap().model_id = model_id;
-    }
-
-    fn active_model(&self) -> ActiveModel {
-        self.model.read().unwrap().clone()
     }
 
     /// Build the system prompt for this run from the toolset, workspace, and any
@@ -112,6 +109,7 @@ impl Agent {
         run_id: &str,
         mut context: ModelContext,
         workspace: &Path,
+        model: &SharedModel,
         cancel: &CancelFlag,
         sink: &mut S,
     ) -> Result<RunStop, AgentRunError<S::Error>>
@@ -128,7 +126,9 @@ impl Agent {
                 return Ok(RunStop::Cancelled);
             }
 
-            let active_model = self.active_model();
+            // Re-read the session's model each iteration so a switch made while
+            // the run is in flight takes effect on its next provider call.
+            let active_model = model.read_recover().clone();
             let started_at_ms = now_ms();
             let started = Instant::now();
             let traced = match active_model.model.respond_with_trace(&context, &tool_defs) {

@@ -29,9 +29,31 @@ test("sidebar uses a flat opaque base color", () => {
 });
 
 function readRendererStyles() {
-  return fs.readFileSync(
-    path.join(__dirname, "..", "desktop", "electron", "renderer", "styles.css"),
-    "utf8",
+  const entry = path.join(
+    __dirname,
+    "..",
+    "desktop",
+    "electron",
+    "renderer",
+    "styles.css",
+  );
+  return resolveCssImports(entry);
+}
+
+// styles.css is an @import manifest; the rules live in feature partials. Inline
+// the imports in order (mirroring how Vite bundles them) so assertions can match
+// a rule wherever it lives.
+function resolveCssImports(filePath: string, seen: Set<string> = new Set()) {
+  if (seen.has(filePath)) {
+    return "";
+  }
+  seen.add(filePath);
+  const source = fs.readFileSync(filePath, "utf8");
+  const dir = path.dirname(filePath);
+  return source.replace(
+    /@import\s+["']([^"']+)["'];?/g,
+    (_match: string, ref: string) =>
+      resolveCssImports(path.resolve(dir, ref), seen),
   );
 }
 
