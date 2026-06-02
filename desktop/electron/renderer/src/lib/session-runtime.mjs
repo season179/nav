@@ -154,7 +154,9 @@ export function reduceSessions(states, event) {
   }
   const current = states[sessionId] ?? createSessionState();
   const next = reduceSessionState(current, event);
-  if (next === current && states[sessionId]) {
+  // Nothing changed (an unrecognized or empty event): leave the map untouched,
+  // so a no-op event never inserts a phantom empty session.
+  if (next === current) {
     return states;
   }
   return { ...states, [sessionId]: next };

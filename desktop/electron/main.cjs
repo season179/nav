@@ -332,6 +332,12 @@ function ensureSubscription(
     },
     onError(error) {
       markStartup(startup, "electron.sse.error", { error: error.message });
+      // A stream can fire onError more than once (request and response paths),
+      // possibly after the session was re-subscribed. Only tear down the entry
+      // if it is still this exact subscription, never a newer replacement.
+      if (subscriptions.get(id) !== subscription) {
+        return;
+      }
       subscriptions.delete(id);
       // Name the session whose stream died so the renderer reports the error in
       // that conversation, not whichever one happens to be on screen.

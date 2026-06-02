@@ -157,6 +157,19 @@ test("events without a session id are ignored", async () => {
   );
 });
 
+test("an unrecognized event does not create a phantom session", async () => {
+  const { reduceSessions } = await loadSessionRuntime();
+
+  const states = {};
+  const next = reduceSessions(states, {
+    type: "unknown.event",
+    session_id: "a",
+  });
+
+  assert.equal(next, states, "no-op event returns the same map");
+  assert.deepEqual(Object.keys(next), [], "no empty session was inserted");
+});
+
 test("terminal run event helper matches the renderer's set", async () => {
   const { isTerminalRunEvent } = await loadSessionRuntime();
 
