@@ -95,66 +95,82 @@ export default function StacksPage({ onUnavailable, sessionId }) {
 }
 
 function StackCall({ stack }) {
+  const request = stack.request ?? {};
+  const response = stack.response ?? {};
+  const tokens = tokenSummary(response.tokenUsage);
+
   return (
     <li className={`stack-call stack-call-${stack.status}`}>
       <header className="stack-call-header">
         <div>
           <h2>Call {stack.sequence + 1}</h2>
           <p>
-            {stack.status} - {formatDuration(stack.durationMs)} -{" "}
+            {stack.status} · {formatDuration(stack.durationMs)} ·{" "}
             {formatTime(stack.startedAtMs)}
           </p>
         </div>
-        <span className="stack-run-id" title={stack.runId}>
-          {shortId(stack.runId)}
-        </span>
+        <div className="stack-call-meta">
+          {request.model ? (
+            <span className="stack-call-model">{request.model}</span>
+          ) : null}
+          {Number.isFinite(response.statusCode) ? (
+            <span className="stack-call-status-code">
+              HTTP {response.statusCode}
+            </span>
+          ) : null}
+          {tokens ? <span className="stack-call-tokens">{tokens}</span> : null}
+          <span className="stack-run-id" title={stack.runId}>
+            {shortId(stack.runId)}
+          </span>
+        </div>
       </header>
 
-      <ol className="stack-layer-list">
-        {stack.layers.map((layer, index) => (
-          <StackLayer
-            index={index}
-            key={`${stack.id}-${layer.kind}`}
-            layer={layer}
-          />
-        ))}
-      </ol>
+      <RequestSection request={request} />
+      <ResponseSection response={response} />
     </li>
   );
 }
 
-function StackLayer({ index, layer }) {
+function RequestSection({ request }) {
+  const hasBody = request.body !== undefined && request.body !== null;
+  const meta = [request.api, request.url].filter(Boolean).join(" · ");
+
   return (
-    <li className={`stack-layer stack-layer-${layer.status}`}>
-      <details open={defaultOpen(layer)}>
-        <summary>
-          <span className="stack-layer-index">
-            {String(index + 1).padStart(2, "0")}
-          </span>
-          <span className="stack-layer-title">{layer.title}</span>
-          <span className="stack-layer-status">{layer.status}</span>
-        </summary>
-        <p className="stack-layer-summary">{layer.summary}</p>
-        {layer.entries?.length ? <EntryGrid entries={layer.entries} /> : null}
-        {layer.text ? <pre className="stack-text">{layer.text}</pre> : null}
-        {layer.json !== undefined ? (
-          <pre className="stack-json">{stringifyJson(layer.json)}</pre>
+    <details className="stack-section stack-section-request" open>
+      <summary>
+        <span className="stack-section-title">Request</span>
+        {meta ? <span className="stack-section-meta">{meta}</span> : null}
+      </summary>
+      {hasBody ? (
+        <pre className="stack-json">{stringifyJson(request.body)}</pre>
+      ) : (
+        <p className="stack-section-empty">No request body captured.</p>
+      )}
+    </details>
+  );
+}
+
+function ResponseSection({ response }) {
+  const hasBody = response.body !== undefined && response.body !== null;
+
+  return (
+    <details className="stack-section stack-section-response" open>
+      <summary>
+        <span className="stack-section-title">Response</span>
+        {Number.isFinite(response.statusCode) ? (
+          <span className="stack-section-meta">HTTP {response.statusCode}</span>
         ) : null}
-      </details>
-    </li>
-  );
-}
-
-function EntryGrid({ entries }) {
-  return (
-    <dl className="stack-entry-grid">
-      {entries.map((entry) => (
-        <div key={`${entry.label}:${entry.value}`} className="stack-entry">
-          <dt>{entry.label}</dt>
-          <dd>{entry.value}</dd>
-        </div>
-      ))}
-    </dl>
+      </summary>
+      {response.error ? (
+        <pre className="stack-error-body">{response.error}</pre>
+      ) : null}
+      {hasBody ? (
+        <pre className="stack-json">{stringifyJson(response.body)}</pre>
+      ) : null}
+      {!hasBody && !response.error ? (
+        <p className="stack-section-empty">No response body captured.</p>
+      ) : null}
+    </details>
   );
 }
 
@@ -175,14 +191,21 @@ function emptyStackText(reason) {
   }
 }
 
-function defaultOpen(layer) {
-  return [
-    "system_prompt",
-    "session_history",
-    "provider_payload",
-    "normalized_response",
-    "carried_forward",
-  ].includes(layer.kind);
+function tokenSummary(usage) {
+  if (!usage || typeof usage !== "object") {
+    return "";
+  }
+  const parts = [];
+  if (Number.isFinite(usage.input)) {
+    parts.push(`${usage.input} in`);
+  }
+  if (Number.isFinite(usage.output)) {
+    parts.push(`${usage.output} out`);
+  }
+  if (Number.isFinite(usage.total)) {
+    parts.push(`${usage.total} total`);
+  }
+  return parts.join(" / ");
 }
 
 function stringifyJson(value) {

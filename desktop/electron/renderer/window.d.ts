@@ -71,15 +71,18 @@ declare global {
           status: string;
           startedAtMs: number;
           durationMs: number;
-          layers: Array<{
-            kind: string;
-            title: string;
-            status: string;
-            summary: string;
-            entries: Array<{ label: string; value: string }>;
-            text?: string;
-            json?: unknown;
-          }>;
+          request: {
+            api: string;
+            url: string;
+            model: string;
+            body?: unknown;
+          };
+          response: {
+            statusCode?: number;
+            body?: unknown;
+            error?: string;
+            tokenUsage?: unknown;
+          };
         }>;
         unavailableReason?: string;
       }>;

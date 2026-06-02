@@ -730,6 +730,38 @@ fn a_provider_failure_is_reported_without_leaking_the_key() {
 }
 
 #[test]
+fn a_provider_error_body_is_captured_in_the_trace() {
+    // The gpt-5.5 + tools failure mode: a 400 whose JSON body explains the
+    // rejection. The faithful record must keep that body, not just the status —
+    // that body is what makes the failure debuggable.
+    let (base_url, _requests) = fake_provider(
+        "400 Bad Request",
+        r#"{"error":{"message":"Invalid value for 'reasoning'","type":"invalid_request_error"}}"#,
+    );
+    let model = model(base_url);
+
+    let error = model
+        .respond_with_trace(&context(vec![ChatMessage::user("hi")]), &[])
+        .expect_err("a 400 response must surface as an error");
+
+    assert!(
+        error.message.contains("Invalid value for 'reasoning'"),
+        "the error detail should carry the provider's explanation: {}",
+        error.message
+    );
+    let trace = error
+        .provider_trace
+        .as_ref()
+        .expect("a failed call should still carry the provider trace");
+    assert_eq!(trace.status_code, Some(400));
+    let body = trace
+        .response_payload
+        .as_ref()
+        .expect("the provider error body should be captured");
+    assert_eq!(body["error"]["message"], "Invalid value for 'reasoning'");
+}
+
+#[test]
 fn a_malformed_response_is_reported() {
     let (base_url, _requests) = fake_provider("200 OK", r#"{"unexpected":"shape"}"#);
     let model = model(base_url);

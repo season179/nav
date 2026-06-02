@@ -52,7 +52,7 @@ pub use session::{Event, SendError, SessionStore, Subscription};
 pub use stack_store::{
     DEFAULT_STACKS_MAX_BYTES, StackAvailability, StackQueryResult, StackStore, StackStoreError,
 };
-pub use stacks::{ModelCallStack, StackEntry, StackLayer};
+pub use stacks::{ModelCallRequest, ModelCallResponse, ModelCallStack};
 pub use storage::{SessionSummary, Storage, StorageError};
 pub use system_prompt::{
     BuildSystemPromptOptions, ContextFile, build_system_prompt, load_project_context_files,

@@ -213,11 +213,11 @@ fn provider_token_usage_is_recorded_for_the_session() {
 }
 
 #[test]
-fn model_call_stacks_capture_context_response_and_carried_state() {
+fn model_call_stacks_capture_the_request_sent_and_the_response_received() {
     let path =
         std::env::temp_dir().join(format!("nav_session_stacks_{}.jsonl", uuid::Uuid::now_v7()));
     let stack_store = Arc::new(StackStore::open(&path, 1024 * 1024).expect("open stack store"));
-    let store = SessionStore::new(Arc::new(RecordingModel::new())).with_stack_store(stack_store);
+    let store = SessionStore::new(Arc::new(MockModel::new())).with_stack_store(stack_store);
     let session_id = store.create_session();
 
     store.send_message(&session_id, "show the stack").unwrap();
@@ -237,30 +237,25 @@ fn model_call_stacks_capture_context_response_and_carried_state() {
     assert_eq!(stack.status, "completed");
     assert_eq!(stack.run_id.len(), 36);
 
-    let layer = |kind: &str| {
-        stack
-            .layers
+    // The request body holds exactly what was sent: the system prompt leads, the
+    // user's message follows.
+    let request_body = stack.request.body.as_ref().expect("a captured request");
+    let messages = request_body["messages"].as_array().expect("messages array");
+    assert_eq!(messages[0]["role"], "system");
+    assert!(
+        messages
             .iter()
-            .find(|layer| layer.kind == kind)
-            .unwrap_or_else(|| panic!("missing stack layer {kind}"))
-    };
-    assert_eq!(layer("system_prompt").status, "available");
-    assert!(
-        layer("session_history").summary.contains("1 message(s)"),
-        "history layer should describe the request context: {:?}",
-        layer("session_history")
+            .any(|message| message["content"] == "show the stack"),
+        "request should carry the user message verbatim: {messages:?}"
     );
-    assert_eq!(layer("provider_payload").status, "unavailable");
+
+    // The response body holds what came back, with no captured error.
+    assert_eq!(stack.response.status_code, Some(200));
     assert!(
-        layer("normalized_response").summary.contains("stop finish"),
-        "normalized layer should include finish reason: {:?}",
-        layer("normalized_response")
+        stack.response.body.is_some(),
+        "a successful call should capture a response body"
     );
-    assert!(
-        layer("carried_forward").summary.contains("2 message(s)"),
-        "carried-forward layer should include user plus assistant state: {:?}",
-        layer("carried_forward")
-    );
+    assert_eq!(stack.response.error, None);
 
     let _ = std::fs::remove_file(path);
 }

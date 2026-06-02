@@ -805,7 +805,13 @@ impl ChatModel for OpenAiModel {
             body.clone(),
         );
 
+        // `http_status_as_error(false)` keeps ureq from collapsing a 4xx/5xx into
+        // a bare transport error, so the provider's error body stays readable and
+        // is captured into the trace below.
         let mut response = ureq::post(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .send_json(&body)
             .map_err(|error| {
@@ -813,13 +819,7 @@ impl ChatModel for OpenAiModel {
                 ModelError::new(message.clone())
                     .with_provider_trace(trace.clone().with_error(&message))
             })?;
-        trace.status_code = Some(response.status().as_u16());
-        trace.request_id = response
-            .headers()
-            .get("x-request-id")
-            .or_else(|| response.headers().get("request-id"))
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        capture_status_or_error(&mut response, &mut trace)?;
 
         let payload: Value = response.body_mut().read_json().map_err(|error| {
             let message = format!("could not read model response: {error}");
@@ -928,8 +928,14 @@ impl ChatModel for OpenAiResponsesModel {
             body.clone(),
         );
 
-        let mut request =
-            ureq::post(&url).header("Authorization", format!("Bearer {}", self.config.api_key));
+        // `http_status_as_error(false)` keeps ureq from collapsing a 4xx/5xx into
+        // a bare transport error, so the provider's error body stays readable and
+        // is captured into the trace below.
+        let mut request = ureq::post(&url)
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("Authorization", format!("Bearer {}", self.config.api_key));
         if streaming {
             request = request.header("Accept", "text/event-stream");
         }
@@ -944,13 +950,10 @@ impl ChatModel for OpenAiResponsesModel {
             let message = format!("model request failed: {error}");
             ModelError::new(message.clone()).with_provider_trace(trace.clone().with_error(&message))
         })?;
-        trace.status_code = Some(response.status().as_u16());
-        trace.request_id = response
-            .headers()
-            .get("x-request-id")
-            .or_else(|| response.headers().get("request-id"))
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
+        // A non-2xx never carries the SSE stream, even for the streaming Codex
+        // backend — it returns a JSON error body, which `capture_status_or_error`
+        // captures before we attempt to read the success payload below.
+        capture_status_or_error(&mut response, &mut trace)?;
 
         // Codex auth streams the response as SSE; every other Responses provider
         // returns one JSON body. Both reduce to a single payload value or an
@@ -996,6 +999,76 @@ impl ChatModel for OpenAiResponsesModel {
             self.token_counter.as_ref(),
         )
     }
+}
+
+/// Record the response status and request id onto the trace, then turn a non-2xx
+/// into a [`ModelError`] whose message carries the provider's error body (also
+/// captured onto the trace). Returns `Ok(())` on a 2xx so the caller proceeds to
+/// read the success payload. Shared by every HTTP adapter so status handling and
+/// error capture stay identical across providers.
+fn capture_status_or_error(
+    response: &mut ureq::http::Response<ureq::Body>,
+    trace: &mut ProviderCallTrace,
+) -> Result<(), ModelError> {
+    let status = response.status().as_u16();
+    trace.status_code = Some(status);
+    trace.request_id = response
+        .headers()
+        .get("x-request-id")
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let detail = capture_provider_error_body(response, trace);
+    let message = format!("model request failed: http status: {status}: {detail}");
+    Err(ModelError::new(message.clone()).with_provider_trace(trace.clone().with_error(&message)))
+}
+
+/// Read a non-2xx provider response body, store it on the trace (parsed as JSON
+/// when possible, otherwise as raw text), and return a short detail for the
+/// error message. Capturing the body is the point: the provider's explanation of
+/// *why* a call failed lives here, not in the status line.
+fn capture_provider_error_body(
+    response: &mut ureq::http::Response<ureq::Body>,
+    trace: &mut ProviderCallTrace,
+) -> String {
+    let text = response.body_mut().read_to_string().unwrap_or_default();
+    match serde_json::from_str::<Value>(&text) {
+        Ok(value) => {
+            let detail = extract_provider_error_message(&value).unwrap_or_else(|| text.clone());
+            trace.response_payload = Some(value);
+            detail
+        }
+        Err(_) => {
+            if !text.is_empty() {
+                trace.response_payload = Some(Value::String(text.clone()));
+            }
+            text
+        }
+    }
+}
+
+/// Pull the provider's human-facing error message out of a JSON error body,
+/// trying the common OpenAI-compatible shapes.
+fn extract_provider_error_message(value: &Value) -> Option<String> {
+    if let Some(message) = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        return Some(message.to_owned());
+    }
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Some(error.to_owned());
+    }
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 fn responses_reasoning_json(config: &OpenAiConfig) -> Option<Value> {
@@ -1586,8 +1659,17 @@ impl ChatModel for MockModel {
     fn respond(
         &self,
         context: &ModelContext,
-        _tools: &[ToolDef],
+        tools: &[ToolDef],
     ) -> Result<ModelResponse, ModelError> {
+        self.respond_with_trace(context, tools)
+            .map(|traced| traced.response)
+    }
+
+    fn respond_with_trace(
+        &self,
+        context: &ModelContext,
+        _tools: &[ToolDef],
+    ) -> Result<TracedModelResponse, ModelError> {
         let user_messages: Vec<&str> = context
             .messages()
             .iter()
@@ -1604,6 +1686,36 @@ impl ChatModel for MockModel {
             reply.push_str(&format!(". Earlier you said: \"{}\"", user_messages[0]));
         }
 
-        Ok(ModelResponse::text(reply))
+        // Build a representative request/response trace so the stack-capture path
+        // is exercised offline and in tests, mirroring the real adapters: the
+        // request body holds the system prompt and message history, the response
+        // body holds the assembled reply.
+        let mut messages: Vec<Value> = Vec::with_capacity(context.messages().len() + 1);
+        if let Some(system_prompt) = context.system_prompt() {
+            messages.push(json!({ "role": "system", "content": system_prompt }));
+        }
+        messages.extend(
+            context
+                .messages()
+                .iter()
+                .map(|message| message_json(message, false)),
+        );
+        let request_payload = json!({ "model": "mock", "messages": messages });
+
+        let mut trace = ProviderCallTrace::new(
+            "mock",
+            "mock://local".to_owned(),
+            "mock".to_owned(),
+            request_payload,
+        );
+        trace.status_code = Some(200);
+        trace.response_payload = Some(json!({
+            "output": [{ "role": "assistant", "content": reply }],
+        }));
+
+        Ok(TracedModelResponse {
+            response: ModelResponse::text(reply),
+            provider_trace: Some(trace),
+        })
     }
 }

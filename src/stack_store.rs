@@ -17,7 +17,9 @@ use uuid::Uuid;
 use crate::stacks::ModelCallStack;
 
 pub const DEFAULT_STACKS_MAX_BYTES: u64 = 800 * 1024 * 1024;
-const STACK_RECORD_SCHEMA_VERSION: u32 = 1;
+// v2: faithful per-turn request/response record (replaced the derived layered
+// view). Older v1 records are silently dropped on read.
+const STACK_RECORD_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub struct StackStoreError(String);

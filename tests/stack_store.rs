@@ -1,6 +1,7 @@
 use std::fs;
 
-use nav::{ModelCallStack, StackLayer, StackStore};
+use nav::{ModelCallRequest, ModelCallResponse, ModelCallStack, StackStore};
+use serde_json::json;
 
 fn stack(id: &str, sequence: u64) -> ModelCallStack {
     ModelCallStack {
@@ -10,15 +11,18 @@ fn stack(id: &str, sequence: u64) -> ModelCallStack {
         status: "completed".to_owned(),
         started_at_ms: sequence,
         duration_ms: 1.0,
-        layers: vec![StackLayer {
-            kind: "metadata".to_owned(),
-            title: "Metadata".to_owned(),
-            status: "available".to_owned(),
-            summary: format!("stack {id}"),
-            entries: Vec::new(),
-            text: None,
-            json: None,
-        }],
+        request: ModelCallRequest {
+            api: "mock".to_owned(),
+            url: "mock://local".to_owned(),
+            model: "mock".to_owned(),
+            body: Some(json!({ "messages": [{ "role": "user", "content": id }] })),
+        },
+        response: ModelCallResponse {
+            status_code: Some(200),
+            body: Some(json!({ "output": [{ "content": format!("reply {id}") }] })),
+            error: None,
+            token_usage: None,
+        },
     }
 }
 

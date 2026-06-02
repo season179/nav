@@ -14,12 +14,9 @@ use uuid::Uuid;
 
 use crate::context::ModelContext;
 use crate::model::{
-    ChatMessage, ChatModel, ModelError, ModelResponse, ProviderCallTrace, ResponseReasoningItem,
-    ToolCall, ToolDef,
+    ChatMessage, ChatModel, ModelError, ProviderCallTrace, ResponseReasoningItem, ToolCall,
 };
-use crate::stacks::{
-    ModelCallStack, ModelCallStackInput, SystemPromptTrace, build_model_call_stack,
-};
+use crate::stacks::{ModelCallStack, ModelCallStackInput, build_model_call_stack};
 use crate::system_prompt::{self, BuildSystemPromptOptions};
 use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
@@ -77,8 +74,9 @@ impl Agent {
 
     /// Build the system prompt for this run from the toolset, workspace, and any
     /// project context files. Rebuilt per run so the date and project context
-    /// stay current.
-    fn system_prompt(&self, workspace: &Path) -> SystemPromptTrace {
+    /// stay current. It rides ahead of the conversation and is captured verbatim
+    /// in the request body of every model-call record.
+    fn system_prompt(&self, workspace: &Path) -> String {
         let tool_snippets = self.registry.prompt_snippets();
         let prompt_guidelines = self.registry.prompt_guidelines();
         let selected_tools = self.registry.tool_names();
@@ -87,21 +85,14 @@ impl Agent {
             system_prompt::nav_agent_dir().as_deref(),
         );
         let date = system_prompt::current_date();
-        let prompt = system_prompt::build_system_prompt(&BuildSystemPromptOptions {
+        system_prompt::build_system_prompt(&BuildSystemPromptOptions {
             selected_tools: &selected_tools,
             tool_snippets: &tool_snippets,
             prompt_guidelines: &prompt_guidelines,
             cwd: workspace,
             context_files: &context_files,
             date: &date,
-        });
-        SystemPromptTrace {
-            prompt,
-            selected_tools,
-            context_files,
-            cwd: workspace.to_string_lossy().replace('\\', "/"),
-            date,
-        }
+        })
     }
 
     /// Run the model/tool loop from the assembled context for one Run.
@@ -128,9 +119,9 @@ impl Agent {
         S: AgentRunSink,
     {
         let tool_defs = self.registry.defs();
-        // Attach the system prompt once; it leads every model call this run.
-        let system_prompt = self.system_prompt(workspace);
-        context = context.with_system_prompt(system_prompt.prompt.clone());
+        // Attach the system prompt once; it leads every model call this run and
+        // is captured verbatim in each model-call record's request body.
+        context = context.with_system_prompt(self.system_prompt(workspace));
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -138,7 +129,6 @@ impl Agent {
             }
 
             let active_model = self.active_model();
-            let context_before = context.messages().to_vec();
             let started_at_ms = now_ms();
             let started = Instant::now();
             let traced = match active_model.model.respond_with_trace(&context, &tool_defs) {
@@ -149,19 +139,13 @@ impl Agent {
                         run_id,
                         started_at_ms,
                         duration_ms,
-                        system_prompt: &system_prompt,
-                        context_before: &context_before,
-                        tools: &tool_defs,
                     }
                     .record(
                         sink,
                         ModelCallStackOutcome {
                             status: "failed",
                             provider_trace: error.provider_trace.as_deref().cloned(),
-                            response: None,
                             token_usage: None,
-                            context_after: context.messages(),
-                            steering_messages: Vec::new(),
                             error: Some(error.message.clone()),
                         },
                     )?;
@@ -173,12 +157,8 @@ impl Agent {
                 run_id,
                 started_at_ms,
                 duration_ms,
-                system_prompt: &system_prompt,
-                context_before: &context_before,
-                tools: &tool_defs,
             };
             let response = traced.response;
-            let response_for_stack = response.clone();
             let provider_trace = traced.provider_trace;
             let usage = response.token_usage.clone().unwrap_or_else(|| {
                 let input_estimate = active_model
@@ -198,10 +178,7 @@ impl Agent {
                     ModelCallStackOutcome {
                         status: "cancelled",
                         provider_trace,
-                        response: Some(response_for_stack),
                         token_usage: Some(usage),
-                        context_after: context.messages(),
-                        steering_messages: Vec::new(),
                         error: Some(
                             "cancelled after model response before reply emission".to_owned(),
                         ),
@@ -239,10 +216,7 @@ impl Agent {
                             ModelCallStackOutcome {
                                 status: "completed",
                                 provider_trace,
-                                response: Some(response_for_stack),
                                 token_usage: Some(usage),
-                                context_after: context.messages(),
-                                steering_messages: messages,
                                 error: None,
                             },
                         )?;
@@ -254,10 +228,7 @@ impl Agent {
                             ModelCallStackOutcome {
                                 status: "completed",
                                 provider_trace,
-                                response: Some(response_for_stack),
                                 token_usage: Some(usage),
-                                context_after: context.messages(),
-                                steering_messages: Vec::new(),
                                 error: None,
                             },
                         )?;
@@ -326,10 +297,7 @@ impl Agent {
                     ModelCallStackOutcome {
                         status: "cancelled",
                         provider_trace,
-                        response: Some(response_for_stack),
                         token_usage: Some(usage),
-                        context_after: context.messages(),
-                        steering_messages: Vec::new(),
                         error: Some("cancelled after tool batch".to_owned()),
                     },
                 )?;
@@ -344,10 +312,7 @@ impl Agent {
                 ModelCallStackOutcome {
                     status: "completed",
                     provider_trace,
-                    response: Some(response_for_stack),
                     token_usage: Some(usage),
-                    context_after: context.messages(),
-                    steering_messages,
                     error: None,
                 },
             )?;
@@ -359,18 +324,12 @@ struct ModelCallCapture<'a> {
     run_id: &'a str,
     started_at_ms: u64,
     duration_ms: f64,
-    system_prompt: &'a SystemPromptTrace,
-    context_before: &'a [ChatMessage],
-    tools: &'a [ToolDef],
 }
 
-struct ModelCallStackOutcome<'a> {
-    status: &'a str,
+struct ModelCallStackOutcome {
+    status: &'static str,
     provider_trace: Option<ProviderCallTrace>,
-    response: Option<ModelResponse>,
     token_usage: Option<TokenUsage>,
-    context_after: &'a [ChatMessage],
-    steering_messages: Vec<String>,
     error: Option<String>,
 }
 
@@ -389,14 +348,8 @@ impl ModelCallCapture<'_> {
             status: outcome.status.to_owned(),
             started_at_ms: self.started_at_ms,
             duration_ms: self.duration_ms,
-            system_prompt: self.system_prompt.clone(),
-            context_before: self.context_before.to_vec(),
-            tools: self.tools.to_vec(),
             provider_trace: outcome.provider_trace,
-            response: outcome.response,
             token_usage: outcome.token_usage,
-            context_after: outcome.context_after.to_vec(),
-            steering_messages: outcome.steering_messages,
             error: outcome.error,
         });
         sink.model_call_stack(stack).map_err(AgentRunError::Sink)
