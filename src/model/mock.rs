@@ -17,12 +17,12 @@ use super::openai::message_json;
 
 /// Stand-in used when no usable model is configured; every turn fails with a
 /// fixed explanation (the not-configured hint, or a specific config error).
-pub(crate) struct FailingModel {
+pub(super) struct FailingModel {
     message: String,
 }
 
 impl FailingModel {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub(super) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }

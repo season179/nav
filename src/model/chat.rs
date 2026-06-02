@@ -244,7 +244,7 @@ pub struct ProviderCallTrace {
 }
 
 impl ProviderCallTrace {
-    pub(crate) fn new(
+    pub(super) fn new(
         api_kind: &str,
         url: String,
         model_id: String,
@@ -264,7 +264,7 @@ impl ProviderCallTrace {
         }
     }
 
-    pub(crate) fn with_error(mut self, error: &str) -> Self {
+    pub(super) fn with_error(mut self, error: &str) -> Self {
         self.error = Some(error.to_owned());
         self
     }
@@ -285,7 +285,7 @@ impl ModelError {
         }
     }
 
-    pub(crate) fn with_provider_trace(mut self, provider_trace: ProviderCallTrace) -> Self {
+    pub(super) fn with_provider_trace(mut self, provider_trace: ProviderCallTrace) -> Self {
         self.provider_trace = Some(Box::new(provider_trace));
         self
     }

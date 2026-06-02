@@ -87,7 +87,7 @@ impl From<ResolvedModelConfig> for OpenAiConfig {
 }
 
 impl OpenAiConfig {
-    pub(crate) fn is_responses_api(&self) -> bool {
+    pub(super) fn is_responses_api(&self) -> bool {
         matches!(
             self.api.as_str(),
             OPENAI_RESPONSES_API | CODEX_RESPONSES_API
@@ -631,7 +631,7 @@ fn responses_tool_json(tool: &ToolDef) -> Value {
 }
 
 /// Serialize one Model Context message into OpenAI chat-completions wire shape.
-pub(crate) fn message_json(message: &ChatMessage, include_reasoning_content: bool) -> Value {
+pub(super) fn message_json(message: &ChatMessage, include_reasoning_content: bool) -> Value {
     match message.role {
         Role::Tool => json!({
             "role": "tool",
