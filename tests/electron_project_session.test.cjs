@@ -107,10 +107,16 @@ test("worktree project creation reuses the newest worktree for the checkout", ()
   );
 });
 
-test("worktree project creation ignores a session with a missing workspaceRoot", () => {
+test("worktree project creation ignores a session with a missing or empty workspaceRoot", () => {
   const sessions = [
     {
       sessionId: "no-workspace",
+      projectRoot: "/Users/season/Personal/nav",
+      updatedAt: 700,
+    },
+    {
+      sessionId: "empty-workspace",
+      workspaceRoot: "",
       projectRoot: "/Users/season/Personal/nav",
       updatedAt: 700,
     },
