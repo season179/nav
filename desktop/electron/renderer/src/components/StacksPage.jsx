@@ -132,29 +132,42 @@ function StackCall({ stack }) {
 }
 
 function RequestSection({ request }) {
+  // Serialize the body only once the user opens the section: a session can hold
+  // hundreds of calls, each carrying the full conversation context, so eagerly
+  // pretty-printing every body on first paint is wasted work.
+  const [expanded, setExpanded] = useState(false);
   const hasBody = request.body !== undefined && request.body !== null;
   const meta = [request.api, request.url].filter(Boolean).join(" · ");
 
   return (
-    <details className="stack-section stack-section-request" open>
+    <details
+      className="stack-section stack-section-request"
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+    >
       <summary>
         <span className="stack-section-title">Request</span>
         {meta ? <span className="stack-section-meta">{meta}</span> : null}
       </summary>
-      {hasBody ? (
+      {expanded && hasBody ? (
         <pre className="stack-json">{stringifyJson(request.body)}</pre>
-      ) : (
+      ) : null}
+      {!hasBody ? (
         <p className="stack-section-empty">No request body captured.</p>
-      )}
+      ) : null}
     </details>
   );
 }
 
 function ResponseSection({ response }) {
+  // Defer body serialization until the section is opened (see RequestSection).
+  const [expanded, setExpanded] = useState(false);
   const hasBody = response.body !== undefined && response.body !== null;
 
   return (
-    <details className="stack-section stack-section-response" open>
+    <details
+      className="stack-section stack-section-response"
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+    >
       <summary>
         <span className="stack-section-title">Response</span>
         {Number.isFinite(response.statusCode) ? (
@@ -164,7 +177,7 @@ function ResponseSection({ response }) {
       {response.error ? (
         <pre className="stack-error-body">{response.error}</pre>
       ) : null}
-      {hasBody ? (
+      {expanded && hasBody ? (
         <pre className="stack-json">{stringifyJson(response.body)}</pre>
       ) : null}
       {!hasBody && !response.error ? (
