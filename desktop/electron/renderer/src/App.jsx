@@ -33,6 +33,9 @@ export default function App() {
   // Every live session's transcript and run state, keyed by id. Routing events
   // here by session id is what keeps concurrent sessions from interfering.
   const [sessionStates, setSessionStates] = useState({});
+  const [attentionSessionIds, setAttentionSessionIds] = useState(
+    () => new Set(),
+  );
   const [modelOptions, setModelOptions] = useState([]);
   const [modelSwitching, setModelSwitching] = useState(false);
   const [activeView, setActiveView] = useState("chat");
@@ -54,6 +57,16 @@ export default function App() {
   const setActiveSession = useCallback((sessionId) => {
     activeSessionIdRef.current = sessionId;
     setActiveSessionId(sessionId);
+    if (sessionId) {
+      setAttentionSessionIds((current) => {
+        if (!current.has(sessionId)) {
+          return current;
+        }
+        const next = new Set(current);
+        next.delete(sessionId);
+        return next;
+      });
+    }
   }, []);
 
   const runtimeFor = useCallback((sessionId) => {
@@ -413,6 +426,25 @@ export default function App() {
           refreshStacks(sessionId);
           break;
         case "run.completed":
+          if (sessionId !== activeSessionIdRef.current) {
+            setAttentionSessionIds((current) => {
+              if (current.has(sessionId)) {
+                return current;
+              }
+              const next = new Set(current);
+              next.add(sessionId);
+              return next;
+            });
+          }
+          runtime.runStarted = false;
+          runtime.running = false;
+          runtime.stopRequested = false;
+          runtime.stopSentForActiveRun = false;
+          refreshSessions();
+          refreshModelInfo(sessionId);
+          refreshStackAvailabilityForEvent(sessionId, event.type);
+          refreshStacksAfterTerminalEvent(sessionId);
+          break;
         case "run.cancelled":
         case "run.failed":
           runtime.runStarted = false;
@@ -667,6 +699,7 @@ export default function App() {
     <div className="app">
       <Sidebar
         activeSessionId={activeSessionId}
+        attentionSessionIds={attentionSessionIds}
         connected={connected}
         runningSessionIds={runningSessionIds}
         sessions={sessionSummaries}

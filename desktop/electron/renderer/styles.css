@@ -384,16 +384,29 @@ body {
 }
 
 /* A small pulsing dot marks a session whose run is still in flight, including
-   sessions working in the background while another is on screen. */
+   sessions working in the background while another is on screen. A steady
+   green dot marks a background session that completed and needs attention. */
 .session-running,
 .project-running,
-.session-toolbar-running {
+.session-toolbar-running,
+.session-attention,
+.project-attention {
   flex: none;
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--active);
+}
+
+.session-running,
+.project-running,
+.session-toolbar-running {
   animation: tool-pulse 1.4s ease-in-out infinite;
+}
+
+.session-attention,
+.project-attention {
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--active) 48%, transparent);
 }
 
 .session-toolbar-running {
@@ -1457,6 +1470,13 @@ h1 {
   .project-running,
   .session-toolbar-running {
     animation: none;
+  }
+
+  .session-attention,
+  .project-attention {
+    box-shadow:
+      0 0 0 2px var(--active-dim),
+      0 0 0 4px color-mix(in oklab, var(--active) 32%, transparent);
   }
 
   .new-chat,
