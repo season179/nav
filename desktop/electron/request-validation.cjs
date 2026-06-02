@@ -54,10 +54,15 @@ function normalizeOptionalSessionMode(value) {
   if (value === undefined || value === null) {
     return null;
   }
-  if (value !== "local" && value !== "worktree") {
+  return normalizeSessionMode(value);
+}
+
+function normalizeSessionMode(value) {
+  const mode = normalizeRequiredString(value, "session mode");
+  if (mode !== "local" && mode !== "worktree") {
     throw new Error("session mode must be local or worktree");
   }
-  return value;
+  return mode;
 }
 
 function normalizeRequiredString(value, label) {
@@ -79,5 +84,6 @@ module.exports = {
   normalizeOptionalThinkingLevel,
   normalizeOptionalWorkspaceRoot,
   normalizeSessionId,
+  normalizeSessionMode,
   normalizeThinkingLevel,
 };

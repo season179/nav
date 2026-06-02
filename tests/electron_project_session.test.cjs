@@ -107,6 +107,32 @@ test("worktree project creation reuses the newest worktree for the checkout", ()
   );
 });
 
+test("worktree startup resumes a worktree session for the checkout, never the local one", () => {
+  // Mirrors the launch-time selection in main.cjs `openSession`: when the
+  // persisted mode is "worktree", startup must reopen a worktree session for
+  // PROJECT_ROOT and must not fall back to the main-checkout (local) session.
+  const projectRoot = "/Users/season/Personal/nav";
+  const sessions = [
+    {
+      sessionId: "startup-local",
+      workspaceRoot: projectRoot,
+      projectRoot,
+      updatedAt: 900,
+    },
+    {
+      sessionId: "startup-worktree",
+      workspaceRoot: `${projectRoot}/.nav/worktrees/nav-wt-019e8685`,
+      projectRoot,
+      updatedAt: 400,
+    },
+  ];
+
+  assert.equal(
+    existingProjectSessionId(sessions, projectRoot, "worktree"),
+    "startup-worktree",
+  );
+});
+
 test("worktree project creation ignores a session with a missing or empty workspaceRoot", () => {
   const sessions = [
     {
