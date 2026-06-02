@@ -7,6 +7,10 @@ const {
   existingProjectSessionId,
   normalizeWorkspaceRoot,
 } = require("./project-session.cjs");
+const {
+  readSessionMode,
+  writeSessionMode,
+} = require("./session-mode-store.cjs");
 const { createStartupTrace } = require("./startup-trace.cjs");
 const { createWindowOptions } = require("./window-options.cjs");
 
@@ -199,6 +203,17 @@ ipcMain.handle("nav:new-session", async (_event, request) => {
   return createdSessionId;
 });
 
+// The composer's "Start in" preference is persisted in Main (not the renderer)
+// because startup runs `openSession` before the renderer exists — the file is
+// the only place the preselected mode can live so launch honors it.
+ipcMain.handle("nav:get-session-mode", () =>
+  readSessionMode(sessionModeFilePath()),
+);
+
+ipcMain.handle("nav:set-session-mode", (_event, mode) =>
+  writeSessionMode(sessionModeFilePath(), mode),
+);
+
 function createMainWindow() {
   trace.mark("electron.window.create.start");
   const window = new BrowserWindow(
@@ -305,37 +320,72 @@ function activateSession(window, id, { startup = false } = {}) {
   });
 }
 
-// Reopen the most recent conversation so sessions persist across launches.
-// Smoke mode always starts fresh to stay deterministic.
+// Reopen the most recent conversation so sessions persist across launches,
+// honoring the persisted "Start in" preference: a worktree launch resumes (or
+// creates) a worktree session and never the main checkout. Smoke mode ignores
+// the preference and starts fresh in local mode so the offline run stays
+// deterministic regardless of machine-local state.
 async function openSession() {
   trace.mark("electron.session.open.start");
+  const sessionMode = smokeMode
+    ? "local"
+    : readSessionMode(sessionModeFilePath());
   if (!smokeMode) {
-    const latest = await tracedRpc("session.latest", { cwd: PROJECT_ROOT });
-    if (latest.result?.sessionId) {
-      // If resumption fails (pruned session, corrupt DB, schema mismatch), fall
-      // back to a fresh session rather than leaving the app stuck on launch.
-      try {
-        const resumed = await tracedRpc("session.resume", {
-          sessionId: latest.result.sessionId,
-        });
-        trace.mark("electron.session.open.end", { mode: "resumed" });
-        return resumed.result.sessionId;
-      } catch (error) {
-        trace.mark("electron.session.resume.fallback", {
-          error: error.message,
-        });
-        console.error(
-          `failed to resume session ${latest.result.sessionId}, starting fresh: ${error.message}`,
-        );
-      }
+    const resumedSessionId = await resumeStartupSession(sessionMode);
+    if (resumedSessionId) {
+      trace.mark("electron.session.open.end", {
+        mode: "resumed",
+        session_mode: sessionMode,
+      });
+      return resumedSessionId;
     }
   }
   const created = await tracedRpc("session.create", {
     cwd: PROJECT_ROOT,
-    mode: "local",
+    mode: sessionMode,
   });
-  trace.mark("electron.session.open.end", { mode: "created" });
+  trace.mark("electron.session.open.end", {
+    mode: "created",
+    session_mode: sessionMode,
+  });
   return created.result.sessionId;
+}
+
+// Resume the newest session for the requested mode, or null when none exists or
+// resumption fails so the caller creates a fresh one instead of leaving the app
+// stuck on launch.
+async function resumeStartupSession(sessionMode) {
+  const sessionId = await latestSessionIdForMode(sessionMode);
+  if (!sessionId) {
+    return null;
+  }
+  // Resumption can fail on a pruned session, corrupt DB, or schema mismatch.
+  try {
+    const resumed = await tracedRpc("session.resume", { sessionId });
+    return resumed.result.sessionId;
+  } catch (error) {
+    trace.mark("electron.session.resume.fallback", { error: error.message });
+    console.error(
+      `failed to resume session ${sessionId}, starting fresh: ${error.message}`,
+    );
+    return null;
+  }
+}
+
+// The newest resumable session id for the mode, or null when none matches.
+// Worktree mode matches only worktree sessions for this checkout (via the same
+// helper Add Project uses), so a worktree launch is never silently downgraded
+// to the main checkout.
+async function latestSessionIdForMode(sessionMode) {
+  if (sessionMode === "worktree") {
+    return findExistingProjectSession(PROJECT_ROOT, "worktree");
+  }
+  const latest = await tracedRpc("session.latest", { cwd: PROJECT_ROOT });
+  return latest.result?.sessionId ?? null;
+}
+
+function sessionModeFilePath() {
+  return path.join(app.getPath("userData"), "nav-ui.json");
 }
 
 async function createBackendSession(cwd, mode) {

@@ -1,4 +1,11 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Composer from "./components/Composer.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import StacksPage from "./components/StacksPage.jsx";
@@ -32,6 +39,7 @@ export default function App() {
   const stopRequestedRef = useRef(false);
   const nextMessageIdRef = useRef(0);
   const stackAvailabilityRequestRef = useRef(0);
+  const sessionModeTouchedRef = useRef(false);
 
   const setConnectedState = useCallback((isConnected) => {
     connectedRef.current = isConnected;
@@ -390,6 +398,42 @@ export default function App() {
 
   useNavSubscriptions(handleBackendStatus, handleSessionEvent, appendMessage);
 
+  // Load the persisted "Start in" preference so the menu reflects the mode the
+  // next launch will actually use (it is owned by Main, which reads it before
+  // the renderer exists). Skip if the user already picked a mode, so a slow
+  // async load can never clobber a fresh selection.
+  useEffect(() => {
+    let cancelled = false;
+    window.nav
+      ?.getSessionMode?.()
+      .then((mode) => {
+        if (
+          !cancelled &&
+          !sessionModeTouchedRef.current &&
+          (mode === "local" || mode === "worktree")
+        ) {
+          setNewSessionMode(mode);
+        }
+      })
+      .catch(() => {
+        // Falling back to the default mode must never block the chat UI.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Persist every change so startup and new threads agree on the mode, even
+  // across restarts.
+  const changeNewSessionMode = useCallback((mode) => {
+    sessionModeTouchedRef.current = true;
+    setNewSessionMode(mode);
+    window.nav?.setSessionMode?.(mode).catch(() => {
+      // The in-memory selection still applies this session; persistence is a
+      // best-effort convenience.
+    });
+  }, []);
+
   const activateCreatedSession = useCallback(
     async (sessionId) => {
       setActiveSession(sessionId);
@@ -588,7 +632,7 @@ export default function App() {
               newSessionMode={newSessionMode}
               running={running}
               stopPending={stopPending}
-              onNewSessionModeChange={setNewSessionMode}
+              onNewSessionModeChange={changeNewSessionMode}
               onModelChange={switchModel}
               onThinkingChange={switchThinking}
               onSend={sendMessage}

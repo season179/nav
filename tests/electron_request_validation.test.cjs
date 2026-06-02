@@ -9,6 +9,7 @@ const {
   normalizeOptionalThinkingLevel,
   normalizeOptionalWorkspaceRoot,
   normalizeSessionId,
+  normalizeSessionMode,
   normalizeThinkingLevel,
 } = require("../desktop/electron/request-validation.cjs");
 
@@ -89,4 +90,15 @@ test("preload session mode validation accepts local and worktree", () => {
 test("preload session mode validation rejects unknown modes", () => {
   assert.throws(() => normalizeOptionalSessionMode("remote"));
   assert.throws(() => normalizeOptionalSessionMode(42));
+});
+
+test("required session mode validation trims and accepts known modes", () => {
+  assert.equal(normalizeSessionMode("  worktree  "), "worktree");
+  assert.equal(normalizeSessionMode("local"), "local");
+});
+
+test("required session mode validation rejects blanks and unknown modes", () => {
+  assert.throws(() => normalizeSessionMode(undefined), TypeError);
+  assert.throws(() => normalizeSessionMode("   "));
+  assert.throws(() => normalizeSessionMode("remote"));
 });

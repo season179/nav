@@ -58,10 +58,15 @@ function normalizeOptionalSessionMode(value) {
   if (value === undefined || value === null) {
     return null;
   }
-  if (value !== "local" && value !== "worktree") {
+  return normalizeSessionMode(value);
+}
+
+function normalizeSessionMode(value) {
+  const mode = normalizeRequiredString(value, "session mode");
+  if (mode !== "local" && mode !== "worktree") {
     throw new Error("session mode must be local or worktree");
   }
-  return value;
+  return mode;
 }
 
 function normalizeRequiredString(value, label) {
@@ -158,6 +163,17 @@ contextBridge.exposeInMainWorld("nav", {
       cwd: normalizeOptionalWorkspaceRoot(workspaceRoot),
       mode: normalizeOptionalSessionMode(mode),
     });
+  },
+  // Read the persisted "Start in" preference so the composer can initialize it.
+  getSessionMode() {
+    return ipcRenderer.invoke("nav:get-session-mode");
+  },
+  // Persist the "Start in" preference so the next launch starts in this mode.
+  setSessionMode(mode) {
+    return ipcRenderer.invoke(
+      "nav:set-session-mode",
+      normalizeSessionMode(mode),
+    );
   },
 });
 
