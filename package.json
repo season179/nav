@@ -2,6 +2,9 @@
   "name": "nav",
   "private": true,
   "description": "Learning project for building a coding agent.",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "scripts": {
     "reset-data": "bun scripts/reset-data.mjs",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.main.json --noEmit",

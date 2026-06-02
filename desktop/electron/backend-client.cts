@@ -159,5 +159,11 @@ function parseSseFrame(frame: string): SessionEvent | null {
     return null;
   }
 
-  return JSON.parse(dataLine.slice("data: ".length)) as SessionEvent;
+  try {
+    return JSON.parse(dataLine.slice("data: ".length)) as SessionEvent;
+  } catch {
+    // A malformed SSE payload must not tear down the stream: drop the frame so
+    // parseSseBuffer keeps delivering the well-formed events around it.
+    return null;
+  }
 }
