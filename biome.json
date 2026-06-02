@@ -8,6 +8,7 @@
   "files": {
     "includes": [
       "desktop/**",
+      "scripts/**",
       "tests/**/*.cjs",
       "!!.nav",
       "!desktop/electron/renderer/vendor"
