@@ -10,6 +10,7 @@ const projectOrderStorageKey = "nav.projectOrder.v1";
 
 export default function Sidebar({
   activeSessionId,
+  attentionSessionIds,
   connected,
   runningSessionIds,
   sessions,
@@ -87,6 +88,7 @@ export default function Sidebar({
               <ProjectGroup
                 key={project.key}
                 activeSessionId={activeSessionId}
+                attentionSessionIds={attentionSessionIds}
                 collapsed={collapsedProjectKeys.has(project.key)}
                 connected={connected}
                 expanded={expandedProjectSessionKeys.has(project.key)}
@@ -111,6 +113,7 @@ export default function Sidebar({
 
 function ProjectGroup({
   activeSessionId,
+  attentionSessionIds,
   collapsed,
   connected,
   expanded,
@@ -128,6 +131,9 @@ function ProjectGroup({
   const projectRunning = project.sessions.some((session) =>
     runningSessionIds.has(session.sessionId),
   );
+  const projectNeedsAttention = project.sessions.some((session) =>
+    attentionSessionIds.has(session.sessionId),
+  );
 
   return (
     <li className="project-group">
@@ -135,6 +141,7 @@ function ProjectGroup({
         connected={connected}
         project={project}
         running={projectRunning}
+        needsAttention={projectNeedsAttention}
         toggleView={toggleView}
         onNewChatInProject={onNewChatInProject}
         onToggleProject={onToggleProject}
@@ -142,6 +149,7 @@ function ProjectGroup({
       {collapsed ? null : (
         <ProjectSessions
           activeSessionId={activeSessionId}
+          attentionSessionIds={attentionSessionIds}
           runningSessionIds={runningSessionIds}
           sessions={visibleSessions}
           toggle={toggle}
@@ -157,6 +165,7 @@ function ProjectHeading({
   connected,
   project,
   running,
+  needsAttention,
   toggleView,
   onNewChatInProject,
   onToggleProject,
@@ -191,6 +200,13 @@ function ProjectHeading({
               aria-label="Running"
               title="Running"
             />
+          ) : needsAttention ? (
+            <span
+              className="project-attention"
+              role="img"
+              aria-label="Needs attention"
+              title="Needs attention"
+            />
           ) : null}
         </span>
       </button>
@@ -210,6 +226,7 @@ function ProjectHeading({
 
 function ProjectSessions({
   activeSessionId,
+  attentionSessionIds,
   runningSessionIds,
   sessions,
   toggle,
@@ -236,6 +253,13 @@ function ProjectSessions({
                 role="img"
                 aria-label="Running"
                 title="Running"
+              />
+            ) : attentionSessionIds.has(session.sessionId) ? (
+              <span
+                className="session-attention"
+                role="img"
+                aria-label="Needs attention"
+                title="Needs attention"
               />
             ) : null}
           </button>
