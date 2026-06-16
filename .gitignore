@@ -170,3 +170,5 @@ desktop/electron/out/
 
 # Claude
 .claude/*
+
+codedb.snapshot
