@@ -6,7 +6,10 @@
 //! pinning, summaries, citations, and pruning without spreading those decisions
 //! across sessions, agents, and model adapters.
 
-use crate::model::ChatMessage;
+use std::sync::Arc;
+
+use crate::model::{ChatMessage, ToolDef};
+use crate::tokens::{TextTokenCounter, TokenEstimate, estimate_model_context};
 
 /// The raw ordered turns that belong to a Session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -117,5 +120,123 @@ impl ContextAssembler {
 
     pub fn assemble(&self, history: &TurnHistory) -> ModelContext {
         self.strategy.assemble(history)
+    }
+}
+
+/// Share of a model's context window at which a [`TokenBudgetGuard`] warns.
+///
+/// 0.8 means a warning fires once the estimated context reaches 80% of the
+/// window. Kept as a type rather than a bare `f64` so the threshold stays an
+/// explicit decision at construction time.
+#[derive(Clone, Copy, Debug)]
+pub struct WarningThreshold(f64);
+
+impl WarningThreshold {
+    /// Warn when the estimate reaches 80% of the context window.
+    pub const fn at_80_percent() -> Self {
+        Self(0.8)
+    }
+
+    /// The threshold as a fraction in `0.0..=1.0`.
+    pub fn as_ratio(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for WarningThreshold {
+    fn default() -> Self {
+        Self::at_80_percent()
+    }
+}
+
+/// A pre-call estimate that crossed a [`TokenBudgetGuard`]'s threshold.
+///
+/// Carries everything the caller needs to surface a warning without re-counting:
+/// the token count, the window it was measured against, and the estimate's
+/// source/confidence so the message can note how much to trust it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenBudgetWarning {
+    /// Estimated tokens in the model-visible context.
+    pub used: u64,
+    /// The context window `used` was measured against.
+    pub context_window: u64,
+    /// How the estimate was produced (tokenizer vs. heuristic, and confidence).
+    pub estimate: TokenEstimate,
+}
+
+impl TokenBudgetWarning {
+    /// `used` as a fraction of `context_window`, in `0.0..=1.0`.
+    pub fn ratio(&self) -> f64 {
+        if self.context_window == 0 {
+            return 0.0;
+        }
+        self.used as f64 / self.context_window as f64
+    }
+}
+
+/// Estimates a [`ModelContext`]'s token size before a model call and reports
+/// when it crosses a [`WarningThreshold`] of the model's context window.
+///
+/// This is the read-only half of context management: it does not truncate or
+/// prune, only measures and warns. The estimate comes from
+/// [`estimate_model_context`], so it uses whichever [`TextTokenCounter`] the
+/// guard is configured with, falling back to the heuristic when no tokenizer is
+/// available.
+#[derive(Clone)]
+pub struct TokenBudgetGuard {
+    counter: Arc<dyn TextTokenCounter>,
+    threshold: WarningThreshold,
+}
+
+impl TokenBudgetGuard {
+    /// Build a guard with the given counter that warns at 80% of the window.
+    pub fn new(counter: Arc<dyn TextTokenCounter>) -> Self {
+        Self {
+            counter,
+            threshold: WarningThreshold::default(),
+        }
+    }
+
+    /// The fraction of the context window at which this guard warns.
+    pub fn threshold(&self) -> WarningThreshold {
+        self.threshold
+    }
+
+    /// Return a warning when `estimate` crosses `threshold` of `context_window`.
+    /// Returns `None` when `context_window` is absent/zero or the estimate stays
+    /// under the threshold.
+    ///
+    /// Use this when the caller already has an estimate (for example the model's
+    /// own tokenizer-backed count); [`check`](Self::check) is the convenience that
+    /// counts `context` with this guard's configured counter first.
+    pub fn check_estimate(
+        &self,
+        estimate: TokenEstimate,
+        context_window: Option<u64>,
+    ) -> Option<TokenBudgetWarning> {
+        let context_window = context_window.filter(|window| *window != 0)?;
+        if (estimate.tokens as f64) >= self.threshold.as_ratio() * context_window as f64 {
+            Some(TokenBudgetWarning {
+                used: estimate.tokens,
+                context_window,
+                estimate,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Estimate `context` (with `tools`) using this guard's counter and return a
+    /// warning when it crosses `threshold` of `context_window`. Returns `None`
+    /// when `context_window` is absent/zero or the estimate stays under the
+    /// threshold.
+    pub fn check(
+        &self,
+        context: &ModelContext,
+        tools: &[ToolDef],
+        context_window: Option<u64>,
+    ) -> Option<TokenBudgetWarning> {
+        let estimate = estimate_model_context(context, tools, self.counter.as_ref());
+        self.check_estimate(estimate, context_window)
     }
 }

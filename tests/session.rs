@@ -35,6 +35,12 @@ fn model_info(label: &str) -> ModelInfo {
     }
 }
 
+fn model_info_with_window(label: &str, context_window: u64) -> ModelInfo {
+    let mut info = model_info(label);
+    info.context_window = Some(context_window);
+    info
+}
+
 #[test]
 fn a_turn_emits_the_chat_event_sequence_and_records_both_messages() {
     let model = Arc::new(RecordingModel::new());
@@ -212,6 +218,45 @@ fn a_model_failure_emits_run_failed_with_the_error() {
     let failure = events.last().unwrap();
     assert_eq!(failure.status.as_deref(), Some("failed"));
     assert_eq!(failure.error.as_deref(), Some("model is offline"));
+}
+
+#[test]
+fn a_context_warning_fires_when_the_context_nears_the_window() {
+    // A window so small that the heuristic estimate of even a short message
+    // crosses 80%: the heuristic counts roughly bytes/3, so a few characters
+    // exceed one token.
+    let store = SessionStore::new(Arc::new(StaticModel("reply")))
+        .with_model_info(model_info_with_window("tiny model", 1));
+    let session_id = store.create_session();
+
+    store
+        .send_message(&session_id, "hello world this is a long message")
+        .unwrap();
+
+    let events = store.events(&session_id).unwrap();
+    let run_started = events
+        .iter()
+        .find(|event| event.kind == "run.started")
+        .expect("a run.started event was emitted");
+    let warning = events
+        .iter()
+        .find(|event| event.kind == "context.warning")
+        .expect("a context.warning event was emitted");
+
+    assert_eq!(warning.run_id, run_started.run_id);
+    assert!(warning.text.as_deref().unwrap().contains("context at"));
+}
+
+#[test]
+fn no_context_warning_fires_when_the_window_is_unknown() {
+    let store =
+        SessionStore::new(Arc::new(StaticModel("reply"))).with_model_info(model_info("no window"));
+    let session_id = store.create_session();
+
+    store.send_message(&session_id, "hello world").unwrap();
+
+    let events = store.events(&session_id).unwrap();
+    assert!(!events.iter().any(|event| event.kind == "context.warning"));
 }
 
 #[test]

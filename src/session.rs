@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::agent::{
     ActiveModel, Agent, AgentRunError, AgentRunSink, RunStop, SharedModel, TurnContinuation,
 };
-use crate::context::{ContextAssembler, TurnHistory};
+use crate::context::{ContextAssembler, TokenBudgetGuard, TokenBudgetWarning, TurnHistory};
 use crate::lock::{LockExt, RwLockExt};
 use crate::model::{
     ChatMessage, ChatModel, ModelChoice, ModelInfo, ResponseReasoningItem, Role, ToolCall,
@@ -28,7 +28,7 @@ use crate::stacks::ModelCallStack;
 use crate::storage::{
     SessionSummary, Storage, StorageError, project_root_to_string, workspace_root_to_string,
 };
-use crate::tokens::TokenUsage;
+use crate::tokens::{HeuristicTokenCounter, TokenUsage};
 use crate::tools::{CancelFlag, Registry};
 
 /// How a session originates, recorded on the persisted `sessions` row.
@@ -184,6 +184,9 @@ pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
     agent: Agent,
     context_assembler: ContextAssembler,
+    /// Pre-call context budget check. Warns when an assembled context nears the
+    /// model's window; does not truncate.
+    token_budget_guard: TokenBudgetGuard,
     storage: Option<Arc<Storage>>,
     stack_store: Option<Arc<StackStore>>,
     /// The model new (and resumed) sessions start with; each session then owns
@@ -199,6 +202,7 @@ impl SessionStore {
             sessions: Mutex::new(HashMap::new()),
             agent: Agent::new(),
             context_assembler: ContextAssembler::new(),
+            token_budget_guard: TokenBudgetGuard::new(Arc::new(HeuristicTokenCounter)),
             storage: None,
             stack_store: None,
             default_model: ActiveModel::new(model, None),
@@ -587,9 +591,14 @@ impl SessionStore {
         seq += 1;
 
         // Assemble model context under the lock, then let the agent run
-        // unlocked. The raw Session history remains the source of truth.
-        let context = self.with_session(session_id, |session| {
-            self.context_assembler.assemble(&session.turns)
+        // unlocked. The raw Session history remains the source of truth. Also
+        // grab the model and its context window so the budget guard can run a
+        // pre-call estimate before the run starts.
+        let (context, guard_model, context_window) = self.with_session(session_id, |session| {
+            let context = self.context_assembler.assemble(&session.turns);
+            let model = session.model.read_recover().clone();
+            let context_window = session.model_info.context_window;
+            (context, model, context_window)
         })?;
         let mut sink = SessionRunSink {
             store: self,
@@ -597,6 +606,16 @@ impl SessionStore {
             run_id: &run_id,
             seq,
         };
+        // Warn (without truncating) when the assembled context nears the model's
+        // window. Uses the model's own tokenizer-backed estimate when available.
+        let tools = self.agent.tool_defs();
+        let estimate = guard_model.model.estimate_context_tokens(&context, &tools);
+        if let Some(warning) = self
+            .token_budget_guard
+            .check_estimate(estimate, context_window)
+        {
+            sink.context_warning(&warning)?;
+        }
         let outcome = self
             .agent
             .run_turn(&run_id, context, &workspace, &model, &cancel, &mut sink);
@@ -1003,6 +1022,23 @@ impl AgentRunSink for SessionRunSink<'_> {
 }
 
 impl SessionRunSink<'_> {
+    /// Emit a `context.warning` event when the assembled context nears the
+    /// model's window. Pure observability: it surfaces the estimate, never
+    /// truncates or blocks the run.
+    fn context_warning(&mut self, warning: &TokenBudgetWarning) -> Result<(), SendError> {
+        self.store.with_session(self.session_id, |session| {
+            session.emit("context.warning", |event| {
+                event.run_id = Some(self.run_id.to_owned());
+                event.text = Some(format!(
+                    "context at {}/{} tokens (~{:.0}%)",
+                    warning.used,
+                    warning.context_window,
+                    warning.ratio() * 100.0
+                ));
+            });
+        })
+    }
+
     /// Persist steered user Turns drained from the run, advancing the run's
     /// sequence so each lands after the turns already recorded. Their history
     /// and events were written under the lock in [`drain_steer_locked`]; this is

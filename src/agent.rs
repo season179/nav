@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::context::ModelContext;
 use crate::lock::RwLockExt;
 use crate::model::{
-    ChatMessage, ChatModel, ModelError, ProviderCallTrace, ResponseReasoningItem, ToolCall,
+    ChatMessage, ChatModel, ModelError, ProviderCallTrace, ResponseReasoningItem, ToolCall, ToolDef,
 };
 use crate::stacks::{ModelCallStack, ModelCallStackInput, build_model_call_stack};
 use crate::system_prompt::{self, BuildSystemPromptOptions};
@@ -63,6 +63,13 @@ impl Agent {
     pub(crate) fn with_workspace(mut self, workspace: PathBuf) -> Self {
         self.workspace = workspace;
         self
+    }
+
+    /// The tool definitions the agent advertises to the model, in order.
+    /// Exposed so callers can run pre-call checks (e.g. a context budget guard)
+    /// against the same toolset the next model call will see.
+    pub(crate) fn tool_defs(&self) -> Vec<ToolDef> {
+        self.registry.defs()
     }
 
     pub(crate) fn workspace(&self) -> &Path {
