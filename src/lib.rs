@@ -43,7 +43,7 @@ pub use config::{
     resolve_default_model_config, resolve_default_model_config_with_thinking, resolve_model_config,
     resolve_model_config_with_thinking, supported_thinking_levels,
 };
-pub use context::{ContextAssembler, ModelContext, TurnHistory};
+pub use context::{ContextAssembler, ContextStrategy, FullForward, ModelContext, TurnHistory};
 pub use model::{
     ChatMessage, ChatModel, FinishReason, MockModel, ModelChoice, ModelError, ModelInfo,
     ModelResponse, OpenAiConfig, OpenAiModel, OpenAiResponsesModel, ResponseReasoningItem, Role,
