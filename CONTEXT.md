@@ -37,6 +37,12 @@ The model-visible view assembled for one Run from Turn History and, later,
 other context sources.
 _Avoid_: History, prompt
 
+**Context Strategy**:
+How Turn History becomes Model Context for one Run: order, ranking, pinning,
+summaries, and pruning. Today's only strategy forwards every turn verbatim; the
+trait is the seam future context management grows in.
+_Avoid_: Prompt builder, context formatter
+
 **Token Usage**:
 The provider-reported or locally estimated token counts observed for model calls.
 Used for operational visibility and context management, not billing.
@@ -44,8 +50,21 @@ _Avoid_: Cost, charge
 
 **Token Estimate**:
 A pre-call count produced from Model Context with an explicit source and
-confidence, used as the future foundation for budget checks.
+confidence, fed to a Token Budget Guard before each model call.
 _Avoid_: Exact count, quota
+
+**Context Window**:
+The maximum number of tokens a model accepts in one request. Optional because
+not every configured model reports one; the Token Budget Guard stays silent
+when it is unknown.
+_Avoid_: Token limit, max tokens
+
+**Token Budget Guard**:
+The read-only pre-call check that compares a Token Estimate against the model's
+Context Window and warns (without truncating) when it nears the limit. The
+measuring half of context management; pruning and compaction are the writing
+half, not yet built.
+_Avoid_: Compaction, truncation, limiter
 
 **Tool**:
 A model-visible capability with a schema and executor that may act against the
@@ -64,9 +83,12 @@ _Avoid_: Output, response
 
 - A **Session** contains many **Runs**.
 - A **Session** owns one **Turn History**.
+- A **Context Strategy** assembles one Run's **Model Context** from **Turn History**.
 - A **Run** starts from one **Model Context** assembled from **Turn History**.
 - A **Run** can record **Token Usage** from provider telemetry or local estimates.
 - A **Token Estimate** is derived before a model call from **Model Context**.
+- A **Token Budget Guard** checks a **Token Estimate** against the model's
+  **Context Window** and warns when it nears the limit, without truncating.
 - A **Run** starts from one user **Turn**, may fold in further user **Turns**
   sent while it runs (**Steering**), and produces assistant **Turns**.
 - A **Run** is executed by one or more **Agents**.

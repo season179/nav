@@ -530,6 +530,8 @@ impl SessionStore {
     ///
     /// A turn with no tool calls emits exactly `user.message`, `run.started`,
     /// `message.completed`, `run.completed` — unchanged from the pre-tools loop.
+    /// When the active model reports a context window, a `context.warning` may
+    /// also fire after `run.started`, before the first model call.
     ///
     /// Lock discipline: agent work happens with the store lock released, so
     /// other sessions stay responsive while one is working. The lock is only
