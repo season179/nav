@@ -12,10 +12,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::context::ModelContext;
+use crate::context::{ModelContext, TokenBudget, TokenBudgetWarning};
 use crate::lock::RwLockExt;
 use crate::model::{
-    ChatMessage, ChatModel, ModelError, ProviderCallTrace, ResponseReasoningItem, ToolCall, ToolDef,
+    ChatMessage, ChatModel, ModelError, ProviderCallTrace, ResponseReasoningItem, ToolCall,
 };
 use crate::stacks::{ModelCallStack, ModelCallStackInput, build_model_call_stack};
 use crate::system_prompt::{self, BuildSystemPromptOptions};
@@ -47,6 +47,18 @@ impl ActiveModel {
 /// effect before the run's next model call (the loop re-reads it each iteration).
 pub(crate) type SharedModel = Arc<RwLock<ActiveModel>>;
 
+/// The run-scoped inputs one agent turn needs: the run's id, the workspace, the
+/// session's shared model, the cooperative cancel flag, and the context budget.
+/// Bundled so [`Agent::run_turn`] takes one inputs value instead of a long
+/// parameter list.
+pub(crate) struct RunInputs<'a> {
+    pub run_id: &'a str,
+    pub workspace: &'a Path,
+    pub model: &'a SharedModel,
+    pub cancel: &'a CancelFlag,
+    pub budget: &'a TokenBudget<'a>,
+}
+
 impl Agent {
     pub(crate) fn new() -> Self {
         Self {
@@ -63,13 +75,6 @@ impl Agent {
     pub(crate) fn with_workspace(mut self, workspace: PathBuf) -> Self {
         self.workspace = workspace;
         self
-    }
-
-    /// The tool definitions the agent advertises to the model, in order.
-    /// Exposed so callers can run pre-call checks (e.g. a context budget guard)
-    /// against the same toolset the next model call will see.
-    pub(crate) fn tool_defs(&self) -> Vec<ToolDef> {
-        self.registry.defs()
     }
 
     pub(crate) fn workspace(&self) -> &Path {
@@ -113,20 +118,37 @@ impl Agent {
     /// Returns how the run ended so the caller can emit the right terminal event.
     pub(crate) fn run_turn<S>(
         &self,
-        run_id: &str,
         mut context: ModelContext,
-        workspace: &Path,
-        model: &SharedModel,
-        cancel: &CancelFlag,
+        inputs: &RunInputs<'_>,
         sink: &mut S,
     ) -> Result<RunStop, AgentRunError<S::Error>>
     where
         S: AgentRunSink,
     {
+        let RunInputs {
+            run_id,
+            workspace,
+            model,
+            cancel,
+            budget,
+        } = *inputs;
         let tool_defs = self.registry.defs();
         // Attach the system prompt once; it leads every model call this run and
         // is captured verbatim in each model-call record's request body.
         context = context.with_system_prompt(self.system_prompt(workspace));
+
+        // Warn (without truncating) when the assembled context nears the model's
+        // window. This runs *after* the system prompt is attached so the estimate
+        // counts the prompt's tool snippets, guidelines, and project context —
+        // which can easily be thousands of tokens.
+        let active_model = model.read_recover().clone();
+        let estimate = active_model
+            .model
+            .estimate_context_tokens(&context, &tool_defs);
+        if let Some(warning) = budget.warn_if_over(estimate) {
+            sink.context_warning(&warning)
+                .map_err(AgentRunError::Sink)?;
+        }
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -440,6 +462,12 @@ pub(crate) trait AgentRunSink {
     }
 
     fn model_call_stack(&mut self, _stack: ModelCallStack) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Surface a pre-call context budget warning (no truncation). Default no-op
+    /// so sinks that don't render events still compile.
+    fn context_warning(&mut self, _warning: &TokenBudgetWarning) -> Result<(), Self::Error> {
         Ok(())
     }
 }

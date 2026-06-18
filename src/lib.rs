@@ -44,7 +44,7 @@ pub use config::{
     resolve_model_config_with_thinking, supported_thinking_levels,
 };
 pub use context::{
-    ContextAssembler, ContextStrategy, FullForward, ModelContext, TokenBudgetGuard,
+    ContextAssembler, ContextStrategy, FullForward, ModelContext, TokenBudget, TokenBudgetGuard,
     TokenBudgetWarning, TurnHistory, WarningThreshold,
 };
 pub use model::{

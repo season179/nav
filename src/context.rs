@@ -188,6 +188,30 @@ pub struct TokenBudgetGuard {
     threshold: WarningThreshold,
 }
 
+/// A bound on a run's context size: the guard that measures it and the window
+/// it is measured against. Bundled so the agent loop takes one budget argument
+/// rather than a guard/window pair that must stay in sync.
+pub struct TokenBudget<'a> {
+    guard: &'a TokenBudgetGuard,
+    context_window: Option<u64>,
+}
+
+impl<'a> TokenBudget<'a> {
+    /// Build a budget from its guard and the model's context window.
+    pub fn new(guard: &'a TokenBudgetGuard, context_window: Option<u64>) -> Self {
+        Self {
+            guard,
+            context_window,
+        }
+    }
+
+    /// Check the model's own `estimate` against this budget, returning a warning
+    /// when it crosses the guard's threshold of the window.
+    pub fn warn_if_over(&self, estimate: TokenEstimate) -> Option<TokenBudgetWarning> {
+        self.guard.check_estimate(estimate, self.context_window)
+    }
+}
+
 impl TokenBudgetGuard {
     /// Build a guard with the given counter that warns at 80% of the window.
     pub fn new(counter: Arc<dyn TextTokenCounter>) -> Self {

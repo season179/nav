@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use nav::{
     ChatMessage, ChatModel, Event, MockModel, ModelContext, ModelError, ModelInfo, ModelResponse,
-    SessionStore, StackStore, Storage, TokenUsage, ToolDef,
+    SessionStore, StackStore, Storage, TokenCountConfidence, TokenCountSource, TokenEstimate,
+    TokenUsage, ToolDef,
 };
 
 #[test]
@@ -257,6 +258,26 @@ fn no_context_warning_fires_when_the_window_is_unknown() {
 
     let events = store.events(&session_id).unwrap();
     assert!(!events.iter().any(|event| event.kind == "context.warning"));
+}
+
+#[test]
+fn the_context_warning_counts_the_system_prompt() {
+    // The guard runs inside the agent loop *after* the system prompt is
+    // attached, so the estimate must see the prompt. The probe records whether
+    // a system prompt was present when estimate_context_tokens ran.
+    let model = Arc::new(BudgetProbeModel::default());
+    let store =
+        SessionStore::new(model.clone()).with_model_info(model_info_with_window("tiny model", 1));
+    let session_id = store.create_session();
+
+    store.send_message(&session_id, "hello world").unwrap();
+
+    assert!(
+        model.saw_system_prompt_during_estimate(),
+        "the budget estimate must run after the system prompt is attached"
+    );
+    let events = store.events(&session_id).unwrap();
+    assert!(events.iter().any(|event| event.kind == "context.warning"));
 }
 
 #[test]
@@ -714,5 +735,40 @@ impl ChatModel for UsageModel {
         let mut response = ModelResponse::text("counted reply");
         response.token_usage = Some(TokenUsage::provider_reported(21, 8, 3, 5, 0, Some(29)));
         Ok(response)
+    }
+}
+
+/// A model that records whether a system prompt was attached when its context
+/// estimate was requested, so a test can prove the budget guard runs after the
+/// prompt is attached.
+#[derive(Default)]
+struct BudgetProbeModel {
+    saw_system_prompt: Mutex<bool>,
+}
+
+impl BudgetProbeModel {
+    fn saw_system_prompt_during_estimate(&self) -> bool {
+        *self.saw_system_prompt.lock().unwrap()
+    }
+}
+
+impl ChatModel for BudgetProbeModel {
+    fn respond(
+        &self,
+        _context: &ModelContext,
+        _tools: &[ToolDef],
+    ) -> Result<ModelResponse, ModelError> {
+        Ok(ModelResponse::text("probed reply"))
+    }
+
+    fn estimate_context_tokens(&self, context: &ModelContext, _tools: &[ToolDef]) -> TokenEstimate {
+        *self.saw_system_prompt.lock().unwrap() = context.system_prompt().is_some();
+        // Report a large estimate so the guard crosses any tiny window.
+        TokenEstimate {
+            tokens: u64::MAX,
+            source: TokenCountSource::Heuristic,
+            confidence: TokenCountConfidence::Low,
+            tokenizer_id: None,
+        }
     }
 }

@@ -16,9 +16,12 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::agent::{
-    ActiveModel, Agent, AgentRunError, AgentRunSink, RunStop, SharedModel, TurnContinuation,
+    ActiveModel, Agent, AgentRunError, AgentRunSink, RunInputs, RunStop, SharedModel,
+    TurnContinuation,
 };
-use crate::context::{ContextAssembler, TokenBudgetGuard, TokenBudgetWarning, TurnHistory};
+use crate::context::{
+    ContextAssembler, TokenBudget, TokenBudgetGuard, TokenBudgetWarning, TurnHistory,
+};
 use crate::lock::{LockExt, RwLockExt};
 use crate::model::{
     ChatMessage, ChatModel, ModelChoice, ModelInfo, ResponseReasoningItem, Role, ToolCall,
@@ -591,14 +594,13 @@ impl SessionStore {
         seq += 1;
 
         // Assemble model context under the lock, then let the agent run
-        // unlocked. The raw Session history remains the source of truth. Also
-        // grab the model and its context window so the budget guard can run a
-        // pre-call estimate before the run starts.
-        let (context, guard_model, context_window) = self.with_session(session_id, |session| {
+        // unlocked. The raw Session history remains the source of truth. The
+        // context window is captured here so the agent loop can run the budget
+        // guard after the system prompt is attached.
+        let (context, context_window) = self.with_session(session_id, |session| {
             let context = self.context_assembler.assemble(&session.turns);
-            let model = session.model.read_recover().clone();
             let context_window = session.model_info.context_window;
-            (context, model, context_window)
+            (context, context_window)
         })?;
         let mut sink = SessionRunSink {
             store: self,
@@ -606,19 +608,15 @@ impl SessionStore {
             run_id: &run_id,
             seq,
         };
-        // Warn (without truncating) when the assembled context nears the model's
-        // window. Uses the model's own tokenizer-backed estimate when available.
-        let tools = self.agent.tool_defs();
-        let estimate = guard_model.model.estimate_context_tokens(&context, &tools);
-        if let Some(warning) = self
-            .token_budget_guard
-            .check_estimate(estimate, context_window)
-        {
-            sink.context_warning(&warning)?;
-        }
-        let outcome = self
-            .agent
-            .run_turn(&run_id, context, &workspace, &model, &cancel, &mut sink);
+        let budget = TokenBudget::new(&self.token_budget_guard, context_window);
+        let inputs = RunInputs {
+            run_id: &run_id,
+            workspace: &workspace,
+            model: &model,
+            cancel: &cancel,
+            budget: &budget,
+        };
+        let outcome = self.agent.run_turn(context, &inputs, &mut sink);
         match outcome {
             // A completed run already finalized itself inside the loop
             // (`next_input_or_finish` cleared the run and emitted `run.completed`
@@ -1006,6 +1004,23 @@ impl AgentRunSink for SessionRunSink<'_> {
         Ok(())
     }
 
+    /// Emit a `context.warning` event when the assembled context nears the
+    /// model's window. Pure observability: it surfaces the estimate, never
+    /// truncates or blocks the run.
+    fn context_warning(&mut self, warning: &TokenBudgetWarning) -> Result<(), Self::Error> {
+        self.store.with_session(self.session_id, |session| {
+            session.emit("context.warning", |event| {
+                event.run_id = Some(self.run_id.to_owned());
+                event.text = Some(format!(
+                    "context at {}/{} tokens (~{:.0}%)",
+                    warning.used,
+                    warning.context_window,
+                    warning.ratio() * 100.0
+                ));
+            });
+        })
+    }
+
     fn model_call_stack(&mut self, mut stack: ModelCallStack) -> Result<(), Self::Error> {
         let sequence = self.store.with_session(self.session_id, |session| {
             let sequence = session.next_stack_sequence;
@@ -1022,23 +1037,6 @@ impl AgentRunSink for SessionRunSink<'_> {
 }
 
 impl SessionRunSink<'_> {
-    /// Emit a `context.warning` event when the assembled context nears the
-    /// model's window. Pure observability: it surfaces the estimate, never
-    /// truncates or blocks the run.
-    fn context_warning(&mut self, warning: &TokenBudgetWarning) -> Result<(), SendError> {
-        self.store.with_session(self.session_id, |session| {
-            session.emit("context.warning", |event| {
-                event.run_id = Some(self.run_id.to_owned());
-                event.text = Some(format!(
-                    "context at {}/{} tokens (~{:.0}%)",
-                    warning.used,
-                    warning.context_window,
-                    warning.ratio() * 100.0
-                ));
-            });
-        })
-    }
-
     /// Persist steered user Turns drained from the run, advancing the run's
     /// sequence so each lands after the turns already recorded. Their history
     /// and events were written under the lock in [`drain_steer_locked`]; this is
