@@ -12,14 +12,14 @@ use std::sync::{Arc, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::context::ModelContext;
+use crate::context::{ModelContext, TokenBudget, TokenBudgetWarning};
 use crate::lock::RwLockExt;
 use crate::model::{
     ChatMessage, ChatModel, ModelError, ProviderCallTrace, ResponseReasoningItem, ToolCall,
 };
 use crate::stacks::{ModelCallStack, ModelCallStackInput, build_model_call_stack};
 use crate::system_prompt::{self, BuildSystemPromptOptions};
-use crate::tokens::TokenUsage;
+use crate::tokens::{TokenEstimate, TokenUsage};
 use crate::tools::{CancelFlag, Registry};
 
 /// Runs one coding-agent turn with a configured toolset and workspace. The model
@@ -46,6 +46,18 @@ impl ActiveModel {
 /// A session's active model, shared with its in-flight run so a switch can take
 /// effect before the run's next model call (the loop re-reads it each iteration).
 pub(crate) type SharedModel = Arc<RwLock<ActiveModel>>;
+
+/// The run-scoped inputs one agent turn needs: the run's id, the workspace, the
+/// session's shared model, the cooperative cancel flag, and the context budget.
+/// Bundled so [`Agent::run_turn`] takes one inputs value instead of a long
+/// parameter list.
+pub(crate) struct RunInputs<'a> {
+    pub run_id: &'a str,
+    pub workspace: &'a Path,
+    pub model: &'a SharedModel,
+    pub cancel: &'a CancelFlag,
+    pub budget: &'a TokenBudget<'a>,
+}
 
 impl Agent {
     pub(crate) fn new() -> Self {
@@ -106,16 +118,20 @@ impl Agent {
     /// Returns how the run ended so the caller can emit the right terminal event.
     pub(crate) fn run_turn<S>(
         &self,
-        run_id: &str,
         mut context: ModelContext,
-        workspace: &Path,
-        model: &SharedModel,
-        cancel: &CancelFlag,
+        inputs: &RunInputs<'_>,
         sink: &mut S,
     ) -> Result<RunStop, AgentRunError<S::Error>>
     where
         S: AgentRunSink,
     {
+        let RunInputs {
+            run_id,
+            workspace,
+            model,
+            cancel,
+            budget,
+        } = *inputs;
         let tool_defs = self.registry.defs();
         // Attach the system prompt once; it leads every model call this run and
         // is captured verbatim in each model-call record's request body.
@@ -129,6 +145,24 @@ impl Agent {
             // Re-read the session's model each iteration so a switch made while
             // the run is in flight takes effect on its next provider call.
             let active_model = model.read_recover().clone();
+
+            // Warn (without truncating) when the assembled context nears the
+            // model's window. Re-checked each iteration because the context
+            // grows as tool calls round-trip — the common blowup path. This runs
+            // after the system prompt is attached (above) so the estimate counts
+            // the prompt's tool snippets, guidelines, and project context.
+            let mut pre_call_estimate: Option<TokenEstimate> = None;
+            if budget.has_window() {
+                let estimate = active_model
+                    .model
+                    .estimate_context_tokens(&context, &tool_defs);
+                pre_call_estimate = Some(estimate.clone());
+                if let Some(warning) = budget.warn_if_over(estimate) {
+                    sink.context_warning(&warning)
+                        .map_err(AgentRunError::Sink)?;
+                }
+            }
+
             let started_at_ms = now_ms();
             let started = Instant::now();
             let traced = match active_model.model.respond_with_trace(&context, &tool_defs) {
@@ -161,9 +195,11 @@ impl Agent {
             let response = traced.response;
             let provider_trace = traced.provider_trace;
             let usage = response.token_usage.clone().unwrap_or_else(|| {
-                let input_estimate = active_model
-                    .model
-                    .estimate_context_tokens(&context, &tool_defs);
+                let input_estimate = pre_call_estimate.unwrap_or_else(|| {
+                    active_model
+                        .model
+                        .estimate_context_tokens(&context, &tool_defs)
+                });
                 let output_estimate = active_model.model.estimate_output_tokens(&response);
                 crate::tokens::TokenUsage::estimated(input_estimate, output_estimate)
             });
@@ -433,6 +469,12 @@ pub(crate) trait AgentRunSink {
     }
 
     fn model_call_stack(&mut self, _stack: ModelCallStack) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Surface a pre-call context budget warning (no truncation). Default no-op
+    /// so sinks that don't render events still compile.
+    fn context_warning(&mut self, _warning: &TokenBudgetWarning) -> Result<(), Self::Error> {
         Ok(())
     }
 }
