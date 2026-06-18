@@ -1,9 +1,7 @@
 use nav::{
-    ChatMessage, ContextAssembler, ContextStrategy, FullForward, HeuristicTokenCounter,
-    ModelContext, TokenBudgetGuard, TokenCountConfidence, TokenCountSource, TokenEstimate,
-    ToolCall, TurnHistory,
+    ChatMessage, ContextAssembler, ContextStrategy, FullForward, TokenBudgetGuard,
+    TokenCountConfidence, TokenCountSource, TokenEstimate, ToolCall, TurnHistory,
 };
-use std::sync::Arc;
 
 #[test]
 fn context_assembly_preserves_turn_history_order_today() {
@@ -53,8 +51,14 @@ fn full_forward_forwards_every_turn_in_order() {
 
 #[test]
 fn full_forward_is_a_clone_of_the_history_not_a_view() {
-    let history = TurnHistory::from_turns(vec![ChatMessage::user("first")]);
+    let mut history = TurnHistory::from_turns(vec![ChatMessage::user("first")]);
     let context = FullForward::new().assemble(&history);
+
+    assert_eq!(context.messages(), &[ChatMessage::user("first")]);
+
+    // Mutating the source history after assembly must not change the assembled
+    // context — only a true clone (not a view into the history) survives this.
+    history.push(ChatMessage::user("second"));
 
     assert_eq!(context.messages(), &[ChatMessage::user("first")]);
 }
@@ -83,7 +87,7 @@ fn estimate(tokens: u64) -> TokenEstimate {
 
 #[test]
 fn budget_guard_warns_at_eighty_percent_of_the_window() {
-    let guard = TokenBudgetGuard::new(Arc::new(HeuristicTokenCounter));
+    let guard = TokenBudgetGuard::new();
 
     // 80 of 100 is exactly the threshold.
     let warning = guard
@@ -97,38 +101,34 @@ fn budget_guard_warns_at_eighty_percent_of_the_window() {
 
 #[test]
 fn budget_guard_is_silent_below_eighty_percent() {
-    let guard = TokenBudgetGuard::new(Arc::new(HeuristicTokenCounter));
+    let guard = TokenBudgetGuard::new();
 
     assert!(guard.check_estimate(estimate(79), Some(100)).is_none());
 }
 
 #[test]
 fn budget_guard_is_silent_when_the_window_is_unknown() {
-    let guard = TokenBudgetGuard::new(Arc::new(HeuristicTokenCounter));
+    let guard = TokenBudgetGuard::new();
 
     assert!(guard.check_estimate(estimate(u64::MAX), None).is_none());
     assert!(guard.check_estimate(estimate(u64::MAX), Some(0)).is_none());
 }
 
 #[test]
-fn budget_guard_check_estimates_the_context_with_its_counter() {
-    let guard = TokenBudgetGuard::new(Arc::new(HeuristicTokenCounter));
-
-    // A small window so the heuristic estimate of even a short message crosses
-    // 80%: the heuristic counts roughly bytes/3, so a few characters suffice.
-    let context = ModelContext::from_messages(vec![ChatMessage::user("hello world")]);
-
+fn budget_guard_warns_over_budget_above_one_hundred_percent() {
+    // The guard exists to report the over-budget case, where `used` exceeds the
+    // window; ratio() then returns >1.0, which the session renders uncapped.
+    let guard = TokenBudgetGuard::new();
     let warning = guard
-        .check(&context, &[], Some(1))
-        .expect("the estimate crosses the threshold");
+        .check_estimate(estimate(150), Some(100))
+        .expect("the threshold is crossed");
 
-    assert!(warning.used >= 1);
-    assert_eq!(warning.context_window, 1);
+    assert_eq!(warning.ratio(), 1.5);
 }
 
 #[test]
 fn budget_warning_reports_its_estimate_source() {
-    let guard = TokenBudgetGuard::new(Arc::new(HeuristicTokenCounter));
+    let guard = TokenBudgetGuard::new();
     let warning = guard
         .check_estimate(estimate(90), Some(100))
         .expect("the threshold is crossed");

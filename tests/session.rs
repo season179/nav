@@ -762,7 +762,10 @@ impl ChatModel for BudgetProbeModel {
     }
 
     fn estimate_context_tokens(&self, context: &ModelContext, _tools: &[ToolDef]) -> TokenEstimate {
-        *self.saw_system_prompt.lock().unwrap() = context.system_prompt().is_some();
+        // OR-accumulate so the probe records the system prompt being present in
+        // *any* estimate call, not just the last — a run now estimates once per
+        // loop iteration, and only one needs to prove the prompt was attached.
+        *self.saw_system_prompt.lock().unwrap() |= context.system_prompt().is_some();
         // Report a large estimate so the guard crosses any tiny window.
         TokenEstimate {
             tokens: u64::MAX,

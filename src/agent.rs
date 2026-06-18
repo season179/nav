@@ -137,19 +137,6 @@ impl Agent {
         // is captured verbatim in each model-call record's request body.
         context = context.with_system_prompt(self.system_prompt(workspace));
 
-        // Warn (without truncating) when the assembled context nears the model's
-        // window. This runs *after* the system prompt is attached so the estimate
-        // counts the prompt's tool snippets, guidelines, and project context —
-        // which can easily be thousands of tokens.
-        let active_model = model.read_recover().clone();
-        let estimate = active_model
-            .model
-            .estimate_context_tokens(&context, &tool_defs);
-        if let Some(warning) = budget.warn_if_over(estimate) {
-            sink.context_warning(&warning)
-                .map_err(AgentRunError::Sink)?;
-        }
-
         loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(RunStop::Cancelled);
@@ -158,6 +145,20 @@ impl Agent {
             // Re-read the session's model each iteration so a switch made while
             // the run is in flight takes effect on its next provider call.
             let active_model = model.read_recover().clone();
+
+            // Warn (without truncating) when the assembled context nears the
+            // model's window. Re-checked each iteration because the context
+            // grows as tool calls round-trip — the common blowup path. This runs
+            // after the system prompt is attached (above) so the estimate counts
+            // the prompt's tool snippets, guidelines, and project context.
+            let estimate = active_model
+                .model
+                .estimate_context_tokens(&context, &tool_defs);
+            if let Some(warning) = budget.warn_if_over(estimate) {
+                sink.context_warning(&warning)
+                    .map_err(AgentRunError::Sink)?;
+            }
+
             let started_at_ms = now_ms();
             let started = Instant::now();
             let traced = match active_model.model.respond_with_trace(&context, &tool_defs) {

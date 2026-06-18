@@ -31,7 +31,7 @@ use crate::stacks::ModelCallStack;
 use crate::storage::{
     SessionSummary, Storage, StorageError, project_root_to_string, workspace_root_to_string,
 };
-use crate::tokens::{HeuristicTokenCounter, TokenUsage};
+use crate::tokens::TokenUsage;
 use crate::tools::{CancelFlag, Registry};
 
 /// How a session originates, recorded on the persisted `sessions` row.
@@ -205,7 +205,7 @@ impl SessionStore {
             sessions: Mutex::new(HashMap::new()),
             agent: Agent::new(),
             context_assembler: ContextAssembler::new(),
-            token_budget_guard: TokenBudgetGuard::new(Arc::new(HeuristicTokenCounter)),
+            token_budget_guard: TokenBudgetGuard::new(),
             storage: None,
             stack_store: None,
             default_model: ActiveModel::new(model, None),
