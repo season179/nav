@@ -201,6 +201,13 @@ impl<'a> TokenBudget<'a> {
         }
     }
 
+    /// Whether this budget has a usable context window to measure against.
+    /// Warnings never fire when there is none, so callers can skip producing
+    /// an estimate (a full tokenization of the context) until this is true.
+    pub fn has_window(&self) -> bool {
+        self.context_window.filter(|window| *window != 0).is_some()
+    }
+
     /// Check the model's own `estimate` against this budget, returning a warning
     /// when it crosses the guard's threshold of the window.
     pub fn warn_if_over(&self, estimate: TokenEstimate) -> Option<TokenBudgetWarning> {

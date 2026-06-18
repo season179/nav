@@ -1,5 +1,5 @@
 use nav::{
-    ChatMessage, ContextAssembler, ContextStrategy, FullForward, TokenBudgetGuard,
+    ChatMessage, ContextAssembler, ContextStrategy, FullForward, TokenBudget, TokenBudgetGuard,
     TokenCountConfidence, TokenCountSource, TokenEstimate, ToolCall, TurnHistory,
 };
 
@@ -135,4 +135,17 @@ fn budget_warning_reports_its_estimate_source() {
 
     assert_eq!(warning.estimate.source, TokenCountSource::Heuristic);
     assert_eq!(warning.estimate.confidence, TokenCountConfidence::Low);
+}
+
+#[test]
+fn budget_has_window_only_when_a_nonzero_window_is_set() {
+    let guard = TokenBudgetGuard::new();
+
+    // No window: the default for new sessions. `has_window` must be false so
+    // callers skip the per-iteration context estimate entirely.
+    assert!(!TokenBudget::new(&guard, None).has_window());
+    // A zero window is treated like none at all (check_estimate filters it out).
+    assert!(!TokenBudget::new(&guard, Some(0)).has_window());
+    // A real window reports true.
+    assert!(TokenBudget::new(&guard, Some(200_000)).has_window());
 }

@@ -19,7 +19,7 @@ use crate::model::{
 };
 use crate::stacks::{ModelCallStack, ModelCallStackInput, build_model_call_stack};
 use crate::system_prompt::{self, BuildSystemPromptOptions};
-use crate::tokens::TokenUsage;
+use crate::tokens::{TokenEstimate, TokenUsage};
 use crate::tools::{CancelFlag, Registry};
 
 /// Runs one coding-agent turn with a configured toolset and workspace. The model
@@ -151,12 +151,16 @@ impl Agent {
             // grows as tool calls round-trip — the common blowup path. This runs
             // after the system prompt is attached (above) so the estimate counts
             // the prompt's tool snippets, guidelines, and project context.
-            let estimate = active_model
-                .model
-                .estimate_context_tokens(&context, &tool_defs);
-            if let Some(warning) = budget.warn_if_over(estimate) {
-                sink.context_warning(&warning)
-                    .map_err(AgentRunError::Sink)?;
+            let mut pre_call_estimate: Option<TokenEstimate> = None;
+            if budget.has_window() {
+                let estimate = active_model
+                    .model
+                    .estimate_context_tokens(&context, &tool_defs);
+                pre_call_estimate = Some(estimate.clone());
+                if let Some(warning) = budget.warn_if_over(estimate) {
+                    sink.context_warning(&warning)
+                        .map_err(AgentRunError::Sink)?;
+                }
             }
 
             let started_at_ms = now_ms();
@@ -191,9 +195,11 @@ impl Agent {
             let response = traced.response;
             let provider_trace = traced.provider_trace;
             let usage = response.token_usage.clone().unwrap_or_else(|| {
-                let input_estimate = active_model
-                    .model
-                    .estimate_context_tokens(&context, &tool_defs);
+                let input_estimate = pre_call_estimate.unwrap_or_else(|| {
+                    active_model
+                        .model
+                        .estimate_context_tokens(&context, &tool_defs)
+                });
                 let output_estimate = active_model.model.estimate_output_tokens(&response);
                 crate::tokens::TokenUsage::estimated(input_estimate, output_estimate)
             });
