@@ -1,0 +1,22 @@
+{
+  "name": "@nav/backend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "flue build",
+    "dev": "flue dev"
+  },
+  "dependencies": {
+    "@flue/runtime": "1.0.0-beta.5"
+  },
+  "devDependencies": {
+    "@flue/cli": "1.0.0-beta.5",
+    "@types/node": "^25.9.1",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=24.16.0 <25",
+    "pnpm": ">=11.0.0 <12"
+  }
+}

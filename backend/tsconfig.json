@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["flue.config.ts", "src/**/*.ts"],
+  "exclude": ["dist", "data", "node_modules"]
+}

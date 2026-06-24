@@ -1,8 +1,22 @@
+packages:
+  - "."
+  - "backend"
+
 # pnpm 11 reads all non-auth settings from this file (.npmrc is auth/registry only).
 # Allow prebuilt-binary deps to run their install scripts
 # (pnpm 10+ blocks dependency build scripts by default).
 allowBuilds:
+  "@google/genai": true
+  "@mongodb-js/zstd": true
   electron: true
   esbuild: true
+  node-liblzma: true
+  protobufjs: true
+  sharp: true
+  workerd: true
 # Enforce the pinned Node/pnpm engines declared in package.json.
 engineStrict: true
+minimumReleaseAgeExclude:
+  - '@flue/cli@1.0.0-beta.5'
+  - '@flue/runtime@1.0.0-beta.5'
+  - '@flue/sdk@1.0.0-beta.5'

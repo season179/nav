@@ -8,9 +8,12 @@
   "files": {
     "includes": [
       "desktop/**",
+      "backend/**",
       "scripts/**",
       "tests/**/*.cts",
       "!!.nav",
+      "!backend/data",
+      "!backend/dist",
       "!desktop/electron/out",
       "!desktop/electron/renderer/dist",
       "!desktop/electron/renderer/vendor"
