@@ -19,6 +19,41 @@
   line-height: 1.4;
 }
 
+.stacks-table-tools {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.stacks-table-sort {
+  min-height: 30px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-faint);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.stacks-table-sort:hover,
+.stacks-table-sort[aria-pressed="true"] {
+  border-color: var(--active);
+  color: var(--ink);
+}
+
+.stacks-table-sort:focus-visible {
+  outline: none;
+  border-color: var(--active);
+  box-shadow: 0 0 0 2px var(--active-tint);
+}
+
 .stacks-empty,
 .stacks-error {
   display: grid;

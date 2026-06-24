@@ -1,4 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
+import {
+  type ColumnDef,
+  getCoreRowModel,
+  getSortedRowModel,
+  type SortingState,
+  useReactTable,
+} from "@tanstack/react-table";
 import { useEffect, useMemo, useState } from "react";
 import {
   EMPTY_STACKS_RESULT,
@@ -17,6 +24,9 @@ export default function StacksPage({
   const result = stacksQuery.data ?? EMPTY_STACKS_RESULT;
   const stacks = Array.isArray(result.stacks) ? result.stacks : [];
   const unavailableReason = result.unavailableReason ?? null;
+  const [sorting, setSorting] = useState<SortingState>([
+    { id: "sequence", desc: false },
+  ]);
 
   useEffect(() => {
     if (sessionId && stacks.length === 0 && unavailableReason) {
@@ -24,10 +34,43 @@ export default function StacksPage({
     }
   }, [onUnavailable, sessionId, stacks.length, unavailableReason]);
 
-  const orderedStacks = useMemo(
-    () => [...stacks].sort((left, right) => left.sequence - right.sequence),
-    [stacks],
+  const columns = useMemo<ColumnDef<StackEntry>[]>(
+    () => [
+      {
+        accessorKey: "sequence",
+        header: "Call",
+      },
+      {
+        accessorKey: "status",
+        header: "Status",
+      },
+      {
+        accessorFn: (stack) => stack.request?.model ?? "",
+        id: "model",
+        header: "Model",
+      },
+      {
+        accessorKey: "durationMs",
+        header: "Duration",
+      },
+      {
+        accessorKey: "startedAtMs",
+        header: "Started",
+      },
+    ],
+    [],
   );
+  const stackTable = useReactTable({
+    columns,
+    data: stacks,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    onSortingChange: setSorting,
+    state: {
+      sorting,
+    },
+  });
+  const stackRows = stackTable.getRowModel().rows;
 
   if (!sessionId) {
     return (
@@ -55,19 +98,38 @@ export default function StacksPage({
           <p className="stacks-subtitle">
             {stacksQuery.isPending
               ? "Loading"
-              : `${orderedStacks.length} model call${
-                  orderedStacks.length === 1 ? "" : "s"
+              : `${stackRows.length} model call${
+                  stackRows.length === 1 ? "" : "s"
                 }`}
           </p>
         </div>
+        {stacks.length > 1 ? (
+          <fieldset className="stacks-table-tools" aria-label="Sort stacks">
+            {(["sequence", "status", "durationMs"] as const).map((columnId) => {
+              const column = stackTable.getColumn(columnId);
+              const sorted = column?.getIsSorted() ?? false;
+              return (
+                <button
+                  key={columnId}
+                  type="button"
+                  className="stacks-table-sort"
+                  aria-pressed={Boolean(sorted)}
+                  onClick={() => column?.toggleSorting(sorted === "asc")}
+                >
+                  {sortButtonLabel(columnId, sorted)}
+                </button>
+              );
+            })}
+          </fieldset>
+        ) : null}
       </div>
 
-      {orderedStacks.length === 0 ? (
+      {stackRows.length === 0 ? (
         <EmptyStacks text={emptyStackText(unavailableReason)} />
       ) : (
         <ol className="stack-call-list">
-          {orderedStacks.map((stack) => (
-            <StackCall key={stack.id} stack={stack} />
+          {stackRows.map((row) => (
+            <StackCall key={row.original.id} stack={row.original} />
           ))}
         </ol>
       )}
@@ -187,6 +249,25 @@ function emptyStackText(reason: string | null): string {
     default:
       return "No model calls captured for this live session yet";
   }
+}
+
+function sortButtonLabel(
+  columnId: "sequence" | "status" | "durationMs",
+  sorted: false | "asc" | "desc",
+): string {
+  const label =
+    columnId === "sequence"
+      ? "Call"
+      : columnId === "durationMs"
+        ? "Duration"
+        : "Status";
+  if (sorted === "asc") {
+    return `${label} asc`;
+  }
+  if (sorted === "desc") {
+    return `${label} desc`;
+  }
+  return label;
 }
 
 function tokenSummary(usage: unknown): string {
