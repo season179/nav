@@ -6,6 +6,6 @@
     "noEmit": true,
     "rootDir": "."
   },
-  "include": ["flue.config.ts", "src/**/*.ts"],
+  "include": ["flue.config.ts", "src/**/*.ts", "test/**/*.ts"],
   "exclude": ["dist", "data", "node_modules"]
 }

@@ -1,5 +1,8 @@
 import { flue } from "@flue/runtime/routing";
 import { Hono } from "hono";
+import { createControlPlane } from "./control-plane.js";
+import { backendServices } from "./services.js";
+import { startStackObservation } from "./stacks.js";
 
 const openApiDocument = {
   openapi: "3.1.0",
@@ -69,8 +72,32 @@ const openApiDocument = {
         },
       },
     },
+    "/nav/sessions": {
+      get: {
+        summary: "List nav sessions",
+        responses: {
+          "200": { description: "Session summaries." },
+        },
+      },
+      post: {
+        summary: "Create a nav session",
+        responses: {
+          "200": { description: "Created session id." },
+        },
+      },
+    },
+    "/nav/models": {
+      get: {
+        summary: "List configured model choices",
+        responses: {
+          "200": { description: "Model options." },
+        },
+      },
+    },
   },
 } as const;
+
+startStackObservation(backendServices.stacks);
 
 const app = new Hono();
 
@@ -83,6 +110,7 @@ app.get("/health", (c) =>
 
 app.get("/openapi.json", (c) => c.json(openApiDocument));
 
+app.route("/nav", createControlPlane(backendServices));
 app.route("/", flue());
 
 export default app;
