@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { Project, SessionListEntry } from "../lib/project-list.ts";
 import { groupSessionsByProject } from "../lib/project-list.ts";
 import {
@@ -7,6 +8,7 @@ import {
   projectLabel,
   projectSessionView,
   projectToggleView,
+  shouldVirtualizeProjectSessions,
 } from "./sidebar-model.ts";
 
 const projectOrderStorageKey = "nav.projectOrder.v1";
@@ -274,50 +276,136 @@ function ProjectSessions({
   onSelectSession: (sessionId: string) => void;
   onToggleProjectSessions: () => void;
 }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const shouldVirtualize = shouldVirtualizeProjectSessions(sessions.length);
+  const rowVirtualizer = useVirtualizer({
+    count: sessions.length,
+    estimateSize: () => 41,
+    getItemKey: (index) => sessions[index]?.sessionId ?? index,
+    getScrollElement: () => scrollRef.current,
+    overscan: 4,
+    useFlushSync: false,
+  });
+
   return (
-    <ul className="project-session-list">
-      {sessions.map((session) => (
-        <li key={session.sessionId}>
-          <button
-            type="button"
-            className="session-item"
-            data-session-id={session.sessionId}
-            aria-current={
-              session.sessionId === activeSessionId ? "true" : undefined
-            }
-            onClick={() => onSelectSession(session.sessionId)}
+    <>
+      {shouldVirtualize ? (
+        <div ref={scrollRef} className="project-session-virtual-viewport">
+          <ul
+            className="project-session-list project-session-list-virtual"
+            style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
           >
-            <span className="session-item-title">{sessionTitle(session)}</span>
-            {runningSessionIds.has(session.sessionId) ? (
-              <span
-                className="session-running"
-                role="img"
-                aria-label="Running"
-                title="Running"
+            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+              const session = sessions[virtualRow.index];
+              if (!session) {
+                return null;
+              }
+
+              return (
+                <li
+                  key={virtualRow.key}
+                  ref={rowVirtualizer.measureElement}
+                  className="project-session-virtual-row"
+                  data-index={virtualRow.index}
+                  style={{ transform: `translateY(${virtualRow.start}px)` }}
+                >
+                  <SessionItem
+                    activeSessionId={activeSessionId}
+                    attentionSessionIds={attentionSessionIds}
+                    runningSessionIds={runningSessionIds}
+                    session={session}
+                    onSelectSession={onSelectSession}
+                  />
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : (
+        <ul className="project-session-list">
+          {sessions.map((session) => (
+            <li key={session.sessionId}>
+              <SessionItem
+                activeSessionId={activeSessionId}
+                attentionSessionIds={attentionSessionIds}
+                runningSessionIds={runningSessionIds}
+                session={session}
+                onSelectSession={onSelectSession}
               />
-            ) : attentionSessionIds.has(session.sessionId) ? (
-              <span
-                className="session-attention"
-                role="img"
-                aria-label="Needs attention"
-                title="Needs attention"
-              />
-            ) : null}
-          </button>
-        </li>
-      ))}
+            </li>
+          ))}
+        </ul>
+      )}
       {toggle ? (
-        <li>
-          <button
-            type="button"
-            className="project-session-toggle"
-            aria-label={toggle.ariaLabel}
-            onClick={onToggleProjectSessions}
-          >
-            {toggle.label}
-          </button>
-        </li>
+        <SessionToggle
+          toggle={toggle}
+          onToggleProjectSessions={onToggleProjectSessions}
+        />
       ) : null}
+    </>
+  );
+}
+
+function SessionItem({
+  activeSessionId,
+  attentionSessionIds,
+  runningSessionIds,
+  session,
+  onSelectSession,
+}: {
+  activeSessionId: string | null;
+  attentionSessionIds: Set<string>;
+  runningSessionIds: Set<string>;
+  session: SessionListEntry;
+  onSelectSession: (sessionId: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="session-item"
+      data-session-id={session.sessionId}
+      aria-current={session.sessionId === activeSessionId ? "true" : undefined}
+      onClick={() => onSelectSession(session.sessionId)}
+    >
+      <span className="session-item-title">{sessionTitle(session)}</span>
+      {runningSessionIds.has(session.sessionId) ? (
+        <span
+          className="session-running"
+          role="img"
+          aria-label="Running"
+          title="Running"
+        />
+      ) : attentionSessionIds.has(session.sessionId) ? (
+        <span
+          className="session-attention"
+          role="img"
+          aria-label="Needs attention"
+          title="Needs attention"
+        />
+      ) : null}
+    </button>
+  );
+}
+
+function SessionToggle({
+  toggle,
+  onToggleProjectSessions,
+}: {
+  toggle: ProjectSessionToggle;
+  onToggleProjectSessions: () => void;
+}) {
+  return (
+    <ul className="project-session-list project-session-toggle-list">
+      <li>
+        <button
+          type="button"
+          className="project-session-toggle"
+          aria-label={toggle.ariaLabel}
+          onClick={onToggleProjectSessions}
+        >
+          {toggle.label}
+        </button>
+      </li>
     </ul>
   );
 }

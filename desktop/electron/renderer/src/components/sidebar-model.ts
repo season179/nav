@@ -1,7 +1,7 @@
 import type { Project, SessionListEntry } from "../lib/project-list.ts";
 
 export const PROJECT_SESSION_PREVIEW_LIMIT = 5;
-export const PROJECT_SESSION_DISPLAY_LIMIT = 20;
+export const PROJECT_SESSION_VIRTUAL_THRESHOLD = 12;
 
 export type ProjectToggleView = {
   ariaExpanded: "true" | "false";
@@ -35,13 +35,9 @@ export function projectSessionView(
   project: Project,
   expanded: boolean,
 ): ProjectSessionView {
-  const displaySessions = project.sessions.slice(
-    0,
-    PROJECT_SESSION_DISPLAY_LIMIT,
-  );
   const visibleSessions = expanded
-    ? displaySessions
-    : displaySessions.slice(0, PROJECT_SESSION_PREVIEW_LIMIT);
+    ? project.sessions
+    : project.sessions.slice(0, PROJECT_SESSION_PREVIEW_LIMIT);
 
   return {
     visibleSessions,
@@ -53,11 +49,7 @@ export function projectSessionToggle(
   project: Project,
   expanded: boolean,
 ): ProjectSessionToggle | null {
-  const displayCount = Math.min(
-    project.sessions.length,
-    PROJECT_SESSION_DISPLAY_LIMIT,
-  );
-  if (displayCount <= PROJECT_SESSION_PREVIEW_LIMIT) {
+  if (project.sessions.length <= PROJECT_SESSION_PREVIEW_LIMIT) {
     return null;
   }
 
@@ -68,12 +60,16 @@ export function projectSessionToggle(
     };
   }
 
-  const hiddenCount = displayCount - PROJECT_SESSION_PREVIEW_LIMIT;
+  const hiddenCount = project.sessions.length - PROJECT_SESSION_PREVIEW_LIMIT;
   const sessionLabel = hiddenCount === 1 ? "session" : "sessions";
   return {
     label: "Show more",
     ariaLabel: `Show ${hiddenCount} more ${sessionLabel} in ${projectLabel(project)}`,
   };
+}
+
+export function shouldVirtualizeProjectSessions(sessionCount: number): boolean {
+  return sessionCount > PROJECT_SESSION_VIRTUAL_THRESHOLD;
 }
 
 export function projectLabel(project: Project): string {

@@ -31,19 +31,30 @@ test("project sidebar omits session toggle for five sessions", async () => {
   assert.equal(view.toggle, null);
 });
 
-test("expanded project sidebar renders at most twenty sessions", async () => {
-  const { projectSessionView } = await loadSidebarModel();
+test("expanded project sidebar exposes every session for virtualization", async () => {
+  const { projectSessionView, shouldVirtualizeProjectSessions } =
+    await loadSidebarModel();
   const project = projectWithSessions(25);
 
   const collapsed = projectSessionView(project, false);
-  assert.equal(collapsed.toggle?.ariaLabel, "Show 15 more sessions in nav");
+  assert.equal(collapsed.toggle?.ariaLabel, "Show 20 more sessions in nav");
 
   const expanded = projectSessionView(project, true);
   assert.deepEqual(
     expanded.visibleSessions.map((session) => session.title),
-    sessionRange(20).map((session) => session.title),
+    project.sessions.map((session) => session.title),
   );
-  assert.equal(project.sessions.length, 25, "older sessions remain available");
+  assert.equal(
+    shouldVirtualizeProjectSessions(expanded.visibleSessions.length),
+    true,
+  );
+});
+
+test("short project sidebar does not use the virtualized path", async () => {
+  const { shouldVirtualizeProjectSessions } = await loadSidebarModel();
+
+  assert.equal(shouldVirtualizeProjectSessions(12), false);
+  assert.equal(shouldVirtualizeProjectSessions(13), true);
 });
 
 test("project heading exposes collapse and expand state", async () => {

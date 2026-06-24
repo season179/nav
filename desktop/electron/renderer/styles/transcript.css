@@ -1,11 +1,22 @@
 .message-list {
-  display: grid;
-  gap: 14px;
+  position: relative;
+  display: block;
   width: 100%;
   max-width: var(--content-max-width);
   margin: 0 auto;
   padding: 0;
   list-style: none;
+}
+
+.message-virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  padding-bottom: 14px;
+  box-sizing: border-box;
 }
 
 .message {
@@ -21,16 +32,15 @@
 }
 
 .message-user {
-  justify-self: end;
+  margin-left: auto;
   text-align: right;
 }
 
 .message-assistant {
-  justify-self: start;
+  margin-right: auto;
 }
 
 .message-error {
-  justify-self: start;
   display: flex;
   gap: 8px;
   max-width: 78%;
@@ -220,7 +230,6 @@
 
 /* Tool activity: a compact mono line, distinct from chat messages. */
 .message-tool {
-  justify-self: start;
   display: flex;
   align-items: baseline;
   gap: 8px;

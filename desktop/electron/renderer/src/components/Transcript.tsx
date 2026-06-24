@@ -1,9 +1,18 @@
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useMemo, useRef } from "react";
 import { renderMarkdown } from "../lib/markdown.ts";
 import type { Message, ToolMessage } from "../types.ts";
 
 export default function Transcript({ messages }: { messages: Message[] }) {
-  const listRef = useRef<HTMLOListElement>(null);
+  const scrollRef = useRef<HTMLElement>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: messages.length,
+    estimateSize: () => 88,
+    getItemKey: (index) => messages[index]?.id ?? index,
+    getScrollElement: () => scrollRef.current,
+    overscan: 6,
+    useFlushSync: false,
+  });
   const timestampMessageIds = useMemo(
     () => timestampVisibleMessageIds(messages),
     [messages],
@@ -16,19 +25,37 @@ export default function Transcript({ messages }: { messages: Message[] }) {
     if (messages.length === 0) {
       return;
     }
-    listRef.current?.lastElementChild?.scrollIntoView({ block: "end" });
-  }, [messages]);
+    rowVirtualizer.scrollToIndex(messages.length - 1, { align: "end" });
+  }, [messages, rowVirtualizer]);
 
   return (
-    <section className="chat" aria-label="Chat transcript">
-      <ol ref={listRef} className="message-list" id="message-list">
-        {messages.map((message) => (
-          <MessageRow
-            key={message.id}
-            message={message}
-            showTimestamp={timestampMessageIds.has(message.id)}
-          />
-        ))}
+    <section ref={scrollRef} className="chat" aria-label="Chat transcript">
+      <ol
+        className="message-list"
+        id="message-list"
+        style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
+      >
+        {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+          const message = messages[virtualRow.index];
+          if (!message) {
+            return null;
+          }
+
+          return (
+            <li
+              key={virtualRow.key}
+              ref={rowVirtualizer.measureElement}
+              className="message-virtual-row"
+              data-index={virtualRow.index}
+              style={{ transform: `translateY(${virtualRow.start}px)` }}
+            >
+              <MessageRow
+                message={message}
+                showTimestamp={timestampMessageIds.has(message.id)}
+              />
+            </li>
+          );
+        })}
       </ol>
     </section>
   );
@@ -46,7 +73,7 @@ function MessageRow({
   }
 
   return (
-    <li className={`message message-${message.role}`}>
+    <div className={`message message-${message.role}`}>
       {message.role === "assistant" ? (
         <MarkdownText text={message.text} />
       ) : (
@@ -57,7 +84,7 @@ function MessageRow({
           {formatTimestamp(new Date(message.createdAt))}
         </time>
       ) : null}
-    </li>
+    </div>
   );
 }
 
@@ -74,7 +101,7 @@ function MarkdownText({ text }: { text: string }) {
 
 function ToolMessageRow({ message }: { message: ToolMessage }) {
   return (
-    <li
+    <div
       className={`message message-tool message-tool-${message.state}`}
       data-tool-call-id={message.toolCallId || undefined}
     >
@@ -83,7 +110,7 @@ function ToolMessageRow({ message }: { message: ToolMessage }) {
       {message.detail ? (
         <span className="tool-detail">{previewText(message.detail)}</span>
       ) : null}
-    </li>
+    </div>
   );
 }
 

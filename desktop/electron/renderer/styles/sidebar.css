@@ -255,6 +255,33 @@
   list-style: none;
 }
 
+.project-session-virtual-viewport {
+  max-height: min(320px, 44vh);
+  margin-left: 20px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.project-session-list-virtual {
+  position: relative;
+  display: block;
+  margin-left: 0;
+}
+
+.project-session-virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  min-width: 0;
+  padding-bottom: 3px;
+  box-sizing: border-box;
+}
+
+.project-session-toggle-list {
+  margin-top: 3px;
+}
+
 .project-session-list > li {
   min-width: 0;
 }
