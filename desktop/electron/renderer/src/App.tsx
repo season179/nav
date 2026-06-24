@@ -16,11 +16,13 @@ import {
   navQueryKeys,
   navSessionsQueryOptions,
 } from "./lib/nav-queries.ts";
+import { createSessionState } from "./lib/session-runtime.ts";
 import {
-  appendMessage,
-  createSessionState,
-  reduceSessions,
-} from "./lib/session-runtime.ts";
+  appendStoredSessionMessage,
+  applyStoredSessionEvent,
+  updateStoredSessionState,
+  useSessionStates,
+} from "./lib/session-store.ts";
 import {
   STACK_AVAILABILITY_RECHECK_DELAY_MS,
   shouldRefreshStackAvailabilityForEvent,
@@ -32,7 +34,6 @@ import type {
   ModelOption,
   SessionEvent,
   SessionMode,
-  SessionState,
 } from "./types.ts";
 
 // Shown when a session has no state yet (e.g. before its first event arrives),
@@ -61,11 +62,6 @@ export default function App() {
   const queryClient = useQueryClient();
   const [connected, setConnected] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  // Every live session's transcript and run state, keyed by id. Routing events
-  // here by session id is what keeps concurrent sessions from interfering.
-  const [sessionStates, setSessionStates] = useState<
-    Record<string, SessionState>
-  >({});
   const [attentionSessionIds, setAttentionSessionIds] = useState(
     () => new Set<string>(),
   );
@@ -86,6 +82,7 @@ export default function App() {
     ...modelOptionsQueryOptions(),
     enabled: connected,
   });
+  const sessionStates = useSessionStates((states) => states);
   const sessionSummaries = sessionsQuery.data ?? [];
   const modelOptions = modelOptionsQuery.data ?? [];
 
@@ -130,56 +127,32 @@ export default function App() {
     return runtime;
   }, []);
 
-  // Update one session's view state, creating it on first touch so events for a
-  // brand-new (or backgrounded) session never need pre-registration.
-  const updateSessionState = useCallback(
-    (
-      sessionId: string | null,
-      updater: (state: SessionState) => SessionState,
-    ) => {
-      if (!sessionId) {
-        return;
-      }
-      setSessionStates((current) => {
-        const previous = current[sessionId] ?? createSessionState();
-        const next = updater(previous);
-        if (next === previous) {
-          return current;
-        }
-        return { ...current, [sessionId]: next };
-      });
-    },
-    [],
-  );
-
   const appendSessionMessage = useCallback(
     (sessionId: string, role: ChatMessage["role"], text?: string) => {
-      updateSessionState(sessionId, (state) =>
-        appendMessage(state, role, text),
-      );
+      appendStoredSessionMessage(sessionId, role, text);
     },
-    [updateSessionState],
+    [],
   );
 
   const setSessionRunning = useCallback(
     (sessionId: string, isRunning: boolean) => {
       runtimeFor(sessionId).running = isRunning;
-      updateSessionState(sessionId, (state) =>
+      updateStoredSessionState(sessionId, (state) =>
         state.running === isRunning ? state : { ...state, running: isRunning },
       );
     },
-    [runtimeFor, updateSessionState],
+    [runtimeFor],
   );
 
   const setSessionStopPending = useCallback(
     (sessionId: string, isPending: boolean) => {
-      updateSessionState(sessionId, (state) =>
+      updateStoredSessionState(sessionId, (state) =>
         state.stopPending === isPending
           ? state
           : { ...state, stopPending: isPending },
       );
     },
-    [updateSessionState],
+    [],
   );
 
   // Forget a session's stop request and clear its pending indicator. Used both
@@ -196,23 +169,23 @@ export default function App() {
 
   const setSessionModelInfo = useCallback(
     (sessionId: string | null, modelInfo: ModelInfo | null) => {
-      updateSessionState(sessionId, (state) => ({
+      updateStoredSessionState(sessionId, (state) => ({
         ...state,
         modelInfo: modelInfo ?? null,
       }));
     },
-    [updateSessionState],
+    [],
   );
 
   const setSessionStackAvailable = useCallback(
     (sessionId: string | null, available: boolean) => {
-      updateSessionState(sessionId, (state) =>
+      updateStoredSessionState(sessionId, (state) =>
         state.stackAvailable === available
           ? state
           : { ...state, stackAvailable: available },
       );
     },
-    [updateSessionState],
+    [],
   );
 
   const refreshStacks = useCallback(
@@ -435,7 +408,7 @@ export default function App() {
       }
 
       // Transcript + running/stopPending for the named session only.
-      setSessionStates((current) => reduceSessions(current, event));
+      applyStoredSessionEvent(event);
 
       switch (event.type) {
         case "run.started":
