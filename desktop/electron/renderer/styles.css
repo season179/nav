@@ -6,5 +6,6 @@
 @import "./styles/sidebar.css"; /* sidebar: projects, session list, new chat */
 @import "./styles/layout.css"; /* shell, session toolbar, view tabs, chat frame */
 @import "./styles/stacks.css"; /* the debug "stacks" page */
+@import "./styles/settings.css"; /* settings view: model/thinking/mode */
 @import "./styles/transcript.css"; /* messages, markdown, tables, tool activity */
 @import "./styles/composer.css"; /* composer input, model metadata, send/stop */

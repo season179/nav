@@ -2,12 +2,21 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
 test("nav route helpers build Electron-safe hash paths", async () => {
-  const { chatPath, sessionChatPath, sessionStacksPath, settingsPath } =
-    await loadAppRoutes();
+  const {
+    chatPath,
+    sessionChatPath,
+    sessionSettingsPath,
+    sessionStacksPath,
+    settingsPath,
+  } = await loadAppRoutes();
 
   assert.equal(chatPath(), "/chat");
   assert.equal(sessionChatPath("session 1"), "/sessions/session%201");
   assert.equal(sessionStacksPath("session 1"), "/sessions/session%201/stacks");
+  assert.equal(
+    sessionSettingsPath("session 1"),
+    "/sessions/session%201/settings",
+  );
   assert.equal(settingsPath(), "/settings");
 });
 
@@ -31,6 +40,18 @@ test("nav route parser deep-links sessions and thread views", async () => {
     known: true,
     sessionId: "session 1",
     view: "stacks",
+  });
+  assert.deepEqual(parseNavPathname("/sessions/session%201/settings"), {
+    canonicalPath: "/sessions/session%201/settings",
+    known: true,
+    sessionId: "session 1",
+    view: "settings",
+  });
+  assert.deepEqual(parseNavPathname("/settings"), {
+    canonicalPath: "/settings",
+    known: true,
+    sessionId: null,
+    view: "settings",
   });
 });
 

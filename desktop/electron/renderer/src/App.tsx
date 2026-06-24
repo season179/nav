@@ -9,6 +9,7 @@ import {
   useState,
 } from "react";
 import Composer from "./components/Composer.tsx";
+import SettingsPage from "./components/SettingsPage.tsx";
 import Sidebar from "./components/Sidebar.tsx";
 import StacksPage from "./components/StacksPage.tsx";
 import Transcript from "./components/Transcript.tsx";
@@ -44,7 +45,7 @@ const EMPTY_SESSION_STATE = createSessionState();
 // Where startup/connection errors land before any real session exists.
 const SYSTEM_SESSION_ID = "system";
 
-type ViewName = Extract<NavAppView, "chat" | "stacks">;
+type ViewName = Extract<NavAppView, "chat" | "stacks" | "settings">;
 
 // Imperative per-session run bookkeeping read synchronously by the stop/send
 // paths (React state would be stale inside the async stop loop). `running`
@@ -94,7 +95,12 @@ export default function App() {
   const sessionStates = useSessionStates((states) => states);
   const sessionSummaries = sessionsQuery.data ?? [];
   const modelOptions = modelOptionsQuery.data ?? [];
-  const activeView: ViewName = routeState.view === "stacks" ? "stacks" : "chat";
+  const activeView: ViewName =
+    routeState.view === "stacks"
+      ? "stacks"
+      : routeState.view === "settings"
+        ? "settings"
+        : "chat";
 
   const setConnectedState = useCallback((isConnected: boolean) => {
     connectedRef.current = isConnected;
@@ -122,6 +128,18 @@ export default function App() {
       sessionId: string | null | undefined,
       options: { replace?: boolean } = {},
     ) => {
+      if (view === "settings") {
+        if (sessionId) {
+          void navigate({
+            params: { sessionId },
+            replace: options.replace,
+            to: "/sessions/$sessionId/settings",
+          });
+          return;
+        }
+        void navigate({ replace: options.replace, to: "/settings" });
+        return;
+      }
       if (view === "stacks" && sessionId) {
         void navigate({
           params: { sessionId },
@@ -818,7 +836,19 @@ export default function App() {
           showStacks={activeState.stackAvailable}
           onSelectView={selectView}
         />
-        {activeView === "stacks" ? (
+        {activeView === "settings" ? (
+          <SettingsPage
+            connected={connected}
+            modelInfo={activeState.modelInfo}
+            modelOptions={modelOptions}
+            modelSwitching={modelSwitching}
+            newSessionMode={newSessionMode}
+            sessionId={activeSessionId}
+            onModelChange={switchModel}
+            onNewSessionModeChange={changeNewSessionMode}
+            onThinkingChange={switchThinking}
+          />
+        ) : activeView === "stacks" ? (
           <StacksPage
             key={activeSessionId ?? "none"}
             onUnavailable={markStacksUnavailable}
@@ -904,6 +934,15 @@ function SessionToolbar({
             Stacks
           </button>
         ) : null}
+        <button
+          type="button"
+          className="session-view-tab"
+          aria-current={activeView === "settings" ? "page" : undefined}
+          disabled={!connected}
+          onClick={() => onSelectView("settings")}
+        >
+          Settings
+        </button>
       </nav>
     </header>
   );

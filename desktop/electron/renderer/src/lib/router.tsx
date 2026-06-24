@@ -30,6 +30,11 @@ const sessionStacksRoute = createRoute({
   path: "sessions/$sessionId/stacks",
 });
 
+const sessionSettingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "sessions/$sessionId/settings",
+});
+
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "settings",
@@ -40,6 +45,7 @@ const routeTree = rootRoute.addChildren([
   chatRoute,
   sessionChatRoute,
   sessionStacksRoute,
+  sessionSettingsRoute,
   settingsRoute,
 ]);
 

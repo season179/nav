@@ -15,6 +15,9 @@ export const sessionChatPath = (sessionId: string) =>
 export const sessionStacksPath = (sessionId: string) =>
   `${sessionChatPath(sessionId)}/stacks`;
 
+export const sessionSettingsPath = (sessionId: string) =>
+  `${sessionChatPath(sessionId)}/settings`;
+
 export const settingsPath = () => "/settings";
 
 export function navPathFor(
@@ -22,7 +25,7 @@ export function navPathFor(
   sessionId: string | null | undefined,
 ) {
   if (view === "settings") {
-    return settingsPath();
+    return sessionId ? sessionSettingsPath(sessionId) : settingsPath();
   }
   if (!sessionId) {
     return chatPath();
@@ -41,10 +44,17 @@ export function parseNavPathname(pathname: string): NavRouteState {
     return routeState("settings", null, settingsPath(), true);
   }
 
-  const sessionMatch = normalized.match(/^\/sessions\/([^/]+)(?:\/(stacks))?$/);
+  const sessionMatch = normalized.match(
+    /^\/sessions\/([^/]+)(?:\/(stacks|settings))?$/,
+  );
   if (sessionMatch) {
     const sessionId = safeDecodeURIComponent(sessionMatch[1]);
-    const view = sessionMatch[2] === "stacks" ? "stacks" : "chat";
+    const view =
+      sessionMatch[2] === "stacks"
+        ? "stacks"
+        : sessionMatch[2] === "settings"
+          ? "settings"
+          : "chat";
     return routeState(view, sessionId, navPathFor(view, sessionId), true);
   }
 
