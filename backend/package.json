@@ -5,10 +5,12 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "flue build",
-    "dev": "flue dev"
+    "dev": "flue dev",
+    "start": "node scripts/start.mjs"
   },
   "dependencies": {
-    "@flue/runtime": "1.0.0-beta.5"
+    "@flue/runtime": "1.0.0-beta.5",
+    "hono": "^4.12.27"
   },
   "devDependencies": {
     "@flue/cli": "1.0.0-beta.5",
