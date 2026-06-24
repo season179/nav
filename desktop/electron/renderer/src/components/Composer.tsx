@@ -1,4 +1,10 @@
+import { useDebouncer } from "@tanstack/react-pacer";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  browserComposerDraftStorage,
+  readComposerDraft,
+  writeComposerDraft,
+} from "../lib/composer-draft.ts";
 import type {
   ModelInfo,
   ModelOption,
@@ -21,6 +27,7 @@ const thinkingLevelDetails: Record<string, string> = {
 
 export default function Composer({
   connected,
+  draftKey,
   modelInfo,
   modelOptions,
   modelSwitching,
@@ -34,6 +41,7 @@ export default function Composer({
   onThinkingChange,
 }: {
   connected: boolean;
+  draftKey: string | null;
   modelInfo: ModelInfo | null;
   modelOptions: ModelOption[];
   modelSwitching: boolean;
@@ -46,8 +54,18 @@ export default function Composer({
   onStop: () => void;
   onThinkingChange: (level: string) => void;
 }) {
-  const [text, setText] = useState("");
+  const draftStorage = browserComposerDraftStorage();
+  const [text, setText] = useState(() =>
+    readComposerDraft(draftStorage, draftKey),
+  );
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const saveDraftDebouncer = useDebouncer(
+    (draft: string) => writeComposerDraft(draftStorage, draftKey, draft),
+    {
+      onUnmount: (debouncer) => debouncer.flush(),
+      wait: 250,
+    },
+  );
 
   useEffect(() => {
     const input = inputRef.current;
@@ -64,6 +82,11 @@ export default function Composer({
     }
   }, [connected]);
 
+  function updateText(nextText: string) {
+    setText(nextText);
+    saveDraftDebouncer.maybeExecute(nextText);
+  }
+
   async function handleSubmit(event: React.SyntheticEvent<HTMLFormElement>) {
     event.preventDefault();
     const message = text.trim();
@@ -71,6 +94,8 @@ export default function Composer({
       return;
     }
 
+    saveDraftDebouncer.cancel();
+    writeComposerDraft(draftStorage, draftKey, "");
     setText("");
     await onSend(message);
   }
@@ -98,7 +123,7 @@ export default function Composer({
           rows={1}
           disabled={!connected}
           value={text}
-          onChange={(event) => setText(event.target.value)}
+          onChange={(event) => updateText(event.target.value)}
           onKeyDown={handleKeyDown}
         />
         <button

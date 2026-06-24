@@ -30,6 +30,7 @@
     "vite": "^8.0.14"
   },
   "dependencies": {
+    "@tanstack/react-pacer": "^0.22.1",
     "@tanstack/react-query": "^5.101.1",
     "@tanstack/react-query-devtools": "^5.101.1",
     "@tanstack/react-router": "^1.170.16",

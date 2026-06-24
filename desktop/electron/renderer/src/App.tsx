@@ -831,7 +831,9 @@ export default function App() {
               messages={activeState.messages}
             />
             <Composer
+              key={activeSessionId ?? "none"}
               connected={connected}
+              draftKey={activeSessionId}
               modelInfo={activeState.modelInfo}
               modelOptions={modelOptions}
               modelSwitching={modelSwitching}
