@@ -1,6 +1,7 @@
 import { flue } from "@flue/runtime/routing";
 import { Hono } from "hono";
 import { createControlPlane } from "./control-plane.js";
+import { registerNavMockProvider } from "./mock-provider.js";
 import { backendServices } from "./services.js";
 import { startStackObservation } from "./stacks.js";
 
@@ -97,6 +98,7 @@ const openApiDocument = {
   },
 } as const;
 
+registerNavMockProvider();
 startStackObservation(backendServices.stacks);
 
 const app = new Hono();

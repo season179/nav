@@ -132,6 +132,33 @@ describe("nav control plane", () => {
     });
   });
 
+  test("selects the offline mock model when smoke mode is enabled", () => {
+    const models = new ModelCatalog({ env: { NAV_MOCK_MODEL: "1" } });
+
+    expect(models.defaultSelection()).toMatchObject({
+      provider: "nav-mock",
+      model: "nav-smoke",
+      thinkingLevel: "off",
+    });
+    expect(models.defaultModelInfo()).toMatchObject({
+      label: "nav Offline Smoke Mock",
+      provider: "nav-mock",
+      model: "nav-smoke",
+      thinking: "off",
+      tokenUsage: {
+        used: 0,
+        contextWindow: 128_000,
+      },
+    });
+    expect(models.list()).toContainEqual(
+      expect.objectContaining({
+        provider: "nav-mock",
+        model: "nav-smoke",
+        thinkingLevels: ["off"],
+      }),
+    );
+  });
+
   test("creates tracked worktree sessions with the agent cwd pointed at the worktree", async () => {
     const workspace = await tempDir("nav-workspace-");
     const projectRoot = await tempDir("nav-project-");

@@ -62,6 +62,11 @@ Real model turns read provider keys from the backend process environment, such
 as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. Electron inherits the user's
 environment and passes it through to the backend process.
 
+Offline Electron smoke runs set `NAV_MOCK_MODEL=1`. In that mode the backend
+registers a local `nav-mock/nav-smoke` provider, selects it for new sessions,
+and streams a deterministic assistant response without reading any provider
+key.
+
 ## Modes
 
 `local` mode runs the agent in the selected workspace.

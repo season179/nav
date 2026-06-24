@@ -14,15 +14,10 @@
     checks now read as intent. The guards narrow the nullable module state and
     shadow `backendUrl`/`mainWindow` so existing shorthand call sites are unchanged.
 
-- [x] Decide how to handle poisoned Rust locks.
-  - Added `src/lock.rs` with `LockExt::lock_recover()` and
-    `RwLockExt::read_recover()/write_recover()`: they log once and recover the
-    guard instead of panicking, so one poisoned section degrades gracefully
-    rather than cascading into a dead backend. Replaced all 26 single-line and 5
-    multi-line `.lock()/.read()/.write().unwrap()` call sites across
-    `session.rs`, `storage/mod.rs`, `agent.rs`, `stack_store.rs`. (Left the lone
-    `get_mut().unwrap()` in `with_model_info`: it is exclusive `&mut self` builder
-    access during construction, not a concurrent lock.)
+- [x] Retire the old backend lock-recovery cleanup.
+  - This item belonged to the removed pre-Flue backend. The current backend is a
+    TypeScript Flue service, so there is no remaining lock-recovery follow-up in
+    the active implementation.
 
 - [x] Split renderer CSS by feature/component.
   - `styles.css` is now an `@import` manifest; rules live in
@@ -51,26 +46,16 @@
     and the updated `electron_backend_client` e2e prove a switch is isolated to
     one session and leaves the default untouched.
 
-- [x] Split the largest module (`src/model.rs`, 1721 lines) into a `model/`
-  module of focused units.
-  - `model/mod.rs` is a thin facade: submodule declarations plus `pub use`
-    re-exports, so every existing `crate::model::*` path is unchanged.
-  - `model/chat.rs` holds the request/response domain types and the `ChatModel`
-    trait; `model/choice.rs` holds `ModelChoice` resolution and the
-    renderer-facing `ModelInfo`; `model/openai.rs` holds the two OpenAI-compatible
-    adapters and their wire (de)serialization; `model/mock.rs` holds `MockModel`
-    and `FailingModel`.
-  - Cross-module internals were narrowed to `pub(crate)` (`ProviderCallTrace::new`
-    / `with_error`, `ModelError::with_provider_trace`, `OpenAiConfig::is_responses_api`,
-    `message_json`, `FailingModel`) rather than left fully public. Surfaced
-    `TracedModelResponse` at the crate root for parity with the other
-    `ChatModel::respond_with_trace` signature types.
+- [x] Retire the old model-module split follow-up.
+  - This item belonged to the removed pre-Flue backend model layer. The current
+    model catalog and provider selection live in `backend/src/model-catalog.ts`.
 
 ## Open (need a product/scope decision — investigated, not yet changed)
 
 - [ ] Split the remaining large components into smaller focused units.
   - Candidates: `App.tsx` (873) extract hooks/subscriptions from rendering;
     `main.cts` (now smaller after the guard extraction) move IPC registration to
-    its own module; `lib.rs` (620) separate HTTP/RPC routing from backend helpers.
+    its own module; backend control-plane handlers can be split further if they
+    keep growing.
   - Deferred deliberately: these are large, churny diffs better landed on their
     own so they stay reviewable, rather than mixed into the mechanical cleanup.

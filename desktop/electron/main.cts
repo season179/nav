@@ -596,7 +596,8 @@ function forwardEvent(window: BrowserWindow | null, event: SessionEvent): void {
     trace.mark("electron.smoke.run_completed");
     console.log("nav electron smoke received run.completed");
     printStartupSummary();
-    app.quit();
+    stopBackend();
+    app.exit(0);
   }
   if (smokeMode && event.type === "run.failed") {
     trace.mark("electron.smoke.run_failed", {
@@ -614,6 +615,11 @@ async function runSmokeTurn(): Promise<void> {
     sessionId,
     text: "smoke test message",
   });
+  if (sessionId) {
+    subscriptions.get(sessionId)?.close();
+    subscriptions.delete(sessionId);
+    ensureSubscription(mainWindow, sessionId);
+  }
   trace.mark("electron.smoke.turn.accepted");
 }
 

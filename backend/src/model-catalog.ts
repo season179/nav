@@ -1,3 +1,9 @@
+import {
+  isNavMockModelEnabled,
+  NAV_MOCK_MODEL,
+  NAV_MOCK_PROVIDER,
+} from "./mock-provider.js";
+
 export const THINKING_LEVELS = [
   "off",
   "minimal",
@@ -42,6 +48,7 @@ type ModelDefinition = ModelOption & {
 };
 
 const DEFAULT_MODEL_SPECIFIER = "anthropic/claude-sonnet-4-6";
+const MOCK_MODEL_SPECIFIER = `${NAV_MOCK_PROVIDER}/${NAV_MOCK_MODEL}`;
 
 const DEFAULT_MODELS: ModelDefinition[] = [
   {
@@ -62,6 +69,15 @@ const DEFAULT_MODELS: ModelDefinition[] = [
   },
 ];
 
+const MOCK_MODEL: ModelDefinition = {
+  provider: NAV_MOCK_PROVIDER,
+  model: NAV_MOCK_MODEL,
+  label: "nav Offline Smoke Mock",
+  thinkingLevels: ["off"],
+  defaultThinkingLevel: "off",
+  contextWindow: 128_000,
+};
+
 export class ModelCatalog {
   readonly #definitions: ModelDefinition[];
   readonly #env: NodeJS.ProcessEnv;
@@ -73,7 +89,9 @@ export class ModelCatalog {
     definitions?: ModelDefinition[];
     env?: NodeJS.ProcessEnv;
   } = {}) {
-    this.#definitions = definitions;
+    this.#definitions = isNavMockModelEnabled(env)
+      ? [...definitions, MOCK_MODEL]
+      : definitions;
     this.#env = env;
   }
 
@@ -90,7 +108,9 @@ export class ModelCatalog {
 
   defaultSelection(): ModelSelection {
     const parsed = parseModelSpecifier(
-      this.#env.NAV_DEFAULT_MODEL ?? DEFAULT_MODEL_SPECIFIER,
+      isNavMockModelEnabled(this.#env)
+        ? MOCK_MODEL_SPECIFIER
+        : (this.#env.NAV_DEFAULT_MODEL ?? DEFAULT_MODEL_SPECIFIER),
     );
     const definition = this.find(parsed.provider, parsed.model);
 

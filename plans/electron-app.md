@@ -1,89 +1,91 @@
-# Plan: Electron App as a Future Frontend
+# Plan: Electron App Frontend
 
-Status: planning note. Do not implement this whole document in one shot.
+Status: current orientation note. The implementation plan lives in
+`docs/plan-flue-tanstack-rewrite.md`; this document records the product and
+boundary decisions for the desktop app.
 
 `nav` is first a learning project for building a coding agent and agent
-harness. A desktop app can become useful later, but it should not pull the
-project away from the backend, protocol, and TUI learning path.
+harness. The desktop app should make that learning surface usable without
+turning Electron into a second backend.
 
 ## Recommendation
 
-Do not build the full Electron app as one milestone.
+Keep Electron small and focused:
 
-The first Electron milestone should be a small viability slice:
+1. Electron Main supervises the local Flue backend and owns OS-only capabilities.
+2. The preload bridge exposes a narrow typed API for backend URL discovery,
+   directory picking, and the "Start in" preference.
+3. The renderer talks to the local HTTP control plane and Flue agent streams as
+   an app client.
+4. Canonical sessions, transcript history, model configuration, stacks, and
+   worktree paths stay backend-owned.
 
-1. Record the HTTP/SSE transport decision.
-2. Create or verify a runnable local HTTP/SSE backend surface.
-3. Start a minimal Electron shell with a secure renderer/preload/main boundary.
-4. Launch or attach to the local Rust backend from Electron Main.
-5. Render one backend session event stream read-only.
-6. Add one command path, probably `session.sendMessage`.
-
-Approvals, durable replay, crash recovery, multi-window behavior, packaging,
-auto-update, and polished desktop UI should come later.
+Approvals, durable replay hardening, multi-window behavior, packaging,
+auto-update, and polished desktop UI can build on that foundation later.
 
 ## Why Not One Shot
 
-The original shape combines too many separate projects:
+The desktop app still spans several separate concerns:
 
 - Electron shell and window lifecycle.
 - Renderer security, preload API design, and IPC filtering.
-- Backend launch, supervision, restart, and logs.
-- Protocol transport choice.
-- Session stream rendering.
-- Command acknowledgement and cancellation.
+- Backend launch, supervision, shutdown, and logs.
+- HTTP control-plane reads and mutations.
+- Flue SSE stream rendering.
+- Command acknowledgement and cancellation semantics.
 - Approvals.
-- Durable session/event replay.
+- Durable session and event replay.
 - Crash recovery.
 - Packaging and distribution.
 
-That is too much surface area for one implementation pass. It also risks
-adding dormant desktop code that makes `nav` harder to understand before the
-backend and protocol are settled.
+Keep each slice independently verifiable so the app remains understandable while
+the harness evolves.
 
 ## Transport Decision
 
-Decision: Electron will use the chosen `nav` local HTTP/SSE protocol first.
+Decision: Electron uses the local Flue backend over HTTP plus Flue's native SSE
+streaming routes.
 
 ```text
-commands: POST /rpc
-events:   GET /sessions/{session_id}/events
+control plane: /nav/*
+agent send:    POST /agents/nav/:id
+agent stream:  GET /agents/nav/:id?live=sse&offset=...
 ```
 
-The architecture docs describe JSON-RPC over HTTP for commands and SSE for
-ordered session events. Electron should start by acting as another frontend
-client of that contract, not by inventing a second protocol.
+Electron Main still watches for the backend readiness line:
 
-Current state: this checkout has a minimal `nav-local-backend` fixture command
-documented in `docs/local-backend.md`. It is not a full `nav-server`
-implementation and there is still no `crates/nav-protocol` crate. Treat those
-names as possible future implementation names, not as current components.
-Electron spike work can attach to the fixture SSE endpoint for read-only
-protocol wiring, but command execution and live agent-loop behavior remain
-backend follow-up work.
+```text
+nav local backend listening on http://127.0.0.1:<port>
+```
 
-Recommended first shape:
+The renderer should receive the resolved base URL through the preload bridge,
+then use normal HTTP and SSE clients from the sandboxed renderer process.
+
+Recommended shape:
 
 ```text
 Electron Renderer
+  -> local HTTP/SSE client
+  -> Flue backend
+
+Electron Renderer
   -> Electron Preload API
   -> Electron Main Process
-  -> local HTTP/SSE client
-  -> local nav backend endpoint
+  -> OS-only operations
 ```
 
-Use a `stdin/stdout` transport only if there is a concrete reason the HTTP/SSE
-path cannot serve a packaged desktop app. If that path is chosen later, treat it
-as a deliberate protocol adapter, not as the primary protocol.
+Use a process stdio transport only if there is a concrete packaging reason the
+HTTP/SSE path cannot serve the desktop app. Treat that as a later adapter, not
+as the primary app protocol.
 
 Important Electron note: Electron `utilityProcess` does not support writable
-`stdin`. A `stdin/stdout` protocol would usually mean Node `child_process.spawn`
-from Electron Main, with all the supervision and packaging details that implies.
+`stdin`. A stdio protocol would usually mean Node `child_process.spawn` from
+Electron Main, with all the supervision and packaging details that implies.
 
 ## Security Boundary
 
-Electron Main is the only process that may supervise or talk directly to the
-Rust backend.
+Electron Main is the only process that may supervise the backend or touch
+native desktop capabilities.
 
 The renderer should never receive raw Node, Electron, filesystem, shell, or
 backend process access. Keep `nodeIntegration` off, keep `contextIsolation` on,
@@ -92,8 +94,10 @@ and expose only a narrow typed API through preload.
 Good preload shape:
 
 ```ts
-window.nav.sessionSendMessage({ sessionId, text });
-window.nav.onSessionEvent(sessionId, callback);
+window.nav.getBackendUrl();
+window.nav.pickDirectory();
+window.nav.getStartMode();
+window.nav.setStartMode("worktree");
 ```
 
 Bad preload shape:
@@ -115,158 +119,92 @@ Reference docs:
 
 ### Electron Renderer
 
-- Render sessions, assistant output, tool calls, diffs, and approvals.
+- Render sessions, assistant output, tool calls, stacks, diffs, and approvals.
 - Hold local presentation state.
-- Call only the safe preload API.
-- Avoid any direct process, filesystem, shell, or backend transport access.
+- Read and mutate backend state through TanStack Query.
+- Feed Flue stream events into the TanStack Store-backed session reducer.
+- Call only the safe preload API for OS-owned work.
+- Avoid any direct process, filesystem, shell, or backend supervision access.
 
 ### Electron Preload
 
 - Expose a minimal typed frontend API.
 - Validate renderer calls before invoking Electron Main IPC.
-- Subscribe renderer code to typed backend events.
 - Hide `ipcRenderer` itself.
 
 ### Electron Main
 
 - Create and manage windows.
-- Start, locate, or attach to the Rust backend.
+- Start and stop the local Flue backend.
+- Detect the backend readiness line and expose the resolved base URL.
 - Own backend supervision, restart, and shutdown behavior.
-- Speak the backend protocol.
-- Route backend responses/events to renderer windows.
+- Own OS-only capabilities such as directory picking and local preferences.
 - Enforce IPC method allowlists.
 
-### Rust Backend
+### Flue Backend
 
-- Own sessions, runs, messages, tool calls, approvals, and event history.
-- Execute agent runs and tool operations.
+- Own sessions, runs, transcript persistence, model choices, stacks, and
+  worktree metadata.
+- Execute agent runs with Flue's local sandbox.
 - Own filesystem, Git, shell, model, and policy side effects.
-- Persist canonical session state.
-- Expose protocol projections for frontends.
+- Expose the `/nav/*` control plane and Flue native agent routes for frontends.
 
-## Protocol Model
+## Product Milestones
 
-Commands use request/response JSON-RPC semantics. The response acknowledges that
-the command was accepted and returns correlation IDs.
+### Phase 0: Backend Reachability
 
-Example command:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "019f2f6f-f178-7a72-9f28-000000000001",
-  "method": "session.sendMessage",
-  "params": {
-    "sessionId": "019f2f6f-f178-7a72-9f28-000000000100",
-    "text": "Explain this repo"
-  }
-}
-```
-
-Long-running output is delivered through session events, not by holding the
-command response open until the run finishes.
-
-Core identifiers:
-
-| Identifier | Purpose |
-| --- | --- |
-| `id` | JSON-RPC request/response correlation |
-| `sessionId` | Long-lived coding-agent session |
-| `runId` | One execution or agent turn |
-| `eventId` | Ordered session event identity |
-| `toolCallId` | Tool start/completion correlation |
-| `approvalId` | Approval request/response correlation |
-
-## Persistence Model
-
-Do not make the Electron app the source of truth for session history.
-
-The durable source of truth belongs in the Rust backend. Electron should rebuild
-its UI from backend state and event replay.
-
-The backend should own:
-
-- sessions
-- runs
-- turns and turn parts
-- events
-- approvals
-- tool calls
-- file changes
-
-The desktop app may keep small local UI preferences, but not canonical
-transcripts or provider state.
-
-## Phased Milestones
-
-### Phase 0: Transport Decision
-
-- Re-read the archived protocol docs and the current checkout.
-- Confirm the selected transport is local HTTP/SSE.
-- Do not assume `nav-server` or `crates/nav-protocol` already exist.
-- Open or complete the prerequisite backend/protocol work needed for a runnable
-  local HTTP/SSE endpoint.
-- Do not create desktop UI scaffolding yet.
+- Main starts the Flue backend.
+- Renderer receives the backend URL.
+- Health and OpenAPI endpoints answer keyless.
 
 Exit criteria:
 
-- One written decision: HTTP/SSE first.
-- One runnable local HTTP/SSE endpoint exists, or the Electron work is blocked
-  on a specific backend/protocol issue.
+- A local desktop window can reach the backend without provider keys.
 
-### Phase 1: Read-Only Desktop Spike
+### Phase 1: Session Shell
 
-Prerequisite: a runnable local HTTP/SSE backend endpoint exists.
-
-Current state: this checkout has a minimal Electron spike under
-`desktop/electron/`. It starts the `nav-local-backend` fixture from Electron
-Main, receives the deterministic fixture stream over HTTP/SSE, and renders the
-events read-only. It is intentionally not a polished desktop product.
-
-- Add the smallest Electron shell.
-- Keep the renderer secure by default.
-- Start or attach to the backend from Electron Main.
-- Subscribe to one session event stream.
-- Render streamed messages read-only.
+- Create, list, select, resume, and delete sessions.
+- Preserve the chosen workspace and start mode.
+- Reflect backend unavailable and reconnect states.
 
 Exit criteria:
 
-- A local desktop window can display a backend session stream.
-- No command execution, approvals, filesystem access, or packaging work.
+- A user can create a session and relaunch into it.
 
-### Phase 2: One Command Path
+### Phase 2: Live Chat
 
-- Add `session.sendMessage`.
-- Route command acknowledgement back to the renderer.
-- Continue rendering run events from the event stream.
-- Handle basic backend unavailable and reconnect states.
+- Send a prompt through Flue's native agent route.
+- Subscribe to the stream with offset handling.
+- Render live text, completion, errors, and tool lifecycle messages.
 
 Exit criteria:
 
 - A user can send one prompt and see the response stream.
 
-### Phase 3: Approvals and Tool Visibility
+### Phase 3: Model, Settings, And Stacks
 
-- Render tool calls and approval requests.
-- Add typed approve/reject preload methods.
-- Keep approval decisions in the backend protocol.
+- Switch model and thinking level per session.
+- Configure "Start in" mode through the settings view.
+- Render captured stack rows with sortable/filterable affordances.
 
 Exit criteria:
 
-- A desktop user can approve or reject a pending tool request.
+- A user can inspect and adjust the execution context for a session.
 
 ### Phase 4: Durable Resume
 
 - Rebuild desktop UI state from backend session storage.
-- Support event replay and reconnect behavior.
+- Support stream reconnect and offset resume behavior.
 - Handle backend restart without losing canonical session history.
 
 Exit criteria:
 
-- Closing and reopening the desktop app restores the session from backend state.
+- Closing and reopening the desktop app restores the selected session from
+  backend state.
 
 ### Phase 5: Desktop Product Work
 
+- Approval UX.
 - Multi-window behavior.
 - App menus and keyboard shortcuts.
 - File/diff viewing.
@@ -275,14 +213,13 @@ Exit criteria:
 
 Exit criteria:
 
-- The app is useful as a desktop product, not only as a protocol spike.
+- The app is useful as a desktop product, not only as a harness UI.
 
 ## Key Design Rules
 
-- Electron is a frontend, not a second backend.
-- Use the chosen HTTP/SSE protocol before creating a new transport.
-- Keep Electron-specific concepts out of the Rust harness.
-- Keep backend-owned side effects behind Rust protocol methods.
+- Electron is a frontend and supervisor, not a second backend.
+- Use the local HTTP/SSE backend before creating a new transport.
+- Keep backend-owned side effects behind backend routes.
 - Keep the renderer isolated from Node, Electron internals, and process access.
-- Do not stream multiple JSON-RPC responses with the same request ID.
-- Use event IDs and run/session IDs for long-running output correlation.
+- Use Flue stream offsets and run/session IDs for long-running output
+  correlation.
