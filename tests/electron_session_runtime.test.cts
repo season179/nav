@@ -74,6 +74,27 @@ test("run.failed records the error and ends the run", async () => {
   assert.equal(last?.text, "model exploded");
 });
 
+test("assistant deltas update one bubble until authoritative completion", async () => {
+  const { createSessionState, reduceSessionState } = await loadSessionRuntime();
+
+  let state = reduceSessionState(createSessionState(), {
+    type: "message.delta",
+    text: "hel",
+  });
+  state = reduceSessionState(state, { type: "message.delta", text: "lo" });
+  assert.equal(state.messages.length, 1, "deltas update one live message");
+  assert.equal((state.messages[0] as ChatMessage).text, "hello");
+
+  state = reduceSessionState(state, {
+    type: "message.completed",
+    text: "hello!",
+  });
+
+  assert.equal(state.messages.length, 1, "completion replaces the live text");
+  assert.equal((state.messages[0] as ChatMessage).text, "hello!");
+  assert.equal(state.streamingAssistantMessageId, null);
+});
+
 test("an event only touches the session it names", async () => {
   const { reduceSessions } = await loadSessionRuntime();
 

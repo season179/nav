@@ -119,6 +119,7 @@ export type SessionState = {
   stackAvailable: boolean;
   stackRefreshKey: number;
   messageSeq: number;
+  streamingAssistantMessageId: string | null;
 };
 
 // The API the preload exposes on `window.nav`.

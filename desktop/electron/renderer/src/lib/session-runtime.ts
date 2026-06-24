@@ -25,6 +25,7 @@ export function createSessionState(): SessionState {
     stackAvailable: false,
     stackRefreshKey: 0,
     messageSeq: 0,
+    streamingAssistantMessageId: null,
   };
 }
 
@@ -122,6 +123,8 @@ export function reduceSessionState(
       return state.running ? state : { ...state, running: true };
     case "assistant.tool_calls":
       return event.text ? appendMessage(state, "assistant", event.text) : state;
+    case "message.delta":
+      return appendAssistantDelta(state, event.text);
     case "tool.started":
       return upsertToolLine(
         state,
@@ -146,7 +149,7 @@ export function reduceSessionState(
         event.error,
       );
     case "message.completed":
-      return appendMessage(state, "assistant", event.text);
+      return completeAssistantMessage(state, event.text);
     case "run.completed":
     case "run.cancelled":
       return finishRun(state);
@@ -161,9 +164,78 @@ export function reduceSessionState(
 
 function finishRun(state: SessionState): SessionState {
   if (!state.running && !state.stopPending) {
+    return state.streamingAssistantMessageId
+      ? { ...state, streamingAssistantMessageId: null }
+      : state;
+  }
+  return {
+    ...state,
+    running: false,
+    stopPending: false,
+    streamingAssistantMessageId: null,
+  };
+}
+
+function appendAssistantDelta(
+  state: SessionState,
+  text: string | undefined,
+): SessionState {
+  if (!text) {
     return state;
   }
-  return { ...state, running: false, stopPending: false };
+
+  if (state.streamingAssistantMessageId) {
+    const index = state.messages.findIndex(
+      (message) => message.id === state.streamingAssistantMessageId,
+    );
+    const existing = state.messages[index];
+    if (existing?.role === "assistant") {
+      const messages = state.messages.slice();
+      messages[index] = { ...existing, text: `${existing.text}${text}` };
+      return { ...state, messages };
+    }
+  }
+
+  const messageSeq = state.messageSeq + 1;
+  const id = `message-${messageSeq}`;
+  return {
+    ...state,
+    messageSeq,
+    streamingAssistantMessageId: id,
+    messages: [
+      ...state.messages,
+      {
+        id,
+        role: "assistant",
+        text,
+        createdAt: new Date().toISOString(),
+      },
+    ],
+  };
+}
+
+function completeAssistantMessage(
+  state: SessionState,
+  text: string | undefined,
+): SessionState {
+  if (!state.streamingAssistantMessageId) {
+    return appendMessage(state, "assistant", text);
+  }
+
+  const index = state.messages.findIndex(
+    (message) => message.id === state.streamingAssistantMessageId,
+  );
+  const existing = state.messages[index];
+  if (existing?.role !== "assistant") {
+    return {
+      ...appendMessage(state, "assistant", text),
+      streamingAssistantMessageId: null,
+    };
+  }
+
+  const messages = state.messages.slice();
+  messages[index] = { ...existing, text: text ?? existing.text };
+  return { ...state, messages, streamingAssistantMessageId: null };
 }
 
 // Apply an event to a map of sessions keyed by id, touching only the session it

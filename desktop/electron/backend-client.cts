@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
+import { parseFlueSseBuffer } from "./flue-session-events.cjs";
 import type { RpcResponse, SessionEvent } from "./types.cjs";
 
 export type Subscription = { close(): void };
@@ -27,6 +28,7 @@ export function subscribeToSessionEvents({
     backendUrl,
   );
   eventsUrl.searchParams.set("live", "sse");
+  eventsUrl.searchParams.set("offset", "-1");
   const transport = eventsUrl.protocol === "https:" ? https : http;
   let buffer = "";
   let closed = false;
@@ -42,7 +44,7 @@ export function subscribeToSessionEvents({
     response.setEncoding("utf8");
     response.on("data", (chunk: string) => {
       buffer += chunk;
-      const parsed = parseSseBuffer(buffer);
+      const parsed = parseFlueSseBuffer(buffer, { sessionId });
       buffer = parsed.remainder;
       for (const event of parsed.events) {
         onEvent(event);
@@ -76,24 +78,6 @@ export function subscribeToSessionEvents({
       request.destroy();
     },
   };
-}
-
-function parseSseBuffer(buffer: string): {
-  events: SessionEvent[];
-  remainder: string;
-} {
-  const events: SessionEvent[] = [];
-  const frames = buffer.split(/\n\n/);
-  const remainder = frames.pop() ?? "";
-
-  for (const frame of frames) {
-    const event = parseSseFrame(frame);
-    if (event) {
-      events.push(event);
-    }
-  }
-
-  return { events, remainder };
 }
 
 export function sendRpc({
@@ -343,26 +327,6 @@ function readBackendError(payload: unknown): string | null {
   }
   const message = (error as { message?: unknown }).message;
   return typeof message === "string" ? message : null;
-}
-
-function parseSseFrame(frame: string): SessionEvent | null {
-  const data = frame
-    .split(/\n/)
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice("data:".length).trimStart())
-    .join("\n");
-
-  if (!data) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(data) as SessionEvent;
-  } catch {
-    // A malformed SSE payload must not tear down the stream: drop the frame so
-    // parseSseBuffer keeps delivering the well-formed events around it.
-    return null;
-  }
 }
 
 function paramsObject(params: unknown): Record<string, unknown> {
