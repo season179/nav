@@ -2,17 +2,19 @@
   "name": "nav",
   "private": true,
   "description": "Learning project for building a coding agent.",
+  "packageManager": "pnpm@11.9.0",
   "engines": {
-    "node": ">=22.18.0"
+    "node": ">=24.16.0 <25",
+    "pnpm": ">=11.0.0 <12"
   },
   "scripts": {
-    "reset-data": "bun scripts/reset-data.mjs",
+    "reset-data": "node scripts/reset-data.mjs",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.main.json --noEmit",
     "main:build": "tsc -p tsconfig.main.json",
     "renderer:build": "vite build --config desktop/electron/renderer/vite.config.ts",
-    "electron:dev": "bun run main:build && bun run renderer:build && electron desktop/electron/out/main.cjs",
-    "electron:smoke": "bun run main:build && bun run renderer:build && electron desktop/electron/out/main.cjs --smoke",
-    "check:electron": "bun run typecheck && bun run main:build && bun run renderer:build && node --test tests/*.test.cts",
+    "electron:dev": "pnpm run main:build && pnpm run renderer:build && electron desktop/electron/out/main.cjs",
+    "electron:smoke": "pnpm run main:build && pnpm run renderer:build && electron desktop/electron/out/main.cjs --smoke",
+    "check:electron": "pnpm run typecheck && pnpm run main:build && pnpm run renderer:build && node --test tests/*.test.cts",
     "lint": "biome check",
     "lint:fix": "biome check --write",
     "format": "biome format --write"
