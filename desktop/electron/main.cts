@@ -97,6 +97,7 @@ ipcMain.handle("nav:send-message", async (_event, request) => {
     method: "session.sendMessage",
     params: { sessionId: targetSessionId, text },
   });
+  ensureSubscription(mainWindow, targetSessionId);
 });
 
 ipcMain.handle("nav:stop", async (_event, requestedSessionId) => {
@@ -337,33 +338,31 @@ function activateSession(
   { startup = false }: { startup?: boolean } = {},
 ): void {
   sessionId = id;
-  ensureSubscription(window, id, { startup, announce: startup });
+  if (startup) {
+    sendConnected(window, id);
+  }
+  ensureSubscription(window, id, { startup });
 }
 
 // Subscribe to a session's event feed once and keep it open. Re-activating an
 // already-subscribed session is a no-op (its backlog already streamed and lives
 // in the renderer), so switching back never replays or duplicates a transcript.
-// `announce` sends the renderer the single startup `connected` status; later
-// sessions are activated by the renderer itself, which must not be told to jump
-// its active conversation.
+// Flue beta.5 returns 400 for a native stream before the first accepted
+// submission creates it, so startup readiness is announced from the control
+// plane and a pre-run stream miss is treated as "subscribe again after send".
 function ensureSubscription(
   window: BrowserWindow | null,
   id: string,
-  {
-    startup = false,
-    announce = false,
-  }: { startup?: boolean; announce?: boolean } = {},
+  { startup = false }: { startup?: boolean } = {},
 ): void {
   if (subscriptions.has(id)) {
-    if (announce) {
-      sendConnected(window, id);
-    }
     return;
   }
   if (!backendUrl) {
     return;
   }
   markStartup(startup, "electron.sse.subscribe.start", { session_id: id });
+  let streamUnavailableBeforeRun = false;
   const subscription = subscribeToSessionEvents({
     backendUrl,
     sessionId: id,
@@ -373,10 +372,8 @@ function ensureSubscription(
         status_code: statusCode,
       });
       if (statusCode !== 200) {
+        streamUnavailableBeforeRun = statusCode === 400 || statusCode === 404;
         return;
-      }
-      if (announce) {
-        sendConnected(window, id);
       }
       markStartup(startup, "electron.connected", { session_id: id });
     },
@@ -388,6 +385,10 @@ function ensureSubscription(
     },
     onError(error) {
       markStartup(startup, "electron.sse.error", { error: error.message });
+      if (streamUnavailableBeforeRun) {
+        subscriptions.delete(id);
+        return;
+      }
       // A stream can fire onError more than once (request and response paths),
       // possibly after the session was re-subscribed. Only tear down the entry
       // if it is still this exact subscription, never a newer replacement.

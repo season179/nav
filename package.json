@@ -12,9 +12,9 @@
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.main.json --noEmit && pnpm --dir backend run typecheck",
     "main:build": "tsc -p tsconfig.main.json",
     "renderer:build": "vite build --config desktop/electron/renderer/vite.config.ts",
-    "electron:dev": "pnpm run main:build && pnpm run renderer:build && electron desktop/electron/out/main.cjs",
-    "electron:smoke": "pnpm run main:build && pnpm run renderer:build && electron desktop/electron/out/main.cjs --smoke",
-    "check:electron": "pnpm run typecheck && pnpm run main:build && pnpm run renderer:build && node --test tests/*.test.cts",
+    "electron:dev": "pnpm --dir backend run build && pnpm run main:build && pnpm run renderer:build && electron desktop/electron/out/main.cjs",
+    "electron:smoke": "pnpm --dir backend run build && pnpm run main:build && pnpm run renderer:build && electron desktop/electron/out/main.cjs --smoke",
+    "check:electron": "pnpm run typecheck && pnpm --dir backend run build && pnpm run main:build && pnpm run renderer:build && node --test tests/*.test.cts",
     "lint": "biome check",
     "lint:fix": "biome check --write",
     "format": "biome format --write"

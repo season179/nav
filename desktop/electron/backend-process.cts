@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { StartupTrace } from "./startup-trace.cjs";
 
@@ -22,23 +23,16 @@ export async function startLocalBackend({
   trace,
 }: StartLocalBackendOptions): Promise<{ child: ChildProcess; url: string }> {
   trace?.mark("electron.backend.spawn.start");
+  const backendRoot = path.join(projectRoot, "backend");
   const child = spawn(
-    "cargo",
-    [
-      "run",
-      "--quiet",
-      "--bin",
-      "nav-local-backend",
-      "--",
-      "--bind",
-      "127.0.0.1:0",
-    ],
+    process.env.NAV_NODE_BINARY ?? "node",
+    [path.join(backendRoot, "scripts", "start.mjs")],
     {
-      cwd: projectRoot,
+      cwd: backendRoot,
       stdio: ["ignore", "pipe", "pipe"],
-      // Inherit the user's environment (so a real NAV_API_KEY flows through),
-      // with caller overrides such as forcing the mock model.
-      env: { ...process.env, ...env },
+      // Inherit the user's environment so provider keys flow through, while
+      // pinning the default agent workspace to the Electron project root.
+      env: { ...process.env, NAV_AGENT_CWD: projectRoot, ...env },
     },
   );
   trace?.mark("electron.backend.process.spawned", { pid: child.pid });

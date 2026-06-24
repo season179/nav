@@ -1,7 +1,7 @@
-// Shared shapes for the Electron main process. The backend is a separate Rust
-// process reached over JSON-RPC + SSE, so these describe the wire payloads the
-// main process reads — fields are intentionally permissive where the backend
-// owns the schema.
+// Shared shapes for the Electron main process. The backend is a separate Flue
+// process reached over HTTP + SSE, so these describe the payloads the main
+// process reads — fields are intentionally permissive where the backend owns
+// the schema.
 
 // One persisted session as returned by `session.list`.
 export type BackendSession = {
@@ -22,8 +22,8 @@ export type SessionEvent = {
   [key: string]: unknown;
 };
 
-// A decoded JSON-RPC response. `sendRpc` rejects on `error`, so callers that
-// resolve can read `result` directly.
+// A decoded backend response. `sendRpc` keeps the old result envelope for the
+// main process while routing requests to the Flue HTTP control plane.
 // biome-ignore lint/suspicious/noExplicitAny: the backend owns each method's result schema.
 export type RpcResponse<T = any> = {
   jsonrpc?: string;

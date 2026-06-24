@@ -22,7 +22,11 @@ export function subscribeToSessionEvents({
   onError,
   onOpen,
 }: SubscribeOptions): Subscription {
-  const eventsUrl = new URL(`/sessions/${sessionId}/events`, backendUrl);
+  const eventsUrl = new URL(
+    `/agents/nav/${encodeURIComponent(sessionId)}`,
+    backendUrl,
+  );
+  eventsUrl.searchParams.set("live", "sse");
   const transport = eventsUrl.protocol === "https:" ? https : http;
   let buffer = "";
   let closed = false;
@@ -101,24 +105,183 @@ export function sendRpc({
   method: string;
   params?: unknown;
 }): Promise<RpcResponse> {
-  const rpcUrl = new URL("/rpc", backendUrl);
-  const transport = rpcUrl.protocol === "https:" ? https : http;
-  const body = JSON.stringify({
+  const id = randomUUID();
+
+  return sendBackendMethod({ backendUrl, method, params }).then((result) => ({
     jsonrpc: "2.0",
-    id: randomUUID(),
-    method,
-    ...(params ? { params } : {}),
-  });
+    id,
+    result,
+  }));
+}
+
+async function sendBackendMethod({
+  backendUrl,
+  method,
+  params,
+}: {
+  backendUrl: string;
+  method: string;
+  params?: unknown;
+}): Promise<unknown> {
+  const values = paramsObject(params);
+
+  switch (method) {
+    case "session.create":
+      return requestJson({
+        url: new URL("/nav/sessions", backendUrl),
+        method: "POST",
+        body: values,
+      });
+    case "session.list":
+      return requestJson({
+        url: new URL("/nav/sessions", backendUrl),
+        method: "GET",
+      });
+    case "session.latest": {
+      const url = new URL("/nav/sessions/latest", backendUrl);
+      const cwd = optionalString(values.cwd);
+      if (cwd) {
+        url.searchParams.set("cwd", cwd);
+      }
+      return requestJson({ url, method: "GET" });
+    }
+    case "session.resume": {
+      const sessionId = requiredString(values.sessionId, "sessionId");
+      return requestJson({
+        url: new URL(
+          `/nav/sessions/${encodeURIComponent(sessionId)}/resume`,
+          backendUrl,
+        ),
+        method: "POST",
+      });
+    }
+    case "session.delete": {
+      const sessionId = requiredString(values.sessionId, "sessionId");
+      return requestJson({
+        url: new URL(
+          `/nav/sessions/${encodeURIComponent(sessionId)}`,
+          backendUrl,
+        ),
+        method: "DELETE",
+      });
+    }
+    case "session.sendMessage": {
+      const sessionId = requiredString(values.sessionId, "sessionId");
+      const text = requiredString(values.text, "text");
+      return requestJson({
+        url: new URL(
+          `/agents/nav/${encodeURIComponent(sessionId)}`,
+          backendUrl,
+        ),
+        method: "POST",
+        body: { message: text },
+      });
+    }
+    case "session.stop": {
+      const sessionId = requiredString(values.sessionId, "sessionId");
+      return requestJson({
+        url: new URL(
+          `/nav/sessions/${encodeURIComponent(sessionId)}/stop`,
+          backendUrl,
+        ),
+        method: "POST",
+      });
+    }
+    case "session.modelInfo": {
+      const sessionId = optionalString(values.sessionId);
+      return requestJson({
+        url: new URL(
+          sessionId
+            ? `/nav/sessions/${encodeURIComponent(sessionId)}/model`
+            : "/nav/model",
+          backendUrl,
+        ),
+        method: "GET",
+      });
+    }
+    case "session.models":
+      return requestJson({
+        url: new URL("/nav/models", backendUrl),
+        method: "GET",
+      });
+    case "session.switchModel": {
+      const sessionId = requiredString(values.sessionId, "sessionId");
+      return requestJson({
+        url: new URL(
+          `/nav/sessions/${encodeURIComponent(sessionId)}/model`,
+          backendUrl,
+        ),
+        method: "POST",
+        body: {
+          provider: requiredString(values.provider, "provider"),
+          model: requiredString(values.model, "model"),
+          ...(optionalString(values.thinkingLevel)
+            ? { thinkingLevel: values.thinkingLevel }
+            : {}),
+        },
+      });
+    }
+    case "session.switchThinking": {
+      const sessionId = requiredString(values.sessionId, "sessionId");
+      return requestJson({
+        url: new URL(
+          `/nav/sessions/${encodeURIComponent(sessionId)}/thinking`,
+          backendUrl,
+        ),
+        method: "POST",
+        body: {
+          thinkingLevel: requiredString(values.thinkingLevel, "thinkingLevel"),
+        },
+      });
+    }
+    case "session.stacks": {
+      const sessionId = requiredString(values.sessionId, "sessionId");
+      return requestJson({
+        url: new URL(
+          `/nav/sessions/${encodeURIComponent(sessionId)}/stacks`,
+          backendUrl,
+        ),
+        method: "GET",
+      });
+    }
+    case "session.stackAvailability": {
+      const sessionId = requiredString(values.sessionId, "sessionId");
+      return requestJson({
+        url: new URL(
+          `/nav/sessions/${encodeURIComponent(sessionId)}/stacks/availability`,
+          backendUrl,
+        ),
+        method: "GET",
+      });
+    }
+    default:
+      throw new Error(`unsupported backend method: ${method}`);
+  }
+}
+
+function requestJson({
+  url,
+  method,
+  body,
+}: {
+  url: URL;
+  method: "DELETE" | "GET" | "POST";
+  body?: unknown;
+}): Promise<unknown> {
+  const transport = url.protocol === "https:" ? https : http;
+  const payload = body ? JSON.stringify(body) : undefined;
 
   return new Promise((resolve, reject) => {
     const request = transport.request(
-      rpcUrl,
+      url,
       {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(body),
-        },
+        method,
+        headers: payload
+          ? {
+              "content-type": "application/json",
+              "content-length": Buffer.byteLength(payload),
+            }
+          : undefined,
       },
       (response) => {
         let payload = "";
@@ -127,19 +290,34 @@ export function sendRpc({
           payload += chunk;
         });
         response.on("end", () => {
-          let parsed: RpcResponse;
+          let parsed: unknown;
           try {
-            parsed = JSON.parse(payload) as RpcResponse;
+            parsed = payload ? JSON.parse(payload) : {};
           } catch (error) {
             reject(
               new Error(
-                `RPC ${method} returned invalid JSON: ${(error as Error).message}`,
+                `${method} ${url.pathname} returned invalid JSON: ${
+                  (error as Error).message
+                }`,
               ),
             );
             return;
           }
-          if (parsed.error) {
-            reject(new Error(`RPC ${method} failed: ${parsed.error.message}`));
+          const backendError = readBackendError(parsed);
+          if (!response.statusCode || response.statusCode >= 400) {
+            reject(
+              new Error(
+                `${method} ${url.pathname} failed with HTTP ${
+                  response.statusCode ?? "unknown"
+                }${backendError ? `: ${backendError}` : ""}`,
+              ),
+            );
+            return;
+          }
+          if (backendError) {
+            reject(
+              new Error(`${method} ${url.pathname} failed: ${backendError}`),
+            );
             return;
           }
           resolve(parsed);
@@ -148,22 +326,59 @@ export function sendRpc({
     );
 
     request.on("error", reject);
-    request.write(body);
+    if (payload) {
+      request.write(payload);
+    }
     request.end();
   });
 }
 
+function readBackendError(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const error = (payload as { error?: unknown }).error;
+  if (!error || typeof error !== "object") {
+    return null;
+  }
+  const message = (error as { message?: unknown }).message;
+  return typeof message === "string" ? message : null;
+}
+
 function parseSseFrame(frame: string): SessionEvent | null {
-  const dataLine = frame.split(/\n/).find((line) => line.startsWith("data: "));
-  if (!dataLine) {
+  const data = frame
+    .split(/\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart())
+    .join("\n");
+
+  if (!data) {
     return null;
   }
 
   try {
-    return JSON.parse(dataLine.slice("data: ".length)) as SessionEvent;
+    return JSON.parse(data) as SessionEvent;
   } catch {
     // A malformed SSE payload must not tear down the stream: drop the frame so
     // parseSseBuffer keeps delivering the well-formed events around it.
     return null;
   }
+}
+
+function paramsObject(params: unknown): Record<string, unknown> {
+  return params && typeof params === "object"
+    ? (params as Record<string, unknown>)
+    : {};
+}
+
+function optionalString(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function requiredString(value: unknown, name: string): string {
+  const parsed = optionalString(value);
+  if (!parsed) {
+    throw new Error(`${name} is required`);
+  }
+  return parsed;
 }

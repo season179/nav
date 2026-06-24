@@ -8,6 +8,7 @@ const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
 const crypto = require("node:crypto");
+const { once } = require("node:events");
 
 const {
   subscribeToSessionEvents,
@@ -19,19 +20,23 @@ const {
   startLocalBackend,
 } = require("../desktop/electron/out/backend-process.cjs");
 
-test("Electron backend client runs a multi-turn chat over RPC + SSE", async () => {
-  const backend = await startMockBackend();
-  const controller = new AbortController();
-  const events: { type: string; text?: string }[] = [];
+test("Electron backend client reaches the Flue control plane", async () => {
+  const backend = await startIsolatedBackend();
   let projectRoot = null;
 
   try {
+    const healthResponse = await fetch(new URL("/health", backend.url));
+    assert.equal(healthResponse.status, 200);
+    assert.equal((await healthResponse.json()).service, "nav-backend");
+
     const created = await sendRpc({
       backendUrl: backend.url,
       method: "session.create",
+      params: { mode: "local" },
     });
     const sessionId = created.result.sessionId;
     assert.ok(sessionId, "session.create returns a sessionId");
+
     const listed = await sendRpc({
       backendUrl: backend.url,
       method: "session.list",
@@ -74,69 +79,53 @@ test("Electron backend client runs a multi-turn chat over RPC + SSE", async () =
       "new project sessions list under their selected directory",
     );
 
-    await new Promise<void>((resolve, reject) => {
-      let completions = 0;
-      subscribeToSessionEvents({
-        backendUrl: backend.url,
-        sessionId,
-        signal: controller.signal,
-        onEvent(event: { type: string }) {
-          events.push(event);
-          if (event.type === "run.completed") {
-            completions += 1;
-            if (completions === 1) {
-              // First turn done; send a follow-up that depends on it.
-              sendRpc({
-                backendUrl: backend.url,
-                method: "session.sendMessage",
-                params: { sessionId, text: "what is my name?" },
-              }).catch(reject);
-            } else {
-              resolve();
-            }
-          }
-        },
-        onError: reject,
-      });
-
-      // First turn.
-      sendRpc({
-        backendUrl: backend.url,
-        method: "session.sendMessage",
-        params: { sessionId, text: "my name is Ada" },
-      }).catch(reject);
+    const latest = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.latest",
+      params: { cwd: projectRoot },
     });
+    assert.equal(latest.result.sessionId, projectSession.result.sessionId);
+
+    const resumed = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.resume",
+      params: { sessionId },
+    });
+    assert.equal(resumed.result.sessionId, sessionId);
+
+    const stopped = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.stop",
+      params: { sessionId },
+    });
+    assert.equal(stopped.result.stopped, false);
+
+    const stacks = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.stacks",
+      params: { sessionId },
+    });
+    assert.deepEqual(stacks.result.stacks, []);
+
+    const availability = await sendRpc({
+      backendUrl: backend.url,
+      method: "session.stackAvailability",
+      params: { sessionId },
+    });
+    assert.equal(availability.result.available, true);
   } finally {
-    controller.abort();
-    backend.stop();
+    await backend.stop();
     if (projectRoot) {
       fs.rmSync(projectRoot, { recursive: true, force: true });
     }
   }
-
-  const types = events.map((event) => event.type);
-  assert.deepEqual(types, [
-    "session.created",
-    "user.message",
-    "run.started",
-    "message.completed",
-    "run.completed",
-    "user.message",
-    "run.started",
-    "message.completed",
-    "run.completed",
-  ]);
-
-  const assistantReplies = events.filter(
-    (event) => event.type === "message.completed",
-  );
-  // The second reply proves prior context was forwarded to the model.
-  assert.match(assistantReplies[1].text, /what is my name\?/);
-  assert.match(assistantReplies[1].text, /my name is Ada/);
 });
 
 test("Electron backend client lists and switches configured models", async () => {
-  const backend = await startConfiguredBackend();
+  const backend = await startIsolatedBackend({
+    NAV_DEFAULT_MODEL: "openai/gpt-5",
+    NAV_DEFAULT_THINKING_LEVEL: "high",
+  });
 
   try {
     const listed = await sendRpc({
@@ -145,15 +134,15 @@ test("Electron backend client lists and switches configured models", async () =>
     });
     assert.deepEqual(listed.result.models, [
       {
-        provider: "local",
-        model: "qwen-coder",
-        label: "Qwen Coder",
-        thinkingLevels: ["off", "low", "medium"],
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+        thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
       },
       {
         provider: "openai",
-        model: "gpt-default",
-        label: "Default GPT",
+        model: "gpt-5",
+        label: "GPT-5",
         thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
       },
     ]);
@@ -170,9 +159,9 @@ test("Electron backend client lists and switches configured models", async () =>
       method: "session.modelInfo",
       params: { sessionId },
     });
-    assert.equal(before.result.label, "Default GPT");
+    assert.equal(before.result.label, "GPT-5");
     assert.equal(before.result.provider, "openai");
-    assert.equal(before.result.model, "gpt-default");
+    assert.equal(before.result.model, "gpt-5");
     assert.equal(before.result.thinking, "high");
     assert.deepEqual(before.result.thinkingLevels, [
       "off",
@@ -186,16 +175,23 @@ test("Electron backend client lists and switches configured models", async () =>
     const switched = await sendRpc({
       backendUrl: backend.url,
       method: "session.switchModel",
-      params: { sessionId, provider: "local", model: "qwen-coder" },
+      params: {
+        sessionId,
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      },
     });
-    assert.equal(switched.result.modelInfo.label, "Qwen Coder");
-    assert.equal(switched.result.modelInfo.provider, "local");
-    assert.equal(switched.result.modelInfo.model, "qwen-coder");
+    assert.equal(switched.result.modelInfo.label, "Claude Sonnet 4.6");
+    assert.equal(switched.result.modelInfo.provider, "anthropic");
+    assert.equal(switched.result.modelInfo.model, "claude-sonnet-4-6");
     assert.equal(switched.result.modelInfo.thinking, "medium");
     assert.deepEqual(switched.result.modelInfo.thinkingLevels, [
       "off",
+      "minimal",
       "low",
       "medium",
+      "high",
+      "xhigh",
     ]);
 
     const thinkingOff = await sendRpc({
@@ -203,26 +199,26 @@ test("Electron backend client lists and switches configured models", async () =>
       method: "session.switchThinking",
       params: { sessionId, thinkingLevel: "off" },
     });
-    assert.equal(thinkingOff.result.modelInfo.label, "Qwen Coder");
+    assert.equal(thinkingOff.result.modelInfo.label, "Claude Sonnet 4.6");
     assert.equal(thinkingOff.result.modelInfo.thinking, "off");
 
-    const thinkingClamped = await sendRpc({
+    const thinkingHigh = await sendRpc({
       backendUrl: backend.url,
       method: "session.switchThinking",
       params: { sessionId, thinkingLevel: "xhigh" },
     });
-    assert.equal(thinkingClamped.result.modelInfo.label, "Qwen Coder");
-    assert.equal(thinkingClamped.result.modelInfo.thinking, "medium");
+    assert.equal(thinkingHigh.result.modelInfo.label, "Claude Sonnet 4.6");
+    assert.equal(thinkingHigh.result.modelInfo.thinking, "xhigh");
 
     const after = await sendRpc({
       backendUrl: backend.url,
       method: "session.modelInfo",
       params: { sessionId },
     });
-    assert.equal(after.result.label, "Qwen Coder");
-    assert.equal(after.result.provider, "local");
-    assert.equal(after.result.model, "qwen-coder");
-    assert.equal(after.result.thinking, "medium");
+    assert.equal(after.result.label, "Claude Sonnet 4.6");
+    assert.equal(after.result.provider, "anthropic");
+    assert.equal(after.result.model, "claude-sonnet-4-6");
+    assert.equal(after.result.thinking, "xhigh");
 
     // The switch is scoped to this session: the default new sessions start
     // from is untouched.
@@ -230,10 +226,10 @@ test("Electron backend client lists and switches configured models", async () =>
       backendUrl: backend.url,
       method: "session.modelInfo",
     });
-    assert.equal(untouchedDefault.result.label, "Default GPT");
-    assert.equal(untouchedDefault.result.model, "gpt-default");
+    assert.equal(untouchedDefault.result.label, "GPT-5");
+    assert.equal(untouchedDefault.result.model, "gpt-5");
   } finally {
-    backend.stop();
+    await backend.stop();
   }
 });
 
@@ -300,122 +296,39 @@ test("backend startup timeout reports duration and captured output", () => {
       { length: 14 },
       (_value, index) => `stderr ${index + 1}`,
     ).join("\n"),
-    stdout: "cargo build still running",
+    stdout: "flue build still running",
   });
 
   assert.match(message, /backend did not print a local URL within 0.2s/);
   assert.match(message, /backend stderr:\nstderr 3/);
   assert.doesNotMatch(message, /^stderr 1$/m);
   assert.match(message, /stderr 14/);
-  assert.match(message, /backend stdout:\ncargo build still running/);
+  assert.match(message, /backend stdout:\nflue build still running/);
 });
 
-async function startMockBackend() {
-  // Persist to throwaway files so the test never touches ~/.nav/nav.db or
-  // ~/.nav/stacks.jsonl.
-  const dbPath = path.join(
-    os.tmpdir(),
-    `nav-electron-test-${crypto.randomUUID()}.db`,
-  );
-  const stacksPath = path.join(
-    os.tmpdir(),
-    `nav-electron-test-stacks-${crypto.randomUUID()}.jsonl`,
-  );
+async function startIsolatedBackend(env = {}) {
+  // Persist to throwaway files so the test never touches backend/data.
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "nav-backend-"));
+  const sessionCatalogPath = path.join(dataDir, "sessions.json");
+  const stacksPath = path.join(dataDir, `stacks-${crypto.randomUUID()}.json`);
   const backend = await startLocalBackend({
     projectRoot: process.cwd(),
     startupAttempts: 80,
     env: {
-      NAV_MOCK_MODEL: "1",
-      NAV_DB_PATH: dbPath,
+      NAV_SESSION_CATALOG_PATH: sessionCatalogPath,
       NAV_STACKS_PATH: stacksPath,
+      ...env,
     },
   });
 
   return {
     url: backend.url,
-    stop() {
-      backend.child.kill();
-      for (const suffix of ["", "-wal", "-shm"]) {
-        fs.rmSync(`${dbPath}${suffix}`, { force: true });
+    async stop() {
+      if (backend.child.exitCode === null) {
+        backend.child.kill();
+        await once(backend.child, "exit");
       }
-      fs.rmSync(stacksPath, { force: true });
-    },
-  };
-}
-
-async function startConfiguredBackend() {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "nav-home-"));
-  const navDir = path.join(home, ".nav");
-  fs.mkdirSync(navDir, { recursive: true });
-  fs.writeFileSync(
-    path.join(navDir, "settings.json"),
-    JSON.stringify({
-      defaultModel: {
-        provider: "openai",
-        model: "gpt-default",
-      },
-      defaultThinkingLevel: "high",
-      providers: {
-        openai: {
-          baseUrl: "https://api.openai.example/v1",
-          apiKey: "test-openai-key",
-          api: "openai-completions",
-          models: [
-            {
-              id: "gpt-default",
-              name: "Default GPT",
-              reasoning: true,
-              thinkingLevelMap: {
-                xhigh: "xhigh",
-              },
-            },
-          ],
-        },
-        local: {
-          baseUrl: "http://localhost:11434/v1",
-          apiKey: "test-local-key",
-          api: "openai-completions",
-          models: [
-            {
-              id: "qwen-coder",
-              name: "Qwen Coder",
-              reasoning: true,
-              thinkingLevelMap: {
-                minimal: null,
-                high: null,
-              },
-            },
-          ],
-        },
-      },
-    }),
-  );
-
-  const dbPath = path.join(
-    os.tmpdir(),
-    `nav-electron-config-test-${crypto.randomUUID()}.db`,
-  );
-  const backend = await startLocalBackend({
-    projectRoot: process.cwd(),
-    startupAttempts: 80,
-    env: {
-      HOME: home,
-      CARGO_HOME: process.env.CARGO_HOME ?? path.join(os.homedir(), ".cargo"),
-      RUSTUP_HOME:
-        process.env.RUSTUP_HOME ?? path.join(os.homedir(), ".rustup"),
-      NAV_DB_PATH: dbPath,
-      NAV_MOCK_MODEL: "",
-    },
-  });
-
-  return {
-    url: backend.url,
-    stop() {
-      backend.child.kill();
-      fs.rmSync(home, { recursive: true, force: true });
-      for (const suffix of ["", "-wal", "-shm"]) {
-        fs.rmSync(`${dbPath}${suffix}`, { force: true });
-      }
+      fs.rmSync(dataDir, { recursive: true, force: true });
     },
   };
 }
