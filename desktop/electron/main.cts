@@ -301,7 +301,7 @@ async function startChatSession(window: BrowserWindow | null): Promise<void> {
 
   try {
     // Tests and offline smoke use the deterministic mock; a real launch
-    // inherits the user's environment (NAV_API_KEY, etc.).
+    // inherits provider keys from the user's environment.
     const backend = await startLocalBackend({
       projectRoot: PROJECT_ROOT,
       env: trace.childEnv(smokeMode ? { NAV_MOCK_MODEL: "1" } : {}),

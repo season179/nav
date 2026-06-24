@@ -275,7 +275,7 @@ test("backend stderr collector preserves split trace lines", () => {
     },
   });
   const finalRemainder = collectStderrLines({
-    chunk: 'ready"}\nnav-local-backend: using mock\npartial',
+    chunk: 'ready"}\nflue backend: using mock\npartial',
     previousRemainder: remainder,
     onLine(line: string) {
       lines.push(line);
@@ -284,7 +284,7 @@ test("backend stderr collector preserves split trace lines", () => {
 
   assert.deepEqual(lines, [
     'nav startup trace {"event":"backend.ready"}',
-    "nav-local-backend: using mock",
+    "flue backend: using mock",
   ]);
   assert.equal(finalRemainder, "partial");
 });

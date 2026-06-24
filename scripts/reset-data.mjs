@@ -1,21 +1,21 @@
 /**
  * reset-data — wipe nav's local runtime data for a clean-slate dev session.
  *
- * Removes the SQLite session database (nav.db + -wal/-shm), the stacks log,
- * and the blobs/ and traces/ artifact directories. nav recreates an empty
- * schema on its next launch.
+ * Removes Flue's SQLite database (flue.db + -wal/-shm), nav's session
+ * catalog, the stacks capture store, and generated session worktrees. nav
+ * recreates empty backend state on its next launch.
  *
  * Safety rails (this is meant to be safe to run as a developer):
  *   - Never touches settings.json, its *.bak backups, or nav.log.
- *   - Refuses to run while a nav-local-backend process is alive (the DB is
+ *   - Refuses to run while a nav Flue backend process is alive (the DB is
  *     open in WAL mode; wiping it live risks corruption). Override with --force.
  *   - Moves data into a recoverable trash dir by default instead of deleting.
  *     Restore by moving it back; reclaim the space with --purge or by deleting
  *     the trash dir. Use --purge to delete immediately.
  *   - Prompts for confirmation unless -y/--yes.
- *   - Honors NAV_DB_PATH and NAV_STACKS_PATH.
+ *   - Honors NAV_SESSION_CATALOG_PATH, NAV_STACKS_PATH, and NAV_WORKTREE_DIR.
  *
- * Usage: bun run reset-data [--purge] [--keep-blobs] [--dry-run] [-y] [--force]
+ * Usage: pnpm run reset-data [--purge] [--keep-worktrees] [--dry-run] [-y] [--force]
  */
 
 import { spawnSync } from "node:child_process";
@@ -30,28 +30,33 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const BACKEND_PROCESS_PATTERN =
+  "backend/(scripts/start\\.mjs|dist/server\\.mjs)";
 
 function printHelp() {
   console.log(`reset-data — wipe nav's local runtime data for a fresh start
 
-Usage: bun run reset-data [options]
+Usage: pnpm run reset-data [options]
 
 Options:
   --purge        Delete immediately instead of moving to a recoverable trash dir
-  --keep-blobs   Leave blobs/ and traces/ in place (reset only the DB + stacks)
+  --keep-worktrees
+                 Leave generated session worktrees in place
   --dry-run      Show what would happen without changing anything
   -y, --yes      Skip the confirmation prompt
-  --force        Proceed even if a nav-local-backend process is running
+  --force        Proceed even if a nav Flue backend process is running
   -h, --help     Show this help
 
 Preserved always: settings.json, settings.json.bak-*, nav.log.
-Honors NAV_DB_PATH and NAV_STACKS_PATH.`);
+Honors NAV_SESSION_CATALOG_PATH, NAV_STACKS_PATH, and NAV_WORKTREE_DIR.`);
 }
 
 function parseArgs(argv) {
   const opts = {
     purge: false,
-    keepBlobs: false,
+    keepWorktrees: false,
     dryRun: false,
     yes: false,
     force: false,
@@ -61,8 +66,10 @@ function parseArgs(argv) {
       case "--purge":
         opts.purge = true;
         break;
-      case "--keep-blobs":
-        opts.keepBlobs = true;
+      case "--":
+        break;
+      case "--keep-worktrees":
+        opts.keepWorktrees = true;
         break;
       case "--dry-run":
         opts.dryRun = true;
@@ -114,9 +121,9 @@ function formatBytes(bytes) {
   return `${size.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
-/** PIDs of any running nav-local-backend, so we never wipe an open DB. */
+/** PIDs of any running nav Flue backend, so we never wipe open state. */
 function findRunningBackend() {
-  const res = spawnSync("pgrep", ["-f", "nav-local-backend"], {
+  const res = spawnSync("pgrep", ["-f", BACKEND_PROCESS_PATTERN], {
     encoding: "utf8",
   });
   // Couldn't run the check at all (e.g. pgrep not on PATH): return null so the
@@ -163,27 +170,36 @@ function moveToTrash(target, trashDir) {
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   const home = homedir();
-  const navDir = join(home, ".nav");
-
-  const dbPath = resolve(
-    process.env.NAV_DB_PATH?.trim() || join(navDir, "nav.db"),
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const projectRoot = resolve(scriptDir, "..");
+  const dataDir = resolve(projectRoot, "backend", "data");
+  const dbPath = resolve(dataDir, "flue.db");
+  const sessionCatalogPath = resolve(
+    process.env.NAV_SESSION_CATALOG_PATH?.trim() ||
+      join(dataDir, "sessions.json"),
   );
   const stacksPath = resolve(
-    process.env.NAV_STACKS_PATH?.trim() || join(navDir, "stacks.jsonl"),
+    process.env.NAV_STACKS_PATH?.trim() || join(dataDir, "stacks.json"),
   );
-  // Artifacts live beside the database; anchoring to the DB's dir means an
-  // overridden NAV_DB_PATH won't wipe the unrelated default ~/.nav/blobs.
-  const dataDir = dirname(dbPath);
+  const worktreeDir = resolve(
+    process.env.NAV_WORKTREE_DIR?.trim() || join(dataDir, "worktrees"),
+  );
 
-  // Session DB trio + stacks log, plus artifact dirs unless kept.
-  const targets = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`, stacksPath];
-  if (!opts.keepBlobs) {
-    targets.push(join(dataDir, "blobs"), join(dataDir, "traces"));
+  // Flue DB trio + nav-owned stores, plus session worktrees unless kept.
+  const targets = [
+    dbPath,
+    `${dbPath}-wal`,
+    `${dbPath}-shm`,
+    sessionCatalogPath,
+    stacksPath,
+  ];
+  if (!opts.keepWorktrees) {
+    targets.push(worktreeDir);
   }
 
   // Defense in depth: never let a target escape into settings/backups/home.
   const present = targets.filter((target) => {
-    if (target === dataDir || target === navDir || target === home) {
+    if (target === dataDir || target === projectRoot || target === home) {
       throw new Error(`refusing to operate on ${target}`);
     }
     const name = basename(target);
@@ -198,7 +214,7 @@ function main() {
     return;
   }
 
-  console.log(`nav data dir: ${dataDir}`);
+  console.log(`nav backend data dir: ${dataDir}`);
   let totalBytes = 0;
   for (const target of present) {
     const size = pathSize(target);
@@ -213,12 +229,12 @@ function main() {
   const backendRunning = pids.length > 0;
   if (found === null) {
     console.error(
-      "\nCould not check for a running nav-local-backend (pgrep unavailable).",
+      "\nCould not check for a running nav Flue backend (pgrep unavailable).",
     );
     console.error("Make sure it is stopped before continuing.");
   } else if (backendRunning) {
     console.error(
-      `\nnav-local-backend appears to be running (pid ${pids.join(", ")}).`,
+      `\nA nav Flue backend appears to be running (pid ${pids.join(", ")}).`,
     );
     console.error("Wiping the DB while it is open risks corruption.");
   }
@@ -286,7 +302,7 @@ function main() {
     process.exitCode = 1;
   }
 
-  console.log("nav will recreate a fresh database on its next launch.");
+  console.log("nav will recreate fresh backend state on its next launch.");
 }
 
 main();
