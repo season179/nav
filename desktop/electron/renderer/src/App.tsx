@@ -1,4 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import {
   useCallback,
   useEffect,
@@ -11,6 +12,7 @@ import Composer from "./components/Composer.tsx";
 import Sidebar from "./components/Sidebar.tsx";
 import StacksPage from "./components/StacksPage.tsx";
 import Transcript from "./components/Transcript.tsx";
+import { type NavAppView, parseNavPathname } from "./lib/app-routes.ts";
 import {
   modelOptionsQueryOptions,
   navQueryKeys,
@@ -42,7 +44,7 @@ const EMPTY_SESSION_STATE = createSessionState();
 // Where startup/connection errors land before any real session exists.
 const SYSTEM_SESSION_ID = "system";
 
-type ViewName = "chat" | "stacks";
+type ViewName = Extract<NavAppView, "chat" | "stacks">;
 
 // Imperative per-session run bookkeeping read synchronously by the stop/send
 // paths (React state would be stale inside the async stop loop). `running`
@@ -60,13 +62,20 @@ type SessionRuntime = {
 
 export default function App() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const routePathname = useRouterState({
+    select: (state) => state.location.pathname,
+  });
+  const routeState = useMemo(
+    () => parseNavPathname(routePathname),
+    [routePathname],
+  );
   const [connected, setConnected] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [attentionSessionIds, setAttentionSessionIds] = useState(
     () => new Set<string>(),
   );
   const [modelSwitching, setModelSwitching] = useState(false);
-  const [activeView, setActiveView] = useState<ViewName>("chat");
   const [newSessionMode, setNewSessionMode] = useState<SessionMode>("local");
 
   const connectedRef = useRef(false);
@@ -85,6 +94,7 @@ export default function App() {
   const sessionStates = useSessionStates((states) => states);
   const sessionSummaries = sessionsQuery.data ?? [];
   const modelOptions = modelOptionsQuery.data ?? [];
+  const activeView: ViewName = routeState.view === "stacks" ? "stacks" : "chat";
 
   const setConnectedState = useCallback((isConnected: boolean) => {
     connectedRef.current = isConnected;
@@ -105,6 +115,33 @@ export default function App() {
       });
     }
   }, []);
+
+  const navigateToView = useCallback(
+    (
+      view: ViewName,
+      sessionId: string | null | undefined,
+      options: { replace?: boolean } = {},
+    ) => {
+      if (view === "stacks" && sessionId) {
+        void navigate({
+          params: { sessionId },
+          replace: options.replace,
+          to: "/sessions/$sessionId/stacks",
+        });
+        return;
+      }
+      if (sessionId) {
+        void navigate({
+          params: { sessionId },
+          replace: options.replace,
+          to: "/sessions/$sessionId",
+        });
+        return;
+      }
+      void navigate({ replace: options.replace, to: "/chat" });
+    },
+    [navigate],
+  );
 
   const runtimeFor = useCallback((sessionId: string): SessionRuntime => {
     let runtime = runtimesRef.current.get(sessionId);
@@ -275,6 +312,36 @@ export default function App() {
     [refreshStackAvailability],
   );
 
+  useEffect(() => {
+    if (!routeState.known) {
+      navigateToView("chat", null, { replace: true });
+      return;
+    }
+
+    if (routeState.sessionId !== activeSessionIdRef.current) {
+      setActiveSession(routeState.sessionId);
+      if (routeState.sessionId && connectedRef.current) {
+        window.nav?.switchSession(routeState.sessionId).catch((error) => {
+          appendSessionMessage(
+            routeState.sessionId ?? SYSTEM_SESSION_ID,
+            "error",
+            `Could not open session: ${errorMessage(error)}`,
+          );
+        });
+        refreshModelInfo(routeState.sessionId);
+        refreshStackAvailability(routeState.sessionId, { reset: true });
+      }
+    }
+  }, [
+    appendSessionMessage,
+    navigateToView,
+    refreshModelInfo,
+    refreshStackAvailability,
+    routeState.known,
+    routeState.sessionId,
+    setActiveSession,
+  ]);
+
   // Surface a connection/backend error in a transcript the user can see. When
   // the failure names a session (e.g. one session's stream dropped), report it
   // there without yanking the user's active view; otherwise fall back to the
@@ -368,10 +435,23 @@ export default function App() {
       }
 
       setConnectedState(true);
-      if (status.sessionId) {
-        setActiveSession(status.sessionId);
-        refreshModelInfo(status.sessionId);
-        refreshStackAvailability(status.sessionId, { reset: true });
+      const sessionId = routeState.sessionId ?? status.sessionId;
+      if (sessionId) {
+        setActiveSession(sessionId);
+        if (routeState.sessionId && routeState.sessionId !== status.sessionId) {
+          window.nav?.switchSession(routeState.sessionId).catch((error) => {
+            appendSessionMessage(
+              routeState.sessionId ?? SYSTEM_SESSION_ID,
+              "error",
+              `Could not open session: ${errorMessage(error)}`,
+            );
+          });
+        }
+        if (!routeState.sessionId) {
+          navigateToView("chat", sessionId, { replace: true });
+        }
+        refreshModelInfo(sessionId);
+        refreshStackAvailability(sessionId, { reset: true });
       }
       void queryClient.invalidateQueries({
         queryKey: navQueryKeys.modelOptions(),
@@ -379,11 +459,14 @@ export default function App() {
       void refreshSessions();
     },
     [
+      appendSessionMessage,
       refreshModelInfo,
       refreshSessions,
       refreshStackAvailability,
+      navigateToView,
       queryClient,
       renderBackendStatus,
+      routeState.sessionId,
       setActiveSession,
       setConnectedState,
     ],
@@ -520,8 +603,8 @@ export default function App() {
 
   const activateCreatedSession = useCallback(
     async (sessionId: string) => {
-      setActiveView("chat");
       setActiveSession(sessionId);
+      navigateToView("chat", sessionId);
       refreshModelInfo(sessionId);
       refreshStackAvailability(sessionId, { reset: true });
       await refreshSessions();
@@ -530,6 +613,7 @@ export default function App() {
       refreshModelInfo,
       refreshSessions,
       refreshStackAvailability,
+      navigateToView,
       setActiveSession,
     ],
   );
@@ -544,14 +628,15 @@ export default function App() {
       }
 
       const previousSessionId = activeSessionIdRef.current;
-      setActiveView("chat");
       setActiveSession(sessionId);
+      navigateToView("chat", sessionId);
       try {
         await window.nav.switchSession(sessionId);
         refreshModelInfo(sessionId);
         refreshStackAvailability(sessionId, { reset: true });
       } catch (error) {
         setActiveSession(previousSessionId);
+        navigateToView("chat", previousSessionId, { replace: true });
         appendSessionMessage(
           previousSessionId ?? SYSTEM_SESSION_ID,
           "error",
@@ -561,6 +646,7 @@ export default function App() {
     },
     [
       appendSessionMessage,
+      navigateToView,
       refreshModelInfo,
       refreshStackAvailability,
       setActiveSession,
@@ -703,6 +789,13 @@ export default function App() {
     setSessionStackAvailable(activeSessionIdRef.current, false);
   }, [setSessionStackAvailable]);
 
+  const selectView = useCallback(
+    (view: ViewName) => {
+      navigateToView(view, activeSessionIdRef.current);
+    },
+    [navigateToView],
+  );
+
   return (
     <div className="app">
       <Sidebar
@@ -723,7 +816,7 @@ export default function App() {
           running={activeState.running}
           sessionId={activeSessionId}
           showStacks={activeState.stackAvailable}
-          onSelectView={setActiveView}
+          onSelectView={selectView}
         />
         {activeView === "stacks" ? (
           <StacksPage
