@@ -1,3 +1,4 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useCallback,
   useEffect,
@@ -10,6 +11,11 @@ import Composer from "./components/Composer.tsx";
 import Sidebar from "./components/Sidebar.tsx";
 import StacksPage from "./components/StacksPage.tsx";
 import Transcript from "./components/Transcript.tsx";
+import {
+  modelOptionsQueryOptions,
+  navQueryKeys,
+  navSessionsQueryOptions,
+} from "./lib/nav-queries.ts";
 import {
   appendMessage,
   createSessionState,
@@ -27,7 +33,6 @@ import type {
   SessionEvent,
   SessionMode,
   SessionState,
-  SessionSummary,
 } from "./types.ts";
 
 // Shown when a session has no state yet (e.g. before its first event arrives),
@@ -53,11 +58,9 @@ type SessionRuntime = {
 };
 
 export default function App() {
+  const queryClient = useQueryClient();
   const [connected, setConnected] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [sessionSummaries, setSessionSummaries] = useState<SessionSummary[]>(
-    [],
-  );
   // Every live session's transcript and run state, keyed by id. Routing events
   // here by session id is what keeps concurrent sessions from interfering.
   const [sessionStates, setSessionStates] = useState<
@@ -66,7 +69,6 @@ export default function App() {
   const [attentionSessionIds, setAttentionSessionIds] = useState(
     () => new Set<string>(),
   );
-  const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
   const [modelSwitching, setModelSwitching] = useState(false);
   const [activeView, setActiveView] = useState<ViewName>("chat");
   const [newSessionMode, setNewSessionMode] = useState<SessionMode>("local");
@@ -75,6 +77,17 @@ export default function App() {
   const activeSessionIdRef = useRef<string | null>(null);
   const runtimesRef = useRef<Map<string, SessionRuntime>>(new Map());
   const sessionModeTouchedRef = useRef(false);
+
+  const sessionsQuery = useQuery({
+    ...navSessionsQueryOptions(),
+    enabled: connected,
+  });
+  const modelOptionsQuery = useQuery({
+    ...modelOptionsQueryOptions(),
+    enabled: connected,
+  });
+  const sessionSummaries = sessionsQuery.data ?? [];
+  const modelOptions = modelOptionsQuery.data ?? [];
 
   const setConnectedState = useCallback((isConnected: boolean) => {
     connectedRef.current = isConnected;
@@ -204,12 +217,11 @@ export default function App() {
 
   const refreshStacks = useCallback(
     (sessionId: string) => {
-      updateSessionState(sessionId, (state) => ({
-        ...state,
-        stackRefreshKey: state.stackRefreshKey + 1,
-      }));
+      void queryClient.invalidateQueries({
+        queryKey: navQueryKeys.stacks(sessionId),
+      });
     },
-    [updateSessionState],
+    [queryClient],
   );
 
   const refreshStacksAfterTerminalEvent = useCallback(
@@ -242,27 +254,9 @@ export default function App() {
     [runtimeFor, setSessionModelInfo],
   );
 
-  const refreshModelOptions = useCallback(async () => {
-    if (!window.nav) {
-      return;
-    }
-    try {
-      setModelOptions(await window.nav.modelList());
-    } catch {
-      setModelOptions([]);
-    }
-  }, []);
-
   const refreshSessions = useCallback(async () => {
-    if (!window.nav) {
-      return;
-    }
-    try {
-      setSessionSummaries(await window.nav.listSessions());
-    } catch {
-      // Listing is best-effort; never let it disrupt the chat.
-    }
-  }, []);
+    await queryClient.invalidateQueries({ queryKey: navQueryKeys.sessions() });
+  }, [queryClient]);
 
   const refreshStackAvailability = useCallback(
     async (
@@ -406,14 +400,16 @@ export default function App() {
         refreshModelInfo(status.sessionId);
         refreshStackAvailability(status.sessionId, { reset: true });
       }
-      refreshModelOptions();
-      refreshSessions();
+      void queryClient.invalidateQueries({
+        queryKey: navQueryKeys.modelOptions(),
+      });
+      void refreshSessions();
     },
     [
       refreshModelInfo,
-      refreshModelOptions,
       refreshSessions,
       refreshStackAvailability,
+      queryClient,
       renderBackendStatus,
       setActiveSession,
       setConnectedState,
@@ -758,7 +754,7 @@ export default function App() {
         />
         {activeView === "stacks" ? (
           <StacksPage
-            key={`${activeSessionId ?? "none"}-${activeState.stackRefreshKey}`}
+            key={activeSessionId ?? "none"}
             onUnavailable={markStacksUnavailable}
             sessionId={activeSessionId}
           />

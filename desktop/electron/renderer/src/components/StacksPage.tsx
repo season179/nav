@@ -1,4 +1,9 @@
+import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
+import {
+  EMPTY_STACKS_RESULT,
+  sessionStacksQueryOptions,
+} from "../lib/nav-queries.ts";
 import type { StackEntry, StackRequest, StackResponse } from "../types.ts";
 
 export default function StacksPage({
@@ -8,51 +13,16 @@ export default function StacksPage({
   onUnavailable?: (reason: string) => void;
   sessionId: string | null;
 }) {
-  const [stacks, setStacks] = useState<StackEntry[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [unavailableReason, setUnavailableReason] = useState<string | null>(
-    null,
-  );
+  const stacksQuery = useQuery(sessionStacksQueryOptions(sessionId));
+  const result = stacksQuery.data ?? EMPTY_STACKS_RESULT;
+  const stacks = Array.isArray(result.stacks) ? result.stacks : [];
+  const unavailableReason = result.unavailableReason ?? null;
 
   useEffect(() => {
-    let alive = true;
-    if (!sessionId || !window.nav) {
-      setStacks([]);
-      setUnavailableReason(null);
-      return undefined;
+    if (sessionId && stacks.length === 0 && unavailableReason) {
+      onUnavailable?.(unavailableReason);
     }
-
-    setLoading(true);
-    setError(null);
-    setUnavailableReason(null);
-    window.nav
-      .sessionStacks(sessionId)
-      .then((result) => {
-        if (alive) {
-          const nextStacks = Array.isArray(result?.stacks) ? result.stacks : [];
-          setStacks(nextStacks);
-          setUnavailableReason(result?.unavailableReason ?? null);
-          if (nextStacks.length === 0 && result?.unavailableReason) {
-            onUnavailable?.(result.unavailableReason);
-          }
-        }
-      })
-      .catch((fetchError) => {
-        if (alive) {
-          setError(fetchError.message);
-        }
-      })
-      .finally(() => {
-        if (alive) {
-          setLoading(false);
-        }
-      });
-
-    return () => {
-      alive = false;
-    };
-  }, [onUnavailable, sessionId]);
+  }, [onUnavailable, sessionId, stacks.length, unavailableReason]);
 
   const orderedStacks = useMemo(
     () => [...stacks].sort((left, right) => left.sequence - right.sequence),
@@ -67,10 +37,12 @@ export default function StacksPage({
     );
   }
 
-  if (error) {
+  if (stacksQuery.error) {
     return (
       <section className="stacks-page" aria-label="Model call stacks">
-        <div className="stacks-error">Could not load stacks: {error}</div>
+        <div className="stacks-error">
+          Could not load stacks: {errorMessage(stacksQuery.error)}
+        </div>
       </section>
     );
   }
@@ -81,7 +53,7 @@ export default function StacksPage({
         <div>
           <h1>Stacks</h1>
           <p className="stacks-subtitle">
-            {loading
+            {stacksQuery.isPending
               ? "Loading"
               : `${orderedStacks.length} model call${
                   orderedStacks.length === 1 ? "" : "s"
@@ -198,6 +170,10 @@ function ResponseSection({ response }: { response: StackResponse }) {
 
 function EmptyStacks({ text }: { text: string }) {
   return <div className="stacks-empty">{text}</div>;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function emptyStackText(reason: string | null): string {
