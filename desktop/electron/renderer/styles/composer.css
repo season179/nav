@@ -259,6 +259,14 @@
   white-space: nowrap;
 }
 
+.composer-error {
+  min-height: 16px;
+  margin-top: 6px;
+  color: var(--error);
+  font-size: 12px;
+  line-height: 16px;
+}
+
 .composer-model:empty,
 .composer-thinking:empty,
 .composer-token-usage:empty {

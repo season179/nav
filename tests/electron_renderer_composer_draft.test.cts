@@ -36,8 +36,25 @@ test("composer draft storage failures are ignored", async () => {
   assert.equal(readComposerDraft(storage, "session 1"), "");
 });
 
+test("composer message validation rejects blank and disconnected submits", async () => {
+  const { normalizeComposerMessage, validateComposerMessage } =
+    await loadComposerValidation();
+
+  assert.equal(normalizeComposerMessage("  ship it  "), "ship it");
+  assert.equal(validateComposerMessage("  ", true), "Message is required");
+  assert.equal(
+    validateComposerMessage("ship it", false),
+    "Backend is not connected",
+  );
+  assert.equal(validateComposerMessage("ship it", true), undefined);
+});
+
 function loadComposerDraft() {
   return import("../desktop/electron/renderer/src/lib/composer-draft.ts");
+}
+
+function loadComposerValidation() {
+  return import("../desktop/electron/renderer/src/lib/composer-validation.ts");
 }
 
 function memoryStorage(): TestStorage {
