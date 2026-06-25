@@ -10,6 +10,13 @@ import {
   MessageResponse,
 } from "@/components/ai-elements/message";
 import {
+  Tool,
+  ToolContent,
+  ToolHeader,
+  ToolInput,
+  ToolOutput,
+} from "@/components/ai-elements/tool";
+import {
   type AiElementsChatMessage,
   type AiElementsToolMessage,
   adaptMessagesForAiElements,
@@ -78,15 +85,31 @@ function ChatMessageItem({
 function ToolMessageItem({ item }: { item: AiElementsToolMessage }) {
   return (
     <AiMessage className="message message-tool-wrapper" from="assistant">
-      <MessageContent
-        className={`message-tool message-tool-${item.state}`}
-        data-tool-call-id={item.toolCallId || undefined}
-      >
-        <span className="message-role">{toolMarker(item.state)}</span>
-        <span className="tool-name">{item.toolName}</span>
-        {item.detail ? (
-          <span className="tool-detail">{previewText(item.detail)}</span>
-        ) : null}
+      <MessageContent className="message-tool-content">
+        <Tool
+          className="message-tool"
+          data-tool-call-id={item.toolCallId || undefined}
+          defaultOpen={item.state !== "input-available"}
+        >
+          <ToolHeader
+            state={item.state}
+            toolName={item.toolName}
+            type="dynamic-tool"
+          />
+          <ToolContent>
+            <ToolInput input={item.input} />
+            <ToolOutput
+              errorText={item.errorText}
+              output={
+                item.output ? (
+                  <MessageResponse className="message-response">
+                    {item.output}
+                  </MessageResponse>
+                ) : undefined
+              }
+            />
+          </ToolContent>
+        </Tool>
       </MessageContent>
     </AiMessage>
   );
@@ -118,20 +141,4 @@ function formatTimestamp(date: Date): string {
   const hours = String(date.getHours()).padStart(2, "0");
   const minutes = String(date.getMinutes()).padStart(2, "0");
   return `${day} ${month} ${hours}:${minutes}`;
-}
-
-function toolMarker(state: string): string {
-  switch (state) {
-    case "running":
-      return ">";
-    case "failed":
-      return "x";
-    default:
-      return "*";
-  }
-}
-
-function previewText(text: string): string {
-  const firstLine = text.split("\n", 1)[0];
-  return firstLine.length > 120 ? `${firstLine.slice(0, 117)}...` : firstLine;
 }

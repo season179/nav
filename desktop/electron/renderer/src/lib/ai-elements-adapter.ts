@@ -1,4 +1,5 @@
 import type { MessageProps } from "@/components/ai-elements/message";
+import type { ToolPart } from "@/components/ai-elements/tool";
 import type { ChatMessage, Message, ToolMessage } from "../types.ts";
 
 export type AiElementsChatMessage = {
@@ -15,8 +16,10 @@ export type AiElementsToolMessage = {
   id: string;
   toolCallId: string;
   toolName: string;
-  state: ToolMessage["state"];
-  detail: string;
+  state: ToolPart["state"];
+  input: ToolPart["input"];
+  output: string | undefined;
+  errorText: ToolPart["errorText"];
 };
 
 export type AiElementsTranscriptItem =
@@ -28,6 +31,14 @@ const messageRoleToFrom = {
   error: "assistant",
   user: "user",
 } satisfies Record<ChatMessage["role"], MessageProps["from"]>;
+
+const toolStateToAiElementsState = {
+  completed: "output-available",
+  done: "output-available",
+  failed: "output-error",
+  running: "input-available",
+} satisfies Record<string, ToolPart["state"]>;
+type KnownToolState = keyof typeof toolStateToAiElementsState;
 
 export function adaptMessagesForAiElements(
   messages: Message[],
@@ -52,13 +63,23 @@ function adaptChatMessage(message: ChatMessage): AiElementsChatMessage {
 }
 
 function adaptToolMessage(message: ToolMessage): AiElementsToolMessage {
+  const state = mapToolState(message.state);
+  const failed = state === "output-error";
+
   return {
     kind: "tool",
     id: message.id,
     toolCallId: message.toolCallId,
     toolName: message.toolName,
-    // TODO: Map this to AI Elements tool states after Step 1.4 generates tool.tsx.
-    state: message.state,
-    detail: message.detail,
+    state,
+    input: {},
+    output: failed || !message.detail ? undefined : message.detail,
+    errorText: failed ? message.detail || "Tool call failed" : undefined,
   };
+}
+
+function mapToolState(state: ToolMessage["state"]): ToolPart["state"] {
+  return (
+    toolStateToAiElementsState[state as KnownToolState] ?? "input-streaming"
+  );
 }

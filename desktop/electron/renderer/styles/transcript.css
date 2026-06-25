@@ -80,55 +80,22 @@
   opacity: 1;
 }
 
-/* Tool activity: a compact mono line, distinct from chat messages. */
-.message-tool {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
+/* AI Elements tool cards should align with assistant messages while preserving
+   their generated internal status/badge styling. */
+.message-tool-wrapper {
+  width: 78%;
   max-width: 78%;
-  padding: 6px 12px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
+}
+
+.message-tool-content,
+.message-tool {
+  width: 100%;
+}
+
+.message-tool {
+  margin-bottom: 0;
+  border-color: var(--border);
   background: var(--surface-muted);
-  font-size: 12.5px;
-  font-family: var(--font-mono);
-}
-
-.message-tool .message-role {
-  font-size: 12.5px;
-  color: var(--active);
-}
-
-.message-tool-running .message-role {
-  color: var(--active-dim);
-  animation: tool-pulse 1.4s ease-in-out infinite;
-}
-
-@keyframes tool-pulse {
-  50% {
-    opacity: 0.4;
-  }
-}
-
-.message-tool .tool-name {
-  font-weight: 600;
-  color: var(--active);
-}
-
-.message-tool .tool-detail {
-  color: var(--ink-dim);
-  overflow-wrap: anywhere;
-}
-
-.message-tool-failed {
-  border-color: var(--danger);
-  background: var(--danger-tint);
-}
-
-.message-tool-failed .message-role,
-.message-tool-failed .tool-name,
-.message-tool-failed .tool-detail {
-  color: var(--danger);
 }
 
 .composer {

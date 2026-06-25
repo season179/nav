@@ -59,7 +59,7 @@ test("adapter maps user, assistant, and error chat messages", async () => {
   ]);
 });
 
-test("adapter preserves tool messages until AI Elements tool states are known", async () => {
+test("adapter maps local tool lifecycle states to AI Elements tool states", async () => {
   const { adaptMessagesForAiElements } = await loadAdapter();
 
   assert.deepEqual(
@@ -72,6 +72,22 @@ test("adapter preserves tool messages until AI Elements tool states are known", 
         toolName: "read",
         detail: "Reading file",
       },
+      {
+        id: "tool-2",
+        role: "tool",
+        toolCallId: "call-2",
+        state: "done",
+        toolName: "bash",
+        detail: "ok",
+      },
+      {
+        id: "tool-3",
+        role: "tool",
+        toolCallId: "call-3",
+        state: "failed",
+        toolName: "write",
+        detail: "permission denied",
+      },
     ]),
     [
       {
@@ -79,8 +95,30 @@ test("adapter preserves tool messages until AI Elements tool states are known", 
         id: "tool-1",
         toolCallId: "call-1",
         toolName: "read",
-        state: "running",
-        detail: "Reading file",
+        state: "input-available",
+        input: {},
+        output: "Reading file",
+        errorText: undefined,
+      },
+      {
+        kind: "tool",
+        id: "tool-2",
+        toolCallId: "call-2",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: "ok",
+        errorText: undefined,
+      },
+      {
+        kind: "tool",
+        id: "tool-3",
+        toolCallId: "call-3",
+        toolName: "write",
+        state: "output-error",
+        input: {},
+        output: undefined,
+        errorText: "permission denied",
       },
     ],
   );

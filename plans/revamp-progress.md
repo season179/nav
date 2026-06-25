@@ -65,3 +65,14 @@
 - electron:smoke: passed
 - Screenshot: `plans/revamp-shots/step-1.3.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session, but the surface is stable with no `agent-browser errors` or console output.
+
+## Step 1.4 — Render tool calls through AI Elements Tool
+- Checked DeepWiki plus current AI Elements/shadcn docs before wiring this step. DeepWiki confirmed `shadcn add` needs `--yes --overwrite` for noninteractive overwrites; the official AI Elements Tool docs define the accepted states as `input-streaming`, `input-available`, `approval-requested`, `approval-responded`, `output-available`, `output-error`, and `output-denied`.
+- Added `@ai-elements/tool` with `pnpm dlx shadcn@latest add @ai-elements/tool -c . --yes --overwrite`; relocated generated `tool.tsx` and `code-block.tsx` into renderer src, and added generated `badge`, `collapsible`, and `select` UI primitives plus the direct `shiki` dependency.
+- Mapped local tool states into AI Elements states: `running` -> `input-available`, `done`/`completed` -> `output-available`, `failed` -> `output-error`, unknown -> `input-streaming`.
+- Rebuilt transcript tool rows on `Tool`, `ToolHeader`, `ToolInput`, and `ToolOutput`; removed the old custom tool glyph/preview CSS and the stale reduced-motion selector.
+- Added/updated static tests for generated AI Elements relocation and adapter coverage for running/done/failed tool lifecycle mapping.
+- format/lint/check: passed (`check:electron` 103/103 tests when rerun unsandboxed; sandboxed run failed only on known `127.0.0.1` listen `EPERM`); build still warns about large Streamdown/Shiki/Mermaid chunks, now with an additional direct Shiki tool-code path.
+- electron:smoke: passed when rerun unsandboxed (sandboxed Electron launch aborted with `SIGABRT`).
+- Screenshot: `plans/revamp-shots/step-1.4.png` captured from Electron CDP target
+  `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session so no live tool row was visible, but the surface is stable with no `agent-browser errors` or console output.

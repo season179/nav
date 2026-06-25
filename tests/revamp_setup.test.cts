@@ -64,6 +64,26 @@ test("AI Elements generated components live under renderer src", () => {
     "ai-elements",
     "conversation.tsx",
   );
+  const toolPath = path.join(
+    REPO_ROOT,
+    "desktop",
+    "electron",
+    "renderer",
+    "src",
+    "components",
+    "ai-elements",
+    "tool.tsx",
+  );
+  const codeBlockPath = path.join(
+    REPO_ROOT,
+    "desktop",
+    "electron",
+    "renderer",
+    "src",
+    "components",
+    "ai-elements",
+    "code-block.tsx",
+  );
   const rootMessagePath = path.join(
     REPO_ROOT,
     "components",
@@ -76,11 +96,27 @@ test("AI Elements generated components live under renderer src", () => {
     "ai-elements",
     "conversation.tsx",
   );
+  const rootToolPath = path.join(
+    REPO_ROOT,
+    "components",
+    "ai-elements",
+    "tool.tsx",
+  );
+  const rootCodeBlockPath = path.join(
+    REPO_ROOT,
+    "components",
+    "ai-elements",
+    "code-block.tsx",
+  );
 
   const message = fs.readFileSync(messagePath, "utf8");
   const conversation = fs.readFileSync(conversationPath, "utf8");
+  const tool = fs.readFileSync(toolPath, "utf8");
+  const codeBlock = fs.readFileSync(codeBlockPath, "utf8");
   assert.match(message, /export const MessageResponse/);
   assert.match(conversation, /export const Conversation/);
+  assert.match(tool, /export const Tool/);
+  assert.match(codeBlock, /export const CodeBlock/);
   assert.equal(
     fs.existsSync(rootMessagePath),
     false,
@@ -88,6 +124,16 @@ test("AI Elements generated components live under renderer src", () => {
   );
   assert.equal(
     fs.existsSync(rootConversationPath),
+    false,
+    "AI Elements registry files should be relocated into renderer src",
+  );
+  assert.equal(
+    fs.existsSync(rootToolPath),
+    false,
+    "AI Elements registry files should be relocated into renderer src",
+  );
+  assert.equal(
+    fs.existsSync(rootCodeBlockPath),
     false,
     "AI Elements registry files should be relocated into renderer src",
   );

@@ -372,7 +372,6 @@
 
 @media (prefers-reduced-motion: reduce) {
   .message,
-  .message-tool-running .message-role,
   .session-running,
   .project-running,
   .session-toolbar-running {
