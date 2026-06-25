@@ -58,3 +58,30 @@ test("src/components/_RevampSmoke.tsx contains AI-ELEMENTS-SMOKE-OK", () => {
   );
   assert.match(smoke, /AI-ELEMENTS-SMOKE-OK/);
 });
+
+test("AI Elements message component lives under renderer src", () => {
+  const messagePath = path.join(
+    REPO_ROOT,
+    "desktop",
+    "electron",
+    "renderer",
+    "src",
+    "components",
+    "ai-elements",
+    "message.tsx",
+  );
+  const rootRegistryPath = path.join(
+    REPO_ROOT,
+    "components",
+    "ai-elements",
+    "message.tsx",
+  );
+
+  const message = fs.readFileSync(messagePath, "utf8");
+  assert.match(message, /export const MessageResponse/);
+  assert.equal(
+    fs.existsSync(rootRegistryPath),
+    false,
+    "AI Elements registry files should be relocated into renderer src",
+  );
+});
