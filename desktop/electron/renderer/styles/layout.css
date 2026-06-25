@@ -48,16 +48,24 @@
 
 .session-view-tabs {
   display: inline-flex;
+  min-width: 0;
+  -webkit-app-region: no-drag;
+}
+
+.session-view-tabs-list {
+  display: inline-flex;
   align-items: center;
   gap: 4px;
+  width: auto;
+  height: auto;
   padding: 3px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--surface-muted);
-  -webkit-app-region: no-drag;
 }
 
 .session-view-tab {
+  flex: 0 0 auto;
   min-width: 66px;
   padding: 6px 12px;
   border: 1px solid transparent;
@@ -74,7 +82,7 @@
   color: var(--ink);
 }
 
-.session-view-tab[aria-current="page"] {
+.session-view-tab[data-state="active"] {
   border-color: var(--active-border);
   background: var(--active-tint);
   color: var(--ink);

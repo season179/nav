@@ -12,6 +12,7 @@ import {
 } from "react";
 import Composer from "./components/Composer.tsx";
 import Sidebar from "./components/Sidebar.tsx";
+import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs.tsx";
 import { type NavAppView, parseNavPathname } from "./lib/app-routes.ts";
 import {
   modelOptionsQueryOptions,
@@ -903,6 +904,12 @@ function SessionToolbar({
   showStacks: boolean;
   onSelectView: (view: ViewName) => void;
 }) {
+  function handleViewChange(value: string) {
+    if (value === "chat" || value === "stacks" || value === "settings") {
+      onSelectView(value);
+    }
+  }
+
   return (
     <header className="session-toolbar">
       <div className="session-toolbar-title">
@@ -919,36 +926,33 @@ function SessionToolbar({
           />
         ) : null}
       </div>
-      <nav className="session-view-tabs" aria-label="Thread views">
-        <button
-          type="button"
-          className="session-view-tab"
-          aria-current={activeView === "chat" ? "page" : undefined}
-          onClick={() => onSelectView("chat")}
-        >
-          Chat
-        </button>
-        {showStacks ? (
-          <button
-            type="button"
+      <Tabs
+        className="session-view-tabs"
+        value={activeView}
+        onValueChange={handleViewChange}
+      >
+        <TabsList className="session-view-tabs-list" aria-label="Thread views">
+          <TabsTrigger className="session-view-tab" value="chat">
+            Chat
+          </TabsTrigger>
+          {showStacks ? (
+            <TabsTrigger
+              className="session-view-tab"
+              disabled={!connected || !sessionId}
+              value="stacks"
+            >
+              Stacks
+            </TabsTrigger>
+          ) : null}
+          <TabsTrigger
             className="session-view-tab"
-            aria-current={activeView === "stacks" ? "page" : undefined}
-            disabled={!connected || !sessionId}
-            onClick={() => onSelectView("stacks")}
+            disabled={!connected}
+            value="settings"
           >
-            Stacks
-          </button>
-        ) : null}
-        <button
-          type="button"
-          className="session-view-tab"
-          aria-current={activeView === "settings" ? "page" : undefined}
-          disabled={!connected}
-          onClick={() => onSelectView("settings")}
-        >
-          Settings
-        </button>
-      </nav>
+            Settings
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
     </header>
   );
 }

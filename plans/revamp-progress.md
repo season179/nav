@@ -110,3 +110,13 @@
 - electron:smoke: passed when run unsandboxed.
 - Screenshot: `plans/revamp-shots/step-2.3.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session, so only the disabled session-mode Select trigger was visible, but the surface is stable with no `agent-browser errors` or console output.
+
+## Step 3.1 — Session toolbar tabs on shadcn Tabs
+- Checked DeepWiki plus current shadcn Tabs/CLI docs first; both confirmed the controlled `Tabs`/`TabsList`/`TabsTrigger` shape and the `--yes --overwrite` CLI path for noninteractive adds.
+- Added `tabs.tsx` with `pnpm dlx shadcn@latest add tabs -c . --yes --overwrite`.
+- Replaced the custom thread-view `nav` buttons in `SessionToolbar` with controlled shadcn `Tabs`, preserving the existing `onSelectView` route callback and disabled states for settings/stacks.
+- Moved the pill styling onto the generated `TabsList`, switched active styling to Radix `data-state="active"`, and added a static setup test guarding against the old `aria-current` button toolbar returning.
+- format/lint/check: passed (`check:electron` 107/107 tests when run unsandboxed).
+- electron:smoke: passed when run unsandboxed.
+- Screenshot: `plans/revamp-shots/step-3.1.png` captured from Electron CDP target
+  `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session, but the toolbar now snapshots as a real `tablist` with no `agent-browser errors` or console output.

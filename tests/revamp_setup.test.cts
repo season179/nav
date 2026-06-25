@@ -304,3 +304,33 @@ test("Composer thinking and session mode use shadcn Select", () => {
     /session-mode-menu|thinking-menu|thinking-option/,
   );
 });
+
+test("Session toolbar uses shadcn Tabs", () => {
+  const app = fs.readFileSync(
+    path.join(REPO_ROOT, "desktop", "electron", "renderer", "src", "App.tsx"),
+    "utf8",
+  );
+  const tabs = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "components",
+      "ui",
+      "tabs.tsx",
+    ),
+    "utf8",
+  );
+
+  assert.match(app, /TabsList/);
+  assert.match(app, /TabsTrigger/);
+  assert.match(app, /onValueChange/);
+  assert.match(tabs, /function Tabs\(/);
+  assert.match(tabs, /function TabsList\(/);
+  assert.match(tabs, /function TabsTrigger\(/);
+  assert.match(tabs, /function TabsContent\(/);
+  assert.doesNotMatch(app, /<nav className="session-view-tabs"/);
+  assert.doesNotMatch(app, /aria-current=\{activeView/);
+});
