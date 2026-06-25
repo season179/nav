@@ -14,15 +14,16 @@ test("session mode trigger keeps a stable slot for local and worktree labels", (
 test("sidebar uses a flat opaque base color", () => {
   const styles = readRendererStyles();
 
-  const rootRule = cssRule(styles, ":root");
+  // theme.css defines the shadcn --sidebar token (opaque).
+  assert.match(styles, /--sidebar:\s*oklch\(0\.35 0\.024 266\);/);
+  // base.css defines --sidebar-glass in its :root block.
+  assert.match(styles, /--sidebar-glass:/);
+  assert.doesNotMatch(styles, /--sidebar-glass-highlight-start:/);
+  assert.doesNotMatch(styles, /--sidebar-glass-highlight-mid:/);
+  assert.doesNotMatch(styles, /--sidebar-glass-shadow:/);
+
   const sidebarRule = cssRule(styles, ".sidebar");
   const newChatRule = cssRule(styles, ".new-chat");
-
-  assert.match(rootRule, /--sidebar-bg:\s*oklch\(0\.35 0\.024 266\);/);
-  assert.match(rootRule, /--sidebar-glass:/);
-  assert.doesNotMatch(rootRule, /--sidebar-glass-highlight-start:/);
-  assert.doesNotMatch(rootRule, /--sidebar-glass-highlight-mid:/);
-  assert.doesNotMatch(rootRule, /--sidebar-glass-shadow:/);
   assert.match(sidebarRule, /background:\s*var\(--sidebar-bg\);/);
   assert.doesNotMatch(sidebarRule, /linear-gradient\(/);
   assert.match(newChatRule, /background:\s*var\(--sidebar-glass-strong\);/);
@@ -42,7 +43,7 @@ function readRendererStyles() {
 
 // styles.css is an @import manifest; the rules live in feature partials. Inline
 // the imports in order (mirroring how Vite bundles them) so assertions can match
-// a rule wherever it lives.
+// a rule wherever it lives. Package imports (e.g. "tailwindcss") are left as-is.
 function resolveCssImports(filePath: string, seen: Set<string> = new Set()) {
   if (seen.has(filePath)) {
     return "";
@@ -52,8 +53,13 @@ function resolveCssImports(filePath: string, seen: Set<string> = new Set()) {
   const dir = path.dirname(filePath);
   return source.replace(
     /@import\s+["']([^"']+)["'];?/g,
-    (_match: string, ref: string) =>
-      resolveCssImports(path.resolve(dir, ref), seen),
+    (_match: string, ref: string) => {
+      // Skip npm package imports — they are not file paths.
+      if (!ref.startsWith("./") && !ref.startsWith("../")) {
+        return _match;
+      }
+      return resolveCssImports(path.resolve(dir, ref), seen);
+    },
   );
 }
 

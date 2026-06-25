@@ -1,0 +1,72 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Tailwind v4 must scan Streamdown's prebuilt classes or markdown/code won't be
+   styled. Path is relative to THIS file → repo-root node_modules (up 4 dirs).
+   After adding the `message` component (Step 0.3), confirm this path resolves. */
+@source "../../../../node_modules/streamdown/dist/*.js";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(0.21 0.004 95);
+  --foreground: oklch(0.98 0.004 95);
+  --card: oklch(0.29 0.016 264);
+  --card-foreground: oklch(0.98 0.004 95);
+  --popover: oklch(0.29 0.016 264);
+  --popover-foreground: oklch(0.98 0.004 95);
+  --primary: oklch(0.72 0.08 176);
+  --primary-foreground: oklch(0.21 0.004 95);
+  --secondary: oklch(0.39 0.012 261);
+  --secondary-foreground: oklch(0.98 0.004 95);
+  --muted: oklch(0.29 0.016 264);
+  --muted-foreground: oklch(0.72 0.004 95);
+  --accent: oklch(0.39 0.012 261);
+  --accent-foreground: oklch(0.98 0.004 95);
+  --destructive: oklch(0.66 0.13 25);
+  --border: oklch(0.34 0.01 264);
+  --input: oklch(0.34 0.01 264);
+  --ring: oklch(0.72 0.08 176);
+  --sidebar: oklch(0.35 0.024 266);
+  --sidebar-foreground: oklch(0.98 0.004 95);
+  --sidebar-primary: oklch(0.72 0.08 176);
+  --sidebar-primary-foreground: oklch(0.21 0.004 95);
+  --sidebar-accent: oklch(0.39 0.012 261);
+  --sidebar-accent-foreground: oklch(0.98 0.004 95);
+  --sidebar-border: oklch(0.34 0.01 264);
+  --sidebar-ring: oklch(0.72 0.08 176);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
