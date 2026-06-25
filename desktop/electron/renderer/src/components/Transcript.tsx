@@ -7,13 +7,13 @@ import {
 import {
   Message as AiMessage,
   MessageContent,
+  MessageResponse,
 } from "@/components/ai-elements/message";
 import {
   type AiElementsChatMessage,
   type AiElementsToolMessage,
   adaptMessagesForAiElements,
 } from "../lib/ai-elements-adapter.ts";
-import { renderMarkdown } from "../lib/markdown.ts";
 import type { Message } from "../types.ts";
 
 export default function Transcript({ messages }: { messages: Message[] }) {
@@ -59,7 +59,9 @@ function ChatMessageItem({
     <AiMessage className={`message message-${item.role}`} from={item.from}>
       <MessageContent className="message-content">
         {item.role === "assistant" ? (
-          <MarkdownText text={item.text} />
+          <MessageResponse className="message-response">
+            {item.text}
+          </MessageResponse>
         ) : (
           <span className="message-text">{item.text}</span>
         )}
@@ -70,17 +72,6 @@ function ChatMessageItem({
         ) : null}
       </MessageContent>
     </AiMessage>
-  );
-}
-
-function MarkdownText({ text }: { text: string }) {
-  const html = useMemo(() => renderMarkdown(text), [text]);
-  return (
-    <div
-      className="message-text markdown"
-      /* Assistant markdown is sanitized with DOMPurify first. */
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
   );
 }
 

@@ -92,3 +92,21 @@ test("AI Elements generated components live under renderer src", () => {
     "AI Elements registry files should be relocated into renderer src",
   );
 });
+
+test("Transcript renders assistant markdown through AI Elements MessageResponse", () => {
+  const transcript = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "components",
+      "Transcript.tsx",
+    ),
+    "utf8",
+  );
+
+  assert.match(transcript, /MessageResponse/);
+  assert.doesNotMatch(transcript, /renderMarkdown|MarkdownText/);
+});

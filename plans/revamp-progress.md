@@ -55,3 +55,13 @@
 - electron:smoke: passed
 - Screenshot: `plans/revamp-shots/step-1.2.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; empty chat surface renders without the smoke card, no stray conversation scroll button, no `agent-browser errors` or console output.
+
+## Step 1.3 — Render assistant markdown through Streamdown
+- Replaced transcript assistant markdown rendering with AI Elements `MessageResponse` (Streamdown) and removed `renderMarkdown`/`MarkdownText` from `Transcript.tsx`.
+- Ran `rg -n "marked|dompurify|renderMarkdown|MarkdownText" desktop/electron/renderer/src`; remaining hits are only in the old `src/lib/markdown.ts` helper, so `marked`/`dompurify` deps stay for Phase 5 cleanup.
+- Removed the old `.markdown` transcript CSS block and kept a small `.message-response` wrapper rule for transcript typography.
+- Added a static setup test that guards `Transcript.tsx` against regressing back to `renderMarkdown`/`MarkdownText`.
+- format/lint/check: passed (`check:electron` 103/103 tests); build still warns about large Streamdown/Shiki/Mermaid chunks, though the transcript bundle is smaller after dropping the old markdown path.
+- electron:smoke: passed
+- Screenshot: `plans/revamp-shots/step-1.3.png` captured from Electron CDP target
+  `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session, but the surface is stable with no `agent-browser errors` or console output.
