@@ -34,3 +34,13 @@
 - electron:smoke: passed
 - Screenshot: `plans/revamp-shots/step-0.3.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; markdown heading/list and syntax-highlighted code block visible, no `agent-browser errors` or console output.
+
+## Step 1.1 — Pure session to AI Elements adapter
+- Added `src/lib/ai-elements-adapter.ts`, a pure mapper from existing renderer `Message[]` data into AI Elements-friendly transcript items.
+- Maps `user`, `assistant`, and `error` chat roles into AI Elements `Message` props; `error` keeps its original role for later styling while rendering from the assistant side because AI Elements does not expose an `error` sender.
+- Preserves tool messages with their current `state` and leaves the Step 1.4 TODO for final AI Elements tool-state mapping after `tool.tsx` is generated.
+- Added `tests/revamp_adapter.test.cts` covering user/assistant/error role mapping and tool-message preservation.
+- format/lint/check: passed (`check:electron` 103/103 tests); build still warns about large Streamdown/Shiki/Mermaid chunks from Step 0.3.
+- electron:smoke: passed
+- Screenshot: `plans/revamp-shots/step-1.1.png` captured from Electron CDP target
+  `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; existing smoke surface remains visible, no `agent-browser errors` or console output.
