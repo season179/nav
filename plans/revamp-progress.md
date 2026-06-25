@@ -76,3 +76,17 @@
 - electron:smoke: passed when rerun unsandboxed (sandboxed Electron launch aborted with `SIGABRT`).
 - Screenshot: `plans/revamp-shots/step-1.4.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session so no live tool row was visible, but the surface is stable with no `agent-browser errors` or console output.
+
+## Step 1.5 — Reasoning component probe
+- Skipped: `rg -n "reasoning|thinking|thought" desktop/electron/renderer/src/types.ts desktop/electron/renderer/src/lib` found only model thinking-level settings, not streamed reasoning/thought transcript content.
+
+## Step 2.1 — Rebuild composer input on AI Elements PromptInput
+- Checked DeepWiki plus current shadcn/AI Elements docs first: DeepWiki only confirmed the shadcn overwrite behavior, while the official Prompt Input docs and generated file showed the real exports are `PromptInputFooter`/`PromptInputTools` rather than the plan's guessed `PromptInputToolbar`.
+- Added `@ai-elements/prompt-input` with `pnpm dlx shadcn@latest add @ai-elements/prompt-input -c . --yes --overwrite`, relocated the generated `prompt-input.tsx` into renderer src, and added its generated UI primitives plus `cmdk`/`nanoid`.
+- Rebuilt the composer text area/send shell on `PromptInput`, `PromptInputTextarea`, `PromptInputFooter`, `PromptInputTools`, and `PromptInputSubmit`; kept the TanStack form validation/draft/onSend path and the separate Stop button so running sessions retain their existing behavior.
+- Removed the old manual Enter key handling and textarea autosize code; `PromptInputTextarea` now owns Enter-to-submit, Shift+Enter newline, IME composition handling, and field-sizing growth.
+- Added/updated static tests for AI Elements relocation and PromptInput usage.
+- format/lint/check: passed (`check:electron` 104/104 tests when run unsandboxed; sandboxed local-listener runs are still not reliable in this repo).
+- electron:smoke: passed when run unsandboxed.
+- Screenshot: `plans/revamp-shots/step-2.1.png` captured from Electron CDP target
+  `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session, but the new prompt shell is visible and stable with no `agent-browser errors` or console output.

@@ -1,6 +1,17 @@
 import { useForm } from "@tanstack/react-form";
 import { useDebouncer } from "@tanstack/react-pacer";
+import type { FormEvent } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  PromptInput,
+  PromptInputBody,
+  PromptInputButton,
+  PromptInputFooter,
+  type PromptInputMessage,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputTools,
+} from "@/components/ai-elements/prompt-input";
 import {
   browserComposerDraftStorage,
   readComposerDraft,
@@ -87,15 +98,6 @@ export default function Composer({
   });
 
   useEffect(() => {
-    const input = inputRef.current;
-    if (!input) {
-      return;
-    }
-    input.style.height = "auto";
-    input.style.height = `${input.scrollHeight}px`;
-  });
-
-  useEffect(() => {
     if (connected) {
       inputRef.current?.focus();
     }
@@ -105,24 +107,16 @@ export default function Composer({
     saveDraftDebouncer.maybeExecute(nextText);
   }
 
-  async function handleSubmit(event: React.SyntheticEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function handlePromptSubmit(
+    _message: PromptInputMessage,
+    event: FormEvent<HTMLFormElement>,
+  ) {
     event.stopPropagation();
     await form.handleSubmit();
   }
 
-  function handleKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.nativeEvent.isComposing) {
-      return;
-    }
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      event.currentTarget.form?.requestSubmit();
-    }
-  }
-
   return (
-    <form className="composer" id="composer" onSubmit={handleSubmit}>
+    <div className="composer">
       <form.Field
         name="message"
         validators={{
@@ -134,54 +128,62 @@ export default function Composer({
           const errorText = field.state.meta.errors.join(", ");
           return (
             <>
-              <div className="composer-row">
-                <textarea
-                  ref={inputRef}
-                  id="composer-input"
-                  className="composer-input"
-                  aria-label="Message"
-                  aria-describedby={
-                    errorText ? "composer-input-error" : undefined
-                  }
-                  aria-invalid={errorText ? true : undefined}
-                  placeholder="Tell nav what to do"
-                  autoComplete="off"
-                  rows={1}
-                  disabled={!connected}
-                  value={message}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => {
-                    const nextMessage = event.target.value;
-                    field.handleChange(nextMessage);
-                    saveDraft(nextMessage);
-                    resizeComposerInput(event.currentTarget);
-                  }}
-                  onKeyDown={handleKeyDown}
-                />
-                <button
-                  type="submit"
-                  id="composer-send"
-                  className="composer-send"
-                  aria-label="Send message"
-                  title="Send message"
-                  disabled={
-                    !connected || normalizeComposerMessage(message).length === 0
-                  }
-                >
-                  ↑
-                </button>
-                {running ? (
-                  <button
-                    type="button"
-                    id="composer-stop"
-                    className="composer-stop"
-                    disabled={!connected || stopPending}
-                    onClick={onStop}
+              <PromptInput
+                className="composer-input-form"
+                id="composer"
+                onSubmit={handlePromptSubmit}
+              >
+                <PromptInputBody>
+                  <PromptInputTextarea
+                    ref={inputRef}
+                    id="composer-input"
+                    className="composer-input"
+                    aria-label="Message"
+                    aria-describedby={
+                      errorText ? "composer-input-error" : undefined
+                    }
+                    aria-invalid={errorText ? true : undefined}
+                    placeholder="Tell nav what to do"
+                    autoComplete="off"
+                    rows={1}
+                    disabled={!connected}
+                    value={message}
+                    onBlur={field.handleBlur}
+                    onChange={(event) => {
+                      const nextMessage = event.target.value;
+                      field.handleChange(nextMessage);
+                      saveDraft(nextMessage);
+                    }}
+                  />
+                </PromptInputBody>
+                <PromptInputFooter className="composer-input-footer">
+                  <PromptInputTools>
+                    {running ? (
+                      <PromptInputButton
+                        type="button"
+                        id="composer-stop"
+                        className="composer-stop"
+                        disabled={!connected || stopPending}
+                        onClick={onStop}
+                      >
+                        Stop
+                      </PromptInputButton>
+                    ) : null}
+                  </PromptInputTools>
+                  <PromptInputSubmit
+                    id="composer-send"
+                    className="composer-send"
+                    aria-label="Send message"
+                    title="Send message"
+                    disabled={
+                      !connected ||
+                      normalizeComposerMessage(message).length === 0
+                    }
                   >
-                    Stop
-                  </button>
-                ) : null}
-              </div>
+                    ↑
+                  </PromptInputSubmit>
+                </PromptInputFooter>
+              </PromptInput>
               {errorText ? (
                 <div
                   className="composer-error"
@@ -220,13 +222,8 @@ export default function Composer({
           </span>
         </span>
       </div>
-    </form>
+    </div>
   );
-}
-
-function resizeComposerInput(input: HTMLTextAreaElement) {
-  input.style.height = "auto";
-  input.style.height = `${input.scrollHeight}px`;
 }
 
 function ThinkingMenu({

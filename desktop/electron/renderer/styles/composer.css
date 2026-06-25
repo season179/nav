@@ -285,7 +285,7 @@
   font-family: inherit;
   font-size: 15px;
   line-height: 1.4;
-  /* Grows with content (height set in JS); caps out before scrolling. */
+  /* Grows with field-sizing-content; caps out before scrolling. */
   resize: none;
   overflow-y: auto;
   max-height: 200px;

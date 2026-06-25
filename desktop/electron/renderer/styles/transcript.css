@@ -107,13 +107,13 @@
   background: var(--surface);
 }
 
-.composer-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 8px;
+.composer-input-form {
   width: 100%;
   max-width: var(--content-max-width);
   margin: 0 auto;
+}
+
+.composer-input-form [data-slot="input-group"] {
   padding: 10px;
   border: 1px solid var(--border);
   border-radius: 24px;
@@ -124,7 +124,7 @@
     box-shadow 150ms ease-out;
 }
 
-.composer-row:focus-within {
+.composer-input-form [data-slot="input-group"]:focus-within {
   border-color: var(--active-border);
   box-shadow:
     0 14px 30px rgb(0 0 0 / 0.24),
