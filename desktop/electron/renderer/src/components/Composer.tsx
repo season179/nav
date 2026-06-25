@@ -1,7 +1,7 @@
 import { useForm } from "@tanstack/react-form";
 import { useDebouncer } from "@tanstack/react-pacer";
 import type { FormEvent } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ContextContent,
   ContextContentHeader,
@@ -31,6 +31,14 @@ import {
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input";
 import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   browserComposerDraftStorage,
   readComposerDraft,
   writeComposerDraft,
@@ -51,15 +59,6 @@ const sessionModeOptions: { value: SessionMode; label: string }[] = [
   { value: "local", label: "Local" },
   { value: "worktree", label: "Worktree" },
 ];
-const thinkingLevelDetails: Record<string, string> = {
-  off: "No reasoning",
-  minimal: "Very brief reasoning",
-  low: "Light reasoning",
-  medium: "Balanced reasoning",
-  high: "Deeper reasoning",
-  xhigh: "Maximum reasoning",
-};
-
 export default function Composer({
   connected,
   draftKey,
@@ -251,104 +250,10 @@ function ThinkingMenu({
   modelInfo: ModelInfo | null;
   onThinkingChange: (level: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const [focusedIndex, setFocusedIndex] = useState(0);
-  const menuRef = useRef<HTMLSpanElement>(null);
-  const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
-  const triggerRef = useRef<HTMLButtonElement>(null);
   const rawLevels = modelInfo?.thinkingLevels;
   const levels = Array.isArray(rawLevels) ? rawLevels : [];
   const current = modelInfo?.thinking ?? levels[0] ?? "";
   const hasChoices = levels.length > 1;
-
-  const closeMenu = useCallback(() => {
-    setOpen(false);
-    window.setTimeout(() => {
-      triggerRef.current?.focus();
-    }, 0);
-  }, []);
-
-  const openMenu = useCallback(() => {
-    setFocusedIndex(0);
-    setOpen(true);
-  }, []);
-
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-
-    function closeOnOutsidePointer(event: PointerEvent) {
-      if (!menuRef.current?.contains(event.target as Node)) {
-        closeMenu();
-      }
-    }
-
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-    };
-  }, [open, closeMenu]);
-
-  useEffect(() => {
-    if (disabled || !hasChoices) {
-      closeMenu();
-    }
-  }, [disabled, hasChoices, closeMenu]);
-
-  useEffect(() => {
-    itemRefs.current = itemRefs.current.slice(0, levels.length);
-  }, [levels.length]);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    window.setTimeout(() => {
-      itemRefs.current[focusedIndex]?.focus();
-    }, 0);
-  }, [focusedIndex, open]);
-
-  function selectThinking(level: string) {
-    onThinkingChange(level);
-    closeMenu();
-  }
-
-  function handleTriggerKeyDown(event: React.KeyboardEvent<HTMLButtonElement>) {
-    if (event.key === "Escape") {
-      closeMenu();
-    }
-  }
-
-  function handleMenuKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
-    if (event.key === "Escape") {
-      closeMenu();
-      return;
-    }
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      focusThinkingOption(focusedIndex + 1);
-      return;
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      focusThinkingOption(focusedIndex - 1);
-      return;
-    }
-    if (event.key === "Enter" || event.key === " ") {
-      event.preventDefault();
-      const focusedLevel = levels[focusedIndex];
-      if (focusedLevel) {
-        selectThinking(focusedLevel);
-      }
-    }
-  }
-
-  function focusThinkingOption(index: number) {
-    const nextIndex = wrapIndex(index, levels.length);
-    setFocusedIndex(nextIndex);
-    itemRefs.current[nextIndex]?.focus();
-  }
 
   if (!current && !hasChoices) {
     return (
@@ -373,63 +278,28 @@ function ThinkingMenu({
   }
 
   return (
-    <span className="composer-thinking-menu" ref={menuRef}>
-      <button
-        ref={triggerRef}
-        type="button"
+    <Select
+      value={current}
+      disabled={disabled || !hasChoices}
+      onValueChange={onThinkingChange}
+    >
+      <SelectTrigger
         id="composer-thinking"
         className="thinking-trigger"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-live="polite"
-        disabled={disabled}
-        onClick={() => (open ? closeMenu() : openMenu())}
-        onKeyDown={handleTriggerKeyDown}
+        aria-label="Thinking level"
       >
-        <span>{formatThinkingLabel(current)}</span>
-        <span className="thinking-chevron" aria-hidden="true">
-          v
-        </span>
-      </button>
-      {open ? (
-        <div
-          className="thinking-menu"
-          role="menu"
-          onKeyDown={handleMenuKeyDown}
-        >
-          {levels.map((level, index) => {
-            const selected = level === current;
-            return (
-              <button
-                key={level}
-                ref={(node) => {
-                  itemRefs.current[index] = node;
-                }}
-                type="button"
-                className="thinking-option"
-                role="menuitemradio"
-                aria-checked={selected ? "true" : "false"}
-                tabIndex={index === focusedIndex ? 0 : -1}
-                onFocus={() => setFocusedIndex(index)}
-                onClick={() => selectThinking(level)}
-              >
-                <span>
-                  <span className="thinking-option-label">
-                    {formatThinkingLabel(level)}
-                  </span>
-                  <span className="thinking-option-description">
-                    {thinkingLevelDetails[level] ?? ""}
-                  </span>
-                </span>
-                <span className="thinking-check" aria-hidden="true">
-                  {selected ? "✓" : ""}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
-    </span>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent align="end" className="composer-select-content">
+        <SelectGroup>
+          {levels.map((level) => (
+            <SelectItem key={level} value={level}>
+              {formatThinkingLabel(level)}
+            </SelectItem>
+          ))}
+        </SelectGroup>
+      </SelectContent>
+    </Select>
   );
 }
 
@@ -553,10 +423,6 @@ function formatThinkingLabel(level: string): string {
   return level === "off" ? "thinking off" : `thinking ${level}`;
 }
 
-function wrapIndex(index: number, length: number): number {
-  return ((index % length) + length) % length;
-}
-
 function SessionModeMenu({
   disabled,
   mode,
@@ -566,101 +432,33 @@ function SessionModeMenu({
   mode: SessionMode;
   onModeChange: (mode: SessionMode) => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const menuRef = useRef<HTMLSpanElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-
-  const closeMenu = useCallback(() => {
-    setOpen(false);
-    window.setTimeout(() => {
-      triggerRef.current?.focus();
-    }, 0);
-  }, []);
-
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-
-    function closeOnOutsidePointer(event: PointerEvent) {
-      if (!menuRef.current?.contains(event.target as Node)) {
-        closeMenu();
-      }
-    }
-
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-    };
-  }, [open, closeMenu]);
-
-  useEffect(() => {
-    if (disabled) {
-      closeMenu();
-    }
-  }, [disabled, closeMenu]);
-
-  function selectMode(value: SessionMode) {
-    onModeChange(value);
-    closeMenu();
-  }
-
-  function closeOnEscape(event: React.KeyboardEvent) {
-    if (event.key === "Escape") {
-      closeMenu();
-    }
-  }
-
   return (
-    <span className="composer-session-mode" ref={menuRef}>
-      <button
-        ref={triggerRef}
-        type="button"
+    <Select
+      value={mode}
+      disabled={disabled}
+      onValueChange={(value) => {
+        if (value === "local" || value === "worktree") {
+          onModeChange(value);
+        }
+      }}
+    >
+      <SelectTrigger
         id="new-session-mode"
         className="session-mode-trigger"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        disabled={disabled}
-        onClick={() => setOpen((isOpen) => !isOpen)}
-        onKeyDown={closeOnEscape}
+        aria-label="New session mode"
       >
-        <span>{sessionModeLabel(mode)}</span>
-        <span className="session-mode-chevron" aria-hidden="true">
-          v
-        </span>
-      </button>
-      {open ? (
-        <div
-          className="session-mode-menu"
-          role="menu"
-          onKeyDown={closeOnEscape}
-        >
-          <div className="session-mode-menu-title">Start in</div>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent align="start" className="composer-select-content">
+        <SelectGroup>
           {sessionModeOptions.map((option) => (
-            <button
-              key={option.value}
-              type="button"
-              className="session-mode-option"
-              role="menuitemradio"
-              aria-checked={option.value === mode ? "true" : "false"}
-              onClick={() => selectMode(option.value)}
-            >
-              <span>{option.label}</span>
-              <span className="session-mode-check" aria-hidden="true">
-                {option.value === mode ? "✓" : ""}
-              </span>
-            </button>
+            <SelectItem key={option.value} value={option.value}>
+              {option.label}
+            </SelectItem>
           ))}
-        </div>
-      ) : null}
-    </span>
-  );
-}
-
-function sessionModeLabel(mode: SessionMode): string {
-  return (
-    sessionModeOptions.find((option) => option.value === mode)?.label ??
-    sessionModeOptions[0].label
+        </SelectGroup>
+      </SelectContent>
+    </Select>
   );
 }
 

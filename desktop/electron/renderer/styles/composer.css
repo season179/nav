@@ -11,14 +11,6 @@
   padding-left: 2px;
 }
 
-.composer-session-mode,
-.composer-thinking-menu {
-  position: relative;
-  display: inline-flex;
-  flex: 0 0 auto;
-  min-width: 0;
-}
-
 .session-mode-trigger,
 .model-trigger,
 .thinking-trigger {
@@ -83,50 +75,13 @@
   opacity: 0.65;
 }
 
-.session-mode-chevron,
-.model-chevron,
-.thinking-chevron {
+.model-chevron {
   color: var(--ink-faint);
   font-size: 10px;
   line-height: 1;
 }
 
-.session-mode-menu {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  left: 0;
-  z-index: var(--z-overlay);
-  width: 184px;
-  padding: 8px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--surface-raised);
-  box-shadow: 0 18px 40px rgb(0 0 0 / 0.14);
-}
-
-.thinking-menu {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 8px);
-  z-index: var(--z-overlay);
-  width: 220px;
-  padding: 8px;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: var(--surface-raised);
-  box-shadow: 0 18px 40px rgb(0 0 0 / 0.14);
-}
-
-.session-mode-menu-title {
-  padding: 2px 8px 8px;
-  color: var(--ink-faint);
-  font-size: 11px;
-  line-height: 1.2;
-}
-
-.session-mode-option,
-.model-option,
-.thinking-option {
+.model-option {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -143,10 +98,6 @@
   cursor: pointer;
 }
 
-.session-mode-option {
-  justify-content: space-between;
-}
-
 .model-option {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto 14px;
@@ -160,57 +111,21 @@
   color: var(--ink);
 }
 
-.thinking-option {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 14px;
-}
-
-.session-mode-option:hover,
-.session-mode-option:focus-visible,
 .model-option:hover,
-.model-option:focus-visible,
-.thinking-option:hover,
-.thinking-option:focus-visible {
+.model-option:focus-visible {
   outline: none;
   background: var(--active-tint);
   color: var(--ink);
 }
 
-.session-mode-option[aria-checked="true"],
-.model-option[data-current="true"],
-.thinking-option[aria-checked="true"] {
+.model-option[data-current="true"] {
   color: var(--ink);
-}
-
-.thinking-option-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.thinking-option-label,
-.thinking-option-description {
-  display: block;
-}
-
-.thinking-option-description {
-  margin-top: 2px;
-  color: var(--ink-faint);
-  font-size: 11px;
-  line-height: 1.2;
 }
 
 .model-option-provider {
   color: var(--ink-faint);
   font-size: 11px;
   white-space: nowrap;
-}
-
-.session-mode-check,
-.thinking-check {
-  width: 14px;
-  color: var(--active);
-  text-align: center;
 }
 
 .composer-token-usage {
@@ -233,6 +148,12 @@ button.composer-token-usage:focus-visible {
   outline: none;
   border-radius: 4px;
   box-shadow: 0 0 0 2px var(--active-tint);
+}
+
+.composer-select-content {
+  border-color: var(--border);
+  background: var(--surface-raised);
+  color: var(--ink);
 }
 
 .composer-error {

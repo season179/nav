@@ -101,3 +101,12 @@
 - electron:smoke: passed when run unsandboxed.
 - Screenshot: `plans/revamp-shots/step-2.2.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session after a longer wait, so the model selector and token context could not be exercised visually, but the surface is stable with no `agent-browser errors` or console output.
+
+## Step 2.3 — Thinking and session-mode menus on shadcn Select
+- Did not re-add `select`; the shadcn `select.tsx` primitive was already generated in Step 1.4 by the AI Elements tool dependency.
+- Replaced the custom `ThinkingMenu` and `SessionModeMenu` popover/menu implementations with shadcn `Select`, preserving the existing option lists and callback paths.
+- Removed the dead custom thinking/session menu CSS and added a static setup test guarding against the old manual menu helpers/selectors returning.
+- format/lint/check: passed (`check:electron` 106/106 tests when run unsandboxed).
+- electron:smoke: passed when run unsandboxed.
+- Screenshot: `plans/revamp-shots/step-2.3.png` captured from Electron CDP target
+  `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session, so only the disabled session-mode Select trigger was visible, but the surface is stable with no `agent-browser errors` or console output.

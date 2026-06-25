@@ -266,3 +266,41 @@ test("Composer metadata uses AI Elements model selector and context", () => {
   assert.match(composer, /ContextContentHeader/);
   assert.doesNotMatch(composer, /model-search|filterModelOptions/);
 });
+
+test("Composer thinking and session mode use shadcn Select", () => {
+  const composer = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "components",
+      "Composer.tsx",
+    ),
+    "utf8",
+  );
+  const composerCss = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "styles",
+      "composer.css",
+    ),
+    "utf8",
+  );
+
+  assert.match(composer, /SelectTrigger/);
+  assert.match(composer, /SelectContent/);
+  assert.match(composer, /SelectItem/);
+  assert.doesNotMatch(
+    composer,
+    /wrapIndex|sessionModeLabel|thinkingLevelDetails/,
+  );
+  assert.doesNotMatch(
+    composerCss,
+    /session-mode-menu|thinking-menu|thinking-option/,
+  );
+});
