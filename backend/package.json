@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --dir test",
     "build": "flue build",
     "dev": "flue dev",
     "start": "node scripts/start.mjs"

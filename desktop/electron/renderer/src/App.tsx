@@ -1,6 +1,8 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -9,10 +11,7 @@ import {
   useState,
 } from "react";
 import Composer from "./components/Composer.tsx";
-import SettingsPage from "./components/SettingsPage.tsx";
 import Sidebar from "./components/Sidebar.tsx";
-import StacksPage from "./components/StacksPage.tsx";
-import Transcript from "./components/Transcript.tsx";
 import { type NavAppView, parseNavPathname } from "./lib/app-routes.ts";
 import {
   modelOptionsQueryOptions,
@@ -38,6 +37,10 @@ import type {
   SessionEvent,
   SessionMode,
 } from "./types.ts";
+
+const SettingsPage = lazy(() => import("./components/SettingsPage.tsx"));
+const StacksPage = lazy(() => import("./components/StacksPage.tsx"));
+const Transcript = lazy(() => import("./components/Transcript.tsx"));
 
 // Shown when a session has no state yet (e.g. before its first event arrives),
 // so the composer and transcript always have a stable object to read.
@@ -836,48 +839,50 @@ export default function App() {
           showStacks={activeState.stackAvailable}
           onSelectView={selectView}
         />
-        {activeView === "settings" ? (
-          <SettingsPage
-            connected={connected}
-            modelInfo={activeState.modelInfo}
-            modelOptions={modelOptions}
-            modelSwitching={modelSwitching}
-            newSessionMode={newSessionMode}
-            sessionId={activeSessionId}
-            onModelChange={switchModel}
-            onNewSessionModeChange={changeNewSessionMode}
-            onThinkingChange={switchThinking}
-          />
-        ) : activeView === "stacks" ? (
-          <StacksPage
-            key={activeSessionId ?? "none"}
-            onUnavailable={markStacksUnavailable}
-            sessionId={activeSessionId}
-          />
-        ) : (
-          <>
-            <Transcript
-              key={activeSessionId ?? "none"}
-              messages={activeState.messages}
-            />
-            <Composer
-              key={activeSessionId ?? "none"}
+        <Suspense fallback={null}>
+          {activeView === "settings" ? (
+            <SettingsPage
               connected={connected}
-              draftKey={activeSessionId}
               modelInfo={activeState.modelInfo}
               modelOptions={modelOptions}
               modelSwitching={modelSwitching}
               newSessionMode={newSessionMode}
-              running={activeState.running}
-              stopPending={activeState.stopPending}
-              onNewSessionModeChange={changeNewSessionMode}
+              sessionId={activeSessionId}
               onModelChange={switchModel}
+              onNewSessionModeChange={changeNewSessionMode}
               onThinkingChange={switchThinking}
-              onSend={sendMessage}
-              onStop={() => stopRun(activeSessionIdRef.current)}
             />
-          </>
-        )}
+          ) : activeView === "stacks" ? (
+            <StacksPage
+              key={activeSessionId ?? "none"}
+              onUnavailable={markStacksUnavailable}
+              sessionId={activeSessionId}
+            />
+          ) : (
+            <>
+              <Transcript
+                key={activeSessionId ?? "none"}
+                messages={activeState.messages}
+              />
+              <Composer
+                key={activeSessionId ?? "none"}
+                connected={connected}
+                draftKey={activeSessionId}
+                modelInfo={activeState.modelInfo}
+                modelOptions={modelOptions}
+                modelSwitching={modelSwitching}
+                newSessionMode={newSessionMode}
+                running={activeState.running}
+                stopPending={activeState.stopPending}
+                onNewSessionModeChange={changeNewSessionMode}
+                onModelChange={switchModel}
+                onThinkingChange={switchThinking}
+                onSend={sendMessage}
+                onStop={() => stopRun(activeSessionIdRef.current)}
+              />
+            </>
+          )}
+        </Suspense>
       </main>
     </div>
   );

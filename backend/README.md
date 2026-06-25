@@ -8,7 +8,7 @@ OpenAPI document.
 
 ```sh
 pnpm --dir backend run typecheck
-pnpm --dir backend exec vitest run
+pnpm --dir backend run test
 pnpm --dir backend run build
 pnpm --dir backend run start
 ```
