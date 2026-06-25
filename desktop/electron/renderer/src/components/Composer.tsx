@@ -3,6 +3,24 @@ import { useDebouncer } from "@tanstack/react-pacer";
 import type { FormEvent } from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  ContextContent,
+  ContextContentHeader,
+  ContextTrigger,
+  Context as TokenContext,
+} from "@/components/ai-elements/context";
+import {
+  ModelSelector,
+  ModelSelectorContent,
+  ModelSelectorEmpty,
+  ModelSelectorGroup,
+  ModelSelectorInput,
+  ModelSelectorItem,
+  ModelSelectorList,
+  ModelSelectorName,
+  ModelSelectorShortcut,
+  ModelSelectorTrigger,
+} from "@/components/ai-elements/model-selector";
+import {
   PromptInput,
   PromptInputBody,
   PromptInputButton,
@@ -217,9 +235,7 @@ export default function Composer({
             modelInfo={modelInfo}
             onThinkingChange={onThinkingChange}
           />
-          <span className="composer-token-usage" id="composer-token-usage">
-            {formatTokenUsage(modelInfo?.tokenUsage)}
-          </span>
+          <TokenUsageMeter modelInfo={modelInfo} />
         </span>
       </div>
     </div>
@@ -429,77 +445,18 @@ function ModelMenu({
   onModelChange: (option: ModelOption) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const menuRef = useRef<HTMLSpanElement>(null);
-  const searchRef = useRef<HTMLInputElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
   const hasOptions = options.length > 0;
-  const visibleOptions = filterModelOptions(options, query);
-
-  const closeMenu = useCallback(() => {
-    setOpen(false);
-    setQuery("");
-    window.setTimeout(() => {
-      triggerRef.current?.focus();
-    }, 0);
-  }, []);
-
-  const openMenu = useCallback(() => {
-    setOpen(true);
-    window.setTimeout(() => {
-      searchRef.current?.focus();
-    }, 0);
-  }, []);
-
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-
-    function closeOnOutsidePointer(event: PointerEvent) {
-      if (!menuRef.current?.contains(event.target as Node)) {
-        closeMenu();
-      }
-    }
-
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-    };
-  }, [open, closeMenu]);
+  const groupedOptions = groupModelOptions(options);
 
   useEffect(() => {
     if (disabled || !hasOptions) {
-      closeMenu();
+      setOpen(false);
     }
-  }, [disabled, hasOptions, closeMenu]);
+  }, [disabled, hasOptions]);
 
   function selectModel(option: ModelOption) {
     onModelChange(option);
-    closeMenu();
-  }
-
-  function closeOnEscape(event: React.KeyboardEvent) {
-    if (event.key === "Escape") {
-      closeMenu();
-    }
-  }
-
-  function handleSearchKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
-    event.stopPropagation();
-    if (event.key === "Enter") {
-      event.preventDefault();
-      return;
-    }
-    closeOnEscape(event);
-  }
-
-  function toggleMenu() {
-    if (open) {
-      closeMenu();
-    } else {
-      openMenu();
-    }
+    setOpen(false);
   }
 
   if (!hasOptions) {
@@ -511,75 +468,72 @@ function ModelMenu({
   }
 
   return (
-    <span className="composer-model-menu" ref={menuRef}>
-      <button
-        ref={triggerRef}
-        type="button"
-        id="composer-model"
-        className="model-trigger"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-live="polite"
-        disabled={disabled}
-        onClick={toggleMenu}
-        onKeyDown={closeOnEscape}
-      >
-        <span>{modelInfo?.label ?? "Model"}</span>
-        <span className="model-chevron" aria-hidden="true">
-          v
-        </span>
-      </button>
-      {open ? (
-        <div className="model-menu" role="menu" onKeyDown={closeOnEscape}>
-          <input
-            ref={searchRef}
-            type="search"
-            className="model-search"
-            aria-label="Search models"
-            placeholder="Search models"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={handleSearchKeyDown}
-          />
-          {visibleOptions.map((option) => {
-            const selected = isCurrentModel(option, modelInfo);
-            return (
-              <button
-                key={`${option.provider}:${option.model}`}
-                type="button"
-                className="model-option"
-                role="menuitemradio"
-                aria-checked={selected ? "true" : "false"}
-                onClick={() => selectModel(option)}
-              >
-                <span className="model-option-label">{option.label}</span>
-                <span className="model-option-provider">{option.provider}</span>
-                <span className="model-check" aria-hidden="true">
-                  {selected ? "✓" : ""}
-                </span>
-              </button>
-            );
-          })}
-          {visibleOptions.length === 0 ? (
-            <div className="model-empty">No matching models</div>
-          ) : null}
-        </div>
-      ) : null}
-    </span>
+    <ModelSelector
+      open={open}
+      onOpenChange={(nextOpen) => {
+        setOpen(disabled ? false : nextOpen);
+      }}
+    >
+      <ModelSelectorTrigger asChild>
+        <button
+          type="button"
+          id="composer-model"
+          className="model-trigger"
+          aria-live="polite"
+          disabled={disabled}
+        >
+          <span>{modelInfo?.label ?? "Model"}</span>
+          <span className="model-chevron" aria-hidden="true">
+            v
+          </span>
+        </button>
+      </ModelSelectorTrigger>
+      <ModelSelectorContent className="model-selector-content">
+        <ModelSelectorInput placeholder="Search models" />
+        <ModelSelectorList>
+          <ModelSelectorEmpty>No matching models</ModelSelectorEmpty>
+          {groupedOptions.map(([provider, providerOptions]) => (
+            <ModelSelectorGroup heading={provider} key={provider}>
+              {providerOptions.map((option) => {
+                const selected = isCurrentModel(option, modelInfo);
+                return (
+                  <ModelSelectorItem
+                    key={`${option.provider}:${option.model}`}
+                    className="model-option"
+                    data-current={selected ? "true" : undefined}
+                    value={modelSearchText(option)}
+                    onSelect={() => selectModel(option)}
+                  >
+                    <ModelSelectorName>{option.label}</ModelSelectorName>
+                    <span className="model-option-provider">
+                      {option.provider}
+                    </span>
+                    <ModelSelectorShortcut>
+                      {selected ? "✓" : ""}
+                    </ModelSelectorShortcut>
+                  </ModelSelectorItem>
+                );
+              })}
+            </ModelSelectorGroup>
+          ))}
+        </ModelSelectorList>
+      </ModelSelectorContent>
+    </ModelSelector>
   );
 }
 
-function filterModelOptions(
-  options: ModelOption[],
-  query: string,
-): ModelOption[] {
-  const normalizedQuery = query.trim().toLowerCase();
-  if (!normalizedQuery) {
-    return options;
+function groupModelOptions(options: ModelOption[]): [string, ModelOption[]][] {
+  const groups = new Map<string, ModelOption[]>();
+  for (const option of options) {
+    const provider = option.provider || "Other";
+    const providerOptions = groups.get(provider);
+    if (providerOptions) {
+      providerOptions.push(option);
+    } else {
+      groups.set(provider, [option]);
+    }
   }
-  return options.filter((option) =>
-    modelSearchText(option).includes(normalizedQuery),
-  );
+  return [...groups.entries()];
 }
 
 function modelSearchText(option: ModelOption): string {
@@ -707,6 +661,33 @@ function sessionModeLabel(mode: SessionMode): string {
   return (
     sessionModeOptions.find((option) => option.value === mode)?.label ??
     sessionModeOptions[0].label
+  );
+}
+
+function TokenUsageMeter({ modelInfo }: { modelInfo: ModelInfo | null }) {
+  const tokenUsage = modelInfo?.tokenUsage;
+  if (!tokenUsage?.contextWindow) {
+    return <span className="composer-token-usage" id="composer-token-usage" />;
+  }
+
+  const usedTokens = Math.max(0, tokenUsage.used);
+  const maxTokens = Math.max(1, tokenUsage.contextWindow);
+
+  return (
+    <TokenContext usedTokens={usedTokens} maxTokens={maxTokens}>
+      <ContextTrigger>
+        <button
+          type="button"
+          className="composer-token-usage"
+          id="composer-token-usage"
+        >
+          {formatTokenUsage(tokenUsage)}
+        </button>
+      </ContextTrigger>
+      <ContextContent align="end">
+        <ContextContentHeader />
+      </ContextContent>
+    </TokenContext>
   );
 }
 

@@ -94,6 +94,26 @@ test("AI Elements generated components live under renderer src", () => {
     "ai-elements",
     "prompt-input.tsx",
   );
+  const modelSelectorPath = path.join(
+    REPO_ROOT,
+    "desktop",
+    "electron",
+    "renderer",
+    "src",
+    "components",
+    "ai-elements",
+    "model-selector.tsx",
+  );
+  const contextPath = path.join(
+    REPO_ROOT,
+    "desktop",
+    "electron",
+    "renderer",
+    "src",
+    "components",
+    "ai-elements",
+    "context.tsx",
+  );
   const rootMessagePath = path.join(
     REPO_ROOT,
     "components",
@@ -124,17 +144,33 @@ test("AI Elements generated components live under renderer src", () => {
     "ai-elements",
     "prompt-input.tsx",
   );
+  const rootModelSelectorPath = path.join(
+    REPO_ROOT,
+    "components",
+    "ai-elements",
+    "model-selector.tsx",
+  );
+  const rootContextPath = path.join(
+    REPO_ROOT,
+    "components",
+    "ai-elements",
+    "context.tsx",
+  );
 
   const message = fs.readFileSync(messagePath, "utf8");
   const conversation = fs.readFileSync(conversationPath, "utf8");
   const tool = fs.readFileSync(toolPath, "utf8");
   const codeBlock = fs.readFileSync(codeBlockPath, "utf8");
   const promptInput = fs.readFileSync(promptInputPath, "utf8");
+  const modelSelector = fs.readFileSync(modelSelectorPath, "utf8");
+  const context = fs.readFileSync(contextPath, "utf8");
   assert.match(message, /export const MessageResponse/);
   assert.match(conversation, /export const Conversation/);
   assert.match(tool, /export const Tool/);
   assert.match(codeBlock, /export const CodeBlock/);
   assert.match(promptInput, /export const PromptInput/);
+  assert.match(modelSelector, /export const ModelSelector/);
+  assert.match(context, /export const Context/);
   assert.equal(
     fs.existsSync(rootMessagePath),
     false,
@@ -157,6 +193,16 @@ test("AI Elements generated components live under renderer src", () => {
   );
   assert.equal(
     fs.existsSync(rootPromptInputPath),
+    false,
+    "AI Elements registry files should be relocated into renderer src",
+  );
+  assert.equal(
+    fs.existsSync(rootModelSelectorPath),
+    false,
+    "AI Elements registry files should be relocated into renderer src",
+  );
+  assert.equal(
+    fs.existsSync(rootContextPath),
     false,
     "AI Elements registry files should be relocated into renderer src",
   );
@@ -198,4 +244,25 @@ test("Composer input is rebuilt on AI Elements PromptInput", () => {
   assert.match(composer, /PromptInputTextarea/);
   assert.match(composer, /PromptInputSubmit/);
   assert.doesNotMatch(composer, /<textarea|composer-row/);
+});
+
+test("Composer metadata uses AI Elements model selector and context", () => {
+  const composer = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "components",
+      "Composer.tsx",
+    ),
+    "utf8",
+  );
+
+  assert.match(composer, /ModelSelector/);
+  assert.match(composer, /ModelSelectorInput/);
+  assert.match(composer, /TokenContext/);
+  assert.match(composer, /ContextContentHeader/);
+  assert.doesNotMatch(composer, /model-search|filterModelOptions/);
 });

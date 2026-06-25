@@ -90,3 +90,14 @@
 - electron:smoke: passed when run unsandboxed.
 - Screenshot: `plans/revamp-shots/step-2.1.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session, but the new prompt shell is visible and stable with no `agent-browser errors` or console output.
+
+## Step 2.2 — Model selector and context for composer metadata
+- Checked DeepWiki plus current AI Elements docs first. DeepWiki could not provide the generated exports for `@ai-elements/model-selector`/`@ai-elements/context`, but confirmed the noninteractive shadcn overwrite path; the official docs show `ModelSelector*` command-dialog parts and `Context*` token/context-window parts.
+- Added `@ai-elements/model-selector` and `@ai-elements/context` with `pnpm dlx shadcn@latest add @ai-elements/model-selector @ai-elements/context -c . --yes --overwrite`; relocated generated `model-selector.tsx` and `context.tsx` into renderer src, and added generated `progress.tsx` plus `tokenlens`.
+- Replaced the custom composer `ModelMenu` popover/search with AI Elements `ModelSelector`, preserving the existing model list, selected-model check, provider grouping, and `onModelChange` callback.
+- Replaced the plain token text with AI Elements `Context`/`ContextTrigger`/`ContextContentHeader`, while keeping the visible `used/contextWindow` text because the local model info API does not expose input/output/reasoning token breakdowns.
+- Removed dead custom model popover/search CSS and added static setup tests for the new generated components and composer metadata wiring.
+- format/lint/check: passed (`check:electron` 105/105 tests when run unsandboxed).
+- electron:smoke: passed when run unsandboxed.
+- Screenshot: `plans/revamp-shots/step-2.2.png` captured from Electron CDP target
+  `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session after a longer wait, so the model selector and token context could not be exercised visually, but the surface is stable with no `agent-browser errors` or console output.
