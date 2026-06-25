@@ -71,6 +71,29 @@ describe("nav control plane", () => {
     expect(afterDelete.sessionId).toBeNull();
   });
 
+  test("persists concurrent local session creates", async () => {
+    const workspace = await tempDir("nav-workspace-");
+    const services = await testServices({ defaultCwd: workspace });
+    const app = createControlPlane(services);
+
+    const createSession = async () =>
+      json<{ sessionId: string }>(
+        await app.request("/sessions", { method: "POST" }),
+      );
+    const [first, second] = await Promise.all([
+      createSession(),
+      createSession(),
+    ]);
+
+    const listed = await json<{ sessions: { sessionId: string }[] }>(
+      await app.request("/sessions"),
+    );
+    const sessionIds = listed.sessions.map((session) => session.sessionId);
+
+    expect(sessionIds).toContain(first.sessionId);
+    expect(sessionIds).toContain(second.sessionId);
+  });
+
   test("returns model shapes and persists per-session model choices", async () => {
     const workspace = await tempDir("nav-workspace-");
     const services = await testServices({ defaultCwd: workspace });
@@ -243,6 +266,7 @@ describe("nav control plane", () => {
 
     const stacks = await json<{
       stacks: {
+        sequence: number;
         status: string;
         durationMs: number;
         request: { api: string; model: string; body: unknown };
@@ -252,6 +276,7 @@ describe("nav control plane", () => {
 
     expect(stacks.stacks).toHaveLength(1);
     expect(stacks.stacks[0]).toMatchObject({
+      sequence: 0,
       status: "completed",
       durationMs: 42,
       request: {
@@ -269,6 +294,89 @@ describe("nav control plane", () => {
       await app.request(`/sessions/${created.sessionId}/stacks/availability`),
     );
     expect(availability.available).toBe(true);
+  });
+
+  test("reports stack availability only after a session has records", async () => {
+    const workspace = await tempDir("nav-workspace-");
+    const services = await testServices({ defaultCwd: workspace });
+    const app = createControlPlane(services);
+    const created = await json<{ sessionId: string }>(
+      await app.request("/sessions", { method: "POST" }),
+    );
+
+    const before = await json<{ available: boolean }>(
+      await app.request(`/sessions/${created.sessionId}/stacks/availability`),
+    );
+    expect(before.available).toBe(false);
+
+    await services.stacks.recordObservation({
+      type: "turn",
+      instanceId: created.sessionId,
+      operationId: "operation-1",
+      turnId: "turn-1",
+      response: {
+        output: [{ role: "assistant", content: "hi" }],
+      },
+    });
+
+    const after = await json<{ available: boolean }>(
+      await app.request(`/sessions/${created.sessionId}/stacks/availability`),
+    );
+    expect(after.available).toBe(true);
+  });
+
+  test("merges concurrently recorded stack request and response observations", async () => {
+    const workspace = await tempDir("nav-workspace-");
+    const services = await testServices({ defaultCwd: workspace });
+    const app = createControlPlane(services);
+    const created = await json<{ sessionId: string }>(
+      await app.request("/sessions", { method: "POST" }),
+    );
+
+    await Promise.all([
+      services.stacks.recordObservation({
+        type: "turn_request",
+        instanceId: created.sessionId,
+        operationId: "operation-1",
+        turnId: "turn-1",
+        timestamp: "2026-06-25T00:00:00.000Z",
+        request: {
+          providerName: "openai",
+          model: "gpt-5",
+          input: [{ role: "user", content: "hello" }],
+        },
+      }),
+      services.stacks.recordObservation({
+        type: "turn",
+        instanceId: created.sessionId,
+        operationId: "operation-1",
+        turnId: "turn-1",
+        durationMs: 42,
+        response: {
+          output: [{ role: "assistant", content: "hi" }],
+        },
+      }),
+    ]);
+
+    const stacks = await json<{
+      stacks: {
+        status: string;
+        request: { model: string; body: unknown };
+        response: { body: unknown };
+      }[];
+    }>(await app.request(`/sessions/${created.sessionId}/stacks`));
+
+    expect(stacks.stacks).toHaveLength(1);
+    expect(stacks.stacks[0]).toMatchObject({
+      status: "completed",
+      request: {
+        model: "gpt-5",
+        body: [{ role: "user", content: "hello" }],
+      },
+      response: {
+        body: [{ role: "assistant", content: "hi" }],
+      },
+    });
   });
 });
 

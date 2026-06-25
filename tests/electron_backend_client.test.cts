@@ -112,7 +112,7 @@ test("Electron backend client reaches the Flue control plane", async () => {
       method: "session.stackAvailability",
       params: { sessionId },
     });
-    assert.equal(availability.result.available, true);
+    assert.equal(availability.result.available, false);
   } finally {
     await backend.stop();
     if (projectRoot) {

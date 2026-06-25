@@ -43,6 +43,7 @@ export class SessionCatalog {
   readonly #clock: () => number;
   readonly #idFactory: () => string;
   readonly #execFile: ExecFileLike;
+  #mutationQueue: Promise<unknown> = Promise.resolve();
 
   constructor({
     filePath,
@@ -100,13 +101,16 @@ export class SessionCatalog {
       worktreePath: workspace.worktreePath,
       ...defaultModel,
     };
-    const data = await this.load();
-    data.sessions = [session, ...data.sessions];
-    await this.save(data);
+    await this.mutate(async () => {
+      const data = await this.load();
+      data.sessions = [session, ...data.sessions];
+      await this.save(data);
+    });
     return session;
   }
 
   async list(): Promise<SessionSummary[]> {
+    await this.waitForPendingMutation();
     const data = await this.load();
     return data.sessions
       .toSorted((left, right) => right.updatedAt - left.updatedAt)
@@ -114,6 +118,7 @@ export class SessionCatalog {
   }
 
   async get(sessionId: string): Promise<CatalogSession | null> {
+    await this.waitForPendingMutation();
     const data = await this.load();
     return (
       data.sessions.find((session) => session.sessionId === sessionId) ?? null
@@ -121,6 +126,7 @@ export class SessionCatalog {
   }
 
   async latestByCwd(cwd?: string | null): Promise<string | null> {
+    await this.waitForPendingMutation();
     const data = await this.load();
     const sessions = data.sessions.toSorted(
       (left, right) => right.updatedAt - left.updatedAt,
@@ -142,81 +148,106 @@ export class SessionCatalog {
   }
 
   async resume(sessionId: string): Promise<CatalogSession | null> {
-    const data = await this.load();
-    const session = data.sessions.find(
-      (entry) => entry.sessionId === sessionId,
-    );
-    if (!session) {
-      return null;
-    }
+    return this.mutate(async () => {
+      const data = await this.load();
+      const session = data.sessions.find(
+        (entry) => entry.sessionId === sessionId,
+      );
+      if (!session) {
+        return null;
+      }
 
-    session.updatedAt = this.#clock();
-    await this.save(data);
-    return session;
+      session.updatedAt = this.#clock();
+      await this.save(data);
+      return session;
+    });
   }
 
   async updateModel(
     sessionId: string,
     selection: ModelSelection,
   ): Promise<CatalogSession | null> {
-    const data = await this.load();
-    const session = data.sessions.find(
-      (entry) => entry.sessionId === sessionId,
-    );
-    if (!session) {
-      return null;
-    }
+    return this.mutate(async () => {
+      const data = await this.load();
+      const session = data.sessions.find(
+        (entry) => entry.sessionId === sessionId,
+      );
+      if (!session) {
+        return null;
+      }
 
-    session.provider = selection.provider;
-    session.model = selection.model;
-    session.thinkingLevel = selection.thinkingLevel;
-    session.updatedAt = this.#clock();
-    await this.save(data);
-    return session;
+      session.provider = selection.provider;
+      session.model = selection.model;
+      session.thinkingLevel = selection.thinkingLevel;
+      session.updatedAt = this.#clock();
+      await this.save(data);
+      return session;
+    });
   }
 
   async updateThinking(
     sessionId: string,
     thinkingLevel: ThinkingLevel,
   ): Promise<CatalogSession | null> {
-    const data = await this.load();
-    const session = data.sessions.find(
-      (entry) => entry.sessionId === sessionId,
-    );
-    if (!session) {
-      return null;
-    }
+    return this.mutate(async () => {
+      const data = await this.load();
+      const session = data.sessions.find(
+        (entry) => entry.sessionId === sessionId,
+      );
+      if (!session) {
+        return null;
+      }
 
-    session.thinkingLevel = thinkingLevel;
-    session.updatedAt = this.#clock();
-    await this.save(data);
-    return session;
+      session.thinkingLevel = thinkingLevel;
+      session.updatedAt = this.#clock();
+      await this.save(data);
+      return session;
+    });
   }
 
   async delete(sessionId: string): Promise<boolean> {
-    const data = await this.load();
-    const session = data.sessions.find(
-      (entry) => entry.sessionId === sessionId,
-    );
-    if (!session) {
+    const deletedSession = await this.mutate(async () => {
+      const data = await this.load();
+      const session = data.sessions.find(
+        (entry) => entry.sessionId === sessionId,
+      );
+      if (!session) {
+        return null;
+      }
+
+      data.sessions = data.sessions.filter(
+        (entry) => entry.sessionId !== sessionId,
+      );
+      await this.save(data);
+      return session;
+    });
+
+    if (!deletedSession) {
       return false;
     }
 
-    data.sessions = data.sessions.filter(
-      (entry) => entry.sessionId !== sessionId,
-    );
-    await this.save(data);
-
-    if (session.worktreePath) {
+    if (deletedSession.worktreePath) {
       await removeWorktree({
         projectRoot:
-          session.projectRoot ?? session.workspaceRoot ?? session.agentCwd,
-        worktreePath: session.worktreePath,
+          deletedSession.projectRoot ??
+          deletedSession.workspaceRoot ??
+          deletedSession.agentCwd,
+        worktreePath: deletedSession.worktreePath,
         execFile: this.#execFile,
       });
     }
 
     return true;
+  }
+
+  private mutate<T>(run: () => Promise<T>): Promise<T> {
+    const next = this.#mutationQueue.then(run, run);
+    this.#mutationQueue = next.catch(() => {});
+    return next;
+  }
+
+  private async waitForPendingMutation(): Promise<void> {
+    await this.#mutationQueue.catch(() => {});
   }
 
   private async load(): Promise<CatalogFile> {

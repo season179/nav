@@ -49,6 +49,7 @@ type ObservationLike = Record<string, unknown> & {
 export class StackStore {
   readonly #filePath: string;
   readonly #clock: () => number;
+  #mutationQueue: Promise<void> = Promise.resolve();
 
   constructor({
     filePath,
@@ -62,6 +63,7 @@ export class StackStore {
   }
 
   async list(sessionId: string): Promise<SessionStacksResult> {
+    await this.waitForPendingMutation();
     const data = await this.load();
     return {
       stacks: [...(data.sessions[sessionId] ?? [])].toSorted(
@@ -70,10 +72,18 @@ export class StackStore {
     };
   }
 
-  async deleteSession(sessionId: string): Promise<void> {
+  async hasSessionRecord(sessionId: string): Promise<boolean> {
+    await this.waitForPendingMutation();
     const data = await this.load();
-    delete data.sessions[sessionId];
-    await this.save(data);
+    return (data.sessions[sessionId]?.length ?? 0) > 0;
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    await this.mutate(async () => {
+      const data = await this.load();
+      delete data.sessions[sessionId];
+      await this.save(data);
+    });
   }
 
   async recordObservation(observation: unknown): Promise<void> {
@@ -82,14 +92,26 @@ export class StackStore {
       return;
     }
 
-    if (event.type === "turn_request") {
-      await this.recordTurnRequest(event);
-      return;
-    }
+    await this.mutate(async () => {
+      if (event.type === "turn_request") {
+        await this.recordTurnRequest(event);
+        return;
+      }
 
-    if (event.type === "turn") {
-      await this.recordTurn(event);
-    }
+      if (event.type === "turn") {
+        await this.recordTurn(event);
+      }
+    });
+  }
+
+  private async mutate(run: () => Promise<void>): Promise<void> {
+    const next = this.#mutationQueue.then(run, run);
+    this.#mutationQueue = next.catch(() => {});
+    await next;
+  }
+
+  private async waitForPendingMutation(): Promise<void> {
+    await this.#mutationQueue.catch(() => {});
   }
 
   private async recordTurnRequest(event: ObservationLike): Promise<void> {
@@ -255,7 +277,7 @@ function sanitizeJson(value: unknown): unknown {
 }
 
 function nextSequence(entries: StackEntry[]): number {
-  return entries.reduce((max, entry) => Math.max(max, entry.sequence), 0) + 1;
+  return entries.reduce((max, entry) => Math.max(max, entry.sequence), -1) + 1;
 }
 
 function timestampMs(timestamp: unknown, fallbackClock: () => number): number {

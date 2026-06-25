@@ -118,8 +118,11 @@ export function createControlPlane(services: BackendServices): Hono {
 
   app.get("/sessions/:sessionId/stacks/availability", async (c) =>
     handle(c, async () => {
-      await requireSession(services, c.req.param("sessionId"));
-      return { available: true };
+      const sessionId = c.req.param("sessionId");
+      await requireSession(services, sessionId);
+      return {
+        available: await services.stacks.hasSessionRecord(sessionId),
+      };
     }),
   );
 

@@ -87,4 +87,5 @@ endpoint that guarantees durable submission cancellation.
 Stacks are implemented with `observe()` in `src/stacks.ts`. The store records
 `turn_request` and `turn` observations, sanitizes request/response payloads for
 JSON storage, and serves them through `/nav/sessions/:sessionId/stacks`.
-Availability currently returns `{ "available": true }`.
+Availability returns `{ "available": true }` only after the session has at
+least one retained stack record.
