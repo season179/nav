@@ -1,90 +1,75 @@
-import { useVirtualizer } from "@tanstack/react-virtual";
-import { useEffect, useMemo, useRef } from "react";
+import { useMemo } from "react";
+import {
+  Conversation,
+  ConversationContent,
+  ConversationScrollButton,
+} from "@/components/ai-elements/conversation";
+import {
+  Message as AiMessage,
+  MessageContent,
+} from "@/components/ai-elements/message";
+import {
+  type AiElementsChatMessage,
+  type AiElementsToolMessage,
+  adaptMessagesForAiElements,
+} from "../lib/ai-elements-adapter.ts";
 import { renderMarkdown } from "../lib/markdown.ts";
-import type { Message, ToolMessage } from "../types.ts";
+import type { Message } from "../types.ts";
 
 export default function Transcript({ messages }: { messages: Message[] }) {
-  const scrollRef = useRef<HTMLElement>(null);
-  const rowVirtualizer = useVirtualizer({
-    count: messages.length,
-    estimateSize: () => 88,
-    getItemKey: (index) => messages[index]?.id ?? index,
-    getScrollElement: () => scrollRef.current,
-    overscan: 6,
-    useFlushSync: false,
-  });
+  const transcriptItems = useMemo(
+    () => adaptMessagesForAiElements(messages),
+    [messages],
+  );
   const timestampMessageIds = useMemo(
     () => timestampVisibleMessageIds(messages),
     [messages],
   );
 
-  // Only follow this transcript's own new messages. Without the dependency the
-  // effect runs on every App re-render — including a background session's
-  // events — and would yank the viewport down while the user reads history.
-  useEffect(() => {
-    if (messages.length === 0) {
-      return;
-    }
-    rowVirtualizer.scrollToIndex(messages.length - 1, { align: "end" });
-  }, [messages, rowVirtualizer]);
-
   return (
-    <section ref={scrollRef} className="chat" aria-label="Chat transcript">
-      <ol
-        className="message-list"
-        id="message-list"
-        style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
-      >
-        {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-          const message = messages[virtualRow.index];
-          if (!message) {
-            return null;
-          }
-
-          return (
-            <li
-              key={virtualRow.key}
-              ref={rowVirtualizer.measureElement}
-              className="message-virtual-row"
-              data-index={virtualRow.index}
-              style={{ transform: `translateY(${virtualRow.start}px)` }}
-            >
-              <MessageRow
-                message={message}
-                showTimestamp={timestampMessageIds.has(message.id)}
-              />
-            </li>
-          );
-        })}
-      </ol>
-    </section>
+    <Conversation className="chat" aria-label="Chat transcript">
+      <ConversationContent className="message-list" id="message-list">
+        {transcriptItems.map((item) =>
+          item.kind === "tool" ? (
+            <ToolMessageItem item={item} key={item.id} />
+          ) : (
+            <ChatMessageItem
+              item={item}
+              key={item.id}
+              showTimestamp={timestampMessageIds.has(item.id)}
+            />
+          ),
+        )}
+      </ConversationContent>
+      {transcriptItems.length > 0 ? (
+        <ConversationScrollButton aria-label="Scroll to latest message" />
+      ) : null}
+    </Conversation>
   );
 }
 
-function MessageRow({
-  message,
+function ChatMessageItem({
+  item,
   showTimestamp,
 }: {
-  message: Message;
+  item: AiElementsChatMessage;
   showTimestamp: boolean;
 }) {
-  if (message.role === "tool") {
-    return <ToolMessageRow message={message} />;
-  }
-
   return (
-    <div className={`message message-${message.role}`}>
-      {message.role === "assistant" ? (
-        <MarkdownText text={message.text} />
-      ) : (
-        <span className="message-text">{message.text}</span>
-      )}
-      {showTimestamp ? (
-        <time className="message-time" dateTime={message.createdAt}>
-          {formatTimestamp(new Date(message.createdAt))}
-        </time>
-      ) : null}
-    </div>
+    <AiMessage className={`message message-${item.role}`} from={item.from}>
+      <MessageContent className="message-content">
+        {item.role === "assistant" ? (
+          <MarkdownText text={item.text} />
+        ) : (
+          <span className="message-text">{item.text}</span>
+        )}
+        {showTimestamp ? (
+          <time className="message-time" dateTime={item.createdAt}>
+            {formatTimestamp(new Date(item.createdAt))}
+          </time>
+        ) : null}
+      </MessageContent>
+    </AiMessage>
   );
 }
 
@@ -99,18 +84,20 @@ function MarkdownText({ text }: { text: string }) {
   );
 }
 
-function ToolMessageRow({ message }: { message: ToolMessage }) {
+function ToolMessageItem({ item }: { item: AiElementsToolMessage }) {
   return (
-    <div
-      className={`message message-tool message-tool-${message.state}`}
-      data-tool-call-id={message.toolCallId || undefined}
-    >
-      <span className="message-role">{toolMarker(message.state)}</span>
-      <span className="tool-name">{message.toolName}</span>
-      {message.detail ? (
-        <span className="tool-detail">{previewText(message.detail)}</span>
-      ) : null}
-    </div>
+    <AiMessage className="message message-tool-wrapper" from="assistant">
+      <MessageContent
+        className={`message-tool message-tool-${item.state}`}
+        data-tool-call-id={item.toolCallId || undefined}
+      >
+        <span className="message-role">{toolMarker(item.state)}</span>
+        <span className="tool-name">{item.toolName}</span>
+        {item.detail ? (
+          <span className="tool-detail">{previewText(item.detail)}</span>
+        ) : null}
+      </MessageContent>
+    </AiMessage>
   );
 }
 

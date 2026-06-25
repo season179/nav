@@ -101,7 +101,9 @@ h1 {
 }
 
 .chat {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   padding: 26px 32px 18px;
-  overflow: auto;
+  overflow: hidden;
 }

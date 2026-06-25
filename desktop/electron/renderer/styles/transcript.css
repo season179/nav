@@ -1,22 +1,12 @@
 .message-list {
-  position: relative;
-  display: block;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
   width: 100%;
   max-width: var(--content-max-width);
   margin: 0 auto;
   padding: 0;
   list-style: none;
-}
-
-.message-virtual-row {
-  position: absolute;
-  top: 0;
-  left: 0;
-  display: flex;
-  width: 100%;
-  min-width: 0;
-  padding-bottom: 14px;
-  box-sizing: border-box;
 }
 
 .message {
@@ -65,11 +55,6 @@
 }
 
 .message-user .message-text {
-  display: inline-block;
-  padding: 9px 13px;
-  border: 1px solid var(--border);
-  border-radius: 18px;
-  background: var(--surface-muted);
   text-align: left;
 }
 

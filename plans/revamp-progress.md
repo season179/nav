@@ -44,3 +44,14 @@
 - electron:smoke: passed
 - Screenshot: `plans/revamp-shots/step-1.1.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; existing smoke surface remains visible, no `agent-browser errors` or console output.
+
+## Step 1.2 — Rebuild transcript on AI Elements conversation and message
+- Added `@ai-elements/conversation`; the documented `--yes` command still prompted on existing `button.tsx`, so reran with `--yes --overwrite`.
+- Added the generated `conversation.tsx` under `desktop/electron/renderer/src/components/ai-elements/` and kept the static setup test guarding AI Elements files against staying in root `components/`.
+- Added `use-stick-to-bottom`, the dependency pulled by the AI Elements conversation registry item.
+- Rebuilt `Transcript.tsx` to render AI Elements `Conversation`/`ConversationContent`, AI Elements `Message`/`MessageContent`, and the Step 1.1 adapter; kept the existing sanitized `renderMarkdown` path for assistant text until Step 1.3.
+- Removed the temporary `_RevampSmoke.tsx` render and file, and adjusted transcript/layout CSS from virtualized rows to the conversation scroll container.
+- format/lint/check: passed (`check:electron` 102/102 tests); build still warns about large Streamdown/Shiki/Mermaid chunks.
+- electron:smoke: passed
+- Screenshot: `plans/revamp-shots/step-1.2.png` captured from Electron CDP target
+  `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; empty chat surface renders without the smoke card, no stray conversation scroll button, no `agent-browser errors` or console output.

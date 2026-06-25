@@ -10,7 +10,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { RevampSmoke } from "./components/_RevampSmoke.tsx";
 import Composer from "./components/Composer.tsx";
 import Sidebar from "./components/Sidebar.tsx";
 import { type NavAppView, parseNavPathname } from "./lib/app-routes.ts";
@@ -861,7 +860,6 @@ export default function App() {
             />
           ) : (
             <>
-              <RevampSmoke />
               <Transcript
                 key={activeSessionId ?? "none"}
                 messages={activeState.messages}

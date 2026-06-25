@@ -43,23 +43,7 @@ test("root components.json exists", () => {
   assert.equal(config.tailwind.cssVariables, true);
 });
 
-test("src/components/_RevampSmoke.tsx contains AI-ELEMENTS-SMOKE-OK", () => {
-  const smoke = fs.readFileSync(
-    path.join(
-      REPO_ROOT,
-      "desktop",
-      "electron",
-      "renderer",
-      "src",
-      "components",
-      "_RevampSmoke.tsx",
-    ),
-    "utf8",
-  );
-  assert.match(smoke, /AI-ELEMENTS-SMOKE-OK/);
-});
-
-test("AI Elements message component lives under renderer src", () => {
+test("AI Elements generated components live under renderer src", () => {
   const messagePath = path.join(
     REPO_ROOT,
     "desktop",
@@ -70,17 +54,40 @@ test("AI Elements message component lives under renderer src", () => {
     "ai-elements",
     "message.tsx",
   );
-  const rootRegistryPath = path.join(
+  const conversationPath = path.join(
+    REPO_ROOT,
+    "desktop",
+    "electron",
+    "renderer",
+    "src",
+    "components",
+    "ai-elements",
+    "conversation.tsx",
+  );
+  const rootMessagePath = path.join(
     REPO_ROOT,
     "components",
     "ai-elements",
     "message.tsx",
   );
+  const rootConversationPath = path.join(
+    REPO_ROOT,
+    "components",
+    "ai-elements",
+    "conversation.tsx",
+  );
 
   const message = fs.readFileSync(messagePath, "utf8");
+  const conversation = fs.readFileSync(conversationPath, "utf8");
   assert.match(message, /export const MessageResponse/);
+  assert.match(conversation, /export const Conversation/);
   assert.equal(
-    fs.existsSync(rootRegistryPath),
+    fs.existsSync(rootMessagePath),
+    false,
+    "AI Elements registry files should be relocated into renderer src",
+  );
+  assert.equal(
+    fs.existsSync(rootConversationPath),
     false,
     "AI Elements registry files should be relocated into renderer src",
   );
