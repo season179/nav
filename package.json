@@ -22,15 +22,18 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.15",
+    "@tailwindcss/vite": "^4.3.1",
     "@types/node": "^25.9.1",
     "@types/react": "^19.2.15",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
     "electron": "^42.2.0",
+    "tailwindcss": "^4.3.1",
     "typescript": "^6.0.3",
     "vite": "^8.0.14"
   },
   "dependencies": {
+    "@ai-sdk/react": "^3.0.211",
     "@tanstack/react-form": "^1.33.0",
     "@tanstack/react-pacer": "^0.22.1",
     "@tanstack/react-query": "^5.101.1",
@@ -41,9 +44,15 @@
     "@tanstack/react-table": "^8.21.3",
     "@tanstack/react-virtual": "^3.14.3",
     "@tanstack/store": "^0.11.0",
+    "ai": "^6.0.209",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
     "dompurify": "^3.4.5",
+    "lucide-react": "^1.21.0",
     "marked": "^18.0.4",
     "react": "^19.2.6",
-    "react-dom": "^19.2.6"
+    "react-dom": "^19.2.6",
+    "tailwind-merge": "^3.6.0",
+    "tw-animate-css": "^1.4.0"
   }
 }

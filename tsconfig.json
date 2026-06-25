@@ -14,7 +14,10 @@
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true,
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "@/*": ["./desktop/electron/renderer/src/*"]
+    }
   },
   "include": [
     "desktop/electron/**/*.ts",
