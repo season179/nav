@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "isolatedModules": true,
+    "jsx": "react-jsx",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleDetection": "force",
@@ -16,5 +17,6 @@
     "target": "ES2023",
     "useDefineForClassFields": true
   },
-  "include": ["src/main.ts", "src/vite-env.d.ts"]
+  "exclude": ["src/main-process"],
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
 }
