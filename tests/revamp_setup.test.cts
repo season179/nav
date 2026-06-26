@@ -353,6 +353,25 @@ test("Renderer stylesheet does not import legacy feature CSS", () => {
   );
 });
 
+test("Sidebar reserves titlebar space above New thread", () => {
+  const sidebar = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "components",
+      "Sidebar.tsx",
+    ),
+    "utf8",
+  );
+
+  assert.match(sidebar, /<aside[\s\S]*pt-8/);
+  assert.match(sidebar, /id="new-chat"/);
+  assert.match(sidebar, /New thread/);
+});
+
 test("Session toolbar uses shadcn Tabs", () => {
   const app = fs.readFileSync(
     path.join(REPO_ROOT, "desktop", "electron", "renderer", "src", "App.tsx"),

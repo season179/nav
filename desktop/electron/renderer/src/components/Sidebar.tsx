@@ -78,7 +78,7 @@ export default function Sidebar({
 
   return (
     <aside
-      className="flex h-screen min-h-0 w-80 flex-col border-sidebar-border border-r bg-sidebar text-sidebar-foreground"
+      className="flex h-screen min-h-0 w-80 flex-col border-sidebar-border border-r bg-sidebar pt-8 text-sidebar-foreground"
       aria-label="Sidebar"
     >
       <div className="border-sidebar-border border-b p-3">
