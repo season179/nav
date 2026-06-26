@@ -21,7 +21,7 @@ test("settings model helpers derive stable model keys and searchable text", asyn
     "openai:gpt-5.1",
   );
   assert.equal(modelOptionMatchesQuery(option, "openai"), true);
-  assert.equal(modelOptionMatchesQuery(option, "claude"), false);
+  assert.equal(modelOptionMatchesQuery(option, "gemini"), false);
   assert.deepEqual(
     settingsFormDefaults("worktree", {
       label: "GPT-5.1",

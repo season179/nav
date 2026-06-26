@@ -122,9 +122,49 @@ test("Electron backend client reaches the Flue control plane", async () => {
 });
 
 test("Electron backend client lists and switches configured models", async () => {
+  const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "nav-settings-"));
+  const settingsPath = path.join(settingsDir, "settings.json");
+  const codexAuthPath = path.join(settingsDir, "codex-auth.json");
+  fs.writeFileSync(
+    settingsPath,
+    JSON.stringify({
+      defaultModel: { provider: "codex", model: "gpt-5.5" },
+      providers: {
+        codex: {
+          api: "codex-responses",
+          models: [
+            {
+              id: "gpt-5.5",
+              name: "GPT 5.5",
+              reasoning: true,
+              contextWindow: 272_000,
+            },
+          ],
+        },
+        commandcode: {
+          api: "openai-completions",
+          apiKey: "COMMANDCODE_KEY",
+          baseUrl: "https://api.commandcode.example/provider/v1",
+          models: [
+            {
+              id: "Qwen/Qwen3.7-Max",
+              name: "Qwen 3.7 Max",
+              reasoning: false,
+              contextWindow: 1_000_000,
+            },
+          ],
+        },
+      },
+    }),
+  );
+  fs.writeFileSync(
+    codexAuthPath,
+    JSON.stringify({ tokens: { access_token: "codex-access-token" } }),
+  );
   const backend = await startIsolatedBackend({
-    NAV_DEFAULT_MODEL: "openai/gpt-5",
-    NAV_DEFAULT_THINKING_LEVEL: "high",
+    COMMANDCODE_KEY: "secret-value",
+    NAV_CODEX_AUTH_PATH: codexAuthPath,
+    NAV_SETTINGS_PATH: settingsPath,
   });
 
   try {
@@ -134,19 +174,18 @@ test("Electron backend client lists and switches configured models", async () =>
     });
     assert.deepEqual(listed.result.models, [
       {
-        provider: "anthropic",
-        model: "claude-sonnet-4-6",
-        label: "Claude Sonnet 4.6",
+        provider: "openai-codex",
+        model: "gpt-5.5",
+        label: "GPT 5.5",
         thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
       },
       {
-        provider: "openai",
-        model: "gpt-5",
-        label: "GPT-5",
-        thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh"],
+        provider: "commandcode",
+        model: "Qwen/Qwen3.7-Max",
+        label: "Qwen 3.7 Max",
+        thinkingLevels: ["off"],
       },
     ]);
-
     const created = await sendRpc({
       backendUrl: backend.url,
       method: "session.create",
@@ -159,10 +198,10 @@ test("Electron backend client lists and switches configured models", async () =>
       method: "session.modelInfo",
       params: { sessionId },
     });
-    assert.equal(before.result.label, "GPT-5");
-    assert.equal(before.result.provider, "openai");
-    assert.equal(before.result.model, "gpt-5");
-    assert.equal(before.result.thinking, "high");
+    assert.equal(before.result.label, "GPT 5.5");
+    assert.equal(before.result.provider, "openai-codex");
+    assert.equal(before.result.model, "gpt-5.5");
+    assert.equal(before.result.thinking, "medium");
     assert.deepEqual(before.result.thinkingLevels, [
       "off",
       "minimal",
@@ -177,29 +216,22 @@ test("Electron backend client lists and switches configured models", async () =>
       method: "session.switchModel",
       params: {
         sessionId,
-        provider: "anthropic",
-        model: "claude-sonnet-4-6",
+        provider: "commandcode",
+        model: "Qwen/Qwen3.7-Max",
       },
     });
-    assert.equal(switched.result.modelInfo.label, "Claude Sonnet 4.6");
-    assert.equal(switched.result.modelInfo.provider, "anthropic");
-    assert.equal(switched.result.modelInfo.model, "claude-sonnet-4-6");
-    assert.equal(switched.result.modelInfo.thinking, "medium");
-    assert.deepEqual(switched.result.modelInfo.thinkingLevels, [
-      "off",
-      "minimal",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
+    assert.equal(switched.result.modelInfo.label, "Qwen 3.7 Max");
+    assert.equal(switched.result.modelInfo.provider, "commandcode");
+    assert.equal(switched.result.modelInfo.model, "Qwen/Qwen3.7-Max");
+    assert.equal(switched.result.modelInfo.thinking, "off");
+    assert.deepEqual(switched.result.modelInfo.thinkingLevels, ["off"]);
 
     const thinkingOff = await sendRpc({
       backendUrl: backend.url,
       method: "session.switchThinking",
       params: { sessionId, thinkingLevel: "off" },
     });
-    assert.equal(thinkingOff.result.modelInfo.label, "Claude Sonnet 4.6");
+    assert.equal(thinkingOff.result.modelInfo.label, "Qwen 3.7 Max");
     assert.equal(thinkingOff.result.modelInfo.thinking, "off");
 
     const thinkingHigh = await sendRpc({
@@ -207,18 +239,18 @@ test("Electron backend client lists and switches configured models", async () =>
       method: "session.switchThinking",
       params: { sessionId, thinkingLevel: "xhigh" },
     });
-    assert.equal(thinkingHigh.result.modelInfo.label, "Claude Sonnet 4.6");
-    assert.equal(thinkingHigh.result.modelInfo.thinking, "xhigh");
+    assert.equal(thinkingHigh.result.modelInfo.label, "Qwen 3.7 Max");
+    assert.equal(thinkingHigh.result.modelInfo.thinking, "off");
 
     const after = await sendRpc({
       backendUrl: backend.url,
       method: "session.modelInfo",
       params: { sessionId },
     });
-    assert.equal(after.result.label, "Claude Sonnet 4.6");
-    assert.equal(after.result.provider, "anthropic");
-    assert.equal(after.result.model, "claude-sonnet-4-6");
-    assert.equal(after.result.thinking, "xhigh");
+    assert.equal(after.result.label, "Qwen 3.7 Max");
+    assert.equal(after.result.provider, "commandcode");
+    assert.equal(after.result.model, "Qwen/Qwen3.7-Max");
+    assert.equal(after.result.thinking, "off");
 
     // The switch is scoped to this session: the default new sessions start
     // from is untouched.
@@ -226,10 +258,11 @@ test("Electron backend client lists and switches configured models", async () =>
       backendUrl: backend.url,
       method: "session.modelInfo",
     });
-    assert.equal(untouchedDefault.result.label, "GPT-5");
-    assert.equal(untouchedDefault.result.model, "gpt-5");
+    assert.equal(untouchedDefault.result.label, "GPT 5.5");
+    assert.equal(untouchedDefault.result.model, "gpt-5.5");
   } finally {
     await backend.stop();
+    fs.rmSync(settingsDir, { recursive: true, force: true });
   }
 });
 
@@ -316,6 +349,8 @@ async function startIsolatedBackend(env = {}) {
     startupAttempts: 80,
     env: {
       NAV_SESSION_CATALOG_PATH: sessionCatalogPath,
+      NAV_CODEX_AUTH_PATH: path.join(dataDir, "missing-codex-auth.json"),
+      NAV_SETTINGS_PATH: path.join(dataDir, "missing-settings.json"),
       NAV_STACKS_PATH: stacksPath,
       ...env,
     },

@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import {
+  Fragment,
   lazy,
   Suspense,
   useCallback,
@@ -768,6 +769,7 @@ export default function App() {
       if (!wasRunning) {
         runtime.runStarted = false;
         resetSessionStop(sessionId);
+        appendSessionMessage(sessionId, "user", text);
         setSessionRunning(sessionId, true);
       }
 
@@ -861,11 +863,12 @@ export default function App() {
               sessionId={activeSessionId}
             />
           ) : (
-            <>
-              <Transcript
-                key={activeSessionId ?? "none"}
-                messages={activeState.messages}
-              />
+            <Fragment key={activeSessionId ?? "pending"}>
+              {activeSessionId ? (
+                <Transcript messages={activeState.messages} />
+              ) : (
+                <ChatPlaceholder />
+              )}
               <Composer
                 key={activeSessionId ?? "none"}
                 connected={connected}
@@ -882,11 +885,25 @@ export default function App() {
                 onSend={sendMessage}
                 onStop={() => stopRun(activeSessionIdRef.current)}
               />
-            </>
+            </Fragment>
           )}
         </Suspense>
       </main>
     </div>
+  );
+}
+
+function ChatPlaceholder() {
+  return (
+    <section
+      className="flex min-h-0 flex-1 items-center justify-center bg-background px-5 text-center"
+      aria-label="Chat transcript"
+    >
+      <div className="space-y-1 text-muted-foreground text-sm">
+        <h2 className="font-medium text-foreground text-sm">Starting nav</h2>
+        <p>Preparing the thread.</p>
+      </div>
+    </section>
   );
 }
 

@@ -1,19 +1,16 @@
+import { registerProvider } from "@flue/runtime";
 import {
   isNavMockModelEnabled,
   NAV_MOCK_MODEL,
   NAV_MOCK_PROVIDER,
 } from "./mock-provider.js";
-
-export const THINKING_LEVELS = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-] as const;
-
-export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+import {
+  loadModelSettings,
+  normalizeProviderId,
+  type ProviderRegistrationSpec,
+  type SettingsModelDefinition,
+} from "./model-settings.js";
+import { THINKING_LEVELS, type ThinkingLevel } from "./model-types.js";
 
 export type ModelOption = {
   provider: string;
@@ -47,18 +44,10 @@ type ModelDefinition = ModelOption & {
   contextWindow: number;
 };
 
-const DEFAULT_MODEL_SPECIFIER = "anthropic/claude-sonnet-4-6";
+const DEFAULT_MODEL_SPECIFIER = "openai/gpt-5";
 const MOCK_MODEL_SPECIFIER = `${NAV_MOCK_PROVIDER}/${NAV_MOCK_MODEL}`;
 
 const DEFAULT_MODELS: ModelDefinition[] = [
-  {
-    provider: "anthropic",
-    model: "claude-sonnet-4-6",
-    label: "Claude Sonnet 4.6",
-    thinkingLevels: [...THINKING_LEVELS],
-    defaultThinkingLevel: "medium",
-    contextWindow: 200_000,
-  },
   {
     provider: "openai",
     model: "gpt-5",
@@ -81,18 +70,39 @@ const MOCK_MODEL: ModelDefinition = {
 export class ModelCatalog {
   readonly #definitions: ModelDefinition[];
   readonly #env: NodeJS.ProcessEnv;
+  readonly #settingsDefault: ModelSelection | null;
+  readonly #providerRegistrations: ProviderRegistrationSpec[];
 
   constructor({
     definitions = DEFAULT_MODELS,
     env = process.env,
+    settings,
+    settingsPath,
   }: {
     definitions?: ModelDefinition[];
     env?: NodeJS.ProcessEnv;
+    settings?: unknown;
+    settingsPath?: string;
   } = {}) {
+    const configured = loadModelSettings({ env, settings, settingsPath });
+    const configuredDefinitions = configured.definitions.map(toModelDefinition);
+    const baseDefinitions =
+      configuredDefinitions.length > 0 ? configuredDefinitions : definitions;
+
     this.#definitions = isNavMockModelEnabled(env)
-      ? [...definitions, MOCK_MODEL]
-      : definitions;
+      ? [...baseDefinitions, MOCK_MODEL]
+      : baseDefinitions;
     this.#env = env;
+    this.#settingsDefault = configured.defaultModel
+      ? {
+          ...configured.defaultModel,
+          thinkingLevel: this.find(
+            configured.defaultModel.provider,
+            configured.defaultModel.model,
+          ).defaultThinkingLevel,
+        }
+      : null;
+    this.#providerRegistrations = configured.registrations;
   }
 
   list(): ModelOption[] {
@@ -110,7 +120,10 @@ export class ModelCatalog {
     const parsed = parseModelSpecifier(
       isNavMockModelEnabled(this.#env)
         ? MOCK_MODEL_SPECIFIER
-        : (this.#env.NAV_DEFAULT_MODEL ?? DEFAULT_MODEL_SPECIFIER),
+        : (this.#env.NAV_DEFAULT_MODEL ??
+            (this.#settingsDefault
+              ? this.specifier(this.#settingsDefault)
+              : DEFAULT_MODEL_SPECIFIER)),
     );
     const definition = this.find(parsed.provider, parsed.model);
 
@@ -137,10 +150,11 @@ export class ModelCatalog {
     model: string;
     thinkingLevel?: string | null;
   }): ModelSelection {
-    const definition = this.find(provider, model);
+    const normalizedProvider = normalizeProviderId(provider);
+    const definition = this.find(normalizedProvider, model);
 
     return {
-      provider,
+      provider: normalizedProvider,
       model,
       thinkingLevel: this.coerceThinkingLevel(thinkingLevel, definition),
     };
@@ -150,17 +164,19 @@ export class ModelCatalog {
     selection: Pick<ModelSelection, "provider" | "model">,
     thinkingLevel: string | null | undefined,
   ): ModelSelection {
-    const definition = this.find(selection.provider, selection.model);
+    const provider = normalizeProviderId(selection.provider);
+    const definition = this.find(provider, selection.model);
 
     return {
-      provider: selection.provider,
+      provider,
       model: selection.model,
       thinkingLevel: this.coerceThinkingLevel(thinkingLevel, definition),
     };
   }
 
   modelInfo(selection: ModelSelection): ModelInfo {
-    const definition = this.find(selection.provider, selection.model);
+    const provider = normalizeProviderId(selection.provider);
+    const definition = this.find(provider, selection.model);
     const thinkingLevel = this.coerceThinkingLevel(
       selection.thinkingLevel,
       definition,
@@ -168,7 +184,7 @@ export class ModelCatalog {
 
     return {
       label: definition.label,
-      provider: selection.provider,
+      provider,
       model: selection.model,
       thinking: thinkingLevel,
       thinkingLevels: definition.thinkingLevels,
@@ -180,23 +196,35 @@ export class ModelCatalog {
   }
 
   specifier(selection: Pick<ModelSelection, "provider" | "model">): string {
-    return `${selection.provider}/${selection.model}`;
+    return `${normalizeProviderId(selection.provider)}/${selection.model}`;
   }
 
   find(provider: string, model: string): ModelDefinition {
+    const normalizedProvider = normalizeProviderId(provider);
     return (
       this.#definitions.find(
         (definition) =>
-          definition.provider === provider && definition.model === model,
+          definition.provider === normalizedProvider &&
+          definition.model === model,
       ) ?? {
-        provider,
+        provider: normalizedProvider,
         model,
-        label: `${provider}/${model}`,
+        label: `${normalizedProvider}/${model}`,
         thinkingLevels: [...THINKING_LEVELS],
         defaultThinkingLevel: "medium",
         contextWindow: 0,
       }
     );
+  }
+
+  providerRegistrations(): ProviderRegistrationSpec[] {
+    return this.#providerRegistrations;
+  }
+
+  registerProviders(): void {
+    for (const { provider, registration } of this.#providerRegistrations) {
+      registerProvider(provider, registration);
+    }
   }
 
   private coerceThinkingLevel(
@@ -207,6 +235,19 @@ export class ModelCatalog {
       ? value
       : definition.defaultThinkingLevel;
   }
+}
+
+function toModelDefinition(
+  definition: SettingsModelDefinition,
+): ModelDefinition {
+  return {
+    provider: definition.provider,
+    model: definition.model,
+    label: definition.label,
+    thinkingLevels: definition.thinkingLevels,
+    defaultThinkingLevel: definition.defaultThinkingLevel,
+    contextWindow: definition.contextWindow,
+  };
 }
 
 function parseModelSpecifier(specifier: string): {
@@ -220,7 +261,7 @@ function parseModelSpecifier(specifier: string): {
     return parseModelSpecifier(DEFAULT_MODEL_SPECIFIER);
   }
 
-  return { provider, model };
+  return { provider: normalizeProviderId(provider), model };
 }
 
 function isThinkingLevel(

@@ -1,11 +1,8 @@
 import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { createUuidV7 } from "./ids.js";
-import type {
-  ModelCatalog,
-  ModelSelection,
-  ThinkingLevel,
-} from "./model-catalog.js";
+import type { ModelCatalog, ModelSelection } from "./model-catalog.js";
+import type { ThinkingLevel } from "./model-types.js";
 import {
   defaultExecFile,
   type ExecFileLike,

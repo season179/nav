@@ -99,6 +99,7 @@ const openApiDocument = {
 } as const;
 
 registerNavMockProvider();
+backendServices.models.registerProviders();
 startStackObservation(backendServices.stacks);
 
 const app = new Hono();

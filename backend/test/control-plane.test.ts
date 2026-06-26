@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -105,19 +105,17 @@ describe("nav control plane", () => {
     const models = await json<{
       models: { provider: string; model: string }[];
     }>(await app.request("/models"));
+    expect(models.models.map((model) => model.provider)).toEqual(["openai"]);
     expect(models.models).toContainEqual(
-      expect.objectContaining({
-        provider: "anthropic",
-        model: "claude-sonnet-4-6",
-      }),
+      expect.objectContaining({ provider: "openai", model: "gpt-5" }),
     );
 
     const before = await json<{ provider: string; model: string }>(
       await app.request(`/sessions/${created.sessionId}/model`),
     );
     expect(before).toMatchObject({
-      provider: "anthropic",
-      model: "claude-sonnet-4-6",
+      provider: "openai",
+      model: "gpt-5",
     });
 
     const switched = await json<{
@@ -178,6 +176,95 @@ describe("nav control plane", () => {
         provider: "nav-mock",
         model: "nav-smoke",
         thinkingLevels: ["off"],
+      }),
+    );
+  });
+
+  test("loads Pi-style nav settings and aliases Codex to Flue's provider id", async () => {
+    const authDir = await tempDir("nav-codex-auth-");
+    const authPath = join(authDir, "auth.json");
+    await writeFile(
+      authPath,
+      JSON.stringify({ tokens: { access_token: "codex-access-token" } }),
+    );
+    const models = new ModelCatalog({
+      env: {
+        COMMANDCODE_KEY: "secret-value",
+        NAV_CODEX_AUTH_PATH: authPath,
+      },
+      settings: {
+        defaultModel: { provider: "codex", model: "gpt-5.5" },
+        providers: {
+          codex: {
+            api: "codex-responses",
+            models: [
+              {
+                id: "gpt-5.5",
+                name: "GPT 5.5",
+                reasoning: true,
+                contextWindow: 272_000,
+              },
+            ],
+          },
+          commandcode: {
+            api: "openai-completions",
+            apiKey: "COMMANDCODE_KEY",
+            baseUrl: "https://api.commandcode.example/provider/v1",
+            models: [
+              {
+                id: "Qwen/Qwen3.7-Max",
+                name: "Qwen 3.7 Max",
+                reasoning: false,
+                contextWindow: 1_000_000,
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    expect(models.defaultSelection()).toMatchObject({
+      provider: "openai-codex",
+      model: "gpt-5.5",
+      thinkingLevel: "medium",
+    });
+    expect(models.defaultModelInfo()).toMatchObject({
+      label: "GPT 5.5",
+      provider: "openai-codex",
+      model: "gpt-5.5",
+      tokenUsage: { contextWindow: 272_000 },
+    });
+    expect(models.list().map((model) => model.provider)).toEqual([
+      "openai-codex",
+      "commandcode",
+    ]);
+    expect(models.list()).toContainEqual(
+      expect.objectContaining({
+        provider: "commandcode",
+        model: "Qwen/Qwen3.7-Max",
+        thinkingLevels: ["off"],
+      }),
+    );
+    expect(models.specifier({ provider: "codex", model: "gpt-5.5" })).toBe(
+      "openai-codex/gpt-5.5",
+    );
+    expect(models.providerRegistrations()).toContainEqual(
+      expect.objectContaining({
+        provider: "openai-codex",
+        registration: expect.objectContaining({
+          api: "openai-codex-responses",
+          apiKey: "codex-access-token",
+        }),
+      }),
+    );
+    expect(models.providerRegistrations()).toContainEqual(
+      expect.objectContaining({
+        provider: "commandcode",
+        registration: expect.objectContaining({
+          api: "openai-completions",
+          apiKey: "secret-value",
+          baseUrl: "https://api.commandcode.example/provider/v1",
+        }),
       }),
     );
   });
@@ -392,7 +479,7 @@ async function testServices({
   execFile?: ExecFileLike;
 }): Promise<BackendServices> {
   const resolvedDataDir = dataDir ?? (await tempDir("nav-data-"));
-  const models = new ModelCatalog();
+  const models = new ModelCatalog({ settings: null });
 
   return {
     models,

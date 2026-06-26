@@ -401,3 +401,41 @@ test("Session toolbar uses shadcn Tabs", () => {
   assert.doesNotMatch(app, /<nav className="session-view-tabs"/);
   assert.doesNotMatch(app, /aria-current=\{activeView/);
 });
+
+test("Conversation uses one renderer-owned transcript scroll region", () => {
+  const conversation = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "components",
+      "ai-elements",
+      "conversation.tsx",
+    ),
+    "utf8",
+  );
+
+  assert.match(conversation, /createContext/);
+  assert.match(conversation, /role="log"/);
+  assert.match(conversation, /overflow-y-auto/);
+  assert.doesNotMatch(conversation, /StickToBottom|use-stick-to-bottom/);
+});
+
+test("Chat view appends local user messages before Flue assistant events", () => {
+  const app = fs.readFileSync(
+    path.join(REPO_ROOT, "desktop", "electron", "renderer", "src", "App.tsx"),
+    "utf8",
+  );
+
+  assert.match(
+    app,
+    /appendSessionMessage\(\s*sessionId,\s*"user",\s*text,?\s*\);\s*setSessionRunning\(sessionId, true\);/,
+  );
+  assert.match(app, /<Fragment key=\{activeSessionId \?\? "pending"\}>/);
+  assert.match(
+    app,
+    /\{activeSessionId \? \(\s*<Transcript messages=\{activeState\.messages\} \/>[\s\S]*\) : \(\s*<ChatPlaceholder \/>/,
+  );
+});

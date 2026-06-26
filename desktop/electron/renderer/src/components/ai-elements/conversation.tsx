@@ -2,36 +2,81 @@
 
 import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
-import type { ComponentProps, ReactNode } from "react";
-import { useCallback } from "react";
-import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
+import type { ComponentProps, ReactNode, RefObject } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useRef,
+  useState,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
-export type ConversationProps = ComponentProps<typeof StickToBottom>;
+type ConversationScrollContextValue = {
+  isAtBottom: boolean;
+  scrollToBottom: () => void;
+  scrollRef: RefObject<HTMLDivElement | null>;
+};
 
-export const Conversation = ({ className, ...props }: ConversationProps) => (
-  <StickToBottom
-    className={cn("relative flex-1 overflow-y-hidden", className)}
-    initial="smooth"
-    resize="smooth"
-    role="log"
-    {...props}
-  />
-);
+const ConversationScrollContext =
+  createContext<ConversationScrollContextValue | null>(null);
 
-export type ConversationContentProps = ComponentProps<
-  typeof StickToBottom.Content
->;
+export type ConversationProps = ComponentProps<"div">;
+
+export const Conversation = ({
+  className,
+  children,
+  ...props
+}: ConversationProps) => {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+
+  const updateBottomState = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+    const distance =
+      element.scrollHeight - element.clientHeight - element.scrollTop;
+    setIsAtBottom(distance <= 70);
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
+    const element = scrollRef.current;
+    if (!element) {
+      return;
+    }
+    element.scrollTo({
+      behavior: "smooth",
+      top: element.scrollHeight,
+    });
+  }, []);
+
+  return (
+    <ConversationScrollContext.Provider
+      value={{ isAtBottom, scrollRef, scrollToBottom }}
+    >
+      <div
+        className={cn("relative flex-1 overflow-y-auto", className)}
+        onScroll={updateBottomState}
+        ref={scrollRef}
+        role="log"
+        {...props}
+      >
+        {children}
+      </div>
+    </ConversationScrollContext.Provider>
+  );
+};
+
+export type ConversationContentProps = ComponentProps<"div">;
 
 export const ConversationContent = ({
   className,
   ...props
 }: ConversationContentProps) => (
-  <StickToBottom.Content
-    className={cn("flex flex-col gap-8 p-4", className)}
-    {...props}
-  />
+  <div className={cn("flex flex-col gap-8 p-4", className)} {...props} />
 );
 
 export type ConversationEmptyStateProps = ComponentProps<"div"> & {
@@ -75,14 +120,15 @@ export const ConversationScrollButton = ({
   className,
   ...props
 }: ConversationScrollButtonProps) => {
-  const { isAtBottom, scrollToBottom } = useStickToBottomContext();
+  const context = useContext(ConversationScrollContext);
 
   const handleScrollToBottom = useCallback(() => {
-    scrollToBottom();
-  }, [scrollToBottom]);
+    context?.scrollToBottom();
+  }, [context]);
 
   return (
-    !isAtBottom && (
+    context &&
+    !context.isAtBottom && (
       <Button
         className={cn(
           "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full dark:bg-background dark:hover:bg-muted",

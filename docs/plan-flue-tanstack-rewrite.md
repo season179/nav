@@ -335,6 +335,10 @@ If a library has no honest use, say so in the PR rather than forcing it.
 3. **Startup-line / `listen()` seam.** Confirm how the built Flue Node server exposes its bound
    address so the startup line reflects the real (possibly ephemeral) port; if the generated entry
    owns `listen()`, print from a ready path or pin `PORT` from main. Document the approach.
+4. **First-run provider setup.** If no usable model/provider configuration exists, the Electron app
+   should show a setup path instead of letting the user submit into a backend error. Initial scope:
+   detect the empty config state, explain what is missing, and link or write to the nav settings file;
+   full credential/provider management can come later.
 
 For each: if unresolved at the end, leave a `TODO(verify)` naming the exact doc query to run.
 
