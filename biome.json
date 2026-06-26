@@ -17,6 +17,7 @@
       "!desktop/electron/renderer/vendor",
       "!packages/desktop/dist",
       "!packages/desktop/out",
+      "!packages/desktop/src/components/ai-elements",
       "!packages/desktop/src/components/ui",
       "!packages/desktop/src/lib/utils.ts",
       "!packages/desktop/src/styles.css"

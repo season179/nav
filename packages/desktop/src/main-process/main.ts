@@ -3,10 +3,17 @@ import { fileURLToPath } from "node:url";
 import { app, BrowserWindow } from "electron";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const appBackgroundColor = "#090b0c";
 
 const createWindow = () => {
   const window = new BrowserWindow({
+    backgroundColor: appBackgroundColor,
     height: 768,
+    titleBarOverlay: {
+      color: appBackgroundColor,
+      symbolColor: "#f9fbfa",
+    },
+    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
