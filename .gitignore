@@ -167,6 +167,8 @@ rustc-ice-*.txt
 
 # Compiled Electron main process (tsc output from tsconfig.main.json)
 desktop/electron/out/
+packages/desktop/out/
+packages/desktop/dist/
 
 # Claude
 .claude/*

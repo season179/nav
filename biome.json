@@ -8,12 +8,15 @@
   "files": {
     "includes": [
       "desktop/**",
+      "packages/desktop/**",
       "scripts/**",
       "tests/**/*.cts",
       "!!.nav",
       "!desktop/electron/out",
       "!desktop/electron/renderer/dist",
-      "!desktop/electron/renderer/vendor"
+      "!desktop/electron/renderer/vendor",
+      "!packages/desktop/dist",
+      "!packages/desktop/out"
     ]
   },
   "formatter": {

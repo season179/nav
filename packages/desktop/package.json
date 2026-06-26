@@ -1,0 +1,22 @@
+{
+  "name": "@nav/desktop",
+  "version": "1.0.0",
+  "private": true,
+  "main": "out/main-process/main.js",
+  "scripts": {
+    "dev": "pnpm run build:main && concurrently -k -n vite,electron \"vite --host 127.0.0.1\" \"wait-on tcp:127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build": "pnpm run build:main && tsc -p tsconfig.renderer.json && vite build",
+    "build:main": "tsc -p tsconfig.main.json",
+    "test": "node --test"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@types/node": "26.0.1",
+    "concurrently": "10.0.3",
+    "cross-env": "10.1.0",
+    "electron": "42.5.0",
+    "typescript": "6.0.3",
+    "vite": "8.1.0",
+    "wait-on": "9.0.10"
+  }
+}
