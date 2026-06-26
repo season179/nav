@@ -9,7 +9,19 @@ import {
   type SortingState,
   useReactTable,
 } from "@tanstack/react-table";
+import { CheckIcon } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import {
   formatThinkingLabel,
   modelInfoKey,
@@ -103,45 +115,64 @@ export default function SettingsPage({
   const modelSelectionDisabled = !connected || !sessionId || modelSwitching;
 
   return (
-    <section className="settings-page" aria-label="Settings">
-      <div className="settings-content">
-        <header className="settings-header">
+    <section
+      className="min-h-0 flex-1 overflow-y-auto bg-background px-5 py-6"
+      aria-label="Settings"
+    >
+      <div className="mx-auto w-full max-w-5xl space-y-6">
+        <header className="flex items-center justify-between gap-4">
           <div>
-            <h1>Settings</h1>
-            <p className="settings-subtitle">
+            <h1 className="font-semibold text-2xl tracking-tight">Settings</h1>
+            <p className="text-muted-foreground text-sm">
               {sessionId ? shortId(sessionId) : "No thread selected"}
             </p>
           </div>
         </header>
 
         <form
-          className="settings-form"
+          className="space-y-4"
           onSubmit={(event) => {
             event.preventDefault();
             event.stopPropagation();
             void form.handleSubmit();
           }}
         >
-          <section className="settings-section" aria-labelledby="mode-heading">
-            <div className="settings-section-copy">
-              <h2 id="mode-heading">Start in</h2>
-              <span>{sessionModeLabel(newSessionMode)}</span>
+          <section
+            className="grid gap-4 rounded-lg border bg-card p-4 shadow-sm sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+            aria-labelledby="mode-heading"
+          >
+            <div className="space-y-1">
+              <h2 id="mode-heading" className="font-medium">
+                Start in
+              </h2>
+              <span className="text-muted-foreground text-sm">
+                {sessionModeLabel(newSessionMode)}
+              </span>
             </div>
             <form.Field name="mode">
               {(field) => (
-                <div className="settings-segmented" role="radiogroup">
+                <div
+                  className="grid grid-cols-2 gap-1 rounded-lg border bg-muted p-1"
+                  role="radiogroup"
+                >
                   {settingsSessionModeOptions.map((option) => {
                     const selected = field.state.value === option.value;
                     return (
                       <label
                         key={option.value}
-                        className="settings-segment"
+                        className={cn(
+                          "flex h-9 min-w-28 items-center justify-center rounded-md px-3 font-medium text-sm transition-colors",
+                          selected
+                            ? "bg-background text-foreground shadow-sm"
+                            : "text-muted-foreground hover:text-foreground",
+                          !connected && "cursor-not-allowed opacity-50",
+                        )}
                         data-disabled={!connected || undefined}
                         data-selected={selected || undefined}
                       >
                         <input
                           type="radio"
-                          className="settings-segment-input"
+                          className="sr-only"
                           name={field.name}
                           value={option.value}
                           checked={selected}
@@ -162,57 +193,66 @@ export default function SettingsPage({
           </section>
 
           <section
-            className="settings-section"
+            className="grid gap-4 rounded-lg border bg-card p-4 shadow-sm sm:grid-cols-[minmax(0,1fr)_14rem] sm:items-center"
             aria-labelledby="thinking-heading"
           >
-            <div className="settings-section-copy">
-              <h2 id="thinking-heading">Thinking</h2>
-              <span>{formatThinkingLabel(modelInfo?.thinking ?? "")}</span>
+            <div className="space-y-1">
+              <h2 id="thinking-heading" className="font-medium">
+                Thinking
+              </h2>
+              <span className="text-muted-foreground text-sm">
+                {formatThinkingLabel(modelInfo?.thinking ?? "")}
+              </span>
             </div>
             <form.Field name="thinking">
               {(field) => (
-                <select
-                  className="settings-select"
+                <Select
                   value={field.state.value}
                   disabled={modelSelectionDisabled || thinkingLevels.length < 2}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => {
-                    const level = event.target.value;
+                  onValueChange={(level) => {
                     field.handleChange(level);
                     onThinkingChange(level);
                   }}
                 >
-                  {thinkingLevels.length === 0 ? (
-                    <option value="">Default</option>
-                  ) : (
-                    thinkingLevels.map((level) => (
-                      <option key={level} value={level}>
-                        {formatThinkingLabel(level)}
-                      </option>
-                    ))
-                  )}
-                </select>
+                  <SelectTrigger className="w-full" onBlur={field.handleBlur}>
+                    <SelectValue placeholder="Default" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {thinkingLevels.length === 0 ? (
+                        <SelectItem value="default">Default</SelectItem>
+                      ) : (
+                        thinkingLevels.map((level) => (
+                          <SelectItem key={level} value={level}>
+                            {formatThinkingLabel(level)}
+                          </SelectItem>
+                        ))
+                      )}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
               )}
             </form.Field>
           </section>
 
-          <section className="settings-section settings-models-section">
-            <div className="settings-section-copy">
-              <h2>Models</h2>
-              <span>
-                {modelOptions.length} option
-                {modelOptions.length === 1 ? "" : "s"}
-              </span>
-            </div>
-            <div className="settings-table-tools">
-              <input
-                type="search"
-                className="settings-model-search"
-                aria-label="Search models"
-                placeholder="Search models"
-                value={globalFilter}
-                onChange={(event) => setGlobalFilter(event.target.value)}
-              />
+          <section className="rounded-lg border bg-card p-4 shadow-sm">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="space-y-1">
+                <h2 className="font-medium">Models</h2>
+                <span className="text-muted-foreground text-sm">
+                  {modelOptions.length} option
+                  {modelOptions.length === 1 ? "" : "s"}
+                </span>
+              </div>
+              <div className="w-full sm:w-72">
+                <Input
+                  type="search"
+                  aria-label="Search models"
+                  placeholder="Search models"
+                  value={globalFilter}
+                  onChange={(event) => setGlobalFilter(event.target.value)}
+                />
+              </div>
             </div>
             <form.Field
               name="modelKey"
@@ -228,18 +268,27 @@ export default function SettingsPage({
             >
               {(field) => (
                 <>
-                  <div className="settings-table-wrap">
-                    <table className="settings-model-table">
+                  <div className="mt-4 overflow-hidden rounded-lg border">
+                    <table className="w-full border-collapse text-sm">
                       <thead>
                         {table.getHeaderGroups().map((headerGroup) => (
-                          <tr key={headerGroup.id}>
-                            <th className="settings-model-selected" />
+                          <tr
+                            key={headerGroup.id}
+                            className="border-b bg-muted/60 text-muted-foreground"
+                          >
+                            <th className="w-10 px-3 py-2" />
                             {headerGroup.headers.map((header) => (
-                              <th key={header.id} colSpan={header.colSpan}>
+                              <th
+                                key={header.id}
+                                className="px-3 py-2 text-left font-medium"
+                                colSpan={header.colSpan}
+                              >
                                 {header.isPlaceholder ? null : (
-                                  <button
+                                  <Button
                                     type="button"
-                                    className="settings-table-sort"
+                                    className="h-7 justify-start gap-1 px-2 text-muted-foreground hover:text-foreground"
+                                    variant="ghost"
+                                    size="sm"
                                     disabled={!header.column.getCanSort()}
                                     onClick={header.column.getToggleSortingHandler()}
                                   >
@@ -250,7 +299,7 @@ export default function SettingsPage({
                                     <span aria-hidden="true">
                                       {sortMarker(header.column.getIsSorted())}
                                     </span>
-                                  </button>
+                                  </Button>
                                 )}
                               </th>
                             ))}
@@ -265,24 +314,21 @@ export default function SettingsPage({
                           return (
                             <tr
                               key={row.id}
+                              className="border-b transition-colors last:border-b-0 hover:bg-muted/50 data-[selected=true]:bg-accent"
                               data-selected={selected || undefined}
                             >
-                              <td className="settings-model-selected">
-                                {selected ? "✓" : ""}
+                              <td className="px-3 py-2 text-primary">
+                                {selected ? (
+                                  <CheckIcon className="size-4" />
+                                ) : null}
                               </td>
                               {row.getVisibleCells().map((cell) => (
-                                <td
-                                  key={cell.id}
-                                  className={
-                                    cell.column.id === "label"
-                                      ? "settings-model-label-cell"
-                                      : undefined
-                                  }
-                                >
+                                <td key={cell.id} className="min-w-0 px-3 py-2">
                                   {cell.column.id === "label" ? (
-                                    <button
+                                    <Button
                                       type="button"
-                                      className="settings-model-button"
+                                      className="h-auto max-w-full justify-start p-0 text-left font-medium hover:bg-transparent"
+                                      variant="ghost"
                                       disabled={modelSelectionDisabled}
                                       onClick={() => {
                                         field.handleChange(optionKey);
@@ -293,7 +339,7 @@ export default function SettingsPage({
                                         cell.column.columnDef.cell,
                                         cell.getContext(),
                                       )}
-                                    </button>
+                                    </Button>
                                   ) : (
                                     flexRender(
                                       cell.column.columnDef.cell,
@@ -308,13 +354,13 @@ export default function SettingsPage({
                       </tbody>
                     </table>
                     {table.getRowModel().rows.length === 0 ? (
-                      <div className="settings-model-empty">
+                      <div className="px-4 py-8 text-center text-muted-foreground text-sm">
                         No matching models
                       </div>
                     ) : null}
                   </div>
                   {!field.state.meta.isValid ? (
-                    <div className="settings-error" role="alert">
+                    <div className="mt-3 text-destructive text-sm" role="alert">
                       {field.state.meta.errors.join(", ")}
                     </div>
                   ) : null}

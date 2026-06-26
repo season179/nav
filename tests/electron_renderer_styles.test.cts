@@ -3,30 +3,37 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { test } = require("node:test");
 
-test("session mode trigger keeps a stable slot for local and worktree labels", () => {
+test("renderer uses shadcn neutral dark tokens without legacy feature CSS", () => {
+  const manifest = fs.readFileSync(
+    path.join(__dirname, "..", "desktop", "electron", "renderer", "styles.css"),
+    "utf8",
+  );
   const styles = readRendererStyles();
 
-  const triggerRule = cssRule(styles, ".session-mode-trigger");
-  assert.match(triggerRule, /justify-content:\s*space-between;/);
-  assert.match(triggerRule, /width:\s*96px;/);
-});
+  assert.match(manifest, /@import "\.\/styles\/theme\.css"/);
+  assert.match(manifest, /@import "\.\/styles\/base\.css"/);
+  assert.doesNotMatch(
+    manifest,
+    /@import "\.\/styles\/(sidebar|layout|stacks|settings|transcript|composer)\.css"/,
+  );
 
-test("sidebar uses a flat opaque base color", () => {
-  const styles = readRendererStyles();
-
-  // theme.css defines the shadcn --sidebar token (opaque).
-  assert.match(styles, /--sidebar:\s*oklch\(0\.35 0\.024 266\);/);
-  // base.css defines --sidebar-glass in its :root block.
-  assert.match(styles, /--sidebar-glass:/);
-  assert.doesNotMatch(styles, /--sidebar-glass-highlight-start:/);
-  assert.doesNotMatch(styles, /--sidebar-glass-highlight-mid:/);
-  assert.doesNotMatch(styles, /--sidebar-glass-shadow:/);
-
-  const sidebarRule = cssRule(styles, ".sidebar");
-  const newChatRule = cssRule(styles, ".new-chat");
-  assert.match(sidebarRule, /background:\s*var\(--sidebar-bg\);/);
-  assert.doesNotMatch(sidebarRule, /linear-gradient\(/);
-  assert.match(newChatRule, /background:\s*var\(--sidebar-glass-strong\);/);
+  assert.match(styles, /:root\s*\{[\s\S]*--background:\s*oklch\(1 0 0\);/);
+  assert.match(
+    styles,
+    /\.dark\s*\{[\s\S]*--background:\s*oklch\(0\.145 0 0\);/,
+  );
+  assert.match(
+    styles,
+    /\.dark\s*\{[\s\S]*--sidebar-primary:\s*oklch\(0\.488 0\.243 264\.376\);/,
+  );
+  assert.match(styles, /--color-chart-1:\s*var\(--chart-1\);/);
+  assert.match(styles, /color-scheme:\s*light;/);
+  assert.match(styles, /color-scheme:\s*dark;/);
+  assert.doesNotMatch(
+    styles,
+    /\.(sidebar|new-chat|composer|session-view-tab|settings-page|stacks-page)\s*\{/,
+  );
+  assert.doesNotMatch(styles, /\.app\s*\{/);
 });
 
 function readRendererStyles() {
@@ -61,15 +68,4 @@ function resolveCssImports(filePath: string, seen: Set<string> = new Set()) {
       return resolveCssImports(path.resolve(dir, ref), seen);
     },
   );
-}
-
-function cssRule(styles: string, selector: string) {
-  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = styles.match(
-    new RegExp(`${escapedSelector}\\s*\\{([\\s\\S]*?)\\}`),
-  );
-  if (!match) {
-    throw new Error(`${selector} rule should exist`);
-  }
-  return match[1];
 }

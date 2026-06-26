@@ -30,6 +30,7 @@ import {
   STACK_AVAILABILITY_RECHECK_DELAY_MS,
   shouldRefreshStackAvailabilityForEvent,
 } from "./lib/stack-availability.ts";
+import { cn } from "./lib/utils.ts";
 import type {
   BackendStatus,
   ChatMessage,
@@ -819,7 +820,7 @@ export default function App() {
   );
 
   return (
-    <div className="app">
+    <div className="grid h-screen min-h-0 grid-cols-[20rem_minmax(0,1fr)] overflow-hidden bg-background text-foreground">
       <Sidebar
         activeSessionId={activeSessionId}
         attentionSessionIds={attentionSessionIds}
@@ -831,7 +832,7 @@ export default function App() {
         onNewChatInProject={startNewChatInProject}
         onSelectSession={selectSession}
       />
-      <main className="shell">
+      <main className="flex min-h-0 flex-col overflow-hidden">
         <SessionToolbar
           activeView={activeView}
           connected={connected}
@@ -911,15 +912,17 @@ function SessionToolbar({
   }
 
   return (
-    <header className="session-toolbar">
-      <div className="session-toolbar-title">
-        <span className="session-toolbar-label">Thread</span>
-        <span className="session-toolbar-id">
+    <header className="flex h-14 shrink-0 items-center justify-between border-b bg-background/95 px-5">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="font-medium text-muted-foreground text-xs uppercase tracking-[0.12em]">
+          Thread
+        </span>
+        <span className="rounded-md bg-muted px-2 py-1 font-mono text-muted-foreground text-xs">
           {sessionId ? shortId(sessionId) : "none"}
         </span>
         {running ? (
           <span
-            className="session-toolbar-running"
+            className="size-2 rounded-full bg-primary"
             role="img"
             aria-label="Running"
             title="Running"
@@ -927,17 +930,20 @@ function SessionToolbar({
         ) : null}
       </div>
       <Tabs
-        className="session-view-tabs"
+        className="shrink-0"
         value={activeView}
         onValueChange={handleViewChange}
       >
-        <TabsList className="session-view-tabs-list" aria-label="Thread views">
-          <TabsTrigger className="session-view-tab" value="chat">
+        <TabsList aria-label="Thread views" variant="line">
+          <TabsTrigger
+            className={cn(activeView === "chat" && "text-foreground")}
+            value="chat"
+          >
             Chat
           </TabsTrigger>
           {showStacks ? (
             <TabsTrigger
-              className="session-view-tab"
+              className={cn(activeView === "stacks" && "text-foreground")}
               disabled={!connected || !sessionId}
               value="stacks"
             >
@@ -945,7 +951,7 @@ function SessionToolbar({
             </TabsTrigger>
           ) : null}
           <TabsTrigger
-            className="session-view-tab"
+            className={cn(activeView === "settings" && "text-foreground")}
             disabled={!connected}
             value="settings"
           >

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import {
   Conversation,
   ConversationContent,
+  ConversationEmptyState,
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import {
@@ -34,18 +35,32 @@ export default function Transcript({ messages }: { messages: Message[] }) {
   );
 
   return (
-    <Conversation className="chat" aria-label="Chat transcript">
-      <ConversationContent className="message-list" id="message-list">
-        {transcriptItems.map((item) =>
-          item.kind === "tool" ? (
-            <ToolMessageItem item={item} key={item.id} />
-          ) : (
-            <ChatMessageItem
-              item={item}
-              key={item.id}
-              showTimestamp={timestampMessageIds.has(item.id)}
-            />
-          ),
+    <Conversation
+      className="min-h-0 bg-background"
+      aria-label="Chat transcript"
+    >
+      <ConversationContent
+        className="mx-auto w-full max-w-3xl gap-6 px-5 py-8 md:px-6"
+        id="message-list"
+      >
+        {transcriptItems.length === 0 ? (
+          <ConversationEmptyState
+            className="min-h-[45vh]"
+            title="Ready when you are"
+            description="Start a thread and the conversation will appear here."
+          />
+        ) : (
+          transcriptItems.map((item) =>
+            item.kind === "tool" ? (
+              <ToolMessageItem item={item} key={item.id} />
+            ) : (
+              <ChatMessageItem
+                item={item}
+                key={item.id}
+                showTimestamp={timestampMessageIds.has(item.id)}
+              />
+            ),
+          )
         )}
       </ConversationContent>
       {transcriptItems.length > 0 ? (
@@ -63,17 +78,20 @@ function ChatMessageItem({
   showTimestamp: boolean;
 }) {
   return (
-    <AiMessage className={`message message-${item.role}`} from={item.from}>
-      <MessageContent className="message-content">
+    <AiMessage className="max-w-[88%]" from={item.from}>
+      <MessageContent>
         {item.role === "assistant" ? (
-          <MessageResponse className="message-response">
+          <MessageResponse className="text-[0.95rem] leading-7">
             {item.text}
           </MessageResponse>
         ) : (
-          <span className="message-text">{item.text}</span>
+          <span className="whitespace-pre-wrap text-sm">{item.text}</span>
         )}
         {showTimestamp ? (
-          <time className="message-time" dateTime={item.createdAt}>
+          <time
+            className="text-muted-foreground text-[11px]"
+            dateTime={item.createdAt}
+          >
             {formatTimestamp(new Date(item.createdAt))}
           </time>
         ) : null}
@@ -84,10 +102,10 @@ function ChatMessageItem({
 
 function ToolMessageItem({ item }: { item: AiElementsToolMessage }) {
   return (
-    <AiMessage className="message message-tool-wrapper" from="assistant">
-      <MessageContent className="message-tool-content">
+    <AiMessage className="max-w-full" from="assistant">
+      <MessageContent className="w-full">
         <Tool
-          className="message-tool"
+          className="rounded-lg border bg-card shadow-sm"
           data-tool-call-id={item.toolCallId || undefined}
           defaultOpen={item.state !== "input-available"}
         >
@@ -102,7 +120,7 @@ function ToolMessageItem({ item }: { item: AiElementsToolMessage }) {
               errorText={item.errorText}
               output={
                 item.output ? (
-                  <MessageResponse className="message-response">
+                  <MessageResponse className="text-sm leading-6">
                     {item.output}
                   </MessageResponse>
                 ) : undefined

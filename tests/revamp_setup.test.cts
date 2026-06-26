@@ -226,6 +226,57 @@ test("Transcript renders assistant markdown through AI Elements MessageResponse"
   assert.doesNotMatch(transcript, /renderMarkdown|MarkdownText/);
 });
 
+test("AI Elements markdown highlighting uses the renderer-local Shiki allowlist", () => {
+  const message = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "components",
+      "ai-elements",
+      "message.tsx",
+    ),
+    "utf8",
+  );
+  const codeBlock = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "components",
+      "ai-elements",
+      "code-block.tsx",
+    ),
+    "utf8",
+  );
+  const highlighter = fs.readFileSync(
+    path.join(
+      REPO_ROOT,
+      "desktop",
+      "electron",
+      "renderer",
+      "src",
+      "lib",
+      "shiki-highlighter.ts",
+    ),
+    "utf8",
+  );
+
+  assert.doesNotMatch(message, /@streamdown\/code/);
+  assert.match(message, /code:\s*navCodePlugin/);
+  assert.doesNotMatch(codeBlock, /^import\s+(?!type).*from "shiki";/m);
+  assert.doesNotMatch(highlighter, /^import\s+(?!type).*from "shiki";/m);
+  assert.match(highlighter, /from "shiki\/core"/);
+  assert.match(highlighter, /shiki\/dist\/langs\/typescript\.mjs/);
+  assert.match(highlighter, /shiki\/dist\/langs\/json\.mjs/);
+  assert.doesNotMatch(highlighter, /shiki\/dist\/langs\/(cpp|emacs-lisp)\.mjs/);
+  assert.doesNotMatch(highlighter, /bundledLanguages|createHighlighter\(/);
+});
+
 test("Composer input is rebuilt on AI Elements PromptInput", () => {
   const composer = fs.readFileSync(
     path.join(
@@ -280,28 +331,25 @@ test("Composer thinking and session mode use shadcn Select", () => {
     ),
     "utf8",
   );
-  const composerCss = fs.readFileSync(
-    path.join(
-      REPO_ROOT,
-      "desktop",
-      "electron",
-      "renderer",
-      "styles",
-      "composer.css",
-    ),
-    "utf8",
-  );
 
   assert.match(composer, /SelectTrigger/);
   assert.match(composer, /SelectContent/);
   assert.match(composer, /SelectItem/);
   assert.doesNotMatch(
     composer,
-    /wrapIndex|sessionModeLabel|thinkingLevelDetails/,
+    /wrapIndex|sessionModeLabel|thinkingLevelDetails|thinking-trigger|session-mode-trigger|composer-select-content/,
   );
+});
+
+test("Renderer stylesheet does not import legacy feature CSS", () => {
+  const styles = fs.readFileSync(
+    path.join(REPO_ROOT, "desktop", "electron", "renderer", "styles.css"),
+    "utf8",
+  );
+
   assert.doesNotMatch(
-    composerCss,
-    /session-mode-menu|thinking-menu|thinking-option/,
+    styles,
+    /sidebar\.css|layout\.css|stacks\.css|settings\.css|transcript\.css|composer\.css/,
   );
 });
 

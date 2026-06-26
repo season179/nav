@@ -1,5 +1,15 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  ChevronRightIcon,
+  CircleAlertIcon,
+  FolderIcon,
+  MessageSquarePlusIcon,
+  PlusIcon,
+  SparklesIcon,
+} from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import type { Project, SessionListEntry } from "../lib/project-list.ts";
 import { groupSessionsByProject } from "../lib/project-list.ts";
 import {
@@ -67,37 +77,53 @@ export default function Sidebar({
   }
 
   return (
-    <aside className="sidebar" aria-label="Sidebar">
-      <div className="sidebar-header">
-        <button
+    <aside
+      className="flex h-screen min-h-0 w-80 flex-col border-sidebar-border border-r bg-sidebar text-sidebar-foreground"
+      aria-label="Sidebar"
+    >
+      <div className="border-sidebar-border border-b p-3">
+        <Button
           type="button"
           id="new-chat"
-          className="new-chat"
+          className="h-9 w-full justify-start bg-sidebar-primary text-sidebar-primary-foreground shadow-none hover:bg-sidebar-primary/90"
           disabled={!connected}
           onClick={onNewChat}
         >
-          + New thread
-        </button>
+          <MessageSquarePlusIcon />
+          New thread
+        </Button>
       </div>
 
-      <nav className="sidebar-section" aria-label="Projects">
-        <div className="sidebar-section-heading">
-          <h2 className="sidebar-section-title">Projects</h2>
-          <button
+      <nav
+        className="flex min-h-0 flex-1 flex-col gap-2 p-3"
+        aria-label="Projects"
+      >
+        <div className="flex items-center justify-between px-1">
+          <h2 className="font-medium text-sidebar-foreground/70 text-xs uppercase tracking-[0.12em]">
+            Projects
+          </h2>
+          <Button
             type="button"
             id="new-project"
-            className="project-add"
+            className="text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+            variant="ghost"
+            size="icon-xs"
             aria-label="Add project"
             title="Add project"
             disabled={!connected}
             onClick={onCreateProject}
           >
-            +
-          </button>
+            <PlusIcon />
+          </Button>
         </div>
-        <ul className="session-list" id="session-list">
+        <ul
+          className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1"
+          id="session-list"
+        >
           {projects.length === 0 ? (
-            <li className="sidebar-empty">No sessions yet</li>
+            <li className="rounded-md border border-sidebar-border/60 border-dashed px-3 py-6 text-center text-sidebar-foreground/55 text-sm">
+              No sessions yet
+            </li>
           ) : (
             projects.map((project) => (
               <ProjectGroup
@@ -121,7 +147,7 @@ export default function Sidebar({
         </ul>
       </nav>
 
-      <div className="sidebar-footer" />
+      <div className="h-3 shrink-0" />
     </aside>
   );
 }
@@ -163,7 +189,7 @@ function ProjectGroup({
   );
 
   return (
-    <li className="project-group">
+    <li className="space-y-1">
       <ProjectHeading
         connected={connected}
         project={project}
@@ -208,53 +234,59 @@ function ProjectHeading({
   const label = projectLabel(project);
 
   return (
-    <div className="project-heading">
+    <div className="flex items-center gap-1">
       <button
         type="button"
-        className="project-toggle"
+        className="group flex min-w-0 flex-1 items-center justify-between gap-2 rounded-md px-2 py-2 text-left text-sidebar-foreground/90 text-sm outline-none transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
         title={project.path || label}
         aria-label={toggleView.ariaLabel}
         aria-expanded={toggleView.ariaExpanded}
         onClick={onToggleProject}
       >
-        <span className="project-label">
-          <span className="project-disclosure" aria-hidden="true">
-            {toggleView.disclosure}
+        <span className="flex min-w-0 items-center gap-2">
+          <ChevronRightIcon
+            className={cn(
+              "size-3.5 shrink-0 text-sidebar-foreground/55 transition-transform",
+              toggleView.ariaExpanded ? "rotate-90" : "",
+            )}
+            aria-hidden="true"
+          />
+          <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-sidebar-accent text-sidebar-accent-foreground">
+            <FolderIcon className="size-3.5" aria-hidden="true" />
           </span>
-          <span className="project-icon" aria-hidden="true" />
-          <span className="project-title">
-            <span className="project-name">{project.name}</span>
+          <span className="min-w-0">
+            <span className="block truncate font-medium">{project.name}</span>
             {project.pathHint ? (
-              <span className="project-path-hint">{project.pathHint}</span>
+              <span className="block truncate text-sidebar-foreground/50 text-xs">
+                {project.pathHint}
+              </span>
             ) : null}
           </span>
           {running ? (
-            <span
-              className="project-running"
-              role="img"
+            <SparklesIcon
+              className="size-3.5 shrink-0 text-sidebar-primary"
               aria-label="Running"
-              title="Running"
             />
           ) : needsAttention ? (
-            <span
-              className="project-attention"
-              role="img"
+            <CircleAlertIcon
+              className="size-3.5 shrink-0 text-destructive"
               aria-label="Needs attention"
-              title="Needs attention"
             />
           ) : null}
         </span>
       </button>
-      <button
+      <Button
         type="button"
-        className="project-chat-add"
+        className="text-sidebar-foreground/60 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+        variant="ghost"
+        size="icon-xs"
         title={`New thread in ${label}`}
         aria-label={`New thread in ${label}`}
         disabled={!connected}
         onClick={() => onNewChatInProject(project.path)}
       >
-        +
-      </button>
+        <PlusIcon />
+      </Button>
     </div>
   );
 }
@@ -290,9 +322,9 @@ function ProjectSessions({
   return (
     <>
       {shouldVirtualize ? (
-        <div ref={scrollRef} className="project-session-virtual-viewport">
+        <div ref={scrollRef} className="max-h-72 overflow-y-auto">
           <ul
-            className="project-session-list project-session-list-virtual"
+            className="relative ml-9 space-y-1"
             style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
           >
             {rowVirtualizer.getVirtualItems().map((virtualRow) => {
@@ -305,7 +337,7 @@ function ProjectSessions({
                 <li
                   key={virtualRow.key}
                   ref={rowVirtualizer.measureElement}
-                  className="project-session-virtual-row"
+                  className="absolute top-0 left-0 w-full"
                   data-index={virtualRow.index}
                   style={{ transform: `translateY(${virtualRow.start}px)` }}
                 >
@@ -322,7 +354,7 @@ function ProjectSessions({
           </ul>
         </div>
       ) : (
-        <ul className="project-session-list">
+        <ul className="ml-9 space-y-1">
           {sessions.map((session) => (
             <li key={session.sessionId}>
               <SessionItem
@@ -362,25 +394,28 @@ function SessionItem({
   return (
     <button
       type="button"
-      className="session-item"
+      className={cn(
+        "flex h-8 w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 text-left text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring",
+        session.sessionId === activeSessionId
+          ? "bg-sidebar-accent text-sidebar-accent-foreground"
+          : "text-sidebar-foreground/65 hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground",
+      )}
       data-session-id={session.sessionId}
       aria-current={session.sessionId === activeSessionId ? "true" : undefined}
       onClick={() => onSelectSession(session.sessionId)}
     >
-      <span className="session-item-title">{sessionTitle(session)}</span>
+      <span className="truncate">{sessionTitle(session)}</span>
       {runningSessionIds.has(session.sessionId) ? (
         <span
-          className="session-running"
+          className="size-2 shrink-0 rounded-full bg-sidebar-primary"
           role="img"
           aria-label="Running"
-          title="Running"
         />
       ) : attentionSessionIds.has(session.sessionId) ? (
         <span
-          className="session-attention"
+          className="size-2 shrink-0 rounded-full bg-destructive"
           role="img"
           aria-label="Needs attention"
-          title="Needs attention"
         />
       ) : null}
     </button>
@@ -395,11 +430,11 @@ function SessionToggle({
   onToggleProjectSessions: () => void;
 }) {
   return (
-    <ul className="project-session-list project-session-toggle-list">
+    <ul className="ml-9 space-y-1">
       <li>
         <button
           type="button"
-          className="project-session-toggle"
+          className="h-8 rounded-md px-2 text-left text-sidebar-foreground/55 text-xs transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
           aria-label={toggle.ariaLabel}
           onClick={onToggleProjectSessions}
         >

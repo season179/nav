@@ -1,5 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useDebouncer } from "@tanstack/react-pacer";
+import { ChevronDownIcon } from "lucide-react";
 import type { FormEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -30,6 +31,7 @@ import {
   PromptInputTextarea,
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input";
+import { Button } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
@@ -133,109 +135,108 @@ export default function Composer({
   }
 
   return (
-    <div className="composer">
-      <form.Field
-        name="message"
-        validators={{
-          onSubmit: ({ value }) => validateComposerMessage(value, connected),
-        }}
-      >
-        {(field) => {
-          const message = field.state.value;
-          const errorText = field.state.meta.errors.join(", ");
-          return (
-            <>
-              <PromptInput
-                className="composer-input-form"
-                id="composer"
-                onSubmit={handlePromptSubmit}
-              >
-                <PromptInputBody>
-                  <PromptInputTextarea
-                    ref={inputRef}
-                    id="composer-input"
-                    className="composer-input"
-                    aria-label="Message"
-                    aria-describedby={
-                      errorText ? "composer-input-error" : undefined
-                    }
-                    aria-invalid={errorText ? true : undefined}
-                    placeholder="Tell nav what to do"
-                    autoComplete="off"
-                    rows={1}
-                    disabled={!connected}
-                    value={message}
-                    onBlur={field.handleBlur}
-                    onChange={(event) => {
-                      const nextMessage = event.target.value;
-                      field.handleChange(nextMessage);
-                      saveDraft(nextMessage);
-                    }}
-                  />
-                </PromptInputBody>
-                <PromptInputFooter className="composer-input-footer">
-                  <PromptInputTools>
-                    {running ? (
-                      <PromptInputButton
-                        type="button"
-                        id="composer-stop"
-                        className="composer-stop"
-                        disabled={!connected || stopPending}
-                        onClick={onStop}
-                      >
-                        Stop
-                      </PromptInputButton>
-                    ) : null}
-                  </PromptInputTools>
-                  <PromptInputSubmit
-                    id="composer-send"
-                    className="composer-send"
-                    aria-label="Send message"
-                    title="Send message"
-                    disabled={
-                      !connected ||
-                      normalizeComposerMessage(message).length === 0
-                    }
-                  >
-                    ↑
-                  </PromptInputSubmit>
-                </PromptInputFooter>
-              </PromptInput>
-              {errorText ? (
-                <div
-                  className="composer-error"
-                  id="composer-input-error"
-                  role="alert"
+    <div className="shrink-0 border-t bg-background px-5 py-4">
+      <div className="mx-auto w-full max-w-3xl space-y-3">
+        <form.Field
+          name="message"
+          validators={{
+            onSubmit: ({ value }) => validateComposerMessage(value, connected),
+          }}
+        >
+          {(field) => {
+            const message = field.state.value;
+            const errorText = field.state.meta.errors.join(", ");
+            return (
+              <>
+                <PromptInput
+                  className="[&_[data-slot=input-group]]:rounded-xl [&_[data-slot=input-group]]:bg-card [&_[data-slot=input-group]]:shadow-sm"
+                  id="composer"
+                  onSubmit={handlePromptSubmit}
                 >
-                  {errorText}
-                </div>
-              ) : null}
-            </>
-          );
-        }}
-      </form.Field>
-      <div className="composer-meta">
-        <span className="composer-meta-left">
-          <SessionModeMenu
-            disabled={!connected}
-            mode={newSessionMode}
-            onModeChange={onNewSessionModeChange}
-          />
-          <ModelMenu
-            disabled={!connected || modelSwitching}
-            modelInfo={modelInfo}
-            options={modelOptions}
-            onModelChange={onModelChange}
-          />
-        </span>
-        <span className="composer-meta-right">
-          <ThinkingMenu
-            disabled={!connected || modelSwitching}
-            modelInfo={modelInfo}
-            onThinkingChange={onThinkingChange}
-          />
-          <TokenUsageMeter modelInfo={modelInfo} />
-        </span>
+                  <PromptInputBody>
+                    <PromptInputTextarea
+                      ref={inputRef}
+                      id="composer-input"
+                      className="min-h-[4.5rem] text-sm"
+                      aria-label="Message"
+                      aria-describedby={
+                        errorText ? "composer-input-error" : undefined
+                      }
+                      aria-invalid={errorText ? true : undefined}
+                      placeholder="Tell nav what to do"
+                      autoComplete="off"
+                      rows={1}
+                      disabled={!connected}
+                      value={message}
+                      onBlur={field.handleBlur}
+                      onChange={(event) => {
+                        const nextMessage = event.target.value;
+                        field.handleChange(nextMessage);
+                        saveDraft(nextMessage);
+                      }}
+                    />
+                  </PromptInputBody>
+                  <PromptInputFooter className="border-t px-3 py-2">
+                    <PromptInputTools>
+                      {running ? (
+                        <PromptInputButton
+                          type="button"
+                          id="composer-stop"
+                          variant="outline"
+                          disabled={!connected || stopPending}
+                          onClick={onStop}
+                        >
+                          Stop
+                        </PromptInputButton>
+                      ) : null}
+                    </PromptInputTools>
+                    <PromptInputSubmit
+                      id="composer-send"
+                      aria-label="Send message"
+                      title="Send message"
+                      disabled={
+                        !connected ||
+                        normalizeComposerMessage(message).length === 0
+                      }
+                    />
+                  </PromptInputFooter>
+                </PromptInput>
+                {errorText ? (
+                  <div
+                    className="text-destructive text-sm"
+                    id="composer-input-error"
+                    role="alert"
+                  >
+                    {errorText}
+                  </div>
+                ) : null}
+              </>
+            );
+          }}
+        </form.Field>
+        <div className="flex flex-wrap items-center justify-between gap-2 text-muted-foreground text-xs">
+          <span className="flex min-w-0 flex-wrap items-center gap-2">
+            <SessionModeMenu
+              disabled={!connected}
+              mode={newSessionMode}
+              onModeChange={onNewSessionModeChange}
+            />
+            <ModelMenu
+              disabled={!connected || modelSwitching}
+              modelInfo={modelInfo}
+              options={modelOptions}
+              onModelChange={onModelChange}
+            />
+          </span>
+          <span className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+            <ThinkingMenu
+              disabled={!connected || modelSwitching}
+              modelInfo={modelInfo}
+              onThinkingChange={onThinkingChange}
+            />
+            <TokenUsageMeter modelInfo={modelInfo} />
+          </span>
+        </div>
       </div>
     </div>
   );
@@ -257,18 +258,14 @@ function ThinkingMenu({
 
   if (!current && !hasChoices) {
     return (
-      <span
-        className="composer-thinking"
-        id="composer-thinking"
-        aria-live="polite"
-      />
+      <span className="sr-only" id="composer-thinking" aria-live="polite" />
     );
   }
 
   if (!hasChoices) {
     return (
       <span
-        className="composer-thinking"
+        className="inline-flex h-8 items-center rounded-md px-2 text-muted-foreground text-xs"
         id="composer-thinking"
         aria-live="polite"
       >
@@ -285,12 +282,13 @@ function ThinkingMenu({
     >
       <SelectTrigger
         id="composer-thinking"
-        className="thinking-trigger"
+        className="h-8 w-[8.5rem]"
+        size="sm"
         aria-label="Thinking level"
       >
         <SelectValue />
       </SelectTrigger>
-      <SelectContent align="end" className="composer-select-content">
+      <SelectContent align="end">
         <SelectGroup>
           {levels.map((level) => (
             <SelectItem key={level} value={level}>
@@ -331,7 +329,11 @@ function ModelMenu({
 
   if (!hasOptions) {
     return (
-      <span className="composer-model" id="composer-model" aria-live="polite">
+      <span
+        className="inline-flex h-8 max-w-52 items-center truncate rounded-md px-2 text-muted-foreground text-xs"
+        id="composer-model"
+        aria-live="polite"
+      >
         {modelInfo?.label ?? ""}
       </span>
     );
@@ -345,20 +347,20 @@ function ModelMenu({
       }}
     >
       <ModelSelectorTrigger asChild>
-        <button
+        <Button
           type="button"
           id="composer-model"
-          className="model-trigger"
+          className="h-8 max-w-60 justify-between gap-2 px-2 text-xs"
+          variant="outline"
+          size="sm"
           aria-live="polite"
           disabled={disabled}
         >
-          <span>{modelInfo?.label ?? "Model"}</span>
-          <span className="model-chevron" aria-hidden="true">
-            v
-          </span>
-        </button>
+          <span className="truncate">{modelInfo?.label ?? "Model"}</span>
+          <ChevronDownIcon className="size-3.5 opacity-60" aria-hidden="true" />
+        </Button>
       </ModelSelectorTrigger>
-      <ModelSelectorContent className="model-selector-content">
+      <ModelSelectorContent className="max-w-lg">
         <ModelSelectorInput placeholder="Search models" />
         <ModelSelectorList>
           <ModelSelectorEmpty>No matching models</ModelSelectorEmpty>
@@ -369,13 +371,13 @@ function ModelMenu({
                 return (
                   <ModelSelectorItem
                     key={`${option.provider}:${option.model}`}
-                    className="model-option"
+                    className="items-center gap-2"
                     data-current={selected ? "true" : undefined}
                     value={modelSearchText(option)}
                     onSelect={() => selectModel(option)}
                   >
                     <ModelSelectorName>{option.label}</ModelSelectorName>
-                    <span className="model-option-provider">
+                    <span className="text-muted-foreground text-xs">
                       {option.provider}
                     </span>
                     <ModelSelectorShortcut>
@@ -444,12 +446,13 @@ function SessionModeMenu({
     >
       <SelectTrigger
         id="new-session-mode"
-        className="session-mode-trigger"
+        className="h-8 w-[6.75rem]"
+        size="sm"
         aria-label="New session mode"
       >
         <SelectValue />
       </SelectTrigger>
-      <SelectContent align="start" className="composer-select-content">
+      <SelectContent align="start">
         <SelectGroup>
           {sessionModeOptions.map((option) => (
             <SelectItem key={option.value} value={option.value}>
@@ -465,7 +468,7 @@ function SessionModeMenu({
 function TokenUsageMeter({ modelInfo }: { modelInfo: ModelInfo | null }) {
   const tokenUsage = modelInfo?.tokenUsage;
   if (!tokenUsage?.contextWindow) {
-    return <span className="composer-token-usage" id="composer-token-usage" />;
+    return <span className="sr-only" id="composer-token-usage" />;
   }
 
   const usedTokens = Math.max(0, tokenUsage.used);
@@ -473,15 +476,11 @@ function TokenUsageMeter({ modelInfo }: { modelInfo: ModelInfo | null }) {
 
   return (
     <TokenContext usedTokens={usedTokens} maxTokens={maxTokens}>
-      <ContextTrigger>
-        <button
-          type="button"
-          className="composer-token-usage"
-          id="composer-token-usage"
-        >
-          {formatTokenUsage(tokenUsage)}
-        </button>
-      </ContextTrigger>
+      <ContextTrigger
+        className="h-8 px-2 text-xs"
+        id="composer-token-usage"
+        title={formatTokenUsage(tokenUsage)}
+      />
       <ContextContent align="end">
         <ContextContentHeader />
       </ContextContent>

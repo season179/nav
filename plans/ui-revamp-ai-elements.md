@@ -43,6 +43,14 @@ Deps and `tsconfig.json` live at the **repo root** (it is a pnpm workspace). The
 8. **Do not delete old CSS, deps, or files until an `rg` search proves nothing imports them.**
 9. **Visual check = `agent-browser`** against the running app (see §3 step 5). Never Playwright.
 10. Commit messages use the prefix `revamp: `.
+11. **Do not reuse legacy feature CSS for revamped surfaces.** The old renderer partials
+    (`sidebar.css`, `layout.css`, `transcript.css`, `composer.css`, `settings.css`,
+    `stacks.css`) must not style AI Elements or shadcn components. Use generated component
+    variants, semantic theme tokens, and Tailwind composition classes instead; only a minimal
+    global reset/theme layer should remain in the renderer stylesheet.
+12. **Use the AI Elements/shadcn default dark theme unless the user explicitly asks for a
+    custom palette.** AI Elements inherits shadcn semantic CSS variables; do not invent custom
+    color tokens or a separate app theme.
 
 ---
 

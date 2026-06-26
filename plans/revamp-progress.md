@@ -120,3 +120,32 @@
 - electron:smoke: passed when run unsandboxed.
 - Screenshot: `plans/revamp-shots/step-3.1.png` captured from Electron CDP target
   `file:///Users/season/Personal/nav/desktop/electron/renderer/dist/index.html#/chat`; local app remained disconnected/no-session, but the toolbar now snapshots as a real `tablist` with no `agent-browser errors` or console output.
+
+## Correction — Remove legacy visual CSS from the revamped shell
+- User rejected the previous direction because shadcn/AI Elements components were being wrapped in the old renderer CSS; this pass treats old feature CSS as off-limits for the revamped UI.
+- Checked DeepWiki plus current shadcn/AI Elements docs again. Both point to the same boundary: component variants and semantic tokens should carry the look, with `className` used mainly for layout/composition.
+- Reduced `desktop/electron/renderer/styles.css` to only `theme.css` and a minimal `base.css`; the old feature partials are no longer imported.
+- Replaced the old app palette with the default shadcn neutral dark token scaffold used by AI Elements; `index.html` keeps `class="dark"` so components inherit the dark tokens.
+- Rebuilt the app frame, sidebar, transcript, composer, settings, and stacks surfaces with AI Elements/shadcn components plus Tailwind token classes instead of legacy selectors.
+- Added static tests guarding against legacy feature CSS imports and old composer/session selector regressions.
+- format/lint/check: passed (`check:electron` 107/107 tests when run unsandboxed).
+- electron:smoke: passed when run unsandboxed.
+- Screenshots: `plans/revamp-shots/no-old-css-chat.png` and `plans/revamp-shots/no-old-css-settings.png` captured from the real Electron CDP target; surfaces render on the new component/token layer.
+
+## Correction — Use AI Elements/shadcn default dark theme
+- User rejected the custom light theme as another invented layer.
+- Verified current AI Elements docs and shadcn theming docs, then cross-checked DeepWiki: AI Elements does not ship separate theme CSS; it inherits shadcn semantic tokens.
+- Replaced the custom `theme.css` token values with the default shadcn neutral scaffold, including `.dark` overrides and chart tokens.
+- Added `.dark { color-scheme: dark; }` in the minimal reset so native controls match the dark token layer.
+- Updated the stylesheet regression test to verify the default neutral dark token values.
+- Verified in the real Electron renderer via CDP: `html` has `class="dark"` and computed tokens include `--background: oklch(14.5% 0 0)`, `--foreground: oklch(98.5% 0 0)`, and `--sidebar-primary: oklch(48.8% .243 264.376)`.
+- Screenshots: `plans/revamp-shots/ai-elements-dark-chat.png` and `plans/revamp-shots/ai-elements-dark-settings.png`.
+
+## Correction — Limit Shiki languages to the renderer allowlist
+- User flagged duplicate `cpp-*` and `emacs-lisp-*` chunks in the renderer build.
+- Checked current Shiki docs: importing the main `shiki` bundle makes every supported language/theme available as async chunks, while `shiki/core` plus explicit language/theme imports controls the emitted bundle.
+- Removed `@streamdown/code`, which brought a second Shiki 3.23 graph, and replaced it with a renderer-local Streamdown code highlighter plugin.
+- The local highlighter allowlists `bash`, `css`, `diff`, `go`, `html`, `javascript`, `json`, `jsx`, `markdown`, `python`, `rust`, `shellscript`, `tsx`, and `typescript`; it intentionally has no `cpp`, `c++`, `emacs-lisp`, or `elisp` aliases/imports.
+- Added a regression test that forbids runtime `shiki` imports, `@streamdown/code`, `bundledLanguages`, and `cpp`/`emacs-lisp` Shiki language imports.
+- format/lint/check: passed (`check:electron` 108/108 tests); `electron:smoke` passed.
+- Verified the built renderer has no `cpp-*` or `emacs-lisp-*` assets/references. Language chunks remain lazy async chunks under the transcript/code path and are not preloaded by `index.html`.
