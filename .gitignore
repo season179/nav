@@ -172,3 +172,5 @@ desktop/electron/out/
 .claude/*
 
 codedb.snapshot
+.commandcode/
+.gnhf/
