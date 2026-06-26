@@ -60,11 +60,21 @@ Real model turns need the provider key in the process environment, for example
 
 Runtime state is ignored under `backend/data/`:
 
-- `flue.db` stores Flue conversation history.
-- `sessions.json` stores nav's session catalog, including per-session model,
-  thinking level, mode, workspace, and worktree metadata.
-- `stacks.json` stores sanitized model-turn stack captures.
+- `flue.db` is the durable source of truth for Flue conversation history:
+  sessions, entries, submissions, and event streams.
+- `sessions.json` is nav's durable source of truth for discoverability and
+  per-session configuration: sidebar summaries, model, thinking level, mode,
+  workspace, and worktree metadata.
+- `stacks.json` is a disposable observability sidecar for sanitized model-turn
+  stack captures. It must not be required to resume or render a chat.
 - `worktrees/` contains per-session git worktrees for worktree mode.
+
+All three stores are keyed by the same `sessionId`, but they are not written in
+one transaction. Code that reads them must tolerate drift: a catalog entry may
+exist before a Flue thread has any events, stack rows may be missing or pruned,
+and stale sidecar rows should be harmless. Reset removes all local backend
+state; delete flows should remove the catalog entry, stack sidecar rows, and any
+generated worktree for that session.
 
 Reset local backend state with:
 

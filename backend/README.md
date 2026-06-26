@@ -33,17 +33,48 @@ wrapper chooses an available local port before starting the generated server.
 - `/nav/*` is the nav control plane for sessions, models, thinking level,
   stop, stacks, and stack availability.
 
-## State Split
+## State Contract
 
-Flue and nav store different state:
+Flue and nav intentionally store different state. The `sessionId` is the shared
+key across every store, but no transaction spans the stores, so callers must
+treat cross-store drift as normal and recoverable.
 
-- `src/db.ts` configures Flue SQLite at `data/flue.db`; this is conversation
-  history owned by Flue.
-- `data/sessions.json` is nav's catalog because Flue does not enumerate agent
-  instances. It stores session summaries, per-session model and thinking level,
-  local/worktree mode, workspace paths, and generated worktree paths.
-- `data/stacks.json` stores sanitized stack rows captured from Flue observation
-  events.
+- `src/db.ts` configures Flue SQLite at `data/flue.db`. This is the durable
+  source of truth for conversation history: Flue sessions, entries,
+  submissions, and event streams. nav should not duplicate transcript state in
+  its own catalog.
+- `data/sessions.json` is nav's durable source of truth for discoverability and
+  per-session configuration because Flue does not enumerate agent instances. It
+  stores sidebar summaries, per-session model and thinking level, local/worktree
+  mode, workspace paths, and generated worktree paths.
+- `data/stacks.json` is a disposable observability sidecar. It stores sanitized
+  stack rows captured from Flue observation events and must not be required to
+  send, resume, or render a chat.
+
+Recovery rules:
+
+- A catalog entry with no Flue event stream is a valid empty session.
+- Missing or pruned stack rows mean stack details are unavailable, not that the
+  session is invalid.
+- Stack rows without a catalog entry are stale sidecar data and should be
+  ignored by normal session flows.
+- If a catalog entry points at a missing worktree, worktree-mode operations may
+  fail for that session, but local-mode sessions and other sessions should keep
+  working.
+- The renderer's TanStack Store state is only a live projection of Flue events.
+  It is not durable state and may be rebuilt from the backend stream.
+
+Lifecycle expectations:
+
+- Creating a session writes the catalog first; Flue creates conversation state
+  when the first prompt is accepted.
+- Resuming a session updates catalog recency and reopens the Flue stream for
+  the same `sessionId`.
+- Deleting a session should remove the catalog entry, remove stack sidecar rows,
+  and remove that session's generated worktree when present. Flue conversation
+  deletion should be added here if nav begins exposing durable transcript delete.
+- Resetting backend data removes the full local runtime state set:
+  `flue.db`, `sessions.json`, `stacks.json`, and generated worktrees.
 
 The catalog path can be overridden with `NAV_SESSION_CATALOG_PATH`. Stack
 storage can be overridden with `NAV_STACKS_PATH`.
