@@ -13,6 +13,19 @@ import {
   MessageContent,
   MessageResponse,
 } from "@/components/ai-elements/message";
+import {
+  PromptInput,
+  PromptInputActionAddAttachments,
+  PromptInputActionAddScreenshot,
+  PromptInputActionMenu,
+  PromptInputActionMenuContent,
+  PromptInputActionMenuTrigger,
+  PromptInputBody,
+  PromptInputFooter,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputTools,
+} from "@/components/ai-elements/prompt-input";
 import { AppSidebar } from "@/components/app-sidebar";
 import {
   Empty,
@@ -26,6 +39,7 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 import "./styles.css";
 
@@ -62,6 +76,8 @@ const getMessageText = (message: UIMessage) =>
     .map((part) => part.text)
     .join("");
 
+const handlePromptSubmit = () => undefined;
+
 function NoSelectedConversationEmpty() {
   return (
     <Empty className="min-h-0 border-0 px-6 py-10">
@@ -95,6 +111,37 @@ function StarterConversation() {
   );
 }
 
+function PromptComposer() {
+  return (
+    <div className="shrink-0 bg-background/95 px-4 py-3 backdrop-blur">
+      <PromptInput
+        aria-label="Chat prompt"
+        className="mx-auto max-w-3xl"
+        onSubmit={handlePromptSubmit}
+      >
+        <PromptInputBody>
+          <PromptInputTextarea placeholder="Message Nav" />
+        </PromptInputBody>
+        <PromptInputFooter>
+          <PromptInputTools>
+            <PromptInputActionMenu>
+              <PromptInputActionMenuTrigger
+                aria-label="Add context"
+                tooltip="Add context"
+              />
+              <PromptInputActionMenuContent>
+                <PromptInputActionAddAttachments />
+                <PromptInputActionAddScreenshot />
+              </PromptInputActionMenuContent>
+            </PromptInputActionMenu>
+          </PromptInputTools>
+          <PromptInputSubmit />
+        </PromptInputFooter>
+      </PromptInput>
+    </div>
+  );
+}
+
 function App() {
   const hasSelectedConversation =
     selectedSessionId !== null ||
@@ -102,18 +149,23 @@ function App() {
     selectedThreadId !== null;
 
   return (
-    <SidebarProvider>
-      <AppSidebar />
-      <div className="fixed inset-x-0 top-0 z-40 h-10 [-webkit-app-region:drag]" />
-      <SidebarTrigger className="fixed top-1 left-[76px] z-50 [-webkit-app-region:no-drag] [&_svg]:!size-[18px]" />
-      <SidebarInset className="min-h-svh overflow-hidden pt-10">
-        {hasSelectedConversation ? (
-          <StarterConversation />
-        ) : (
-          <NoSelectedConversationEmpty />
-        )}
-      </SidebarInset>
-    </SidebarProvider>
+    <TooltipProvider>
+      <SidebarProvider>
+        <AppSidebar />
+        <div className="fixed inset-x-0 top-0 z-40 h-10 [-webkit-app-region:drag]" />
+        <SidebarTrigger className="fixed top-1 left-[76px] z-50 [-webkit-app-region:no-drag] [&_svg]:!size-[18px]" />
+        <SidebarInset className="min-h-svh overflow-hidden pt-10">
+          <div className="flex min-h-0 flex-1 flex-col">
+            {hasSelectedConversation ? (
+              <StarterConversation />
+            ) : (
+              <NoSelectedConversationEmpty />
+            )}
+            <PromptComposer />
+          </div>
+        </SidebarInset>
+      </SidebarProvider>
+    </TooltipProvider>
   );
 }
 
