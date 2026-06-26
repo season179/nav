@@ -9,6 +9,7 @@
     "includes": [
       "desktop/**",
       "packages/desktop/**",
+      "packages/flue/**",
       "scripts/**",
       "tests/**/*.cts",
       "!!.nav",
@@ -20,7 +21,10 @@
       "!packages/desktop/src/components/ai-elements",
       "!packages/desktop/src/components/ui",
       "!packages/desktop/src/lib/utils.ts",
-      "!packages/desktop/src/styles.css"
+      "!packages/desktop/src/styles.css",
+      "!packages/flue/.flue/.generated",
+      "!packages/flue/.flue/generated",
+      "!packages/flue/dist"
     ]
   },
   "formatter": {

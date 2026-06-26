@@ -1,0 +1,20 @@
+{
+  "name": "@nav/flue",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "flue dev --port 3583",
+    "run:hello-world": "flue run agent:hello-world --server /api --input '{\"message\":\"Say hello from the Nav Flue workspace.\"}'",
+    "build": "flue build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@flue/runtime": "1.0.0-beta.7",
+    "hono": "4.12.27"
+  },
+  "devDependencies": {
+    "@flue/cli": "1.0.0-beta.7",
+    "typescript": "6.0.3"
+  }
+}

@@ -169,6 +169,11 @@ rustc-ice-*.txt
 desktop/electron/out/
 packages/desktop/out/
 packages/desktop/dist/
+packages/flue/.flue/.generated/
+packages/flue/.flue/generated/
+packages/flue/dist/
+packages/flue/.env
+packages/flue/.env.*
 
 # Claude
 .claude/*

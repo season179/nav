@@ -1,3 +1,8 @@
 packages:
   - "packages/desktop"
+  - "packages/flue"
   - "packages/tui"
+minimumReleaseAgeExclude:
+  - '@flue/cli@1.0.0-beta.7'
+  - '@flue/runtime@1.0.0-beta.7'
+  - '@flue/sdk@1.0.0-beta.7'
