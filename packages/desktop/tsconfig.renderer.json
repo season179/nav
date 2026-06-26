@@ -6,10 +6,15 @@
     "moduleDetection": "force",
     "moduleResolution": "bundler",
     "noEmit": true,
+    "baseUrl": ".",
+    "ignoreDeprecations": "6.0",
+    "paths": {
+      "@/*": ["./src/*"]
+    },
     "skipLibCheck": true,
     "strict": true,
     "target": "ES2023",
     "useDefineForClassFields": true
   },
-  "include": ["src/main.ts"]
+  "include": ["src/main.ts", "src/vite-env.d.ts"]
 }
