@@ -10,7 +10,9 @@ import {
 } from "@/components/ai-elements/chain-of-thought";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
-  getStatusBadge,
+  Tool,
+  ToolContent,
+  ToolHeader,
   ToolInput,
   ToolOutput,
 } from "@/components/ai-elements/tool";
@@ -70,18 +72,27 @@ function ActivityPartView({ part }: { part: ActivityPart }) {
       return (
         <ChainOfThoughtStep
           icon={WrenchIcon}
-          label={
-            <span className="inline-flex flex-wrap items-center gap-2">
-              <span>{part.toolName}</span>
-              {getStatusBadge(part.state)}
-            </span>
-          }
+          label={<span>{part.toolName}</span>}
           status={toolStepStatus(part.state)}
         >
-          <div className="mt-2 space-y-3">
-            <ToolInput input={part.input} />
-            <ToolOutput errorText={errorText} output={output} />
-          </div>
+          <Tool
+            className="mt-2 mb-0 border-border/70 bg-background/70"
+            defaultOpen={
+              part.state === "input-available" || part.state === "output-error"
+            }
+          >
+            <ToolHeader
+              className="p-2 text-xs"
+              state={part.state}
+              title="Details"
+              toolName={part.toolName}
+              type={part.type}
+            />
+            <ToolContent className="space-y-3 border-t p-3">
+              <ToolInput input={part.input} />
+              <ToolOutput errorText={errorText} output={output} />
+            </ToolContent>
+          </Tool>
         </ChainOfThoughtStep>
       );
     }
