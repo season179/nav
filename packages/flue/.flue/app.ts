@@ -6,6 +6,9 @@ import {
   ensureCodexProvider,
   startCodexProviderRefresh,
 } from "./shared/codex-provider.js";
+import { ensureDeepseekProvider } from "./shared/deepseek-provider.js";
+import { pruneAgentWorktrees } from "./shared/worktrees.js";
+import { ensureZaiProvider } from "./shared/zai-provider.js";
 
 const app = new Hono();
 const streamHeaders = [
@@ -74,6 +77,16 @@ void ensureCodexProvider().catch((error: unknown) => {
   );
 });
 startCodexProviderRefresh();
+ensureDeepseekProvider();
+ensureZaiProvider();
+try {
+  pruneAgentWorktrees();
+} catch (error) {
+  console.warn(
+    "[nav] Failed to prune stale agent worktrees:",
+    error instanceof Error ? error.message : error,
+  );
+}
 
 app.get("/health", (c) =>
   c.json({
@@ -110,7 +123,7 @@ app.use(
   }),
 );
 app.use("/api/*", requireDesktopAuth);
-app.use("/api/agents/*", requireCodexProvider);
+app.use("/api/agents/nav/*", requireCodexProvider);
 app.route("/api", flue());
 
 export default app;

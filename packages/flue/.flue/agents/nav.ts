@@ -5,6 +5,7 @@ import {
 } from "@flue/runtime";
 import { local } from "@flue/runtime/node";
 import { getWorkspaceRoot } from "../shared/codex.js";
+import { consult, consultPanel } from "../shared/delegation.js";
 
 const validThinkingLevels = [
   "minimal",
@@ -42,9 +43,13 @@ export default defineAgent(() => {
       "Use your file and command tools to read the codebase, investigate, debug, review, and explain.",
       "Be concise. Reference code as path:line so the user can click it.",
       "Do not create, modify, or delete files, and do not run mutating commands unless the user explicitly asks you to make changes.",
+      "You are the lead, coordinating a team of engineers who each work in their own separate checkout of this repo. Use consult to delegate one task to one engineer, or consult_panel to give the same task to several at once and compare.",
+      "Route by difficulty, not domain: hard, ambiguous, or high-judgment work goes to glm; well-scoped mechanical work goes to deepseek-pro; small trivial fully-specified tasks go to deepseek-flash.",
+      "Each result includes a worktree path. Read its real changes with git -C <worktree> diff, take the best parts of each, and write the final result in your own checkout. Never delegate image-based tasks because all delegates are text-only.",
     ].join(" "),
     model: "openai-codex/gpt-5.5",
     sandbox: local({ cwd: repoRoot }),
+    tools: [consult, consultPanel],
     thinkingLevel: resolveThinkingLevel(),
   };
 });

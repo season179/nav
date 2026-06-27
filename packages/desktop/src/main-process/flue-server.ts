@@ -100,6 +100,7 @@ export class FlueServer {
             ? new URL(this.#devServerUrl).origin
             : "null",
           NAV_DESKTOP_TOKEN: this.#token,
+          NAV_FLUE_PORT: String(port),
         },
         shell: process.platform === "win32",
         stdio: ["ignore", "pipe", "pipe"],
