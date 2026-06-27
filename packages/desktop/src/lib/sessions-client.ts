@@ -16,6 +16,13 @@ type SessionsResponse = {
   sessions: NavSession[];
 };
 
+type GenerateTitleResponse = {
+  generated: boolean;
+  ok: true;
+  title: string | null;
+  titleSource: string;
+};
+
 type RequestOptions = {
   body?: unknown;
   method?: "GET" | "POST" | "PATCH" | "DELETE";
@@ -97,6 +104,14 @@ export function createSessionsClient(connection: FlueConnection) {
       const response = await request<SessionsResponse>("/api/sessions");
 
       return response.sessions;
+    },
+    async generateSessionTitle(id: string) {
+      return request<GenerateTitleResponse>(
+        `/api/sessions/${id}/title/generate`,
+        {
+          method: "POST",
+        },
+      );
     },
     async renameSession(id: string, title: string) {
       await request<{ ok: true }>(`/api/sessions/${id}`, {

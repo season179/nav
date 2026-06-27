@@ -237,3 +237,31 @@ test("consult tools pass git context headers and repo-scoped worktree paths", as
     }
   }
 });
+
+test("session title helpers enforce eligibility and short titles", async () => {
+  const {
+    buildTitlePrompt,
+    hasTitleTranscriptExchange,
+    isTitleSourceEligible,
+    normalizeGeneratedTitle,
+    TITLE_MODEL,
+  } = await importBuilt(".flue/shared/session-title.js");
+  const transcript = [
+    { role: "user", text: "Can you debug the failing fleet worktree test?" },
+    { role: "assistant", text: "I found the repo root mismatch." },
+  ];
+
+  assert.equal(TITLE_MODEL, "deepseek/deepseek-v4-flash");
+  assert.equal(isTitleSourceEligible("first-message"), true);
+  assert.equal(isTitleSourceEligible("imported"), true);
+  assert.equal(isTitleSourceEligible("manual"), false);
+  assert.equal(isTitleSourceEligible("llm"), false);
+  assert.equal(hasTitleTranscriptExchange(transcript), true);
+  assert.equal(
+    normalizeGeneratedTitle(
+      '"Debugging the Project Fleet Worktree Routing Failure"',
+    ),
+    "Debugging the Project Fleet Worktree Routing",
+  );
+  assert.match(buildTitlePrompt(transcript), /at most 6 words/);
+});

@@ -380,6 +380,7 @@ function PromptComposer({
 function NavChat({
   conversationId,
   isDraft,
+  onGenerateSessionTitle,
   onEnsureSessionBound,
   onSessionAdmitted,
   project,
@@ -387,6 +388,7 @@ function NavChat({
 }: {
   conversationId: string;
   isDraft: boolean;
+  onGenerateSessionTitle: (id: string) => Promise<void>;
   onEnsureSessionBound: (id: string) => Promise<void>;
   onSessionAdmitted: (id: string, title: string) => Promise<void>;
   project: NavProject | null;
@@ -398,6 +400,9 @@ function NavChat({
     id: conversationId,
     name: "nav",
   });
+  const [titleRequestedFor, setTitleRequestedFor] = useState<string | null>(
+    null,
+  );
 
   const serverReady = serverStatus?.state === "ready";
   // Only block the composer while the server is down or a send is in flight.
@@ -421,6 +426,30 @@ function NavChat({
     status === "submitted" ||
     (status === "streaming" &&
       !hasVisibleAssistantOutputAfterLastUser(messages));
+
+  useEffect(() => {
+    if (
+      isDraft ||
+      titleRequestedFor === conversationId ||
+      !hasVisibleAssistantOutputAfterLastUser(messages)
+    ) {
+      return;
+    }
+
+    setTitleRequestedFor(conversationId);
+    void onGenerateSessionTitle(conversationId).catch((caught: unknown) => {
+      console.warn(
+        "[nav] Failed to generate session title:",
+        caught instanceof Error ? caught.message : caught,
+      );
+    });
+  }, [
+    conversationId,
+    isDraft,
+    messages,
+    onGenerateSessionTitle,
+    titleRequestedFor,
+  ]);
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
@@ -473,6 +502,7 @@ function ConnectedApp({
   activeSessionId,
   connection,
   isDraftActive,
+  onGenerateSessionTitle,
   onEnsureSessionBound,
   onSessionAdmitted,
   project,
@@ -481,6 +511,7 @@ function ConnectedApp({
   activeSessionId: string | null;
   connection: FlueConnection;
   isDraftActive: boolean;
+  onGenerateSessionTitle: (id: string) => Promise<void>;
   onEnsureSessionBound: (id: string) => Promise<void>;
   onSessionAdmitted: (id: string, title: string) => Promise<void>;
   project: NavProject | null;
@@ -510,6 +541,7 @@ function ConnectedApp({
         conversationId={activeSessionId}
         key={activeSessionId}
         isDraft={isDraftActive}
+        onGenerateSessionTitle={onGenerateSessionTitle}
         onEnsureSessionBound={onEnsureSessionBound}
         onSessionAdmitted={onSessionAdmitted}
         project={project}
@@ -839,6 +871,21 @@ function AppShell() {
     [activeProjectId, refreshProjects, refreshSessions, sessionsClient],
   );
 
+  const handleGenerateSessionTitle = useCallback(
+    async (id: string) => {
+      if (!sessionsClient) {
+        return;
+      }
+
+      const result = await sessionsClient.generateSessionTitle(id);
+
+      if (result.generated) {
+        await refreshSessions();
+      }
+    },
+    [refreshSessions, sessionsClient],
+  );
+
   const handleRenameSession = useCallback(
     async (id: string, title: string) => {
       if (!sessionsClient) {
@@ -976,6 +1023,7 @@ function AppShell() {
         activeSessionId={activeSessionId}
         connection={connection}
         isDraftActive={isDraftActive}
+        onGenerateSessionTitle={handleGenerateSessionTitle}
         onEnsureSessionBound={handleEnsureSessionBound}
         onSessionAdmitted={handleSessionAdmitted}
         project={activeProject}

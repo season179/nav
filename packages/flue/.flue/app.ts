@@ -18,6 +18,7 @@ import {
   ensureNavSessionsReady,
   handleCreateNavSession,
   handleDeleteNavSession,
+  handleGenerateNavSessionTitle,
   handleListNavSessions,
   handleUpdateNavSession,
 } from "./shared/nav-sessions.js";
@@ -151,6 +152,7 @@ app.patch("/api/projects/:id", handleUpdateNavProject);
 app.delete("/api/projects/:id", handleDeleteNavProject);
 app.get("/api/sessions", handleListNavSessions);
 app.post("/api/sessions", handleCreateNavSession);
+app.post("/api/sessions/:id/title/generate", handleGenerateNavSessionTitle);
 app.patch("/api/sessions/:id", handleUpdateNavSession);
 app.delete("/api/sessions/:id", handleDeleteNavSession);
 app.use("/api/agents/nav/*", requireCodexProvider);

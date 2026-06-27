@@ -15,11 +15,19 @@ import {
   resolveWritableProjectId,
   touchNavProject,
 } from "./nav-projects.js";
+import {
+  hasTitleTranscriptExchange,
+  isTitleSourceEligible,
+  normalizeGeneratedTitle,
+  type TitleTranscriptMessage,
+} from "./session-title.js";
 
 const AGENT_NAME = "nav";
 const SESSION_KEY_PREFIX = "agent-session:";
 const MAX_TITLE_LENGTH = 80;
 const MAX_PREVIEW_LENGTH = 140;
+const MAX_TITLE_TRANSCRIPT_CHARS = 4000;
+const MAX_TITLE_TRANSCRIPT_MESSAGES = 12;
 
 type NavSessionRow = {
   id: string;
@@ -47,6 +55,12 @@ type FlueEntryRow = {
 type FlueSubmissionRow = {
   session_key: string;
   payload: string;
+};
+
+type TitleWorkflowResponse = {
+  result?: {
+    title?: unknown;
+  };
 };
 
 export type NavSessionSummary = {
@@ -211,6 +225,26 @@ const getSessionData = (storageKey: string) => {
   return row ? parseJson(row.data) : null;
 };
 
+const selectNavSessionById = (id: string) =>
+  getNavDb()
+    .prepare(
+      `SELECT
+        id,
+        agent_name,
+        title,
+        title_source,
+        pinned,
+        archived,
+        project_id,
+        created_at,
+        last_opened_at,
+        imported_at
+       FROM nav_sessions
+       WHERE id = ? AND agent_name = ?
+       LIMIT 1`,
+    )
+    .get(id, AGENT_NAME) as NavSessionRow | undefined;
+
 const summarizeEntries = (entries: FlueEntryRow[]) => {
   let firstUserText: string | null = null;
   let lastPreview: string | null = null;
@@ -246,6 +280,48 @@ const summarizeEntries = (entries: FlueEntryRow[]) => {
     lastPreview: normalizePreview(lastPreview),
     updatedAt,
   };
+};
+
+const buildTitleTranscript = (
+  entries: FlueEntryRow[],
+): TitleTranscriptMessage[] => {
+  const transcript: TitleTranscriptMessage[] = [];
+  let characterCount = 0;
+
+  for (const row of entries) {
+    const entry = parseJson(row.data);
+    const message = entry ? extractEntryMessage(entry) : null;
+
+    if (!message) {
+      continue;
+    }
+
+    const text = message.text.replace(/\s+/g, " ").trim();
+
+    if (!text) {
+      continue;
+    }
+
+    const remaining = MAX_TITLE_TRANSCRIPT_CHARS - characterCount;
+
+    if (remaining <= 0 || transcript.length >= MAX_TITLE_TRANSCRIPT_MESSAGES) {
+      break;
+    }
+
+    const clipped = text.slice(0, remaining).trim();
+
+    if (!clipped) {
+      continue;
+    }
+
+    transcript.push({
+      role: message.role === "user" ? "user" : "assistant",
+      text: clipped,
+    });
+    characterCount += clipped.length;
+  }
+
+  return transcript;
 };
 
 const backfillNavSessions = () => {
@@ -465,6 +541,110 @@ const updateNavSession = async (
     .run(...values, id);
 };
 
+const requestGeneratedTitle = async (
+  transcript: TitleTranscriptMessage[],
+  signal?: AbortSignal,
+) => {
+  const port = process.env.NAV_FLUE_PORT;
+  const token = process.env.NAV_DESKTOP_TOKEN;
+
+  if (!port || !token) {
+    throw new Error("NAV_FLUE_PORT / NAV_DESKTOP_TOKEN not set");
+  }
+
+  const res = await fetch(
+    `http://127.0.0.1:${port}/api/workflows/session-title?wait=result`,
+    {
+      body: JSON.stringify({ transcript }),
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      method: "POST",
+      signal,
+    },
+  );
+
+  if (!res.ok) {
+    throw new Error(
+      `title generation failed: ${res.status} ${await res.text()}`,
+    );
+  }
+
+  const json = (await res.json()) as TitleWorkflowResponse;
+  const title = normalizeGeneratedTitle(json.result?.title);
+
+  if (!title) {
+    throw new Error("Generated title was empty.");
+  }
+
+  return title;
+};
+
+const generateNavSessionTitle = async (id: string, signal?: AbortSignal) => {
+  await ensureNavSessionsReady();
+
+  const row = selectNavSessionById(id);
+
+  if (!row) {
+    return {
+      body: {
+        error: "session_not_found",
+        message: "Session was not found.",
+      },
+      status: 404,
+    } as const;
+  }
+
+  if (!isTitleSourceEligible(row.title_source)) {
+    return {
+      body: {
+        generated: false,
+        ok: true,
+        title: row.title,
+        titleSource: row.title_source,
+      },
+      status: 200,
+    } as const;
+  }
+
+  const transcript = buildTitleTranscript(getEntryRows(createStorageKey(id)));
+
+  if (!hasTitleTranscriptExchange(transcript)) {
+    return {
+      body: {
+        generated: false,
+        ok: true,
+        title: row.title,
+        titleSource: row.title_source,
+      },
+      status: 200,
+    } as const;
+  }
+
+  const title = await requestGeneratedTitle(transcript, signal);
+  const result = getNavDb()
+    .prepare(
+      `UPDATE nav_sessions
+       SET title = ?, title_source = 'llm'
+       WHERE id = ?
+        AND agent_name = ?
+        AND title_source IN ('first-message', 'imported')`,
+    )
+    .run(title, id, AGENT_NAME);
+  const updated = selectNavSessionById(id);
+
+  return {
+    body: {
+      generated: result.changes > 0,
+      ok: true,
+      title: updated?.title ?? row.title,
+      titleSource: updated?.title_source ?? row.title_source,
+    },
+    status: 200,
+  } as const;
+};
+
 const deleteNavSession = async (id: string) => {
   await ensureNavSessionsReady();
 
@@ -565,6 +745,31 @@ export const handleUpdateNavSession = async (c: Context) => {
   await updateNavSession(id, input);
 
   return c.json({ ok: true });
+};
+
+export const handleGenerateNavSessionTitle = async (c: Context) => {
+  const id = c.req.param("id") ?? "";
+
+  if (!isValidSessionId(id)) {
+    return c.json({ error: "invalid_session_id" }, 400);
+  }
+
+  try {
+    const result = await generateNavSessionTitle(id, c.req.raw.signal);
+
+    return c.json(result.body, result.status);
+  } catch (error) {
+    return c.json(
+      {
+        error: "session_title_generation_failed",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Unable to generate a title for this session.",
+      },
+      503,
+    );
+  }
 };
 
 export const handleDeleteNavSession = async (c: Context) => {
