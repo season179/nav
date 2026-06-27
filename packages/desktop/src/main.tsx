@@ -39,6 +39,7 @@ import {
 } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { FlueConnection, FlueServerStatus } from "@/lib/flue-connection";
+import { createProjectsClient, type NavProject } from "@/lib/projects-client";
 import { createSessionsClient, type NavSession } from "@/lib/sessions-client";
 
 import "./styles.css";
@@ -66,14 +67,54 @@ const createUuidV7 = () => {
   return formatUuidBytes(bytes);
 };
 
-const ACTIVE_SESSION_STORAGE_KEY = "nav.activeSessionId";
+const ACTIVE_PROJECT_STORAGE_KEY = "nav.activeProjectId";
+const ACTIVE_SESSION_BY_PROJECT_STORAGE_KEY = "nav.activeSessionIdByProject";
+const LEGACY_ACTIVE_SESSION_STORAGE_KEY = "nav.activeSessionId";
 
-const rememberActiveSession = (id: string) => {
-  window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, id);
+type ActiveSessionByProject = Record<string, string>;
+
+const rememberActiveProject = (id: string) => {
+  window.localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, id);
 };
 
-const getRememberedActiveSession = () =>
-  window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+const getRememberedActiveProject = () =>
+  window.localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY);
+
+const getLegacyRememberedActiveSession = () =>
+  window.localStorage.getItem(LEGACY_ACTIVE_SESSION_STORAGE_KEY);
+
+const rememberActiveSessionByProject = (value: ActiveSessionByProject) => {
+  window.localStorage.setItem(
+    ACTIVE_SESSION_BY_PROJECT_STORAGE_KEY,
+    JSON.stringify(value),
+  );
+};
+
+const getRememberedActiveSessionByProject = (): ActiveSessionByProject => {
+  try {
+    const parsed: unknown = JSON.parse(
+      window.localStorage.getItem(ACTIVE_SESSION_BY_PROJECT_STORAGE_KEY) ??
+        "{}",
+    );
+
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] =>
+          typeof entry[0] === "string" && typeof entry[1] === "string",
+      ),
+    );
+  } catch {
+    return {};
+  }
+};
 
 function EmptyConversation() {
   return (
@@ -227,11 +268,17 @@ function PromptComposer({
 
 function NavChat({
   conversationId,
+  isDraft,
+  onEnsureSessionBound,
   onSessionAdmitted,
+  project,
   serverStatus,
 }: {
   conversationId: string;
+  isDraft: boolean;
+  onEnsureSessionBound: (id: string) => Promise<void>;
   onSessionAdmitted: (id: string, title: string) => Promise<void>;
+  project: NavProject | null;
   serverStatus: FlueServerStatus | null;
 }) {
   const [sessionError, setSessionError] = useState<string | null>(null);
@@ -247,7 +294,8 @@ function NavChat({
   // gating on it would leave the composer permanently disabled with no way to
   // type, retry, or surface the error.
   const sending = status === "submitted" || status === "streaming";
-  const disabled = !serverReady || sending;
+  const projectUnavailable = project !== null && !project.available;
+  const disabled = !serverReady || sending || projectUnavailable;
 
   const composerStatus =
     status === "error"
@@ -269,11 +317,29 @@ function NavChat({
           {error?.message ?? sessionError}
         </div>
       )}
+      {projectUnavailable && (
+        <div className="mx-auto mt-4 w-full max-w-3xl rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive text-sm">
+          Project folder is unavailable: {project.path}
+        </div>
+      )}
       <LiveConversation isThinking={isThinking} messages={messages} />
       <PromptComposer
         disabled={disabled}
         onSubmit={async (text) => {
           setSessionError(null);
+          if (isDraft) {
+            try {
+              await onEnsureSessionBound(conversationId);
+            } catch (caught) {
+              setSessionError(
+                caught instanceof Error
+                  ? caught.message
+                  : "Chat could not be attached to this project.",
+              );
+              return;
+            }
+          }
+
           await sendMessage(text);
           try {
             await onSessionAdmitted(conversationId, text);
@@ -294,12 +360,18 @@ function NavChat({
 function ConnectedApp({
   activeSessionId,
   connection,
+  isDraftActive,
+  onEnsureSessionBound,
   onSessionAdmitted,
+  project,
   serverStatus,
 }: {
   activeSessionId: string | null;
   connection: FlueConnection;
+  isDraftActive: boolean;
+  onEnsureSessionBound: (id: string) => Promise<void>;
   onSessionAdmitted: (id: string, title: string) => Promise<void>;
+  project: NavProject | null;
   serverStatus: FlueServerStatus | null;
 }) {
   const client = useMemo(
@@ -325,7 +397,10 @@ function ConnectedApp({
       <NavChat
         conversationId={activeSessionId}
         key={activeSessionId}
+        isDraft={isDraftActive}
+        onEnsureSessionBound={onEnsureSessionBound}
         onSessionAdmitted={onSessionAdmitted}
+        project={project}
         serverStatus={serverStatus}
       />
     </FlueProvider>
@@ -333,12 +408,22 @@ function ConnectedApp({
 }
 
 function AppShell() {
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(() =>
-    getRememberedActiveSession(),
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(() =>
+    getRememberedActiveProject(),
   );
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [activeSessionIdByProject, setActiveSessionIdByProject] =
+    useState<ActiveSessionByProject>(() =>
+      getRememberedActiveSessionByProject(),
+    );
   const [connection, setConnection] = useState<FlueConnection | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
-  const [draftSessionId, setDraftSessionId] = useState<string | null>(null);
+  const [draftSessionIdByProject, setDraftSessionIdByProject] =
+    useState<ActiveSessionByProject>({});
+  const [projects, setProjects] = useState<NavProject[]>([]);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
+  const [projectsLoading, setProjectsLoading] = useState(false);
   const [sessions, setSessions] = useState<NavSession[]>([]);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
@@ -350,12 +435,102 @@ function AppShell() {
     () => (connection ? createSessionsClient(connection) : null),
     [connection],
   );
+  const projectsClient = useMemo(
+    () => (connection ? createProjectsClient(connection) : null),
+    [connection],
+  );
 
-  const activateSession = useCallback((id: string, draft: boolean) => {
-    setActiveSessionId(id);
-    setDraftSessionId(draft ? id : null);
-    rememberActiveSession(id);
-  }, []);
+  const activeProject = useMemo(
+    () => projects.find((project) => project.id === activeProjectId) ?? null,
+    [activeProjectId, projects],
+  );
+  const isDraftActive =
+    activeProjectId !== null &&
+    draftSessionIdByProject[activeProjectId] === activeSessionId;
+
+  const activateSession = useCallback(
+    (projectId: string, sessionId: string, draft: boolean) => {
+      setActiveProjectId(projectId);
+      setActiveSessionId(sessionId);
+      rememberActiveProject(projectId);
+      setActiveSessionIdByProject((current) => {
+        const next = { ...current, [projectId]: sessionId };
+        rememberActiveSessionByProject(next);
+        return next;
+      });
+      setDraftSessionIdByProject((current) => {
+        const next = { ...current };
+
+        if (draft) {
+          next[projectId] = sessionId;
+        } else {
+          delete next[projectId];
+        }
+
+        return next;
+      });
+    },
+    [],
+  );
+
+  const activateProjectWithSession = useCallback(
+    (projectId: string) => {
+      const projectSessions = sessions.filter(
+        (session) => session.projectId === projectId,
+      );
+      const rememberedSession = projectSessions.find(
+        (session) => session.id === activeSessionIdByProject[projectId],
+      );
+      const draftSessionId = draftSessionIdByProject[projectId];
+      const nextSessionId =
+        rememberedSession?.id ??
+        draftSessionId ??
+        projectSessions[0]?.id ??
+        createUuidV7();
+
+      activateSession(
+        projectId,
+        nextSessionId,
+        !rememberedSession &&
+          (nextSessionId === draftSessionId || projectSessions.length === 0),
+      );
+    },
+    [
+      activateSession,
+      activeSessionIdByProject,
+      draftSessionIdByProject,
+      sessions,
+    ],
+  );
+
+  const refreshProjects = useCallback(async () => {
+    if (!projectsClient) {
+      setProjects([]);
+      setProjectsLoaded(false);
+
+      return [];
+    }
+
+    setProjectsError(null);
+    setProjectsLoaded(false);
+    setProjectsLoading(true);
+
+    try {
+      const nextProjects = await projectsClient.listProjects();
+      setProjects(nextProjects);
+
+      return nextProjects;
+    } catch (caught) {
+      setProjectsError(
+        caught instanceof Error ? caught.message : "Unable to load projects.",
+      );
+
+      return [];
+    } finally {
+      setProjectsLoaded(true);
+      setProjectsLoading(false);
+    }
+  }, [projectsClient]);
 
   const refreshSessions = useCallback(async () => {
     if (!sessionsClient) {
@@ -386,6 +561,10 @@ function AppShell() {
     }
   }, [sessionsClient]);
 
+  const refreshWorkspace = useCallback(async () => {
+    await Promise.all([refreshProjects(), refreshSessions()]);
+  }, [refreshProjects, refreshSessions]);
+
   useEffect(() => {
     const unsubscribe = window.navDesktop.onFlueStatus(setServerStatus);
 
@@ -405,78 +584,147 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
-    void refreshSessions();
-  }, [refreshSessions]);
+    void refreshWorkspace();
+  }, [refreshWorkspace]);
 
   useEffect(() => {
-    if (!sessionsClient) {
+    if (!sessionsClient && !projectsClient) {
       return;
     }
 
     const handleFocus = () => {
-      void refreshSessions();
+      void refreshWorkspace();
     };
 
     window.addEventListener("focus", handleFocus);
 
     return () => window.removeEventListener("focus", handleFocus);
-  }, [refreshSessions, sessionsClient]);
+  }, [projectsClient, refreshWorkspace, sessionsClient]);
 
   useEffect(() => {
-    if (!sessionsLoaded || !connection || sessionsError) {
+    if (
+      !projectsLoaded ||
+      !sessionsLoaded ||
+      !connection ||
+      projectsError ||
+      sessionsError
+    ) {
+      return;
+    }
+
+    if (projects.length === 0) {
+      return;
+    }
+
+    const activeProjectExists =
+      activeProjectId !== null &&
+      projects.some((project) => project.id === activeProjectId);
+
+    if (!activeProjectExists) {
+      const rememberedProject = projects.find(
+        (project) => project.id === getRememberedActiveProject(),
+      );
+      const legacySession = sessions.find(
+        (session) => session.id === getLegacyRememberedActiveSession(),
+      );
+      const legacyProjectId = legacySession?.projectId || undefined;
+      const defaultProject = projects.find((project) => project.isDefault);
+      const nextProjectId =
+        rememberedProject?.id ??
+        legacyProjectId ??
+        defaultProject?.id ??
+        projects[0]?.id;
+
+      if (nextProjectId) {
+        activateProjectWithSession(nextProjectId);
+      }
       return;
     }
 
     if (!activeSessionId) {
-      const rememberedId = getRememberedActiveSession();
-      const rememberedSession = sessions.find(
-        (session) => session.id === rememberedId,
-      );
-      const nextId = rememberedSession?.id ?? sessions[0]?.id ?? createUuidV7();
-
-      activateSession(nextId, !rememberedSession && sessions.length === 0);
+      activateProjectWithSession(activeProjectId);
       return;
     }
 
-    if (draftSessionId === activeSessionId) {
+    if (draftSessionIdByProject[activeProjectId] === activeSessionId) {
       return;
     }
 
-    if (sessions.some((session) => session.id === activeSessionId)) {
+    const activeSession = sessions.find(
+      (session) => session.id === activeSessionId,
+    );
+
+    if (activeSession?.projectId === activeProjectId) {
       return;
     }
 
-    const fallbackId = sessions[0]?.id ?? createUuidV7();
-    activateSession(fallbackId, sessions.length === 0);
+    activateProjectWithSession(activeProjectId);
   }, [
-    activateSession,
+    activateProjectWithSession,
+    activeProjectId,
     activeSessionId,
     connection,
-    draftSessionId,
+    draftSessionIdByProject,
+    projects,
+    projectsError,
+    projectsLoaded,
     sessions,
     sessionsError,
     sessionsLoaded,
   ]);
 
-  const handleNewChat = useCallback(() => {
-    activateSession(createUuidV7(), true);
-  }, [activateSession]);
-
-  const handleSessionAdmitted = useCallback(
-    async (id: string, title: string) => {
-      if (!sessionsClient) {
+  const handleNewChat = useCallback(
+    (projectId = activeProjectId) => {
+      if (!projectId) {
         return;
       }
 
-      await sessionsClient.createSession(id, title);
+      const project = projects.find((candidate) => candidate.id === projectId);
+
+      if (!project?.available) {
+        return;
+      }
+
+      activateSession(projectId, createUuidV7(), true);
+    },
+    [activateSession, activeProjectId, projects],
+  );
+
+  const handleEnsureSessionBound = useCallback(
+    async (id: string) => {
+      if (!sessionsClient || !activeProjectId) {
+        throw new Error("Project is not ready.");
+      }
+
+      await sessionsClient.createSession(id, null, activeProjectId);
+    },
+    [activeProjectId, sessionsClient],
+  );
+
+  const handleSessionAdmitted = useCallback(
+    async (id: string, title: string) => {
+      if (!sessionsClient || !activeProjectId) {
+        return;
+      }
+
+      await sessionsClient.createSession(id, title, activeProjectId);
 
       const nextSessions = await refreshSessions();
+      void refreshProjects();
 
       if (nextSessions.some((session) => session.id === id)) {
-        setDraftSessionId((current) => (current === id ? null : current));
+        setDraftSessionIdByProject((current) => {
+          if (current[activeProjectId] !== id) {
+            return current;
+          }
+
+          const next = { ...current };
+          delete next[activeProjectId];
+          return next;
+        });
       }
     },
-    [refreshSessions, sessionsClient],
+    [activeProjectId, refreshProjects, refreshSessions, sessionsClient],
   );
 
   const handleRenameSession = useCallback(
@@ -497,15 +745,28 @@ function AppShell() {
         return;
       }
 
+      const deletedSession = sessions.find((session) => session.id === id);
+      const projectId = deletedSession?.projectId ?? activeProjectId;
+
       await sessionsClient.deleteSession(id);
 
-      if (activeSessionId === id) {
-        const fallback = sessions.find((session) => session.id !== id);
+      setDraftSessionIdByProject((current) => {
+        const next = Object.fromEntries(
+          Object.entries(current).filter((entry) => entry[1] !== id),
+        );
 
-        if (fallback) {
-          activateSession(fallback.id, false);
+        return next;
+      });
+
+      if (activeSessionId === id) {
+        if (!projectId) {
+          setActiveSessionId(null);
         } else {
-          activateSession(createUuidV7(), true);
+          const fallback = sessions.find(
+            (session) => session.id !== id && session.projectId === projectId,
+          );
+
+          activateSession(projectId, fallback?.id ?? createUuidV7(), !fallback);
         }
       }
 
@@ -513,12 +774,74 @@ function AppShell() {
     },
     [
       activateSession,
+      activeProjectId,
       activeSessionId,
       refreshSessions,
       sessions,
       sessionsClient,
     ],
   );
+
+  const handleAddProject = useCallback(async () => {
+    if (!projectsClient) {
+      return;
+    }
+
+    setProjectsError(null);
+
+    const path = await window.navDesktop.pickProjectDirectory();
+
+    if (!path) {
+      return;
+    }
+
+    const project = await projectsClient.createProject(path);
+    await refreshWorkspace();
+    activateSession(project.id, createUuidV7(), true);
+  }, [activateSession, projectsClient, refreshWorkspace]);
+
+  const handleRenameProject = useCallback(
+    async (id: string, name: string) => {
+      if (!projectsClient) {
+        return;
+      }
+
+      await projectsClient.renameProject(id, name);
+      await refreshProjects();
+    },
+    [projectsClient, refreshProjects],
+  );
+
+  const handleRemoveProject = useCallback(
+    async (id: string) => {
+      if (!projectsClient) {
+        return;
+      }
+
+      await projectsClient.removeProject(id);
+      setActiveSessionIdByProject((current) => {
+        const next = { ...current };
+        delete next[id];
+        rememberActiveSessionByProject(next);
+        return next;
+      });
+      setDraftSessionIdByProject((current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+
+      if (activeProjectId === id) {
+        setActiveProjectId(null);
+        setActiveSessionId(null);
+      }
+
+      await refreshWorkspace();
+    },
+    [activeProjectId, projectsClient, refreshWorkspace],
+  );
+
+  const sidebarError = projectsError ?? sessionsError;
 
   const chatContent = (() => {
     if (connectionError) {
@@ -540,7 +863,10 @@ function AppShell() {
       <ConnectedApp
         activeSessionId={activeSessionId}
         connection={connection}
+        isDraftActive={isDraftActive}
+        onEnsureSessionBound={handleEnsureSessionBound}
         onSessionAdmitted={handleSessionAdmitted}
+        project={activeProject}
         serverStatus={serverStatus}
       />
     );
@@ -549,14 +875,21 @@ function AppShell() {
   return (
     <>
       <AppSidebar
+        activeProjectId={activeProjectId}
         activeSessionId={activeSessionId}
-        error={sessionsError}
-        isDraftActive={draftSessionId === activeSessionId}
-        loading={sessionsLoading}
+        error={sidebarError}
+        loading={projectsLoading || sessionsLoading}
+        onAddProject={handleAddProject}
         onDeleteSession={handleDeleteSession}
         onNewChat={handleNewChat}
+        onRemoveProject={handleRemoveProject}
+        onRenameProject={handleRenameProject}
         onRenameSession={handleRenameSession}
-        onSelectSession={(id) => activateSession(id, false)}
+        onSelectProject={activateProjectWithSession}
+        onSelectSession={(session) =>
+          activateSession(session.projectId, session.id, false)
+        }
+        projects={projects}
         sessions={sessions}
       />
       <div className="fixed inset-x-0 top-0 z-40 h-10 [-webkit-app-region:drag]" />

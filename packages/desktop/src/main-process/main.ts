@@ -1,6 +1,13 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, ipcMain, type WebFrameMain } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  type OpenDialogOptions,
+  type WebFrameMain,
+} from "electron";
 
 import { FlueServer } from "./flue-server.js";
 
@@ -69,6 +76,20 @@ void app.whenReady().then(() => {
     }
 
     return await flueServer.getConnection();
+  });
+
+  ipcMain.handle("dialog:pickProjectDirectory", async (event) => {
+    if (!event.senderFrame || !isTrustedSender(event.senderFrame)) {
+      throw new Error("Untrusted renderer requested a project directory.");
+    }
+
+    const owner = BrowserWindow.fromWebContents(event.sender);
+    const options: OpenDialogOptions = { properties: ["openDirectory"] };
+    const result = owner
+      ? await dialog.showOpenDialog(owner, options)
+      : await dialog.showOpenDialog(options);
+
+    return result.canceled ? null : (result.filePaths[0] ?? null);
   });
 
   void flueServer.start().catch(() => undefined);

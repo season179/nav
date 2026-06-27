@@ -17,3 +17,7 @@ Nav's backend is a **Flue** app (`@flue/runtime@1.0.0-beta.7`, models via `@eare
 **Thinking levels.** `thinkingLevel` (`minimal|low|medium|high|xhigh`, harness default `medium`) is mapped per-model by its `thinkingLevelMap`. It is **not** linear — for `zai/glm-5.2` it's binary: `low/medium/high`→GLM `"high"`, only `xhigh`→GLM `"max"`; for DeepSeek v4, `minimal/low/medium` disable reasoning, `high`→`"high"`, and `xhigh`→`"max"`. Check the map before assuming a level does anything.
 
 **Delegation/fleet.** Nav uses top-level delegate agents, not Flue subagents. `agents/glm.ts`, `agents/deepseek-pro.ts`, and `agents/deepseek-flash.ts` export `route` and run through loopback HTTP from Nav's `consult` / `consult_panel` tools (`shared/delegation.ts`). Each delegate gets a per-delegation git worktree outside the checkout (`shared/worktrees.ts`), while Nav keeps the final edit in the real checkout. Delegate profiles live in `shared/*.ts`; do not give delegates the consult tools or copy `process.env` into their `local({ cwd })` sandbox.
+
+## Codex CLI (consult/review)
+
+`codex exec resume <SESSION_ID> "<prompt>"` has a **different flag grammar** than `codex exec`. It rejects `-C/--cwd` and `-s/--sandbox` (resume inherits cwd + sandbox from the original session); valid flags are `-c`, `--enable`, `--last`, `--all`, `--json`. When a resume fails with `unexpected argument '-C'` / `For more information, try '--help'`, strip **all** `codex exec`-only flags at once — don't peel them off one at a time.

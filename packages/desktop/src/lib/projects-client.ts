@@ -1,19 +1,23 @@
 import type { FlueConnection } from "@/lib/flue-connection";
 
-export type NavSession = {
+export type NavProject = {
   id: string;
-  title: string | null;
-  titleSource: string;
-  pinned: boolean;
+  name: string;
+  path: string;
+  displayPath: string | null;
+  isDefault: boolean;
   archived: boolean;
-  projectId: string;
+  available: boolean;
   createdAt: number;
-  updatedAt: number;
-  lastPreview: string | null;
+  lastOpenedAt: number | null;
 };
 
-type SessionsResponse = {
-  sessions: NavSession[];
+type ProjectsResponse = {
+  projects: NavProject[];
+};
+
+type ProjectResponse = {
+  project: NavProject;
 };
 
 type RequestOptions = {
@@ -21,10 +25,10 @@ type RequestOptions = {
   method?: "GET" | "POST" | "PATCH" | "DELETE";
 };
 
-export class SessionsClientError extends Error {
+export class ProjectsClientError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "SessionsClientError";
+    this.name = "ProjectsClientError";
   }
 }
 
@@ -53,10 +57,10 @@ const readErrorMessage = async (response: Response) => {
     // Fall through to the HTTP status text.
   }
 
-  return response.statusText || "Session request failed.";
+  return response.statusText || "Project request failed.";
 };
 
-export function createSessionsClient(connection: FlueConnection) {
+export function createProjectsClient(connection: FlueConnection) {
   const request = async <T>(path: string, options: RequestOptions = {}) => {
     const response = await fetch(new URL(path, connection.baseUrl), {
       body:
@@ -71,38 +75,38 @@ export function createSessionsClient(connection: FlueConnection) {
     });
 
     if (!response.ok) {
-      throw new SessionsClientError(await readErrorMessage(response));
+      throw new ProjectsClientError(await readErrorMessage(response));
     }
 
     return (await response.json()) as T;
   };
 
   return {
-    async createSession(
-      id: string,
-      title: string | null,
-      projectId: string | null,
-    ) {
-      await request<{ ok: true }>("/api/sessions", {
-        body: { id, projectId, ...(title === null ? {} : { title }) },
+    async createProject(path: string) {
+      const response = await request<ProjectResponse>("/api/projects", {
+        body: { path },
         method: "POST",
       });
+
+      return response.project;
     },
-    async deleteSession(id: string) {
-      await request<{ ok: true }>(`/api/sessions/${id}`, {
+    async listProjects() {
+      const response = await request<ProjectsResponse>("/api/projects");
+
+      return response.projects;
+    },
+    async removeProject(id: string) {
+      await request<{ ok: true }>(`/api/projects/${id}`, {
         method: "DELETE",
       });
     },
-    async listSessions() {
-      const response = await request<SessionsResponse>("/api/sessions");
-
-      return response.sessions;
-    },
-    async renameSession(id: string, title: string) {
-      await request<{ ok: true }>(`/api/sessions/${id}`, {
-        body: { title },
+    async renameProject(id: string, name: string) {
+      const response = await request<ProjectResponse>(`/api/projects/${id}`, {
+        body: { name },
         method: "PATCH",
       });
+
+      return response.project;
     },
   };
 }

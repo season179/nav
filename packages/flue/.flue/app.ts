@@ -8,6 +8,13 @@ import {
 } from "./shared/codex-provider.js";
 import { ensureDeepseekProvider } from "./shared/deepseek-provider.js";
 import {
+  ensureNavProjectsReady,
+  handleCreateNavProject,
+  handleDeleteNavProject,
+  handleListNavProjects,
+  handleUpdateNavProject,
+} from "./shared/nav-projects.js";
+import {
   ensureNavSessionsReady,
   handleCreateNavSession,
   handleDeleteNavSession,
@@ -86,12 +93,14 @@ void ensureCodexProvider().catch((error: unknown) => {
 startCodexProviderRefresh();
 ensureDeepseekProvider();
 ensureZaiProvider();
-void ensureNavSessionsReady().catch((error: unknown) => {
-  console.error(
-    "[nav] Session registry not ready at boot:",
-    error instanceof Error ? error.message : error,
-  );
-});
+void ensureNavSessionsReady()
+  .then(() => ensureNavProjectsReady())
+  .catch((error: unknown) => {
+    console.error(
+      "[nav] Session/project registry not ready at boot:",
+      error instanceof Error ? error.message : error,
+    );
+  });
 try {
   pruneAgentWorktrees();
 } catch (error) {
@@ -136,6 +145,10 @@ app.use(
   }),
 );
 app.use("/api/*", requireDesktopAuth);
+app.get("/api/projects", handleListNavProjects);
+app.post("/api/projects", handleCreateNavProject);
+app.patch("/api/projects/:id", handleUpdateNavProject);
+app.delete("/api/projects/:id", handleDeleteNavProject);
 app.get("/api/sessions", handleListNavSessions);
 app.post("/api/sessions", handleCreateNavSession);
 app.patch("/api/sessions/:id", handleUpdateNavSession);

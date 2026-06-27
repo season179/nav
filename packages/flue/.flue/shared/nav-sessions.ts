@@ -1,14 +1,21 @@
-import { DatabaseSync } from "node:sqlite";
 import {
   createSessionStorageKey,
-  type PersistenceStores,
   SUBMISSION_HARNESS_NAME,
   SUBMISSION_SESSION_NAME,
 } from "@flue/runtime/adapter";
 import type { Context } from "hono";
-import store from "../db.js";
+import {
+  ensureNavSessionTable,
+  getNavDb,
+  getNavStores,
+  migrateNavStore,
+} from "./nav-db.js";
+import {
+  ensureNavProjectsReadySync,
+  resolveWritableProjectId,
+  touchNavProject,
+} from "./nav-projects.js";
 
-const DB_PATH = "./data/flue.db";
 const AGENT_NAME = "nav";
 const SESSION_KEY_PREFIX = "agent-session:";
 const MAX_TITLE_LENGTH = 80;
@@ -21,6 +28,7 @@ type NavSessionRow = {
   title_source: string;
   pinned: number;
   archived: number;
+  project_id: string | null;
   created_at: number;
   last_opened_at: number | null;
   imported_at: number | null;
@@ -47,27 +55,13 @@ export type NavSessionSummary = {
   titleSource: string;
   pinned: boolean;
   archived: boolean;
+  projectId: string;
   createdAt: number;
   updatedAt: number;
   lastPreview: string | null;
 };
 
-let db: DatabaseSync | null = null;
-let storesPromise: Promise<PersistenceStores> | null = null;
 let readyPromise: Promise<void> | null = null;
-
-const getDb = () => {
-  if (!db) {
-    db = new DatabaseSync(DB_PATH);
-  }
-
-  return db;
-};
-
-const getStores = () => {
-  storesPromise ??= Promise.resolve(store.connect());
-  return storesPromise;
-};
 
 const trimToLength = (value: string, maxLength: number) => {
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -199,31 +193,8 @@ const createStorageKey = (id: string) =>
 const isValidSessionId = (id: string) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
 
-const ensureNavSessionTable = () => {
-  const sql = getDb();
-
-  sql.exec(`
-    CREATE TABLE IF NOT EXISTS nav_sessions (
-      id TEXT PRIMARY KEY,
-      agent_name TEXT NOT NULL DEFAULT 'nav',
-      title TEXT,
-      title_source TEXT NOT NULL DEFAULT 'first-message',
-      pinned INTEGER NOT NULL DEFAULT 0,
-      archived INTEGER NOT NULL DEFAULT 0,
-      project_id TEXT,
-      created_at INTEGER NOT NULL,
-      last_opened_at INTEGER,
-      imported_at INTEGER
-    )
-  `);
-  sql.exec(`
-    CREATE INDEX IF NOT EXISTS nav_sessions_agent_archived_idx
-      ON nav_sessions (agent_name, archived, pinned)
-  `);
-};
-
 const getEntryRows = (storageKey: string) =>
-  getDb()
+  getNavDb()
     .prepare(
       `SELECT position, data
        FROM flue_session_entries
@@ -233,7 +204,7 @@ const getEntryRows = (storageKey: string) =>
     .all(storageKey) as FlueEntryRow[];
 
 const getSessionData = (storageKey: string) => {
-  const row = getDb()
+  const row = getNavDb()
     .prepare("SELECT data FROM flue_sessions WHERE id = ?")
     .get(storageKey) as { data: string } | undefined;
 
@@ -278,7 +249,7 @@ const summarizeEntries = (entries: FlueEntryRow[]) => {
 };
 
 const backfillNavSessions = () => {
-  const sql = getDb();
+  const sql = getNavDb();
   const importedAt = Date.now();
   const sessions = sql
     .prepare("SELECT id, data FROM flue_sessions")
@@ -341,9 +312,10 @@ const backfillNavSessions = () => {
 };
 
 const initializeNavSessions = async () => {
-  await Promise.resolve(store.migrate?.());
+  await migrateNavStore();
   ensureNavSessionTable();
   backfillNavSessions();
+  ensureNavProjectsReadySync();
 };
 
 export const ensureNavSessionsReady = () => {
@@ -358,20 +330,25 @@ export const ensureNavSessionsReady = () => {
 const listNavSessions = async (includeArchived: boolean) => {
   await ensureNavSessionsReady();
 
-  const rows = getDb()
+  const rows = getNavDb()
     .prepare(
       `SELECT
-        id,
-        agent_name,
-        title,
-        title_source,
-        pinned,
-        archived,
-        created_at,
-        last_opened_at,
-        imported_at
-       FROM nav_sessions
-       WHERE agent_name = ? AND (? = 1 OR archived = 0)`,
+        s.id,
+        s.agent_name,
+        s.title,
+        s.title_source,
+        s.pinned,
+        s.archived,
+        s.project_id,
+        s.created_at,
+        s.last_opened_at,
+        s.imported_at
+       FROM nav_sessions s
+       LEFT JOIN nav_projects p ON p.id = s.project_id
+       WHERE
+        s.agent_name = ?
+        AND (? = 1 OR s.archived = 0)
+        AND (s.project_id IS NULL OR p.archived = 0)`,
     )
     .all(AGENT_NAME, includeArchived ? 1 : 0) as NavSessionRow[];
   const sessions: NavSessionSummary[] = [];
@@ -397,6 +374,7 @@ const listNavSessions = async (includeArchived: boolean) => {
       titleSource: row.title_source,
       pinned: row.pinned === 1,
       archived: row.archived === 1,
+      projectId: row.project_id ?? "",
       createdAt: row.created_at,
       updatedAt,
       lastPreview: summary.lastPreview,
@@ -412,12 +390,16 @@ const listNavSessions = async (includeArchived: boolean) => {
   });
 };
 
-const createOrAdoptNavSession = async (id: string, title: string | null) => {
+const createOrAdoptNavSession = async (
+  id: string,
+  title: string | null,
+  projectId: string,
+) => {
   await ensureNavSessionsReady();
 
   const now = Date.now();
 
-  getDb()
+  getNavDb()
     .prepare(
       `INSERT INTO nav_sessions (
         id,
@@ -426,13 +408,28 @@ const createOrAdoptNavSession = async (id: string, title: string | null) => {
         title_source,
         pinned,
         archived,
+        project_id,
         created_at,
         last_opened_at
        )
-       VALUES (?, ?, ?, 'first-message', 0, 0, ?, ?)
-       ON CONFLICT(id) DO NOTHING`,
+       VALUES (?, ?, ?, 'first-message', 0, 0, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+        title = CASE
+          WHEN nav_sessions.title IS NULL AND excluded.title IS NOT NULL
+            THEN excluded.title
+          ELSE nav_sessions.title
+        END,
+        title_source = CASE
+          WHEN nav_sessions.title IS NULL AND excluded.title IS NOT NULL
+            THEN excluded.title_source
+          ELSE nav_sessions.title_source
+        END,
+        project_id = COALESCE(nav_sessions.project_id, excluded.project_id),
+        last_opened_at = excluded.last_opened_at`,
     )
-    .run(id, AGENT_NAME, title, now, now);
+    .run(id, AGENT_NAME, title, projectId, now, now);
+
+  touchNavProject(projectId);
 };
 
 const updateNavSession = async (
@@ -463,7 +460,7 @@ const updateNavSession = async (
     return;
   }
 
-  getDb()
+  getNavDb()
     .prepare(`UPDATE nav_sessions SET ${sets.join(", ")} WHERE id = ?`)
     .run(...values, id);
 };
@@ -472,13 +469,13 @@ const deleteNavSession = async (id: string) => {
   await ensureNavSessionsReady();
 
   const storageKey = createStorageKey(id);
-  const stores = await getStores();
+  const stores = await getNavStores();
 
   await stores.executionStore.submissions.deleteSession(storageKey, () =>
     stores.executionStore.sessions.delete(storageKey),
   );
 
-  getDb().prepare("DELETE FROM nav_sessions WHERE id = ?").run(id);
+  getNavDb().prepare("DELETE FROM nav_sessions WHERE id = ?").run(id);
 };
 
 const readJsonObject = async (c: Context) => {
@@ -506,7 +503,20 @@ export const handleCreateNavSession = async (c: Context) => {
     return c.json({ error: "invalid_session_id" }, 400);
   }
 
-  await createOrAdoptNavSession(id, normalizeTitle(body?.title));
+  const project = resolveWritableProjectId(body?.projectId);
+
+  if (!project.ok) {
+    return c.json(
+      { error: project.error, message: project.message },
+      project.status,
+    );
+  }
+
+  await createOrAdoptNavSession(
+    id,
+    normalizeTitle(body?.title),
+    project.projectId,
+  );
 
   return c.json({ ok: true }, 201);
 };
