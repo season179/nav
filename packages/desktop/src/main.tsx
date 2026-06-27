@@ -159,13 +159,16 @@ function LiveConversation({
   return (
     <Conversation className="min-h-0">
       <ConversationContent className="mx-auto w-full max-w-3xl px-6 pt-14 pb-8">
-        {messages.map((message) => (
+        {messages.map((message, index) => (
           <Message
             from={message.role === "assistant" ? "assistant" : "user"}
             key={message.id}
           >
             <MessageContent>
-              <ChatMessageParts message={message} />
+              <ChatMessageParts
+                isLatestMessage={index === messages.length - 1}
+                message={message}
+              />
             </MessageContent>
           </Message>
         ))}

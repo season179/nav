@@ -1,5 +1,6 @@
 import type { UIMessage, UIMessagePart } from "@flue/react";
-import { BrainIcon, WrenchIcon } from "lucide-react";
+import { WrenchIcon } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import {
   ChainOfThought,
@@ -22,7 +23,12 @@ type KeyedActivityPart = { key: string; part: ActivityPart };
 
 type RenderItem =
   | { type: "text"; key: string; part: TextPart }
-  | { type: "activity"; key: string; parts: KeyedActivityPart[] };
+  | {
+      type: "activity";
+      key: string;
+      parts: KeyedActivityPart[];
+      hasFollowingText: boolean;
+    };
 
 const isActivityPart = (part: UIMessagePart): part is ActivityPart =>
   part.type === "reasoning" || part.type === "dynamic-tool";
@@ -50,15 +56,9 @@ function ActivityPartView({ part }: { part: ActivityPart }) {
     case "reasoning":
       // Don't render empty reasoning chrome (e.g. a started-but-empty block).
       return part.text.trim() ? (
-        <ChainOfThoughtStep
-          icon={BrainIcon}
-          label={part.state === "streaming" ? "Thinking" : "Reasoning"}
-          status={part.state === "streaming" ? "active" : "complete"}
-        >
-          <MessageResponse className="text-muted-foreground text-sm">
-            {part.text}
-          </MessageResponse>
-        </ChainOfThoughtStep>
+        <MessageResponse className="text-muted-foreground text-sm">
+          {part.text}
+        </MessageResponse>
       ) : null;
 
     case "dynamic-tool": {
@@ -88,11 +88,25 @@ function ActivityPartView({ part }: { part: ActivityPart }) {
   }
 }
 
-function ActivityView({ parts }: { parts: KeyedActivityPart[] }) {
-  const defaultOpen = parts.some(({ part }) => isActiveActivityPart(part));
+function ActivityView({
+  hasFollowingText,
+  isLatestMessage,
+  parts,
+}: {
+  hasFollowingText: boolean;
+  isLatestMessage: boolean;
+  parts: KeyedActivityPart[];
+}) {
+  const isActive = parts.some(({ part }) => isActiveActivityPart(part));
+  const shouldBeOpen = isLatestMessage && isActive && !hasFollowingText;
+  const [isOpen, setIsOpen] = useState(shouldBeOpen);
+
+  useEffect(() => {
+    setIsOpen(shouldBeOpen);
+  }, [shouldBeOpen]);
 
   return (
-    <ChainOfThought defaultOpen={defaultOpen}>
+    <ChainOfThought onOpenChange={setIsOpen} open={isOpen}>
       <ChainOfThoughtHeader>Activity</ChainOfThoughtHeader>
       <ChainOfThoughtContent>
         {parts.map(({ key, part }) => (
@@ -119,6 +133,7 @@ function createMessageRenderItems(parts: UIMessagePart[]) {
     }
 
     renderItems.push({
+      hasFollowingText: false,
       key: `activity-${pendingActivity.keys.join("-")}`,
       parts: pendingActivity.parts,
       type: "activity",
@@ -158,26 +173,57 @@ function createMessageRenderItems(parts: UIMessagePart[]) {
 
   flushActivity();
 
-  return renderItems;
+  return renderItems.map((item, index) =>
+    item.type === "activity"
+      ? {
+          ...item,
+          hasFollowingText: renderItems
+            .slice(index + 1)
+            .some((nextItem) => nextItem.type === "text"),
+        }
+      : item,
+  );
 }
 
-export function ChatMessageParts({ message }: { message: UIMessage }) {
+export function ChatMessageParts({
+  isLatestMessage,
+  message,
+}: {
+  isLatestMessage: boolean;
+  message: UIMessage;
+}) {
   const renderItems = createMessageRenderItems(message.parts);
 
   return (
     <>
       {renderItems.map((item) => (
-        <MessageRenderItem key={item.key} item={item} />
+        <MessageRenderItem
+          isLatestMessage={isLatestMessage}
+          item={item}
+          key={item.key}
+        />
       ))}
     </>
   );
 }
 
-function MessageRenderItem({ item }: { item: RenderItem }) {
+function MessageRenderItem({
+  isLatestMessage,
+  item,
+}: {
+  isLatestMessage: boolean;
+  item: RenderItem;
+}) {
   switch (item.type) {
     case "text":
       return <TextPartView part={item.part} />;
     case "activity":
-      return <ActivityView parts={item.parts} />;
+      return (
+        <ActivityView
+          hasFollowingText={item.hasFollowingText}
+          isLatestMessage={isLatestMessage}
+          parts={item.parts}
+        />
+      );
   }
 }
