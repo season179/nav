@@ -245,7 +245,7 @@ function NavChat({ serverStatus }: { serverStatus: FlueServerStatus | null }) {
       !hasVisibleAssistantOutputAfterLastUser(messages));
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
       {error && (
         <div className="mx-auto mt-4 w-full max-w-3xl rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive text-sm">
           {error.message}
@@ -339,11 +339,11 @@ function AppContent() {
 function App() {
   return (
     <TooltipProvider>
-      <SidebarProvider>
+      <SidebarProvider className="h-svh overflow-hidden">
         <AppSidebar />
         <div className="fixed inset-x-0 top-0 z-40 h-10 [-webkit-app-region:drag]" />
         <SidebarTrigger className="fixed top-1 left-[76px] z-50 [-webkit-app-region:no-drag] [&_svg]:!size-[18px]" />
-        <SidebarInset className="min-h-svh overflow-hidden pt-10">
+        <SidebarInset className="h-svh overflow-hidden pt-10">
           <AppContent />
         </SidebarInset>
       </SidebarProvider>
