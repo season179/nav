@@ -24,7 +24,10 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { AppSidebar } from "@/components/app-sidebar";
-import { ChatMessageParts } from "@/components/chat-message-parts";
+import {
+  ChatMessageParts,
+  hasRenderableMessageParts,
+} from "@/components/chat-message-parts";
 import {
   Empty,
   EmptyDescription,
@@ -160,6 +163,19 @@ function ConnectionEmpty({
 }
 
 type MessagePart = UIMessage["parts"][number];
+type ConversationRenderItem =
+  | {
+      isLatestMessage: boolean;
+      key: string;
+      message: UIMessage;
+      type: "message";
+    }
+  | {
+      isLatestMessage: boolean;
+      key: string;
+      messages: UIMessage[];
+      type: "assistant-group";
+    };
 
 const hasVisiblePart = (part: MessagePart) => {
   switch (part.type) {
@@ -186,6 +202,97 @@ const hasVisibleAssistantOutputAfterLastUser = (messages: UIMessage[]) => {
     );
 };
 
+const createConversationRenderItems = (messages: UIMessage[]) => {
+  const items: ConversationRenderItem[] = [];
+  let pendingAssistantGroup: UIMessage[] = [];
+
+  const flushAssistantGroup = () => {
+    if (pendingAssistantGroup.length === 0) {
+      return;
+    }
+
+    items.push({
+      isLatestMessage:
+        pendingAssistantGroup.at(-1) === messages[messages.length - 1],
+      key: pendingAssistantGroup[0]?.id ?? "assistant-group",
+      messages: pendingAssistantGroup,
+      type: "assistant-group",
+    });
+    pendingAssistantGroup = [];
+  };
+
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      pendingAssistantGroup.push(message);
+      continue;
+    }
+
+    flushAssistantGroup();
+    items.push({
+      isLatestMessage: message === messages[messages.length - 1],
+      key: message.id,
+      message,
+      type: "message",
+    });
+  }
+
+  flushAssistantGroup();
+
+  return items;
+};
+
+function AssistantMessageGroup({
+  isLatestMessage,
+  messages,
+}: {
+  isLatestMessage: boolean;
+  messages: UIMessage[];
+}) {
+  const parts = messages.flatMap((message) => message.parts);
+
+  if (!hasRenderableMessageParts(parts)) {
+    return null;
+  }
+
+  const lastMessageWithMetadata = messages.findLast(
+    (message) => message.metadata,
+  );
+  const message: UIMessage = {
+    id: messages[0]?.id ?? "assistant-group",
+    metadata: lastMessageWithMetadata?.metadata,
+    parts,
+    role: "assistant",
+  };
+
+  return (
+    <Message from="assistant">
+      <MessageContent>
+        <ChatMessageParts isLatestMessage={isLatestMessage} message={message} />
+      </MessageContent>
+    </Message>
+  );
+}
+
+function ConversationMessage({
+  isLatestMessage,
+  message,
+}: {
+  isLatestMessage: boolean;
+  message: UIMessage;
+}) {
+  if (!hasRenderableMessageParts(message.parts)) {
+    return null;
+  }
+
+  return (
+    <Message from={message.role === "assistant" ? "assistant" : "user"}>
+      <MessageContent>
+        <ChatMessageParts isLatestMessage={isLatestMessage} message={message} />
+      </MessageContent>
+    </Message>
+  );
+}
+
 function ThinkingMessage() {
   return (
     <Message from="assistant">
@@ -207,22 +314,26 @@ function LiveConversation({
     return <EmptyConversation />;
   }
 
+  const renderItems = createConversationRenderItems(messages);
+
   return (
     <Conversation className="min-h-0">
       <ConversationContent className="mx-auto w-full max-w-3xl px-6 pt-14 pb-8">
-        {messages.map((message, index) => (
-          <Message
-            from={message.role === "assistant" ? "assistant" : "user"}
-            key={message.id}
-          >
-            <MessageContent>
-              <ChatMessageParts
-                isLatestMessage={index === messages.length - 1}
-                message={message}
-              />
-            </MessageContent>
-          </Message>
-        ))}
+        {renderItems.map((item) =>
+          item.type === "assistant-group" ? (
+            <AssistantMessageGroup
+              isLatestMessage={item.isLatestMessage}
+              key={item.key}
+              messages={item.messages}
+            />
+          ) : (
+            <ConversationMessage
+              isLatestMessage={item.isLatestMessage}
+              key={item.key}
+              message={item.message}
+            />
+          ),
+        )}
         {isThinking && <ThinkingMessage />}
       </ConversationContent>
       <ConversationScrollButton aria-label="Scroll to bottom" />
@@ -283,6 +394,7 @@ function NavChat({
 }) {
   const [sessionError, setSessionError] = useState<string | null>(null);
   const { messages, status, error, sendMessage } = useFlueAgent({
+    history: "all",
     id: conversationId,
     name: "nav",
   });

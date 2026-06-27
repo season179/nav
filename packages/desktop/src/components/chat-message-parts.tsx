@@ -1,6 +1,6 @@
 import type { UIMessage, UIMessagePart } from "@flue/react";
 import { WrenchIcon } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   ChainOfThought,
@@ -29,7 +29,6 @@ type RenderItem =
       type: "activity";
       key: string;
       parts: KeyedActivityPart[];
-      hasFollowingText: boolean;
     };
 
 const isActivityPart = (part: UIMessagePart): part is ActivityPart =>
@@ -46,7 +45,7 @@ const toolStepStatus = (
 
 // Renders a Flue UIMessage by walking its parts in order instead of flattening
 // everything into assistant text: `text` becomes the markdown answer, and
-// adjacent thinking/tool parts become one Activity block. Narrow by `part.type`
+// thinking/tool parts share one stable Activity block. Narrow by `part.type`
 // — these are @flue/react's part types, which only overlap with the AI SDK
 // types the generated components are written against.
 function TextPartView({ part }: { part: TextPart }) {
@@ -100,24 +99,36 @@ function ActivityPartView({ part }: { part: ActivityPart }) {
 }
 
 function ActivityView({
-  hasFollowingText,
   isLatestMessage,
   parts,
 }: {
-  hasFollowingText: boolean;
   isLatestMessage: boolean;
   parts: KeyedActivityPart[];
 }) {
   const isActive = parts.some(({ part }) => isActiveActivityPart(part));
-  const shouldBeOpen = isLatestMessage && isActive && !hasFollowingText;
-  const [isOpen, setIsOpen] = useState(shouldBeOpen);
+  const shouldAutoOpen = isLatestMessage && isActive;
+  const [isOpen, setIsOpen] = useState(shouldAutoOpen);
+  const hasUserToggledRef = useRef(false);
 
   useEffect(() => {
-    setIsOpen(shouldBeOpen);
-  }, [shouldBeOpen]);
+    if (hasUserToggledRef.current) {
+      return;
+    }
+
+    if (shouldAutoOpen) {
+      setIsOpen(true);
+    } else if (!isLatestMessage) {
+      setIsOpen(false);
+    }
+  }, [isLatestMessage, shouldAutoOpen]);
+
+  const handleOpenChange = (open: boolean) => {
+    hasUserToggledRef.current = true;
+    setIsOpen(open);
+  };
 
   return (
-    <ChainOfThought onOpenChange={setIsOpen} open={isOpen}>
+    <ChainOfThought onOpenChange={handleOpenChange} open={isOpen}>
       <ChainOfThoughtHeader>Activity</ChainOfThoughtHeader>
       <ChainOfThoughtContent>
         {parts.map(({ key, part }) => (
@@ -134,22 +145,19 @@ function createMessageRenderItems(parts: UIMessagePart[]) {
   // raw array index.
   const seen: Record<string, number> = {};
   const renderItems: RenderItem[] = [];
-  let pendingActivity:
-    | { keys: string[]; parts: KeyedActivityPart[] }
-    | undefined;
+  let activityItem: Extract<RenderItem, { type: "activity" }> | undefined;
 
-  const flushActivity = () => {
-    if (!pendingActivity) {
-      return;
+  const ensureActivityItem = () => {
+    if (!activityItem) {
+      activityItem = {
+        key: "activity",
+        parts: [],
+        type: "activity",
+      };
+      renderItems.push(activityItem);
     }
 
-    renderItems.push({
-      hasFollowingText: false,
-      key: `activity-${pendingActivity.keys.join("-")}`,
-      parts: pendingActivity.parts,
-      type: "activity",
-    });
-    pendingActivity = undefined;
+    return activityItem;
   };
 
   for (const part of parts) {
@@ -160,7 +168,6 @@ function createMessageRenderItems(parts: UIMessagePart[]) {
         : `${part.type}-${seen[part.type]}`;
 
     if (part.type === "text") {
-      flushActivity();
       if (part.text) {
         renderItems.push({ key, part, type: "text" });
       }
@@ -172,28 +179,15 @@ function createMessageRenderItems(parts: UIMessagePart[]) {
         continue;
       }
 
-      pendingActivity ??= { keys: [], parts: [] };
-      pendingActivity.keys.push(key);
-      pendingActivity.parts.push({ key, part });
-      continue;
+      ensureActivityItem().parts.push({ key, part });
     }
-
-    // `file` and `data-*` parts have no surface in this slice.
-    flushActivity();
   }
 
-  flushActivity();
+  return renderItems;
+}
 
-  return renderItems.map((item, index) =>
-    item.type === "activity"
-      ? {
-          ...item,
-          hasFollowingText: renderItems
-            .slice(index + 1)
-            .some((nextItem) => nextItem.type === "text"),
-        }
-      : item,
-  );
+export function hasRenderableMessageParts(parts: UIMessagePart[]) {
+  return createMessageRenderItems(parts).length > 0;
 }
 
 export function ChatMessageParts({
@@ -230,11 +224,7 @@ function MessageRenderItem({
       return <TextPartView part={item.part} />;
     case "activity":
       return (
-        <ActivityView
-          hasFollowingText={item.hasFollowingText}
-          isLatestMessage={isLatestMessage}
-          parts={item.parts}
-        />
+        <ActivityView isLatestMessage={isLatestMessage} parts={item.parts} />
       );
   }
 }
