@@ -12,6 +12,7 @@
       "packages/flue/**",
       "scripts/**",
       "tests/**/*.cts",
+      "tests/**/*.js",
       "!!.nav",
       "!desktop/electron/out",
       "!desktop/electron/renderer/dist",

@@ -373,6 +373,16 @@ export const touchNavProject = (id: string) => {
     .run(Date.now(), id);
 };
 
+export const listNavProjectPathsForWorktreePrune = () => {
+  ensureNavProjectsReadySync();
+
+  return (
+    getNavDb().prepare("SELECT path FROM nav_projects").all() as {
+      path: string;
+    }[]
+  ).map((row) => row.path);
+};
+
 export const resolveSessionProject = (
   sessionId: string,
 ): ResolvedSessionProject => {

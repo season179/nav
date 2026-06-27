@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { getWorkspaceRoot } from "./codex.js";
+import { resolveGitRoot } from "./git-context.js";
+import { listNavProjectPathsForWorktreePrune } from "./nav-projects.js";
+
+const WORKTREE_BASE = path.join(tmpdir(), "nav-worktrees");
 
 function worktreeRoot(repoRoot: string): string {
   const repoHash = createHash("sha256")
@@ -11,11 +14,15 @@ function worktreeRoot(repoRoot: string): string {
     .digest("hex")
     .slice(0, 12);
 
-  return path.join(tmpdir(), "nav-worktrees", repoHash);
+  return path.join(WORKTREE_BASE, repoHash);
 }
 
-export function agentWorktreePath(agent: string, instanceId: string): string {
-  return path.join(worktreeRoot(getWorkspaceRoot()), agent, instanceId);
+export function agentWorktreePath(
+  agent: string,
+  instanceId: string,
+  repoRoot: string,
+): string {
+  return path.join(worktreeRoot(repoRoot), agent, instanceId);
 }
 
 function createWorkspaceSnapshot(repoRoot: string): string {
@@ -66,9 +73,12 @@ function createWorkspaceSnapshot(repoRoot: string): string {
   }
 }
 
-export function createAgentWorktree(agent: string, instanceId: string): string {
-  const repoRoot = getWorkspaceRoot();
-  const worktree = agentWorktreePath(agent, instanceId);
+export function createAgentWorktree(
+  agent: string,
+  instanceId: string,
+  repoRoot: string,
+): string {
+  const worktree = agentWorktreePath(agent, instanceId, repoRoot);
 
   if (existsSync(worktree)) {
     return worktree;
@@ -87,10 +97,21 @@ export function createAgentWorktree(agent: string, instanceId: string): string {
 }
 
 export function pruneAgentWorktrees(): void {
-  const repoRoot = getWorkspaceRoot();
+  const gitRoots = new Set<string>();
 
-  rmSync(worktreeRoot(repoRoot), { recursive: true, force: true });
-  execFileSync("git", ["-C", repoRoot, "worktree", "prune"], {
-    stdio: "ignore",
-  });
+  for (const projectPath of listNavProjectPathsForWorktreePrune()) {
+    const root = resolveGitRoot(projectPath);
+
+    if (root.ok) {
+      gitRoots.add(root.gitRoot);
+    }
+  }
+
+  rmSync(WORKTREE_BASE, { recursive: true, force: true });
+
+  for (const gitRoot of gitRoots) {
+    execFileSync("git", ["-C", gitRoot, "worktree", "prune"], {
+      stdio: "ignore",
+    });
+  }
 }

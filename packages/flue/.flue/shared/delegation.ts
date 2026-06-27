@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { defineTool } from "@flue/runtime";
 import * as v from "valibot";
+import type { GitContext } from "./git-context.js";
 import { agentWorktreePath } from "./worktrees.js";
 
 const FLEET = ["glm", "deepseek-pro", "deepseek-flash"] as const;
@@ -41,6 +42,7 @@ function resultText(result: AgentPromptResponse["result"]): string {
 }
 
 async function consultAgent(
+  gitCtx: GitContext,
   agent: FleetAgent,
   message: string,
   signal?: AbortSignal,
@@ -60,6 +62,8 @@ async function consultAgent(
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${token}`,
+        "X-Nav-Repo-Root": gitCtx.gitRoot,
+        "X-Nav-Subpath": gitCtx.subpath,
       },
       body: JSON.stringify({ message }),
       signal,
@@ -77,52 +81,56 @@ async function consultAgent(
   return {
     agent,
     answer: resultText(json.result),
-    worktree: agentWorktreePath(agent, id),
+    worktree: agentWorktreePath(agent, id, gitCtx.gitRoot),
   };
 }
 
-export const consult = defineTool({
-  name: "consult",
-  description:
-    "Delegate a task to one engineer (glm | deepseek-pro | deepseek-flash). It works in its own checkout and returns its solution plus the worktree path. Inspect its real changes with git -C <worktree> diff.",
-  input: v.object({ agent: v.picklist(FLEET), task: v.string() }),
-  output: v.object({
-    agent: v.string(),
-    answer: v.string(),
-    worktree: v.string(),
-  }),
-  async run({ input, signal }) {
-    return consultAgent(input.agent, input.task, signal);
-  },
-});
+export const makeConsult = (gitCtx: GitContext) =>
+  defineTool({
+    name: "consult",
+    description:
+      "Delegate a task to one engineer (glm | deepseek-pro | deepseek-flash). It works in its own checkout and returns its solution plus the worktree path. Inspect its real changes with git -C <worktree> diff.",
+    input: v.object({ agent: v.picklist(FLEET), task: v.string() }),
+    output: v.object({
+      agent: v.string(),
+      answer: v.string(),
+      worktree: v.string(),
+    }),
+    async run({ input, signal }) {
+      return consultAgent(gitCtx, input.agent, input.task, signal);
+    },
+  });
 
-export const consultPanel = defineTool({
-  name: "consult_panel",
-  description:
-    "Delegate the same task to several engineers in parallel. Returns each result's answer and worktree path so Nav can compare real diffs and synthesize the final change.",
-  input: v.object({ agents: v.array(v.picklist(FLEET)), task: v.string() }),
-  output: v.object({
-    results: v.array(
-      v.object({
-        agent: v.string(),
-        answer: v.string(),
-        worktree: v.string(),
-      }),
-    ),
-  }),
-  async run({ input, signal }) {
-    if (input.agents.length === 0) {
-      throw new Error("consult_panel: at least one agent is required");
-    }
+export const makeConsultPanel = (gitCtx: GitContext) =>
+  defineTool({
+    name: "consult_panel",
+    description:
+      "Delegate the same task to several engineers in parallel. Returns each result's answer and worktree path so Nav can compare real diffs and synthesize the final change.",
+    input: v.object({ agents: v.array(v.picklist(FLEET)), task: v.string() }),
+    output: v.object({
+      results: v.array(
+        v.object({
+          agent: v.string(),
+          answer: v.string(),
+          worktree: v.string(),
+        }),
+      ),
+    }),
+    async run({ input, signal }) {
+      if (input.agents.length === 0) {
+        throw new Error("consult_panel: at least one agent is required");
+      }
 
-    if (new Set(input.agents).size !== input.agents.length) {
-      throw new Error("consult_panel: duplicate agents are not allowed");
-    }
+      if (new Set(input.agents).size !== input.agents.length) {
+        throw new Error("consult_panel: duplicate agents are not allowed");
+      }
 
-    const results = await Promise.all(
-      input.agents.map((agent) => consultAgent(agent, input.task, signal)),
-    );
+      const results = await Promise.all(
+        input.agents.map((agent) =>
+          consultAgent(gitCtx, agent, input.task, signal),
+        ),
+      );
 
-    return { results };
-  },
-});
+      return { results };
+    },
+  });
