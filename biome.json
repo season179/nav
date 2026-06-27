@@ -9,7 +9,7 @@
     "includes": [
       "desktop/**",
       "packages/desktop/**",
-      "packages/flue/**",
+      "packages/agent-server/**",
       "scripts/**",
       "tests/**/*.cts",
       "!!.nav",
@@ -22,9 +22,7 @@
       "!packages/desktop/src/components/ui",
       "!packages/desktop/src/lib/utils.ts",
       "!packages/desktop/src/styles.css",
-      "!packages/flue/.flue/.generated",
-      "!packages/flue/.flue/generated",
-      "!packages/flue/dist"
+      "!packages/agent-server/dist"
     ]
   },
   "formatter": {

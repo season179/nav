@@ -1,6 +1,8 @@
+import { useChat } from "@ai-sdk/react";
 import type { UIMessage } from "ai";
-import { SquareDashedMousePointerIcon } from "lucide-react";
-import { StrictMode } from "react";
+import { DefaultChatTransport } from "ai";
+import { MessagesSquareIcon } from "lucide-react";
+import { StrictMode, useMemo } from "react";
 import { createRoot } from "react-dom/client";
 
 import {
@@ -43,32 +45,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 import "./styles.css";
 
-const starterMessages = [
-  {
-    id: "starter-user",
-    parts: [
-      {
-        text: "What should this space become?",
-        type: "text",
-      },
-    ],
-    role: "user",
-  },
-  {
-    id: "starter-assistant",
-    parts: [
-      {
-        text: "A live Nav conversation surface. The desktop shell is ready for the Flue-backed chat flow when that integration lands.",
-        type: "text",
-      },
-    ],
-    role: "assistant",
-  },
-] satisfies UIMessage[];
-
-const selectedSessionId: string | null = null;
-const selectedChatId: string | null = null;
-const selectedThreadId: string | null = null;
+const agentServerUrl =
+  import.meta.env.VITE_NAV_AGENT_SERVER_URL ?? "http://127.0.0.1:3583";
 
 const getMessageText = (message: UIMessage) =>
   message.parts
@@ -76,48 +54,66 @@ const getMessageText = (message: UIMessage) =>
     .map((part) => part.text)
     .join("");
 
-const handlePromptSubmit = () => undefined;
-
-function NoSelectedConversationEmpty() {
+function EmptyConversation() {
   return (
     <Empty className="min-h-0 border-0 px-6 py-10">
       <EmptyHeader>
         <EmptyMedia className="size-10 rounded-xl" variant="icon">
-          <SquareDashedMousePointerIcon aria-hidden="true" className="size-5" />
+          <MessagesSquareIcon aria-hidden="true" className="size-5" />
         </EmptyMedia>
-        <EmptyTitle>No chat selected</EmptyTitle>
-        <EmptyDescription>
-          Choose a session, chat, or thread from the sidebar to open it here.
-        </EmptyDescription>
+        <EmptyTitle>Nav</EmptyTitle>
+        <EmptyDescription>Ask about this workspace.</EmptyDescription>
       </EmptyHeader>
     </Empty>
   );
 }
 
-function StarterConversation() {
+function ChatConversation({
+  error,
+  messages,
+}: {
+  error?: Error;
+  messages: UIMessage[];
+}) {
   return (
     <Conversation className="min-h-0">
       <ConversationContent className="mx-auto w-full max-w-3xl px-6 pt-14 pb-8">
-        {starterMessages.map((message) => (
+        {messages.length === 0 ? <EmptyConversation /> : null}
+        {messages.map((message) => (
           <Message from={message.role} key={message.id}>
             <MessageContent>
               <MessageResponse>{getMessageText(message)}</MessageResponse>
             </MessageContent>
           </Message>
         ))}
+        {error ? (
+          <Message from="assistant">
+            <MessageContent>
+              <MessageResponse>{`Nav hit an error: ${error.message}`}</MessageResponse>
+            </MessageContent>
+          </Message>
+        ) : null}
       </ConversationContent>
       <ConversationScrollButton aria-label="Scroll to bottom" />
     </Conversation>
   );
 }
 
-function PromptComposer() {
+function PromptComposer({
+  onSubmit,
+  status,
+  stop,
+}: {
+  onSubmit: (message: string) => void;
+  status: "error" | "ready" | "submitted" | "streaming";
+  stop: () => void;
+}) {
   return (
     <div className="shrink-0 bg-background/95 px-4 py-3 backdrop-blur">
       <PromptInput
         aria-label="Chat prompt"
         className="mx-auto max-w-3xl"
-        onSubmit={handlePromptSubmit}
+        onSubmit={(message) => onSubmit(message.text)}
       >
         <PromptInputBody>
           <PromptInputTextarea placeholder="Message Nav" />
@@ -135,7 +131,7 @@ function PromptComposer() {
               </PromptInputActionMenuContent>
             </PromptInputActionMenu>
           </PromptInputTools>
-          <PromptInputSubmit />
+          <PromptInputSubmit onStop={stop} status={status} />
         </PromptInputFooter>
       </PromptInput>
     </div>
@@ -143,10 +139,25 @@ function PromptComposer() {
 }
 
 function App() {
-  const hasSelectedConversation =
-    selectedSessionId !== null ||
-    selectedChatId !== null ||
-    selectedThreadId !== null;
+  const transport = useMemo(
+    () =>
+      new DefaultChatTransport({
+        api: `${agentServerUrl}/api/chat`,
+      }),
+    [],
+  );
+  const { error, messages, sendMessage, status, stop } = useChat({
+    transport,
+  });
+
+  const handleSubmit = (text: string) => {
+    const trimmedText = text.trim();
+    if (!trimmedText || status === "submitted" || status === "streaming") {
+      return;
+    }
+
+    sendMessage({ text: trimmedText });
+  };
 
   return (
     <TooltipProvider>
@@ -156,12 +167,12 @@ function App() {
         <SidebarTrigger className="fixed top-1 left-[76px] z-50 [-webkit-app-region:no-drag] [&_svg]:!size-[18px]" />
         <SidebarInset className="min-h-svh overflow-hidden pt-10">
           <div className="flex min-h-0 flex-1 flex-col">
-            {hasSelectedConversation ? (
-              <StarterConversation />
-            ) : (
-              <NoSelectedConversationEmpty />
-            )}
-            <PromptComposer />
+            <ChatConversation error={error} messages={messages} />
+            <PromptComposer
+              onSubmit={handleSubmit}
+              status={status}
+              stop={stop}
+            />
           </div>
         </SidebarInset>
       </SidebarProvider>

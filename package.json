@@ -10,7 +10,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "dev:app": "pnpm --filter @nav/desktop dev",
+    "dev:app": "concurrently -k -n agent,desktop \"pnpm --filter @nav/agent-server dev\" \"pnpm --filter @nav/desktop dev\"",
     "lint": "biome check",
     "lint:fix": "biome check --write",
     "format": "biome format --write"
@@ -26,7 +26,8 @@
     }
   },
   "devDependencies": {
-    "@biomejs/biome": "2.4.15"
+    "@biomejs/biome": "2.4.15",
+    "concurrently": "10.0.3"
   },
   "type": "module"
 }
