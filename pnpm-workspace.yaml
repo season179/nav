@@ -2,6 +2,14 @@ packages:
   - "packages/desktop"
   - "packages/flue"
   - "packages/tui"
+allowBuilds:
+  '@google/genai': true
+  '@mongodb-js/zstd': true
+  esbuild: true
+  node-liblzma: true
+  protobufjs: true
+  sharp: true
+  workerd: true
 minimumReleaseAgeExclude:
   - '@flue/cli@1.0.0-beta.7'
   - '@flue/runtime@1.0.0-beta.7'
