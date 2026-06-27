@@ -10,5 +10,5 @@
     "target": "ES2023",
     "types": ["node"]
   },
-  "include": ["src/main-process/**/*.ts"]
+  "include": ["src/main-process/**/*.cts", "src/main-process/**/*.ts"]
 }

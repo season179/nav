@@ -1,9 +1,37 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, ipcMain, type WebFrameMain } from "electron";
+
+import { FlueServer } from "./flue-server.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const appBackgroundColor = "#090b0c";
+const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+const trustedDevOrigin = devServerUrl ? new URL(devServerUrl).origin : null;
+
+const flueServer = new FlueServer({
+  devServerUrl,
+  mainProcessDir: __dirname,
+  onStatusChange: (status) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      window.webContents.send("flue:status", status);
+    }
+  },
+});
+
+const isTrustedSender = (frame: WebFrameMain) => {
+  try {
+    const url = new URL(frame.url);
+
+    if (url.protocol === "file:") {
+      return true;
+    }
+
+    return trustedDevOrigin !== null && url.origin === trustedDevOrigin;
+  } catch {
+    return false;
+  }
+};
 
 const createWindow = () => {
   const window = new BrowserWindow({
@@ -17,11 +45,14 @@ const createWindow = () => {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      preload: path.join(__dirname, "preload.cjs"),
     },
     width: 1024,
   });
 
-  const devServerUrl = process.env.VITE_DEV_SERVER_URL;
+  window.webContents.once("did-finish-load", () => {
+    window.webContents.send("flue:status", flueServer.getStatus());
+  });
 
   if (devServerUrl) {
     void window.loadURL(devServerUrl);
@@ -32,6 +63,16 @@ const createWindow = () => {
 };
 
 void app.whenReady().then(() => {
+  ipcMain.handle("flue:getConnection", async (event) => {
+    if (!event.senderFrame || !isTrustedSender(event.senderFrame)) {
+      throw new Error("Untrusted renderer requested Flue connection details.");
+    }
+
+    return await flueServer.getConnection();
+  });
+
+  void flueServer.start().catch(() => undefined);
+
   createWindow();
 
   app.on("activate", () => {
@@ -45,4 +86,8 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", () => {
+  flueServer.stop();
 });

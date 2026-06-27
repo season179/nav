@@ -213,6 +213,12 @@ importers:
 
   packages/desktop:
     dependencies:
+      '@flue/react':
+        specifier: 1.0.0-beta.7
+        version: 1.0.0-beta.7(@flue/sdk@1.0.0-beta.7)(react@19.2.7)
+      '@flue/sdk':
+        specifier: 1.0.0-beta.7
+        version: 1.0.0-beta.7
       '@fontsource-variable/inter':
         specifier: 5.2.8
         version: 5.2.8
@@ -337,6 +343,9 @@ importers:
 
   packages/flue:
     dependencies:
+      '@earendil-works/pi-ai':
+        specifier: 0.79.10
+        version: 0.79.10(@modelcontextprotocol/sdk@1.29.0(zod@3.25.76))(ws@8.21.0)(zod@3.25.76)
       '@flue/runtime':
         specifier: 1.0.0-beta.7
         version: 1.0.0-beta.7(@standard-schema/spec@1.1.0)(@types/json-schema@7.0.15)(typebox@1.1.38)(typescript@6.0.3)(ws@8.21.0)(zod-to-json-schema@3.25.2(zod@3.25.76))(zod@3.25.76)
@@ -957,6 +966,12 @@ packages:
     resolution: {integrity: sha512-Kusf37Y4Uqyj21MorVINGRjQFw0YAcpjT83nM2daLBiooBNi7YMndX3ffKZbL+F8F0PXDFoUlQvn3HHwkAHVYQ==}
     engines: {node: '>=22.19.0'}
     hasBin: true
+
+  '@flue/react@1.0.0-beta.7':
+    resolution: {integrity: sha512-dmiK/zx+OJX9st023tZLCZZd9PxMTBqFnyl7jDoY9gwpO0IP01ZSnhaQXtgirJfp975ZVEyGmkWRUoi8lpmcGQ==}
+    peerDependencies:
+      '@flue/sdk': '>=1.0.0-beta.3 <1.0.0'
+      react: '>=18'
 
   '@flue/runtime@1.0.0-beta.7':
     resolution: {integrity: sha512-iWckCoEu5/9hybwQF0IUMLCxdpfN3ZfsnbLCFV7m6LEF4vHiLvh1tgA7h+dVHfl4uez8NnDaulQOKyDpCbu+XA==}
@@ -6151,6 +6166,11 @@ snapshots:
       - zod
       - zod-openapi
       - zod-to-json-schema
+
+  '@flue/react@1.0.0-beta.7(@flue/sdk@1.0.0-beta.7)(react@19.2.7)':
+    dependencies:
+      '@flue/sdk': 1.0.0-beta.7
+      react: 19.2.7
 
   '@flue/runtime@1.0.0-beta.7(@standard-schema/spec@1.1.0)(@types/json-schema@7.0.15)(typebox@1.1.38)(typescript@6.0.3)(ws@8.21.0)(zod-to-json-schema@3.25.2(zod@3.25.76))(zod@3.25.76)':
     dependencies:

@@ -1,8 +1,79 @@
 import { flue } from "@flue/runtime/routing";
-import { Hono } from "hono";
+import { Hono, type MiddlewareHandler } from "hono";
+import { cors } from "hono/cors";
 import { getCodexAuthStatus } from "./shared/codex.js";
+import {
+  ensureCodexProvider,
+  startCodexProviderRefresh,
+} from "./shared/codex-provider.js";
 
 const app = new Hono();
+const streamHeaders = [
+  "Stream-Next-Offset",
+  "Stream-Up-To-Date",
+  "Stream-Closed",
+  "Stream-Cursor",
+  "ETag",
+];
+
+const getAllowedDesktopOrigins = () =>
+  new Set(
+    (process.env.NAV_DESKTOP_ORIGIN ?? "")
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean),
+  );
+
+const requireDesktopAuth: MiddlewareHandler = async (c, next) => {
+  if (c.req.method === "OPTIONS") {
+    return next();
+  }
+
+  const expectedToken = process.env.NAV_DESKTOP_TOKEN;
+
+  if (!expectedToken) {
+    return c.json({ error: "desktop_auth_not_configured" }, 503);
+  }
+
+  const token = c.req.header("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+
+  if (token !== expectedToken) {
+    return c.notFound();
+  }
+
+  return next();
+};
+
+const requireCodexProvider: MiddlewareHandler = async (c, next) => {
+  if (c.req.method === "OPTIONS") {
+    return next();
+  }
+
+  try {
+    await ensureCodexProvider();
+  } catch (error) {
+    return c.json(
+      {
+        error: "codex_auth_unavailable",
+        message:
+          error instanceof Error
+            ? error.message
+            : "Codex subscription auth is unavailable.",
+      },
+      503,
+    );
+  }
+
+  return next();
+};
+
+void ensureCodexProvider().catch((error: unknown) => {
+  console.error(
+    "[nav] Codex provider not ready at boot:",
+    error instanceof Error ? error.message : error,
+  );
+});
+startCodexProviderRefresh();
 
 app.get("/health", (c) =>
   c.json({
@@ -15,12 +86,31 @@ app.get("/auth/codex/status", async (c) => {
   const auth = await getCodexAuthStatus();
 
   return c.json({
-    ok: auth.status === "ready",
+    // The Nav agent runs on the ChatGPT subscription bearer specifically, so a
+    // ready API-key or access-token credential is not usable here. Report `ok`
+    // only when it matches what the agent path actually requires, otherwise the
+    // status contradicts the 503 every chat request would return.
+    ok: auth.status === "ready" && auth.mode === "chatgpt",
     auth,
   });
 });
 
-// TODO: Require authenticated desktop requests before wiring this into the app.
+app.use(
+  "/api/*",
+  cors({
+    allowHeaders: ["Authorization", "Content-Type"],
+    allowMethods: ["GET", "HEAD", "POST", "OPTIONS"],
+    exposeHeaders: streamHeaders,
+    maxAge: 600,
+    origin: (origin) => {
+      const allowedOrigins = getAllowedDesktopOrigins();
+
+      return allowedOrigins.has(origin) ? origin : null;
+    },
+  }),
+);
+app.use("/api/*", requireDesktopAuth);
+app.use("/api/agents/*", requireCodexProvider);
 app.route("/api", flue());
 
 export default app;

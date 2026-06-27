@@ -172,6 +172,7 @@ packages/desktop/dist/
 packages/flue/.flue/.generated/
 packages/flue/.flue/generated/
 packages/flue/dist/
+packages/flue/data/
 packages/flue/.env
 packages/flue/.env.*
 
@@ -181,3 +182,4 @@ packages/flue/.env.*
 codedb.snapshot
 .commandcode/
 .gnhf/
+.lavish/

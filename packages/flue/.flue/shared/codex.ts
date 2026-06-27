@@ -2,9 +2,6 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { defineTool } from "@flue/runtime";
-import { Codex, type ThreadOptions, type Usage } from "@openai/codex-sdk";
-import * as v from "valibot";
 
 type CodexAuthMode = "access_token" | "chatgpt" | "api_key";
 
@@ -25,32 +22,6 @@ type AuthCache = {
 type TokenCache = {
   access_token?: unknown;
   refresh_token?: unknown;
-};
-
-export const codexTaskInputSchema = v.object({
-  prompt: v.pipe(
-    v.string(),
-    v.minLength(1),
-    v.description("The bounded coding-agent task to run through Codex."),
-  ),
-  threadId: v.optional(
-    v.pipe(
-      v.string(),
-      v.minLength(1),
-      v.description("Existing Codex thread ID to resume."),
-    ),
-  ),
-});
-
-type CodexTaskInput = v.InferOutput<typeof codexTaskInputSchema>;
-
-export type CodexTaskResult = {
-  ok: boolean;
-  auth: CodexAuthStatus;
-  threadId: string | null;
-  finalResponse: string | null;
-  usage: Usage | null;
-  error: string | null;
 };
 
 export async function getCodexAuthStatus(): Promise<CodexAuthStatus> {
@@ -121,61 +92,6 @@ export async function getCodexAuthStatus(): Promise<CodexAuthStatus> {
   };
 }
 
-export async function runCodexTask(
-  input: CodexTaskInput,
-  signal?: AbortSignal,
-): Promise<CodexTaskResult> {
-  const auth = await getCodexAuthStatus();
-
-  if (auth.status !== "ready") {
-    return {
-      ok: false,
-      auth,
-      threadId: null,
-      finalResponse: null,
-      usage: null,
-      error: auth.message,
-    };
-  }
-
-  try {
-    const codex = new Codex();
-    const threadOptions = getThreadOptions();
-    const thread = input.threadId
-      ? codex.resumeThread(input.threadId, threadOptions)
-      : codex.startThread(threadOptions);
-    const result = await thread.run(input.prompt, { signal });
-
-    return {
-      ok: true,
-      auth,
-      threadId: thread.id,
-      finalResponse: result.finalResponse,
-      usage: result.usage,
-      error: null,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      auth,
-      threadId: input.threadId ?? null,
-      finalResponse: null,
-      usage: null,
-      error: error instanceof Error ? error.message : "Codex run failed.",
-    };
-  }
-}
-
-export const runCodexTaskTool = defineTool({
-  name: "run_codex_task",
-  description:
-    "Run a bounded Codex local task using the user's Codex ChatGPT subscription auth or CODEX_ACCESS_TOKEN.",
-  input: codexTaskInputSchema,
-  async run({ input, signal }) {
-    return await runCodexTask(input, signal);
-  },
-});
-
 async function readAuthCache(): Promise<AuthCache | null> {
   const authPath = join(getCodexHome(), "auth.json");
 
@@ -188,22 +104,12 @@ async function readAuthCache(): Promise<AuthCache | null> {
   }
 }
 
-function getCodexHome(): string {
+export function getCodexHome(): string {
   const configured = process.env.CODEX_HOME?.trim();
   return configured ? configured : join(homedir(), ".codex");
 }
 
-function getThreadOptions(): ThreadOptions {
-  return {
-    approvalPolicy: "never",
-    model: process.env.NAV_CODEX_MODEL?.trim() || undefined,
-    sandboxMode: "read-only",
-    webSearchMode: "disabled",
-    workingDirectory: getWorkspaceRoot(),
-  };
-}
-
-function getWorkspaceRoot(): string {
+export function getWorkspaceRoot(): string {
   const configured = process.env.NAV_CODEX_WORKDIR?.trim();
   if (configured) return resolve(configured);
 
