@@ -1,27 +1,39 @@
 import type { UIMessage, UIMessagePart } from "@flue/react";
-import { WrenchIcon } from "lucide-react";
+import {
+  BrainIcon,
+  ChevronDownIcon,
+  FileTextIcon,
+  PencilIcon,
+  SearchIcon,
+  TerminalIcon,
+  WrenchIcon,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
-import {
-  ChainOfThought,
-  ChainOfThoughtContent,
-  ChainOfThoughtHeader,
-  ChainOfThoughtStep,
-} from "@/components/ai-elements/chain-of-thought";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
-  Tool,
-  ToolContent,
-  ToolHeader,
-  ToolInput,
-  ToolOutput,
-} from "@/components/ai-elements/tool";
+  Task,
+  TaskContent,
+  TaskItem,
+  TaskTrigger,
+} from "@/components/ai-elements/task";
 
 type TextPart = Extract<UIMessagePart, { type: "text" }>;
 type ReasoningPart = Extract<UIMessagePart, { type: "reasoning" }>;
 type DynamicToolPart = Extract<UIMessagePart, { type: "dynamic-tool" }>;
 type ActivityPart = ReasoningPart | DynamicToolPart;
 type KeyedActivityPart = { key: string; part: ActivityPart };
+type ActivitySummaryKind =
+  | "command"
+  | "edit"
+  | "other"
+  | "read"
+  | "reasoning"
+  | "search";
+type ActivitySummary = {
+  kind: ActivitySummaryKind;
+  title: string;
+};
 
 type RenderItem =
   | { type: "text"; key: string; part: TextPart }
@@ -38,14 +50,202 @@ const isActiveActivityPart = (part: ActivityPart) =>
   (part.type === "reasoning" && part.state === "streaming") ||
   (part.type === "dynamic-tool" && part.state === "input-available");
 
-const toolStepStatus = (
-  state: DynamicToolPart["state"],
-): "active" | "complete" | "pending" =>
-  state === "input-available" ? "active" : "complete";
+const COMMAND_TOOL_NAMES = new Set([
+  "bash",
+  "command",
+  "exec",
+  "exec_command",
+  "run_command",
+  "shell",
+]);
+const EDIT_TOOL_NAMES = new Set([
+  "apply_patch",
+  "delete",
+  "edit",
+  "write",
+  "write_file",
+]);
+const READ_TOOL_NAMES = new Set(["cat", "read", "read_file"]);
+const SEARCH_TOOL_NAMES = new Set([
+  "find",
+  "glob",
+  "grep",
+  "list",
+  "ls",
+  "rg",
+  "search",
+]);
+
+const capitalize = (text: string) =>
+  text.charAt(0).toUpperCase() + text.slice(1);
+
+const joinPhrases = (phrases: string[]) => {
+  if (phrases.length <= 1) {
+    return phrases[0] ?? "";
+  }
+
+  if (phrases.length === 2) {
+    return `${phrases[0]} and ${phrases[1]}`;
+  }
+
+  return `${phrases.slice(0, -1).join(", ")}, and ${phrases.at(-1)}`;
+};
+
+const normalizeToolName = (name: string) =>
+  name.trim().toLowerCase().replaceAll("-", "_");
+
+const getToolKind = (toolName: string): ActivitySummaryKind => {
+  const name = normalizeToolName(toolName);
+
+  if (EDIT_TOOL_NAMES.has(name)) {
+    return "edit";
+  }
+
+  if (READ_TOOL_NAMES.has(name)) {
+    return "read";
+  }
+
+  if (SEARCH_TOOL_NAMES.has(name)) {
+    return "search";
+  }
+
+  if (COMMAND_TOOL_NAMES.has(name)) {
+    return "command";
+  }
+
+  return "other";
+};
+
+const countToolKinds = (parts: KeyedActivityPart[]) =>
+  parts.reduce<Record<ActivitySummaryKind, number>>(
+    (counts, { part }) => {
+      if (part.type === "reasoning") {
+        counts.reasoning += 1;
+        return counts;
+      }
+
+      counts[getToolKind(part.toolName)] += 1;
+      return counts;
+    },
+    {
+      command: 0,
+      edit: 0,
+      other: 0,
+      read: 0,
+      reasoning: 0,
+      search: 0,
+    },
+  );
+
+const createActivitySummary = (parts: KeyedActivityPart[]): ActivitySummary => {
+  const counts = countToolKinds(parts);
+  const phrases: string[] = [];
+
+  if (counts.edit > 0) {
+    phrases.push(
+      counts.edit === 1 ? "Edited a file" : `Edited ${counts.edit} files`,
+    );
+  }
+
+  if (counts.read > 0) {
+    phrases.push(
+      counts.read === 1 ? "Read a file" : `Read ${counts.read} files`,
+    );
+  }
+
+  if (counts.search > 0) {
+    phrases.push("searched code");
+  }
+
+  if (counts.other > 0) {
+    phrases.push(
+      counts.other === 1 ? "used a tool" : `used ${counts.other} tools`,
+    );
+  }
+
+  const commandPhrase =
+    counts.command > 0
+      ? `ran ${counts.command} command${counts.command === 1 ? "" : "s"}`
+      : "";
+  const nonCommandSummary = joinPhrases(phrases);
+  const title =
+    nonCommandSummary && commandPhrase
+      ? `${nonCommandSummary}, ${commandPhrase}`
+      : nonCommandSummary || capitalize(commandPhrase);
+
+  if (title) {
+    return {
+      kind:
+        counts.edit > 0
+          ? "edit"
+          : counts.command > 0
+            ? "command"
+            : counts.read > 0
+              ? "read"
+              : counts.search > 0
+                ? "search"
+                : "other",
+      title,
+    };
+  }
+
+  return {
+    kind: "reasoning" as const,
+    title: "Thought through the task",
+  };
+};
+
+const getToolActionLabel = (toolName: string) => {
+  switch (getToolKind(toolName)) {
+    case "command":
+      return "Ran command";
+    case "edit":
+      return "Edited file";
+    case "read":
+      return "Read file";
+    case "search":
+      return "Searched code";
+    case "other":
+    case "reasoning":
+      return `Used ${toolName}`;
+  }
+};
+
+const getToolDetail = (part: DynamicToolPart) => {
+  const action = getToolActionLabel(part.toolName);
+
+  switch (part.state) {
+    case "input-available":
+      return `${action} running`;
+    case "output-error":
+      return part.errorText
+        ? `${action} failed: ${part.errorText}`
+        : `${action} failed`;
+    default:
+      return action;
+  }
+};
+
+function ActivitySummaryIcon({ kind }: { kind: ActivitySummaryKind }) {
+  switch (kind) {
+    case "command":
+      return <TerminalIcon className="size-4 shrink-0" />;
+    case "edit":
+      return <PencilIcon className="size-4 shrink-0" />;
+    case "read":
+      return <FileTextIcon className="size-4 shrink-0" />;
+    case "search":
+      return <SearchIcon className="size-4 shrink-0" />;
+    case "reasoning":
+      return <BrainIcon className="size-4 shrink-0" />;
+    case "other":
+      return <WrenchIcon className="size-4 shrink-0" />;
+  }
+}
 
 // Renders a Flue UIMessage by walking its parts in order instead of flattening
 // everything into assistant text: `text` becomes the markdown answer, and
-// thinking/tool parts share one stable Activity block. Narrow by `part.type`
+// thinking/tool parts share one stable Task block. Narrow by `part.type`
 // — these are @flue/react's part types, which only overlap with the AI SDK
 // types the generated components are written against.
 function TextPartView({ part }: { part: TextPart }) {
@@ -57,44 +257,13 @@ function ActivityPartView({ part }: { part: ActivityPart }) {
     case "reasoning":
       // Don't render empty reasoning chrome (e.g. a started-but-empty block).
       return part.text.trim() ? (
-        <MessageResponse className="text-muted-foreground text-sm">
-          {part.text}
-        </MessageResponse>
+        <TaskItem>
+          <MessageResponse>{part.text}</MessageResponse>
+        </TaskItem>
       ) : null;
 
-    case "dynamic-tool": {
-      const output =
-        part.state === "output-available" ? part.output : undefined;
-      const errorText =
-        part.state === "output-error" ? part.errorText : undefined;
-
-      return (
-        <ChainOfThoughtStep
-          icon={WrenchIcon}
-          label={<span>{part.toolName}</span>}
-          status={toolStepStatus(part.state)}
-        >
-          <Tool
-            className="mt-2 mb-0 border-border/70 bg-background/70"
-            defaultOpen={
-              part.state === "input-available" || part.state === "output-error"
-            }
-          >
-            <ToolHeader
-              className="p-2 text-xs"
-              state={part.state}
-              title="Details"
-              toolName={part.toolName}
-              type={part.type}
-            />
-            <ToolContent className="space-y-3 border-t p-3">
-              <ToolInput input={part.input} />
-              <ToolOutput errorText={errorText} output={output} />
-            </ToolContent>
-          </Tool>
-        </ChainOfThoughtStep>
-      );
-    }
+    case "dynamic-tool":
+      return <TaskItem>{getToolDetail(part)}</TaskItem>;
   }
 }
 
@@ -126,16 +295,28 @@ function ActivityView({
     hasUserToggledRef.current = true;
     setIsOpen(open);
   };
+  const summary = createActivitySummary(parts);
 
   return (
-    <ChainOfThought onOpenChange={handleOpenChange} open={isOpen}>
-      <ChainOfThoughtHeader>Activity</ChainOfThoughtHeader>
-      <ChainOfThoughtContent>
+    <Task
+      className="not-prose w-full"
+      defaultOpen={shouldAutoOpen}
+      onOpenChange={handleOpenChange}
+      open={isOpen}
+    >
+      <TaskTrigger title={summary.title}>
+        <div className="flex w-full cursor-pointer items-center gap-2 text-muted-foreground text-sm transition-colors hover:text-foreground">
+          <ActivitySummaryIcon kind={summary.kind} />
+          <p className="min-w-0 flex-1 truncate text-sm">{summary.title}</p>
+          <ChevronDownIcon className="size-4 shrink-0 transition-transform group-data-[state=open]:rotate-180" />
+        </div>
+      </TaskTrigger>
+      <TaskContent>
         {parts.map(({ key, part }) => (
           <ActivityPartView key={key} part={part} />
         ))}
-      </ChainOfThoughtContent>
-    </ChainOfThought>
+      </TaskContent>
+    </Task>
   );
 }
 
