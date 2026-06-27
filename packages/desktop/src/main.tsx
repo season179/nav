@@ -5,7 +5,7 @@ import {
   LoaderCircleIcon,
   MessageSquareTextIcon,
 } from "lucide-react";
-import { StrictMode, useEffect, useMemo, useState } from "react";
+import { StrictMode, useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 import {
@@ -39,6 +39,7 @@ import {
 } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { FlueConnection, FlueServerStatus } from "@/lib/flue-connection";
+import { createSessionsClient, type NavSession } from "@/lib/sessions-client";
 
 import "./styles.css";
 
@@ -64,6 +65,15 @@ const createUuidV7 = () => {
 
   return formatUuidBytes(bytes);
 };
+
+const ACTIVE_SESSION_STORAGE_KEY = "nav.activeSessionId";
+
+const rememberActiveSession = (id: string) => {
+  window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, id);
+};
+
+const getRememberedActiveSession = () =>
+  window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
 
 function EmptyConversation() {
   return (
@@ -215,8 +225,16 @@ function PromptComposer({
   );
 }
 
-function NavChat({ serverStatus }: { serverStatus: FlueServerStatus | null }) {
-  const [conversationId] = useState(() => createUuidV7());
+function NavChat({
+  conversationId,
+  onSessionAdmitted,
+  serverStatus,
+}: {
+  conversationId: string;
+  onSessionAdmitted: (id: string, title: string) => Promise<void>;
+  serverStatus: FlueServerStatus | null;
+}) {
+  const [sessionError, setSessionError] = useState<string | null>(null);
   const { messages, status, error, sendMessage } = useFlueAgent({
     id: conversationId,
     name: "nav",
@@ -246,16 +264,26 @@ function NavChat({ serverStatus }: { serverStatus: FlueServerStatus | null }) {
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden">
-      {error && (
+      {(error || sessionError) && (
         <div className="mx-auto mt-4 w-full max-w-3xl rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive text-sm">
-          {error.message}
+          {error?.message ?? sessionError}
         </div>
       )}
       <LiveConversation isThinking={isThinking} messages={messages} />
       <PromptComposer
         disabled={disabled}
         onSubmit={async (text) => {
+          setSessionError(null);
           await sendMessage(text);
+          try {
+            await onSessionAdmitted(conversationId, text);
+          } catch (caught) {
+            setSessionError(
+              caught instanceof Error
+                ? caught.message
+                : "Chat was saved, but the sidebar did not refresh.",
+            );
+          }
         }}
         status={composerStatus}
       />
@@ -264,10 +292,14 @@ function NavChat({ serverStatus }: { serverStatus: FlueServerStatus | null }) {
 }
 
 function ConnectedApp({
+  activeSessionId,
   connection,
+  onSessionAdmitted,
   serverStatus,
 }: {
+  activeSessionId: string | null;
   connection: FlueConnection;
+  onSessionAdmitted: (id: string, title: string) => Promise<void>;
   serverStatus: FlueServerStatus | null;
 }) {
   const client = useMemo(
@@ -280,19 +312,79 @@ function ConnectedApp({
     [connection.baseUrl, connection.token],
   );
 
+  if (!activeSessionId) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        <ConnectionEmpty message="Loading chats." state="starting" />
+      </div>
+    );
+  }
+
   return (
     <FlueProvider client={client}>
-      <NavChat serverStatus={serverStatus} />
+      <NavChat
+        conversationId={activeSessionId}
+        key={activeSessionId}
+        onSessionAdmitted={onSessionAdmitted}
+        serverStatus={serverStatus}
+      />
     </FlueProvider>
   );
 }
 
-function AppContent() {
+function AppShell() {
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(() =>
+    getRememberedActiveSession(),
+  );
   const [connection, setConnection] = useState<FlueConnection | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [draftSessionId, setDraftSessionId] = useState<string | null>(null);
+  const [sessions, setSessions] = useState<NavSession[]>([]);
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
+  const [sessionsLoaded, setSessionsLoaded] = useState(false);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
   const [serverStatus, setServerStatus] = useState<FlueServerStatus | null>(
     null,
   );
+  const sessionsClient = useMemo(
+    () => (connection ? createSessionsClient(connection) : null),
+    [connection],
+  );
+
+  const activateSession = useCallback((id: string, draft: boolean) => {
+    setActiveSessionId(id);
+    setDraftSessionId(draft ? id : null);
+    rememberActiveSession(id);
+  }, []);
+
+  const refreshSessions = useCallback(async () => {
+    if (!sessionsClient) {
+      setSessions([]);
+      setSessionsLoaded(false);
+
+      return [];
+    }
+
+    setSessionsError(null);
+    setSessionsLoaded(false);
+    setSessionsLoading(true);
+
+    try {
+      const nextSessions = await sessionsClient.listSessions();
+      setSessions(nextSessions);
+
+      return nextSessions;
+    } catch (caught) {
+      setSessionsError(
+        caught instanceof Error ? caught.message : "Unable to load chats.",
+      );
+
+      return [];
+    } finally {
+      setSessionsLoaded(true);
+      setSessionsLoading(false);
+    }
+  }, [sessionsClient]);
 
   useEffect(() => {
     const unsubscribe = window.navDesktop.onFlueStatus(setServerStatus);
@@ -312,40 +404,175 @@ function AppContent() {
     return unsubscribe;
   }, []);
 
-  if (connectionError) {
-    return (
-      <div className="flex min-h-0 flex-1 flex-col">
-        <ConnectionEmpty message={connectionError} state="failed" />
-      </div>
-    );
-  }
+  useEffect(() => {
+    void refreshSessions();
+  }, [refreshSessions]);
 
-  if (!connection) {
-    return (
-      <div className="flex min-h-0 flex-1 flex-col">
+  useEffect(() => {
+    if (!sessionsClient) {
+      return;
+    }
+
+    const handleFocus = () => {
+      void refreshSessions();
+    };
+
+    window.addEventListener("focus", handleFocus);
+
+    return () => window.removeEventListener("focus", handleFocus);
+  }, [refreshSessions, sessionsClient]);
+
+  useEffect(() => {
+    if (!sessionsLoaded || !connection || sessionsError) {
+      return;
+    }
+
+    if (!activeSessionId) {
+      const rememberedId = getRememberedActiveSession();
+      const rememberedSession = sessions.find(
+        (session) => session.id === rememberedId,
+      );
+      const nextId = rememberedSession?.id ?? sessions[0]?.id ?? createUuidV7();
+
+      activateSession(nextId, !rememberedSession && sessions.length === 0);
+      return;
+    }
+
+    if (draftSessionId === activeSessionId) {
+      return;
+    }
+
+    if (sessions.some((session) => session.id === activeSessionId)) {
+      return;
+    }
+
+    const fallbackId = sessions[0]?.id ?? createUuidV7();
+    activateSession(fallbackId, sessions.length === 0);
+  }, [
+    activateSession,
+    activeSessionId,
+    connection,
+    draftSessionId,
+    sessions,
+    sessionsError,
+    sessionsLoaded,
+  ]);
+
+  const handleNewChat = useCallback(() => {
+    activateSession(createUuidV7(), true);
+  }, [activateSession]);
+
+  const handleSessionAdmitted = useCallback(
+    async (id: string, title: string) => {
+      if (!sessionsClient) {
+        return;
+      }
+
+      await sessionsClient.createSession(id, title);
+
+      const nextSessions = await refreshSessions();
+
+      if (nextSessions.some((session) => session.id === id)) {
+        setDraftSessionId((current) => (current === id ? null : current));
+      }
+    },
+    [refreshSessions, sessionsClient],
+  );
+
+  const handleRenameSession = useCallback(
+    async (id: string, title: string) => {
+      if (!sessionsClient) {
+        return;
+      }
+
+      await sessionsClient.renameSession(id, title);
+      await refreshSessions();
+    },
+    [refreshSessions, sessionsClient],
+  );
+
+  const handleDeleteSession = useCallback(
+    async (id: string) => {
+      if (!sessionsClient) {
+        return;
+      }
+
+      await sessionsClient.deleteSession(id);
+
+      if (activeSessionId === id) {
+        const fallback = sessions.find((session) => session.id !== id);
+
+        if (fallback) {
+          activateSession(fallback.id, false);
+        } else {
+          activateSession(createUuidV7(), true);
+        }
+      }
+
+      await refreshSessions();
+    },
+    [
+      activateSession,
+      activeSessionId,
+      refreshSessions,
+      sessions,
+      sessionsClient,
+    ],
+  );
+
+  const chatContent = (() => {
+    if (connectionError) {
+      return <ConnectionEmpty message={connectionError} state="failed" />;
+    }
+
+    if (!connection) {
+      return (
         <ConnectionEmpty
           message={
             serverStatus?.message ?? "Waiting for the local Flue server."
           }
           state={serverStatus?.state === "failed" ? "failed" : "starting"}
         />
-      </div>
-    );
-  }
+      );
+    }
 
-  return <ConnectedApp connection={connection} serverStatus={serverStatus} />;
+    return (
+      <ConnectedApp
+        activeSessionId={activeSessionId}
+        connection={connection}
+        onSessionAdmitted={handleSessionAdmitted}
+        serverStatus={serverStatus}
+      />
+    );
+  })();
+
+  return (
+    <>
+      <AppSidebar
+        activeSessionId={activeSessionId}
+        error={sessionsError}
+        isDraftActive={draftSessionId === activeSessionId}
+        loading={sessionsLoading}
+        onDeleteSession={handleDeleteSession}
+        onNewChat={handleNewChat}
+        onRenameSession={handleRenameSession}
+        onSelectSession={(id) => activateSession(id, false)}
+        sessions={sessions}
+      />
+      <div className="fixed inset-x-0 top-0 z-40 h-10 [-webkit-app-region:drag]" />
+      <SidebarTrigger className="fixed top-1 left-[76px] z-50 [-webkit-app-region:no-drag] [&_svg]:!size-[18px]" />
+      <SidebarInset className="h-svh overflow-hidden pt-10">
+        <div className="flex h-full min-h-0 flex-1 flex-col">{chatContent}</div>
+      </SidebarInset>
+    </>
+  );
 }
 
 function App() {
   return (
     <TooltipProvider>
       <SidebarProvider className="h-svh overflow-hidden">
-        <AppSidebar />
-        <div className="fixed inset-x-0 top-0 z-40 h-10 [-webkit-app-region:drag]" />
-        <SidebarTrigger className="fixed top-1 left-[76px] z-50 [-webkit-app-region:no-drag] [&_svg]:!size-[18px]" />
-        <SidebarInset className="h-svh overflow-hidden pt-10">
-          <AppContent />
-        </SidebarInset>
+        <AppShell />
       </SidebarProvider>
     </TooltipProvider>
   );

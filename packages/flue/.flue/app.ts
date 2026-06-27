@@ -7,6 +7,13 @@ import {
   startCodexProviderRefresh,
 } from "./shared/codex-provider.js";
 import { ensureDeepseekProvider } from "./shared/deepseek-provider.js";
+import {
+  ensureNavSessionsReady,
+  handleCreateNavSession,
+  handleDeleteNavSession,
+  handleListNavSessions,
+  handleUpdateNavSession,
+} from "./shared/nav-sessions.js";
 import { pruneAgentWorktrees } from "./shared/worktrees.js";
 import { ensureZaiProvider } from "./shared/zai-provider.js";
 
@@ -79,6 +86,12 @@ void ensureCodexProvider().catch((error: unknown) => {
 startCodexProviderRefresh();
 ensureDeepseekProvider();
 ensureZaiProvider();
+void ensureNavSessionsReady().catch((error: unknown) => {
+  console.error(
+    "[nav] Session registry not ready at boot:",
+    error instanceof Error ? error.message : error,
+  );
+});
 try {
   pruneAgentWorktrees();
 } catch (error) {
@@ -112,7 +125,7 @@ app.use(
   "/api/*",
   cors({
     allowHeaders: ["Authorization", "Content-Type"],
-    allowMethods: ["GET", "HEAD", "POST", "OPTIONS"],
+    allowMethods: ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"],
     exposeHeaders: streamHeaders,
     maxAge: 600,
     origin: (origin) => {
@@ -123,6 +136,10 @@ app.use(
   }),
 );
 app.use("/api/*", requireDesktopAuth);
+app.get("/api/sessions", handleListNavSessions);
+app.post("/api/sessions", handleCreateNavSession);
+app.patch("/api/sessions/:id", handleUpdateNavSession);
+app.delete("/api/sessions/:id", handleDeleteNavSession);
 app.use("/api/agents/nav/*", requireCodexProvider);
 app.route("/api", flue());
 
