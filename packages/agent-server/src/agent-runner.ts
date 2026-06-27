@@ -8,6 +8,7 @@ import {
   createUIMessageStreamResponse,
   type ModelMessage,
   toUIMessageStream,
+  type UIMessage,
 } from "ai";
 import { OverlayFs } from "just-bash";
 
@@ -20,9 +21,14 @@ const SANDBOX_WORKSPACE_CWD = `${SANDBOX_WORKSPACE_ROOT}/${SANDBOX_WORKSPACE_NAM
 const NAV_AGENT_INSTRUCTIONS =
   "You are Nav, a local coding agent running in the current workspace. Keep answers concise and use tools only when they materially help.";
 
+export interface AgentRunMessages {
+  modelMessages: ModelMessage[];
+  uiMessages: UIMessage[];
+}
+
 export interface AgentRunner {
   createResponse(
-    messages: ModelMessage[],
+    messages: AgentRunMessages,
     options?: { signal?: AbortSignal },
   ): Promise<Response> | Response;
 }
@@ -78,7 +84,7 @@ const getLatestUserText = (messages: ModelMessage[]): string => {
 
 export class PiAgentRunner implements AgentRunner {
   async createResponse(
-    messages: ModelMessage[],
+    { modelMessages, uiMessages }: AgentRunMessages,
     options: { signal?: AbortSignal } = {},
   ): Promise<Response> {
     const { provider: _provider, ...piSettings } =
@@ -117,13 +123,16 @@ export class PiAgentRunner implements AgentRunner {
     try {
       const result = await agent.stream({
         abortSignal: options.signal,
-        messages,
+        messages: modelMessages,
         session,
       });
       const stream = toUIMessageStream({
         onEnd: destroySession,
-        onError: (error) =>
-          error instanceof Error ? error.message : String(error),
+        onError: (error) => {
+          console.error("Nav agent stream failed.", error);
+          return "The agent run failed. Check the server logs for details.";
+        },
+        originalMessages: uiMessages,
         stream: result.stream,
         tools: agent.tools,
       });
@@ -137,8 +146,8 @@ export class PiAgentRunner implements AgentRunner {
 }
 
 export class MockAgentRunner implements AgentRunner {
-  createResponse(messages: ModelMessage[]): Response {
-    const text = getLatestUserText(messages);
+  createResponse({ modelMessages }: AgentRunMessages): Response {
+    const text = getLatestUserText(modelMessages);
     const stream = createUIMessageStream({
       execute: ({ writer }) => {
         writer.write({ id: TEXT_PART_ID, type: "text-start" });

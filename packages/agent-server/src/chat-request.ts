@@ -5,6 +5,8 @@ import {
   type UIMessage,
 } from "ai";
 
+const DIRECT_MESSAGE_ID = "direct-message";
+
 export class ChatRequestError extends Error {
   constructor(
     readonly status: number,
@@ -19,20 +21,15 @@ interface ChatRequestBody {
   messages?: unknown;
 }
 
-interface MessagePart {
-  type?: unknown;
-  text?: unknown;
-}
-
 interface RequestMessage {
   role?: unknown;
   content?: unknown;
   parts?: unknown;
 }
 
-interface TextMessage {
-  role: "assistant" | "user";
-  text: string;
+export interface ChatMessages {
+  modelMessages: ModelMessage[];
+  uiMessages: UIMessage[];
 }
 
 const parseJsonBody = async (request: Request): Promise<ChatRequestBody> => {
@@ -49,9 +46,17 @@ const getTextFromParts = (parts: unknown): string => {
   }
 
   return parts
-    .map((part: MessagePart) =>
-      part?.type === "text" && typeof part.text === "string" ? part.text : "",
-    )
+    .map((part) => {
+      if (!part || typeof part !== "object") {
+        return "";
+      }
+
+      const maybeTextPart = part as { text?: unknown; type?: unknown };
+      return maybeTextPart.type === "text" &&
+        typeof maybeTextPart.text === "string"
+        ? maybeTextPart.text
+        : "";
+    })
     .join("");
 };
 
@@ -69,62 +74,81 @@ const getTextFromMessage = (message: unknown): string => {
   return getTextFromParts(requestMessage.parts);
 };
 
-const toTextMessage = (message: unknown): TextMessage | undefined => {
-  if (!message || typeof message !== "object") {
-    return undefined;
-  }
+const createSingleUserMessage = (text: string): UIMessage => ({
+  id: DIRECT_MESSAGE_ID,
+  parts: [{ text, type: "text" }],
+  role: "user",
+});
 
-  const requestMessage = message as RequestMessage;
-  const { role } = requestMessage;
-  if (role !== "assistant" && role !== "user") {
-    return undefined;
-  }
+const isUnsupportedAttachmentPart = (type: string): boolean =>
+  type === "file" || type === "reasoning-file" || type.startsWith("data-");
 
-  const text = getTextFromMessage(requestMessage).trim();
-  return text ? { role, text } : undefined;
+const assertSupportedMessages = (messages: UIMessage[]) => {
+  for (const message of messages) {
+    if (message.role === "system") {
+      throw new ChatRequestError(
+        400,
+        "System messages are not accepted from clients.",
+      );
+    }
+
+    for (const part of message.parts) {
+      const { type } = part;
+
+      if (isUnsupportedAttachmentPart(type)) {
+        throw new ChatRequestError(
+          400,
+          "File and data message parts are not supported yet.",
+        );
+      }
+
+      if (message.role === "user" && type !== "text") {
+        throw new ChatRequestError(
+          400,
+          "Only text user messages are supported yet.",
+        );
+      }
+    }
+  }
 };
 
-const formatPrompt = (messages: TextMessage[]): string => {
-  const latestUserIndex = messages.findLastIndex(
-    (message) => message.role === "user",
+const hasUserTextMessage = (messages: UIMessage[]): boolean =>
+  messages.some(
+    (message) =>
+      message.role === "user" &&
+      message.parts.some(
+        (part) => part.type === "text" && part.text.trim().length > 0,
+      ),
   );
-  if (latestUserIndex === -1) {
+
+const toChatMessages = async (
+  uiMessages: UIMessage[],
+): Promise<ChatMessages> => {
+  assertSupportedMessages(uiMessages);
+  if (!hasUserTextMessage(uiMessages)) {
     throw new ChatRequestError(400, "Expected a non-empty user message.");
   }
 
-  const latestUserMessage = messages[latestUserIndex];
-  const history = messages.slice(0, latestUserIndex);
-  if (history.length === 0) {
-    return latestUserMessage.text;
+  try {
+    return {
+      modelMessages: await convertToModelMessages(uiMessages, {
+        ignoreIncompleteToolCalls: true,
+      }),
+      uiMessages,
+    };
+  } catch {
+    throw new ChatRequestError(400, "Expected convertible UI messages.");
   }
-
-  return [
-    "Conversation so far:",
-    ...history.map((message) => `${message.role}: ${message.text}`),
-    "",
-    "Current user request:",
-    latestUserMessage.text,
-  ].join("\n");
 };
-
-const toSingleUserModelMessage = async (
-  text: string,
-): Promise<ModelMessage[]> =>
-  convertToModelMessages([
-    {
-      parts: [{ text, type: "text" }],
-      role: "user",
-    },
-  ] satisfies Array<Omit<UIMessage, "id">>);
 
 export const readChatMessages = async (
   request: Request,
-): Promise<ModelMessage[]> => {
+): Promise<ChatMessages> => {
   const body = await parseJsonBody(request);
 
   const directMessageText = getTextFromMessage(body.message).trim();
   if (directMessageText) {
-    return toSingleUserModelMessage(directMessageText);
+    return toChatMessages([createSingleUserMessage(directMessageText)]);
   }
 
   if (!Array.isArray(body.messages)) {
@@ -138,14 +162,5 @@ export const readChatMessages = async (
     throw new ChatRequestError(400, "Expected valid UI messages.");
   }
 
-  const prompt = formatPrompt(
-    validated.data
-      .map(toTextMessage)
-      .filter((message): message is TextMessage => message !== undefined),
-  );
-  if (!prompt) {
-    throw new ChatRequestError(400, "Expected a non-empty user message.");
-  }
-
-  return toSingleUserModelMessage(prompt);
+  return toChatMessages(validated.data);
 };

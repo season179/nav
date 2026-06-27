@@ -55,8 +55,8 @@ export const handleAgentRequest = async (
 
   if (request.method === "POST" && url.pathname === "/api/chat") {
     try {
-      const messages = await readChatMessages(request);
-      const response = await runner.createResponse(messages, {
+      const chatMessages = await readChatMessages(request);
+      const response = await runner.createResponse(chatMessages, {
         signal: request.signal,
       });
       const headers = new Headers(response.headers);
@@ -207,7 +207,8 @@ export const createAgentServer = (options: AgentServerOptions = {}) => {
         serverResponse.setHeader("content-type", "application/json");
         serverResponse.end(
           JSON.stringify({
-            error: error instanceof Error ? error.message : String(error),
+            error:
+              "Nav request failed. Check the agent server logs for details.",
           }),
         );
       });

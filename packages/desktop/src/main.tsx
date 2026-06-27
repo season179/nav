@@ -1,6 +1,12 @@
 import { useChat } from "@ai-sdk/react";
-import type { UIMessage } from "ai";
-import { DefaultChatTransport } from "ai";
+import {
+  DefaultChatTransport,
+  type DynamicToolUIPart,
+  isDynamicToolUIPart,
+  isToolUIPart,
+  type ToolUIPart,
+  type UIMessage,
+} from "ai";
 import { MessagesSquareIcon } from "lucide-react";
 import { StrictMode, useMemo } from "react";
 import { createRoot } from "react-dom/client";
@@ -17,11 +23,21 @@ import {
 } from "@/components/ai-elements/message";
 import {
   PromptInput,
-  PromptInputBody,
-  PromptInputFooter,
   PromptInputSubmit,
   PromptInputTextarea,
 } from "@/components/ai-elements/prompt-input";
+import {
+  Reasoning,
+  ReasoningContent,
+  ReasoningTrigger,
+} from "@/components/ai-elements/reasoning";
+import {
+  Tool,
+  ToolContent,
+  ToolHeader,
+  ToolInput,
+  ToolOutput,
+} from "@/components/ai-elements/tool";
 import { AppSidebar } from "@/components/app-sidebar";
 import {
   Empty,
@@ -30,6 +46,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty";
+import { InputGroupAddon } from "@/components/ui/input-group";
 import {
   SidebarInset,
   SidebarProvider,
@@ -42,11 +59,56 @@ import "./styles.css";
 const agentServerUrl =
   import.meta.env.VITE_NAV_AGENT_SERVER_URL ?? "http://127.0.0.1:3583";
 
-const getMessageText = (message: UIMessage) =>
-  message.parts
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("");
+type ToolMessagePart = DynamicToolUIPart | ToolUIPart;
+
+function ChatToolPart({ part }: { part: ToolMessagePart }) {
+  return (
+    <Tool defaultOpen={part.state !== "output-available"}>
+      {isDynamicToolUIPart(part) ? (
+        <ToolHeader
+          state={part.state}
+          toolName={part.toolName}
+          type={part.type}
+        />
+      ) : (
+        <ToolHeader state={part.state} type={part.type} />
+      )}
+      <ToolContent>
+        {part.input === undefined ? null : <ToolInput input={part.input} />}
+        <ToolOutput errorText={part.errorText} output={part.output} />
+      </ToolContent>
+    </Tool>
+  );
+}
+
+function ChatMessageParts({ message }: { message: UIMessage }) {
+  return message.parts.map((part, index) => {
+    const key = `${message.id}-${part.type}-${index}`;
+
+    if (part.type === "text") {
+      return <MessageResponse key={key}>{part.text}</MessageResponse>;
+    }
+
+    if (part.type === "reasoning") {
+      return (
+        <Reasoning
+          defaultOpen={part.state === "streaming"}
+          isStreaming={part.state === "streaming"}
+          key={key}
+        >
+          <ReasoningTrigger />
+          <ReasoningContent>{part.text}</ReasoningContent>
+        </Reasoning>
+      );
+    }
+
+    if (isToolUIPart(part) || isDynamicToolUIPart(part)) {
+      return <ChatToolPart key={key} part={part} />;
+    }
+
+    return null;
+  });
+}
 
 function EmptyConversation() {
   return (
@@ -75,8 +137,10 @@ function ChatConversation({
         {messages.length === 0 ? <EmptyConversation /> : null}
         {messages.map((message) => (
           <Message from={message.role} key={message.id}>
-            <MessageContent>
-              <MessageResponse>{getMessageText(message)}</MessageResponse>
+            <MessageContent
+              className={message.role === "assistant" ? "w-full" : undefined}
+            >
+              <ChatMessageParts message={message} />
             </MessageContent>
           </Message>
         ))}
@@ -109,12 +173,10 @@ function PromptComposer({
         className="mx-auto max-w-3xl"
         onSubmit={(message) => onSubmit(message.text)}
       >
-        <PromptInputBody>
-          <PromptInputTextarea placeholder="Message Nav" />
-        </PromptInputBody>
-        <PromptInputFooter>
+        <PromptInputTextarea placeholder="Message Nav" />
+        <InputGroupAddon align="inline-end">
           <PromptInputSubmit onStop={stop} status={status} />
-        </PromptInputFooter>
+        </InputGroupAddon>
       </PromptInput>
     </div>
   );

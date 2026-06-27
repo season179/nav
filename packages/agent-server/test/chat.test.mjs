@@ -39,8 +39,8 @@ const getTextContent = (message) => {
 };
 
 const runner = {
-  createResponse(messages) {
-    const latestMessage = messages.findLast(
+  createResponse({ modelMessages }) {
+    const latestMessage = modelMessages.findLast(
       (message) => message.role === "user",
     );
     return createRunnerResponse(`hello ${getTextContent(latestMessage)}`);
@@ -91,6 +91,7 @@ test("chat streams a UI message response", async () => {
 
 test("chat passes text history as model messages", async () => {
   let capturedMessages = [];
+  let capturedUiMessages = [];
   const response = await handleAgentRequest(
     createChatRequest({
       messages: [
@@ -112,8 +113,9 @@ test("chat passes text history as model messages", async () => {
       ],
     }),
     {
-      createResponse(messages) {
-        capturedMessages = messages;
+      createResponse({ modelMessages, uiMessages }) {
+        capturedMessages = modelMessages;
+        capturedUiMessages = uiMessages;
         return createRunnerResponse("ok");
       },
     },
@@ -121,18 +123,16 @@ test("chat passes text history as model messages", async () => {
 
   await response.text();
 
-  assert.equal(capturedMessages.length, 1);
+  assert.equal(capturedMessages.length, 3);
   assert.equal(capturedMessages[0].role, "user");
-  assert.equal(
-    getTextContent(capturedMessages[0]),
-    [
-      "Conversation so far:",
-      "user: What is this repo?",
-      "assistant: It is Nav.",
-      "",
-      "Current user request:",
-      "What tests should I run?",
-    ].join("\n"),
+  assert.equal(capturedMessages[1].role, "assistant");
+  assert.equal(capturedMessages[2].role, "user");
+  assert.equal(getTextContent(capturedMessages[0]), "What is this repo?");
+  assert.equal(getTextContent(capturedMessages[1]), "It is Nav.");
+  assert.equal(getTextContent(capturedMessages[2]), "What tests should I run?");
+  assert.deepEqual(
+    capturedUiMessages.map((message) => message.id),
+    ["user-1", "assistant-1", "user-2"],
   );
 });
 
@@ -153,7 +153,7 @@ test("chat passes the request abort signal to the runner", async () => {
   let capturedSignal;
 
   await handleAgentRequest(request, {
-    createResponse(_messages, options) {
+    createResponse(_chatMessages, options) {
       capturedSignal = options?.signal;
       return createRunnerResponse("ok");
     },
@@ -258,6 +258,32 @@ test("chat with no user message returns 400", async () => {
   );
 
   assert.equal(response.status, 400);
+});
+
+test("chat with unsupported file parts returns 400", async () => {
+  const response = await handleAgentRequest(
+    createChatRequest({
+      messages: [
+        {
+          id: "user-1",
+          parts: [
+            {
+              mediaType: "image/png",
+              type: "file",
+              url: "data:image/png;base64,AA==",
+            },
+          ],
+          role: "user",
+        },
+      ],
+    }),
+    runner,
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: "File and data message parts are not supported yet.",
+  });
 });
 
 test("request abort signal tracks premature response close", () => {
