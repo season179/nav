@@ -22,6 +22,7 @@ import {
   PromptInputTextarea,
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input";
+import { Shimmer } from "@/components/ai-elements/shimmer";
 import { AppSidebar } from "@/components/app-sidebar";
 import { ChatMessageParts } from "@/components/chat-message-parts";
 import {
@@ -107,8 +108,51 @@ function ConnectionEmpty({
   );
 }
 
-function LiveConversation({ messages }: { messages: UIMessage[] }) {
-  if (messages.length === 0) {
+type MessagePart = UIMessage["parts"][number];
+
+const hasVisiblePart = (part: MessagePart) => {
+  switch (part.type) {
+    case "text":
+    case "reasoning":
+      return part.text.trim().length > 0;
+    case "dynamic-tool":
+      return true;
+    default:
+      return false;
+  }
+};
+
+const hasVisibleAssistantOutputAfterLastUser = (messages: UIMessage[]) => {
+  const lastUserIndex = messages.findLastIndex(
+    (message) => message.role === "user",
+  );
+
+  return messages
+    .slice(lastUserIndex + 1)
+    .some(
+      (message) =>
+        message.role === "assistant" && message.parts.some(hasVisiblePart),
+    );
+};
+
+function ThinkingMessage() {
+  return (
+    <Message from="assistant">
+      <MessageContent>
+        <Shimmer duration={1}>Thinking...</Shimmer>
+      </MessageContent>
+    </Message>
+  );
+}
+
+function LiveConversation({
+  isThinking,
+  messages,
+}: {
+  isThinking: boolean;
+  messages: UIMessage[];
+}) {
+  if (messages.length === 0 && !isThinking) {
     return <EmptyConversation />;
   }
 
@@ -125,6 +169,7 @@ function LiveConversation({ messages }: { messages: UIMessage[] }) {
             </MessageContent>
           </Message>
         ))}
+        {isThinking && <ThinkingMessage />}
       </ConversationContent>
       <ConversationScrollButton aria-label="Scroll to bottom" />
     </Conversation>
@@ -191,6 +236,10 @@ function NavChat({ serverStatus }: { serverStatus: FlueServerStatus | null }) {
         : status === "submitted"
           ? "submitted"
           : undefined;
+  const isThinking =
+    status === "submitted" ||
+    (status === "streaming" &&
+      !hasVisibleAssistantOutputAfterLastUser(messages));
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -199,7 +248,7 @@ function NavChat({ serverStatus }: { serverStatus: FlueServerStatus | null }) {
           {error.message}
         </div>
       )}
-      <LiveConversation messages={messages} />
+      <LiveConversation isThinking={isThinking} messages={messages} />
       <PromptComposer
         disabled={disabled}
         onSubmit={async (text) => {
