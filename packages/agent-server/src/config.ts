@@ -4,9 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import type { Api, Model, Models } from "@earendil-works/pi-ai";
-import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import type { PiHarnessSettings } from "@ai-sdk/harness-pi";
 
 const execAsync = promisify(exec);
 
@@ -19,26 +17,35 @@ export const DEFAULT_AGENT_HOST = "127.0.0.1";
 export const DEFAULT_AGENT_PORT = 3583;
 export const NAV_WORKSPACE_CWD = "/Users/season/Personal/nav";
 
+type PiThinkingLevel = NonNullable<PiHarnessSettings["thinkingLevel"]>;
+
+const THINKING_LEVELS = new Set<PiThinkingLevel>([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+]);
+
 interface PiSettings {
   defaultProvider?: unknown;
   defaultModel?: unknown;
+  defaultThinkingLevel?: unknown;
+}
+
+interface PiProviderConfig {
+  apiKey?: unknown;
+  baseUrl?: unknown;
+  headers?: unknown;
 }
 
 interface PiModelsConfig {
-  providers?: Record<
-    string,
-    {
-      apiKey?: unknown;
-      headers?: unknown;
-    }
-  >;
+  providers?: Record<string, PiProviderConfig>;
 }
 
-export interface ResolvedPiModel {
-  model: Model<Api>;
-  models: Models;
-  provider: string;
-  modelId: string;
+export interface ResolvedPiHarnessSettings extends PiHarnessSettings {
+  provider?: string;
 }
 
 const readJsonFile = async <T>(path: string): Promise<T | undefined> => {
@@ -93,55 +100,90 @@ const resolveSecret = async (
   return value;
 };
 
-const seedPiCredentials = async (
-  credentials: InMemoryCredentialStore,
-  provider: string,
-) => {
+const toEnvPrefix = (provider: string): string =>
+  provider
+    .replace(/[^A-Za-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toUpperCase();
+
+export const toPiModelReference = (
+  provider: string | undefined,
+  model: string,
+): string => {
+  if (!provider || model.startsWith(`${provider}/`)) {
+    return model;
+  }
+
+  return `${provider}/${model}`;
+};
+
+const resolveThinkingLevel = (value: unknown): PiThinkingLevel | undefined => {
+  const thinkingLevel = asNonEmptyString(value);
+  if (!thinkingLevel) {
+    return undefined;
+  }
+
+  if (!THINKING_LEVELS.has(thinkingLevel as PiThinkingLevel)) {
+    throw new Error(`Unsupported Pi thinking level: ${thinkingLevel}.`);
+  }
+
+  return thinkingLevel as PiThinkingLevel;
+};
+
+const resolveProviderEnv = async (
+  provider: string | undefined,
+): Promise<Record<string, string> | undefined> => {
+  if (!provider) {
+    return undefined;
+  }
+
   const modelsConfig = await readJsonFile<PiModelsConfig>(PI_MODELS_PATH);
   const providerConfig = modelsConfig?.providers?.[provider];
   const apiKey = await resolveSecret(providerConfig?.apiKey);
+  const baseUrl = await resolveSecret(providerConfig?.baseUrl);
 
-  if (!apiKey) {
-    return;
+  const customEnv: Record<string, string> = {};
+  const prefix = toEnvPrefix(provider);
+
+  if (apiKey) {
+    customEnv[`${prefix}_API_KEY`] = apiKey;
   }
 
-  await credentials.modify(provider, async () => ({
-    key: apiKey,
-    type: "api_key",
-  }));
+  if (baseUrl) {
+    customEnv[`${prefix}_BASE_URL`] = baseUrl;
+  }
+
+  return Object.keys(customEnv).length > 0 ? customEnv : undefined;
 };
 
-export const resolvePiModel = async (): Promise<ResolvedPiModel> => {
-  const settings = await readJsonFile<PiSettings>(PI_SETTINGS_PATH);
-  const provider =
-    asNonEmptyString(process.env.NAV_AGENT_PROVIDER) ??
-    asNonEmptyString(process.env.PI_PROVIDER) ??
-    asNonEmptyString(settings?.defaultProvider);
-  const modelId =
-    asNonEmptyString(process.env.NAV_AGENT_MODEL) ??
-    asNonEmptyString(process.env.PI_MODEL) ??
-    asNonEmptyString(settings?.defaultModel);
-
-  if (!provider || !modelId) {
-    throw new Error(
-      "No Pi model is configured. Set NAV_AGENT_PROVIDER/NAV_AGENT_MODEL or configure ~/.pi/agent/settings.json.",
+export const resolvePiHarnessSettings =
+  async (): Promise<ResolvedPiHarnessSettings> => {
+    const settings = await readJsonFile<PiSettings>(PI_SETTINGS_PATH);
+    const provider =
+      asNonEmptyString(process.env.NAV_AGENT_PROVIDER) ??
+      asNonEmptyString(process.env.PI_PROVIDER) ??
+      asNonEmptyString(settings?.defaultProvider);
+    const model =
+      asNonEmptyString(process.env.NAV_AGENT_MODEL) ??
+      asNonEmptyString(process.env.PI_MODEL) ??
+      asNonEmptyString(settings?.defaultModel);
+    const thinkingLevel = resolveThinkingLevel(
+      asNonEmptyString(process.env.NAV_AGENT_THINKING_LEVEL) ??
+        asNonEmptyString(process.env.PI_THINKING_LEVEL) ??
+        settings?.defaultThinkingLevel,
     );
-  }
+    const customEnv = await resolveProviderEnv(provider);
 
-  const credentials = new InMemoryCredentialStore();
-  await seedPiCredentials(credentials, provider);
+    if (!model) {
+      throw new Error(
+        "No Pi model is configured. Set NAV_AGENT_MODEL/PI_MODEL or configure ~/.pi/agent/settings.json.",
+      );
+    }
 
-  const models = builtinModels({ credentials });
-  const model = models.getModel(provider, modelId);
-
-  if (!model) {
-    throw new Error(`Pi model is not available: ${provider}/${modelId}.`);
-  }
-
-  return {
-    model,
-    modelId,
-    models,
-    provider,
+    return {
+      ...(customEnv ? { auth: { customEnv } } : {}),
+      ...(provider ? { provider } : {}),
+      model: toPiModelReference(provider, model),
+      ...(thinkingLevel ? { thinkingLevel } : {}),
+    };
   };
-};

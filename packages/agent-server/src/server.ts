@@ -9,13 +9,12 @@ import {
   MockAgentRunner,
   PiAgentRunner,
 } from "./agent-runner.js";
-import { ChatRequestError, readLatestUserPrompt } from "./chat-request.js";
+import { ChatRequestError, readChatMessages } from "./chat-request.js";
 import {
   DEFAULT_AGENT_HOST,
   DEFAULT_AGENT_PORT,
   SERVICE_NAME,
 } from "./config.js";
-import { createChatStreamResponse } from "./ui-message-stream.js";
 
 export interface AgentServerOptions {
   runner?: AgentRunner;
@@ -56,8 +55,10 @@ export const handleAgentRequest = async (
 
   if (request.method === "POST" && url.pathname === "/api/chat") {
     try {
-      const prompt = await readLatestUserPrompt(request);
-      const response = createChatStreamResponse(runner, prompt, request.signal);
+      const messages = await readChatMessages(request);
+      const response = await runner.createResponse(messages, {
+        signal: request.signal,
+      });
       const headers = new Headers(response.headers);
       for (const [key, value] of Object.entries(corsHeaders(request))) {
         headers.set(key, value);
@@ -98,7 +99,40 @@ const readIncomingBody = async (
   return chunks.length > 0 ? Buffer.concat(chunks) : undefined;
 };
 
-const toWebRequest = async (request: IncomingMessage): Promise<Request> => {
+export const createRequestAbortSignal = (
+  incomingRequest: IncomingMessage,
+  serverResponse: ServerResponse,
+): AbortSignal => {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) {
+      controller.abort();
+    }
+  };
+  const abortOnResponseClose = () => {
+    if (!serverResponse.writableEnded) {
+      abort();
+    }
+  };
+  const cleanup = () => {
+    incomingRequest.off("aborted", abort);
+    serverResponse.off("close", abortOnResponseClose);
+    serverResponse.off("close", cleanup);
+    serverResponse.off("finish", cleanup);
+  };
+
+  incomingRequest.on("aborted", abort);
+  serverResponse.on("close", abortOnResponseClose);
+  serverResponse.on("close", cleanup);
+  serverResponse.on("finish", cleanup);
+
+  return controller.signal;
+};
+
+const toWebRequest = async (
+  request: IncomingMessage,
+  signal?: AbortSignal,
+): Promise<Request> => {
   const host =
     request.headers.host ?? `${DEFAULT_AGENT_HOST}:${DEFAULT_AGENT_PORT}`;
   const url = new URL(request.url ?? "/", `http://${host}`);
@@ -120,6 +154,7 @@ const toWebRequest = async (request: IncomingMessage): Promise<Request> => {
     body: body ? new Uint8Array(body) : undefined,
     headers,
     method: request.method,
+    signal,
   });
 };
 
@@ -160,7 +195,10 @@ export const createAgentServer = (options: AgentServerOptions = {}) => {
       : new PiAgentRunner());
 
   return createServer((incomingRequest, serverResponse) => {
-    toWebRequest(incomingRequest)
+    toWebRequest(
+      incomingRequest,
+      createRequestAbortSignal(incomingRequest, serverResponse),
+    )
       .then((request) => handleAgentRequest(request, runner))
       .then((response) => sendResponse(serverResponse, response))
       .catch((error) => {

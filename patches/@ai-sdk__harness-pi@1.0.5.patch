@@ -1,0 +1,401 @@
+diff --git a/dist/index.js b/dist/index.js
+index 86ae6f9db637ede643a17a6625cc09278275e87e..2ddf0e20a70add937b0d91be9e955fdd9169c677 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -378,7 +378,12 @@ function createPiModelResolver(modelRegistry, env = process.env) {
+     const effectiveId = modelId ?? (useGateway ? DEFAULT_PI_GATEWAY_MODEL_ID : void 0);
+     if (!effectiveId) return void 0;
+     const models = loadModels();
++    const matchesProviderQualifiedModel = (m) => `${m.provider}/${m.id}` === effectiveId || (m.name ? `${m.provider}/${m.name}` === effectiveId : false);
+     const matches = (m) => m.id === effectiveId || m.name === effectiveId;
++    const providerQualifiedModel = models.find(matchesProviderQualifiedModel);
++    if (providerQualifiedModel) {
++      return providerQualifiedModel;
++    }
+     return useGateway && models.find((m) => m.provider === "vercel-ai-gateway" && matches(m)) || models.find(matches);
+   };
+ }
+@@ -875,7 +880,9 @@ var originalFsSyncMethods = {
+   writeFileSync: fs.writeFileSync
+ };
+ var originalFsCallbackMethods = {
++  lstat: fs.lstat,
+   mkdir: fs.mkdir,
++  readdir: fs.readdir,
+   realpath: fs.realpath,
+   rmdir: fs.rmdir,
+   stat: fs.stat,
+@@ -883,8 +890,16 @@ var originalFsCallbackMethods = {
+   writeFile: fs.writeFile
+ };
+ var originalFsPromises = {
++  access: fs.promises.access.bind(fs.promises),
++  appendFile: fs.promises.appendFile.bind(fs.promises),
++  lstat: fs.promises.lstat.bind(fs.promises),
+   mkdir: fs.promises.mkdir.bind(fs.promises),
++  mkdtemp: fs.promises.mkdtemp.bind(fs.promises),
+   readFile: fs.promises.readFile.bind(fs.promises),
++  readdir: fs.promises.readdir.bind(fs.promises),
++  realpath: fs.promises.realpath.bind(fs.promises),
++  rm: fs.promises.rm.bind(fs.promises),
++  stat: fs.promises.stat.bind(fs.promises),
+   writeFile: fs.promises.writeFile.bind(fs.promises)
+ };
+ function isInsidePath2(parent, candidate) {
+@@ -1007,15 +1022,16 @@ function wrapSinglePathCallback(original, options = {}) {
+     return original(...args);
+   });
+ }
+-function wrapSinglePathPromise(original) {
++function wrapSinglePathPromise(original, options = {}) {
+   return (async (...args) => {
+     const [inputPath] = args;
+     if (typeof inputPath === "string") {
+       const mappedPath = mapToBackingPath(inputPath);
+       if (mappedPath) {
+-        return await original(
++        const result = await original(
+           ...[mappedPath, ...args.slice(1)]
+         );
++        return options.mapResult ? options.mapResult(inputPath, result) : result;
+       }
+     }
+     return await original(...args);
+@@ -1048,7 +1064,9 @@ var wrappedFsSyncMethods = {
+   writeFileSync: wrapSinglePathSync(originalFsSyncMethods.writeFileSync)
+ };
+ var wrappedFsCallbackMethods = {
++  lstat: wrapSinglePathCallback(originalFsCallbackMethods.lstat),
+   mkdir: wrapSinglePathCallback(originalFsCallbackMethods.mkdir),
++  readdir: wrapSinglePathCallback(originalFsCallbackMethods.readdir),
+   realpath: wrapSinglePathCallback(originalFsCallbackMethods.realpath, {
+     mapCallbackResult: (inputPath, result) => typeof result === "string" ? mapRealpathResult(inputPath, result) : result
+   }),
+@@ -1058,8 +1076,20 @@ var wrappedFsCallbackMethods = {
+   writeFile: wrapSinglePathCallback(originalFsCallbackMethods.writeFile)
+ };
+ var wrappedFsPromises = {
++  access: wrapSinglePathPromise(originalFsPromises.access),
++  appendFile: wrapSinglePathPromise(originalFsPromises.appendFile),
++  lstat: wrapSinglePathPromise(originalFsPromises.lstat),
+   mkdir: wrapSinglePathPromise(originalFsPromises.mkdir),
++  mkdtemp: wrapSinglePathPromise(originalFsPromises.mkdtemp, {
++    mapResult: (inputPath, result) => typeof result === "string" ? mapRealpathResult(inputPath, result) : result
++  }),
+   readFile: wrapSinglePathPromise(originalFsPromises.readFile),
++  readdir: wrapSinglePathPromise(originalFsPromises.readdir),
++  realpath: wrapSinglePathPromise(originalFsPromises.realpath, {
++    mapResult: (inputPath, result) => typeof result === "string" ? mapRealpathResult(inputPath, result) : result
++  }),
++  rm: wrapSinglePathPromise(originalFsPromises.rm),
++  stat: wrapSinglePathPromise(originalFsPromises.stat),
+   writeFile: wrapSinglePathPromise(originalFsPromises.writeFile)
+ };
+ function areExtraFsPatchesInstalled() {
+@@ -1077,14 +1107,24 @@ function installExtraFsPatches() {
+   mutableFs.rmSync = wrappedFsSyncMethods.rmSync;
+   mutableFs.statSync = wrappedFsSyncMethods.statSync;
+   mutableFs.writeFileSync = wrappedFsSyncMethods.writeFileSync;
++  mutableFs.lstat = wrappedFsCallbackMethods.lstat;
+   mutableFs.mkdir = wrappedFsCallbackMethods.mkdir;
++  mutableFs.readdir = wrappedFsCallbackMethods.readdir;
+   mutableFs.realpath = wrappedFsCallbackMethods.realpath;
+   mutableFs.rmdir = wrappedFsCallbackMethods.rmdir;
+   mutableFs.stat = wrappedFsCallbackMethods.stat;
+   mutableFs.utimes = wrappedFsCallbackMethods.utimes;
+   mutableFs.writeFile = wrappedFsCallbackMethods.writeFile;
++  mutableFsPromises.access = wrappedFsPromises.access;
++  mutableFsPromises.appendFile = wrappedFsPromises.appendFile;
++  mutableFsPromises.lstat = wrappedFsPromises.lstat;
+   mutableFsPromises.mkdir = wrappedFsPromises.mkdir;
++  mutableFsPromises.mkdtemp = wrappedFsPromises.mkdtemp;
+   mutableFsPromises.readFile = wrappedFsPromises.readFile;
++  mutableFsPromises.readdir = wrappedFsPromises.readdir;
++  mutableFsPromises.realpath = wrappedFsPromises.realpath;
++  mutableFsPromises.rm = wrappedFsPromises.rm;
++  mutableFsPromises.stat = wrappedFsPromises.stat;
+   mutableFsPromises.writeFile = wrappedFsPromises.writeFile;
+   syncBuiltinESMExports();
+ }
+@@ -1100,14 +1140,24 @@ function restoreExtraFsPatches() {
+   mutableFs.rmSync = originalFsSyncMethods.rmSync;
+   mutableFs.statSync = originalFsSyncMethods.statSync;
+   mutableFs.writeFileSync = originalFsSyncMethods.writeFileSync;
++  mutableFs.lstat = originalFsCallbackMethods.lstat;
+   mutableFs.mkdir = originalFsCallbackMethods.mkdir;
++  mutableFs.readdir = originalFsCallbackMethods.readdir;
+   mutableFs.realpath = originalFsCallbackMethods.realpath;
+   mutableFs.rmdir = originalFsCallbackMethods.rmdir;
+   mutableFs.stat = originalFsCallbackMethods.stat;
+   mutableFs.utimes = originalFsCallbackMethods.utimes;
+   mutableFs.writeFile = originalFsCallbackMethods.writeFile;
++  mutableFsPromises.access = originalFsPromises.access;
++  mutableFsPromises.appendFile = originalFsPromises.appendFile;
++  mutableFsPromises.lstat = originalFsPromises.lstat;
+   mutableFsPromises.mkdir = originalFsPromises.mkdir;
++  mutableFsPromises.mkdtemp = originalFsPromises.mkdtemp;
+   mutableFsPromises.readFile = originalFsPromises.readFile;
++  mutableFsPromises.readdir = originalFsPromises.readdir;
++  mutableFsPromises.realpath = originalFsPromises.realpath;
++  mutableFsPromises.rm = originalFsPromises.rm;
++  mutableFsPromises.stat = originalFsPromises.stat;
+   mutableFsPromises.writeFile = originalFsPromises.writeFile;
+   syncBuiltinESMExports();
+ }
+@@ -1459,6 +1509,18 @@ async function createPiSession(input) {
+   });
+   const workspaceVfs = new PiWorkspaceVfs();
+   workspaceVfs.mount(hostWorkDir, sessionWorkDir);
++  const syncSandboxWorkspaceIntoHostMirror = async () => {
++    workspaceVfs.unmount();
++    try {
++      await syncHostWorkspaceFromSandbox({
++        sandbox,
++        sandboxWorkDir: input.sessionWorkDir,
++        hostWorkDir
++      });
++    } finally {
++      workspaceVfs.mount(hostWorkDir, sessionWorkDir);
++    }
++  };
+   const paths = createPiPathMapper({
+     hostWorkDir,
+     sandboxWorkDir: sessionWorkDir,
+@@ -1684,12 +1746,8 @@ async function createPiSession(input) {
+       await rebuildPiSession(userTools, piSession == null);
+       lastToolsSignature = signature;
+     }
++    await syncSandboxWorkspaceIntoHostMirror();
+     await resourceLoader.reload();
+-    await syncHostWorkspaceFromSandbox({
+-      sandbox,
+-      sandboxWorkDir: input.sessionWorkDir,
+-      hostWorkDir
+-    });
+     currentEmit = turnOpts.emit;
+     translatorState = createPiTranslatorState({
+       builtinToolNames: [...PI_NATIVE_BUILTIN_NAMES],
+diff --git a/src/pi-model-resolver.ts b/src/pi-model-resolver.ts
+index 037d1f3ee4750c1ed13ec35ff7467fc7b2fe851d..9ed8bd274e8ead84e93dfb94eaefee2e1d2e83ec 100644
+--- a/src/pi-model-resolver.ts
++++ b/src/pi-model-resolver.ts
+@@ -36,8 +36,15 @@ export function createPiModelResolver(
+     if (!effectiveId) return undefined;
+ 
+     const models = loadModels();
++    const matchesProviderQualifiedModel = (m: PiModel) =>
++      `${m.provider}/${m.id}` === effectiveId ||
++      (m.name ? `${m.provider}/${m.name}` === effectiveId : false);
+     const matches = (m: PiModel) =>
+       m.id === effectiveId || m.name === effectiveId;
++    const providerQualifiedModel = models.find(matchesProviderQualifiedModel);
++    if (providerQualifiedModel) {
++      return providerQualifiedModel;
++    }
+ 
+     // When gateway creds are present, prefer the gateway-routed entry for the
+     // given id. Pi's catalog lists the same model id under multiple providers
+diff --git a/src/pi-session.ts b/src/pi-session.ts
+index 7a50265094366e0832fac608655b4adb819baffd..29eb37494e30b96a6fb2a9e0bf6f372589835c2c 100644
+--- a/src/pi-session.ts
++++ b/src/pi-session.ts
+@@ -297,6 +297,19 @@ export async function createPiSession(
+   const workspaceVfs = new PiWorkspaceVfs();
+   workspaceVfs.mount(hostWorkDir, sessionWorkDir);
+ 
++  const syncSandboxWorkspaceIntoHostMirror = async () => {
++    workspaceVfs.unmount();
++    try {
++      await syncHostWorkspaceFromSandbox({
++        sandbox,
++        sandboxWorkDir: input.sessionWorkDir,
++        hostWorkDir,
++      });
++    } finally {
++      workspaceVfs.mount(hostWorkDir, sessionWorkDir);
++    }
++  };
++
+   const paths = createPiPathMapper({
+     hostWorkDir,
+     sandboxWorkDir: sessionWorkDir,
+@@ -620,12 +633,8 @@ export async function createPiSession(
+       lastToolsSignature = signature;
+     }
+ 
++    await syncSandboxWorkspaceIntoHostMirror();
+     await resourceLoader.reload();
+-    await syncHostWorkspaceFromSandbox({
+-      sandbox,
+-      sandboxWorkDir: input.sessionWorkDir,
+-      hostWorkDir,
+-    });
+ 
+     currentEmit = turnOpts.emit;
+     // Fresh translator state for the new turn — keep the tool sets the
+diff --git a/src/pi-workspace-vfs.ts b/src/pi-workspace-vfs.ts
+index d7569f8d76867a4f21273c0447abecb874ae0f33..9120b9417ce03a61e7fcb9f5ca12bf95d79c962a 100644
+--- a/src/pi-workspace-vfs.ts
++++ b/src/pi-workspace-vfs.ts
+@@ -23,9 +23,12 @@
+  * - Sync: `existsSync`, `readFileSync`, `writeFileSync`, `mkdirSync`,
+  *   `readdirSync`, `renameSync`, `rmSync`, `openSync`, `statSync`,
+  *   `realpathSync` (+ `.native`).
+- * - Callback: `mkdir`, `realpath`, `stat`, `rmdir`, `utimes`, `writeFile`.
+- * - Promises: `fs.promises.mkdir`, `fs.promises.readFile`,
+- *   `fs.promises.writeFile`.
++ * - Callback: `lstat`, `mkdir`, `readdir`, `realpath`, `stat`, `rmdir`,
++ *   `utimes`, `writeFile`.
++ * - Promises: `fs.promises.access`, `fs.promises.appendFile`,
++ *   `fs.promises.lstat`, `fs.promises.mkdir`, `fs.promises.mkdtemp`,
++ *   `fs.promises.readFile`, `fs.promises.readdir`, `fs.promises.realpath`,
++ *   `fs.promises.rm`, `fs.promises.stat`, `fs.promises.writeFile`.
+  *
+  * Anything else is intentionally unsupported. If Pi starts using additional
+  * `fs` APIs against logical roots, those call sites must be added here
+@@ -67,7 +70,9 @@ const originalFsSyncMethods = {
+ };
+ 
+ const originalFsCallbackMethods = {
++  lstat: fs.lstat,
+   mkdir: fs.mkdir,
++  readdir: fs.readdir,
+   realpath: fs.realpath,
+   rmdir: fs.rmdir,
+   stat: fs.stat,
+@@ -76,8 +81,16 @@ const originalFsCallbackMethods = {
+ };
+ 
+ const originalFsPromises = {
++  access: fs.promises.access.bind(fs.promises),
++  appendFile: fs.promises.appendFile.bind(fs.promises),
++  lstat: fs.promises.lstat.bind(fs.promises),
+   mkdir: fs.promises.mkdir.bind(fs.promises),
++  mkdtemp: fs.promises.mkdtemp.bind(fs.promises),
+   readFile: fs.promises.readFile.bind(fs.promises),
++  readdir: fs.promises.readdir.bind(fs.promises),
++  realpath: fs.promises.realpath.bind(fs.promises),
++  rm: fs.promises.rm.bind(fs.promises),
++  stat: fs.promises.stat.bind(fs.promises),
+   writeFile: fs.promises.writeFile.bind(fs.promises),
+ };
+ 
+@@ -263,15 +276,26 @@ function wrapSinglePathCallback<Fn extends (...args: never[]) => unknown>(
+ 
+ function wrapSinglePathPromise<
+   Fn extends (...args: never[]) => Promise<unknown>,
+->(original: Fn): Fn {
++>(
++  original: Fn,
++  options: {
++    mapResult?: (
++      inputPath: string,
++      result: Awaited<ReturnType<Fn>>,
++    ) => Awaited<ReturnType<Fn>>;
++  } = {},
++): Fn {
+   return (async (...args: Parameters<Fn>) => {
+     const [inputPath] = args;
+     if (typeof inputPath === 'string') {
+       const mappedPath = mapToBackingPath(inputPath);
+       if (mappedPath) {
+-        return await original(
++        const result = (await original(
+           ...([mappedPath, ...args.slice(1)] as Parameters<Fn>),
+-        );
++        )) as Awaited<ReturnType<Fn>>;
++        return options.mapResult
++          ? options.mapResult(inputPath, result)
++          : result;
+       }
+     }
+     return await original(...args);
+@@ -315,7 +339,9 @@ const wrappedFsSyncMethods = {
+ };
+ 
+ const wrappedFsCallbackMethods = {
++  lstat: wrapSinglePathCallback(originalFsCallbackMethods.lstat),
+   mkdir: wrapSinglePathCallback(originalFsCallbackMethods.mkdir),
++  readdir: wrapSinglePathCallback(originalFsCallbackMethods.readdir),
+   realpath: wrapSinglePathCallback(originalFsCallbackMethods.realpath, {
+     mapCallbackResult: (inputPath, result) =>
+       typeof result === 'string'
+@@ -329,8 +355,26 @@ const wrappedFsCallbackMethods = {
+ };
+ 
+ const wrappedFsPromises = {
++  access: wrapSinglePathPromise(originalFsPromises.access),
++  appendFile: wrapSinglePathPromise(originalFsPromises.appendFile),
++  lstat: wrapSinglePathPromise(originalFsPromises.lstat),
+   mkdir: wrapSinglePathPromise(originalFsPromises.mkdir),
++  mkdtemp: wrapSinglePathPromise(originalFsPromises.mkdtemp, {
++    mapResult: (inputPath, result) =>
++      typeof result === 'string'
++        ? mapRealpathResult(inputPath, result)
++        : result,
++  }),
+   readFile: wrapSinglePathPromise(originalFsPromises.readFile),
++  readdir: wrapSinglePathPromise(originalFsPromises.readdir),
++  realpath: wrapSinglePathPromise(originalFsPromises.realpath, {
++    mapResult: (inputPath, result) =>
++      typeof result === 'string'
++        ? mapRealpathResult(inputPath, result)
++        : result,
++  }),
++  rm: wrapSinglePathPromise(originalFsPromises.rm),
++  stat: wrapSinglePathPromise(originalFsPromises.stat),
+   writeFile: wrapSinglePathPromise(originalFsPromises.writeFile),
+ };
+ 
+@@ -352,15 +396,25 @@ function installExtraFsPatches() {
+   mutableFs.statSync = wrappedFsSyncMethods.statSync;
+   mutableFs.writeFileSync = wrappedFsSyncMethods.writeFileSync;
+ 
++  mutableFs.lstat = wrappedFsCallbackMethods.lstat;
+   mutableFs.mkdir = wrappedFsCallbackMethods.mkdir;
++  mutableFs.readdir = wrappedFsCallbackMethods.readdir;
+   mutableFs.realpath = wrappedFsCallbackMethods.realpath;
+   mutableFs.rmdir = wrappedFsCallbackMethods.rmdir;
+   mutableFs.stat = wrappedFsCallbackMethods.stat;
+   mutableFs.utimes = wrappedFsCallbackMethods.utimes;
+   mutableFs.writeFile = wrappedFsCallbackMethods.writeFile;
+ 
++  mutableFsPromises.access = wrappedFsPromises.access;
++  mutableFsPromises.appendFile = wrappedFsPromises.appendFile;
++  mutableFsPromises.lstat = wrappedFsPromises.lstat;
+   mutableFsPromises.mkdir = wrappedFsPromises.mkdir;
++  mutableFsPromises.mkdtemp = wrappedFsPromises.mkdtemp;
+   mutableFsPromises.readFile = wrappedFsPromises.readFile;
++  mutableFsPromises.readdir = wrappedFsPromises.readdir;
++  mutableFsPromises.realpath = wrappedFsPromises.realpath;
++  mutableFsPromises.rm = wrappedFsPromises.rm;
++  mutableFsPromises.stat = wrappedFsPromises.stat;
+   mutableFsPromises.writeFile = wrappedFsPromises.writeFile;
+ 
+   syncBuiltinESMExports();
+@@ -380,15 +434,25 @@ function restoreExtraFsPatches() {
+   mutableFs.statSync = originalFsSyncMethods.statSync;
+   mutableFs.writeFileSync = originalFsSyncMethods.writeFileSync;
+ 
++  mutableFs.lstat = originalFsCallbackMethods.lstat;
+   mutableFs.mkdir = originalFsCallbackMethods.mkdir;
++  mutableFs.readdir = originalFsCallbackMethods.readdir;
+   mutableFs.realpath = originalFsCallbackMethods.realpath;
+   mutableFs.rmdir = originalFsCallbackMethods.rmdir;
+   mutableFs.stat = originalFsCallbackMethods.stat;
+   mutableFs.utimes = originalFsCallbackMethods.utimes;
+   mutableFs.writeFile = originalFsCallbackMethods.writeFile;
+ 
++  mutableFsPromises.access = originalFsPromises.access;
++  mutableFsPromises.appendFile = originalFsPromises.appendFile;
++  mutableFsPromises.lstat = originalFsPromises.lstat;
+   mutableFsPromises.mkdir = originalFsPromises.mkdir;
++  mutableFsPromises.mkdtemp = originalFsPromises.mkdtemp;
+   mutableFsPromises.readFile = originalFsPromises.readFile;
++  mutableFsPromises.readdir = originalFsPromises.readdir;
++  mutableFsPromises.realpath = originalFsPromises.realpath;
++  mutableFsPromises.rm = originalFsPromises.rm;
++  mutableFsPromises.stat = originalFsPromises.stat;
+   mutableFsPromises.writeFile = originalFsPromises.writeFile;
+ 
+   syncBuiltinESMExports();

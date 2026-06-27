@@ -17,16 +17,10 @@ import {
 } from "@/components/ai-elements/message";
 import {
   PromptInput,
-  PromptInputActionAddAttachments,
-  PromptInputActionAddScreenshot,
-  PromptInputActionMenu,
-  PromptInputActionMenuContent,
-  PromptInputActionMenuTrigger,
   PromptInputBody,
   PromptInputFooter,
   PromptInputSubmit,
   PromptInputTextarea,
-  PromptInputTools,
 } from "@/components/ai-elements/prompt-input";
 import { AppSidebar } from "@/components/app-sidebar";
 import {
@@ -119,18 +113,6 @@ function PromptComposer({
           <PromptInputTextarea placeholder="Message Nav" />
         </PromptInputBody>
         <PromptInputFooter>
-          <PromptInputTools>
-            <PromptInputActionMenu>
-              <PromptInputActionMenuTrigger
-                aria-label="Add context"
-                tooltip="Add context"
-              />
-              <PromptInputActionMenuContent>
-                <PromptInputActionAddAttachments />
-                <PromptInputActionAddScreenshot />
-              </PromptInputActionMenuContent>
-            </PromptInputActionMenu>
-          </PromptInputTools>
           <PromptInputSubmit onStop={stop} status={status} />
         </PromptInputFooter>
       </PromptInput>
