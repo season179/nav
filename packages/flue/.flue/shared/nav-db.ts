@@ -74,10 +74,28 @@ export const ensureNavProjectTable = () => {
       display_path TEXT,
       is_default INTEGER NOT NULL DEFAULT 0,
       archived INTEGER NOT NULL DEFAULT 0,
+      model_spec TEXT,
+      auto_approve_edits INTEGER NOT NULL DEFAULT 0,
+      color TEXT,
+      icon TEXT,
+      sort_order INTEGER,
       created_at INTEGER NOT NULL,
       last_opened_at INTEGER
     )
   `);
+
+  for (const [column, definition] of [
+    ["model_spec", "TEXT"],
+    ["auto_approve_edits", "INTEGER NOT NULL DEFAULT 0"],
+    ["color", "TEXT"],
+    ["icon", "TEXT"],
+    ["sort_order", "INTEGER"],
+  ] as const) {
+    if (!hasColumn("nav_projects", column)) {
+      sql.exec(`ALTER TABLE nav_projects ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
   sql.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS nav_projects_path_unique_idx
       ON nav_projects (path COLLATE NOCASE)

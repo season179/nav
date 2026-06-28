@@ -10,8 +10,38 @@ import {
 } from "./nav-db.js";
 
 const MAX_PROJECT_NAME_LENGTH = 80;
+export const DEFAULT_NAV_MODEL_SPEC = "openai-codex/gpt-5.5";
+export const NAV_MODEL_SPECS = [
+  DEFAULT_NAV_MODEL_SPEC,
+  "zai/glm-5.2",
+  "deepseek/deepseek-v4-pro",
+  "deepseek/deepseek-v4-flash",
+] as const;
+export const NAV_PROJECT_COLORS = [
+  "slate",
+  "red",
+  "orange",
+  "yellow",
+  "green",
+  "teal",
+  "blue",
+  "violet",
+  "pink",
+] as const;
+export const NAV_PROJECT_ICONS = [
+  "folder",
+  "code",
+  "terminal",
+  "package",
+  "book",
+  "spark",
+] as const;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export type NavModelSpec = (typeof NAV_MODEL_SPECS)[number];
+export type NavProjectColor = (typeof NAV_PROJECT_COLORS)[number];
+export type NavProjectIcon = (typeof NAV_PROJECT_ICONS)[number];
 
 type NavProjectRow = {
   id: string;
@@ -20,6 +50,11 @@ type NavProjectRow = {
   display_path: string | null;
   is_default: number;
   archived: number;
+  model_spec: string | null;
+  auto_approve_edits: number;
+  color: string | null;
+  icon: string | null;
+  sort_order: number | null;
   created_at: number;
   last_opened_at: number | null;
 };
@@ -32,6 +67,11 @@ type SessionProjectRow = {
   display_path: string | null;
   is_default: number | null;
   archived: number | null;
+  model_spec: string | null;
+  auto_approve_edits: number | null;
+  color: string | null;
+  icon: string | null;
+  sort_order: number | null;
 };
 
 export type NavProjectSummary = {
@@ -42,6 +82,11 @@ export type NavProjectSummary = {
   isDefault: boolean;
   archived: boolean;
   available: boolean;
+  modelSpec: NavModelSpec | null;
+  autoApproveEdits: boolean;
+  color: NavProjectColor | null;
+  icon: NavProjectIcon | null;
+  sortOrder: number | null;
   createdAt: number;
   lastOpenedAt: number | null;
 };
@@ -53,6 +98,8 @@ export type ResolvedSessionProject = {
   isDefault: boolean;
   archived: boolean;
   available: boolean;
+  modelSpec: NavModelSpec | null;
+  autoApproveEdits: boolean;
 };
 
 type ProjectIdResolution =
@@ -100,6 +147,47 @@ const normalizeProjectName = (value: unknown) => {
 
   return name.length > 0 ? name : null;
 };
+
+const isNavModelSpec = (value: string): value is NavModelSpec =>
+  NAV_MODEL_SPECS.includes(value as NavModelSpec);
+
+const isProjectColor = (value: string): value is NavProjectColor =>
+  NAV_PROJECT_COLORS.includes(value as NavProjectColor);
+
+const isProjectIcon = (value: string): value is NavProjectIcon =>
+  NAV_PROJECT_ICONS.includes(value as NavProjectIcon);
+
+export const resolveNavModelSpec = (value: string | null | undefined) =>
+  value && isNavModelSpec(value) ? value : null;
+
+const normalizeModelSpec = (value: unknown) => {
+  if (value === null || value === "") {
+    return null;
+  }
+
+  return typeof value === "string" && isNavModelSpec(value) ? value : undefined;
+};
+
+const normalizeProjectColor = (value: unknown) => {
+  if (value === null || value === "") {
+    return null;
+  }
+
+  return typeof value === "string" && isProjectColor(value) ? value : undefined;
+};
+
+const normalizeProjectIcon = (value: unknown) => {
+  if (value === null || value === "") {
+    return null;
+  }
+
+  return typeof value === "string" && isProjectIcon(value) ? value : undefined;
+};
+
+const normalizeSortOrder = (value: unknown) =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -173,6 +261,11 @@ const selectProjectByPath = (projectPath: string) =>
         display_path,
         is_default,
         archived,
+        model_spec,
+        auto_approve_edits,
+        color,
+        icon,
+        sort_order,
         created_at,
         last_opened_at
        FROM nav_projects
@@ -191,6 +284,11 @@ const selectProjectById = (id: string) =>
         display_path,
         is_default,
         archived,
+        model_spec,
+        auto_approve_edits,
+        color,
+        icon,
+        sort_order,
         created_at,
         last_opened_at
        FROM nav_projects
@@ -210,6 +308,11 @@ const selectDefaultProject = () =>
          display_path,
          is_default,
          archived,
+         model_spec,
+         auto_approve_edits,
+         color,
+         icon,
+         sort_order,
          created_at,
          last_opened_at
        FROM nav_projects
@@ -227,9 +330,30 @@ const serializeProject = (row: NavProjectRow): NavProjectSummary => ({
   isDefault: isDefaultProjectPath(row.path),
   archived: row.archived === 1,
   available: isDirectoryAvailable(row.path),
+  modelSpec: resolveNavModelSpec(row.model_spec),
+  autoApproveEdits: row.auto_approve_edits === 1,
+  color:
+    row.color && isProjectColor(row.color as NavProjectColor)
+      ? (row.color as NavProjectColor)
+      : null,
+  icon:
+    row.icon && isProjectIcon(row.icon as NavProjectIcon)
+      ? (row.icon as NavProjectIcon)
+      : null,
+  sortOrder: row.sort_order,
   createdAt: row.created_at,
   lastOpenedAt: row.last_opened_at,
 });
+
+const nextSortOrder = () => {
+  const row = getNavDb()
+    .prepare(
+      "SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM nav_projects",
+    )
+    .get() as { next: number } | undefined;
+
+  return row?.next ?? 0;
+};
 
 const missingProjectAfterWrite = (c: Context) =>
   c.json(
@@ -261,6 +385,7 @@ const ensureDefaultProject = () => {
          SET is_default = 1,
              archived = 0,
              display_path = COALESCE(display_path, ?),
+             sort_order = COALESCE(sort_order, 0),
              last_opened_at = COALESCE(last_opened_at, ?)
          WHERE id = ?`,
       )
@@ -281,12 +406,17 @@ const ensureDefaultProject = () => {
         display_path,
         is_default,
         archived,
+        model_spec,
+        auto_approve_edits,
+        color,
+        icon,
+        sort_order,
         created_at,
         last_opened_at
        )
-       VALUES (?, ?, ?, ?, 1, 0, ?, ?)`,
+       VALUES (?, ?, ?, ?, 1, 0, NULL, 0, NULL, NULL, ?, ?, ?)`,
     )
-    .run(id, basename(root) || "Nav", root, root, now, now);
+    .run(id, basename(root) || "Nav", root, root, 0, now, now);
 
   markOnlyDefaultProject(id);
   return id;
@@ -398,7 +528,12 @@ export const resolveSessionProject = (
         p.path,
         p.display_path,
         p.is_default,
-        p.archived
+        p.archived,
+        p.model_spec,
+        p.auto_approve_edits,
+        p.color,
+        p.icon,
+        p.sort_order
        FROM nav_sessions s
        LEFT JOIN nav_projects p ON p.id = s.project_id
        WHERE s.id = ?
@@ -414,6 +549,8 @@ export const resolveSessionProject = (
       isDefault: true,
       archived: defaultProject.archived === 1,
       available: isDirectoryAvailable(defaultProject.path),
+      modelSpec: resolveNavModelSpec(defaultProject.model_spec),
+      autoApproveEdits: defaultProject.auto_approve_edits === 1,
     };
   }
 
@@ -431,6 +568,8 @@ export const resolveSessionProject = (
       isDefault: false,
       archived: false,
       available: false,
+      modelSpec: null,
+      autoApproveEdits: false,
     };
   }
 
@@ -441,12 +580,15 @@ export const resolveSessionProject = (
     isDefault: isDefaultProjectPath(row.path),
     archived: row.archived === 1,
     available: isDirectoryAvailable(row.path),
+    modelSpec: resolveNavModelSpec(row.model_spec),
+    autoApproveEdits: row.auto_approve_edits === 1,
   };
 };
 
 export const handleListNavProjects = async (c: Context) => {
   await ensureNavProjectsReady();
 
+  const includeArchived = c.req.query("archived") === "true";
   const projects = (
     getNavDb()
       .prepare(
@@ -457,13 +599,21 @@ export const handleListNavProjects = async (c: Context) => {
           display_path,
           is_default,
           archived,
+          model_spec,
+          auto_approve_edits,
+          color,
+          icon,
+          sort_order,
           created_at,
           last_opened_at
          FROM nav_projects
-         WHERE archived = 0
-         ORDER BY COALESCE(last_opened_at, created_at) DESC, created_at DESC`,
+         WHERE (? = 1 OR archived = 0)
+         ORDER BY archived ASC,
+          COALESCE(sort_order, 9223372036854775807) ASC,
+          COALESCE(last_opened_at, created_at) DESC,
+          created_at DESC`,
       )
-      .all() as NavProjectRow[]
+      .all(includeArchived ? 1 : 0) as NavProjectRow[]
   ).map(serializeProject);
 
   return c.json({ projects });
@@ -518,6 +668,7 @@ export const handleCreateNavProject = async (c: Context) => {
          SET archived = 0,
              name = CASE WHEN ? IS NULL THEN name ELSE ? END,
              display_path = ?,
+             sort_order = COALESCE(sort_order, ?),
              last_opened_at = ?
          WHERE id = ?`,
       )
@@ -525,6 +676,7 @@ export const handleCreateNavProject = async (c: Context) => {
         requestedName,
         requestedName,
         canonical.displayPath,
+        nextSortOrder(),
         now,
         existing.id,
       );
@@ -549,12 +701,25 @@ export const handleCreateNavProject = async (c: Context) => {
         display_path,
         is_default,
         archived,
+        model_spec,
+        auto_approve_edits,
+        color,
+        icon,
+        sort_order,
         created_at,
         last_opened_at
        )
-       VALUES (?, ?, ?, ?, 0, 0, ?, ?)`,
+       VALUES (?, ?, ?, ?, 0, 0, NULL, 0, NULL, NULL, ?, ?, ?)`,
     )
-    .run(id, name, canonical.path, canonical.displayPath, now, now);
+    .run(
+      id,
+      name,
+      canonical.path,
+      canonical.displayPath,
+      nextSortOrder(),
+      now,
+      now,
+    );
 
   const project = selectProjectById(id);
 
@@ -587,7 +752,65 @@ export const handleUpdateNavProject = async (c: Context) => {
   }
 
   const sets: string[] = [];
-  const values: (string | number)[] = [];
+  const values: (string | number | null)[] = [];
+
+  if ("path" in body) {
+    let canonical: { path: string; displayPath: string };
+
+    try {
+      const nextCanonical = canonicalizeExistingDirectory(body.path);
+
+      if (!nextCanonical) {
+        return c.json({ error: "invalid_path" }, 400);
+      }
+
+      canonical = nextCanonical;
+    } catch (error) {
+      return c.json(
+        {
+          error: "invalid_path",
+          message:
+            error instanceof Error
+              ? error.message
+              : "Selected path is not a directory.",
+        },
+        400,
+      );
+    }
+
+    if (
+      (project.is_default === 1 || isDefaultProjectPath(project.path)) &&
+      !isDefaultProjectPath(canonical.path)
+    ) {
+      return c.json(
+        {
+          error: "default_project_path_locked",
+          message: "The default Nav project path cannot be changed.",
+        },
+        400,
+      );
+    }
+
+    const existing = selectProjectByPath(canonical.path);
+
+    if (existing && existing.id !== id) {
+      return c.json(
+        {
+          error: "project_path_exists",
+          message: "That folder is already a Nav project.",
+        },
+        409,
+      );
+    }
+
+    sets.push(
+      "path = ?",
+      "display_path = ?",
+      "archived = 0",
+      "last_opened_at = ?",
+    );
+    values.push(canonical.path, canonical.displayPath, Date.now());
+  }
 
   if ("name" in body) {
     const name = normalizeProjectName(body.name);
@@ -598,6 +821,59 @@ export const handleUpdateNavProject = async (c: Context) => {
 
     sets.push("name = ?");
     values.push(name);
+  }
+
+  if ("modelSpec" in body) {
+    const modelSpec = normalizeModelSpec(body.modelSpec);
+
+    if (modelSpec === undefined) {
+      return c.json({ error: "invalid_model_spec" }, 400);
+    }
+
+    sets.push("model_spec = ?");
+    values.push(modelSpec);
+  }
+
+  if ("autoApproveEdits" in body) {
+    if (typeof body.autoApproveEdits !== "boolean") {
+      return c.json({ error: "invalid_auto_approve_edits" }, 400);
+    }
+
+    sets.push("auto_approve_edits = ?");
+    values.push(body.autoApproveEdits ? 1 : 0);
+  }
+
+  if ("color" in body) {
+    const color = normalizeProjectColor(body.color);
+
+    if (color === undefined) {
+      return c.json({ error: "invalid_project_color" }, 400);
+    }
+
+    sets.push("color = ?");
+    values.push(color);
+  }
+
+  if ("icon" in body) {
+    const icon = normalizeProjectIcon(body.icon);
+
+    if (icon === undefined) {
+      return c.json({ error: "invalid_project_icon" }, 400);
+    }
+
+    sets.push("icon = ?");
+    values.push(icon);
+  }
+
+  if ("sortOrder" in body) {
+    const sortOrder = normalizeSortOrder(body.sortOrder);
+
+    if (sortOrder === null) {
+      return c.json({ error: "invalid_sort_order" }, 400);
+    }
+
+    sets.push("sort_order = ?");
+    values.push(sortOrder);
   }
 
   if ("archived" in body) {
@@ -617,6 +893,11 @@ export const handleUpdateNavProject = async (c: Context) => {
 
     sets.push("archived = ?");
     values.push(body.archived ? 1 : 0);
+
+    if (!body.archived) {
+      sets.push("sort_order = COALESCE(sort_order, ?)");
+      values.push(nextSortOrder());
+    }
   }
 
   if (sets.length === 0) {
@@ -634,6 +915,53 @@ export const handleUpdateNavProject = async (c: Context) => {
   }
 
   return c.json({ project: serializeProject(updated) });
+};
+
+export const handleReorderNavProjects = async (c: Context) => {
+  await ensureNavProjectsReady();
+
+  const body = await readJsonObject(c);
+  const projectIds = Array.isArray(body?.projectIds) ? body.projectIds : null;
+
+  if (
+    !projectIds ||
+    projectIds.length === 0 ||
+    !projectIds.every(
+      (id): id is string => typeof id === "string" && isValidUuid(id),
+    )
+  ) {
+    return c.json({ error: "invalid_project_order" }, 400);
+  }
+
+  if (new Set(projectIds).size !== projectIds.length) {
+    return c.json({ error: "duplicate_project_order" }, 400);
+  }
+
+  const rows = getNavDb()
+    .prepare(
+      `SELECT id, archived
+       FROM nav_projects
+       WHERE id IN (${projectIds.map(() => "?").join(", ")})`,
+    )
+    .all(...projectIds) as { id: string; archived: number }[];
+  const foundIds = new Set(rows.map((row) => row.id));
+
+  if (
+    foundIds.size !== projectIds.length ||
+    rows.some((row) => row.archived === 1)
+  ) {
+    return c.json({ error: "project_not_found" }, 404);
+  }
+
+  const update = getNavDb().prepare(
+    "UPDATE nav_projects SET sort_order = ? WHERE id = ?",
+  );
+
+  projectIds.forEach((id, index) => {
+    update.run(index, id);
+  });
+
+  return c.json({ ok: true });
 };
 
 export const handleDeleteNavProject = async (c: Context) => {

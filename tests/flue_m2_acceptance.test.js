@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  mkdirSync,
   mkdtempSync,
   realpathSync,
   rmSync,
@@ -46,6 +47,16 @@ const compileFlue = () => {
 
 const importBuilt = (modulePath) =>
   import(pathToFileURL(path.join(buildDir, modulePath)).href);
+
+const callProjectHandler = async (handler, { body, id, query = {} } = {}) =>
+  await handler({
+    req: {
+      json: async () => body,
+      param: (name) => (name === "id" ? id : undefined),
+      query: (name) => query[name],
+    },
+    json: (payload, status = 200) => ({ body: payload, status }),
+  });
 
 const git = (cwd, args) =>
   execFileSync("git", ["-C", cwd, ...args], {
@@ -264,4 +275,171 @@ test("session title helpers enforce eligibility and short titles", async () => {
     "Debugging the Project Fleet Worktree Routing",
   );
   assert.match(buildTitlePrompt(transcript), /at most 6 words/);
+});
+
+test("project APIs relocate, restore, configure, and reorder projects", async () => {
+  const temp = mkdtempSync(path.join(tmpdir(), "nav-project-relocate-"));
+  const previousCwd = process.cwd();
+  const previousWorkdir = process.env.NAV_CODEX_WORKDIR;
+
+  try {
+    const dataRoot = path.join(temp, "data");
+    const defaultRoot = path.join(temp, "default");
+    const originalRoot = path.join(temp, "original");
+    const relocatedRoot = path.join(temp, "relocated");
+    const duplicateRoot = path.join(temp, "duplicate");
+
+    mkdirSync(dataRoot);
+    mkdirSync(defaultRoot);
+    mkdirSync(originalRoot);
+    mkdirSync(relocatedRoot);
+    mkdirSync(duplicateRoot);
+
+    process.chdir(temp);
+    process.env.NAV_CODEX_WORKDIR = defaultRoot;
+
+    const {
+      handleCreateNavProject,
+      handleListNavProjects,
+      handleReorderNavProjects,
+      handleUpdateNavProject,
+      resolveSessionProject,
+    } = await importBuilt(".flue/shared/nav-projects.js");
+    const { getNavDb } = await importBuilt(".flue/shared/nav-db.js");
+
+    const created = await callProjectHandler(handleCreateNavProject, {
+      body: { name: "Moved App", path: originalRoot },
+    });
+
+    assert.equal(created.status, 201);
+    assert.equal(created.body.project.name, "Moved App");
+
+    rmSync(originalRoot, { recursive: true, force: true });
+
+    const relocated = await callProjectHandler(handleUpdateNavProject, {
+      body: { path: relocatedRoot },
+      id: created.body.project.id,
+    });
+
+    assert.equal(relocated.status, 200);
+    assert.equal(relocated.body.project.name, "Moved App");
+    assert.equal(relocated.body.project.path, realpathSync(relocatedRoot));
+    assert.equal(
+      relocated.body.project.displayPath,
+      path.normalize(relocatedRoot),
+    );
+    assert.equal(relocated.body.project.available, true);
+    assert.equal(relocated.body.project.archived, false);
+
+    const configured = await callProjectHandler(handleUpdateNavProject, {
+      body: {
+        autoApproveEdits: true,
+        color: "blue",
+        icon: "terminal",
+        modelSpec: "deepseek/deepseek-v4-pro",
+      },
+      id: created.body.project.id,
+    });
+
+    assert.equal(configured.status, 200);
+    assert.equal(configured.body.project.autoApproveEdits, true);
+    assert.equal(configured.body.project.color, "blue");
+    assert.equal(configured.body.project.icon, "terminal");
+    assert.equal(configured.body.project.modelSpec, "deepseek/deepseek-v4-pro");
+
+    const sessionId = "018f0000-0000-7000-8000-000000000001";
+    getNavDb()
+      .prepare(
+        `INSERT INTO nav_sessions (
+          id,
+          agent_name,
+          title,
+          title_source,
+          pinned,
+          archived,
+          project_id,
+          created_at
+         )
+         VALUES (?, 'nav', NULL, 'first-message', 0, 0, ?, ?)`,
+      )
+      .run(sessionId, created.body.project.id, Date.now());
+
+    const sessionProject = resolveSessionProject(sessionId);
+
+    assert.equal(sessionProject.autoApproveEdits, true);
+    assert.equal(sessionProject.modelSpec, "deepseek/deepseek-v4-pro");
+
+    const duplicate = await callProjectHandler(handleCreateNavProject, {
+      body: { path: duplicateRoot },
+    });
+
+    assert.equal(duplicate.status, 201);
+
+    const rejected = await callProjectHandler(handleUpdateNavProject, {
+      body: { path: duplicateRoot },
+      id: created.body.project.id,
+    });
+
+    assert.equal(rejected.status, 409);
+    assert.equal(rejected.body.error, "project_path_exists");
+
+    const archived = await callProjectHandler(handleUpdateNavProject, {
+      body: { archived: true },
+      id: created.body.project.id,
+    });
+
+    assert.equal(archived.status, 200);
+    assert.equal(archived.body.project.archived, true);
+
+    const activeList = await callProjectHandler(handleListNavProjects);
+    assert.equal(
+      activeList.body.projects.some(
+        (project) => project.id === created.body.project.id,
+      ),
+      false,
+    );
+
+    const archivedList = await callProjectHandler(handleListNavProjects, {
+      query: { archived: "true" },
+    });
+    assert.equal(
+      archivedList.body.projects.some(
+        (project) => project.id === created.body.project.id && project.archived,
+      ),
+      true,
+    );
+
+    const restored = await callProjectHandler(handleUpdateNavProject, {
+      body: { archived: false },
+      id: created.body.project.id,
+    });
+
+    assert.equal(restored.status, 200);
+    assert.equal(restored.body.project.archived, false);
+
+    const beforeReorder = await callProjectHandler(handleListNavProjects);
+    const projectIds = beforeReorder.body.projects.map((project) => project.id);
+    const reversedProjectIds = [...projectIds].reverse();
+    const reordered = await callProjectHandler(handleReorderNavProjects, {
+      body: { projectIds: reversedProjectIds },
+    });
+
+    assert.equal(reordered.status, 200);
+
+    const afterReorder = await callProjectHandler(handleListNavProjects);
+    assert.deepEqual(
+      afterReorder.body.projects.map((project) => project.id),
+      reversedProjectIds,
+    );
+  } finally {
+    process.chdir(previousCwd);
+
+    if (previousWorkdir == null) {
+      delete process.env.NAV_CODEX_WORKDIR;
+    } else {
+      process.env.NAV_CODEX_WORKDIR = previousWorkdir;
+    }
+
+    rmSync(temp, { recursive: true, force: true });
+  }
 });

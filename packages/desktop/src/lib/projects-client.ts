@@ -8,8 +8,22 @@ export type NavProject = {
   isDefault: boolean;
   archived: boolean;
   available: boolean;
+  modelSpec: string | null;
+  autoApproveEdits: boolean;
+  color: string | null;
+  icon: string | null;
+  sortOrder: number | null;
   createdAt: number;
   lastOpenedAt: number | null;
+};
+
+export type ProjectUpdate = {
+  autoApproveEdits?: boolean;
+  color?: string | null;
+  icon?: string | null;
+  modelSpec?: string | null;
+  name?: string;
+  path?: string;
 };
 
 type ProjectsResponse = {
@@ -90,8 +104,10 @@ export function createProjectsClient(connection: FlueConnection) {
 
       return response.project;
     },
-    async listProjects() {
-      const response = await request<ProjectsResponse>("/api/projects");
+    async listProjects(includeArchived = false) {
+      const response = await request<ProjectsResponse>(
+        includeArchived ? "/api/projects?archived=true" : "/api/projects",
+      );
 
       return response.projects;
     },
@@ -100,9 +116,39 @@ export function createProjectsClient(connection: FlueConnection) {
         method: "DELETE",
       });
     },
+    async relocateProject(id: string, path: string) {
+      const response = await request<ProjectResponse>(`/api/projects/${id}`, {
+        body: { path },
+        method: "PATCH",
+      });
+
+      return response.project;
+    },
+    async reorderProjects(projectIds: string[]) {
+      await request<{ ok: true }>("/api/projects/order", {
+        body: { projectIds },
+        method: "PATCH",
+      });
+    },
+    async restoreProject(id: string) {
+      const response = await request<ProjectResponse>(`/api/projects/${id}`, {
+        body: { archived: false },
+        method: "PATCH",
+      });
+
+      return response.project;
+    },
     async renameProject(id: string, name: string) {
       const response = await request<ProjectResponse>(`/api/projects/${id}`, {
         body: { name },
+        method: "PATCH",
+      });
+
+      return response.project;
+    },
+    async updateProject(id: string, update: ProjectUpdate) {
+      const response = await request<ProjectResponse>(`/api/projects/${id}`, {
+        body: update,
         method: "PATCH",
       });
 

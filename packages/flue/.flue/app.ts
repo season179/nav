@@ -12,6 +12,7 @@ import {
   handleCreateNavProject,
   handleDeleteNavProject,
   handleListNavProjects,
+  handleReorderNavProjects,
   handleUpdateNavProject,
 } from "./shared/nav-projects.js";
 import {
@@ -148,6 +149,7 @@ app.use(
 app.use("/api/*", requireDesktopAuth);
 app.get("/api/projects", handleListNavProjects);
 app.post("/api/projects", handleCreateNavProject);
+app.patch("/api/projects/order", handleReorderNavProjects);
 app.patch("/api/projects/:id", handleUpdateNavProject);
 app.delete("/api/projects/:id", handleDeleteNavProject);
 app.get("/api/sessions", handleListNavSessions);

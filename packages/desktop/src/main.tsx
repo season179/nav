@@ -42,7 +42,11 @@ import {
 } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { FlueConnection, FlueServerStatus } from "@/lib/flue-connection";
-import { createProjectsClient, type NavProject } from "@/lib/projects-client";
+import {
+  createProjectsClient,
+  type NavProject,
+  type ProjectUpdate,
+} from "@/lib/projects-client";
 import { createSessionsClient, type NavSession } from "@/lib/sessions-client";
 
 import "./styles.css";
@@ -73,6 +77,7 @@ const createUuidV7 = () => {
 const ACTIVE_PROJECT_STORAGE_KEY = "nav.activeProjectId";
 const ACTIVE_SESSION_BY_PROJECT_STORAGE_KEY = "nav.activeSessionIdByProject";
 const LEGACY_ACTIVE_SESSION_STORAGE_KEY = "nav.activeSessionId";
+const SHOW_ARCHIVED_PROJECTS_STORAGE_KEY = "nav.showArchivedProjects";
 
 type ActiveSessionByProject = Record<string, string>;
 
@@ -85,6 +90,17 @@ const getRememberedActiveProject = () =>
 
 const getLegacyRememberedActiveSession = () =>
   window.localStorage.getItem(LEGACY_ACTIVE_SESSION_STORAGE_KEY);
+
+const getRememberedShowArchivedProjects = () =>
+  window.localStorage.getItem(SHOW_ARCHIVED_PROJECTS_STORAGE_KEY) === "true";
+
+const rememberShowArchivedProjects = (value: boolean) => {
+  if (value) {
+    window.localStorage.setItem(SHOW_ARCHIVED_PROJECTS_STORAGE_KEY, "true");
+  } else {
+    window.localStorage.removeItem(SHOW_ARCHIVED_PROJECTS_STORAGE_KEY);
+  }
+};
 
 const rememberActiveSessionByProject = (value: ActiveSessionByProject) => {
   window.localStorage.setItem(
@@ -572,6 +588,9 @@ function AppShell() {
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [showArchivedProjects, setShowArchivedProjects] = useState(() =>
+    getRememberedShowArchivedProjects(),
+  );
   const [serverStatus, setServerStatus] = useState<FlueServerStatus | null>(
     null,
   );
@@ -660,7 +679,8 @@ function AppShell() {
     setProjectsLoading(true);
 
     try {
-      const nextProjects = await projectsClient.listProjects();
+      const nextProjects =
+        await projectsClient.listProjects(showArchivedProjects);
       setProjects(nextProjects);
 
       return nextProjects;
@@ -674,7 +694,7 @@ function AppShell() {
       setProjectsLoaded(true);
       setProjectsLoading(false);
     }
-  }, [projectsClient]);
+  }, [projectsClient, showArchivedProjects]);
 
   const refreshSessions = useCallback(async () => {
     if (!sessionsClient) {
@@ -708,6 +728,11 @@ function AppShell() {
   const refreshWorkspace = useCallback(async () => {
     await Promise.all([refreshProjects(), refreshSessions()]);
   }, [refreshProjects, refreshSessions]);
+
+  const handleShowArchivedProjectsChange = useCallback((value: boolean) => {
+    setShowArchivedProjects(value);
+    rememberShowArchivedProjects(value);
+  }, []);
 
   useEffect(() => {
     const unsubscribe = window.navDesktop.onFlueStatus(setServerStatus);
@@ -762,22 +787,27 @@ function AppShell() {
 
     const activeProjectExists =
       activeProjectId !== null &&
-      projects.some((project) => project.id === activeProjectId);
+      projects.some(
+        (project) => project.id === activeProjectId && !project.archived,
+      );
 
     if (!activeProjectExists) {
       const rememberedProject = projects.find(
-        (project) => project.id === getRememberedActiveProject(),
+        (project) =>
+          project.id === getRememberedActiveProject() && !project.archived,
       );
       const legacySession = sessions.find(
         (session) => session.id === getLegacyRememberedActiveSession(),
       );
       const legacyProjectId = legacySession?.projectId || undefined;
-      const defaultProject = projects.find((project) => project.isDefault);
+      const defaultProject = projects.find(
+        (project) => project.isDefault && !project.archived,
+      );
       const nextProjectId =
         rememberedProject?.id ??
         legacyProjectId ??
         defaultProject?.id ??
-        projects[0]?.id;
+        projects.find((project) => !project.archived)?.id;
 
       if (nextProjectId) {
         activateProjectWithSession(nextProjectId);
@@ -825,7 +855,7 @@ function AppShell() {
 
       const project = projects.find((candidate) => candidate.id === projectId);
 
-      if (!project?.available) {
+      if (!project?.available || project.archived) {
         return;
       }
 
@@ -971,6 +1001,63 @@ function AppShell() {
     [projectsClient, refreshProjects],
   );
 
+  const handleLocateProject = useCallback(
+    async (id: string) => {
+      if (!projectsClient) {
+        return;
+      }
+
+      setProjectsError(null);
+
+      const path = await window.navDesktop.pickProjectDirectory();
+
+      if (!path) {
+        return;
+      }
+
+      await projectsClient.relocateProject(id, path);
+      await refreshWorkspace();
+    },
+    [projectsClient, refreshWorkspace],
+  );
+
+  const handleRestoreProject = useCallback(
+    async (id: string) => {
+      if (!projectsClient) {
+        return;
+      }
+
+      const project = await projectsClient.restoreProject(id);
+      await refreshWorkspace();
+      activateSession(project.id, createUuidV7(), true);
+    },
+    [activateSession, projectsClient, refreshWorkspace],
+  );
+
+  const handleUpdateProject = useCallback(
+    async (id: string, update: ProjectUpdate) => {
+      if (!projectsClient) {
+        return;
+      }
+
+      await projectsClient.updateProject(id, update);
+      await refreshProjects();
+    },
+    [projectsClient, refreshProjects],
+  );
+
+  const handleReorderProjects = useCallback(
+    async (projectIds: string[]) => {
+      if (!projectsClient) {
+        return;
+      }
+
+      await projectsClient.reorderProjects(projectIds);
+      await refreshProjects();
+    },
+    [projectsClient, refreshProjects],
+  );
+
   const handleRemoveProject = useCallback(
     async (id: string) => {
       if (!projectsClient) {
@@ -1041,9 +1128,12 @@ function AppShell() {
         loading={projectsLoading || sessionsLoading}
         onAddProject={handleAddProject}
         onDeleteSession={handleDeleteSession}
+        onLocateProject={handleLocateProject}
         onNewChat={handleNewChat}
+        onReorderProjects={handleReorderProjects}
         onRemoveProject={handleRemoveProject}
         onRenameProject={handleRenameProject}
+        onRestoreProject={handleRestoreProject}
         onRenameSession={handleRenameSession}
         onSelectProject={activateProjectWithSession}
         onSelectSession={(session) =>
@@ -1051,6 +1141,9 @@ function AppShell() {
         }
         projects={projects}
         sessions={sessions}
+        showArchivedProjects={showArchivedProjects}
+        onShowArchivedProjectsChange={handleShowArchivedProjectsChange}
+        onUpdateProject={handleUpdateProject}
       />
       <div className="fixed inset-x-0 top-0 z-40 h-10 [-webkit-app-region:drag]" />
       <SidebarTrigger className="fixed top-1 left-[76px] z-50 [-webkit-app-region:no-drag] [&_svg]:!size-[18px]" />

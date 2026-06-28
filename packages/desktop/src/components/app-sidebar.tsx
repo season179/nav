@@ -1,20 +1,43 @@
 import {
+  ArchiveIcon,
+  ArchiveRestoreIcon,
+  ArrowDownIcon,
+  ArrowUpIcon,
+  BookOpenIcon,
+  BotIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   CircleAlertIcon,
+  Code2Icon,
   FolderIcon,
   FolderPlusIcon,
+  FolderSearchIcon,
+  GripVerticalIcon,
+  type LucideIcon,
   MoreHorizontalIcon,
+  PackageIcon,
+  PaletteIcon,
   PencilIcon,
   PlusIcon,
+  Settings2Icon,
+  ShieldCheckIcon,
+  SparklesIcon,
+  TerminalIcon,
   Trash2Icon,
 } from "lucide-react";
 import { type FormEvent, Fragment, useEffect, useRef, useState } from "react";
 
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
@@ -33,7 +56,7 @@ import {
   SidebarMenuSkeleton,
   SidebarRail,
 } from "@/components/ui/sidebar";
-import type { NavProject } from "@/lib/projects-client";
+import type { NavProject, ProjectUpdate } from "@/lib/projects-client";
 import type { NavSession } from "@/lib/sessions-client";
 
 type AppSidebarProps = {
@@ -43,14 +66,20 @@ type AppSidebarProps = {
   loading: boolean;
   onAddProject: () => Promise<void>;
   onDeleteSession: (id: string) => Promise<void>;
+  onLocateProject: (id: string) => Promise<void>;
   onNewChat: (projectId: string) => void;
+  onReorderProjects: (projectIds: string[]) => Promise<void>;
   onRemoveProject: (id: string) => Promise<void>;
   onRenameProject: (id: string, name: string) => Promise<void>;
+  onRestoreProject: (id: string) => Promise<void>;
   onRenameSession: (id: string, title: string) => Promise<void>;
   onSelectProject: (id: string) => void;
   onSelectSession: (session: NavSession) => void;
+  onShowArchivedProjectsChange: (value: boolean) => void;
+  onUpdateProject: (id: string, update: ProjectUpdate) => Promise<void>;
   projects: NavProject[];
   sessions: NavSession[];
+  showArchivedProjects: boolean;
 };
 
 type EditingTarget = { id: string; kind: "project" | "session" };
@@ -65,6 +94,39 @@ const skeletonKeys = [
   "project-skeleton-d",
   "project-skeleton-e",
 ];
+const modelOptions = [
+  { label: "Default gpt-5.5", value: "default" },
+  { label: "Codex gpt-5.5", value: "openai-codex/gpt-5.5" },
+  { label: "GLM 5.2", value: "zai/glm-5.2" },
+  { label: "DeepSeek V4 Pro", value: "deepseek/deepseek-v4-pro" },
+  { label: "DeepSeek V4 Flash", value: "deepseek/deepseek-v4-flash" },
+] as const;
+const colorOptions = [
+  { label: "Default", value: "none", color: "transparent" },
+  { label: "Slate", value: "slate", color: "#64748b" },
+  { label: "Red", value: "red", color: "#ef4444" },
+  { label: "Orange", value: "orange", color: "#f97316" },
+  { label: "Yellow", value: "yellow", color: "#eab308" },
+  { label: "Green", value: "green", color: "#22c55e" },
+  { label: "Teal", value: "teal", color: "#14b8a6" },
+  { label: "Blue", value: "blue", color: "#3b82f6" },
+  { label: "Violet", value: "violet", color: "#8b5cf6" },
+  { label: "Pink", value: "pink", color: "#ec4899" },
+] as const;
+const iconOptions = [
+  { Icon: FolderIcon, label: "Folder", value: "folder" },
+  { Icon: Code2Icon, label: "Code", value: "code" },
+  { Icon: TerminalIcon, label: "Terminal", value: "terminal" },
+  { Icon: PackageIcon, label: "Package", value: "package" },
+  { Icon: BookOpenIcon, label: "Book", value: "book" },
+  { Icon: SparklesIcon, label: "Spark", value: "spark" },
+] as const;
+const iconByValue = Object.fromEntries(
+  iconOptions.map(({ Icon, value }) => [value, Icon]),
+) as Record<string, LucideIcon>;
+const colorByValue = Object.fromEntries(
+  colorOptions.map(({ color, value }) => [value, color]),
+) as Record<string, string>;
 
 const getRememberedCollapsedProjects = (): Record<string, boolean> => {
   try {
@@ -135,19 +197,28 @@ export function AppSidebar({
   loading,
   onAddProject,
   onDeleteSession,
+  onLocateProject,
   onNewChat,
+  onReorderProjects,
   onRemoveProject,
   onRenameProject,
+  onRestoreProject,
   onRenameSession,
   onSelectProject,
   onSelectSession,
+  onShowArchivedProjectsChange,
+  onUpdateProject,
   projects,
   sessions,
+  showArchivedProjects,
 }: AppSidebarProps) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<
     Record<string, boolean>
   >(() => getRememberedCollapsedProjects());
+  const [draggingProjectId, setDraggingProjectId] = useState<string | null>(
+    null,
+  );
   const [editing, setEditing] = useState<EditingTarget | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [pendingId, setPendingId] = useState<string | null>(null);
@@ -155,6 +226,8 @@ export function AppSidebar({
     Record<string, boolean>
   >({});
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const activeProjects = projects.filter((project) => !project.archived);
+  const archivedProjects = projects.filter((project) => project.archived);
 
   useEffect(() => {
     if (editing) {
@@ -199,6 +272,56 @@ export function AppSidebar({
       [id]: !current[id],
     }));
   };
+
+  const reorderActiveProjects = async (
+    projectId: string,
+    nextIndex: number,
+  ) => {
+    const orderedIds = activeProjects.map((project) => project.id);
+    const currentIndex = orderedIds.indexOf(projectId);
+
+    if (currentIndex === -1) {
+      return;
+    }
+
+    const boundedIndex = Math.max(
+      0,
+      Math.min(nextIndex, orderedIds.length - 1),
+    );
+
+    if (boundedIndex === currentIndex) {
+      return;
+    }
+
+    const [id] = orderedIds.splice(currentIndex, 1);
+
+    if (!id) {
+      return;
+    }
+
+    orderedIds.splice(boundedIndex, 0, id);
+    await onReorderProjects(orderedIds);
+  };
+
+  const dropProjectOn = async (targetId: string) => {
+    if (!draggingProjectId || draggingProjectId === targetId) {
+      setDraggingProjectId(null);
+      return;
+    }
+
+    const targetIndex = activeProjects.findIndex(
+      (project) => project.id === targetId,
+    );
+
+    try {
+      await reorderActiveProjects(draggingProjectId, targetIndex);
+    } finally {
+      setDraggingProjectId(null);
+    }
+  };
+
+  const updateProject = (id: string, update: ProjectUpdate) =>
+    runAction(id, () => onUpdateProject(id, update));
 
   const startEditingProject = (project: NavProject) => {
     setActionError(null);
@@ -268,7 +391,7 @@ export function AppSidebar({
                       <SidebarMenuSkeleton showIcon />
                     </SidebarMenuItem>
                   ))
-                : projects.map((project) => {
+                : projects.map((project, index) => {
                     const isActiveProject = activeProjectId === project.id;
                     const isCollapsed =
                       collapsedProjectIds[project.id] === true;
@@ -285,10 +408,60 @@ export function AppSidebar({
                     const isEditingProject =
                       editing?.kind === "project" && editing.id === project.id;
                     const projectPath = project.displayPath ?? project.path;
+                    const showProjectActions =
+                      isActiveProject || !project.available || project.archived;
+                    const projectIndex = activeProjects.findIndex(
+                      (candidate) => candidate.id === project.id,
+                    );
+                    const ProjectIcon =
+                      iconByValue[project.icon ?? "folder"] ?? FolderIcon;
+                    const projectColor = project.color
+                      ? colorByValue[project.color]
+                      : null;
+                    const isFirstArchivedProject =
+                      project.archived && !projects[index - 1]?.archived;
 
                     return (
                       <Fragment key={project.id}>
-                        <SidebarMenuItem>
+                        {isFirstArchivedProject && (
+                          <SidebarMenuItem key="archived-projects-label">
+                            <div className="px-2 pt-2 pb-1 text-muted-foreground text-xs">
+                              Archived
+                            </div>
+                          </SidebarMenuItem>
+                        )}
+                        <SidebarMenuItem
+                          draggable={!project.archived && !isEditingProject}
+                          onDragEnd={() => setDraggingProjectId(null)}
+                          onDragOver={(event) => {
+                            if (draggingProjectId && !project.archived) {
+                              event.preventDefault();
+                              event.dataTransfer.dropEffect = "move";
+                            }
+                          }}
+                          onDragStart={(event) => {
+                            if (project.archived || isEditingProject) {
+                              return;
+                            }
+
+                            setDraggingProjectId(project.id);
+                            event.dataTransfer.effectAllowed = "move";
+                            event.dataTransfer.setData(
+                              "text/plain",
+                              project.id,
+                            );
+                          }}
+                          onDrop={(event) => {
+                            if (project.archived) {
+                              return;
+                            }
+
+                            event.preventDefault();
+                            void runAction("project-order", () =>
+                              dropProjectOn(project.id),
+                            );
+                          }}
+                        >
                           {isEditingProject ? (
                             <form
                               className="px-1 py-0.5"
@@ -344,14 +517,40 @@ export function AppSidebar({
                                 aria-current={
                                   isActiveProject ? "page" : undefined
                                 }
-                                className="pl-7 pr-14"
-                                disabled={isProjectPending}
+                                className={`pl-7 pr-14 ${
+                                  project.archived
+                                    ? "opacity-60"
+                                    : "cursor-grab active:cursor-grabbing"
+                                }`}
+                                disabled={isProjectPending || project.archived}
                                 isActive={isActiveProject}
                                 onClick={() => onSelectProject(project.id)}
                                 title={`${project.name} - ${projectPath}`}
                                 type="button"
                               >
-                                <FolderIcon aria-hidden="true" />
+                                {!project.archived && (
+                                  <GripVerticalIcon
+                                    aria-hidden="true"
+                                    className="-ml-1 size-3 text-muted-foreground/70"
+                                  />
+                                )}
+                                <span
+                                  className="flex size-4 shrink-0 items-center justify-center rounded-sm"
+                                  style={
+                                    projectColor
+                                      ? { backgroundColor: projectColor }
+                                      : undefined
+                                  }
+                                >
+                                  <ProjectIcon
+                                    aria-hidden="true"
+                                    className={
+                                      projectColor
+                                        ? "size-3 text-white"
+                                        : "size-4"
+                                    }
+                                  />
+                                </span>
                                 <span className="min-w-0 flex-1 truncate">
                                   {project.name}
                                 </span>
@@ -376,7 +575,7 @@ export function AppSidebar({
                                   <PlusIcon aria-hidden="true" />
                                 </SidebarMenuAction>
                               )}
-                              {isActiveProject && (
+                              {showProjectActions && (
                                 <DropdownMenu>
                                   <DropdownMenuTrigger asChild>
                                     <SidebarMenuAction
@@ -390,8 +589,175 @@ export function AppSidebar({
                                   </DropdownMenuTrigger>
                                   <DropdownMenuContent
                                     align="end"
-                                    className="w-40"
+                                    className="w-52"
                                   >
+                                    {project.archived && (
+                                      <DropdownMenuItem
+                                        onSelect={(event) => {
+                                          event.preventDefault();
+                                          void runAction(project.id, () =>
+                                            onRestoreProject(project.id),
+                                          );
+                                        }}
+                                      >
+                                        <ArchiveRestoreIcon aria-hidden="true" />
+                                        Restore
+                                      </DropdownMenuItem>
+                                    )}
+                                    {!project.available && (
+                                      <DropdownMenuItem
+                                        onSelect={(event) => {
+                                          event.preventDefault();
+                                          void runAction(project.id, () =>
+                                            onLocateProject(project.id),
+                                          );
+                                        }}
+                                      >
+                                        <FolderSearchIcon aria-hidden="true" />
+                                        Locate
+                                      </DropdownMenuItem>
+                                    )}
+                                    <DropdownMenuSub>
+                                      <DropdownMenuSubTrigger>
+                                        <BotIcon aria-hidden="true" />
+                                        Model
+                                      </DropdownMenuSubTrigger>
+                                      <DropdownMenuSubContent className="w-52">
+                                        <DropdownMenuRadioGroup
+                                          onValueChange={(value) => {
+                                            void updateProject(project.id, {
+                                              modelSpec:
+                                                value === "default"
+                                                  ? null
+                                                  : value,
+                                            });
+                                          }}
+                                          value={project.modelSpec ?? "default"}
+                                        >
+                                          {modelOptions.map((option) => (
+                                            <DropdownMenuRadioItem
+                                              key={option.value}
+                                              value={option.value}
+                                            >
+                                              {option.label}
+                                            </DropdownMenuRadioItem>
+                                          ))}
+                                        </DropdownMenuRadioGroup>
+                                      </DropdownMenuSubContent>
+                                    </DropdownMenuSub>
+                                    <DropdownMenuCheckboxItem
+                                      checked={project.autoApproveEdits}
+                                      onCheckedChange={(checked) => {
+                                        void updateProject(project.id, {
+                                          autoApproveEdits: checked === true,
+                                        });
+                                      }}
+                                    >
+                                      <ShieldCheckIcon aria-hidden="true" />
+                                      Auto-approve edits
+                                    </DropdownMenuCheckboxItem>
+                                    <DropdownMenuSub>
+                                      <DropdownMenuSubTrigger>
+                                        <PaletteIcon aria-hidden="true" />
+                                        Color
+                                      </DropdownMenuSubTrigger>
+                                      <DropdownMenuSubContent className="w-36">
+                                        <DropdownMenuRadioGroup
+                                          onValueChange={(value) => {
+                                            void updateProject(project.id, {
+                                              color:
+                                                value === "none" ? null : value,
+                                            });
+                                          }}
+                                          value={project.color ?? "none"}
+                                        >
+                                          {colorOptions.map((option) => (
+                                            <DropdownMenuRadioItem
+                                              key={option.value}
+                                              value={option.value}
+                                            >
+                                              <span
+                                                className="size-3 rounded-full border border-border"
+                                                style={{
+                                                  backgroundColor: option.color,
+                                                }}
+                                              />
+                                              {option.label}
+                                            </DropdownMenuRadioItem>
+                                          ))}
+                                        </DropdownMenuRadioGroup>
+                                      </DropdownMenuSubContent>
+                                    </DropdownMenuSub>
+                                    <DropdownMenuSub>
+                                      <DropdownMenuSubTrigger>
+                                        <Settings2Icon aria-hidden="true" />
+                                        Icon
+                                      </DropdownMenuSubTrigger>
+                                      <DropdownMenuSubContent className="w-36">
+                                        <DropdownMenuRadioGroup
+                                          onValueChange={(value) => {
+                                            void updateProject(project.id, {
+                                              icon: value,
+                                            });
+                                          }}
+                                          value={project.icon ?? "folder"}
+                                        >
+                                          {iconOptions.map((option) => (
+                                            <DropdownMenuRadioItem
+                                              key={option.value}
+                                              value={option.value}
+                                            >
+                                              <option.Icon aria-hidden="true" />
+                                              {option.label}
+                                            </DropdownMenuRadioItem>
+                                          ))}
+                                        </DropdownMenuRadioGroup>
+                                      </DropdownMenuSubContent>
+                                    </DropdownMenuSub>
+                                    {!project.archived && (
+                                      <>
+                                        <DropdownMenuSeparator />
+                                        <DropdownMenuItem
+                                          disabled={projectIndex <= 0}
+                                          onSelect={(event) => {
+                                            event.preventDefault();
+                                            void runAction(
+                                              "project-order",
+                                              () =>
+                                                reorderActiveProjects(
+                                                  project.id,
+                                                  projectIndex - 1,
+                                                ),
+                                            );
+                                          }}
+                                        >
+                                          <ArrowUpIcon aria-hidden="true" />
+                                          Move up
+                                        </DropdownMenuItem>
+                                        <DropdownMenuItem
+                                          disabled={
+                                            projectIndex < 0 ||
+                                            projectIndex >=
+                                              activeProjects.length - 1
+                                          }
+                                          onSelect={(event) => {
+                                            event.preventDefault();
+                                            void runAction(
+                                              "project-order",
+                                              () =>
+                                                reorderActiveProjects(
+                                                  project.id,
+                                                  projectIndex + 1,
+                                                ),
+                                            );
+                                          }}
+                                        >
+                                          <ArrowDownIcon aria-hidden="true" />
+                                          Move down
+                                        </DropdownMenuItem>
+                                      </>
+                                    )}
+                                    <DropdownMenuSeparator />
                                     <DropdownMenuItem
                                       onSelect={(event) => {
                                         event.preventDefault();
@@ -401,36 +767,38 @@ export function AppSidebar({
                                       <PencilIcon aria-hidden="true" />
                                       Rename
                                     </DropdownMenuItem>
-                                    {!project.isDefault && (
-                                      <DropdownMenuItem
-                                        onSelect={(event) => {
-                                          event.preventDefault();
+                                    {!project.isDefault &&
+                                      !project.archived && (
+                                        <DropdownMenuItem
+                                          onSelect={(event) => {
+                                            event.preventDefault();
 
-                                          if (
-                                            !window.confirm(
-                                              `Remove "${project.name}"?`,
-                                            )
-                                          ) {
-                                            return;
-                                          }
+                                            if (
+                                              !window.confirm(
+                                                `Remove "${project.name}"?`,
+                                              )
+                                            ) {
+                                              return;
+                                            }
 
-                                          void runAction(project.id, () =>
-                                            onRemoveProject(project.id),
-                                          );
-                                        }}
-                                        variant="destructive"
-                                      >
-                                        <Trash2Icon aria-hidden="true" />
-                                        Remove
-                                      </DropdownMenuItem>
-                                    )}
+                                            void runAction(project.id, () =>
+                                              onRemoveProject(project.id),
+                                            );
+                                          }}
+                                          variant="destructive"
+                                        >
+                                          <Trash2Icon aria-hidden="true" />
+                                          Remove
+                                        </DropdownMenuItem>
+                                      )}
                                   </DropdownMenuContent>
                                 </DropdownMenu>
                               )}
                             </>
                           )}
                         </SidebarMenuItem>
-                        {!isCollapsed &&
+                        {!project.archived &&
+                          !isCollapsed &&
                           visibleSessions.map((session) => {
                             const title = displayTitle(session);
                             const isActive = activeSessionId === session.id;
@@ -544,28 +912,32 @@ export function AppSidebar({
                               </SidebarMenuItem>
                             );
                           })}
-                        {!isCollapsed && hiddenSessionCount > 0 && (
-                          <SidebarMenuItem key={`${project.id}-show-more`}>
-                            <SidebarMenuButton
-                              className="h-7 pl-8 text-muted-foreground text-xs"
-                              onClick={() => toggleShowAll(project.id)}
-                              type="button"
-                            >
-                              <span>
-                                {showAll
-                                  ? "Show less"
-                                  : `Show more (${hiddenSessionCount})`}
-                              </span>
-                            </SidebarMenuButton>
-                          </SidebarMenuItem>
-                        )}
-                        {!isCollapsed && projectSessions.length === 0 && (
-                          <SidebarMenuItem key={`${project.id}-empty`}>
-                            <div className="px-8 py-1.5 text-muted-foreground text-xs">
-                              No chats yet
-                            </div>
-                          </SidebarMenuItem>
-                        )}
+                        {!project.archived &&
+                          !isCollapsed &&
+                          hiddenSessionCount > 0 && (
+                            <SidebarMenuItem key={`${project.id}-show-more`}>
+                              <SidebarMenuButton
+                                className="h-7 pl-8 text-muted-foreground text-xs"
+                                onClick={() => toggleShowAll(project.id)}
+                                type="button"
+                              >
+                                <span>
+                                  {showAll
+                                    ? "Show less"
+                                    : `Show more (${hiddenSessionCount})`}
+                                </span>
+                              </SidebarMenuButton>
+                            </SidebarMenuItem>
+                          )}
+                        {!project.archived &&
+                          !isCollapsed &&
+                          projectSessions.length === 0 && (
+                            <SidebarMenuItem key={`${project.id}-empty`}>
+                              <div className="px-8 py-1.5 text-muted-foreground text-xs">
+                                No chats yet
+                              </div>
+                            </SidebarMenuItem>
+                          )}
                       </Fragment>
                     );
                   })}
@@ -574,6 +946,27 @@ export function AppSidebar({
                   <div className="px-2 py-1.5 text-muted-foreground text-xs">
                     No projects yet
                   </div>
+                </SidebarMenuItem>
+              )}
+              {!loading && (
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    className="h-7 text-muted-foreground text-xs"
+                    disabled={pendingId === "show-archived-projects"}
+                    onClick={() => {
+                      void runAction("show-archived-projects", async () => {
+                        onShowArchivedProjectsChange(!showArchivedProjects);
+                      });
+                    }}
+                    type="button"
+                  >
+                    <ArchiveIcon aria-hidden="true" />
+                    <span>
+                      {showArchivedProjects
+                        ? `Hide archived (${archivedProjects.length})`
+                        : "Show archived"}
+                    </span>
+                  </SidebarMenuButton>
                 </SidebarMenuItem>
               )}
             </SidebarMenu>

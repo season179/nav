@@ -6,7 +6,10 @@ import {
 import { local } from "@flue/runtime/node";
 import { makeConsult, makeConsultPanel } from "../shared/delegation.js";
 import { resolveGitContext } from "../shared/git-context.js";
-import { resolveSessionProject } from "../shared/nav-projects.js";
+import {
+  DEFAULT_NAV_MODEL_SPEC,
+  resolveSessionProject,
+} from "../shared/nav-projects.js";
 
 const validThinkingLevels = [
   "minimal",
@@ -37,13 +40,16 @@ export const route: AgentRouteHandler = async (_c, next) => {
 
 const buildInstructions = (
   cwd: string,
+  autoApproveEdits: boolean,
   fleetUnavailableReason: string | null,
 ) =>
   [
     `You are Nav, a coding assistant working in the project at ${cwd}.`,
     "Use your file and command tools to read the codebase, investigate, debug, review, and explain.",
     "Be concise. Reference code as path:line so the user can click it.",
-    "Do not create, modify, or delete files, and do not run mutating commands unless the user explicitly asks you to make changes.",
+    autoApproveEdits
+      ? "This project allows edits by default: when the user's goal requires changes, you may create, modify, delete files, and run mutating commands without asking for a separate approval."
+      : "Do not create, modify, or delete files, and do not run mutating commands unless the user explicitly asks you to make changes.",
     fleetUnavailableReason
       ? `Work as a solo agent in this project; fleet unavailable: ${fleetUnavailableReason}.`
       : [
@@ -61,8 +67,12 @@ export default defineAgent((ctx) => {
     : [];
 
   return {
-    instructions: buildInstructions(project.path, git.ok ? null : git.reason),
-    model: "openai-codex/gpt-5.5",
+    instructions: buildInstructions(
+      project.path,
+      project.autoApproveEdits,
+      git.ok ? null : git.reason,
+    ),
+    model: project.modelSpec ?? DEFAULT_NAV_MODEL_SPEC,
     sandbox: local({ cwd: project.path }),
     tools,
     thinkingLevel: resolveThinkingLevel(),
