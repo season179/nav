@@ -58,6 +58,25 @@ const callProjectHandler = async (handler, { body, id, query = {} } = {}) =>
     json: (payload, status = 200) => ({ body: payload, status }),
   });
 
+const insertStoredSession = (db, sessionId) => {
+  const storageKey = `agent-session:${JSON.stringify([
+    sessionId,
+    "default",
+    "default",
+  ])}`;
+
+  db.prepare(
+    `INSERT INTO flue_sessions (id, data)
+     VALUES (?, ?)`,
+  ).run(
+    storageKey,
+    JSON.stringify({
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }),
+  );
+};
+
 const git = (cwd, args) =>
   execFileSync("git", ["-C", cwd, ...args], {
     encoding: "utf8",
@@ -305,7 +324,11 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
       handleUpdateNavProject,
       resolveSessionProject,
     } = await importBuilt(".flue/shared/nav-projects.js");
+    const { handleListNavSessions } = await importBuilt(
+      ".flue/shared/nav-sessions.js",
+    );
     const { getNavDb } = await importBuilt(".flue/shared/nav-db.js");
+    await callProjectHandler(handleListNavSessions);
 
     const created = await callProjectHandler(handleCreateNavProject, {
       body: { name: "Moved App", path: originalRoot },
@@ -363,6 +386,7 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
          VALUES (?, 'nav', NULL, 'first-message', 0, 0, ?, ?)`,
       )
       .run(sessionId, created.body.project.id, Date.now());
+    insertStoredSession(getNavDb(), sessionId);
 
     const sessionProject = resolveSessionProject(sessionId);
 
@@ -390,6 +414,12 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
 
     assert.equal(archived.status, 200);
     assert.equal(archived.body.project.archived, true);
+
+    const activeSessions = await callProjectHandler(handleListNavSessions);
+    assert.equal(
+      activeSessions.body.sessions.some((session) => session.id === sessionId),
+      false,
+    );
 
     const activeList = await callProjectHandler(handleListNavProjects);
     assert.equal(

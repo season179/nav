@@ -408,8 +408,6 @@ export function AppSidebar({
                     const isEditingProject =
                       editing?.kind === "project" && editing.id === project.id;
                     const projectPath = project.displayPath ?? project.path;
-                    const showProjectActions =
-                      isActiveProject || !project.available || project.archived;
                     const projectIndex = activeProjects.findIndex(
                       (candidate) => candidate.id === project.id,
                     );
@@ -575,225 +573,218 @@ export function AppSidebar({
                                   <PlusIcon aria-hidden="true" />
                                 </SidebarMenuAction>
                               )}
-                              {showProjectActions && (
-                                <DropdownMenu>
-                                  <DropdownMenuTrigger asChild>
-                                    <SidebarMenuAction
-                                      aria-label="Project actions"
-                                      disabled={isProjectPending}
-                                      showOnHover
-                                      type="button"
-                                    >
-                                      <MoreHorizontalIcon aria-hidden="true" />
-                                    </SidebarMenuAction>
-                                  </DropdownMenuTrigger>
-                                  <DropdownMenuContent
-                                    align="end"
-                                    className="w-52"
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <SidebarMenuAction
+                                    aria-label="Project actions"
+                                    disabled={isProjectPending}
+                                    showOnHover
+                                    type="button"
                                   >
-                                    {project.archived && (
-                                      <DropdownMenuItem
-                                        onSelect={(event) => {
-                                          event.preventDefault();
-                                          void runAction(project.id, () =>
-                                            onRestoreProject(project.id),
-                                          );
-                                        }}
-                                      >
-                                        <ArchiveRestoreIcon aria-hidden="true" />
-                                        Restore
-                                      </DropdownMenuItem>
-                                    )}
-                                    {!project.available && (
-                                      <DropdownMenuItem
-                                        onSelect={(event) => {
-                                          event.preventDefault();
-                                          void runAction(project.id, () =>
-                                            onLocateProject(project.id),
-                                          );
-                                        }}
-                                      >
-                                        <FolderSearchIcon aria-hidden="true" />
-                                        Locate
-                                      </DropdownMenuItem>
-                                    )}
-                                    <DropdownMenuSub>
-                                      <DropdownMenuSubTrigger>
-                                        <BotIcon aria-hidden="true" />
-                                        Model
-                                      </DropdownMenuSubTrigger>
-                                      <DropdownMenuSubContent className="w-52">
-                                        <DropdownMenuRadioGroup
-                                          onValueChange={(value) => {
-                                            void updateProject(project.id, {
-                                              modelSpec:
-                                                value === "default"
-                                                  ? null
-                                                  : value,
-                                            });
-                                          }}
-                                          value={project.modelSpec ?? "default"}
-                                        >
-                                          {modelOptions.map((option) => (
-                                            <DropdownMenuRadioItem
-                                              key={option.value}
-                                              value={option.value}
-                                            >
-                                              {option.label}
-                                            </DropdownMenuRadioItem>
-                                          ))}
-                                        </DropdownMenuRadioGroup>
-                                      </DropdownMenuSubContent>
-                                    </DropdownMenuSub>
-                                    <DropdownMenuCheckboxItem
-                                      checked={project.autoApproveEdits}
-                                      onCheckedChange={(checked) => {
-                                        void updateProject(project.id, {
-                                          autoApproveEdits: checked === true,
-                                        });
-                                      }}
-                                    >
-                                      <ShieldCheckIcon aria-hidden="true" />
-                                      Auto-approve edits
-                                    </DropdownMenuCheckboxItem>
-                                    <DropdownMenuSub>
-                                      <DropdownMenuSubTrigger>
-                                        <PaletteIcon aria-hidden="true" />
-                                        Color
-                                      </DropdownMenuSubTrigger>
-                                      <DropdownMenuSubContent className="w-36">
-                                        <DropdownMenuRadioGroup
-                                          onValueChange={(value) => {
-                                            void updateProject(project.id, {
-                                              color:
-                                                value === "none" ? null : value,
-                                            });
-                                          }}
-                                          value={project.color ?? "none"}
-                                        >
-                                          {colorOptions.map((option) => (
-                                            <DropdownMenuRadioItem
-                                              key={option.value}
-                                              value={option.value}
-                                            >
-                                              <span
-                                                className="size-3 rounded-full border border-border"
-                                                style={{
-                                                  backgroundColor: option.color,
-                                                }}
-                                              />
-                                              {option.label}
-                                            </DropdownMenuRadioItem>
-                                          ))}
-                                        </DropdownMenuRadioGroup>
-                                      </DropdownMenuSubContent>
-                                    </DropdownMenuSub>
-                                    <DropdownMenuSub>
-                                      <DropdownMenuSubTrigger>
-                                        <Settings2Icon aria-hidden="true" />
-                                        Icon
-                                      </DropdownMenuSubTrigger>
-                                      <DropdownMenuSubContent className="w-36">
-                                        <DropdownMenuRadioGroup
-                                          onValueChange={(value) => {
-                                            void updateProject(project.id, {
-                                              icon: value,
-                                            });
-                                          }}
-                                          value={project.icon ?? "folder"}
-                                        >
-                                          {iconOptions.map((option) => (
-                                            <DropdownMenuRadioItem
-                                              key={option.value}
-                                              value={option.value}
-                                            >
-                                              <option.Icon aria-hidden="true" />
-                                              {option.label}
-                                            </DropdownMenuRadioItem>
-                                          ))}
-                                        </DropdownMenuRadioGroup>
-                                      </DropdownMenuSubContent>
-                                    </DropdownMenuSub>
-                                    {!project.archived && (
-                                      <>
-                                        <DropdownMenuSeparator />
-                                        <DropdownMenuItem
-                                          disabled={projectIndex <= 0}
-                                          onSelect={(event) => {
-                                            event.preventDefault();
-                                            void runAction(
-                                              "project-order",
-                                              () =>
-                                                reorderActiveProjects(
-                                                  project.id,
-                                                  projectIndex - 1,
-                                                ),
-                                            );
-                                          }}
-                                        >
-                                          <ArrowUpIcon aria-hidden="true" />
-                                          Move up
-                                        </DropdownMenuItem>
-                                        <DropdownMenuItem
-                                          disabled={
-                                            projectIndex < 0 ||
-                                            projectIndex >=
-                                              activeProjects.length - 1
-                                          }
-                                          onSelect={(event) => {
-                                            event.preventDefault();
-                                            void runAction(
-                                              "project-order",
-                                              () =>
-                                                reorderActiveProjects(
-                                                  project.id,
-                                                  projectIndex + 1,
-                                                ),
-                                            );
-                                          }}
-                                        >
-                                          <ArrowDownIcon aria-hidden="true" />
-                                          Move down
-                                        </DropdownMenuItem>
-                                      </>
-                                    )}
-                                    <DropdownMenuSeparator />
+                                    <MoreHorizontalIcon aria-hidden="true" />
+                                  </SidebarMenuAction>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent
+                                  align="end"
+                                  className="w-52"
+                                >
+                                  {project.archived && (
                                     <DropdownMenuItem
                                       onSelect={(event) => {
                                         event.preventDefault();
-                                        startEditingProject(project);
+                                        void runAction(project.id, () =>
+                                          onRestoreProject(project.id),
+                                        );
                                       }}
                                     >
-                                      <PencilIcon aria-hidden="true" />
-                                      Rename
+                                      <ArchiveRestoreIcon aria-hidden="true" />
+                                      Restore
                                     </DropdownMenuItem>
-                                    {!project.isDefault &&
-                                      !project.archived && (
-                                        <DropdownMenuItem
-                                          onSelect={(event) => {
-                                            event.preventDefault();
+                                  )}
+                                  {!project.available && (
+                                    <DropdownMenuItem
+                                      onSelect={(event) => {
+                                        event.preventDefault();
+                                        void runAction(project.id, () =>
+                                          onLocateProject(project.id),
+                                        );
+                                      }}
+                                    >
+                                      <FolderSearchIcon aria-hidden="true" />
+                                      Locate
+                                    </DropdownMenuItem>
+                                  )}
+                                  <DropdownMenuSub>
+                                    <DropdownMenuSubTrigger>
+                                      <BotIcon aria-hidden="true" />
+                                      Model
+                                    </DropdownMenuSubTrigger>
+                                    <DropdownMenuSubContent className="w-52">
+                                      <DropdownMenuRadioGroup
+                                        onValueChange={(value) => {
+                                          void updateProject(project.id, {
+                                            modelSpec:
+                                              value === "default"
+                                                ? null
+                                                : value,
+                                          });
+                                        }}
+                                        value={project.modelSpec ?? "default"}
+                                      >
+                                        {modelOptions.map((option) => (
+                                          <DropdownMenuRadioItem
+                                            key={option.value}
+                                            value={option.value}
+                                          >
+                                            {option.label}
+                                          </DropdownMenuRadioItem>
+                                        ))}
+                                      </DropdownMenuRadioGroup>
+                                    </DropdownMenuSubContent>
+                                  </DropdownMenuSub>
+                                  <DropdownMenuCheckboxItem
+                                    checked={project.autoApproveEdits}
+                                    onCheckedChange={(checked) => {
+                                      void updateProject(project.id, {
+                                        autoApproveEdits: checked === true,
+                                      });
+                                    }}
+                                  >
+                                    <ShieldCheckIcon aria-hidden="true" />
+                                    Auto-approve edits
+                                  </DropdownMenuCheckboxItem>
+                                  <DropdownMenuSub>
+                                    <DropdownMenuSubTrigger>
+                                      <PaletteIcon aria-hidden="true" />
+                                      Color
+                                    </DropdownMenuSubTrigger>
+                                    <DropdownMenuSubContent className="w-36">
+                                      <DropdownMenuRadioGroup
+                                        onValueChange={(value) => {
+                                          void updateProject(project.id, {
+                                            color:
+                                              value === "none" ? null : value,
+                                          });
+                                        }}
+                                        value={project.color ?? "none"}
+                                      >
+                                        {colorOptions.map((option) => (
+                                          <DropdownMenuRadioItem
+                                            key={option.value}
+                                            value={option.value}
+                                          >
+                                            <span
+                                              className="size-3 rounded-full border border-border"
+                                              style={{
+                                                backgroundColor: option.color,
+                                              }}
+                                            />
+                                            {option.label}
+                                          </DropdownMenuRadioItem>
+                                        ))}
+                                      </DropdownMenuRadioGroup>
+                                    </DropdownMenuSubContent>
+                                  </DropdownMenuSub>
+                                  <DropdownMenuSub>
+                                    <DropdownMenuSubTrigger>
+                                      <Settings2Icon aria-hidden="true" />
+                                      Icon
+                                    </DropdownMenuSubTrigger>
+                                    <DropdownMenuSubContent className="w-36">
+                                      <DropdownMenuRadioGroup
+                                        onValueChange={(value) => {
+                                          void updateProject(project.id, {
+                                            icon: value,
+                                          });
+                                        }}
+                                        value={project.icon ?? "folder"}
+                                      >
+                                        {iconOptions.map((option) => (
+                                          <DropdownMenuRadioItem
+                                            key={option.value}
+                                            value={option.value}
+                                          >
+                                            <option.Icon aria-hidden="true" />
+                                            {option.label}
+                                          </DropdownMenuRadioItem>
+                                        ))}
+                                      </DropdownMenuRadioGroup>
+                                    </DropdownMenuSubContent>
+                                  </DropdownMenuSub>
+                                  {!project.archived && (
+                                    <>
+                                      <DropdownMenuSeparator />
+                                      <DropdownMenuItem
+                                        disabled={projectIndex <= 0}
+                                        onSelect={(event) => {
+                                          event.preventDefault();
+                                          void runAction("project-order", () =>
+                                            reorderActiveProjects(
+                                              project.id,
+                                              projectIndex - 1,
+                                            ),
+                                          );
+                                        }}
+                                      >
+                                        <ArrowUpIcon aria-hidden="true" />
+                                        Move up
+                                      </DropdownMenuItem>
+                                      <DropdownMenuItem
+                                        disabled={
+                                          projectIndex < 0 ||
+                                          projectIndex >=
+                                            activeProjects.length - 1
+                                        }
+                                        onSelect={(event) => {
+                                          event.preventDefault();
+                                          void runAction("project-order", () =>
+                                            reorderActiveProjects(
+                                              project.id,
+                                              projectIndex + 1,
+                                            ),
+                                          );
+                                        }}
+                                      >
+                                        <ArrowDownIcon aria-hidden="true" />
+                                        Move down
+                                      </DropdownMenuItem>
+                                    </>
+                                  )}
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    onSelect={(event) => {
+                                      event.preventDefault();
+                                      startEditingProject(project);
+                                    }}
+                                  >
+                                    <PencilIcon aria-hidden="true" />
+                                    Rename
+                                  </DropdownMenuItem>
+                                  {!project.isDefault && !project.archived && (
+                                    <DropdownMenuItem
+                                      onSelect={(event) => {
+                                        event.preventDefault();
 
-                                            if (
-                                              !window.confirm(
-                                                `Remove "${project.name}"?`,
-                                              )
-                                            ) {
-                                              return;
-                                            }
+                                        if (
+                                          !window.confirm(
+                                            `Remove "${project.name}"?`,
+                                          )
+                                        ) {
+                                          return;
+                                        }
 
-                                            void runAction(project.id, () =>
-                                              onRemoveProject(project.id),
-                                            );
-                                          }}
-                                          variant="destructive"
-                                        >
-                                          <Trash2Icon aria-hidden="true" />
-                                          Remove
-                                        </DropdownMenuItem>
-                                      )}
-                                  </DropdownMenuContent>
-                                </DropdownMenu>
-                              )}
+                                        void runAction(project.id, () =>
+                                          onRemoveProject(project.id),
+                                        );
+                                      }}
+                                      variant="destructive"
+                                    >
+                                      <Trash2Icon aria-hidden="true" />
+                                      Remove
+                                    </DropdownMenuItem>
+                                  )}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
                             </>
                           )}
                         </SidebarMenuItem>

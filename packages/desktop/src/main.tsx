@@ -604,7 +604,10 @@ function AppShell() {
   );
 
   const activeProject = useMemo(
-    () => projects.find((project) => project.id === activeProjectId) ?? null,
+    () =>
+      projects.find(
+        (project) => project.id === activeProjectId && !project.archived,
+      ) ?? null,
     [activeProjectId, projects],
   );
   const isDraftActive =
@@ -799,7 +802,12 @@ function AppShell() {
       const legacySession = sessions.find(
         (session) => session.id === getLegacyRememberedActiveSession(),
       );
-      const legacyProjectId = legacySession?.projectId || undefined;
+      const legacyProjectId = projects.some(
+        (project) =>
+          project.id === legacySession?.projectId && !project.archived,
+      )
+        ? legacySession?.projectId
+        : undefined;
       const defaultProject = projects.find(
         (project) => project.isDefault && !project.archived,
       );
