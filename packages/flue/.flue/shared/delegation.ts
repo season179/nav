@@ -6,7 +6,7 @@ import { agentWorktreePath } from "./worktrees.js";
 
 const FLEET = ["glm", "deepseek-pro", "deepseek-flash"] as const;
 
-type FleetAgent = (typeof FLEET)[number];
+export type FleetAgent = (typeof FLEET)[number];
 
 type AgentPromptResponse = {
   result?:
@@ -16,7 +16,7 @@ type AgentPromptResponse = {
       };
 };
 
-function createDelegationId(): string {
+export function createDelegationId(): string {
   const timestamp = Date.now().toString(16).padStart(12, "0");
   const randA = randomBytes(2).readUInt16BE() & 0x0fff;
   const randB = randomBytes(8);
@@ -41,12 +41,35 @@ function resultText(result: AgentPromptResponse["result"]): string {
   return result?.text ?? "";
 }
 
-async function consultAgent(
+export type ConsultAgentResult = {
+  agent: FleetAgent;
+  answer: string;
+  delegationId: string;
+  worktree: string;
+};
+
+export async function consultAgent(
   gitCtx: GitContext,
   agent: FleetAgent,
   message: string,
   signal?: AbortSignal,
-) {
+): Promise<ConsultAgentResult> {
+  return consultAgentWithId(
+    gitCtx,
+    agent,
+    createDelegationId(),
+    message,
+    signal,
+  );
+}
+
+export async function consultAgentWithId(
+  gitCtx: GitContext,
+  agent: FleetAgent,
+  id: string,
+  message: string,
+  signal?: AbortSignal,
+): Promise<ConsultAgentResult> {
   const port = process.env.NAV_FLUE_PORT;
   const token = process.env.NAV_DESKTOP_TOKEN;
 
@@ -54,7 +77,6 @@ async function consultAgent(
     throw new Error("NAV_FLUE_PORT / NAV_DESKTOP_TOKEN not set");
   }
 
-  const id = createDelegationId();
   const res = await fetch(
     `http://127.0.0.1:${port}/api/agents/${agent}/${id}?wait=result`,
     {
@@ -81,9 +103,16 @@ async function consultAgent(
   return {
     agent,
     answer: resultText(json.result),
+    delegationId: id,
     worktree: agentWorktreePath(agent, id, gitCtx.gitRoot),
   };
 }
+
+const toToolResult = ({ agent, answer, worktree }: ConsultAgentResult) => ({
+  agent,
+  answer,
+  worktree,
+});
 
 export const makeConsult = (gitCtx: GitContext) =>
   defineTool({
@@ -97,7 +126,9 @@ export const makeConsult = (gitCtx: GitContext) =>
       worktree: v.string(),
     }),
     async run({ input, signal }) {
-      return consultAgent(gitCtx, input.agent, input.task, signal);
+      return toToolResult(
+        await consultAgent(gitCtx, input.agent, input.task, signal),
+      );
     },
   });
 
@@ -131,6 +162,6 @@ export const makeConsultPanel = (gitCtx: GitContext) =>
         ),
       );
 
-      return { results };
+      return { results: results.map(toToolResult) };
     },
   });

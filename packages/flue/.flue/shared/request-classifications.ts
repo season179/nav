@@ -128,7 +128,7 @@ const insertClassification = (
     );
 };
 
-const requestMessageClassification = async (
+export const requestMessageClassification = async (
   input: { priorAssistant?: string; text: string },
   signal?: AbortSignal,
 ) => {

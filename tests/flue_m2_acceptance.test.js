@@ -362,6 +362,9 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
       handleUpdateNavProject,
       resolveSessionProject,
     } = await importBuilt(".flue/shared/nav-projects.js");
+    const { prepareOrchestratorTurn } = await importBuilt(
+      ".flue/shared/orchestrator.js",
+    );
     const { handleListNavSessions } = await importBuilt(
       ".flue/shared/nav-sessions.js",
     );
@@ -398,6 +401,7 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
         color: "blue",
         icon: "terminal",
         modelSpec: "deepseek/deepseek-v4-pro",
+        orchestratorEnabled: true,
       },
       id: created.body.project.id,
     });
@@ -407,6 +411,7 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
     assert.equal(configured.body.project.color, "blue");
     assert.equal(configured.body.project.icon, "terminal");
     assert.equal(configured.body.project.modelSpec, "deepseek/deepseek-v4-pro");
+    assert.equal(configured.body.project.orchestratorEnabled, true);
 
     const sessionId = "018f0000-0000-7000-8000-000000000001";
     getNavDb()
@@ -430,6 +435,130 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
 
     assert.equal(sessionProject.autoApproveEdits, true);
     assert.equal(sessionProject.modelSpec, "deepseek/deepseek-v4-pro");
+    assert.equal(sessionProject.orchestratorEnabled, true);
+
+    const previousFetch = globalThis.fetch;
+    const previousPort = process.env.NAV_FLUE_PORT;
+    const previousToken = process.env.NAV_DESKTOP_TOKEN;
+    const calls = [];
+    const nextClassifications = [
+      { difficulty: "medium", isPlanning: false },
+      { difficulty: "low", isPlanning: false },
+      { difficulty: "high", isPlanning: false },
+    ];
+
+    process.env.NAV_FLUE_PORT = "3583";
+    process.env.NAV_DESKTOP_TOKEN = "test-token";
+    globalThis.fetch = async (url, init) => {
+      calls.push({ init, url });
+
+      const parsedUrl = new URL(url);
+
+      if (parsedUrl.pathname === "/api/workflows/request-classifier") {
+        return new Response(
+          JSON.stringify({ result: nextClassifications.shift() }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      }
+
+      const agent = parsedUrl.pathname.split("/").at(-2);
+
+      if (agent === "deepseek-pro" && nextClassifications.length === 0) {
+        return new Response("delegate failed", { status: 500 });
+      }
+
+      return new Response(JSON.stringify({ result: `${agent} answer` }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    try {
+      const gitCtx = { gitRoot: relocatedRoot, subpath: "" };
+      const firstOrchestrated = await prepareOrchestratorTurn({
+        git: gitCtx,
+        message: "Implement a medium sized feature",
+        project: sessionProject,
+        sessionId,
+      });
+
+      assert.equal(firstOrchestrated.mode, "panel");
+      assert.equal(firstOrchestrated.status, "complete");
+      assert.equal(firstOrchestrated.active, true);
+      assert.equal(firstOrchestrated.difficulty, "medium");
+      assert.deepEqual(
+        firstOrchestrated.delegateResults.map((result) => result.agent).sort(),
+        ["deepseek-pro", "glm"],
+      );
+
+      const firstTurnRows = getNavDb()
+        .prepare(
+          "SELECT difficulty, mode, status FROM nav_orchestrator_turns WHERE session_id = ?",
+        )
+        .all(sessionId);
+
+      assert.equal(firstTurnRows.length, 1);
+      assert.equal(firstTurnRows[0].difficulty, "medium");
+      assert.equal(firstTurnRows[0].mode, "panel");
+      assert.equal(firstTurnRows[0].status, "complete");
+
+      const lowFollowUp = await prepareOrchestratorTurn({
+        git: gitCtx,
+        message: "also rename the helper",
+        project: sessionProject,
+        sessionId,
+      });
+
+      assert.equal(lowFollowUp.mode, "direct");
+      assert.equal(lowFollowUp.active, true);
+      assert.equal(lowFollowUp.difficulty, "low");
+
+      const partial = await prepareOrchestratorTurn({
+        git: gitCtx,
+        message: "now do the harder follow-up",
+        project: sessionProject,
+        sessionId,
+      });
+
+      assert.equal(partial.mode, "panel");
+      assert.equal(partial.status, "partial");
+      assert.equal(partial.difficulty, "high");
+      assert.equal(
+        partial.delegateResults.some(
+          (result) =>
+            result.agent === "deepseek-pro" && result.status === "failed",
+        ),
+        true,
+      );
+
+      const classifyCalls = calls.filter(
+        (call) =>
+          new URL(call.url).pathname === "/api/workflows/request-classifier",
+      );
+      const delegateCalls = calls.filter((call) =>
+        new URL(call.url).pathname.startsWith("/api/agents/"),
+      );
+
+      assert.equal(classifyCalls.length, 3);
+      assert.equal(delegateCalls.length, 4);
+    } finally {
+      globalThis.fetch = previousFetch;
+
+      if (previousPort == null) {
+        delete process.env.NAV_FLUE_PORT;
+      } else {
+        process.env.NAV_FLUE_PORT = previousPort;
+      }
+
+      if (previousToken == null) {
+        delete process.env.NAV_DESKTOP_TOKEN;
+      } else {
+        process.env.NAV_DESKTOP_TOKEN = previousToken;
+      }
+    }
 
     const duplicate = await callProjectHandler(handleCreateNavProject, {
       body: { path: duplicateRoot },

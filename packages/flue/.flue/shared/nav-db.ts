@@ -91,6 +91,7 @@ export const ensureNavProjectTable = () => {
       archived INTEGER NOT NULL DEFAULT 0,
       model_spec TEXT,
       auto_approve_edits INTEGER NOT NULL DEFAULT 0,
+      orchestrator_enabled INTEGER NOT NULL DEFAULT 0,
       color TEXT,
       icon TEXT,
       sort_order INTEGER,
@@ -102,6 +103,7 @@ export const ensureNavProjectTable = () => {
   for (const [column, definition] of [
     ["model_spec", "TEXT"],
     ["auto_approve_edits", "INTEGER NOT NULL DEFAULT 0"],
+    ["orchestrator_enabled", "INTEGER NOT NULL DEFAULT 0"],
     ["color", "TEXT"],
     ["icon", "TEXT"],
     ["sort_order", "INTEGER"],
@@ -122,5 +124,59 @@ export const ensureNavProjectTable = () => {
   sql.exec(`
     CREATE INDEX IF NOT EXISTS nav_projects_default_idx
       ON nav_projects (is_default)
+  `);
+};
+
+export const ensureOrchestratorReady = () => {
+  const sql = getNavDb();
+
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS nav_orchestrator_state (
+      session_id TEXT PRIMARY KEY,
+      project_id TEXT,
+      active INTEGER NOT NULL DEFAULT 0,
+      thread_id TEXT,
+      started_at INTEGER,
+      updated_at INTEGER NOT NULL,
+      cleared_at INTEGER
+    )
+  `);
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS nav_orchestrator_turns (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      project_id TEXT,
+      thread_id TEXT,
+      request_text TEXT NOT NULL,
+      is_planning INTEGER NOT NULL,
+      difficulty TEXT,
+      mode TEXT NOT NULL,
+      status TEXT NOT NULL,
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      completed_at INTEGER
+    )
+  `);
+  sql.exec(`
+    CREATE INDEX IF NOT EXISTS nav_orchestrator_turns_session_idx
+      ON nav_orchestrator_turns (session_id, created_at)
+  `);
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS nav_orchestrator_delegate_results (
+      turn_id TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      agent_session_id TEXT NOT NULL,
+      worktree TEXT,
+      answer TEXT,
+      status TEXT NOT NULL,
+      error TEXT,
+      started_at INTEGER NOT NULL,
+      completed_at INTEGER,
+      PRIMARY KEY (turn_id, agent)
+    )
+  `);
+  sql.exec(`
+    CREATE INDEX IF NOT EXISTS nav_orchestrator_delegate_results_turn_idx
+      ON nav_orchestrator_delegate_results (turn_id)
   `);
 };

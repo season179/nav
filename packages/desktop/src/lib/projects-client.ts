@@ -10,6 +10,7 @@ export type NavProject = {
   available: boolean;
   modelSpec: string | null;
   autoApproveEdits: boolean;
+  orchestratorEnabled: boolean;
   color: string | null;
   icon: string | null;
   sortOrder: number | null;
@@ -19,6 +20,7 @@ export type NavProject = {
 
 export type ProjectUpdate = {
   autoApproveEdits?: boolean;
+  orchestratorEnabled?: boolean;
   color?: string | null;
   icon?: string | null;
   modelSpec?: string | null;

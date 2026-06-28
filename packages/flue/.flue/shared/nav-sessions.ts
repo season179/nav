@@ -16,6 +16,7 @@ import {
   resolveWritableProjectId,
   touchNavProject,
 } from "./nav-projects.js";
+import { deleteOrchestratorDataForSession } from "./orchestrator.js";
 import {
   hasTitleTranscriptExchange,
   isTitleSourceEligible,
@@ -660,6 +661,7 @@ const deleteNavSession = async (id: string) => {
   getNavDb()
     .prepare("DELETE FROM nav_message_classifications WHERE session_id = ?")
     .run(id);
+  deleteOrchestratorDataForSession(id);
   getNavDb().prepare("DELETE FROM nav_sessions WHERE id = ?").run(id);
 };
 

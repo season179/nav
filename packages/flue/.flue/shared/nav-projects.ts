@@ -6,8 +6,10 @@ import { getWorkspaceRoot } from "./codex.js";
 import {
   ensureNavProjectTable,
   ensureNavSessionTable,
+  ensureOrchestratorReady,
   getNavDb,
 } from "./nav-db.js";
+import { clearOrchestratorStateForProject } from "./orchestrator.js";
 
 const MAX_PROJECT_NAME_LENGTH = 80;
 export const DEFAULT_NAV_MODEL_SPEC = "openai-codex/gpt-5.5";
@@ -52,6 +54,7 @@ type NavProjectRow = {
   archived: number;
   model_spec: string | null;
   auto_approve_edits: number;
+  orchestrator_enabled: number;
   color: string | null;
   icon: string | null;
   sort_order: number | null;
@@ -69,6 +72,7 @@ type SessionProjectRow = {
   archived: number | null;
   model_spec: string | null;
   auto_approve_edits: number | null;
+  orchestrator_enabled: number | null;
   color: string | null;
   icon: string | null;
   sort_order: number | null;
@@ -84,6 +88,7 @@ export type NavProjectSummary = {
   available: boolean;
   modelSpec: NavModelSpec | null;
   autoApproveEdits: boolean;
+  orchestratorEnabled: boolean;
   color: NavProjectColor | null;
   icon: NavProjectIcon | null;
   sortOrder: number | null;
@@ -100,6 +105,7 @@ export type ResolvedSessionProject = {
   available: boolean;
   modelSpec: NavModelSpec | null;
   autoApproveEdits: boolean;
+  orchestratorEnabled: boolean;
 };
 
 type ProjectIdResolution =
@@ -263,6 +269,7 @@ const selectProjectByPath = (projectPath: string) =>
         archived,
         model_spec,
         auto_approve_edits,
+        orchestrator_enabled,
         color,
         icon,
         sort_order,
@@ -286,6 +293,7 @@ const selectProjectById = (id: string) =>
         archived,
         model_spec,
         auto_approve_edits,
+        orchestrator_enabled,
         color,
         icon,
         sort_order,
@@ -310,6 +318,7 @@ const selectDefaultProject = () =>
          archived,
          model_spec,
          auto_approve_edits,
+         orchestrator_enabled,
          color,
          icon,
          sort_order,
@@ -332,6 +341,7 @@ const serializeProject = (row: NavProjectRow): NavProjectSummary => ({
   available: isDirectoryAvailable(row.path),
   modelSpec: resolveNavModelSpec(row.model_spec),
   autoApproveEdits: row.auto_approve_edits === 1,
+  orchestratorEnabled: row.orchestrator_enabled === 1,
   color:
     row.color && isProjectColor(row.color as NavProjectColor)
       ? (row.color as NavProjectColor)
@@ -435,6 +445,7 @@ const backfillDefaultProjectSessions = (defaultProjectId: string) => {
 export const ensureNavProjectsReadySync = () => {
   ensureNavSessionTable();
   ensureNavProjectTable();
+  ensureOrchestratorReady();
 
   const defaultProjectId = ensureDefaultProject();
   backfillDefaultProjectSessions(defaultProjectId);
@@ -531,6 +542,7 @@ export const resolveSessionProject = (
         p.archived,
         p.model_spec,
         p.auto_approve_edits,
+        p.orchestrator_enabled,
         p.color,
         p.icon,
         p.sort_order
@@ -551,6 +563,7 @@ export const resolveSessionProject = (
       available: isDirectoryAvailable(defaultProject.path),
       modelSpec: resolveNavModelSpec(defaultProject.model_spec),
       autoApproveEdits: defaultProject.auto_approve_edits === 1,
+      orchestratorEnabled: defaultProject.orchestrator_enabled === 1,
     };
   }
 
@@ -570,6 +583,7 @@ export const resolveSessionProject = (
       available: false,
       modelSpec: null,
       autoApproveEdits: false,
+      orchestratorEnabled: false,
     };
   }
 
@@ -582,6 +596,7 @@ export const resolveSessionProject = (
     available: isDirectoryAvailable(row.path),
     modelSpec: resolveNavModelSpec(row.model_spec),
     autoApproveEdits: row.auto_approve_edits === 1,
+    orchestratorEnabled: row.orchestrator_enabled === 1,
   };
 };
 
@@ -601,6 +616,7 @@ export const handleListNavProjects = async (c: Context) => {
           archived,
           model_spec,
           auto_approve_edits,
+          orchestrator_enabled,
           color,
           icon,
           sort_order,
@@ -843,6 +859,15 @@ export const handleUpdateNavProject = async (c: Context) => {
     values.push(body.autoApproveEdits ? 1 : 0);
   }
 
+  if ("orchestratorEnabled" in body) {
+    if (typeof body.orchestratorEnabled !== "boolean") {
+      return c.json({ error: "invalid_orchestrator_enabled" }, 400);
+    }
+
+    sets.push("orchestrator_enabled = ?");
+    values.push(body.orchestratorEnabled ? 1 : 0);
+  }
+
   if ("color" in body) {
     const color = normalizeProjectColor(body.color);
 
@@ -907,6 +932,10 @@ export const handleUpdateNavProject = async (c: Context) => {
   getNavDb()
     .prepare(`UPDATE nav_projects SET ${sets.join(", ")} WHERE id = ?`)
     .run(...values, id);
+
+  if (body.orchestratorEnabled === false) {
+    clearOrchestratorStateForProject(id);
+  }
 
   const updated = selectProjectById(id);
 

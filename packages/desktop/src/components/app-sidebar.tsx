@@ -653,6 +653,17 @@ export function AppSidebar({
                                     <ShieldCheckIcon aria-hidden="true" />
                                     Auto-approve edits
                                   </DropdownMenuCheckboxItem>
+                                  <DropdownMenuCheckboxItem
+                                    checked={project.orchestratorEnabled}
+                                    onCheckedChange={(checked) => {
+                                      void updateProject(project.id, {
+                                        orchestratorEnabled: checked === true,
+                                      });
+                                    }}
+                                  >
+                                    <SparklesIcon aria-hidden="true" />
+                                    Orchestrator mode
+                                  </DropdownMenuCheckboxItem>
                                   <DropdownMenuSub>
                                     <DropdownMenuSubTrigger>
                                       <PaletteIcon aria-hidden="true" />
