@@ -440,15 +440,23 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
     const previousFetch = globalThis.fetch;
     const previousPort = process.env.NAV_FLUE_PORT;
     const previousToken = process.env.NAV_DESKTOP_TOKEN;
+    const previousDateNow = Date.now;
+    let now = previousDateNow();
     const calls = [];
     const nextClassifications = [
       { difficulty: "medium", isPlanning: false },
       { difficulty: "low", isPlanning: false },
       { difficulty: "high", isPlanning: false },
+      { difficulty: "medium", isPlanning: false },
     ];
 
     process.env.NAV_FLUE_PORT = "3583";
     process.env.NAV_DESKTOP_TOKEN = "test-token";
+    Date.now = () => {
+      now += 1;
+
+      return now;
+    };
     globalThis.fetch = async (url, init) => {
       calls.push({ init, url });
 
@@ -465,8 +473,12 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
       }
 
       const agent = parsedUrl.pathname.split("/").at(-2);
+      const body = JSON.parse(init.body);
 
-      if (agent === "deepseek-pro" && nextClassifications.length === 0) {
+      if (
+        agent === "deepseek-pro" &&
+        body.message.includes("now do the harder follow-up")
+      ) {
         return new Response("delegate failed", { status: 500 });
       }
 
@@ -534,6 +546,65 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
         true,
       );
 
+      const activeState = getNavDb()
+        .prepare(
+          "SELECT active, thread_id, started_at FROM nav_orchestrator_state WHERE session_id = ?",
+        )
+        .get(sessionId);
+      const previousThreadId = activeState.thread_id;
+      const previousStartedAt = activeState.started_at;
+      const disabledOrchestrator = await callProjectHandler(
+        handleUpdateNavProject,
+        {
+          body: { orchestratorEnabled: false },
+          id: created.body.project.id,
+        },
+      );
+
+      assert.equal(disabledOrchestrator.status, 200);
+      assert.equal(
+        disabledOrchestrator.body.project.orchestratorEnabled,
+        false,
+      );
+
+      const clearedState = getNavDb()
+        .prepare(
+          "SELECT active, thread_id, started_at FROM nav_orchestrator_state WHERE session_id = ?",
+        )
+        .get(sessionId);
+
+      assert.equal(clearedState.active, 0);
+      assert.equal(clearedState.thread_id, null);
+      assert.equal(clearedState.started_at, previousStartedAt);
+
+      const enabledOrchestrator = await callProjectHandler(
+        handleUpdateNavProject,
+        {
+          body: { orchestratorEnabled: true },
+          id: created.body.project.id,
+        },
+      );
+      const restartedProject = resolveSessionProject(sessionId);
+      const restarted = await prepareOrchestratorTurn({
+        git: gitCtx,
+        message: "open a fresh medium thread",
+        project: restartedProject,
+        sessionId,
+      });
+      const restartedState = getNavDb()
+        .prepare(
+          "SELECT active, thread_id, started_at FROM nav_orchestrator_state WHERE session_id = ?",
+        )
+        .get(sessionId);
+
+      assert.equal(enabledOrchestrator.status, 200);
+      assert.equal(enabledOrchestrator.body.project.orchestratorEnabled, true);
+      assert.equal(restarted.mode, "panel");
+      assert.equal(restarted.status, "complete");
+      assert.equal(restartedState.active, 1);
+      assert.notEqual(restartedState.thread_id, previousThreadId);
+      assert.ok(restartedState.started_at > previousStartedAt);
+
       const classifyCalls = calls.filter(
         (call) =>
           new URL(call.url).pathname === "/api/workflows/request-classifier",
@@ -542,10 +613,11 @@ test("project APIs relocate, restore, configure, and reorder projects", async ()
         new URL(call.url).pathname.startsWith("/api/agents/"),
       );
 
-      assert.equal(classifyCalls.length, 3);
-      assert.equal(delegateCalls.length, 4);
+      assert.equal(classifyCalls.length, 4);
+      assert.equal(delegateCalls.length, 6);
     } finally {
       globalThis.fetch = previousFetch;
+      Date.now = previousDateNow;
 
       if (previousPort == null) {
         delete process.env.NAV_FLUE_PORT;

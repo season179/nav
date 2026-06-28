@@ -174,7 +174,9 @@ const upsertState = (input: {
   const now = Date.now();
   const existing = selectState(input.sessionId);
   const startedAt = input.active
-    ? (existing?.started_at ?? now)
+    ? existing?.active === 1
+      ? (existing.started_at ?? now)
+      : now
     : existing?.started_at;
 
   getNavDb()
@@ -409,7 +411,7 @@ export const clearOrchestratorStateForProject = (projectId: string) => {
   getNavDb()
     .prepare(
       `UPDATE nav_orchestrator_state
-       SET active = 0, cleared_at = ?, updated_at = ?
+       SET active = 0, thread_id = NULL, cleared_at = ?, updated_at = ?
        WHERE project_id = ?`,
     )
     .run(now, now, projectId);
