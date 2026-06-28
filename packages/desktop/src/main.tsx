@@ -5,7 +5,14 @@ import {
   LoaderCircleIcon,
   MessageSquareTextIcon,
 } from "lucide-react";
-import { StrictMode, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  StrictMode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 
 import {
@@ -28,6 +35,7 @@ import {
   ChatMessageParts,
   hasRenderableMessageParts,
 } from "@/components/chat-message-parts";
+import { Badge } from "@/components/ui/badge";
 import {
   Empty,
   EmptyDescription,
@@ -47,7 +55,12 @@ import {
   type NavProject,
   type ProjectUpdate,
 } from "@/lib/projects-client";
-import { createSessionsClient, type NavSession } from "@/lib/sessions-client";
+import {
+  createSessionsClient,
+  type MessageClassification,
+  type NavSession,
+  type SessionsClient,
+} from "@/lib/sessions-client";
 
 import "./styles.css";
 
@@ -179,6 +192,8 @@ function ConnectionEmpty({
 }
 
 type MessagePart = UIMessage["parts"][number];
+type ClassificationState = MessageClassification | "pending";
+type ClassificationMap = Map<string, ClassificationState>;
 type ConversationRenderItem =
   | {
       isLatestMessage: boolean;
@@ -193,6 +208,9 @@ type ConversationRenderItem =
       type: "assistant-group";
     };
 
+const MAX_PRIOR_ASSISTANT_CHARS = 2000;
+const OPTIMISTIC_MESSAGE_ID_PREFIX = "local:";
+
 const hasVisiblePart = (part: MessagePart) => {
   switch (part.type) {
     case "text":
@@ -204,6 +222,38 @@ const hasVisiblePart = (part: MessagePart) => {
       return false;
   }
 };
+
+const extractMessageText = (message: UIMessage) =>
+  message.parts
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+
+const getPriorAssistantText = (messages: UIMessage[], messageIndex: number) => {
+  for (let index = messageIndex - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+
+    if (!message || message.role !== "assistant") {
+      continue;
+    }
+
+    const text = extractMessageText(message);
+
+    if (!text) {
+      continue;
+    }
+
+    return text.length > MAX_PRIOR_ASSISTANT_CHARS
+      ? text.slice(-MAX_PRIOR_ASSISTANT_CHARS)
+      : text;
+  }
+
+  return undefined;
+};
+
+const isOptimisticMessageId = (id: string) =>
+  id.startsWith(OPTIMISTIC_MESSAGE_ID_PREFIX);
 
 const hasVisibleAssistantOutputAfterLastUser = (messages: UIMessage[]) => {
   const lastUserIndex = messages.findLastIndex(
@@ -257,6 +307,59 @@ const createConversationRenderItems = (messages: UIMessage[]) => {
   return items;
 };
 
+const difficultyLabel = (difficulty: MessageClassification["difficulty"]) =>
+  difficulty.charAt(0).toUpperCase() + difficulty.slice(1);
+
+const difficultyBadgeClassName: Record<
+  MessageClassification["difficulty"],
+  string
+> = {
+  high: "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-300",
+  low: "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+  medium:
+    "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+};
+
+function MessageClassificationChips({
+  classification,
+}: {
+  classification?: ClassificationState;
+}) {
+  if (!classification) {
+    return null;
+  }
+
+  if (classification === "pending") {
+    return (
+      <div className="flex justify-end pt-1">
+        <Badge
+          className="bg-background/60 text-muted-foreground"
+          variant="secondary"
+        >
+          Analyzing...
+        </Badge>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap justify-end gap-1.5 pt-1">
+      <Badge
+        className="bg-background/60 text-muted-foreground"
+        variant="secondary"
+      >
+        {classification.isPlanning ? "Planning" : "Direct"}
+      </Badge>
+      <Badge
+        className={difficultyBadgeClassName[classification.difficulty]}
+        variant="outline"
+      >
+        {difficultyLabel(classification.difficulty)}
+      </Badge>
+    </div>
+  );
+}
+
 function AssistantMessageGroup({
   isLatestMessage,
   messages,
@@ -290,9 +393,11 @@ function AssistantMessageGroup({
 }
 
 function ConversationMessage({
+  classification,
   isLatestMessage,
   message,
 }: {
+  classification?: ClassificationState;
   isLatestMessage: boolean;
   message: UIMessage;
 }) {
@@ -304,6 +409,7 @@ function ConversationMessage({
     <Message from={message.role === "assistant" ? "assistant" : "user"}>
       <MessageContent>
         <ChatMessageParts isLatestMessage={isLatestMessage} message={message} />
+        <MessageClassificationChips classification={classification} />
       </MessageContent>
     </Message>
   );
@@ -320,9 +426,11 @@ function ThinkingMessage() {
 }
 
 function LiveConversation({
+  classifications,
   isThinking,
   messages,
 }: {
+  classifications: ClassificationMap;
   isThinking: boolean;
   messages: UIMessage[];
 }) {
@@ -344,6 +452,11 @@ function LiveConversation({
             />
           ) : (
             <ConversationMessage
+              classification={
+                item.message.role === "user"
+                  ? classifications.get(item.message.id)
+                  : undefined
+              }
               isLatestMessage={item.isLatestMessage}
               key={item.key}
               message={item.message}
@@ -400,6 +513,7 @@ function NavChat({
   onEnsureSessionBound,
   onSessionAdmitted,
   project,
+  sessionsClient,
   serverStatus,
 }: {
   conversationId: string;
@@ -408,17 +522,26 @@ function NavChat({
   onEnsureSessionBound: (id: string) => Promise<void>;
   onSessionAdmitted: (id: string, title: string) => Promise<void>;
   project: NavProject | null;
+  sessionsClient: SessionsClient;
   serverStatus: FlueServerStatus | null;
 }) {
   const [sessionError, setSessionError] = useState<string | null>(null);
-  const { messages, status, error, sendMessage } = useFlueAgent({
+  const { messages, status, error, historyReady, sendMessage } = useFlueAgent({
     history: "all",
     id: conversationId,
     name: "nav",
   });
+  const [classifications, setClassifications] = useState<ClassificationMap>(
+    () => new Map(),
+  );
   const [titleRequestedFor, setTitleRequestedFor] = useState<string | null>(
     null,
   );
+  const activeConversationIdRef = useRef<string | null>(conversationId);
+  const failedUserMessageIdsRef = useRef<Set<string>>(new Set());
+  const historySeededRef = useRef(false);
+  const inFlightUserMessageIdsRef = useRef<Set<string>>(new Set());
+  const seenUserMessageIdsRef = useRef<Set<string>>(new Set());
 
   const serverReady = serverStatus?.state === "ready";
   // Only block the composer while the server is down or a send is in flight.
@@ -442,6 +565,149 @@ function NavChat({
     status === "submitted" ||
     (status === "streaming" &&
       !hasVisibleAssistantOutputAfterLastUser(messages));
+
+  useEffect(() => {
+    activeConversationIdRef.current = conversationId;
+    failedUserMessageIdsRef.current.clear();
+    historySeededRef.current = false;
+    inFlightUserMessageIdsRef.current.clear();
+    seenUserMessageIdsRef.current.clear();
+    setClassifications(new Map());
+
+    let cancelled = false;
+
+    void sessionsClient
+      .listClassifications(conversationId)
+      .then((storedClassifications) => {
+        if (cancelled || activeConversationIdRef.current !== conversationId) {
+          return;
+        }
+
+        setClassifications((current) => {
+          const next = new Map(current);
+
+          for (const classification of storedClassifications) {
+            seenUserMessageIdsRef.current.add(classification.messageId);
+            next.set(classification.messageId, classification);
+          }
+
+          return next;
+        });
+      })
+      .catch((caught: unknown) => {
+        console.warn(
+          "[nav] Failed to load message classifications:",
+          caught instanceof Error ? caught.message : caught,
+        );
+      });
+
+    return () => {
+      cancelled = true;
+      activeConversationIdRef.current = null;
+    };
+  }, [conversationId, sessionsClient]);
+
+  useEffect(() => {
+    if (!historyReady || historySeededRef.current) {
+      return;
+    }
+
+    for (const message of messages) {
+      if (message.role === "user" && !isOptimisticMessageId(message.id)) {
+        seenUserMessageIdsRef.current.add(message.id);
+      }
+    }
+
+    historySeededRef.current = true;
+  }, [historyReady, messages]);
+
+  useEffect(() => {
+    if (!historyReady || !historySeededRef.current) {
+      return;
+    }
+
+    messages.forEach((message, index) => {
+      if (message.role !== "user") {
+        return;
+      }
+
+      if (isOptimisticMessageId(message.id)) {
+        return;
+      }
+
+      if (
+        classifications.has(message.id) ||
+        failedUserMessageIdsRef.current.has(message.id) ||
+        inFlightUserMessageIdsRef.current.has(message.id) ||
+        seenUserMessageIdsRef.current.has(message.id)
+      ) {
+        return;
+      }
+
+      const text = extractMessageText(message);
+
+      if (!text) {
+        seenUserMessageIdsRef.current.add(message.id);
+        return;
+      }
+
+      const priorAssistant = getPriorAssistantText(messages, index);
+      inFlightUserMessageIdsRef.current.add(message.id);
+      setClassifications((current) => {
+        const next = new Map(current);
+        next.set(message.id, "pending");
+        return next;
+      });
+
+      void sessionsClient
+        .classifyMessage(conversationId, {
+          messageId: message.id,
+          ...(priorAssistant ? { priorAssistant } : {}),
+          text,
+        })
+        .then((classification) => {
+          if (activeConversationIdRef.current !== conversationId) {
+            return;
+          }
+
+          if (!classification) {
+            seenUserMessageIdsRef.current.add(message.id);
+            setClassifications((current) => {
+              const next = new Map(current);
+              next.delete(message.id);
+              return next;
+            });
+            return;
+          }
+
+          seenUserMessageIdsRef.current.add(message.id);
+          setClassifications((current) => {
+            const next = new Map(current);
+            next.set(message.id, classification);
+            return next;
+          });
+        })
+        .catch((caught: unknown) => {
+          if (activeConversationIdRef.current !== conversationId) {
+            return;
+          }
+
+          failedUserMessageIdsRef.current.add(message.id);
+          setClassifications((current) => {
+            const next = new Map(current);
+            next.delete(message.id);
+            return next;
+          });
+          console.warn(
+            "[nav] Failed to classify message:",
+            caught instanceof Error ? caught.message : caught,
+          );
+        })
+        .finally(() => {
+          inFlightUserMessageIdsRef.current.delete(message.id);
+        });
+    });
+  }, [classifications, conversationId, historyReady, messages, sessionsClient]);
 
   useEffect(() => {
     if (
@@ -479,7 +745,11 @@ function NavChat({
           Project folder is unavailable: {project.path}
         </div>
       )}
-      <LiveConversation isThinking={isThinking} messages={messages} />
+      <LiveConversation
+        classifications={classifications}
+        isThinking={isThinking}
+        messages={messages}
+      />
       <PromptComposer
         disabled={disabled}
         onSubmit={async (text) => {
@@ -542,6 +812,10 @@ function ConnectedApp({
       }),
     [connection.baseUrl, connection.token],
   );
+  const sessionsClient = useMemo(
+    () => createSessionsClient(connection),
+    [connection],
+  );
 
   if (!activeSessionId) {
     return (
@@ -561,6 +835,7 @@ function ConnectedApp({
         onEnsureSessionBound={onEnsureSessionBound}
         onSessionAdmitted={onSessionAdmitted}
         project={project}
+        sessionsClient={sessionsClient}
         serverStatus={serverStatus}
       />
     </FlueProvider>

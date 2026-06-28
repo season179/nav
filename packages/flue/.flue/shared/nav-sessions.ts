@@ -5,6 +5,7 @@ import {
 } from "@flue/runtime/adapter";
 import type { Context } from "hono";
 import {
+  ensureMessageClassificationsReady,
   ensureNavSessionTable,
   getNavDb,
   getNavStores,
@@ -390,6 +391,7 @@ const backfillNavSessions = () => {
 const initializeNavSessions = async () => {
   await migrateNavStore();
   ensureNavSessionTable();
+  ensureMessageClassificationsReady();
   backfillNavSessions();
   ensureNavProjectsReadySync();
 };
@@ -655,6 +657,9 @@ const deleteNavSession = async (id: string) => {
     stores.executionStore.sessions.delete(storageKey),
   );
 
+  getNavDb()
+    .prepare("DELETE FROM nav_message_classifications WHERE session_id = ?")
+    .run(id);
   getNavDb().prepare("DELETE FROM nav_sessions WHERE id = ?").run(id);
 };
 

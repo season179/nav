@@ -296,6 +296,44 @@ test("session title helpers enforce eligibility and short titles", async () => {
   assert.match(buildTitlePrompt(transcript), /at most 6 words/);
 });
 
+test("request classifier helpers build prompts and normalize structured output", async () => {
+  const {
+    buildRequestClassifierPrompt,
+    normalizeRequestClassification,
+    REQUEST_CLASSIFIER_MODEL,
+  } = await importBuilt(".flue/shared/request-classifier.js");
+
+  const prompt = buildRequestClassifierPrompt({
+    priorAssistant: "I can split this into a plan first.",
+    text: "ok do it",
+  });
+
+  assert.equal(REQUEST_CLASSIFIER_MODEL, "deepseek/deepseek-v4-flash");
+  assert.match(prompt, /Prior assistant turn:/);
+  assert.match(prompt, /ok do it/);
+  assert.deepEqual(
+    normalizeRequestClassification({
+      difficulty: "high",
+      isPlanning: true,
+    }),
+    { difficulty: "high", isPlanning: true },
+  );
+  assert.equal(
+    normalizeRequestClassification({
+      difficulty: "extreme",
+      isPlanning: true,
+    }),
+    null,
+  );
+  assert.equal(
+    normalizeRequestClassification({
+      difficulty: "low",
+      isPlanning: "yes",
+    }),
+    null,
+  );
+});
+
 test("project APIs relocate, restore, configure, and reorder projects", async () => {
   const temp = mkdtempSync(path.join(tmpdir(), "nav-project-relocate-"));
   const previousCwd = process.cwd();

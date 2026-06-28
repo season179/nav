@@ -12,8 +12,20 @@ export type NavSession = {
   lastPreview: string | null;
 };
 
+export type MessageDifficulty = "low" | "medium" | "high";
+
+export type MessageClassification = {
+  difficulty: MessageDifficulty;
+  isPlanning: boolean;
+  messageId: string;
+};
+
 type SessionsResponse = {
   sessions: NavSession[];
+};
+
+type ClassificationsResponse = {
+  classifications: MessageClassification[];
 };
 
 type GenerateTitleResponse = {
@@ -81,10 +93,26 @@ export function createSessionsClient(connection: FlueConnection) {
       throw new SessionsClientError(await readErrorMessage(response));
     }
 
+    if (response.status === 204) {
+      return null as T;
+    }
+
     return (await response.json()) as T;
   };
 
   return {
+    async classifyMessage(
+      id: string,
+      input: { messageId: string; priorAssistant?: string; text: string },
+    ) {
+      return request<MessageClassification | null>(
+        `/api/sessions/${id}/classify`,
+        {
+          body: input,
+          method: "POST",
+        },
+      );
+    },
     async createSession(
       id: string,
       title: string | null,
@@ -105,6 +133,13 @@ export function createSessionsClient(connection: FlueConnection) {
 
       return response.sessions;
     },
+    async listClassifications(id: string) {
+      const response = await request<ClassificationsResponse>(
+        `/api/sessions/${id}/classifications`,
+      );
+
+      return response.classifications;
+    },
     async generateSessionTitle(id: string) {
       return request<GenerateTitleResponse>(
         `/api/sessions/${id}/title/generate`,
@@ -121,3 +156,5 @@ export function createSessionsClient(connection: FlueConnection) {
     },
   };
 }
+
+export type SessionsClient = ReturnType<typeof createSessionsClient>;

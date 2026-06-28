@@ -23,6 +23,10 @@ import {
   handleListNavSessions,
   handleUpdateNavSession,
 } from "./shared/nav-sessions.js";
+import {
+  handleClassifyNavSessionMessage,
+  handleListNavSessionClassifications,
+} from "./shared/request-classifications.js";
 import { pruneAgentWorktrees } from "./shared/worktrees.js";
 import { ensureZaiProvider } from "./shared/zai-provider.js";
 
@@ -154,6 +158,11 @@ app.patch("/api/projects/:id", handleUpdateNavProject);
 app.delete("/api/projects/:id", handleDeleteNavProject);
 app.get("/api/sessions", handleListNavSessions);
 app.post("/api/sessions", handleCreateNavSession);
+app.get(
+  "/api/sessions/:id/classifications",
+  handleListNavSessionClassifications,
+);
+app.post("/api/sessions/:id/classify", handleClassifyNavSessionMessage);
 app.post("/api/sessions/:id/title/generate", handleGenerateNavSessionTitle);
 app.patch("/api/sessions/:id", handleUpdateNavSession);
 app.delete("/api/sessions/:id", handleDeleteNavSession);

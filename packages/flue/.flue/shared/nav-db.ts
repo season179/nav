@@ -63,6 +63,21 @@ export const ensureNavSessionTable = () => {
   `);
 };
 
+export const ensureMessageClassificationsReady = () => {
+  const sql = getNavDb();
+
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS nav_message_classifications (
+      session_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      is_planning INTEGER NOT NULL,
+      difficulty TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (session_id, message_id)
+    )
+  `);
+};
+
 export const ensureNavProjectTable = () => {
   const sql = getNavDb();
 
